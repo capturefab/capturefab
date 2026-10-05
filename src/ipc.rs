@@ -37,12 +37,11 @@ struct Request {
 struct ClientSlot(Arc<AtomicUsize>);
 impl ClientSlot {
     fn acquire(clients: &Arc<AtomicUsize>) -> Option<Self> {
-        clients
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < MAX_CLIENTS).then_some(n + 1)
-            })
-            .ok()?;
-        Some(Self(clients.clone()))
+        // Count first; the guard undoes the increment if over the limit. Unlike
+        // a CAS loop this works on every supported toolchain.
+        let previous = clients.fetch_add(1, Ordering::AcqRel);
+        let slot = Self(clients.clone());
+        (previous < MAX_CLIENTS).then_some(slot)
     }
 }
 impl Drop for ClientSlot {

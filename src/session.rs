@@ -327,13 +327,11 @@ impl Drop for Coordinator {
 struct PendingSlot(Arc<Coordinator>);
 impl PendingSlot {
     fn acquire(inner: &Arc<Coordinator>) -> Result<Self> {
-        inner
-            .pending
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < MAX_PENDING).then_some(n + 1)
-            })
-            .map_err(|_| anyhow::anyhow!("camera command queue is full"))?;
-        Ok(Self(inner.clone()))
+        // Count first; dropping the guard undoes the increment when full.
+        let previous = inner.pending.fetch_add(1, Ordering::AcqRel);
+        let slot = Self(inner.clone());
+        ensure!(previous < MAX_PENDING, "camera command queue is full");
+        Ok(slot)
     }
 }
 impl Drop for PendingSlot {
