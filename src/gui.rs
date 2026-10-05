@@ -91,6 +91,9 @@ pub fn run_capture(
             configure_theme(&cc.egui_ctx, false);
             configure_theme(&cc.egui_ctx, true);
             configure_fonts(&cc.egui_ctx);
+            // ⌘+ / ⌘− / ⌘0 zoom the camera image, as in image viewers, not the whole interface.
+            cc.egui_ctx
+                .options_mut(|options| options.zoom_with_keyboard = false);
             let capturing = screenshot.is_some();
             let mut app = Workbench::new(handle, session_label, simulated || capturing);
             // CAPTUREFAB_GPU_PREVIEW=0 keeps CPU conversion, e.g. to rule out a driver.
@@ -388,6 +391,11 @@ struct Workbench {
     help_open: bool,
     fit: bool,
     zoom: f32,
+    /// Scale "Fit" used last frame, so zooming from Fit starts where the image already is.
+    fit_scale: f32,
+    /// Whether a widget held keyboard focus at the end of last frame. egui drops focus on
+    /// Escape before `update` runs, so this keeps that Escape from also acting app-wide.
+    focus_held: bool,
     histogram_open: bool,
     focus_camera: bool,
     histogram: [u32; 64],
@@ -441,6 +449,8 @@ impl Workbench {
             help_open: false,
             fit: true,
             zoom: 1.0,
+            fit_scale: 1.0,
+            focus_held: false,
             histogram_open: false,
             focus_camera: false,
             histogram: [0; 64],
@@ -663,7 +673,15 @@ impl Workbench {
                             .color(ui.visuals().weak_text_color()),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Help").clicked() {
+                        if ui
+                            .button("Help")
+                            .on_hover_text(with_shortcut(
+                                ctx,
+                                "Keyboard shortcuts and quick guide",
+                                Action::Help,
+                            ))
+                            .clicked()
+                        {
                             self.help_open = true;
                         }
                         let previous_theme = self.theme_preference;
@@ -697,15 +715,14 @@ impl Workbench {
                         }
                         if ui
                             .button("Copy CLI")
-                            .on_hover_text("Copy a command that controls this visible session")
+                            .on_hover_text(with_shortcut(
+                                ctx,
+                                "Copy a command that controls this visible session",
+                                Action::CopySessionCommand,
+                            ))
                             .clicked()
                         {
-                            ctx.copy_text(format!(
-                                "capturefab --session {} status",
-                                shell_quote(&self.session)
-                            ));
-                            self.notice =
-                                Some(("Session command copied".into(), false, Instant::now()));
+                            self.copy_session_command(ctx);
                         }
                         ui.label(
                             RichText::new(format!("session  {}", self.session))
@@ -745,7 +762,7 @@ impl Workbench {
             ui.add_space(4.0);
             let discovering = self.pending.iter().any(|p| p.label == "Discovering cameras");
             if ui.add_enabled(!discovering, egui::Button::new(if discovering { "Discovering…" } else { "Discover cameras" }).min_size(Vec2::new(ui.available_width(), 34.0)))
-                .on_hover_text(format!("Find GigE Vision and USB3 Vision devices · {}", shortcut_label(ui.ctx(), egui::Key::R))).clicked() { self.discover(); }
+                .on_hover_text(with_shortcut(ui.ctx(), "Find GigE Vision and USB3 Vision devices", Action::Discover)).clicked() { self.discover(); }
             ui.checkbox(&mut self.include_simulator, "Include simulated camera");
             ui.add_space(6.0);
             ui.separator();
@@ -791,8 +808,10 @@ impl Workbench {
             ui.separator();
             ui.add_space(4.0);
             ui.label(RichText::new("Add a camera or stream").strong());
-            ui.add(egui::TextEdit::singleline(&mut self.address).hint_text("Camera IP, stream or native URI").desired_width(f32::INFINITY));
-            if ui.add_enabled(!self.address.trim().is_empty(), egui::Button::new("Connect directly").min_size(Vec2::new(ui.available_width(), 31.0))).clicked() {
+            let address = ui.add(egui::TextEdit::singleline(&mut self.address).id(egui::Id::new("connect-address")).hint_text("Camera IP, stream or native URI").desired_width(f32::INFINITY))
+                .on_hover_text(with_shortcut(ui.ctx(), "Press Enter to connect", Action::ConnectAddress));
+            let submitted = address.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.add_enabled(!self.address.trim().is_empty(), egui::Button::new("Connect directly").min_size(Vec2::new(ui.available_width(), 31.0))).clicked() || submitted) && !self.address.trim().is_empty() {
                 self.edits.clear();
                 self.edit_sources.clear();
                 self.send("Connecting camera", SessionCommand::Connect { camera: self.address.trim().to_owned(), timeout_ms: 5000 });
@@ -805,16 +824,17 @@ impl Workbench {
         egui::SidePanel::right("inspector").default_width(300.0).min_width(245.0).max_width(440.0).show(ctx, |ui| {
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.inspector_tab, 0, "Features");
-                ui.selectable_value(&mut self.inspector_tab, 1, "Capture");
-                ui.selectable_value(&mut self.inspector_tab, 2, "Forward");
+                for (tab, name, action) in [(0, "Features", Action::FeaturesTab), (1, "Capture", Action::CaptureTab), (2, "Forward", Action::ForwardTab)] {
+                    ui.selectable_value(&mut self.inspector_tab, tab, name).on_hover_text(with_shortcut(ui.ctx(), action.label(), action));
+                }
             });
             ui.add_space(5.0);
             ui.separator();
             if self.inspector_tab == 1 { egui::ScrollArea::vertical().id_salt("capture-settings-scroll").show(ui, |ui| self.capture_settings(ui, snapshot)); return; }
             if self.inspector_tab == 2 { egui::ScrollArea::vertical().id_salt("forward-settings-scroll").show(ui, |ui| self.forward_settings(ui, snapshot)); return; }
             if snapshot.connected.is_some() { self.auto_card(ui, snapshot); }
-            ui.add(egui::TextEdit::singleline(&mut self.search).id(egui::Id::new("feature-search")).hint_text("Search features…").desired_width(f32::INFINITY));
+            ui.add(egui::TextEdit::singleline(&mut self.search).id(egui::Id::new("feature-search")).hint_text("Search features…").desired_width(f32::INFINITY))
+                .on_hover_text(with_shortcut(ui.ctx(), "Filter by name", Action::SearchFeatures));
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("{} features", snapshot.features.len())).small().color(ui.visuals().weak_text_color()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -870,6 +890,11 @@ impl Workbench {
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(!busy, egui::Button::selectable(auto.is_none(), "Manual"))
+                        .on_hover_text(with_shortcut(
+                            ui.ctx(),
+                            "Toggle auto / manual",
+                            Action::ToggleAuto,
+                        ))
                         .clicked()
                         && auto.is_some()
                     {
@@ -880,6 +905,11 @@ impl Workbench {
                     }
                     if ui
                         .add_enabled(!busy, egui::Button::selectable(auto.is_some(), "Auto"))
+                        .on_hover_text(with_shortcut(
+                            ui.ctx(),
+                            "Toggle auto / manual",
+                            Action::ToggleAuto,
+                        ))
                         .clicked()
                         && auto.is_none()
                     {
@@ -1240,7 +1270,7 @@ impl Workbench {
         ui.label(
             RichText::new(format!(
                 "{} · Capture from this session",
-                shortcut_label(ui.ctx(), egui::Key::S)
+                shortcut_text(ui.ctx(), Action::Capture)
             ))
             .small()
             .color(ui.visuals().weak_text_color()),
@@ -1577,6 +1607,7 @@ impl Workbench {
                                 "Activity"
                             },
                         )
+                        .on_hover_text(with_shortcut(ui.ctx(), "Session activity log", Action::ToggleActivity))
                         .clicked()
                     {
                         self.logs_open = !self.logs_open;
@@ -1745,7 +1776,16 @@ impl Workbench {
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if snapshot.cameras.len() > 1 && ui.button("All cameras").clicked() {
+                        if snapshot.cameras.len() > 1
+                            && ui
+                                .button("All cameras")
+                                .on_hover_text(with_shortcut(
+                                    ui.ctx(),
+                                    "Back to all cameras",
+                                    Action::Overview,
+                                ))
+                                .clicked()
+                        {
                             self.focus_camera = false;
                         }
                         let label = if snapshot.streaming {
@@ -1758,7 +1798,11 @@ impl Workbench {
                                 snapshot.connected.is_some(),
                                 egui::Button::new(label).min_size(Vec2::new(115.0, 35.0)),
                             )
-                            .on_hover_text("Space · start or stop acquisition")
+                            .on_hover_text(with_shortcut(
+                                ui.ctx(),
+                                "Start or stop acquisition",
+                                Action::ToggleStream,
+                            ))
                             .clicked()
                         {
                             self.toggle_stream(snapshot);
@@ -1848,11 +1892,9 @@ impl Workbench {
                 }
                 if let Some(shown) = &self.shown {
                     let native = shown.size();
-                    let scale = if self.fit {
-                        ((area.width() - 16.0) / native.x).min((area.height() - 16.0) / native.y)
-                    } else {
-                        self.zoom
-                    };
+                    self.fit_scale =
+                        ((area.width() - 16.0) / native.x).min((area.height() - 16.0) / native.y);
+                    let scale = if self.fit { self.fit_scale } else { self.zoom };
                     let image_rect = egui::Rect::from_center_size(area.center(), native * scale);
                     shown.paint(&painter, self.gpu.as_ref(), image_rect);
                     if !snapshot.streaming {
@@ -1912,21 +1954,30 @@ impl Workbench {
                     );
                 }
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.fit, true, "Fit");
+                    let ctx = ui.ctx().clone();
+                    ui.selectable_value(&mut self.fit, true, "Fit")
+                        .on_hover_text(with_shortcut(&ctx, "Zoom to fit", Action::ZoomFit));
                     if ui
                         .selectable_label(!self.fit && (self.zoom - 1.0).abs() < 0.01, "1:1")
+                        .on_hover_text(with_shortcut(&ctx, "Actual pixels", Action::ZoomActual))
                         .clicked()
                     {
                         self.fit = false;
                         self.zoom = 1.0;
                     }
-                    if ui.small_button("−").clicked() {
-                        self.fit = false;
-                        self.zoom = (self.zoom / 1.25).max(0.1);
+                    if ui
+                        .small_button("−")
+                        .on_hover_text(with_shortcut(&ctx, "Zoom out", Action::ZoomOut))
+                        .clicked()
+                    {
+                        self.zoom_by(1.0 / 1.25);
                     }
-                    if ui.small_button("+").clicked() {
-                        self.fit = false;
-                        self.zoom = (self.zoom * 1.25).min(8.0);
+                    if ui
+                        .small_button("+")
+                        .on_hover_text(with_shortcut(&ctx, "Zoom in", Action::ZoomIn))
+                        .clicked()
+                    {
+                        self.zoom_by(1.25);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let Some((id, width, height, format, _)) = self.frame_meta {
@@ -1963,9 +2014,10 @@ impl Workbench {
                             snapshot.connected.is_some(),
                             egui::Button::new("Capture frame"),
                         )
-                        .on_hover_text(format!(
-                            "Save using the settings in Capture · {}",
-                            shortcut_label(ui.ctx(), egui::Key::S)
+                        .on_hover_text(with_shortcut(
+                            ui.ctx(),
+                            "Save using the settings in Capture",
+                            Action::Capture,
                         ))
                         .clicked()
                     {
@@ -1981,7 +2033,15 @@ impl Workbench {
                         .truncate(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Save settings").clicked() {
+                        if ui
+                            .small_button("Save settings")
+                            .on_hover_text(with_shortcut(
+                                ui.ctx(),
+                                "Capture panel",
+                                Action::CaptureTab,
+                            ))
+                            .clicked()
+                        {
                             self.inspector_tab = 1;
                         }
                     });
@@ -2131,10 +2191,22 @@ impl Workbench {
         });
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if ui.button("Capture selected").clicked() {
+            if ui
+                .button("Capture selected")
+                .on_hover_text(with_shortcut(ui.ctx(), "Capture and save", Action::Capture))
+                .clicked()
+            {
                 self.capture();
             }
-            if ui.button("Focus selected").clicked() {
+            if ui
+                .button("Focus selected")
+                .on_hover_text(with_shortcut(
+                    ui.ctx(),
+                    "Focus selected camera",
+                    Action::FocusCamera,
+                ))
+                .clicked()
+            {
                 self.focus_camera = true;
             }
             ui.add(
@@ -2147,15 +2219,23 @@ impl Workbench {
                 .truncate(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Save settings").clicked() {
+                if ui
+                    .small_button("Save settings")
+                    .on_hover_text(with_shortcut(ui.ctx(), "Capture panel", Action::CaptureTab))
+                    .clicked()
+                {
                     self.inspector_tab = 1;
                 }
             });
         });
         ui.label(
-            RichText::new("Click a preview to inspect its camera settings.")
-                .small()
-                .color(ui.visuals().weak_text_color()),
+            RichText::new(format!(
+                "Click a preview to inspect its camera settings · {} / {} switches camera",
+                shortcut_text(ui.ctx(), Action::PreviousCamera),
+                shortcut_text(ui.ctx(), Action::NextCamera)
+            ))
+            .small()
+            .color(ui.visuals().weak_text_color()),
         );
     }
 
@@ -2264,15 +2344,133 @@ impl Workbench {
         ctx.request_repaint_after(Duration::from_millis(33));
     }
 
+    fn shortcuts(&mut self, ctx: &egui::Context, snapshot: &SessionSnapshot) {
+        let keyboard_free = !self.focus_held
+            && ctx.memory(|memory| memory.focused().is_none())
+            && !egui::Popup::is_any_open(ctx);
+        let connected = snapshot.connected.is_some();
+        let overview = snapshot.cameras.len() > 1 && !self.focus_camera;
+        for action in pressed_actions(ctx, keyboard_free) {
+            match action {
+                Action::Discover => self.discover(),
+                Action::ConnectAddress => {
+                    focus_and_select(ctx, egui::Id::new("connect-address"), &self.address)
+                }
+                Action::NextCamera => self.select_relative_camera(snapshot, 1),
+                Action::PreviousCamera => self.select_relative_camera(snapshot, -1),
+                Action::FocusCamera if overview => self.focus_camera = true,
+                Action::Overview if self.help_open => self.help_open = false,
+                Action::Overview if snapshot.cameras.len() > 1 => self.focus_camera = false,
+                Action::ToggleStream if connected => self.toggle_stream(snapshot),
+                Action::Capture if connected => self.capture(),
+                Action::ToggleAuto if connected => self.toggle_auto(snapshot),
+                Action::SearchFeatures => {
+                    self.inspector_tab = 0;
+                    focus_and_select(ctx, egui::Id::new("feature-search"), &self.search);
+                }
+                Action::FeaturesTab => self.inspector_tab = 0,
+                Action::CaptureTab => self.inspector_tab = 1,
+                Action::ForwardTab => self.inspector_tab = 2,
+                Action::ZoomIn => self.zoom_by(1.25),
+                Action::ZoomOut => self.zoom_by(1.0 / 1.25),
+                Action::ZoomFit => self.fit = true,
+                Action::ZoomActual => {
+                    self.fit = false;
+                    self.zoom = 1.0;
+                }
+                Action::ToggleActivity => self.logs_open = !self.logs_open,
+                Action::CopySessionCommand => self.copy_session_command(ctx),
+                Action::Fullscreen => {
+                    let fullscreen = ctx.input(|input| input.viewport().fullscreen);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
+                        !fullscreen.unwrap_or(false),
+                    ));
+                }
+                Action::Help => self.help_open = !self.help_open,
+                Action::CloseWindow => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                // Pressed where it does not apply, e.g. Space with no camera connected.
+                _ => {}
+            }
+        }
+    }
+
+    fn select_relative_camera(&mut self, snapshot: &SessionSnapshot, step: isize) {
+        let count = snapshot.cameras.len();
+        if count < 2 {
+            return;
+        }
+        let current = snapshot
+            .cameras
+            .iter()
+            .position(|camera| snapshot.active_camera.as_ref() == Some(&camera.info.id))
+            .unwrap_or(0);
+        let next = (current as isize + step).rem_euclid(count as isize) as usize;
+        self.send(
+            "Selecting camera",
+            SessionCommand::Select {
+                camera: snapshot.cameras[next].info.id.clone(),
+            },
+        );
+    }
+
+    fn zoom_by(&mut self, factor: f32) {
+        let from = if self.fit { self.fit_scale } else { self.zoom };
+        self.fit = false;
+        self.zoom = (from * factor).clamp(0.1, 8.0);
+    }
+
+    fn toggle_auto(&mut self, snapshot: &SessionSnapshot) {
+        if self.pending.iter().any(|p| {
+            matches!(
+                p.label.as_str(),
+                "Enabling auto mode" | "Switching to manual" | "Updating auto balance"
+            )
+        }) {
+            return;
+        }
+        if snapshot.auto.is_some() {
+            self.send(
+                "Switching to manual",
+                SessionCommand::Manual { revert: false },
+            );
+        } else {
+            self.send(
+                "Enabling auto mode",
+                SessionCommand::Auto {
+                    balance: Some(self.balance),
+                },
+            );
+        }
+    }
+
+    fn copy_session_command(&mut self, ctx: &egui::Context) {
+        ctx.copy_text(format!(
+            "capturefab --session {} status",
+            shell_quote(&self.session)
+        ));
+        self.notice = Some(("Session command copied".into(), false, Instant::now()));
+    }
+
     fn help(&mut self, ctx: &egui::Context) {
-        egui::Window::new("Capturefab quick guide").open(&mut self.help_open).collapsible(false).resizable(false).default_width(460.0).show(ctx, |ui| {
+        egui::Window::new("Capturefab quick guide").open(&mut self.help_open).collapsible(false).resizable(false).default_width(620.0).show(ctx, |ui| {
             ui.label("Discover a camera, connect, then start a stream. The simulator is available without camera hardware.");
             ui.add_space(8.0);
-            egui::Grid::new("keyboard-help").spacing([24.0, 10.0]).show(ui, |ui| {
-                for (key, action) in [(shortcut_label(ctx, egui::Key::R), "Discover cameras"), ("Space".into(), "Start / stop streaming"), (shortcut_label(ctx, egui::Key::S), "Capture and save"), (shortcut_label(ctx, egui::Key::F), "Search camera features"), (format!("{} / {} / {}", shortcut_label(ctx, egui::Key::Num1), shortcut_label(ctx, egui::Key::Num2), shortcut_label(ctx, egui::Key::Num3)), "Features / Capture / Forward"), ("F1 / Esc".into(), "Open / close help") ] {
-                    ui.label(RichText::new(key).monospace()); ui.label(action); ui.end_row();
+            let os = ctx.os();
+            ui.columns(2, |columns| {
+                for (index, (section, actions)) in Action::SECTIONS.into_iter().enumerate() {
+                    let ui = &mut columns[usize::from(index >= 2)];
+                    ui.label(RichText::new(section).strong());
+                    egui::Grid::new(("keyboard-help", section)).num_columns(2).spacing([14.0, 5.0]).show(ui, |ui| {
+                        for action in actions.iter().filter(|action| !action.bindings(os).is_empty()) {
+                            ui.label(RichText::new(shortcut_text(ctx, *action)).monospace().color(accent(ui)));
+                            ui.label(action.label());
+                            ui.end_row();
+                        }
+                    });
+                    ui.add_space(8.0);
                 }
             });
+            ui.label(RichText::new("Space, Enter and Esc act on the workbench when no field or button has keyboard focus. Press Esc or click the background to release focus.").small().color(ui.visuals().weak_text_color()));
             ui.add_space(10.0);
             ui.separator();
             ui.label(RichText::new("One visible session, many ways to control it").strong());
@@ -2326,59 +2524,7 @@ impl eframe::App for Workbench {
                 }
             });
         }
-        let typing = ctx.wants_keyboard_input();
-        if !typing && ctx.input_mut(|input| input.consume_shortcut(&command_shortcut(egui::Key::R)))
-        {
-            self.discover();
-        }
-        if !typing
-            && ctx.input_mut(|input| input.consume_shortcut(&command_shortcut(egui::Key::S)))
-            && snapshot.connected.is_some()
-        {
-            self.capture();
-        }
-        if !typing
-            && ctx.input_mut(|input| {
-                input.consume_shortcut(&egui::KeyboardShortcut::new(
-                    egui::Modifiers::NONE,
-                    egui::Key::Space,
-                ))
-            })
-            && snapshot.connected.is_some()
-        {
-            self.toggle_stream(&snapshot);
-        }
-        if ctx.input_mut(|input| input.consume_shortcut(&command_shortcut(egui::Key::F))) {
-            self.inspector_tab = 0;
-            ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("feature-search")));
-        }
-        for (key, tab) in [
-            (egui::Key::Num1, 0),
-            (egui::Key::Num2, 1),
-            (egui::Key::Num3, 2),
-        ] {
-            if !typing && ctx.input_mut(|input| input.consume_shortcut(&command_shortcut(key))) {
-                self.inspector_tab = tab;
-            }
-        }
-        if ctx.input_mut(|input| {
-            input.consume_shortcut(&egui::KeyboardShortcut::new(
-                egui::Modifiers::NONE,
-                egui::Key::F1,
-            ))
-        }) {
-            self.help_open = true;
-        }
-        if self.help_open
-            && ctx.input_mut(|input| {
-                input.consume_shortcut(&egui::KeyboardShortcut::new(
-                    egui::Modifiers::NONE,
-                    egui::Key::Escape,
-                ))
-            })
-        {
-            self.help_open = false;
-        }
+        self.shortcuts(ctx, &snapshot);
         self.top_bar(ctx, &snapshot);
         self.footer(ctx, &snapshot);
         self.devices(ctx, &snapshot);
@@ -2386,6 +2532,7 @@ impl eframe::App for Workbench {
         self.preview(ctx, &snapshot);
         self.help(ctx);
         self.screenshot_update(ctx, &snapshot);
+        self.focus_held = ctx.memory(|memory| memory.focused().is_some());
         ctx.request_repaint_after(if snapshot.cameras.iter().any(|camera| camera.streaming) {
             Duration::from_millis(33)
         } else if !self.pending.is_empty() {
@@ -2401,8 +2548,230 @@ fn status_dot(ui: &mut egui::Ui, color: Color32) {
     ui.painter().circle_filled(rect.center(), 3.0, color);
 }
 
-fn command_shortcut(key: egui::Key) -> egui::KeyboardShortcut {
-    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key)
+/// Every keyboard command. Bindings, dispatch, tooltips and the help sheet all derive from this
+/// one table so they cannot drift apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    Discover,
+    ConnectAddress,
+    NextCamera,
+    PreviousCamera,
+    FocusCamera,
+    Overview,
+    ToggleStream,
+    Capture,
+    ToggleAuto,
+    SearchFeatures,
+    FeaturesTab,
+    CaptureTab,
+    ForwardTab,
+    ZoomIn,
+    ZoomOut,
+    ZoomFit,
+    ZoomActual,
+    ToggleActivity,
+    CopySessionCommand,
+    Fullscreen,
+    Help,
+    CloseWindow,
+}
+
+impl Action {
+    /// Dispatch order. egui ignores extra Shift/Alt, and Ctrl alongside ⌘, when matching, so a
+    /// chord must come before any chord it extends (⌥⌘0 before ⌘0, ⌃⌘F before ⌘F).
+    const ALL: [Action; 22] = [
+        Action::Fullscreen,
+        Action::ZoomActual,
+        Action::ZoomFit,
+        Action::ZoomIn,
+        Action::ZoomOut,
+        Action::CopySessionCommand,
+        Action::ToggleAuto,
+        Action::Discover,
+        Action::ConnectAddress,
+        Action::NextCamera,
+        Action::PreviousCamera,
+        Action::FocusCamera,
+        Action::Overview,
+        Action::ToggleStream,
+        Action::Capture,
+        Action::SearchFeatures,
+        Action::FeaturesTab,
+        Action::CaptureTab,
+        Action::ForwardTab,
+        Action::ToggleActivity,
+        Action::Help,
+        Action::CloseWindow,
+    ];
+
+    /// Help sheet layout: section title and its actions in reading order.
+    const SECTIONS: [(&'static str, &'static [Action]); 4] = [
+        (
+            "Cameras",
+            &[
+                Action::Discover,
+                Action::ConnectAddress,
+                Action::NextCamera,
+                Action::PreviousCamera,
+                Action::FocusCamera,
+                Action::Overview,
+            ],
+        ),
+        (
+            "Acquisition",
+            &[
+                Action::ToggleStream,
+                Action::Capture,
+                Action::ToggleAuto,
+                Action::SearchFeatures,
+            ],
+        ),
+        (
+            "View",
+            &[
+                Action::FeaturesTab,
+                Action::CaptureTab,
+                Action::ForwardTab,
+                Action::ZoomIn,
+                Action::ZoomOut,
+                Action::ZoomFit,
+                Action::ZoomActual,
+                Action::ToggleActivity,
+                Action::Fullscreen,
+            ],
+        ),
+        (
+            "Window",
+            &[
+                Action::CopySessionCommand,
+                Action::Help,
+                Action::CloseWindow,
+            ],
+        ),
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Action::Discover => "Discover cameras",
+            Action::ConnectAddress => "Connect to an address or stream",
+            Action::NextCamera => "Select next camera",
+            Action::PreviousCamera => "Select previous camera",
+            Action::FocusCamera => "Focus selected camera",
+            Action::Overview => "Back to all cameras",
+            Action::ToggleStream => "Start / stop streaming",
+            Action::Capture => "Capture and save",
+            Action::ToggleAuto => "Toggle auto / manual",
+            Action::SearchFeatures => "Search camera features",
+            Action::FeaturesTab => "Features panel",
+            Action::CaptureTab => "Capture panel",
+            Action::ForwardTab => "Forward panel",
+            Action::ZoomIn => "Zoom in",
+            Action::ZoomOut => "Zoom out",
+            Action::ZoomFit => "Zoom to fit",
+            Action::ZoomActual => "Actual pixels (1:1)",
+            Action::ToggleActivity => "Show / hide activity",
+            Action::CopySessionCommand => "Copy session CLI command",
+            Action::Fullscreen => "Toggle full screen",
+            Action::Help => "Keyboard shortcuts and help",
+            Action::CloseWindow => "Close window",
+        }
+    }
+
+    /// Key bindings for `os`, primary first. Command chords use ⌘ on macOS and Ctrl elsewhere,
+    /// avoiding keys that the OS menu or text fields already own (⌘H, ⌘Q, Ctrl+W, Ctrl+Tab).
+    fn bindings(self, os: egui::os::OperatingSystem) -> Vec<egui::KeyboardShortcut> {
+        use egui::{Key, KeyboardShortcut as S, Modifiers as M};
+        let mac = os == egui::os::OperatingSystem::Mac;
+        let cmd = |key| S::new(M::COMMAND, key);
+        let bare = |key| S::new(M::NONE, key);
+        match self {
+            Action::Discover if mac => vec![cmd(Key::R)],
+            Action::Discover => vec![cmd(Key::R), bare(Key::F5)],
+            Action::ConnectAddress => vec![cmd(Key::L)],
+            Action::NextCamera if mac => vec![S::new(M::COMMAND | M::ALT, Key::ArrowRight)],
+            Action::NextCamera => vec![S::new(M::CTRL, Key::PageDown)],
+            Action::PreviousCamera if mac => vec![S::new(M::COMMAND | M::ALT, Key::ArrowLeft)],
+            Action::PreviousCamera => vec![S::new(M::CTRL, Key::PageUp)],
+            Action::FocusCamera => vec![bare(Key::Enter)],
+            Action::Overview => vec![bare(Key::Escape)],
+            Action::ToggleStream => vec![bare(Key::Space)],
+            Action::Capture => vec![cmd(Key::S)],
+            Action::ToggleAuto => vec![S::new(M::COMMAND | M::SHIFT, Key::A)],
+            Action::SearchFeatures => vec![cmd(Key::F)],
+            Action::FeaturesTab => vec![cmd(Key::Num1)],
+            Action::CaptureTab => vec![cmd(Key::Num2)],
+            Action::ForwardTab => vec![cmd(Key::Num3)],
+            Action::ZoomIn => vec![cmd(Key::Equals), cmd(Key::Plus)],
+            Action::ZoomOut => vec![cmd(Key::Minus)],
+            Action::ZoomFit => vec![cmd(Key::Num0)],
+            Action::ZoomActual => vec![S::new(M::COMMAND | M::ALT, Key::Num0)],
+            Action::ToggleActivity => vec![cmd(Key::J)],
+            Action::CopySessionCommand => vec![S::new(M::COMMAND | M::SHIFT, Key::C)],
+            Action::Fullscreen if mac => vec![S::new(M::MAC_CMD | M::CTRL, Key::F)],
+            Action::Fullscreen => vec![bare(Key::F11)],
+            Action::Help => vec![bare(Key::F1), cmd(Key::Slash)],
+            Action::CloseWindow if mac => vec![cmd(Key::W)],
+            Action::CloseWindow if os == egui::os::OperatingSystem::Nix => vec![cmd(Key::Q)],
+            // Windows closes with Alt+F4, which the OS handles.
+            Action::CloseWindow => vec![],
+        }
+    }
+}
+
+/// Plain keys (Space, Enter, Escape) belong to a focused widget; only chords and function keys
+/// work while one has focus.
+fn needs_free_keyboard(shortcut: &egui::KeyboardShortcut) -> bool {
+    shortcut.modifiers.is_none()
+        && !matches!(
+            shortcut.logical_key,
+            egui::Key::F1 | egui::Key::F5 | egui::Key::F11
+        )
+}
+
+/// Actions pressed this frame, consuming their keys so widgets do not also see them.
+fn pressed_actions(ctx: &egui::Context, keyboard_free: bool) -> Vec<Action> {
+    let os = ctx.os();
+    ctx.input_mut(|input| {
+        Action::ALL
+            .into_iter()
+            .filter(|action| {
+                action.bindings(os).iter().any(|shortcut| {
+                    (keyboard_free || !needs_free_keyboard(shortcut))
+                        && input.consume_shortcut(shortcut)
+                })
+            })
+            .collect()
+    })
+}
+
+/// All of an action's bindings formatted for this platform, e.g. "F1 / ⌘/".
+fn shortcut_text(ctx: &egui::Context, action: Action) -> String {
+    action
+        .bindings(ctx.os())
+        .iter()
+        .map(|shortcut| ctx.format_shortcut(shortcut))
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// Tooltip text in the workbench's "description · shortcut" style.
+fn with_shortcut(ctx: &egui::Context, text: &str, action: Action) -> String {
+    match action.bindings(ctx.os()).first() {
+        Some(shortcut) => format!("{text} · {}", ctx.format_shortcut(shortcut)),
+        None => text.to_owned(),
+    }
+}
+
+/// Focuses a single-line text field with its contents selected, like a browser location bar.
+fn focus_and_select(ctx: &egui::Context, id: egui::Id, text: &str) {
+    use egui::text::{CCursor, CCursorRange};
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    state.cursor.set_char_range(Some(CCursorRange::two(
+        CCursor::new(0),
+        CCursor::new(text.chars().count()),
+    )));
+    state.store(ctx, id);
+    ctx.memory_mut(|memory| memory.request_focus(id));
 }
 
 fn save_screenshot(image: &egui::ColorImage, path: &std::path::Path) -> Result<()> {
@@ -2423,10 +2792,6 @@ fn save_screenshot(image: &egui::ColorImage, path: &std::path::Path) -> Result<(
         .collect();
     encoder.write_header()?.write_image_data(&bytes)?;
     Ok(())
-}
-
-fn shortcut_label(ctx: &egui::Context, key: egui::Key) -> String {
-    ctx.format_shortcut(&command_shortcut(key))
 }
 
 fn stat(ui: &mut egui::Ui, label: &str, value: String, color: Color32) {
@@ -2687,6 +3052,165 @@ mod tests {
         assert_eq!(
             transport_text(&TransportStats::default()),
             "resend 0/0 · 0 lost"
+        );
+    }
+
+    /// Modifiers the OS reports when the user presses `pattern` (⌘ on Mac, Ctrl elsewhere).
+    fn pressed(pattern: egui::Modifiers, mac: bool) -> egui::Modifiers {
+        let command = pattern.command || pattern.mac_cmd;
+        egui::Modifiers {
+            alt: pattern.alt,
+            shift: pattern.shift,
+            ctrl: pattern.ctrl || (command && !mac),
+            mac_cmd: command && mac,
+            command: command || (pattern.ctrl && !mac),
+        }
+    }
+
+    const PLATFORMS: [egui::os::OperatingSystem; 3] = [
+        egui::os::OperatingSystem::Mac,
+        egui::os::OperatingSystem::Windows,
+        egui::os::OperatingSystem::Nix,
+    ];
+
+    #[test]
+    fn every_binding_dispatches_to_its_own_action() {
+        for os in PLATFORMS {
+            let mac = os == egui::os::OperatingSystem::Mac;
+            for action in Action::ALL {
+                for shortcut in action.bindings(os) {
+                    let held = pressed(shortcut.modifiers, mac);
+                    // egui ignores extra Shift/Alt, so the first match in ALL wins.
+                    let winner = Action::ALL.into_iter().find(|candidate| {
+                        candidate.bindings(os).iter().any(|other| {
+                            other.logical_key == shortcut.logical_key
+                                && held.matches_logically(other.modifiers)
+                        })
+                    });
+                    assert_eq!(winner, Some(action), "{shortcut:?} on {os:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bindings_avoid_keys_owned_by_the_os_and_text_fields() {
+        use egui::{Key, Modifiers as M};
+        for os in PLATFORMS {
+            let mac = os == egui::os::OperatingSystem::Mac;
+            // macOS app menu (winit), text editing, and egui's Tab focus traversal.
+            let mut reserved = vec![
+                (M::COMMAND, Key::A),
+                (M::COMMAND, Key::C),
+                (M::COMMAND, Key::V),
+                (M::COMMAND, Key::X),
+                (M::COMMAND, Key::Z),
+                (M::COMMAND, Key::Y),
+                (M::CTRL, Key::Tab),
+            ];
+            if mac {
+                reserved.extend([(M::COMMAND, Key::H), (M::COMMAND, Key::Q)]);
+            } else {
+                // egui text fields treat these as emacs-style deletions.
+                reserved.extend([Key::H, Key::K, Key::U, Key::W].map(|key| (M::CTRL, key)));
+            }
+            for action in Action::ALL {
+                for shortcut in action.bindings(os) {
+                    let held = pressed(shortcut.modifiers, mac);
+                    for (modifiers, key) in &reserved {
+                        assert!(
+                            !(shortcut.logical_key == *key
+                                && held.matches_exact(pressed(*modifiers, mac))),
+                            "{action:?} uses reserved {shortcut:?} on {os:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn help_sheet_lists_every_action_once() {
+        let listed: Vec<Action> = Action::SECTIONS
+            .iter()
+            .flat_map(|(_, actions)| actions.iter().copied())
+            .collect();
+        assert_eq!(listed.len(), Action::ALL.len());
+        for action in Action::ALL {
+            assert_eq!(
+                listed.iter().filter(|&&a| a == action).count(),
+                1,
+                "{action:?}"
+            );
+        }
+        for os in PLATFORMS {
+            for action in Action::ALL {
+                // Only Windows leaves window closing to the OS (Alt+F4).
+                assert_eq!(
+                    action.bindings(os).is_empty(),
+                    action == Action::CloseWindow && os == egui::os::OperatingSystem::Windows,
+                    "{action:?} on {os:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shortcut_labels_follow_the_platform() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_| {}); // loads fonts for formatting
+        ctx.set_os(egui::os::OperatingSystem::Windows);
+        assert_eq!(shortcut_text(&ctx, Action::Capture), "Ctrl+S");
+        assert_eq!(shortcut_text(&ctx, Action::Discover), "Ctrl+R / F5");
+        assert_eq!(shortcut_text(&ctx, Action::Fullscreen), "F11");
+        assert_eq!(
+            with_shortcut(&ctx, "Start or stop acquisition", Action::ToggleStream),
+            "Start or stop acquisition · Space"
+        );
+        ctx.set_os(egui::os::OperatingSystem::Mac);
+        // egui spells modifiers out when the font lacks the ⌘/⌥ glyphs.
+        let discover = shortcut_text(&ctx, Action::Discover);
+        assert!(["⌘R", "Cmd+R"].contains(&discover.as_str()), "{discover}");
+        let actual = shortcut_text(&ctx, Action::ZoomActual);
+        assert!(
+            ["⌥⌘0", "Option+Cmd+0"].contains(&actual.as_str()),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn plain_keys_wait_for_free_keyboard() {
+        let ctx = egui::Context::default();
+        ctx.set_os(egui::os::OperatingSystem::Windows);
+        let press = |key, modifiers| egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            modifiers,
+            ..Default::default()
+        };
+        let run = |input, free| {
+            let mut actions = Vec::new();
+            let _ = ctx.run(input, |ctx| actions = pressed_actions(ctx, free));
+            actions
+        };
+        let none = egui::Modifiers::NONE;
+        assert_eq!(
+            run(press(egui::Key::Space, none), true),
+            [Action::ToggleStream]
+        );
+        assert!(run(press(egui::Key::Space, none), false).is_empty());
+        assert_eq!(run(press(egui::Key::F1, none), false), [Action::Help]);
+        let ctrl = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
+        assert_eq!(run(press(egui::Key::S, ctrl), false), [Action::Capture]);
+        let ctrl_alt = ctrl | egui::Modifiers::ALT;
+        assert_eq!(
+            run(press(egui::Key::Num0, ctrl_alt), true),
+            [Action::ZoomActual]
         );
     }
 }
