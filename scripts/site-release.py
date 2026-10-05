@@ -47,7 +47,7 @@ PAGE = '''<!doctype html>
         <p class="lead">Every published build with its SHA-256 checksum. Desktop includes the GUI; headless is for servers, scripts, and devices without a display.</p>
       </section>
 {body}    </main>
-    <footer class="site-footer"><p><span class="prompt" aria-hidden="true">&gt;_</span> capturefab <span class="separator">/</span> GPLv3</p><div><a href="https://github.com/capturefab/capturefab">Source</a><a href="https://github.com/capturefab/capturefab/issues">Issues</a><a href="feed.xml">Releases / Atom</a><a href="agents.md">For agents</a></div></footer>
+    <footer class="site-footer"><p><span class="prompt" aria-hidden="true">&gt;_</span> capturefab <span class="separator">/</span> MIT</p><div><a href="https://github.com/capturefab/capturefab">Source</a><a href="https://github.com/capturefab/capturefab/issues">Issues</a><a href="feed.xml">Releases / Atom</a><a href="agents.md">For agents</a></div></footer>
   </div>
 </body>
 </html>

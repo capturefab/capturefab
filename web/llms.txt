@@ -7,7 +7,7 @@
 - [Agent instructions](agents.md): CLI conventions, sessions, acquisition workflow, and compatibility boundaries.
 - [Release manifest](releases.json): Versioned JSON with real published assets, architectures, SHA-256 checksums, and signatures when available. An empty releases array means no binaries are published.
 - [Atom releases](feed.xml): Release announcements.
-- [Source and build guide](https://github.com/capturefab/capturefab): Source code, GPLv3 license, CLI reference, and build instructions.
+- [Source and build guide](https://github.com/capturefab/capturefab): Source code, MIT license, CLI reference, and build instructions.
 - [Hardware validation](https://github.com/capturefab/capturefab/blob/main/docs/hardware-validation.md): Tested devices and current limitations.
 - [Camera compatibility](https://github.com/capturefab/capturefab/blob/main/docs/camera-compatibility.md): Host webcams, CSI driver boundaries, industrial transports, and DSLR/mirrorless HDMI capture routes.
 - [FFmpeg build notes](https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md): Bundled media dependencies and source/build provenance.

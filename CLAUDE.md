@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Capturefab is a GPL-3.0-only Rust camera workbench: one binary that is both an egui desktop app (no subcommand) and a scriptable CLI. It implements GigE Vision, USB3 Vision and GenICam natively in Rust; webcams, RTSP/SRT/ONVIF, files, decoding and encoding go through a bundled FFmpeg executable (not linked). Never link Aravis, libusb, vendor SDKs or nonfree FFmpeg components; Aravis is only an external test reference.
+Capturefab is an MIT-licensed Rust camera workbench: one binary that is both an egui desktop app (no subcommand) and a scriptable CLI. It implements GigE Vision, USB3 Vision and GenICam natively in Rust; webcams, RTSP/SRT/ONVIF, files, decoding and encoding go through a bundled FFmpeg executable (not linked). Never link Aravis, libusb, vendor SDKs or nonfree FFmpeg components; Aravis is only an external test reference.
 
 ## Commands
 

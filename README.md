@@ -2,7 +2,7 @@
 
 A camera workbench with a native egui desktop and a scriptable CLI. Open `capturefab` to discover cameras, select a device, inspect its settings, and capture. The same executable runs headless and lets scripts or coding agents control an already visible GUI session.
 
-Capturefab is GPL-3.0-only. Its GigE Vision, USB3 Vision and GenICam implementation is Rust; media decoding, host-driver camera access and encoding use a bundled, source-built FFmpeg executable. Release binaries require no separately installed Aravis, FFmpeg, libusb, vendor SDK or Python. Operating-system graphics and camera drivers remain necessary.
+Capturefab is MIT-licensed. Its GigE Vision, USB3 Vision and GenICam implementation is Rust; media decoding, host-driver camera access and encoding use a bundled, source-built FFmpeg executable. Release binaries require no separately installed Aravis, FFmpeg, libusb, vendor SDK or Python. Operating-system graphics and camera drivers remain necessary.
 
 This is an initial implementation, not complete Aravis or vendor-SDK feature parity. Real Basler GigE acquisition and Aravis simulator interoperability have been tested. USB3 Vision, ONVIF hardware and Windows hardware remain validation targets. See [hardware validation](docs/hardware-validation.md) and [camera compatibility](docs/camera-compatibility.md).
 
@@ -148,4 +148,4 @@ Local automated verification includes public CLI calls, isolated camera subproce
 
 ## License
 
-[GPL v3](LICENSE), SPDX `GPL-3.0-only`. Redistribute the matching complete corresponding source, build scripts, dependency notices and required licenses with binaries. FFmpeg source archives and its exact build manifest accompany releases; never substitute an untraceable binary or enable nonfree FFmpeg components. See [FFmpeg compliance notes](docs/ffmpeg-build.md).
+Capturefab is licensed under the [MIT License](LICENSE), SPDX `MIT`. Release binaries also bundle a separately executed FFmpeg payload that remains GPLv3 (with x264 GPLv2-or-later, SRT MPLv2 and OpenSSL Apache-2.0); it is never linked into Capturefab. Redistribute FFmpeg's complete corresponding source, build scripts and notices with binaries that include it. FFmpeg source archives and its exact build manifest accompany releases; never substitute an untraceable binary or enable nonfree FFmpeg components. See [FFmpeg compliance notes](docs/ffmpeg-build.md).

@@ -79,6 +79,6 @@ Confirm `srt` appears under both input and output, and `libx264` appears in the 
 
 ## Distribution and validation
 
-The combined payload is GPLv3 or later. Keep the exact source archives, Capturefab source, build script, configuration, and upstream notices with each published release's corresponding-source materials. FFmpeg is built with `--enable-gpl --enable-version3`; SRT is MPLv2, OpenSSL is Apache 2.0, and x264 is GPLv2 or later. [FFmpeg licensing](https://ffmpeg.org/legal.html), [SRT license](https://github.com/Haivision/srt/blob/v1.5.7/LICENSE), [OpenSSL license](https://github.com/openssl/openssl/blob/openssl-3.6.4/LICENSE.txt).
+The combined FFmpeg payload is GPLv3 or later; Capturefab itself is MIT-licensed and runs FFmpeg as a separate executable rather than linking it. Keep the exact source archives, build script, configuration, and upstream notices with each published release's corresponding-source materials. FFmpeg is built with `--enable-gpl --enable-version3`; SRT is MPLv2, OpenSSL is Apache 2.0, and x264 is GPLv2 or later. [FFmpeg licensing](https://ffmpeg.org/legal.html), [SRT license](https://github.com/Haivision/srt/blob/v1.5.7/LICENSE), [OpenSSL license](https://github.com/openssl/openssl/blob/openssl-3.6.4/LICENSE.txt).
 
 As of 2026-10-04, a macOS ARM64 FFmpeg 9.0.2 build has been verified to provide both SRT directions, encode with libx264, and link only macOS operating system libraries/frameworks. Other target recipes need target-specific build and runtime validation before release; they are not claimed as tested binaries.

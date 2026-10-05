@@ -51,7 +51,7 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path.display());
         fs::read_to_string(&path).expect("read FFmpeg license notice")
     } else {
-        "Capturefab is GPL-3.0-only. Bundled FFmpeg is GPLv3 with static x264 (GPLv2-or-later), SRT (MPLv2) and OpenSSL (Apache-2.0). Source archives, licenses and build configuration accompany releases. See capturefab ffmpeg and https://ffmpeg.org/.".to_string()
+        "Capturefab is MIT-licensed. Bundled FFmpeg runs as a separate executable and is GPLv3 with static x264 (GPLv2-or-later), SRT (MPLv2) and OpenSSL (Apache-2.0). Source archives, licenses and build configuration accompany releases. See capturefab ffmpeg and https://ffmpeg.org/.".to_string()
     };
     fs::write(out.join("capturefab-ffmpeg-license.txt"), license)
         .expect("write bundled FFmpeg license");

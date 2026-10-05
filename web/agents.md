@@ -124,4 +124,4 @@ shasum -a 256 DOWNLOADED_FILE
 Get-FileHash DOWNLOADED_FILE -Algorithm SHA256
 ```
 
-Capturefab source is GPLv3. Bundled FFmpeg source, build configuration, and licensing notices are part of the release provenance. See the repository's source and FFmpeg build guide when producing a new platform binary.
+Capturefab source is MIT-licensed. The bundled FFmpeg executable is GPLv3; its source, build configuration, and licensing notices are part of the release provenance. See the repository's source and FFmpeg build guide when producing a new platform binary.
