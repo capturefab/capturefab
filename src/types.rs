@@ -32,7 +32,7 @@ pub struct CameraInfo {
     pub address: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Frame {
     pub id: u64,
     pub width: u32,

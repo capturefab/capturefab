@@ -33,10 +33,29 @@ struct Request {
     camera: Option<String>,
     command: SessionCommand,
 }
+/// One of the bounded concurrent RPC client slots, released on drop.
+struct ClientSlot(Arc<AtomicUsize>);
+impl ClientSlot {
+    fn acquire(clients: &Arc<AtomicUsize>) -> Option<Self> {
+        clients
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_CLIENTS).then_some(n + 1)
+            })
+            .ok()?;
+        Some(Self(clients.clone()))
+    }
+}
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+const MAX_CLIENTS: usize = 16;
 pub struct Server {
     pub name: String,
     path: PathBuf,
     token: String,
+    address: SocketAddr,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -180,7 +199,7 @@ impl Server {
         ensure_private_dir(&dir)?;
         let path = descriptor_path(name)?;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
         let mut random = [0u8; 32];
         getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("random session token: {e}"))?;
         let token = random
@@ -213,29 +232,42 @@ impl Server {
         let thread_stop = stop.clone();
         let server_token = token.clone();
         let clients = Arc::new(AtomicUsize::new(0));
+        // Accept blocks instead of polling; Drop wakes it with a loopback connect.
         let thread = std::thread::Builder::new()
             .name("capturefab-rpc".into())
             .spawn(move || {
-                while !thread_stop.load(Ordering::Relaxed) {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            if clients.load(Ordering::Relaxed) >= 16 {
-                                drop(stream);
-                                continue;
-                            }
-                            clients.fetch_add(1, Ordering::Relaxed);
-                            let clients = clients.clone();
-                            let h = h.clone();
-                            let token = server_token.clone();
-                            std::thread::spawn(move || {
-                                let _ = serve_client(stream, h, token);
-                                clients.fetch_sub(1, Ordering::Relaxed);
-                            });
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(20))
+                for stream in listener.incoming() {
+                    if thread_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let stream = match stream {
+                        Ok(stream) => stream,
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::Interrupted
+                            ) =>
+                        {
+                            continue;
                         }
                         Err(_) => break,
+                    };
+                    let Some(slot) = ClientSlot::acquire(&clients) else {
+                        drop(stream);
+                        continue;
+                    };
+                    let h = h.clone();
+                    let token = server_token.clone();
+                    let spawned = std::thread::Builder::new()
+                        .name("capturefab-rpc-client".into())
+                        .spawn(move || {
+                            let _slot = slot;
+                            let _ = serve_client(stream, h, token);
+                        });
+                    if let Err(e) = spawned {
+                        eprintln!("capturefab: rejected RPC client: {e}");
                     }
                 }
             })?;
@@ -243,6 +275,7 @@ impl Server {
             name: name.into(),
             path,
             token,
+            address,
             stop,
             thread: Some(thread),
         })
@@ -250,9 +283,13 @@ impl Server {
 }
 impl Drop for Server {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            // Unblock accept(). If even a loopback connect fails, detach rather
+            // than risk joining a thread that can never wake.
+            if TcpStream::connect_timeout(&self.address, Duration::from_secs(1)).is_ok() {
+                let _ = thread.join();
+            }
         }
         if fs::read(&self.path)
             .ok()

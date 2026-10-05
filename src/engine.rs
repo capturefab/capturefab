@@ -11,7 +11,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     time::{Duration, Instant},
@@ -23,10 +23,29 @@ struct Envelope {
     command: SessionCommand,
     reply: mpsc::Sender<Result<Value>>,
 }
+/// Per-frame statistics, updated lock-free on the acquisition hot path and
+/// merged into snapshots on read.
+#[derive(Default)]
+struct Counters {
+    frames: AtomicU64,
+    dropped: AtomicU64,
+    fps_bits: AtomicU64,
+}
+impl Counters {
+    fn reset(&self) {
+        self.frames.store(0, Ordering::Relaxed);
+        self.dropped.store(0, Ordering::Relaxed);
+        self.set_fps(0.0);
+    }
+    fn set_fps(&self, fps: f64) {
+        self.fps_bits.store(fps.to_bits(), Ordering::Relaxed);
+    }
+}
 #[derive(Clone)]
 pub struct WorkerHandle {
     sender: SyncSender<Envelope>,
     state: Arc<RwLock<SessionSnapshot>>,
+    counters: Arc<Counters>,
     frame: Arc<RwLock<Option<Frame>>>,
     quitting: Arc<AtomicBool>,
     thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
@@ -49,6 +68,7 @@ impl WorkerHandle {
         let handle = Self {
             sender,
             state: Arc::new(RwLock::new(SessionSnapshot::default())),
+            counters: Arc::default(),
             frame: Arc::new(RwLock::new(None)),
             quitting: Arc::new(AtomicBool::new(false)),
             thread: Arc::new(Mutex::new(None)),
@@ -63,7 +83,11 @@ impl WorkerHandle {
         handle
     }
     pub fn snapshot(&self) -> SessionSnapshot {
-        self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
+        let mut s = self.state.read().unwrap_or_else(|e| e.into_inner()).clone();
+        s.frames = self.counters.frames.load(Ordering::Relaxed);
+        s.dropped = self.counters.dropped.load(Ordering::Relaxed);
+        s.fps = f64::from_bits(self.counters.fps_bits.load(Ordering::Relaxed));
+        s
     }
     #[cfg(test)]
     pub fn latest_frame(&self) -> Option<Frame> {
@@ -119,9 +143,7 @@ impl WorkerHandle {
         {
             self.log("error", format!("Shared frame buffer: {e:#}"));
         }
-        let mut s = self.state.write().unwrap_or_else(|e| e.into_inner());
-        s.frames += 1;
-        drop(s);
+        self.counters.frames.fetch_add(1, Ordering::Relaxed);
         if self.ring.is_none() {
             *self.frame.write().unwrap_or_else(|e| e.into_inner()) = Some(frame);
         }
@@ -332,11 +354,11 @@ fn process(
             *camera = Some(Camera::open(&selector, &known, duration)?);
             *h.frame.write().unwrap_or_else(|e| e.into_inner()) = None;
             {
-                let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
-                s.frames = 0;
-                s.dropped = 0;
-                s.fps = 0.0;
-                s.last_error = None;
+                h.counters.reset();
+                h.state
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .last_error = None;
             }
             refresh(h, camera, true);
             h.log(
@@ -859,7 +881,7 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
                 Err(e) => {
                     if !timed_out(&e) {
                         consecutive_errors += 1;
-                        h.state.write().unwrap_or_else(|e| e.into_inner()).dropped += 1;
+                        h.counters.dropped.fetch_add(1, Ordering::Relaxed);
                         if consecutive_errors == 1 {
                             h.log("warn", format!("{e:#}"));
                         }
@@ -875,8 +897,8 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
                 }
             }
             if rate_epoch.elapsed() >= Duration::from_secs(1) {
-                h.state.write().unwrap_or_else(|e| e.into_inner()).fps =
-                    rate_count as f64 / rate_epoch.elapsed().as_secs_f64();
+                h.counters
+                    .set_fps(rate_count as f64 / rate_epoch.elapsed().as_secs_f64());
                 rate_epoch = Instant::now();
                 rate_count = 0;
             }

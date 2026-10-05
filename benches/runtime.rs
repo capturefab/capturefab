@@ -212,6 +212,11 @@ fn main() {
             },
         );
         b.run(
+            &format!("gui-direct/{name}/1920x1200"),
+            f.data.len(),
+            || frame::convert(&f, |[r, g, b]| [r, g, b, 255]).unwrap(),
+        );
+        b.run(
             &format!("gui-new/tile/{name}/1920x1200"),
             f.data.len(),
             || frame::preview_rgba(&f, 640, 480).unwrap(),
@@ -288,6 +293,39 @@ fn main() {
             || {
                 writer.write(&f).unwrap();
                 reader.take_latest().unwrap().unwrap()
+            },
+        );
+    }
+    // The GUI's per-frame display pipeline, end to end on the parent side:
+    // old = fresh ring copy, cached-frame clone, RGB decode, RGBA expansion;
+    // new = ring copy into the reused cache, one direct RGBA decode.
+    for (name, format) in [("Mono8", MONO8), ("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
+        let f = frame(1920, 1200, format);
+        let path = dir.join(format!("display-{name}.shm"));
+        let mut writer = SharedRing::create(&path, 16 << 20).unwrap();
+        let mut reader = SharedRing::open(&path).unwrap();
+        b.run(
+            &format!("display-old/{name}/1920x1200"),
+            f.data.len(),
+            || {
+                writer.write(&f).unwrap();
+                let cached = reader.take_latest().unwrap().unwrap();
+                let rgb = frame::rgb(&cached.clone()).unwrap();
+                rgb.as_chunks::<3>()
+                    .0
+                    .iter()
+                    .map(|p| [p[0], p[1], p[2], 255])
+                    .collect::<Vec<_>>()
+            },
+        );
+        let mut cached = Frame::default();
+        b.run(
+            &format!("display-new/{name}/1920x1200"),
+            f.data.len(),
+            || {
+                writer.write(&f).unwrap();
+                reader.take_latest_into(&mut cached).unwrap();
+                frame::convert(&cached, |[r, g, b]| [r, g, b, 255]).unwrap()
             },
         );
     }

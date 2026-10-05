@@ -75,3 +75,19 @@ timeout (5000 ms) and stream packet size were unchanged.
 
 Not covered here: jumbo frames (the link is MTU 1500, so negotiation selected 1500), several auto-mode
 cameras sharing one link, and USB3 Vision hardware.
+
+## Hardware acceleration checks — 2026-10-05
+
+On macOS ARM64 (Apple Silicon) with Homebrew FFmpeg 9.0.1, simulator recordings
+at 1920×1080 in Mono8 and RGB8 completed through `h264_videotoolbox` and
+`libx264` with the sensor-format FFmpeg input. A real FFmpeg integration test
+decodes every supported PFNC mapping (Mono8/10/12/16, RGB8, BGR8 and all four
+Bayer8 phases) and matches Capturefab's own conversion. The OpenGL preview
+shader was compared with CPU conversion in rendered GUI screenshots of the same
+simulator frame for Mono8, Mono12, RGB8 and BayerRG8: no pixel differed by more
+than one level. SHA-256 storage hashing used the ARMv8 SHA instructions.
+
+Not established by these checks: NVENC and AMF packed-RGB input (guarded at
+runtime by an encoder probe that falls back to YUV input), QSV, VAAPI and Media
+Foundation with the new input formats, the preview shader on non-Apple OpenGL
+drivers or OpenGL ES, and Bayer recordings from physical cameras.

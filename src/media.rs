@@ -1371,6 +1371,7 @@ struct EncoderProcess {
     _exe: Arc<Executable>,
     width: u32,
     height: u32,
+    raw: RawInput,
     encoder: String,
 }
 struct EncodedOutput {
@@ -1439,6 +1440,39 @@ fn select_encoder(exe: &Executable, config: &ForwardConfig) -> Result<String> {
         {
             continue;
         }
+        if probe_encoder(exe, candidate, EncoderInput::Yuv)? {
+            return Ok(candidate.into());
+        }
+    }
+    bail!(
+        "no usable {family} encoder found in bundled FFmpeg; choose --encoder explicitly or provide a build with a software encoder"
+    )
+}
+/// Pixel layout handed to the encoder after FFmpeg's input conversion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EncoderInput {
+    /// Planar or semi-planar 4:2:0 converted by FFmpeg's SIMD swscale.
+    Yuv,
+    /// Packed RGB; the encoder's own color-conversion hardware makes YUV.
+    Rgb,
+}
+/// NVENC and AMF accept packed RGB and convert it to YUV on the GPU, which
+/// keeps that matrix multiply off the CPU for color sources.
+fn hardware_rgb_input(encoder: &str) -> bool {
+    encoder.ends_with("_nvenc") || encoder.ends_with("_amf")
+}
+/// Choose the encoder input for a source. RGB input is used only when the
+/// encoder accepts it on this machine, so a driver without it keeps the YUV
+/// path instead of falling back to software encoding.
+fn encoder_input(exe: &Executable, encoder: &str, color: bool) -> Result<EncoderInput> {
+    if color && hardware_rgb_input(encoder) && probe_encoder(exe, encoder, EncoderInput::Rgb)? {
+        Ok(EncoderInput::Rgb)
+    } else {
+        Ok(EncoderInput::Yuv)
+    }
+}
+fn probe_encoder(exe: &Executable, candidate: &str, input: EncoderInput) -> Result<bool> {
+    {
         let mut args = [
             "-nostdin",
             "-hide_banner",
@@ -1457,15 +1491,10 @@ fn select_encoder(exe: &Executable, config: &ForwardConfig) -> Result<String> {
         .map(str::to_string)
         .collect::<Vec<_>>();
         args.extend(encoder_device_options(candidate));
-        args.extend(encoder_output_options(candidate));
+        args.extend(encoder_output_options(candidate, input));
         args.extend(["-f".into(), "null".into(), "-".into()]);
-        if bounded_output(exe, &args, Duration::from_secs(3))?.0 {
-            return Ok(candidate.into());
-        }
+        Ok(bounded_output(exe, &args, Duration::from_secs(3))?.0)
     }
-    bail!(
-        "no usable {family} encoder found in bundled FFmpeg; choose --encoder explicitly or provide a build with a software encoder"
-    )
 }
 fn encoder_device_options(encoder: &str) -> Vec<String> {
     if encoder.ends_with("_vaapi") {
@@ -1478,7 +1507,7 @@ fn encoder_device_options(encoder: &str) -> Vec<String> {
         Vec::new()
     }
 }
-fn encoder_output_options(encoder: &str) -> Vec<String> {
+fn encoder_output_options(encoder: &str, input: EncoderInput) -> Vec<String> {
     let mut options = if encoder.ends_with("_vaapi") {
         vec![
             "-vf",
@@ -1491,7 +1520,13 @@ fn encoder_output_options(encoder: &str) -> Vec<String> {
             "-vf",
             "pad=ceil(iw/2)*2:ceil(ih/2)*2",
             "-pix_fmt",
-            if encoder.ends_with("_qsv") || encoder.ends_with("_mf") {
+            if input == EncoderInput::Rgb {
+                "bgr0"
+            } else if encoder.ends_with("_qsv")
+                || encoder.ends_with("_mf")
+                || encoder.ends_with("_videotoolbox")
+            {
+                // The native surface layout of these encoders: no repacking copy.
                 "nv12"
             } else {
                 "yuv420p"
@@ -1568,6 +1603,42 @@ fn recording_output(output: &str) -> Result<Option<(PathBuf, &'static str)>> {
     };
     Ok(Some((path, container)))
 }
+/// How a camera frame is handed to FFmpeg unchanged: its rawvideo pixel format,
+/// bytes per pixel and whether it carries color. Sending sensor-native bytes
+/// avoids a CPU conversion on the camera thread and, for mono and Bayer, moves
+/// a third of the bytes RGB24 would through the pipe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RawInput {
+    pixel_format: u32,
+    ffmpeg: &'static str,
+    bytes_per_pixel: usize,
+    color: bool,
+}
+impl RawInput {
+    fn for_format(pixel_format: u32) -> Result<Self> {
+        let (ffmpeg, bytes_per_pixel, color) = match pixel_format {
+            crate::types::MONO8 => ("gray", 1, false),
+            0x0110_0003 => ("gray10le", 2, false),
+            0x0110_0005 => ("gray12le", 2, false),
+            0x0110_0007 => ("gray16le", 2, false),
+            crate::types::RGB8 => ("rgb24", 3, true),
+            0x0218_0015 => ("bgr24", 3, true),
+            0x0108_0008 => ("bayer_grbg8", 1, true),
+            0x0108_0009 => ("bayer_rggb8", 1, true),
+            0x0108_000a => ("bayer_gbrg8", 1, true),
+            0x0108_000b => ("bayer_bggr8", 1, true),
+            v => bail!(
+                "unsupported PFNC format 0x{v:08x}; capture with --format raw to preserve bytes"
+            ),
+        };
+        Ok(Self {
+            pixel_format,
+            ffmpeg,
+            bytes_per_pixel,
+            color,
+        })
+    }
+}
 impl Forwarder {
     pub fn new(config: ForwardConfig) -> Result<Self> {
         ensure!(
@@ -1598,7 +1669,7 @@ impl Forwarder {
             final_stats: ForwardStats::default(),
         })
     }
-    fn spawn(&mut self, width: u32, height: u32) -> Result<()> {
+    fn spawn(&mut self, width: u32, height: u32, raw: RawInput) -> Result<()> {
         ensure!(
             width > 0 && height > 0 && width as usize * height as usize <= MAX_FRAME / 3,
             "invalid forwarding dimensions"
@@ -1607,6 +1678,7 @@ impl Forwarder {
         let local = recording.is_some();
         let exe = executable()?;
         let encoder = select_encoder(&exe, &self.config)?;
+        let input = encoder_input(&exe, &encoder, raw.color)?;
         let mut cmd = command(&exe);
         cmd.args(encoder_device_options(&encoder));
         cmd.args([
@@ -1617,7 +1689,7 @@ impl Forwarder {
             "-f",
             "rawvideo",
             "-pix_fmt",
-            "rgb24",
+            raw.ffmpeg,
             "-video_size",
             &format!("{width}x{height}"),
             "-framerate",
@@ -1632,7 +1704,7 @@ impl Forwarder {
             "-g",
             &((self.config.fps * 2.0).round().max(1.0) as u32).to_string(),
         ]);
-        cmd.args(encoder_output_options(&encoder));
+        cmd.args(encoder_output_options(&encoder, input));
         if encoder == "libx264" {
             cmd.args(["-preset", "veryfast", "-tune", "zerolatency"]);
         } else if encoder == "libx265" {
@@ -1763,18 +1835,27 @@ impl Forwarder {
             _exe: exe,
             width,
             height,
+            raw,
             encoder,
         });
         Ok(())
     }
     pub fn push(&mut self, frame: &Frame) -> Result<bool> {
         if self.process.is_none() {
-            self.spawn(frame.width, frame.height)?
+            self.spawn(
+                frame.width,
+                frame.height,
+                RawInput::for_format(frame.pixel_format)?,
+            )?
         }
         let process = self.process.as_mut().unwrap();
         ensure!(
             frame.width == process.width && frame.height == process.height,
             "forwarding source dimensions changed; restart forwarding"
+        );
+        ensure!(
+            frame.pixel_format == process.raw.pixel_format,
+            "forwarding source pixel format changed; restart forwarding"
         );
         let stored_error = process
             .queue
@@ -1802,7 +1883,15 @@ impl Forwarder {
                 process.log.text(&self.config.output).trim()
             );
         }
-        let bytes = crate::frame::rgb(frame)?;
+        let length = frame.width as usize * frame.height as usize * process.raw.bytes_per_pixel;
+        ensure!(
+            frame.data.len() >= length,
+            "truncated {} frame",
+            crate::frame::pixel_format_name(frame.pixel_format)
+        );
+        // FFmpeg converts on its own threads with SIMD swscale (or the encoder
+        // hardware), so the camera thread only copies sensor bytes.
+        let bytes = frame.data[..length].to_vec();
         let mut state = process
             .queue
             .state
@@ -2003,6 +2092,99 @@ mod tests {
             recording_output("file:record.mp4").unwrap().unwrap().1,
             "mp4"
         );
+    }
+    #[test]
+    #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
+    fn ffmpeg_raw_inputs_decode_like_capturefab() {
+        // Forwarding hands sensor bytes to FFmpeg. Each mapping must describe
+        // the same image Capturefab's own converter produces; a swapped Bayer
+        // phase or channel order shows up as a large color error.
+        let exe = executable().unwrap();
+        let (width, height) = (64usize, 48usize);
+        let rgb: Vec<[u8; 3]> = (0..width * height)
+            .map(|i| {
+                let (x, y) = (i % width, i / width);
+                [(40 + 2 * x) as u8, (60 + 3 * y) as u8, (200 - x - y) as u8]
+            })
+            .collect();
+        let luma =
+            |p: &[u8; 3]| ((p[0] as u32 * 54 + p[1] as u32 * 183 + p[2] as u32 * 19) >> 8) as u16;
+        let wide = |shift: u16| -> Vec<u8> {
+            rgb.iter()
+                .flat_map(|p| (luma(p) << shift).to_le_bytes())
+                .collect()
+        };
+        let formats: [(u32, Vec<u8>); 10] = [
+            (
+                crate::types::MONO8,
+                rgb.iter().map(|p| luma(p) as u8).collect(),
+            ),
+            (0x0110_0003, wide(2)),
+            (0x0110_0005, wide(4)),
+            (0x0110_0007, wide(8)),
+            (crate::types::RGB8, rgb.iter().flatten().copied().collect()),
+            (
+                0x0218_0015,
+                rgb.iter().flat_map(|p| [p[2], p[1], p[0]]).collect(),
+            ),
+            (0x0108_0008, bayer(&rgb, width, [1, 0, 2, 1])),
+            (0x0108_0009, bayer(&rgb, width, [0, 1, 1, 2])),
+            (0x0108_000a, bayer(&rgb, width, [1, 2, 0, 1])),
+            (0x0108_000b, bayer(&rgb, width, [2, 1, 1, 0])),
+        ];
+        fn bayer(rgb: &[[u8; 3]], width: usize, cfa: [usize; 4]) -> Vec<u8> {
+            (0..rgb.len())
+                .map(|i| rgb[i][cfa[((i / width) & 1) * 2 + ((i % width) & 1)]])
+                .collect()
+        }
+        for (pixel_format, data) in formats {
+            let raw = RawInput::for_format(pixel_format).unwrap();
+            let frame = Frame {
+                id: 1,
+                width: width as u32,
+                height: height as u32,
+                pixel_format,
+                timestamp_ns: 0,
+                data,
+            };
+            let expected = crate::frame::rgb(&frame).unwrap();
+            let mut child = command(&exe)
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                ])
+                .arg(raw.ffmpeg)
+                .args(["-video_size", &format!("{width}x{height}"), "-i", "pipe:0"])
+                .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            let bytes = frame.data.clone();
+            let feeder = thread::spawn(move || stdin.write_all(&bytes));
+            let output = child.wait_with_output().unwrap();
+            feeder.join().unwrap().unwrap();
+            assert_eq!(output.stdout.len(), expected.len(), "{}", raw.ffmpeg);
+            // Compare away from the border, where demosaic edge rules differ.
+            let mut error = 0u64;
+            let mut count = 0u64;
+            for y in 2..height - 2 {
+                for x in 2..width - 2 {
+                    for c in 0..3 {
+                        let i = (y * width + x) * 3 + c;
+                        error += (output.stdout[i] as i64 - expected[i] as i64).unsigned_abs();
+                        count += 1;
+                    }
+                }
+            }
+            let mean = error as f64 / count as f64;
+            assert!(mean < 3.0, "{}: mean error {mean:.2}", raw.ffmpeg);
+        }
     }
     #[test]
     #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]

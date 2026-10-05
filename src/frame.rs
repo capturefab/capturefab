@@ -25,13 +25,9 @@ fn gray(out: &mut [u8], value: impl Fn(usize) -> u8) {
     }
 }
 pub fn rgb(frame: &Frame) -> Result<Vec<u8>> {
-    let pixels = (frame.width as usize)
-        .checked_mul(frame.height as usize)
-        .ok_or_else(|| anyhow::anyhow!("image size overflow"))?;
-    ensure!(
-        pixels > 0 && pixels <= 64 * 1024 * 1024,
-        "image dimensions exceed conversion limit"
-    );
+    let pixels = checked_pixels(frame)?;
+    // Flat byte stores vectorize as interleaved 3-byte stores, which `[u8; 3]`
+    // elements from the generic converter do not; only Bayer is shared.
     let mut out = vec![0; pixels * 3];
     match frame.pixel_format {
         MONO8 => {
@@ -65,35 +61,76 @@ pub fn rgb(frame: &Frame) -> Result<Vec<u8>> {
                 (u16::from_le_bytes([data[2 * i], data[2 * i + 1]]) >> shift).min(255) as u8
             });
         }
+        _ => return Ok(convert(frame, |p| p)?.into_flattened()),
+    }
+    Ok(out)
+}
+/// Opaque RGBA bytes, converted in one pass without an intermediate RGB image.
+pub fn rgba(frame: &Frame) -> Result<Vec<u8>> {
+    Ok(convert(frame, |[r, g, b]| [r, g, b, 255])?.into_flattened())
+}
+fn checked_pixels(frame: &Frame) -> Result<usize> {
+    let pixels = (frame.width as usize)
+        .checked_mul(frame.height as usize)
+        .ok_or_else(|| anyhow::anyhow!("image size overflow"))?;
+    ensure!(
+        pixels > 0 && pixels <= 64 * 1024 * 1024,
+        "image dimensions exceed conversion limit"
+    );
+    Ok(pixels)
+}
+/// Convert a PFNC frame into any pixel representation (RGB, RGBA, a GUI color
+/// type) with a single allocation; `pixel` maps each interpolated RGB triple.
+pub fn convert<P: Copy + Default>(frame: &Frame, pixel: impl Fn([u8; 3]) -> P) -> Result<Vec<P>> {
+    let pixels = checked_pixels(frame)?;
+    // Streaming formats map source to output in order; `collect` over a slice
+    // iterator knows its exact length, so it neither pre-fills nor bounds-checks.
+    match frame.pixel_format {
+        MONO8 => {
+            ensure!(frame.data.len() >= pixels, "truncated Mono8 frame");
+            Ok(frame.data[..pixels]
+                .iter()
+                .map(|&v| pixel([v, v, v]))
+                .collect())
+        }
+        RGB8 => {
+            ensure!(frame.data.len() >= pixels * 3, "truncated RGB frame");
+            let source = frame.data[..pixels * 3].as_chunks::<3>().0;
+            Ok(source.iter().map(|p| pixel([p[0], p[1], p[2]])).collect())
+        }
+        0x0218_0015 => {
+            ensure!(frame.data.len() >= pixels * 3, "truncated RGB frame");
+            let source = frame.data[..pixels * 3].as_chunks::<3>().0;
+            Ok(source.iter().map(|p| pixel([p[2], p[1], p[0]])).collect())
+        }
+        0x0110_0003 | 0x0110_0005 | 0x0110_0007 => {
+            ensure!(
+                frame.data.len() >= pixels * 2,
+                "truncated unpacked monochrome frame"
+            );
+            let shift = match frame.pixel_format {
+                0x0110_0003 => 2,
+                0x0110_0005 => 4,
+                _ => 8,
+            };
+            let source = frame.data[..pixels * 2].as_chunks::<2>().0;
+            Ok(source
+                .iter()
+                .map(|&p| {
+                    let v = (u16::from_le_bytes(p) >> shift).min(255) as u8;
+                    pixel([v, v, v])
+                })
+                .collect())
+        }
         0x0108_0008..=0x0108_000b => {
             ensure!(frame.data.len() >= pixels, "truncated Bayer8 frame");
-            // Bilinear interpolation uses only neighbors of the requested color; edges are bounded.
-            let pattern = match frame.pixel_format {
-                0x0108_0008 => [1, 0, 2, 1],
-                0x0108_0009 => [0, 1, 1, 2],
-                0x0108_000a => [1, 2, 0, 1],
-                _ => [2, 1, 1, 0],
-            };
+            // Interpolation writes edges and interiors out of order, so prefill.
+            let mut out = vec![P::default(); pixels];
+            let pattern = bayer_pattern(frame.pixel_format);
             let (w, h, data) = (frame.width as usize, frame.height as usize, &frame.data);
             let color = |x: usize, y: usize| pattern[(y & 1) * 2 + (x & 1)];
-            let bounded = |x: usize, y: usize| -> [u8; 3] {
-                std::array::from_fn(|c| {
-                    if color(x, y) == c {
-                        return data[y * w + x];
-                    }
-                    let (mut sum, mut n) = (0u32, 0u32);
-                    for yy in y.saturating_sub(1)..(y + 2).min(h) {
-                        for xx in x.saturating_sub(1)..(x + 2).min(w) {
-                            if color(xx, yy) == c {
-                                sum += data[yy * w + xx] as u32;
-                                n += 1;
-                            }
-                        }
-                    }
-                    sum.checked_div(n).map_or(data[y * w + x], |v| v as u8)
-                })
-            };
-            for (y, line) in out.as_chunks_mut::<3>().0.chunks_exact_mut(w).enumerate() {
+            let bounded = |x: usize, y: usize| pixel(bayer_bounded(frame, pattern, x, y));
+            for (y, line) in out.chunks_exact_mut(w).enumerate() {
                 if y == 0 || y + 1 == h || w < 3 {
                     for (x, px) in line.iter_mut().enumerate() {
                         *px = bounded(x, y);
@@ -117,21 +154,109 @@ pub fn rgb(frame: &Frame) -> Result<Vec<u8>> {
                             (diagonal >> 2) as u8,
                         )
                     };
-                    line[x + 1] = if chroma == 0 {
+                    line[x + 1] = pixel(if chroma == 0 {
                         [near, green, far]
                     } else {
                         [far, green, near]
-                    };
+                    });
                 }
             }
+            Ok(out)
         }
         v => {
             bail!("unsupported PFNC format 0x{v:08x}; capture with --format raw to preserve bytes")
         }
     }
-    Ok(out)
 }
 
+/// Color filter layout as the channel (0 R, 1 G, 2 B) at (x & 1, y & 1),
+/// indexed `[(y & 1) * 2 + (x & 1)]`.
+pub fn bayer_pattern(pixel_format: u32) -> [usize; 4] {
+    match pixel_format {
+        0x0108_0008 => [1, 0, 2, 1],
+        0x0108_0009 => [0, 1, 1, 2],
+        0x0108_000a => [1, 2, 0, 1],
+        _ => [2, 1, 1, 0],
+    }
+}
+/// Bilinear demosaic of one pixel using only in-bounds neighbors of each
+/// missing color; the reference rule the vectorized interior must match.
+fn bayer_bounded(frame: &Frame, pattern: [usize; 4], x: usize, y: usize) -> [u8; 3] {
+    let (w, h, data) = (frame.width as usize, frame.height as usize, &frame.data);
+    let color = |x: usize, y: usize| pattern[(y & 1) * 2 + (x & 1)];
+    std::array::from_fn(|c| {
+        if color(x, y) == c {
+            return data[y * w + x];
+        }
+        let (mut sum, mut n) = (0u32, 0u32);
+        for yy in y.saturating_sub(1)..(y + 2).min(h) {
+            for xx in x.saturating_sub(1)..(x + 2).min(w) {
+                if color(xx, yy) == c {
+                    sum += data[yy * w + xx] as u32;
+                    n += 1;
+                }
+            }
+        }
+        sum.checked_div(n).map_or(data[y * w + x], |v| v as u8)
+    })
+}
+/// Bytes per pixel of a convertible format, after validating dimensions and
+/// that the frame holds a complete image.
+fn validated_bytes_per_pixel(frame: &Frame) -> Result<usize> {
+    let pixels = checked_pixels(frame)?;
+    let (bytes, name) = match frame.pixel_format {
+        MONO8 => (1, "Mono8"),
+        RGB8 | 0x0218_0015 => (3, "RGB"),
+        0x0110_0003 | 0x0110_0005 | 0x0110_0007 => (2, "unpacked monochrome"),
+        0x0108_0008..=0x0108_000b => (1, "Bayer8"),
+        v => {
+            bail!("unsupported PFNC format 0x{v:08x}; capture with --format raw to preserve bytes")
+        }
+    };
+    ensure!(frame.data.len() >= pixels * bytes, "truncated {name} frame");
+    Ok(bytes)
+}
+/// Whether `rgb`/`convert` can decode this pixel format.
+pub fn convertible(pixel_format: u32) -> bool {
+    matches!(
+        pixel_format,
+        MONO8 | RGB8 | 0x0218_0015 | 0x0110_0003 | 0x0110_0005 | 0x0110_0007 | 0x0108_0008
+            ..=0x0108_000b
+    )
+}
+/// One pixel exactly as `convert` would produce it; for sparse sampling when
+/// the full image is converted elsewhere (for example on the GPU).
+/// The frame must have passed `validated_bytes_per_pixel`.
+fn pixel_at(frame: &Frame, x: usize, y: usize) -> [u8; 3] {
+    let i = y * frame.width as usize + x;
+    let data = &frame.data;
+    match frame.pixel_format {
+        MONO8 => [data[i]; 3],
+        RGB8 => [data[3 * i], data[3 * i + 1], data[3 * i + 2]],
+        0x0218_0015 => [data[3 * i + 2], data[3 * i + 1], data[3 * i]],
+        0x0110_0003 | 0x0110_0005 | 0x0110_0007 => {
+            let shift = match frame.pixel_format {
+                0x0110_0003 => 2,
+                0x0110_0005 => 4,
+                _ => 8,
+            };
+            [(u16::from_le_bytes([data[2 * i], data[2 * i + 1]]) >> shift).min(255) as u8; 3]
+        }
+        _ => bayer_bounded(frame, bayer_pattern(frame.pixel_format), x, y),
+    }
+}
+/// 64-bin luminance histogram over at most 65,536 evenly strided pixels,
+/// decoded individually so no full RGB image is needed.
+pub fn sampled_histogram(frame: &Frame) -> Result<[u32; 64]> {
+    validated_bytes_per_pixel(frame)?;
+    let (w, pixels) = (frame.width as usize, checked_pixels(frame)?);
+    let mut bins = [0; 64];
+    for i in (0..pixels).step_by((pixels / 65_536).max(1)) {
+        let [r, g, b] = pixel_at(frame, i % w, i / w);
+        bins[(r as usize * 54 + g as usize * 183 + b as usize * 19) >> 10] += 1;
+    }
+    Ok(bins)
+}
 pub fn preview_rgba(frame: &Frame, max_width: u32, max_height: u32) -> Result<(u32, u32, Vec<u8>)> {
     let (max_width, max_height) = (max_width.max(1), max_height.max(1));
     // Sample complete Bayer quads so every retained pixel keeps its CFA phase.
@@ -150,13 +275,16 @@ pub fn preview_rgba(frame: &Frame, max_width: u32, max_height: u32) -> Result<(u
         .then(|| decimate(frame, factor as usize))
         .flatten();
     let source = small.as_ref().unwrap_or(frame);
-    let rgb = rgb(source)?;
     // One-pixel bounds or a one-row Bayer source cannot retain complete quads.
     // Finish those cases by sampling after conversion.
     let step = source
         .width
         .div_ceil(max_width)
         .max(source.height.div_ceil(max_height));
+    if step <= 1 {
+        return Ok((source.width, source.height, rgba(source)?));
+    }
+    let rgb = rgb(source)?;
     let (width, height) = (source.width.div_ceil(step), source.height.div_ceil(step));
     let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
     for y in (0..source.height as usize).step_by(step as usize) {
@@ -440,6 +568,93 @@ mod tests {
         }
         assert!(preview_rgba(&f(MONO8, vec![1]), 1, 1).is_err());
         assert!(preview_rgba(&f(0, vec![0; 6]), 1, 1).is_err());
+    }
+    #[test]
+    fn direct_conversions_match_rgb() {
+        let formats = [
+            (MONO8, 1),
+            (RGB8, 3),
+            (0x0218_0015, 3),
+            (0x0110_0003, 2),
+            (0x0110_0005, 2),
+            (0x0110_0007, 2),
+            (0x0108_0008, 1),
+            (0x0108_0009, 1),
+            (0x0108_000a, 1),
+            (0x0108_000b, 1),
+        ];
+        for (width, height) in [(1, 1), (2, 1), (5, 7), (33, 17)] {
+            for (format, bytes) in formats {
+                let frame = Frame {
+                    width,
+                    height,
+                    ..f(
+                        format,
+                        random(format as u64, (width * height) as usize * bytes),
+                    )
+                };
+                let full = rgb(&frame).unwrap();
+                assert_eq!(convert(&frame, |p| p).unwrap().into_flattened(), full);
+                let rgba = rgba(&frame).unwrap();
+                assert_eq!(rgba.len(), full.len() / 3 * 4);
+                assert!(
+                    rgba.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(full.as_chunks::<3>().0)
+                        .all(|(a, b)| a[..3] == b[..] && a[3] == 255),
+                    "{width}x{height} {format:x}"
+                );
+            }
+        }
+        assert!(rgba(&f(RGB8, vec![0])).is_err());
+        assert!(convert(&f(0, vec![0; 6]), |p| p).is_err());
+    }
+    #[test]
+    fn sparse_sampling_matches_full_conversion() {
+        for (width, height) in [(1, 1), (2, 3), (5, 7), (33, 17), (400, 400)] {
+            for (format, bytes) in [
+                (MONO8, 1),
+                (RGB8, 3),
+                (0x0218_0015, 3),
+                (0x0110_0005, 2),
+                (0x0110_0007, 2),
+                (0x0108_0008, 1),
+                (0x0108_0009, 1),
+                (0x0108_000a, 1),
+                (0x0108_000b, 1),
+            ] {
+                let frame = Frame {
+                    width,
+                    height,
+                    ..f(
+                        format,
+                        random(
+                            format as u64 ^ width as u64,
+                            (width * height) as usize * bytes,
+                        ),
+                    )
+                };
+                assert!(convertible(format));
+                let full = rgb(&frame).unwrap();
+                for y in 0..height as usize {
+                    for x in 0..width as usize {
+                        let i = (y * width as usize + x) * 3;
+                        assert_eq!(pixel_at(&frame, x, y), full[i..i + 3], "{format:x} {x},{y}");
+                    }
+                }
+                let mut bins = [0u32; 64];
+                let pixels = full.as_chunks::<3>().0;
+                for p in pixels.iter().step_by((pixels.len() / 65_536).max(1)) {
+                    bins[(p[0] as usize * 54 + p[1] as usize * 183 + p[2] as usize * 19) >> 10] +=
+                        1;
+                }
+                assert_eq!(sampled_histogram(&frame).unwrap(), bins);
+            }
+        }
+        assert!(!convertible(0));
+        assert!(sampled_histogram(&f(0, vec![0; 6])).is_err());
+        assert!(sampled_histogram(&f(RGB8, vec![0; 5])).is_err());
     }
     #[test]
     fn histogram_bins_sampled_luminance() {

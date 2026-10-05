@@ -36,6 +36,11 @@ sha2 = "0.10"
 fs2 = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
+# ARMv8 SHA-2 instructions for storage integrity hashing. x86 already selects
+# SHA-NI at runtime without this; the asm crate does not assemble under MSVC.
+[target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

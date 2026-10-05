@@ -156,6 +156,12 @@ impl SharedRing {
         Ok(true)
     }
     pub fn take_latest(&mut self) -> Result<Option<Frame>> {
+        let mut frame = Frame::default();
+        Ok(self.take_latest_into(&mut frame)?.then_some(frame))
+    }
+    /// Copy the newest ready frame into `frame`, reusing its pixel allocation.
+    /// Returns false, leaving `frame` untouched, when no new frame is ready.
+    pub fn take_latest_into(&mut self, frame: &mut Frame) -> Result<bool> {
         let mut newest: Option<(usize, u32)> = None;
         // Claim before inspecting non-atomic metadata. A writer may reclaim READY slots.
         for i in 0..SLOTS {
@@ -177,23 +183,26 @@ impl SharedRing {
             }
         }
         let Some((slot, _)) = newest else {
-            return Ok(None);
+            return Ok(false);
         };
         let b = self.base(slot);
-        let result = (|| -> Result<Frame> {
+        let result = (|| -> Result<()> {
             let length = u32::from_le_bytes(self.map[b + 28..b + 32].try_into()?) as usize;
             ensure!(length <= self.capacity, "corrupt ring frame length");
-            Ok(Frame {
-                id: u64::from_le_bytes(self.map[b + 8..b + 16].try_into()?),
-                width: u32::from_le_bytes(self.map[b + 16..b + 20].try_into()?),
-                height: u32::from_le_bytes(self.map[b + 20..b + 24].try_into()?),
-                pixel_format: u32::from_le_bytes(self.map[b + 24..b + 28].try_into()?),
-                timestamp_ns: u64::from_le_bytes(self.map[b + 32..b + 40].try_into()?),
-                data: self.map[b + META..b + META + length].to_vec(),
-            })
+            frame.id = u64::from_le_bytes(self.map[b + 8..b + 16].try_into()?);
+            frame.width = u32::from_le_bytes(self.map[b + 16..b + 20].try_into()?);
+            frame.height = u32::from_le_bytes(self.map[b + 20..b + 24].try_into()?);
+            frame.pixel_format = u32::from_le_bytes(self.map[b + 24..b + 28].try_into()?);
+            frame.timestamp_ns = u64::from_le_bytes(self.map[b + 32..b + 40].try_into()?);
+            frame.data.clear();
+            frame
+                .data
+                .extend_from_slice(&self.map[b + META..b + META + length]);
+            Ok(())
         })();
+        // Release the slot even when the metadata was corrupt.
         self.atomic(b).store(FREE, Ordering::Release);
-        Ok(Some(result?))
+        result.map(|()| true)
     }
 }
 impl Drop for SharedRing {
@@ -239,5 +248,45 @@ mod tests {
         drop(reader);
         drop(writer);
         assert!(!path.exists());
+    }
+    #[test]
+    fn take_latest_into_reuses_the_callers_allocation() {
+        let path = std::env::temp_dir().join(format!(
+            "capturefab-ring-reuse-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut writer = SharedRing::create(&path, 4096).unwrap();
+        let mut reader = SharedRing::open(&path).unwrap();
+        let mut frame = Frame {
+            data: Vec::with_capacity(64),
+            ..Frame::default()
+        };
+        let buffer = frame.data.as_ptr();
+        assert!(!reader.take_latest_into(&mut frame).unwrap());
+        assert_eq!((frame.id, frame.data.len()), (0, 0));
+        for id in 1..=3 {
+            let sent = Frame {
+                id,
+                width: 8,
+                height: 4,
+                pixel_format: crate::types::MONO8,
+                timestamp_ns: id * 10,
+                data: vec![id as u8; 32],
+            };
+            assert!(writer.write(&sent).unwrap());
+            assert!(reader.take_latest_into(&mut frame).unwrap());
+            assert_eq!(
+                (frame.id, frame.width, frame.height, frame.timestamp_ns),
+                (id, 8, 4, id * 10)
+            );
+            assert_eq!(frame.data, sent.data);
+            assert_eq!(frame.data.as_ptr(), buffer);
+        }
+        assert!(!reader.take_latest_into(&mut frame).unwrap());
+        assert_eq!(frame.id, 3);
     }
 }

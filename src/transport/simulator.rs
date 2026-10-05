@@ -25,8 +25,8 @@ const XML: &str = r#"<?xml version="1.0"?>
  <IntReg Name="WidthReg"><Address>0x100</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess><Sign>Unsigned</Sign></IntReg>
  <Integer Name="Height"><pValue>HeightReg</pValue><Min>64</Min><Max>1080</Max><Inc>1</Inc></Integer>
  <IntReg Name="HeightReg"><Address>0x104</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess><Sign>Unsigned</Sign></IntReg>
- <Enumeration Name="PixelFormat"><pValue>PixelFormatReg</pValue><pEnumEntry>Mono8</pEnumEntry><pEnumEntry>RGB8</pEnumEntry></Enumeration>
- <EnumEntry Name="Mono8"><Value>0x01080001</Value></EnumEntry><EnumEntry Name="RGB8"><Value>0x02180014</Value></EnumEntry>
+ <Enumeration Name="PixelFormat"><pValue>PixelFormatReg</pValue><pEnumEntry>Mono8</pEnumEntry><pEnumEntry>RGB8</pEnumEntry><pEnumEntry>Mono12</pEnumEntry><pEnumEntry>BayerRG8</pEnumEntry></Enumeration>
+ <EnumEntry Name="Mono8"><Value>0x01080001</Value></EnumEntry><EnumEntry Name="RGB8"><Value>0x02180014</Value></EnumEntry><EnumEntry Name="Mono12"><Value>0x01100005</Value></EnumEntry><EnumEntry Name="BayerRG8"><Value>0x01080009</Value></EnumEntry>
  <IntReg Name="PixelFormatReg"><Address>0x108</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess><Sign>Unsigned</Sign></IntReg>
  <Float Name="ExposureTime"><pValue>ExposureReg</pValue><Min>10</Min><Max>1000000</Max><Unit>us</Unit></Float>
  <FloatReg Name="ExposureReg"><Address>0x110</Address><Length>8</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></FloatReg>
@@ -41,6 +41,15 @@ const XML: &str = r#"<?xml version="1.0"?>
  <IntReg Name="AcqReg"><Address>0x130</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess><Sign>Unsigned</Sign></IntReg>
 </RegisterDescription>"#;
 
+const MONO12: u32 = 0x0110_0005;
+const BAYER_RG8: u32 = 0x0108_0009;
+fn bytes_per_pixel(pixel_format: u32) -> u32 {
+    match pixel_format {
+        RGB8 => 3,
+        MONO12 => 2,
+        _ => 1,
+    }
+}
 fn scene(width: u32, height: u32) -> Vec<(f32, u8)> {
     (0..height)
         .flat_map(|y| (0..width).map(move |x| (x, y)))
@@ -93,7 +102,7 @@ impl Simulator {
     fn refresh_payload(&mut self) {
         self.put_u32(
             0x128,
-            self.u32(0x100) * self.u32(0x104) * if self.u32(0x108) == RGB8 { 3 } else { 1 },
+            self.u32(0x100) * self.u32(0x104) * bytes_per_pixel(self.u32(0x108)),
         );
     }
 }
@@ -132,7 +141,7 @@ impl RegisterIo for Simulator {
             "simulator dimensions out of bounds"
         );
         ensure!(
-            [MONO8, RGB8].contains(&format),
+            [MONO8, RGB8, MONO12, BAYER_RG8].contains(&format),
             "unsupported simulator pixel format"
         );
         let rate = f64::from_le_bytes(proposed[0x120..0x128].try_into()?);
@@ -169,7 +178,6 @@ impl Backend for Simulator {
         let width = self.u32(0x100);
         let height = self.u32(0x104);
         let pixel_format = self.u32(0x108);
-        let channels = if pixel_format == RGB8 { 3 } else { 1 };
         if (self.scene.0, self.scene.1) != (width, height) {
             self.scene = (width, height, scene(width, height));
         }
@@ -179,30 +187,42 @@ impl Backend for Simulator {
         let wave: Vec<f32> = (0..256)
             .map(|i| 30.0 * (std::f32::consts::TAU * (i + shift % 256) as f32 / 256.0).sin())
             .collect();
-        let mut data = vec![0; (width * height * channels) as usize];
-        for (i, (p, (base, ring))) in data
-            .chunks_exact_mut(channels as usize)
-            .zip(&self.scene.2)
-            .enumerate()
-        {
+        let color = matches!(pixel_format, RGB8 | BAYER_RG8);
+        let bytes = bytes_per_pixel(pixel_format) as usize;
+        let mut data = vec![0; width as usize * height as usize * bytes];
+        for (i, (p, (base, ring))) in data.chunks_exact_mut(bytes).zip(&self.scene.2).enumerate() {
             let (x, y) = (i as u32 % width, i as u32 / width);
             let marker = x.abs_diff((shift % width).max(1)) < 2 || y == height / 2;
-            p[0] = level(if marker {
+            let red = level(if marker {
                 230.0
             } else {
                 base + wave[*ring as usize]
             });
-            if channels == 3 {
-                p[1] = level(if marker {
-                    230.0
-                } else {
-                    ((y * 255 / height + shift % 256) % 256) as f32
-                });
-                p[2] = level(if marker {
-                    230.0
-                } else {
-                    ((x + y + shift % 256) % 256) as f32
-                });
+            let rgb = if color {
+                [
+                    red,
+                    level(if marker {
+                        230.0
+                    } else {
+                        ((y * 255 / height + shift % 256) % 256) as f32
+                    }),
+                    level(if marker {
+                        230.0
+                    } else {
+                        ((x + y + shift % 256) % 256) as f32
+                    }),
+                ]
+            } else {
+                [red; 3]
+            };
+            match pixel_format {
+                RGB8 => p.copy_from_slice(&rgb),
+                // Twelve significant bits with low-bit texture, as a sensor would deliver.
+                MONO12 => {
+                    p.copy_from_slice(&((u16::from(red) << 4) | (x as u16 & 15)).to_le_bytes())
+                }
+                BAYER_RG8 => p[0] = rgb[[0, 1, 1, 2][((y & 1) * 2 + (x & 1)) as usize]],
+                _ => p[0] = red,
             }
         }
         self.frame_id += 1;

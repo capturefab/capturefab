@@ -3,9 +3,10 @@ use crate::{
     auto::{AutoChange, AutoStatus},
     frame,
     genicam::FeatureInfo,
+    gpu::GpuFrames,
     session::{SessionCommand, SessionHandle, SessionSnapshot},
     storage::StoragePolicy,
-    types::{MONO8, RGB8, TransportStats},
+    types::{Frame, MONO8, RGB8, TransportStats},
 };
 use anyhow::Result;
 use eframe::egui::{self, Color32, RichText, Stroke, Vec2};
@@ -81,6 +82,7 @@ pub fn run_capture(
     };
     #[cfg(not(feature = "wgpu"))]
     let _ = use_wgpu;
+    let dithering = options.dithering;
     eframe::run_native(
         "Capturefab",
         options,
@@ -91,6 +93,15 @@ pub fn run_capture(
             configure_fonts(&cc.egui_ctx);
             let capturing = screenshot.is_some();
             let mut app = Workbench::new(handle, session_label, simulated || capturing);
+            // CAPTUREFAB_GPU_PREVIEW=0 keeps CPU conversion, e.g. to rule out a driver.
+            if std::env::var_os("CAPTUREFAB_GPU_PREVIEW").is_none_or(|value| value != "0")
+                && let Some(gl) = cc.gl.as_ref()
+            {
+                match GpuFrames::new(gl, dithering) {
+                    Ok(gpu) => app.gpu = Some(gpu),
+                    Err(error) => eprintln!("capturefab: GPU preview unavailable: {error}"),
+                }
+            }
             app.dark = cc.egui_ctx.theme() == egui::Theme::Dark;
             if let Some(path) = screenshot {
                 let count = demo_cameras.clamp(1, 16);
@@ -267,10 +278,75 @@ struct Pending {
     receiver: Receiver<anyhow::Result<serde_json::Value>>,
 }
 
+/// A displayed frame: a CPU-converted egui texture, or sensor bytes the GPU
+/// decodes while painting.
+enum Shown {
+    Texture(egui::TextureHandle),
+    Gpu { key: String, size: Vec2 },
+}
+impl Shown {
+    fn size(&self) -> Vec2 {
+        match self {
+            Self::Texture(texture) => texture.size_vec2(),
+            Self::Gpu { size, .. } => *size,
+        }
+    }
+    fn paint(&self, painter: &egui::Painter, gpu: Option<&GpuFrames>, rect: egui::Rect) {
+        match self {
+            Self::Texture(texture) => {
+                painter.image(
+                    texture.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+            Self::Gpu { key, .. } => {
+                if let Some(gpu) = gpu {
+                    gpu.paint(painter, key, rect);
+                }
+            }
+        }
+    }
+}
+/// GPU slot of the single-camera view; camera tiles use their camera IDs.
+const MAIN_VIEW: &str = "\0main";
+/// Show `frame` under `key`, decoded by the GPU when the renderer supports its
+/// format, otherwise converted on the CPU by `convert` into an egui texture.
+fn present(
+    ctx: &egui::Context,
+    gpu: Option<&GpuFrames>,
+    shown: &mut Option<Shown>,
+    key: &str,
+    frame: Arc<Frame>,
+    convert: impl FnOnce(&Frame) -> Result<egui::ColorImage>,
+) -> Result<()> {
+    if let Some(gpu) = gpu.filter(|gpu| gpu.accepts(&frame)) {
+        let size = Vec2::new(frame.width as f32, frame.height as f32);
+        gpu.submit(key, frame);
+        *shown = Some(Shown::Gpu {
+            key: key.to_owned(),
+            size,
+        });
+        return Ok(());
+    }
+    let image = convert(&frame)?;
+    match shown {
+        Some(Shown::Texture(texture)) => texture.set(image, egui::TextureOptions::LINEAR),
+        _ => {
+            *shown = Some(Shown::Texture(ctx.load_texture(
+                format!("camera {key}"),
+                image,
+                egui::TextureOptions::LINEAR,
+            )))
+        }
+    }
+    Ok(())
+}
 #[derive(Default)]
 struct CameraPreview {
     frame_id: Option<u64>,
-    texture: Option<egui::TextureHandle>,
+    shown: Option<Shown>,
     meta: Option<(u64, u32, u32, u32)>,
     error: Option<String>,
 }
@@ -315,7 +391,9 @@ struct Workbench {
     histogram_open: bool,
     focus_camera: bool,
     histogram: [u32; 64],
-    texture: Option<egui::TextureHandle>,
+    shown: Option<Shown>,
+    /// GPU decoding for the glow renderer; None means CPU conversion.
+    gpu: Option<GpuFrames>,
     frame_meta: Option<(u64, u32, u32, u32, u64)>,
     frame_id: Option<u64>,
     display_error: Option<String>,
@@ -366,7 +444,8 @@ impl Workbench {
             histogram_open: false,
             focus_camera: false,
             histogram: [0; 64],
-            texture: None,
+            shown: None,
+            gpu: None,
             frame_meta: None,
             frame_id: None,
             display_error: None,
@@ -415,22 +494,24 @@ impl Workbench {
                 continue;
             };
             preview.frame_id = Some(frame.id);
-            match frame::preview_rgba(&frame, 640, 480) {
-                Ok((width, height, rgba)) => {
-                    let image = egui::ColorImage::from_rgba_unmultiplied(
+            let meta = (frame.id, frame.width, frame.height, frame.pixel_format);
+            let shown = present(
+                ctx,
+                self.gpu.as_ref(),
+                &mut preview.shown,
+                &camera.info.id,
+                frame,
+                |frame| {
+                    let (width, height, rgba) = frame::preview_rgba(frame, 640, 480)?;
+                    Ok(egui::ColorImage::from_rgba_unmultiplied(
                         [width as usize, height as usize],
                         &rgba,
-                    );
-                    if let Some(texture) = preview.texture.as_mut() {
-                        texture.set(image, egui::TextureOptions::LINEAR);
-                    } else {
-                        preview.texture = Some(ctx.load_texture(
-                            format!("camera {}", camera.info.id),
-                            image,
-                            egui::TextureOptions::LINEAR,
-                        ));
-                    }
-                    preview.meta = Some((frame.id, frame.width, frame.height, frame.pixel_format));
+                    ))
+                },
+            );
+            match shown {
+                Ok(()) => {
+                    preview.meta = Some(meta);
                     preview.error = None;
                 }
                 Err(error) => preview.error = Some(error.to_string()),
@@ -477,35 +558,33 @@ impl Workbench {
             return;
         };
         self.frame_id = Some(frame.id);
-        match frame::rgb(&frame) {
-            Ok(rgb) => {
-                self.histogram = [0; 64];
-                let stride = (rgb.len() / 3 / 65_536).max(1);
-                for pixel in rgb.as_chunks::<3>().0.iter().step_by(stride) {
-                    let luminance = (u32::from(pixel[0]) * 54
-                        + u32::from(pixel[1]) * 183
-                        + u32::from(pixel[2]) * 19)
-                        >> 8;
-                    self.histogram[(luminance / 4) as usize] += 1;
-                }
-                let image =
-                    egui::ColorImage::from_rgb([frame.width as usize, frame.height as usize], &rgb);
-                if let Some(texture) = self.texture.as_mut() {
-                    texture.set(image, egui::TextureOptions::LINEAR);
-                } else {
-                    self.texture = Some(ctx.load_texture(
-                        "live camera frame",
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    ));
-                }
-                self.frame_meta = Some((
-                    frame.id,
-                    frame.width,
-                    frame.height,
-                    frame.pixel_format,
-                    frame.timestamp_ns,
-                ));
+        let meta = (
+            frame.id,
+            frame.width,
+            frame.height,
+            frame.pixel_format,
+            frame.timestamp_ns,
+        );
+        let shown = frame::sampled_histogram(&frame).and_then(|histogram| {
+            present(
+                ctx,
+                self.gpu.as_ref(),
+                &mut self.shown,
+                MAIN_VIEW,
+                frame,
+                |frame| {
+                    // Decode straight into egui's pixel type: one pass, one allocation.
+                    let pixels = frame::convert(frame, |[r, g, b]| Color32::from_rgb(r, g, b))?;
+                    let size = [frame.width as usize, frame.height as usize];
+                    Ok(egui::ColorImage::new(size, pixels))
+                },
+            )?;
+            Ok(histogram)
+        });
+        match shown {
+            Ok(histogram) => {
+                self.histogram = histogram;
+                self.frame_meta = Some(meta);
                 self.display_error = None;
             }
             Err(err) => self.display_error = Some(err.to_string()),
@@ -1727,7 +1806,7 @@ impl Workbench {
                     });
                 });
                 ui.add_space(10.0);
-                let histogram_height = if self.histogram_open && self.texture.is_some() {
+                let histogram_height = if self.histogram_open && self.shown.is_some() {
                     77.0
                 } else {
                     0.0
@@ -1767,20 +1846,15 @@ impl Workbench {
                     );
                     y += grid;
                 }
-                if let Some(texture) = &self.texture {
-                    let native = texture.size_vec2();
+                if let Some(shown) = &self.shown {
+                    let native = shown.size();
                     let scale = if self.fit {
                         ((area.width() - 16.0) / native.x).min((area.height() - 16.0) / native.y)
                     } else {
                         self.zoom
                     };
                     let image_rect = egui::Rect::from_center_size(area.center(), native * scale);
-                    painter.image(
-                        texture.id(),
-                        image_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
+                    shown.paint(&painter, self.gpu.as_ref(), image_rect);
                     if !snapshot.streaming {
                         painter.text(
                             egui::pos2(area.left() + 12.0, area.top() + 12.0),
@@ -2020,10 +2094,10 @@ impl Workbench {
                                     let painter = ui.painter_at(rect);
                                     painter.rect_filled(rect, 5.0, Color32::from_rgb(6, 12, 21));
                                     if let Some(preview) = self.previews.get(&camera.info.id) {
-                                        if let Some(texture) = &preview.texture {
-                                            let native = texture.size_vec2();
+                                        if let Some(shown) = &preview.shown {
+                                            let native = shown.size();
                                             let scale = (rect.width() / native.x).min(rect.height() / native.y);
-                                            painter.image(texture.id(), egui::Rect::from_center_size(rect.center(), native * scale), egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                                            shown.paint(&painter, self.gpu.as_ref(), egui::Rect::from_center_size(rect.center(), native * scale));
                                             if !camera.streaming { painter.text(rect.left_top() + Vec2::splat(9.0), egui::Align2::LEFT_TOP, "LAST FRAME", egui::FontId::monospace(9.0), AQUA); }
                                         } else { painter.text(rect.center(), egui::Align2::CENTER_CENTER, if camera.streaming { "Waiting for a frame…" } else { "Ready to stream" }, egui::FontId::proportional(13.0), MUTED); }
                                     } else { painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Ready to stream", egui::FontId::proportional(13.0), MUTED); }
@@ -2213,6 +2287,11 @@ impl Workbench {
 }
 
 impl eframe::App for Workbench {
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if let (Some(gpu), Some(gl)) = (&self.gpu, gl) {
+            gpu.destroy(gl);
+        }
+    }
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.dark = ctx.theme() == egui::Theme::Dark;
         self.poll();
@@ -2223,7 +2302,7 @@ impl eframe::App for Workbench {
             self.edits.clear();
             self.edit_sources.clear();
             self.frame_id = None;
-            self.texture = None;
+            self.shown = None;
             self.frame_meta = None;
             self.display_error = None;
         }
@@ -2233,6 +2312,19 @@ impl eframe::App for Workbench {
         } else {
             self.update_frame(ctx);
             self.previews.clear();
+        }
+        if let Some(gpu) = &self.gpu {
+            // Free GPU textures of views that are no longer on screen.
+            let gpu_shown = |shown: &Option<Shown>| matches!(shown, Some(Shown::Gpu { .. }));
+            gpu.retain(|key| {
+                if key == MAIN_VIEW {
+                    gpu_shown(&self.shown)
+                } else {
+                    self.previews
+                        .get(key)
+                        .is_some_and(|preview| gpu_shown(&preview.shown))
+                }
+            });
         }
         let typing = ctx.wants_keyboard_input();
         if !typing && ctx.input_mut(|input| input.consume_shortcut(&command_shortcut(egui::Key::R)))

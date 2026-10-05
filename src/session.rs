@@ -12,7 +12,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, ChildStdout, Stdio},
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex, OnceLock, PoisonError, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver},
     },
@@ -150,12 +150,63 @@ pub struct SessionSnapshot {
     pub transport: Option<crate::types::TransportStats>,
 }
 type Reply = Receiver<Result<Value>>;
+/// Newest-frame cache fed by a worker's shared ring. It has its own lock so
+/// previews never wait behind a slow command on the worker's stdio pipe.
+/// Lock order: a `Process` lock may be held while taking a feed lock, never
+/// the reverse.
+struct FrameFeed {
+    ring: SharedRing,
+    latest: Option<Arc<Frame>>,
+}
+impl FrameFeed {
+    fn poll(&mut self) -> Option<Arc<Frame>> {
+        // Overwrite the cached frame in place when no consumer still holds it,
+        // so steady-state streaming reuses one pixel allocation.
+        let updated = match self.latest.as_mut().and_then(Arc::get_mut) {
+            Some(frame) => self.ring.take_latest_into(frame),
+            None => {
+                let mut frame = Frame::default();
+                let updated = self.ring.take_latest_into(&mut frame);
+                if matches!(updated, Ok(true)) {
+                    self.latest = Some(Arc::new(frame));
+                }
+                updated
+            }
+        };
+        if let Err(e) = updated {
+            eprintln!("capturefab: ignoring unreadable shared frame: {e:#}");
+        }
+        self.latest.clone()
+    }
+}
+fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+#[derive(Serialize)]
+struct WorkerReply<'a> {
+    ok: bool,
+    /// Omitted for Status, whose result is the snapshot itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    snapshot: &'a SessionSnapshot,
+}
+#[derive(Deserialize)]
+struct ParentReply {
+    ok: bool,
+    #[serde(default)]
+    result: Option<Value>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    snapshot: Option<Value>,
+}
 struct Process {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
-    ring: Arc<Mutex<SharedRing>>,
-    cached: Option<Frame>,
+    feed: Arc<Mutex<FrameFeed>>,
     snapshot: SessionSnapshot,
 }
 impl Process {
@@ -194,12 +245,20 @@ impl Process {
             child,
             input,
             output,
-            ring: Arc::new(Mutex::new(ring)),
-            cached: None,
+            feed: Arc::new(Mutex::new(FrameFeed { ring, latest: None })),
             snapshot: SessionSnapshot::default(),
         })
     }
     fn call(&mut self, command: SessionCommand) -> Result<Value> {
+        let status = matches!(command, SessionCommand::Status);
+        match self.exchange(command)? {
+            None if status => Ok(serde_json::to_value(&self.snapshot)?),
+            result => Ok(result.unwrap_or_default()),
+        }
+    }
+    /// Send one command and apply the reply's snapshot. Status replies carry no
+    /// separate result, so a background refresh never serializes it twice.
+    fn exchange(&mut self, command: SessionCommand) -> Result<Option<Value>> {
         ensure!(
             self.child.try_wait()?.is_none(),
             "camera worker exited; disconnect and reconnect"
@@ -217,29 +276,19 @@ impl Process {
             data.len() <= 16 * 1024 * 1024 && data.last() == Some(&b'\n'),
             "camera worker exited or sent an invalid response"
         );
-        let v: Value = serde_json::from_slice(&data)?;
-        if let Some(snapshot) = v.get("snapshot") {
-            match serde_json::from_value(snapshot.clone()) {
+        let reply: ParentReply = serde_json::from_slice(&data)?;
+        if let Some(snapshot) = reply.snapshot {
+            match serde_json::from_value(snapshot) {
                 Ok(snapshot) => self.snapshot = snapshot,
                 Err(e) => eprintln!("capturefab: ignoring unreadable worker snapshot: {e}"),
             }
         }
         ensure!(
-            v["ok"] == true,
+            reply.ok,
             "{}",
-            v["error"].as_str().unwrap_or("worker command failed")
+            reply.error.as_deref().unwrap_or("worker command failed")
         );
-        Ok(v["result"].clone())
-    }
-    fn poll_frame(&mut self) {
-        if let Ok(Some(frame)) = self
-            .ring
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take_latest()
-        {
-            self.cached = Some(frame);
-        }
+        Ok(reply.result)
     }
 }
 impl Drop for Process {
@@ -260,11 +309,40 @@ impl Drop for Process {
 struct Coordinator {
     state: RwLock<SessionSnapshot>,
     workers: RwLock<BTreeMap<String, Arc<Mutex<Process>>>>,
-    rings: RwLock<BTreeMap<String, Arc<Mutex<SharedRing>>>>,
+    feeds: RwLock<BTreeMap<String, Arc<Mutex<FrameFeed>>>>,
     quitting: AtomicBool,
     pending: AtomicUsize,
     connecting: Mutex<()>,
+    poller: OnceLock<std::thread::Thread>,
 }
+impl Drop for Coordinator {
+    fn drop(&mut self) {
+        // The poller holds only a Weak; wake it so it exits now, not next tick.
+        if let Some(poller) = self.poller.get() {
+            poller.unpark();
+        }
+    }
+}
+/// Holds one of the bounded command slots; released even if the command panics.
+struct PendingSlot(Arc<Coordinator>);
+impl PendingSlot {
+    fn acquire(inner: &Arc<Coordinator>) -> Result<Self> {
+        inner
+            .pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_PENDING).then_some(n + 1)
+            })
+            .map_err(|_| anyhow::anyhow!("camera command queue is full"))?;
+        Ok(Self(inner.clone()))
+    }
+}
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        self.0.pending.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+const MAX_PENDING: usize = 32;
+const STATUS_POLL: Duration = Duration::from_millis(250);
 #[derive(Clone)]
 pub struct SessionHandle {
     inner: Arc<Coordinator>,
@@ -280,30 +358,44 @@ impl SessionHandle {
             inner: Arc::new(Coordinator {
                 state: RwLock::new(SessionSnapshot::default()),
                 workers: RwLock::new(BTreeMap::new()),
-                rings: RwLock::new(BTreeMap::new()),
+                feeds: RwLock::new(BTreeMap::new()),
                 quitting: AtomicBool::new(false),
                 pending: AtomicUsize::new(0),
                 connecting: Mutex::new(()),
+                poller: OnceLock::new(),
             }),
         };
         let weak = Arc::downgrade(&h.inner);
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_millis(250));
-                let Some(inner) = weak.upgrade() else { break };
-                if inner.quitting.load(Ordering::Relaxed) {
-                    break;
-                }
-                let h = Self { inner };
-                for (_, w) in h.workers() {
-                    if let Ok(mut p) = w.try_lock() {
-                        let _ = p.call(SessionCommand::Status);
+        let poller = std::thread::Builder::new()
+            .name("capturefab-status".into())
+            .spawn(move || {
+                loop {
+                    // Parked rather than slept so shutdown and drop wake it at once.
+                    std::thread::park_timeout(STATUS_POLL);
+                    let Some(inner) = weak.upgrade() else { break };
+                    if inner.quitting.load(Ordering::Acquire) {
+                        break;
                     }
+                    let h = Self { inner };
+                    h.refresh_workers();
+                    h.store_snapshot();
                 }
-                h.store_snapshot();
+            });
+        match poller {
+            Ok(thread) => {
+                let _ = h.inner.poller.set(thread.thread().clone());
             }
-        });
+            Err(e) => eprintln!("capturefab: status refresh unavailable: {e}"),
+        }
         h
+    }
+    /// Refresh every idle worker's snapshot; busy workers report on their reply.
+    fn refresh_workers(&self) {
+        for (_, w) in self.workers() {
+            if let Ok(mut p) = w.try_lock() {
+                let _ = p.exchange(SessionCommand::Status);
+            }
+        }
     }
     fn workers(&self) -> Vec<(String, Arc<Mutex<Process>>)> {
         self.inner
@@ -332,8 +424,7 @@ impl SessionHandle {
                         features: s.features.clone(),
                         streaming: s.streaming,
                         frames: s.frames,
-                        dropped: s.dropped
-                            + p.ring.lock().unwrap_or_else(|e| e.into_inner()).dropped() as u64,
+                        dropped: s.dropped + locked(&p.feed).ring.dropped() as u64,
                         fps: s.fps,
                         last_error: s.last_error.clone(),
                         worker_pid: p.child.id(),
@@ -400,25 +491,36 @@ impl SessionHandle {
         }
         anyhow::bail!("camera '{id}' not connected in this session")
     }
-    pub fn latest_frame(&self) -> Option<Frame> {
+    pub fn latest_frame(&self) -> Option<Arc<Frame>> {
         let id = self.inner.state.read().ok()?.active_camera.clone()?;
         self.latest_frame_for(&id)
     }
     pub fn latest_frame_id(&self) -> Option<u64> {
-        let id = self.inner.state.read().ok()?.active_camera.clone()?;
-        self.latest_frame_id_for(&id)
+        self.latest_frame().map(|f| f.id)
     }
-    pub fn latest_frame_for(&self, id: &str) -> Option<Frame> {
-        let w = self.target(Some(id)).ok()?;
-        let mut p = w.try_lock().ok()?;
-        p.poll_frame();
-        p.cached.clone()
+    /// Newest frame from a camera's shared ring. Never waits for the worker's
+    /// command pipe, so previews keep updating while commands run.
+    pub fn latest_frame_for(&self, id: &str) -> Option<Arc<Frame>> {
+        let feed = self.feed(id)?;
+        locked(&feed).poll()
     }
     pub fn latest_frame_id_for(&self, id: &str) -> Option<u64> {
+        self.latest_frame_for(id).map(|f| f.id)
+    }
+    fn feed(&self, id: &str) -> Option<Arc<Mutex<FrameFeed>>> {
+        let feeds = self
+            .inner
+            .feeds
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(feed) = feeds.get(id) {
+            return Some(feed.clone());
+        }
+        drop(feeds);
+        // Serial or address selectors resolve through the worker table.
         let w = self.target(Some(id)).ok()?;
-        let mut p = w.try_lock().ok()?;
-        p.poll_frame();
-        p.cached.as_ref().map(|f| f.id)
+        let p = w.try_lock().ok()?;
+        Some(p.feed.clone())
     }
     pub fn submit(&self, c: SessionCommand) -> Result<Reply> {
         self.submit_target(None, c)
@@ -431,11 +533,7 @@ impl SessionHandle {
             !self.inner.quitting.load(Ordering::Relaxed),
             "session is shutting down"
         );
-        let old = self.inner.pending.fetch_add(1, Ordering::Relaxed);
-        if old >= 32 {
-            self.inner.pending.fetch_sub(1, Ordering::Relaxed);
-            anyhow::bail!("camera command queue is full")
-        }
+        let slot = PendingSlot::acquire(&self.inner)?;
         let target = target.or_else(|| {
             if matches!(
                 &command,
@@ -456,23 +554,26 @@ impl SessionHandle {
         });
         let h = self.clone();
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let result = h.process(target.as_deref(), command);
-            if let Err(e) = &result {
-                let mut s = h.inner.state.write().unwrap_or_else(|e| e.into_inner());
-                s.last_error = Some(format!("{e:#}"));
-                s.logs.push(LogEntry {
-                    time: "".into(),
-                    level: "error".into(),
-                    message: format!("{e:#}"),
-                });
-                if s.logs.len() > 200 {
-                    s.logs.remove(0);
+        std::thread::Builder::new()
+            .name("capturefab-command".into())
+            .spawn(move || {
+                let _slot = slot;
+                let result = h.process(target.as_deref(), command);
+                if let Err(e) = &result {
+                    let mut s = h.inner.state.write().unwrap_or_else(|e| e.into_inner());
+                    s.last_error = Some(format!("{e:#}"));
+                    s.logs.push(LogEntry {
+                        time: "".into(),
+                        level: "error".into(),
+                        message: format!("{e:#}"),
+                    });
+                    if s.logs.len() > 200 {
+                        s.logs.remove(0);
+                    }
                 }
-            }
-            h.inner.pending.fetch_sub(1, Ordering::Relaxed);
-            let _ = tx.send(result);
-        });
+                let _ = tx.send(result);
+            })
+            .context("start camera command thread")?;
         Ok(rx)
     }
     pub fn request(&self, c: SessionCommand) -> Result<Value> {
@@ -492,11 +593,7 @@ impl SessionHandle {
                     .call(SessionCommand::Status)
             }
             SessionCommand::Status => {
-                for (_, w) in self.workers() {
-                    if let Ok(mut p) = w.try_lock() {
-                        let _ = p.call(SessionCommand::Status);
-                    }
-                }
+                self.refresh_workers();
                 self.store_snapshot();
                 Ok(serde_json::to_value(self.snapshot())?)
             }
@@ -561,10 +658,10 @@ impl SessionHandle {
                 let id = info.id.clone();
                 let pid = p.child.id();
                 self.inner
-                    .rings
+                    .feeds
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(id.clone(), p.ring.clone());
+                    .insert(id.clone(), p.feed.clone());
                 self.inner
                     .workers
                     .write()
@@ -610,7 +707,7 @@ impl SessionHandle {
                 let result = p.call(SessionCommand::Disconnect)?;
                 drop(p);
                 self.inner
-                    .rings
+                    .feeds
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&id);
@@ -649,17 +746,20 @@ impl SessionHandle {
         *self.inner.state.write().unwrap_or_else(|e| e.into_inner()) = snapshot;
     }
     pub fn shutdown(&self) {
-        if self.inner.quitting.swap(true, Ordering::Relaxed) {
+        if self.inner.quitting.swap(true, Ordering::AcqRel) {
             return;
         }
-        for ring in self
+        if let Some(poller) = self.inner.poller.get() {
+            poller.unpark();
+        }
+        for feed in self
             .inner
-            .rings
+            .feeds
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
         {
-            ring.lock().unwrap_or_else(|e| e.into_inner()).cancel();
+            locked(feed).ring.cancel();
         }
         let workers = std::mem::take(
             &mut *self
@@ -670,7 +770,7 @@ impl SessionHandle {
         );
         drop(workers);
         self.inner
-            .rings
+            .feeds
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -710,15 +810,26 @@ pub fn run_worker(path: &std::path::Path) -> Result<()> {
             }
             let command: SessionCommand = serde_json::from_slice(&data)?;
             let result = if matches!(command, SessionCommand::Status) {
-                Ok(serde_json::to_value(handle.snapshot())?)
+                Ok(None)
             } else {
-                handle.request(command)
+                handle.request(command).map(Some)
             };
-            let response = match result {
-                Ok(v) => json!({"ok":true,"result":v,"snapshot":handle.snapshot()}),
-                Err(e) => json!({"ok":false,"error":format!("{e:#}"),"snapshot":handle.snapshot()}),
+            // One snapshot clone per reply, serialized straight to the pipe; the
+            // clone keeps the state lock out of the blocking write.
+            let snapshot = handle.snapshot();
+            let (ok, result, error) = match result {
+                Ok(result) => (true, result, None),
+                Err(e) => (false, None, Some(format!("{e:#}"))),
             };
-            serde_json::to_writer(&mut output, &response)?;
+            serde_json::to_writer(
+                &mut output,
+                &WorkerReply {
+                    ok,
+                    result,
+                    error,
+                    snapshot: &snapshot,
+                },
+            )?;
             output.write_all(b"\n")?;
             output.flush()?;
         }
@@ -726,4 +837,51 @@ pub fn run_worker(path: &std::path::Path) -> Result<()> {
     })();
     handle.shutdown();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn frame_feed_reuses_unshared_frames_and_never_mutates_shared_ones() {
+        let path = std::env::temp_dir().join(format!(
+            "capturefab-feed-test-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut writer = SharedRing::create(&path, 4096).unwrap();
+        let mut feed = FrameFeed {
+            ring: SharedRing::open(&path).unwrap(),
+            latest: None,
+        };
+        let frame = |id: u64| Frame {
+            id,
+            width: 4,
+            height: 4,
+            pixel_format: crate::types::MONO8,
+            timestamp_ns: 0,
+            data: vec![id as u8; 16],
+        };
+        assert!(feed.poll().is_none());
+        writer.write(&frame(1)).unwrap();
+        let held = feed.poll().unwrap();
+        // A consumer still holds frame 1, so frame 2 must get its own buffer.
+        writer.write(&frame(2)).unwrap();
+        let second = feed.poll().unwrap();
+        assert_eq!((held.id, held.data.as_slice()), (1, &[1; 16][..]));
+        assert_eq!((second.id, second.data.as_slice()), (2, &[2; 16][..]));
+        assert_ne!(held.data.as_ptr(), second.data.as_ptr());
+        let buffer = second.data.as_ptr();
+        drop((held, second));
+        // Once released, the cached allocation is overwritten in place.
+        writer.write(&frame(3)).unwrap();
+        let third = feed.poll().unwrap();
+        assert_eq!((third.id, third.data.as_ptr()), (3, buffer));
+        drop(third);
+        // Without a newer frame the cached one is returned unchanged.
+        assert_eq!(feed.poll().unwrap().id, 3);
+    }
 }
