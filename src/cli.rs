@@ -52,6 +52,8 @@ pub struct Cli {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ImageFormat {
     Png,
+    #[value(alias = "jpg")]
+    Jpeg,
     Raw,
     Pgm,
     Ppm,
@@ -60,6 +62,7 @@ impl ImageFormat {
     fn name(self) -> &'static str {
         match self {
             Self::Png => "png",
+            Self::Jpeg => "jpeg",
             Self::Raw => "raw",
             Self::Pgm => "pgm",
             Self::Ppm => "ppm",
@@ -950,10 +953,21 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
 }
 fn doctor() -> Value {
     let interfaces=if_addrs::get_if_addrs().map(|items|items.into_iter().filter_map(|i|match i.addr{if_addrs::IfAddr::V4(a)=>Some(json!({"name":i.name,"ip":a.ip,"netmask":a.netmask,"broadcast":a.broadcast})),_=>None}).collect::<Vec<_>>()).unwrap_or_default();
-    json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"wgpu":cfg!(feature="wgpu")},"session_directory":ipc::session_dir(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required.","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}})
+    json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"wgpu":cfg!(feature="wgpu"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg")},"jpeg":jpeg_backends(),"session_directory":ipc::session_dir(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG are used when installed.","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}})
+}
+/// JPEG encoders available to this build and host, best first.
+fn jpeg_backends() -> Value {
+    #[cfg(feature = "nvjpeg")]
+    let nvjpeg = match crate::nvjpeg::probe() {
+        Ok(status) => json!({"available":true,"status":status}),
+        Err(error) => json!({"available":false,"reason":format!("{error:#}")}),
+    };
+    #[cfg(not(feature = "nvjpeg"))]
+    let nvjpeg = json!({"available":false,"reason":"not compiled in"});
+    json!({"nvjpeg":nvjpeg,"libjpeg_turbo":cfg!(feature="jpeg"),"quality":crate::jpeg::QUALITY})
 }
 fn schema() -> Value {
-    let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"gui","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","raw","pgm","ppm"],"paths":"one frame: file; multiple: directory or {frame} template; existing files fail","stdout":"--camera ... capture -n 1 -o - --format raw; no --json"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized with GUI operations."});
+    let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"gui","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","jpeg","raw","pgm","ppm"],"paths":"one frame: file; multiple: directory or {frame} template; existing files fail","stdout":"--camera ... capture -n 1 -o - --format raw; no --json"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized with GUI operations."});
     contract["exit_codes"]["6"] = json!("storage quota or disk full");
     contract["selection"]["direct"] = json!(
         "--camera ID|serial|IPv4|sim:NAME|RTSP/SRT/media URI|avfoundation:INDEX|v4l2:/dev/videoN|dshow:video=NAME|onvif:ENDPOINT"

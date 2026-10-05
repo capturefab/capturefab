@@ -20,7 +20,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 SEMVER = re.compile(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?')
 TARGETS = [(os_, arch, variant) for os_, arches in [('linux', ['x86_64', 'aarch64', 'armv7']), ('macos', ['x86_64', 'aarch64']), ('windows', ['x86_64', 'aarch64'])] for arch in arches for variant in ['desktop', 'headless']]
-FEATURES = {'desktop': ['--features', 'wgpu'], 'headless': ['--no-default-features', '--features', 'usb']}
+FEATURES = {'desktop': ['--features', 'wgpu'], 'headless': ['--no-default-features', '--features', 'usb,jpeg,nvjpeg']}
 LICENSE_FILE = re.compile(r'(licen[cs]e|copying|notice|unlicense)', re.I)
 
 def version(value=None):

@@ -10,7 +10,10 @@ mod gpu;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod ipc;
+pub mod jpeg;
 pub mod media;
+#[cfg(feature = "nvjpeg")]
+pub mod nvjpeg;
 pub mod onvif;
 pub mod scheduling;
 pub mod session;

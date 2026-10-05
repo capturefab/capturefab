@@ -1372,6 +1372,10 @@ struct EncoderProcess {
     width: u32,
     height: u32,
     raw: RawInput,
+    /// Set when a GStreamer Jetson encoder process precedes FFmpeg.
+    jetson: Option<JetsonInput>,
+    stage: Option<Child>,
+    stage_log: Option<JoinHandle<()>>,
     encoder: String,
 }
 struct EncodedOutput {
@@ -1405,25 +1409,68 @@ fn select_encoder(exe: &Executable, config: &ForwardConfig) -> Result<String> {
         );
         return Ok(config.encoder.clone());
     }
+    // Vendor encoders first, then cross-vendor Vulkan Video, then software.
+    // Every candidate must be present in the FFmpeg build and pass a real
+    // test encode on this machine before it is chosen.
     let candidates: Vec<&str> = match (family, std::env::consts::OS) {
         ("h264", "macos") => vec!["h264_videotoolbox", "libx264"],
         ("hevc", "macos") => vec!["hevc_videotoolbox", "libx265"],
+        ("av1", "macos") => vec!["libsvtav1", "libaom-av1"],
         ("h264", "linux") => vec![
             "h264_nvenc",
+            "nvv4l2h264enc",
+            "h264_amf",
             "h264_qsv",
             "h264_vaapi",
+            "h264_vulkan",
             "h264_v4l2m2m",
             "libx264",
         ],
         ("hevc", "linux") => vec![
             "hevc_nvenc",
+            "nvv4l2h265enc",
+            "hevc_amf",
             "hevc_qsv",
             "hevc_vaapi",
+            "hevc_vulkan",
             "hevc_v4l2m2m",
             "libx265",
         ],
-        ("h264", "windows") => vec!["h264_nvenc", "h264_qsv", "h264_amf", "h264_mf", "libx264"],
-        ("hevc", "windows") => vec!["hevc_nvenc", "hevc_qsv", "hevc_amf", "hevc_mf", "libx265"],
+        ("av1", "linux") => vec![
+            "av1_nvenc",
+            "nvv4l2av1enc",
+            "av1_amf",
+            "av1_qsv",
+            "av1_vaapi",
+            "av1_vulkan",
+            "libsvtav1",
+            "libaom-av1",
+        ],
+        ("h264", "windows") => vec![
+            "h264_nvenc",
+            "h264_qsv",
+            "h264_amf",
+            "h264_vulkan",
+            "h264_mf",
+            "libx264",
+        ],
+        ("hevc", "windows") => vec![
+            "hevc_nvenc",
+            "hevc_qsv",
+            "hevc_amf",
+            "hevc_vulkan",
+            "hevc_mf",
+            "libx265",
+        ],
+        ("av1", "windows") => vec![
+            "av1_nvenc",
+            "av1_qsv",
+            "av1_amf",
+            "av1_vulkan",
+            "av1_mf",
+            "libsvtav1",
+            "libaom-av1",
+        ],
         ("h264", _) => vec!["libx264"],
         ("hevc", _) => vec!["libx265"],
         _ => vec!["av1_nvenc", "libsvtav1", "libaom-av1"],
@@ -1434,6 +1481,12 @@ fn select_encoder(exe: &Executable, config: &ForwardConfig) -> Result<String> {
         Duration::from_secs(5),
     )?;
     for candidate in candidates {
+        if jetson_encoder(candidate) {
+            if probe_jetson(candidate) {
+                return Ok(candidate.into());
+            }
+            continue;
+        }
         if !available
             .lines()
             .any(|line| line.split_whitespace().nth(1) == Some(candidate))
@@ -1447,6 +1500,114 @@ fn select_encoder(exe: &Executable, config: &ForwardConfig) -> Result<String> {
     bail!(
         "no usable {family} encoder found in bundled FFmpeg; choose --encoder explicitly or provide a build with a software encoder"
     )
+}
+/// NVIDIA Jetson hardware encoders, reached through NVIDIA's GStreamer
+/// elements: on Jetson the video engine is a V4L2 device that FFmpeg's NVENC
+/// and generic V4L2 wrappers cannot drive. GStreamer runs as a separate
+/// process that encodes to MPEG-TS for FFmpeg to remux and deliver.
+fn jetson_encoder(encoder: &str) -> bool {
+    matches!(encoder, "nvv4l2h264enc" | "nvv4l2h265enc" | "nvv4l2av1enc")
+}
+fn jetson_parser(encoder: &str) -> &'static str {
+    match encoder {
+        "nvv4l2h264enc" => "h264parse",
+        "nvv4l2h265enc" => "h265parse",
+        _ => "av1parse",
+    }
+}
+/// Run a helper tool briefly; true when it exits successfully in time.
+fn tool_succeeds(program: &str, args: &[&str], timeout: Duration) -> bool {
+    let Ok(mut child) = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+/// The element exists and encodes a short test clip on this device; Orin,
+/// for example, lists the AV1 element but has no AV1 encoder.
+fn probe_jetson(encoder: &str) -> bool {
+    cfg!(target_os = "linux")
+        && tool_succeeds("gst-inspect-1.0", &[encoder], Duration::from_secs(5))
+        && tool_succeeds(
+            "gst-launch-1.0",
+            &[
+                "-q",
+                "videotestsrc",
+                "num-buffers=3",
+                "!",
+                "video/x-raw,width=640,height=480,format=I420",
+                "!",
+                "nvvidconv",
+                "!",
+                "video/x-raw(memory:NVMM),format=NV12",
+                "!",
+                encoder,
+                "!",
+                jetson_parser(encoder),
+                "!",
+                "fakesink",
+            ],
+            Duration::from_secs(10),
+        )
+}
+/// Bits per second from a bitrate like `4M`, `2500k` or `800000`.
+fn bits_per_second(bitrate: &str) -> Result<u64> {
+    let (number, scale) = match bitrate.chars().last() {
+        Some('k' | 'K') => (&bitrate[..bitrate.len() - 1], 1e3),
+        Some('M') => (&bitrate[..bitrate.len() - 1], 1e6),
+        Some('G') => (&bitrate[..bitrate.len() - 1], 1e9),
+        _ => (bitrate, 1.0),
+    };
+    let value: f64 = number.parse().context("invalid forwarding bitrate")?;
+    ensure!(
+        value.is_finite() && value > 0.0 && value * scale <= u32::MAX as f64,
+        "forwarding bitrate out of range"
+    );
+    Ok((value * scale) as u64)
+}
+/// Frames handed to a Jetson encoder: formats `nvvidconv` accepts in system
+/// memory and converts on the VIC engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JetsonInput {
+    /// Gray as the luma plane with neutral chroma.
+    I420,
+    Rgba,
+}
+impl JetsonInput {
+    fn caps(self) -> &'static str {
+        match self {
+            Self::I420 => "i420",
+            Self::Rgba => "rgba",
+        }
+    }
+    fn bytes(self, frame: &Frame) -> Result<Vec<u8>> {
+        Ok(match self {
+            Self::Rgba => crate::frame::rgba(frame)?,
+            Self::I420 => {
+                let mut data = crate::frame::convert(frame, |[gray, _, _]| gray)?;
+                let chroma =
+                    (frame.width as usize).div_ceil(2) * (frame.height as usize).div_ceil(2);
+                data.resize(data.len() + 2 * chroma, 128);
+                data
+            }
+        })
+    }
 }
 /// Pixel layout handed to the encoder after FFmpeg's input conversion.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1503,17 +1664,28 @@ fn encoder_device_options(encoder: &str) -> Vec<String> {
             std::env::var("CAPTUREFAB_VAAPI_DEVICE")
                 .unwrap_or_else(|_| "/dev/dri/renderD128".into()),
         ]
+    } else if encoder.ends_with("_vulkan") {
+        // The first Vulkan device with video encode; FFmpeg loads the system
+        // Vulkan loader at run time.
+        ["-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk"]
+            .map(str::to_owned)
+            .to_vec()
     } else {
         Vec::new()
     }
 }
 fn encoder_output_options(encoder: &str, input: EncoderInput) -> Vec<String> {
-    let mut options = if encoder.ends_with("_vaapi") {
+    let mut options = if encoder.ends_with("_vaapi") || encoder.ends_with("_vulkan") {
+        // Convert and pad on the CPU, then upload into the device's frames.
         vec![
             "-vf",
             "pad=ceil(iw/2)*2:ceil(ih/2)*2,format=nv12,hwupload",
             "-pix_fmt",
-            "vaapi",
+            if encoder.ends_with("_vaapi") {
+                "vaapi"
+            } else {
+                "vulkan"
+            },
         ]
     } else {
         vec![
@@ -1678,39 +1850,104 @@ impl Forwarder {
         let local = recording.is_some();
         let exe = executable()?;
         let encoder = select_encoder(&exe, &self.config)?;
-        let input = encoder_input(&exe, &encoder, raw.color)?;
+        let jetson = jetson_encoder(&encoder).then_some(if raw.color {
+            JetsonInput::Rgba
+        } else {
+            JetsonInput::I420
+        });
         let mut cmd = command(&exe);
-        cmd.args(encoder_device_options(&encoder));
-        cmd.args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-n",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            raw.ffmpeg,
-            "-video_size",
-            &format!("{width}x{height}"),
-            "-framerate",
-            &self.config.fps.to_string(),
-            "-i",
-            "pipe:0",
-            "-an",
-            "-c:v",
-            &encoder,
-            "-b:v",
-            &self.config.bitrate,
-            "-g",
-            &((self.config.fps * 2.0).round().max(1.0) as u32).to_string(),
-        ]);
-        cmd.args(encoder_output_options(&encoder, input));
-        if encoder == "libx264" {
-            cmd.args(["-preset", "veryfast", "-tune", "zerolatency"]);
-        } else if encoder == "libx265" {
-            cmd.args(["-preset", "veryfast"]);
-        } else if encoder.ends_with("_videotoolbox") {
-            cmd.args(["-realtime", "1"]);
+        let mut stage = None;
+        if let Some(input) = jetson {
+            let gop = ((self.config.fps * 2.0).round().max(1.0) as u32).to_string();
+            let mut gst = Command::new("gst-launch-1.0");
+            gst.args([
+                "-q",
+                "fdsrc",
+                "fd=0",
+                "!",
+                "rawvideoparse",
+                &format!("width={width}"),
+                &format!("height={height}"),
+                &format!("format={}", input.caps()),
+                &format!(
+                    "framerate={}/1000",
+                    (self.config.fps * 1000.0).round() as u64
+                ),
+                "!",
+                "nvvidconv",
+                "!",
+                "video/x-raw(memory:NVMM),format=NV12",
+                "!",
+                &encoder,
+                &format!("bitrate={}", bits_per_second(&self.config.bitrate)?),
+                &format!("iframeinterval={gop}"),
+                &format!("idrinterval={gop}"),
+                "insert-sps-pps=true",
+                "!",
+                jetson_parser(&encoder),
+                "config-interval=-1",
+                "!",
+                "mpegtsmux",
+                "!",
+                "fdsink",
+                "fd=1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+            let mut child = gst
+                .spawn()
+                .context("cannot launch GStreamer Jetson encoder")?;
+            let encoded = child.stdout.take().context("GStreamer stdout")?;
+            cmd.stdin(Stdio::from(encoded));
+            stage = Some(child);
+            cmd.args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-n",
+                "-f",
+                "mpegts",
+                "-i",
+                "pipe:0",
+                "-an",
+                "-c:v",
+                "copy",
+            ]);
+        } else {
+            let input = encoder_input(&exe, &encoder, raw.color)?;
+            cmd.args(encoder_device_options(&encoder));
+            cmd.args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-n",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                raw.ffmpeg,
+                "-video_size",
+                &format!("{width}x{height}"),
+                "-framerate",
+                &self.config.fps.to_string(),
+                "-i",
+                "pipe:0",
+                "-an",
+                "-c:v",
+                &encoder,
+                "-b:v",
+                &self.config.bitrate,
+                "-g",
+                &((self.config.fps * 2.0).round().max(1.0) as u32).to_string(),
+            ]);
+            cmd.args(encoder_output_options(&encoder, input));
+            if encoder == "libx264" {
+                cmd.args(["-preset", "veryfast", "-tune", "zerolatency"]);
+            } else if encoder == "libx265" {
+                cmd.args(["-preset", "veryfast"]);
+            } else if encoder.ends_with("_videotoolbox") {
+                cmd.args(["-realtime", "1"]);
+            }
         }
         if let Some((_, container)) = &recording {
             if *container == "mp4" {
@@ -1720,8 +1957,10 @@ impl Forwarder {
         } else {
             cmd.args(output_args(&self.config.output)?);
         }
-        cmd.stdin(Stdio::piped())
-            .stdout(if local { Stdio::piped() } else { Stdio::null() })
+        if stage.is_none() {
+            cmd.stdin(Stdio::piped());
+        }
+        cmd.stdout(if local { Stdio::piped() } else { Stdio::null() })
             .stderr(Stdio::piped());
         // Validate/probe before creating a file, then reserve the global budget.
         let storage = recording
@@ -1736,14 +1975,25 @@ impl Forwarder {
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(error) => {
+                if let Some(mut stage) = stage {
+                    let _ = stage.kill();
+                    let _ = stage.wait();
+                }
                 if let Some(storage) = storage {
                     storage.abort().context("remove failed recording output")?;
                 }
                 return Err(error).context("cannot launch FFmpeg forwarder");
             }
         };
-        let mut input = child.stdin.take().unwrap();
         let log = Log::new();
+        // Frames go to the first process: GStreamer when it encodes, else FFmpeg.
+        let (mut input, stage_log) = match stage.as_mut() {
+            Some(stage) => (
+                stage.stdin.take().context("GStreamer stdin")?,
+                Some(log.collect(stage.stderr.take().context("GStreamer stderr")?)),
+            ),
+            None => (child.stdin.take().context("FFmpeg stdin")?, None),
+        };
         let log_thread = log.collect(child.stderr.take().unwrap());
         let queue = Arc::new(WriterQueue {
             state: Mutex::new(WriterState {
@@ -1836,6 +2086,9 @@ impl Forwarder {
             width,
             height,
             raw,
+            jetson,
+            stage,
+            stage_log,
             encoder,
         });
         Ok(())
@@ -1890,8 +2143,12 @@ impl Forwarder {
             crate::frame::pixel_format_name(frame.pixel_format)
         );
         // FFmpeg converts on its own threads with SIMD swscale (or the encoder
-        // hardware), so the camera thread only copies sensor bytes.
-        let bytes = frame.data[..length].to_vec();
+        // hardware), so the camera thread only copies sensor bytes. Jetson's
+        // converter takes RGBA or I420, built here in one pass.
+        let bytes = match process.jetson {
+            Some(input) => input.bytes(frame)?,
+            None => frame.data[..length].to_vec(),
+        };
         let mut state = process
             .queue
             .state
@@ -1939,7 +2196,9 @@ impl Forwarder {
         };
         process.queue.running.store(false, Ordering::Release);
         process.queue.changed.notify_all();
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // A GStreamer stage must drain the hardware encoder before FFmpeg sees EOF.
+        let grace = if process.stage.is_some() { 6 } else { 3 };
+        let deadline = Instant::now() + Duration::from_secs(grace);
         let mut shutdown_error = None;
         let status = loop {
             match process.child.try_wait() {
@@ -1960,6 +2219,16 @@ impl Forwarder {
             }
             thread::sleep(Duration::from_millis(10));
         };
+        if let Some(mut stage) = process.stage.take() {
+            // FFmpeg has exited; the encoder stage normally already has too.
+            if !matches!(stage.try_wait(), Ok(Some(_))) {
+                let _ = stage.kill();
+            }
+            let _ = stage.wait();
+        }
+        if let Some(thread) = process.stage_log.take() {
+            let _ = thread.join();
+        }
         if let Some(thread) = process.writer.take()
             && thread.join().is_err()
         {
@@ -2092,6 +2361,28 @@ mod tests {
             recording_output("file:record.mp4").unwrap().unwrap().1,
             "mp4"
         );
+    }
+    #[test]
+    fn jetson_inputs_and_bitrates() {
+        assert_eq!(bits_per_second("4M").unwrap(), 4_000_000);
+        assert_eq!(bits_per_second("2500k").unwrap(), 2_500_000);
+        assert_eq!(bits_per_second("800000").unwrap(), 800_000);
+        assert!(bits_per_second("5G").is_err() && bits_per_second("x").is_err());
+        let gray = Frame {
+            id: 1,
+            width: 3,
+            height: 3,
+            pixel_format: crate::types::MONO8,
+            timestamp_ns: 0,
+            data: (1..=9).collect(),
+        };
+        // Luma plane, then 2x2 U and V planes for odd dimensions.
+        let i420 = JetsonInput::I420.bytes(&gray).unwrap();
+        assert_eq!(i420.len(), 9 + 2 * 4);
+        assert_eq!((&i420[..9], &i420[9..]), (&gray.data[..], &[128; 8][..]));
+        let rgba = JetsonInput::Rgba.bytes(&gray).unwrap();
+        assert_eq!(&rgba[..8], [1, 1, 1, 255, 2, 2, 2, 255]);
+        assert!(jetson_encoder("nvv4l2h264enc") && !jetson_encoder("h264_nvenc"));
     }
     #[test]
     #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]

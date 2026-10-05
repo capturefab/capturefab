@@ -1228,6 +1228,7 @@ impl Workbench {
                     .width(110.0)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.format, "png".into(), "PNG image");
+                        ui.selectable_value(&mut self.format, "jpeg".into(), "JPEG image");
                         ui.selectable_value(&mut self.format, "raw".into(), "Raw pixels");
                         ui.selectable_value(&mut self.format, "pgm".into(), "PGM monochrome");
                         ui.selectable_value(&mut self.format, "ppm".into(), "PPM color");

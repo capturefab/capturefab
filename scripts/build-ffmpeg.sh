@@ -11,8 +11,15 @@ FFMPEG_SHA256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 OPENSSL_SHA256=9bffaa1ad1e07b354c21bd3324ec02fa15579f45a7d0494b3e74bc449b7333ef
 SRT_SHA256=017cd1e437ef2073a4dd10ddf7b55e86bc3d6ebac0393d13bd22f6a57055d32b
 X264_SHA256=cd71a7515b0e9a012e1ac9b1f8415bebcaf6fc97d4db32286642ac4c0fbe24f9
-NV_HEADERS_VERSION=11.1.5.4
-NV_HEADERS_SHA256=cbad7c68365ae50b03fe4cfbea05975c94406bdcc0a995bd094a3ea355656ffb
+# 12.0 adds AV1 NVENC; it requires NVIDIA driver 520 or newer at run time.
+NV_HEADERS_VERSION=12.0.16.2
+NV_HEADERS_SHA256=13b4d5d1f8781980629518977f15546c007d7331727b0c62e6be3b77f0e92297
+# Header-only: FFmpeg loads the system Vulkan loader at run time.
+VULKAN_HEADERS_VERSION=1.4.363.0
+VULKAN_HEADERS_SHA256=4a078be12bef21cfebc09d878b77a63cff9d68f899254a0b00d0e37ef73e7f7e
+# Intel oneVPL dispatcher for QSV; it loads the GPU driver's runtime at run time.
+LIBVPL_VERSION=2.17.0
+LIBVPL_SHA256=4de3e2faf1e8307fb282e4a43f443191810f6a6b0a484fffa7995ba1c814c6ec
 AMF_VERSION=1.5.3
 AMF_COMMIT=8c648005e07d4309033282bfd9947df2c7e76104
 AMF_SHA256=65e06bbbc515c3125cffd89fe0a3639a2fedc4d8c7423fc82a60218295a3cc31
@@ -32,7 +39,9 @@ TARGET_OS (darwin/linux/mingw32), TARGET_ARCH (x86_64/aarch64/arm),
 CROSS_PREFIX, HOST_TRIPLE, OPENSSL_TARGET, CMAKE_TOOLCHAIN_FILE,
 MACOSX_DEPLOYMENT_TARGET, FULL_STATIC (Linux, default 0), RUN_CHECKS (0/1).
 ENABLE_NVENC (default 1 on Linux/Windows x64/ARM64), ENABLE_AMF (default
-1 on Windows x64), ENABLE_MF (default 1 on Windows), all accept 0 or 1.
+1 on Linux/Windows x64), ENABLE_MF (default 1 on Windows), ENABLE_VULKAN
+(default 1 on Linux/Windows), ENABLE_QSV (default 1 on Windows x64), all
+accept 0 or 1.
 Cross builds require all matching toolchains; see docs/ffmpeg-build.md.
 HELP
     exit 0
@@ -85,20 +94,30 @@ export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig:$PREFIX/lib64/pkgconfig"
 nvenc_default=0
 amf_default=0
 mf_default=0
+vulkan_default=0
+qsv_default=0
 if [[ $TARGET_OS != darwin && $TARGET_ARCH != arm ]]; then nvenc_default=1; fi
+if [[ $TARGET_OS != darwin ]]; then vulkan_default=1; fi
+if [[ $TARGET_OS != darwin && $TARGET_ARCH == x86_64 ]]; then amf_default=1; fi
 if [[ $TARGET_OS == mingw32 ]]; then
     mf_default=1
-    [[ $TARGET_ARCH != x86_64 ]] || amf_default=1
+    [[ $TARGET_ARCH != x86_64 ]] || qsv_default=1
 fi
 ENABLE_NVENC=${ENABLE_NVENC:-$nvenc_default}
 ENABLE_AMF=${ENABLE_AMF:-$amf_default}
 ENABLE_MF=${ENABLE_MF:-$mf_default}
-for toggle in "$ENABLE_NVENC" "$ENABLE_AMF" "$ENABLE_MF"; do
+ENABLE_VULKAN=${ENABLE_VULKAN:-$vulkan_default}
+ENABLE_QSV=${ENABLE_QSV:-$qsv_default}
+for toggle in "$ENABLE_NVENC" "$ENABLE_AMF" "$ENABLE_MF" "$ENABLE_VULKAN" "$ENABLE_QSV"; do
     [[ $toggle == 0 || $toggle == 1 ]] || die 'hardware switches must be 0 or 1'
 done
 [[ $ENABLE_NVENC == 0 || ( $TARGET_OS != darwin && $TARGET_ARCH != arm ) ]] || die 'NVENC requires Linux/Windows x64 or ARM64'
 [[ $ENABLE_AMF == 0 || $TARGET_OS != darwin ]] || die 'AMF requires Linux or Windows'
 [[ $ENABLE_MF == 0 || $TARGET_OS == mingw32 ]] || die 'Media Foundation requires Windows'
+[[ $ENABLE_VULKAN == 0 || $TARGET_OS != darwin ]] || die 'Vulkan Video requires Linux or Windows'
+# Linux QSV needs VAAPI, which would add system libva/libdrm; Linux Intel GPUs
+# encode through Vulkan Video instead.
+[[ $ENABLE_QSV == 0 || $TARGET_OS == mingw32 ]] || die 'QSV is built for Windows; Linux uses Vulkan Video'
 
 digest() {
     if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'
@@ -129,6 +148,18 @@ if [[ $ENABLE_NVENC == 1 ]]; then
         sed -n '1,/^ \*\//p' "$header"
     done > "$OUTPUT_DIR/licenses/NVIDIA-headers-MIT.txt"
 fi
+if [[ $ENABLE_VULKAN == 1 ]]; then
+    fetch "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-$VULKAN_HEADERS_VERSION.tar.gz" "$DOWNLOAD_DIR/Vulkan-Headers-$VULKAN_HEADERS_VERSION.tar.gz" "$VULKAN_HEADERS_SHA256"
+    tar -xf "$DOWNLOAD_DIR/Vulkan-Headers-$VULKAN_HEADERS_VERSION.tar.gz" -C "$BUILD_DIR"
+    mkdir -p "$PREFIX/include"
+    cp -R "$BUILD_DIR/Vulkan-Headers-vulkan-sdk-$VULKAN_HEADERS_VERSION/include/." "$PREFIX/include/"
+    cp "$BUILD_DIR/Vulkan-Headers-vulkan-sdk-$VULKAN_HEADERS_VERSION/LICENSE.md" "$OUTPUT_DIR/licenses/Vulkan-Headers-Apache2-MIT.txt"
+fi
+if [[ $ENABLE_QSV == 1 ]]; then
+    fetch "https://github.com/intel/libvpl/archive/refs/tags/v$LIBVPL_VERSION.tar.gz" "$DOWNLOAD_DIR/libvpl-$LIBVPL_VERSION.tar.gz" "$LIBVPL_SHA256"
+    tar -xf "$DOWNLOAD_DIR/libvpl-$LIBVPL_VERSION.tar.gz" -C "$BUILD_DIR"
+    cp "$BUILD_DIR/libvpl-$LIBVPL_VERSION/LICENSE" "$OUTPUT_DIR/licenses/Intel-libvpl-MIT.txt"
+fi
 if [[ $ENABLE_AMF == 1 ]]; then
     # Unmodified official headers and license, archived from AMF_COMMIT. The
     # full SDK contains hundreds of MiB of unrelated sample executables.
@@ -150,6 +181,8 @@ ffmpeg_flags=(--prefix="$OUTPUT_DIR" --arch="$TARGET_ARCH" --target-os="$TARGET_
 if [[ $ENABLE_NVENC == 1 ]]; then ffmpeg_flags+=(--enable-ffnvcodec --enable-nvenc --enable-nvdec --enable-cuvid); fi
 if [[ $ENABLE_AMF == 1 ]]; then ffmpeg_flags+=(--enable-amf); fi
 if [[ $ENABLE_MF == 1 ]]; then ffmpeg_flags+=(--enable-mediafoundation); fi
+if [[ $ENABLE_VULKAN == 1 ]]; then ffmpeg_flags+=(--enable-vulkan); fi
+if [[ $ENABLE_QSV == 1 ]]; then ffmpeg_flags+=(--enable-libvpl --enable-d3d11va --enable-dxva2); fi
 x264_flags=(--prefix="$PREFIX" --enable-static --enable-pic --disable-cli --disable-opencl)
 cmake_flags=(-DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release
     -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" -DENABLE_SHARED=OFF
@@ -229,6 +262,15 @@ if [[ $TARGET_OS == linux ]]; then
     mv "$PREFIX/lib/pkgconfig/srt.pc.tmp" "$PREFIX/lib/pkgconfig/srt.pc"
     link_flags="$link_flags -static-libgcc"
 fi
+if [[ $ENABLE_QSV == 1 ]]; then
+    printf 'Building libvpl %s (log: %s)\n' "$LIBVPL_VERSION" "$OUTPUT_DIR/logs/libvpl.log"
+    (
+        cmake -S "$BUILD_DIR/libvpl-$LIBVPL_VERSION" -B "$BUILD_DIR/libvpl-cmake" "${cmake_flags[@]}" \
+            -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DINSTALL_EXAMPLES=OFF -DBUILD_TOOLS=OFF
+        cmake --build "$BUILD_DIR/libvpl-cmake" --parallel "$JOBS"
+        cmake --install "$BUILD_DIR/libvpl-cmake"
+    ) >"$OUTPUT_DIR/logs/libvpl.log" 2>&1
+fi
 ffmpeg_flags+=(--extra-cflags="-I$PREFIX/include" --extra-ldflags="$link_flags")
 printf 'Building FFmpeg %s (log: %s)\n' "$FFMPEG_VERSION" "$OUTPUT_DIR/logs/ffmpeg.log"
 (
@@ -249,7 +291,7 @@ cp "$BUILD_DIR/openssl-$OPENSSL_VERSION/LICENSE.txt" "$OUTPUT_DIR/licenses/OpenS
         printf '\n===== %s =====\n' "${notice##*/}"
         cat "$notice"
     done
-    for notice in "$OUTPUT_DIR/licenses/NVIDIA-headers-MIT.txt" "$OUTPUT_DIR/licenses/AMD-AMF-MIT.txt"; do
+    for notice in "$OUTPUT_DIR/licenses/NVIDIA-headers-MIT.txt" "$OUTPUT_DIR/licenses/AMD-AMF-MIT.txt" "$OUTPUT_DIR/licenses/Vulkan-Headers-Apache2-MIT.txt" "$OUTPUT_DIR/licenses/Intel-libvpl-MIT.txt"; do
         if [[ -f $notice ]]; then printf '\n===== %s =====\n' "${notice##*/}"; cat "$notice"; fi
     done
 } > "$OUTPUT_DIR/licenses/NOTICE.txt"
@@ -261,6 +303,7 @@ binary="$OUTPUT_DIR/bin/ffmpeg"
     printf 'FFmpeg %s\nOpenSSL %s\nSRT %s\nx264 %s\nOS %s\nArchitecture %s\n' "$FFMPEG_VERSION" "$OPENSSL_VERSION" "$SRT_VERSION" "$X264_COMMIT" "$TARGET_OS" "$TARGET_ARCH"
     printf 'SHA256 %s\n' "$(digest "$binary")"
     printf 'NVENC/NVDEC headers enabled: %s (%s)\nAMF headers enabled: %s (%s)\nMedia Foundation enabled: %s\n' "$ENABLE_NVENC" "$NV_HEADERS_VERSION" "$ENABLE_AMF" "$AMF_VERSION" "$ENABLE_MF"
+    printf 'Vulkan headers enabled: %s (%s)\nQSV libvpl enabled: %s (%s)\n' "$ENABLE_VULKAN" "$VULKAN_HEADERS_VERSION" "$ENABLE_QSV" "$LIBVPL_VERSION"
     "$CC" --version
     printf '\nFFmpeg configure arguments:\n'; printf '%q ' "${ffmpeg_flags[@]}"; printf '\n'
 } > "$OUTPUT_DIR/build-manifest.txt"
@@ -280,11 +323,11 @@ if [[ $run_checks == 1 ]]; then
         linux)
             if command -v readelf >/dev/null; then
                 readelf -d "$binary" > "$OUTPUT_DIR/logs/linked-libraries.txt"
-                if grep -E 'NEEDED.*(libsrt|libssl|libcrypto|libx264|libstdc\+\+|libgcc_s)' "$OUTPUT_DIR/logs/linked-libraries.txt"; then die 'third-party shared library found'; fi
+                if grep -E 'NEEDED.*(libsrt|libssl|libcrypto|libx264|libstdc\+\+|libgcc_s|libvulkan|libva|libvpl)' "$OUTPUT_DIR/logs/linked-libraries.txt"; then die 'third-party shared library found'; fi
             fi ;;
         mingw32)
             "${CROSS_PREFIX}objdump" -p "$binary" > "$OUTPUT_DIR/logs/linked-libraries.txt"
-            if grep -Ei 'DLL Name:.*(libstdc|libgcc|libwinpthread|libsrt|libssl|libcrypto|libx264)' "$OUTPUT_DIR/logs/linked-libraries.txt"; then die 'non-system DLL found'; fi ;;
+            if grep -Ei 'DLL Name:.*(libstdc|libgcc|libwinpthread|libsrt|libssl|libcrypto|libx264|vulkan-1|libvpl)' "$OUTPUT_DIR/logs/linked-libraries.txt"; then die 'non-system DLL found'; fi ;;
     esac
 fi
 printf 'FFmpeg ready: %s\nEmbed with: CAPTUREFAB_FFMPEG_BINARY=%q CAPTUREFAB_FFMPEG_LICENSE=%q cargo build --release\n' "$binary" "$binary" "$OUTPUT_DIR/licenses/NOTICE.txt"

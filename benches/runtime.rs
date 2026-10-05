@@ -1,5 +1,5 @@
 use capturefab::{
-    frame,
+    frame, jpeg,
     shared_memory::SharedRing,
     storage::{self, StoragePolicy},
     types::{Frame, MONO8, RGB8},
@@ -277,6 +277,38 @@ fn main() {
             b.run(&name, data.len(), || {
                 png(data, 1920, 1200, color, compression, filter)
             });
+        }
+    }
+    // JPEG stills: libjpeg-turbo in process, and nvJPEG through its helper
+    // once warm (set CAPTUREFAB_EXECUTABLE to the capturefab binary).
+    for (name, format) in [("Mono8", MONO8), ("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
+        let f = frame(1920, 1200, format);
+        #[cfg(feature = "jpeg")]
+        b.run(
+            &format!("jpeg/turbo/{name}/1920x1200"),
+            f.data.len(),
+            || jpeg::software(&jpeg::Raster::new(&f).unwrap()).unwrap(),
+        );
+        #[cfg(feature = "nvjpeg")]
+        {
+            let label = format!("jpeg/nvjpeg/{name}/1920x1200");
+            if b.selected(&label) {
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_secs(30)
+                    && jpeg::encode_with_backend(&f).unwrap().1 != jpeg::Backend::NvJpeg
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if jpeg::encode_with_backend(&f).unwrap().1 == jpeg::Backend::NvJpeg {
+                    b.run(&label, f.data.len(), || {
+                        let (bytes, backend) = jpeg::encode_with_backend(&f).unwrap();
+                        assert_eq!(backend, jpeg::Backend::NvJpeg, "fell back to the CPU");
+                        bytes
+                    });
+                } else {
+                    println!("{label:<40} unavailable on this host");
+                }
+            }
         }
     }
     let data = vec![0x5a; 8 << 20];

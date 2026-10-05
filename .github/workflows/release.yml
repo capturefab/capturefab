@@ -75,6 +75,12 @@ jobs:
       - name: Install NASM
         if: runner.os == 'macOS' && matrix.arch == 'x86_64'
         run: brew install nasm
+      - name: Install NASM for libjpeg-turbo SIMD
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm --no-progress -y
+          Add-Content $env:GITHUB_PATH 'C:\Program Files\NASM'
       - name: Keep LF line endings
         if: runner.os == 'Windows'
         run: git config --global core.autocrlf false

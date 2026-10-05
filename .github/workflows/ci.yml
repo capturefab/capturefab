@@ -26,6 +26,9 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal -c clippy -c rustfmt --no-self-update && rustup default stable
+      - name: Install NASM for libjpeg-turbo SIMD
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-features --all-targets -- -D warnings
@@ -43,6 +46,15 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - name: Install NASM for libjpeg-turbo SIMD
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm
+      - name: Install NASM for libjpeg-turbo SIMD
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm --no-progress -y
+          Add-Content $env:GITHUB_PATH 'C:\Program Files\NASM'
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --locked
 
@@ -55,8 +67,11 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - name: Install NASM for libjpeg-turbo SIMD
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo build --locked --no-default-features --features usb
+      - run: cargo build --locked --no-default-features --features usb,jpeg,nvjpeg
 
   site:
     name: Site and release scripts

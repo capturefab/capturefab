@@ -91,3 +91,36 @@ Not established by these checks: NVENC and AMF packed-RGB input (guarded at
 runtime by an encoder probe that falls back to YUV input), QSV, VAAPI and Media
 Foundation with the new input formats, the preview shader on non-Apple OpenGL
 drivers or OpenGL ES, and Bayer recordings from physical cameras.
+
+## NVIDIA Jetson acceleration — 2026-10-05
+
+On an NVIDIA Jetson AGX Orin (JetPack 7, L4T R39.2.1, CUDA 13.2, nvJPEG
+13.1, Ubuntu 24.04 aarch64, Rust 1.99), Capturefab was built natively with
+`--no-default-features --features usb,jpeg,nvjpeg`, together with the bundled
+FFmpeg (NVENC 12.0 headers and Vulkan enabled). Formatting, clippy with all
+features, and the full test suite passed on the device.
+
+- nvJPEG: `doctor` reported the helper ready. 1920×1200 JPEG stills encoded
+  through the helper process in 2.0 ms (Mono8), 4.9 ms (RGB8) and 5.6 ms
+  (BayerRG8, including CPU demosaic), against 7.5, 13.7 and 15.6 ms for
+  libjpeg-turbo on the same CPU; every timed encode was confirmed to run on
+  the GPU. The nvJPEG hardware encode backend returned `ARCH_MISMATCH` on Orin,
+  so the GPU (CUDA) backend is used. A first test that ran while a large
+  language model saturated the GPU hung inside the driver and survived SIGKILL;
+  this motivated the helper's per-request deadline and CPU fallback, which are
+  covered by unit tests with hung and misbehaving fake helpers.
+- Video: FFmpeg's NVENC cannot load on Orin (`libnvidia-encode` needs
+  `libnvcuvid`, present only for OpenRM GPUs) and Orin's Vulkan driver lacks
+  `VK_KHR_video_encode_queue`; both were rejected by the encoder probe.
+  Automatic selection then chose `nvv4l2h264enc`/`nvv4l2h265enc` through
+  GStreamer, and simulator recordings at 1920×1080 from BayerRG8 and Mono8
+  decoded completely. Encoding H.264 used 50% of one core across the GStreamer
+  and FFmpeg processes, against 412% for libx264. `nvv4l2av1enc` is listed by
+  GStreamer but Orin has no AV1 encoder, and the probe rejects it.
+- The bundled FFmpeg linked only libc, libm and the dynamic loader; it loaded
+  the system Vulkan loader at run time.
+
+Not established: NVENC (including AV1) on discrete NVIDIA GPUs or Jetson Thor,
+Vulkan Video encode on any GPU, AMD AMF on Linux, Intel QSV on Windows, and
+nvJPEG on x86_64 or Windows. These paths are probed at run time and fall back
+to the next encoder.

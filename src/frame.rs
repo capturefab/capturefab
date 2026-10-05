@@ -81,7 +81,10 @@ fn checked_pixels(frame: &Frame) -> Result<usize> {
 }
 /// Convert a PFNC frame into any pixel representation (RGB, RGBA, a GUI color
 /// type) with a single allocation; `pixel` maps each interpolated RGB triple.
-pub fn convert<P: Copy + Default>(frame: &Frame, pixel: impl Fn([u8; 3]) -> P) -> Result<Vec<P>> {
+pub fn convert<P: Copy + Default + Send>(
+    frame: &Frame,
+    pixel: impl Fn([u8; 3]) -> P + Sync,
+) -> Result<Vec<P>> {
     let pixels = checked_pixels(frame)?;
     // Streaming formats map source to output in order; `collect` over a slice
     // iterator knows its exact length, so it neither pre-fills nor bounds-checks.
@@ -130,12 +133,12 @@ pub fn convert<P: Copy + Default>(frame: &Frame, pixel: impl Fn([u8; 3]) -> P) -
             let (w, h, data) = (frame.width as usize, frame.height as usize, &frame.data);
             let color = |x: usize, y: usize| pattern[(y & 1) * 2 + (x & 1)];
             let bounded = |x: usize, y: usize| pixel(bayer_bounded(frame, pattern, x, y));
-            for (y, line) in out.chunks_exact_mut(w).enumerate() {
+            let demosaic_row = |y: usize, line: &mut [P]| {
                 if y == 0 || y + 1 == h || w < 3 {
                     for (x, px) in line.iter_mut().enumerate() {
                         *px = bounded(x, y);
                     }
-                    continue;
+                    return;
                 }
                 (line[0], line[w - 1]) = (bounded(0, y), bounded(w - 1, y));
                 let chroma = color(0, y) + color(1, y) - 1;
@@ -160,6 +163,26 @@ pub fn convert<P: Copy + Default>(frame: &Frame, pixel: impl Fn([u8; 3]) -> P) -
                         [far, green, near]
                     });
                 }
+            };
+            // Rows are independent (each reads three input rows), so large
+            // frames are split into row blocks across cores.
+            let threads = worker_threads(pixels);
+            let block = h.div_ceil(threads).max(1) * w;
+            if threads > 1 {
+                std::thread::scope(|scope| {
+                    for (i, rows) in out.chunks_mut(block).enumerate() {
+                        let demosaic_row = &demosaic_row;
+                        scope.spawn(move || {
+                            for (j, line) in rows.chunks_exact_mut(w).enumerate() {
+                                demosaic_row(i * block / w + j, line);
+                            }
+                        });
+                    }
+                });
+            } else {
+                for (y, line) in out.chunks_exact_mut(w).enumerate() {
+                    demosaic_row(y, line);
+                }
             }
             Ok(out)
         }
@@ -169,6 +192,14 @@ pub fn convert<P: Copy + Default>(frame: &Frame, pixel: impl Fn([u8; 3]) -> P) -
     }
 }
 
+/// Threads for CPU-bound per-pixel work: one below half a megapixel, where
+/// spawning costs more than it saves, else up to eight available cores.
+fn worker_threads(pixels: usize) -> usize {
+    if pixels < 512 * 1024 {
+        return 1;
+    }
+    std::thread::available_parallelism().map_or(1, |n| n.get().min(8))
+}
 /// Color filter layout as the channel (0 R, 1 G, 2 B) at (x & 1, y & 1),
 /// indexed `[(y & 1) * 2 + (x & 1)]`.
 pub fn bayer_pattern(pixel_format: u32) -> [usize; 4] {
@@ -341,6 +372,9 @@ pub fn encode(frame: &Frame, format: &str) -> Result<Vec<u8>> {
     if format == "raw" {
         return Ok(frame.data.clone());
     }
+    if format == "jpeg" {
+        return crate::jpeg::encode(frame);
+    }
     let rgb = rgb(frame)?;
     let mut bytes = Vec::new();
     match format {
@@ -368,7 +402,7 @@ pub fn encode(frame: &Frame, format: &str) -> Result<Vec<u8>> {
             write!(bytes, "P5\n{} {}\n255\n", frame.width, frame.height)?;
             bytes.extend(rgb.as_chunks::<3>().0.iter().map(|p| p[0]));
         }
-        _ => bail!("unknown image format {format}; use png, raw, pgm or ppm"),
+        _ => bail!("unknown image format {format}; use png, jpeg, raw, pgm or ppm"),
     }
     Ok(bytes)
 }
@@ -495,6 +529,8 @@ mod tests {
             (5, 7),
             (33, 17),
             (64, 48),
+            // Above the threading threshold, with uneven row blocks.
+            (1031, 517),
         ];
         for (seed, (width, height)) in sizes.into_iter().enumerate() {
             for pixel_format in 0x0108_0008..=0x0108_000b {

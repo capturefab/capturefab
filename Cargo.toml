@@ -8,9 +8,13 @@ license = "MIT"
 repository = "https://github.com/capturefab/capturefab"
 
 [features]
-default = ["gui", "usb"]
+default = ["gui", "usb", "jpeg", "nvjpeg"]
 gui = ["dep:eframe"]
 usb = ["dep:nusb"]
+# libjpeg-turbo, built from source with its NEON/SSE2/AVX2 SIMD (x86 needs NASM).
+jpeg = ["dep:turbojpeg"]
+# NVIDIA nvJPEG/CUDA, loaded at runtime in an isolated helper process; no SDK at build time.
+nvjpeg = ["dep:libloading"]
 wgpu = ["gui", "eframe/wgpu"]
 
 [dependencies]
@@ -35,6 +39,8 @@ md-5 = "0.10"
 sha2 = "0.10"
 fs2 = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+turbojpeg = { version = "1.5", optional = true, default-features = false, features = ["cmake", "require-simd"] }
+libloading = { version = "0.8", optional = true }
 
 # ARMv8 SHA-2 instructions for storage integrity hashing. x86 already selects
 # SHA-NI at runtime without this; the asm crate does not assemble under MSVC.

@@ -19,8 +19,8 @@ FFmpeg stays a separate executable. Never enable nonfree FFmpeg components: the 
 ## Commands
 
 ```sh
-cargo build                                                   # desktop (default features: gui, usb)
-cargo build --release --no-default-features --features usb    # headless
+cargo build                                                   # desktop (default features: gui, usb, jpeg, nvjpeg)
+cargo build --release --no-default-features --features usb,jpeg,nvjpeg  # headless
 cargo test
 cargo test --test cli                                         # end-to-end binary tests (tests/cli.rs)
 cargo test --lib storage::                                    # unit tests in one module

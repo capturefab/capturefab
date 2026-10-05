@@ -588,8 +588,8 @@ fn process(
             let duration = timeout(timeout_ms)?;
             ensure!((1..=100_000).contains(&count), "count must be 1..100000");
             ensure!(
-                ["png", "raw", "ppm", "pgm"].contains(&format.as_str()),
-                "format must be png, raw, pgm or ppm"
+                ["png", "jpeg", "raw", "ppm", "pgm"].contains(&format.as_str()),
+                "format must be png, jpeg, raw, pgm or ppm"
             );
             ensure!(!output.is_empty(), "provide an output path");
             ensure!(
@@ -667,8 +667,8 @@ fn validate_capture(output: &str, count: u32, timeout_ms: u64, format: &str) -> 
     timeout(timeout_ms)?;
     ensure!((1..=100_000).contains(&count), "count must be 1..100000");
     ensure!(
-        ["png", "raw", "ppm", "pgm"].contains(&format),
-        "format must be png, raw, pgm or ppm"
+        ["png", "jpeg", "raw", "ppm", "pgm"].contains(&format),
+        "format must be png, jpeg, raw, pgm or ppm"
     );
     ensure!(!output.is_empty(), "provide an output path");
     Ok(())
