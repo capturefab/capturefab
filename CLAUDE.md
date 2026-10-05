@@ -4,7 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Capturefab is an MIT-licensed Rust camera workbench: one binary that is both an egui desktop app (no subcommand) and a scriptable CLI. It implements GigE Vision, USB3 Vision and GenICam natively in Rust; webcams, RTSP/SRT/ONVIF, files, decoding and encoding go through a bundled FFmpeg executable (not linked). Never link Aravis, libusb, vendor SDKs or nonfree FFmpeg components; Aravis is only an external test reference.
+Capturefab is an MIT-licensed Rust camera workbench: one binary that is both an egui desktop app (no subcommand) and a scriptable CLI. It implements GigE Vision, USB3 Vision and GenICam natively in Rust; webcams, RTSP/SRT/ONVIF, files, decoding and encoding go through a bundled FFmpeg executable (not linked). Aravis is currently used only as an external test reference.
+
+## Vendor and native dependencies
+
+Linking vendor SDKs and native libraries (camera SDKs, CUDA/nvJPEG, platform media frameworks, libusb, Aravis) is permitted when it fits the repo's structure:
+- Gate each one behind an optional Cargo feature so the default and headless builds keep working without it, and so `doctor` can report whether it was compiled in.
+- Keep it in the process that uses it: camera SDKs belong in the per-camera worker (`session::run_worker`), never in the GUI or coordinator.
+- Isolate it in a separate helper process, the way FFmpeg is run, when its license cannot be combined with Capturefab's MIT code in release binaries (for example GPL), when it can crash, hang or leak and would take the camera worker down with it, or when it would bloat or complicate every build. Talk to helpers over the existing patterns: bounded stdio JSON for control, shared memory or pipes for pixels.
+- Check the vendor's redistribution terms before bundling its runtime, and add its notices to the release license output.
+
+FFmpeg stays a separate executable. Never enable nonfree FFmpeg components: the bundled build is GPL, so a nonfree build could not be redistributed.
 
 ## Commands
 
