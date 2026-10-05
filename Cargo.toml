@@ -1,0 +1,49 @@
+[package]
+name = "capturefab"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Rust camera workbench for GenICam GigE Vision and USB3 Vision"
+license = "GPL-3.0-only"
+repository = "https://github.com/capturefab/capturefab"
+
+[features]
+default = ["gui", "usb"]
+gui = ["dep:eframe"]
+usb = ["dep:nusb"]
+wgpu = ["gui", "eframe/wgpu"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
+clap_complete = "4.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+roxmltree = "0.20"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+png = "0.17"
+if-addrs = "0.13"
+socket2 = "0.6"
+ctrlc = "3.4"
+getrandom = "0.3"
+eframe = { version = "0.33", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "wayland", "accesskit"] }
+nusb = { version = "0.2.7", optional = true }
+memmap2 = "0.9"
+base64 = "0.22"
+sha1 = "0.10"
+md-5 = "0.10"
+sha2 = "0.10"
+fs2 = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+debug = 0
+
+[[bench]]
+name = "runtime"
+harness = false

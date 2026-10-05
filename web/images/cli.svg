@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="712" viewBox="0 0 1200 712" role="img" aria-labelledby="title">
+<title id="title">capturefab discovery, configuration, and capture commands against the built-in simulator</title>
+<rect width="1200" height="712" rx="10" fill="#111612"/>
+<path d="M0 10a10 10 0 0 1 10-10h1180a10 10 0 0 1 10 10v30h-1200z" fill="#1b251a"/>
+<circle cx="24" cy="20" r="6" fill="#354030"/><circle cx="44" cy="20" r="6" fill="#354030"/><circle cx="64" cy="20" r="6" fill="#354030"/>
+<text x="600" y="25" text-anchor="middle" fill="#a5b19e" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13">capturefab</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15">
+<text x="28" y="83" xml:space="preserve" fill="#a0d68d">$ <tspan fill="#e6ece1">capturefab --simulate discover</tspan></text>
+<text x="28" y="105" xml:space="preserve" fill="#a5b19e">ID                           TRANSPORT  MODEL                    SERIAL</text>
+<text x="28" y="127" xml:space="preserve" fill="#a5b19e">sim:0                        simulator  Pattern camera           SIM0</text>
+<text x="28" y="149" xml:space="preserve" fill="#a0d68d">$ <tspan fill="#e6ece1">capturefab --camera sim:0 get Width Height PixelFormat</tspan></text>
+<text x="28" y="171" xml:space="preserve" fill="#a5b19e">Width                              640</text>
+<text x="28" y="193" xml:space="preserve" fill="#a5b19e">Height                             480</text>
+<text x="28" y="215" xml:space="preserve" fill="#a5b19e">PixelFormat                        "Mono8"</text>
+<text x="28" y="237" xml:space="preserve" fill="#a0d68d">$ <tspan fill="#e6ece1">capturefab --camera sim:0 set ExposureTime=5000 Gain=6</tspan></text>
+<text x="28" y="259" xml:space="preserve" fill="#a5b19e">ExposureTime                       5000.0</text>
+<text x="28" y="281" xml:space="preserve" fill="#a5b19e">Gain                               6.0</text>
+<text x="28" y="303" xml:space="preserve" fill="#a0d68d">$ <tspan fill="#e6ece1">capturefab --camera sim:0 capture -o frame.png</tspan></text>
+<text x="28" y="325" xml:space="preserve" fill="#a5b19e">{</text>
+<text x="28" y="347" xml:space="preserve" fill="#a5b19e">  "count": 1,</text>
+<text x="28" y="369" xml:space="preserve" fill="#a5b19e">  "files": [</text>
+<text x="28" y="391" xml:space="preserve" fill="#a5b19e">    "frame.png"</text>
+<text x="28" y="413" xml:space="preserve" fill="#a5b19e">  ],</text>
+<text x="28" y="435" xml:space="preserve" fill="#a5b19e">  "frames": [</text>
+<text x="28" y="457" xml:space="preserve" fill="#a5b19e">    {</text>
+<text x="28" y="479" xml:space="preserve" fill="#a5b19e">      "bytes": 307200,</text>
+<text x="28" y="501" xml:space="preserve" fill="#a5b19e">      "height": 480,</text>
+<text x="28" y="523" xml:space="preserve" fill="#a5b19e">      "id": 1,</text>
+<text x="28" y="545" xml:space="preserve" fill="#a5b19e">      "pixel_format": 17301505,</text>
+<text x="28" y="567" xml:space="preserve" fill="#a5b19e">      "timestamp_ns": 21602750,</text>
+<text x="28" y="589" xml:space="preserve" fill="#a5b19e">      "width": 640</text>
+<text x="28" y="611" xml:space="preserve" fill="#a5b19e">    }</text>
+<text x="28" y="633" xml:space="preserve" fill="#a5b19e">  ]</text>
+<text x="28" y="655" xml:space="preserve" fill="#a5b19e">}</text>
+<text x="28" y="677" xml:space="preserve" fill="#a0d68d">$ <tspan fill="#e6ece1"></tspan></text>
+</g>
+</svg>

@@ -1,0 +1,14 @@
+//! Capability-based connection guidance, including cameras behind HDMI capture devices.
+use serde_json::{Value, json};
+pub fn guide(model: Option<&str>) -> Value {
+    let routes = vec![
+        json!({"family":"GigE Vision","connection":"Ethernet","selector":"gige:192.168.1.10","discover":"capturefab discover","features":"GenICam XML; native Rust GVCP/GVSP"}),
+        json!({"family":"USB3 Vision","connection":"USB 3","selector":"discovered usb3 ID","discover":"capturefab discover","features":"GenICam XML; native Rust USB transfer; OS USB permissions required"}),
+        json!({"family":"UVC / webcams / HDMI capture cards","connection":"host camera driver","selector":if cfg!(target_os="macos"){"avfoundation:0"}else if cfg!(target_os="windows"){"dshow:video=Device name"}else{"v4l2:/dev/video0"},"discover":"capturefab native","features":"AVFoundation / V4L2 / DirectShow; device must expose a video input"}),
+        json!({"family":"ONVIF IP cameras","connection":"network","selector":"onvif:http://192.168.1.10/onvif/device_service","discover":"capturefab onvif discover","features":"profile/RTSP resolution; WS-Security and HTTP authentication"}),
+        json!({"family":"network / files / virtual camera drivers","connection":"media source","selector":"rtsp://host/stream or srt://host:9000 or video.mkv","discover":"explicit stream URI or capturefab native","features":"bundled FFmpeg protocols and codecs; native virtual devices work through host drivers"}),
+        json!({"family":"DSLR / mirrorless / action cameras","connection":"clean HDMI to host capture device, or vendor-provided UVC/virtual camera/RTSP output","discover":"capturefab native","features":"works when a supported video transport is exposed; proprietary USB PTP/tether controls and camera Wi-Fi apps are not implemented"}),
+    ];
+    let lumix = json!({"model":"Panasonic Lumix DMC-GX85 / GX80","supported_route":"clean HDMI -> HDMI capture card -> host video driver -> Capturefab","instructions":["Connect the camera HDMI output to a capture device, then connect that device to this computer.","Enable clean HDMI output in camera settings; select a capture-device-compatible resolution.","Run capturefab native, then use the displayed device ID with --camera to capture or record."],"source":"https://help.na.panasonic.com/answers/specifications-lumix-dsc-cameras-and-panasonic-camcorders-live-video-streaming-compatibility/","direct_usb_tether":"not implemented; do not assume USB supplies video","verified_with_this_model":false});
+    json!({"routes":routes,"model":model,"guidance":if model.is_some_and(|m|m.to_ascii_lowercase().contains("gx85")||m.to_ascii_lowercase().contains("gx80")){lumix}else{Value::Null},"principle":"Discover transports and report capabilities; an unsupported vendor control is a clear error, not a fabricated success."})
+}

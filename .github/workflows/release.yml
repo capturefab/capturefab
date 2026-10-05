@@ -1,0 +1,282 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Check version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then set -- --version "$GITHUB_REF_NAME"; fi
+          version=$(python3 scripts/release.py version "$@")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.os }} ${{ matrix.arch }}
+    needs: version
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: x86_64, target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04, container: 'ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214' }
+          - { os: linux, arch: aarch64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, container: 'ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214' }
+          - { os: macos, arch: aarch64, target: aarch64-apple-darwin, runner: macos-15, macos: '11.0' }
+          - { os: macos, arch: x86_64, target: x86_64-apple-darwin, runner: macos-15-intel, macos: '10.15' }
+          - { os: windows, arch: x86_64, target: x86_64-pc-windows-msvc, runner: windows-2025 }
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 150
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      PYTHON: ${{ matrix.os == 'windows' && 'python' || 'python3' }}
+      RELEASE_TARGET: ${{ matrix.target }}
+      RELEASE_OS: ${{ matrix.os }}
+      RELEASE_ARCH: ${{ matrix.arch }}
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos }}
+      MACOS_SIGNING: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' }}
+      WINDOWS_SIGNING: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates cmake curl git nasm perl pkg-config python3 xz-utils
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install NASM
+        if: runner.os == 'macOS' && matrix.arch == 'x86_64'
+        run: brew install nasm
+      - name: Keep LF line endings
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        if: runner.os == 'Windows'
+        with:
+          msystem: UCRT64
+          install: curl diffutils make perl tar xz
+          pacboy: cmake:p gcc:p nasm:p ninja:p pkgconf:p
+      - id: ffmpeg
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/ffmpeg-bundle
+          key: ffmpeg-${{ matrix.target }}-${{ matrix.container || matrix.runner }}-${{ hashFiles('scripts/build-ffmpeg.sh', 'third_party/**') }}
+      - name: Build FFmpeg
+        if: steps.ffmpeg.outputs.cache-hit != 'true' && runner.os != 'Windows'
+        run: BUILD_DIR="$RUNNER_TEMP/ffmpeg-build" scripts/build-ffmpeg.sh target/ffmpeg-bundle
+      - name: Build FFmpeg with MinGW
+        if: steps.ffmpeg.outputs.cache-hit != 'true' && runner.os == 'Windows'
+        shell: msys2 {0}
+        env:
+          TARGET_OS: mingw32
+          TARGET_ARCH: ${{ matrix.arch }}
+          CC: gcc
+          CXX: g++
+        run: BUILD_DIR="$(cygpath -u "$RUNNER_TEMP")/ffmpeg-build" scripts/build-ffmpeg.sh target/ffmpeg-bundle
+      - if: steps.ffmpeg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/ffmpeg-bundle
+          key: ${{ steps.ffmpeg.outputs.cache-primary-key }}
+      - name: Build, smoke-test and package
+        run: '"$PYTHON" scripts/release.py build --version "$VERSION" --target "$RELEASE_TARGET" --os "$RELEASE_OS" --arch "$RELEASE_ARCH" --ffmpeg-bundle target/ffmpeg-bundle --output dist'
+      - name: Import Apple signing identity
+        if: runner.os == 'macOS' && env.MACOS_SIGNING == 'true'
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(openssl rand -hex 24)
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -d user -s "$keychain"
+          identity=$(security find-identity -v -p codesigning "$keychain" | awk 'NR == 1 && length($2) == 40 {print $2}')
+          if [ -z "$identity" ]; then echo "::error::MACOS_CERTIFICATE_P12_BASE64 holds no valid code signing identity"; exit 1; fi
+          echo "MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          if [ -n "$MACOS_NOTARY_KEY" ]; then
+            printf '%s' "$MACOS_NOTARY_KEY" > "$RUNNER_TEMP/notary.p8"
+            xcrun notarytool store-credentials capturefab-notary --key "$RUNNER_TEMP/notary.p8" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER"
+            rm "$RUNNER_TEMP/notary.p8"
+            echo "MACOS_NOTARY_PROFILE=capturefab-notary" >> "$GITHUB_ENV"
+          fi
+      - name: Import Windows signing certificate
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'certificate.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1
+          "WINDOWS_SIGNTOOL=$($signtool.FullName)" >> $env:GITHUB_ENV
+          "WINDOWS_CERTIFICATE_PFX=$pfx" >> $env:GITHUB_ENV
+      - name: Sign and repackage
+        if: env.MACOS_SIGN_IDENTITY != '' || env.WINDOWS_CERTIFICATE_PFX != ''
+        env:
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: '"$PYTHON" scripts/release.py build --repackage --version "$VERSION" --target "$RELEASE_TARGET" --os "$RELEASE_OS" --arch "$RELEASE_ARCH" --ffmpeg-bundle target/ffmpeg-bundle --output dist'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: build-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist
+          if-no-files-found: ignore
+          retention-days: 7
+
+  assemble:
+    name: Assemble release
+    needs: [version, build]
+    if: ${{ !cancelled() && needs.version.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GPG_SIGNING: ${{ secrets.RELEASE_GPG_PRIVATE_KEY != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: build-*
+          path: dist/builds
+      - name: Import checksum signing key
+        id: gpg
+        if: env.GPG_SIGNING == 'true'
+        env:
+          RELEASE_GPG_PRIVATE_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          install -d -m 700 "$GNUPGHOME"
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          printf '%s\n' "$RELEASE_GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "fingerprint=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" {print $10; exit}')" >> "$GITHUB_OUTPUT"
+      - name: Assemble checksums, manifest, notes and corresponding source
+        env:
+          GPG_KEY: ${{ steps.gpg.outputs.fingerprint }}
+          RELEASE_GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+          PROVENANCE: ${{ vars.CAPTUREFAB_ATTEST == 'true' }}
+        run: |
+          set -- --version "$VERSION" --input dist/builds --output dist/release --repository "$GITHUB_REPOSITORY" --download-base "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/v$VERSION"
+          if [ -n "$GPG_KEY" ]; then set -- "$@" --gpg-key "$GPG_KEY"; fi
+          if [ "$PROVENANCE" = true ]; then set -- "$@" --provenance; fi
+          python3 scripts/release.py assemble "$@"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release
+          path: dist/release
+          if-no-files-found: error
+          retention-days: 30
+
+  attest:
+    name: Attest build provenance
+    needs: assemble
+    if: vars.CAPTUREFAB_ATTEST == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release
+          path: dist/release
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/release/SHA256SUMS
+
+  draft:
+    name: Upload to a draft GitHub release
+    needs: [version, assemble, attest]
+    if: ${{ !cancelled() && github.ref_type == 'tag' && needs.assemble.result == 'success' && needs.attest.result != 'failure' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release
+          path: dist/release
+      - name: Create or update the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          tag="v$VERSION"
+          files=()
+          for file in dist/release/*; do
+            if [ "$file" != dist/release/release-notes.md ]; then files+=("$file"); fi
+          done
+          state=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null || echo missing)
+          case $state in
+            missing)
+              flags=(--draft --verify-tag --title "Capturefab $VERSION" --notes-file dist/release/release-notes.md)
+              if [[ ${VERSION%%+*} == *-* ]]; then flags+=(--prerelease); fi
+              gh release create "$tag" "${files[@]}" "${flags[@]}" ;;
+            true)
+              existing=$(gh release view "$tag" --json assets --jq '.assets[].name')
+              while IFS= read -r asset; do
+                case $asset in
+                  capturefab-"$VERSION"-*|SHA256SUMS.asc) ;;
+                  *) continue ;;
+                esac
+                retained=false
+                for file in "${files[@]}"; do
+                  if [ "${file##*/}" = "$asset" ]; then retained=true; break; fi
+                done
+                if [ "$retained" = false ]; then gh release delete-asset "$tag" "$asset" --yes; fi
+              done <<< "$existing"
+              gh release edit "$tag" --notes-file dist/release/release-notes.md
+              gh release upload "$tag" "${files[@]}" --clobber ;;
+            *)
+              echo "::error::$tag is already published; this workflow only creates or updates draft releases"
+              exit 1 ;;
+          esac

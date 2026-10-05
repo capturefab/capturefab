@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Capturefab is a camera workbench with a fast desktop GUI and a Unix CLI. Discover GenICam cameras, capture network streams, and automate an existing session.">
+  <title>capturefab — a camera workbench, one binary</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="canonical" href="https://capturefab.github.io/capturefab/">
+  <link rel="alternate" type="application/atom+xml" title="Capturefab releases" href="feed.xml">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="shell">
+    <header class="site-header">
+      <a class="wordmark" href="#" aria-label="Capturefab home"><span class="prompt" aria-hidden="true">&gt;_</span> capturefab</a>
+      <nav aria-label="Main navigation">
+        <a href="#download">Download</a>
+        <a href="#quickstart">Quickstart</a>
+        <a href="#automation">Agents</a>
+        <a href="https://github.com/capturefab/capturefab">Source <span aria-hidden="true">↗</span></a>
+      </nav>
+    </header>
+    <main id="main">
+      <section class="hero" aria-labelledby="hero-title">
+        <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> Camera workbench <span class="separator">/</span> <span id="release-version">source checkout</span></p>
+        <h1 id="hero-title">Your cameras.<br>Your command line.</h1>
+        <p class="lead">Discover, configure, debug, and capture. A fast desktop GUI and a Unix CLI in one executable, with a shared session that your tools can drive.</p>
+        <div class="actions">
+          <a class="button primary" href="#download">Get capturefab <span aria-hidden="true">↓</span></a>
+          <a class="button" href="#quickstart">Start in the terminal</a>
+        </div>
+        <ul class="capability-line" aria-label="Camera input families">
+          <li>GigE Vision</li><li>USB3 Vision</li><li>ONVIF / RTSP</li><li>SRT</li><li>Host cameras</li>
+        </ul>
+      </section>
+
+      <section class="preview-section" aria-label="Capturefab screenshots">
+        <figure><a href="images/gui.png" aria-label="Open full-size GUI screenshot"><img src="images/gui.png" alt="Capturefab desktop workbench showing three simulated camera previews" width="2560" height="1680"></a><figcaption>Three simulated cameras, one workbench. Open for full size.</figcaption></figure>
+        <figure><a href="images/cli.svg" aria-label="Open full-size CLI example"><img src="images/cli.svg" alt="Capturefab discovery, configuration, and capture commands against the built-in simulator in a terminal" width="1200" height="712"></a><figcaption>The built-in simulator, from your shell.</figcaption></figure>
+      </section>
+
+      <section id="download" class="section" aria-labelledby="download-title">
+        <div class="section-heading"><p class="eyebrow">01 / Install</p><h2 id="download-title">Choose your binary.</h2></div>
+        <p class="section-intro">Pick the computer that will run capturefab. Desktop includes the GUI; headless is for servers, scripts, and devices without a display.</p>
+        <form class="platform-form" aria-label="Select a download">
+          <label>Operating system<select id="os-select" name="os"><option value="">Choose OS</option><option value="macos">macOS</option><option value="windows">Windows</option><option value="linux">Linux</option></select></label>
+          <label>Processor<select id="arch-select" name="arch"><option value="">Choose processor</option><option value="aarch64">ARM64 / Apple Silicon</option><option value="x86_64">x64 / Intel or AMD</option><option value="armv7">ARMv7 / 32-bit ARM</option></select></label>
+          <label>Build<select id="variant-select" name="variant"><option value="desktop">Desktop / GUI + CLI</option><option value="headless">Headless / CLI</option></select></label>
+        </form>
+        <p class="platform-hint" id="platform-hint">Apple Silicon Macs use ARM64; Intel Macs use x64. Raspberry Pi and Jetson with a 64-bit OS use Linux ARM64. A Pi with a 32-bit OS uses ARMv7.</p>
+        <div class="download-result" aria-live="polite" aria-atomic="true">
+          <div><p class="result-label" id="download-label">Published downloads</p><p id="download-description">The release manifest is loading.</p><p class="asset-detail" id="asset-detail" hidden></p></div>
+          <a id="primary-download" class="button primary" hidden>Download <span aria-hidden="true">↓</span></a>
+        </div>
+        <div id="verify-box" class="verify-box" hidden>
+          <p>Verify the downloaded file.</p><pre><code id="verify-command"></code></pre>
+          <p class="checksum" id="checksum-text"></p><div class="verify-links" id="verify-links"></div>
+        </div>
+        <details class="all-builds"><summary>All published builds</summary><div class="table-scroll"><table><caption>Available release assets and verification files</caption><thead><tr><th scope="col">System</th><th scope="col">Processor</th><th scope="col">Build</th><th scope="col">File</th><th scope="col">Verify</th></tr></thead><tbody id="asset-table"><tr><td colspan="5">Loading the release manifest…</td></tr></tbody></table></div></details>
+        <p class="small-note">Availability comes from the <a href="releases.json">release manifest</a>. A listed target becomes downloadable after its binary is built and validated. <a href="downloads.html">All downloads</a> · <a href="https://github.com/capturefab/capturefab#build-test-and-release">Build from source</a> · <a href="feed.xml">Atom release feed</a></p>
+        <noscript><p class="notice">JavaScript is optional. Open <a href="downloads.html">all downloads</a> for published files, or the <a href="releases.json">release manifest</a> for download URLs and SHA-256 checksums.</p></noscript>
+      </section>
+
+      <section id="quickstart" class="section" aria-labelledby="quickstart-title">
+        <div class="section-heading"><p class="eyebrow">02 / Capture</p><h2 id="quickstart-title">A few commands to a frame.</h2></div>
+        <div class="guide-grid">
+          <article class="guide-card"><h3>Open the GUI</h3><p>Launch the workbench, discover cameras, and connect to a preview.</p><div class="code-wrap"><pre><code>capturefab</code></pre><button class="copy-button" type="button" aria-label="Copy GUI launch command">Copy</button></div></article>
+          <article class="guide-card"><h3>Discover cameras</h3><p>Get structured discovery results for scripts and tools.</p><div class="code-wrap"><pre><code>capturefab discover --json</code></pre><button class="copy-button" type="button" aria-label="Copy discovery command">Copy</button></div></article>
+          <article class="guide-card wide"><h3>Read, configure, capture</h3><p>Use a discovered ID, unique serial, or a GigE camera's IP address. Feature names vary by camera; <code>features</code> shows the available controls.</p><div class="code-wrap"><pre><code>capturefab --camera 192.168.1.10 features
+capturefab --camera 192.168.1.10 get Width Height ExposureTime
+capturefab --camera 192.168.1.10 set ExposureTime=5000
+capturefab --camera 192.168.1.10 capture -n 10 -o frames</code></pre><button class="copy-button" type="button" aria-label="Copy configuration and capture commands">Copy</button></div></article>
+          <article class="guide-card"><h3>Open a network stream</h3><p>Use a stream URL directly, or resolve an ONVIF camera's profiles.</p><div class="code-wrap"><pre><code>capturefab --camera 'rtsp://camera/live' capture -o frame.png
+capturefab onvif discover --json
+capturefab --camera 'onvif:http://camera/onvif/device_service' capture -o onvif.png</code></pre><button class="copy-button" type="button" aria-label="Copy network camera commands">Copy</button></div></article>
+          <article class="guide-card"><h3>Use a host camera</h3><p>List cameras managed by the operating system, then use its native locator.</p><div class="code-wrap"><pre><code>capturefab native --json
+# macOS
+capturefab --camera avfoundation:0 capture -o webcam.png
+# Linux, including driver-backed USB or CSI cameras
+capturefab --camera v4l2:/dev/video0 capture -o webcam.png
+# Windows
+capturefab --camera 'dshow:video=Camera Name' capture -o webcam.png</code></pre><button class="copy-button" type="button" aria-label="Copy native camera commands">Copy</button></div></article>
+        </div>
+        <details class="forwarding"><summary>Forward a camera to MediaMTX or an NVR</summary><p>Publish to an existing RTSP server, SRT endpoint, or a local video file. Automatic encoder selection probes usable hardware and falls back to software.</p><div class="code-wrap"><pre><code>capturefab --camera 192.168.1.10 forward \
+  --output rtsp://localhost:8554/camera \
+  --encoder auto --fps 30 --bitrate 4M --duration 60</code></pre><button class="copy-button" type="button" aria-label="Copy frame forwarding command">Copy</button></div></details>
+      </section>
+
+      <section id="automation" class="section automation-section" aria-labelledby="automation-title">
+        <div class="section-heading"><p class="eyebrow">03 / Automate</p><h2 id="automation-title">Keep the session. Hand over the controls.</h2></div>
+        <p class="section-intro">The GUI exposes a local session. Shell scripts and coding agents can inspect it, connect cameras, change features, and capture frames while the window stays open.</p>
+        <div class="code-wrap"><pre><code>capturefab sessions --json
+capturefab --session gui status --json
+capturefab --session gui connect 192.168.1.10
+capturefab --session gui set ExposureTime=5000
+capturefab --session gui capture -n 10 -o frames
+capturefab schema --json</code></pre><button class="copy-button" type="button" aria-label="Copy session automation commands">Copy</button></div>
+        <div class="automation-notes"><p><strong>Unix conventions.</strong> Structured results on stdout; diagnostics on stderr. Exit codes, pipes, native shell completions, and foreground headless sessions.</p><p><strong>Agent readable.</strong> A versioned schema and local session API, plus instructions for Claude Code, Codex, OpenCode, and other tools that can invoke a CLI.</p></div>
+        <div class="text-links"><a href="agents.md">Agent instructions →</a><a href="llms.txt">llms.txt →</a><a href="https://github.com/capturefab/capturefab/blob/main/docs/hardware-validation.md">Hardware validation →</a></div>
+      </section>
+
+      <section class="section compatibility-section" aria-labelledby="compatibility-title">
+        <div class="section-heading"><p class="eyebrow">04 / Platforms</p><h2 id="compatibility-title">A workbench, wherever the camera is.</h2></div>
+        <ul class="platform-list"><li><strong>macOS</strong><span>Apple Silicon and Intel. Native cameras through AVFoundation.</span></li><li><strong>Windows</strong><span>x64 and ARM64 targets. Native cameras through DirectShow.</span></li><li><strong>Linux</strong><span>x64, ARM64, and ARMv7 targets. Native USB and CSI cameras through V4L2 drivers.</span></li><li><strong>Pi &amp; Jetson</strong><span>Use the Linux build matching the installed OS architecture. Headless builds suit remote capture.</span></li></ul>
+        <p class="small-note">The GUI uses GPU rendering. Video decoding and forwarding can use hardware acceleration when the selected build, driver, and device support it; automatic encoder selection tests the hardware and falls back to software. NVIDIA, Apple, AMD, Qualcomm, and ARM capabilities vary by platform.</p>
+        <p class="small-note">Transport, codec, operating system, and hardware coverage vary by build. See the release assets and <a href="https://github.com/capturefab/capturefab/blob/main/docs/hardware-validation.md">validation record</a> for tested combinations. USB permissions and host camera drivers come from the operating system.</p>
+      </section>
+    </main>
+    <footer class="site-footer"><p><span class="prompt" aria-hidden="true">&gt;_</span> capturefab <span class="separator">/</span> GPLv3</p><div><a href="https://github.com/capturefab/capturefab">Source</a><a href="https://github.com/capturefab/capturefab/issues">Issues</a><a href="feed.xml">Releases / Atom</a><a href="agents.md">For agents</a></div></footer>
+  </div>
+</body>
+</html>
