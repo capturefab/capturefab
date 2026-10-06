@@ -54,6 +54,12 @@ done
 OUTPUT_DIR=${1:-"$PWD/target/ffmpeg-bundle"}
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
+show_log() {
+    local log
+    log=$(ls -t "$OUTPUT_DIR"/logs/*.log 2>/dev/null | head -1) || true
+    [[ -z $log ]] || { printf 'build-ffmpeg: failed; end of %s:\n' "$log" >&2; tail -n 80 "$log" >&2; }
+}
+trap show_log ERR
 BUILD_DIR=${BUILD_DIR:-"$OUTPUT_DIR/build"}
 DOWNLOAD_DIR=${DOWNLOAD_DIR:-"$OUTPUT_DIR/sources"}
 mkdir -p "$BUILD_DIR" "$DOWNLOAD_DIR" "$OUTPUT_DIR/bin" "$OUTPUT_DIR/licenses" "$OUTPUT_DIR/logs"
