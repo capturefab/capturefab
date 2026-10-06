@@ -280,7 +280,7 @@ jobs:
     # On by default for releases; set CAPTUREFAB_ATTEST=false to turn off. The
     # attestations, including the repository identity, are recorded in the
     # public Sigstore transparency log.
-    if: needs.version.outputs.release == 'true' && vars.CAPTUREFAB_ATTEST != 'false'
+    if: ${{ !cancelled() && needs.version.outputs.release == 'true' && needs.assemble.result == 'success' && vars.CAPTUREFAB_ATTEST != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
