@@ -1649,6 +1649,7 @@ impl Workbench {
         }
         let mut layers = stack![body];
         if !docked && inspector > 0.5 {
+            // Below the title bar, so its buttons, including the one that closes this, stay reachable.
             layers = layers.push(
                 container(opaque(
                     container(self.inspector(p))
@@ -1657,7 +1658,11 @@ impl Workbench {
                         .clip(true)
                         .style(style::floating),
                 ))
-                .align_right(Fill),
+                .align_right(Fill)
+                .padding(iced::Padding {
+                    top: BAR,
+                    ..iced::Padding::ZERO
+                }),
             );
         }
         // Building this 1×1 view is what turns on GPU frame decoding.
