@@ -164,6 +164,12 @@ fi
 if [[ $ENABLE_QSV == 1 ]]; then
     fetch "https://github.com/intel/libvpl/archive/refs/tags/v$LIBVPL_VERSION.tar.gz" "$DOWNLOAD_DIR/libvpl-$LIBVPL_VERSION.tar.gz" "$LIBVPL_SHA256"
     tar -xf "$DOWNLOAD_DIR/libvpl-$LIBVPL_VERSION.tar.gz" -C "$BUILD_DIR"
+    # libvpl's pre-2005 MSVC fallback also matches GCC, where its wcscpy_s macro
+    # breaks the secure string inlines in mingw-w64 14 headers.
+    vpl_defs="$BUILD_DIR/libvpl-$LIBVPL_VERSION/libvpl/src/windows/mfx_dispatcher_defs.h"
+    sed 's/^#if _MSC_VER < 1400$/#if defined(_MSC_VER) \&\& _MSC_VER < 1400/' "$vpl_defs" > "$vpl_defs.tmp"
+    mv "$vpl_defs.tmp" "$vpl_defs"
+    grep -q '^#if defined(_MSC_VER) && _MSC_VER < 1400$' "$vpl_defs" || die 'libvpl MinGW patch did not apply'
     cp "$BUILD_DIR/libvpl-$LIBVPL_VERSION/LICENSE" "$OUTPUT_DIR/licenses/Intel-libvpl-MIT.txt"
 fi
 if [[ $ENABLE_AMF == 1 ]]; then
