@@ -282,6 +282,10 @@ if [[ $ENABLE_QSV == 1 ]]; then
         cmake --build "$BUILD_DIR/libvpl-cmake" --parallel "$JOBS"
         cmake --install "$BUILD_DIR/libvpl-cmake"
     ) >"$OUTPUT_DIR/logs/libvpl.log" 2>&1
+    # The static dispatcher is C++, but vpl.pc omits the C++ runtime that
+    # FFmpeg's C link test needs to resolve MFXLoad.
+    sed 's/^Libs.private:.*/& -lstdc++/' "$PREFIX/lib/pkgconfig/vpl.pc" > "$PREFIX/lib/pkgconfig/vpl.pc.tmp"
+    mv "$PREFIX/lib/pkgconfig/vpl.pc.tmp" "$PREFIX/lib/pkgconfig/vpl.pc"
 fi
 ffmpeg_flags+=(--extra-cflags="-I$PREFIX/include" --extra-ldflags="$link_flags")
 printf 'Building FFmpeg %s (log: %s)\n' "$FFMPEG_VERSION" "$OUTPUT_DIR/logs/ffmpeg.log"
