@@ -274,6 +274,12 @@ if [[ $TARGET_OS == linux ]]; then
     mv "$PREFIX/lib/pkgconfig/srt.pc.tmp" "$PREFIX/lib/pkgconfig/srt.pc"
     link_flags="$link_flags -static-libgcc"
 fi
+if [[ $TARGET_OS == mingw32 ]]; then
+    # SRT's pc file lists libgcc_s, the import library for libgcc's DLL, whose
+    # unwinder clashes with the static libgcc_eh that -static links.
+    sed 's|-lgcc_s|-lgcc_eh|g' "$PREFIX/lib/pkgconfig/srt.pc" > "$PREFIX/lib/pkgconfig/srt.pc.tmp"
+    mv "$PREFIX/lib/pkgconfig/srt.pc.tmp" "$PREFIX/lib/pkgconfig/srt.pc"
+fi
 if [[ $ENABLE_QSV == 1 ]]; then
     printf 'Building libvpl %s (log: %s)\n' "$LIBVPL_VERSION" "$OUTPUT_DIR/logs/libvpl.log"
     (
