@@ -52,14 +52,14 @@ pub const LIGHT: Palette = Palette {
     stage: rgb(0x1A1A1C),
     hairline: rgb(0xE5E5E9),
     text: rgb(0x1D1D1F),
-    secondary: rgb(0x86868B),
-    tertiary: rgb(0xB5B5BA),
+    secondary: rgb(0x6E6E73),
+    tertiary: rgb(0x8E8E93),
     accent: rgb(0x2F7BF5),
     accent_text: rgb(0x1F6AE0),
     accent_soft: alpha(rgb(0x2F7BF5), 0.12),
-    live: rgb(0x2BB24C),
-    warn: rgb(0xD97706),
-    danger: rgb(0xE5372C),
+    live: rgb(0x248A3D),
+    warn: rgb(0xC93400),
+    danger: rgb(0xD70015),
     scrim: alpha(rgb(0x000000), 0.18),
     shadow: alpha(rgb(0x000000), 0.12),
 };
@@ -75,7 +75,7 @@ pub const DARK: Palette = Palette {
     hairline: rgb(0x343438),
     text: rgb(0xEDEDF0),
     secondary: rgb(0x98989F),
-    tertiary: rgb(0x5F5F66),
+    tertiary: rgb(0x7C7C83),
     accent: rgb(0x4C8DF8),
     accent_text: rgb(0x6AA1FA),
     accent_soft: alpha(rgb(0x4C8DF8), 0.18),
@@ -185,6 +185,10 @@ fn hairline(color: Color, radius: f32) -> Border {
         width: 1.0,
         radius: radius.into(),
     }
+}
+
+fn track(p: &Palette) -> Color {
+    if p.dark { rgb(0x4A4A50) } else { rgb(0xD2D2D7) }
 }
 
 fn mix(a: Color, b: Color, t: f32) -> Color {
@@ -677,7 +681,7 @@ pub fn slide(theme: &Theme, status: slider::Status) -> slider::Style {
     let p = Palette::from(theme);
     slider::Style {
         rail: slider::Rail {
-            backgrounds: (p.accent.into(), p.hairline.into()),
+            backgrounds: (p.accent.into(), track(p).into()),
             width: 4.0,
             border: border(2.0),
         },
@@ -703,7 +707,7 @@ pub fn slide(theme: &Theme, status: slider::Status) -> slider::Style {
 pub fn progress(theme: &Theme) -> progress_bar::Style {
     let p = Palette::from(theme);
     progress_bar::Style {
-        background: p.hairline.into(),
+        background: track(p).into(),
         bar: p.accent.into(),
         border: border(2.0),
     }

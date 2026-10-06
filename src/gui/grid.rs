@@ -147,7 +147,7 @@ impl Workbench {
         let mut caption = row![
             dot(
                 if camera.streaming {
-                    fade(p.live, self.pulse())
+                    fade(style::DARK.live, self.pulse())
                 } else {
                     style::ON_STAGE_SECONDARY
                 },
@@ -183,7 +183,7 @@ impl Workbench {
             caption = caption.push(
                 text(format!("{lost} lost"))
                     .size(style::SMALL)
-                    .color(p.warn),
+                    .color(style::DARK.warn),
             );
         }
         caption = caption.push(
@@ -208,7 +208,7 @@ impl Workbench {
             .or(camera.last_error.as_ref())
         {
             badges = badges.push(tip(
-                container(icon(Icon::Warning, 12.0, p.danger))
+                container(icon(Icon::Warning, 12.0, style::DARK.danger))
                     .padding([3, 6])
                     .style(style::badge),
                 error.clone(),

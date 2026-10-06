@@ -30,10 +30,13 @@ impl Workbench {
                 icon(Icon::Keyboard, 24.0, p.accent),
                 text("Quick guide").size(style::DISPLAY).font(style::BOLD),
                 space::horizontal(),
-                button(icon(Icon::Close, 14.0, p.secondary))
-                    .padding(6)
-                    .style(style::plain)
-                    .on_press(Message::Help(false)),
+                tip(
+                    button(icon(Icon::Close, 14.0, p.secondary))
+                        .padding(6)
+                        .style(style::plain)
+                        .on_press(Message::Help(false)),
+                    Action::Overview.hint("Close", os),
+                ),
             ]
             .spacing(10)
             .align_y(Alignment::Center),
@@ -45,7 +48,13 @@ impl Workbench {
                 column![section(view), section(window)].spacing(18).width(Fill),
             ]
             .spacing(32),
-            text("Space, Enter and Esc act on the workbench when no field has keyboard focus. Press Esc or click elsewhere to leave a field.")
+            text(format!(
+                "{}, {} and {} act on the workbench when no field has keyboard focus. Press {} or click elsewhere to leave a field.",
+                Action::ToggleStream.shortcut(os),
+                Action::FocusCamera.shortcut(os),
+                Action::Overview.shortcut(os),
+                Action::Overview.shortcut(os)
+            ))
                 .size(style::SMALL)
                 .color(p.secondary),
             heading("One visible session, many ways to control it", p),

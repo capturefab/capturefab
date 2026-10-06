@@ -46,7 +46,7 @@ use std::{
     fmt,
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         mpsc::{self, Receiver, TryRecvError},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -71,6 +71,25 @@ const GUTTER: f32 = 18.0;
 const FRAME_POLL: Duration = Duration::from_millis(2);
 const NOTICE_LIFE: Duration = Duration::from_secs(5);
 const NOTICE_FADE: Duration = Duration::from_millis(180);
+
+fn mac_default(domain: &str, key: &str) -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    std::process::Command::new("/usr/bin/defaults")
+        .args(["read", domain, key])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+}
+
+fn double_click_action() -> Option<&'static str> {
+    static ACTION: OnceLock<Option<String>> = OnceLock::new();
+    ACTION
+        .get_or_init(|| mac_default("-g", "AppleActionOnDoubleClick"))
+        .as_deref()
+}
 
 pub fn run(handle: SessionHandle, session_label: String, simulated: bool) -> Result<()> {
     run_capture(handle, session_label, simulated, None, 0)
@@ -107,14 +126,22 @@ pub fn run_capture(
     } else {
         None
     };
-    let window_size = screenshot_size.unwrap_or(Size::new(1280.0, 840.0));
+    let saved = screenshot.is_none().then(prefs::load);
+    let window_size = screenshot_size
+        .or_else(|| {
+            saved
+                .as_ref()?
+                .window
+                .map(|[w, h]| Size::new(w.max(900.0), h.max(620.0)))
+        })
+        .unwrap_or(Size::new(1280.0, 840.0));
     let boot = move || {
         let capturing = screenshot.is_some();
         let mut app = Workbench::new(
             handle.clone(),
             session_label.clone(),
             simulated || capturing,
-            (!capturing).then(prefs::load),
+            saved.clone(),
         );
         app.width = window_size.width;
         if let Some(path) = &screenshot {
@@ -140,10 +167,16 @@ pub fn run_capture(
         } else {
             app.discover();
         }
-        (app, system::theme().map(Message::SystemTheme))
+        (
+            app,
+            Task::batch([
+                system::theme().map(Message::SystemTheme),
+                window::allow_automatic_tabbing(false),
+            ]),
+        )
     };
     iced::application(boot, Workbench::update, Workbench::view)
-        .title("Capturefab")
+        .title(Workbench::title)
         .subscription(Workbench::subscription)
         .theme(Workbench::theme)
         .default_font(style::SANS)
@@ -152,6 +185,7 @@ pub fn run_capture(
         .antialiasing(true)
         .window(window::Settings {
             size: window_size,
+            position: window::Position::Centered,
             min_size: Some(Size::new(900.0, 620.0)),
             #[cfg(target_os = "macos")]
             platform_specific: window::settings::PlatformSpecific {
@@ -306,6 +340,7 @@ enum Message {
     FrameArrived,
     SystemTheme(theme::Mode),
     Key { chord: Chord, captured: bool },
+    FocusNext(bool),
     CycleAppearance,
     Help(bool),
     DragWindow,
@@ -365,6 +400,8 @@ enum Message {
     ToggleInspector,
     ToggleImage,
     Resized(Size),
+    WindowMode(window::Mode, Option<Size>),
+    ZoomWindow,
     Pointer,
     OverControls(bool),
     HoverTile(Option<String>),
@@ -452,6 +489,8 @@ struct Workbench {
     image_mode: bool,
     /// Window width at the last resize.
     width: f32,
+    window: Option<[f32; 2]>,
+    fullscreen: bool,
     pointer_moved: Option<Instant>,
     over_controls: bool,
     hovered_tile: Option<String>,
@@ -519,7 +558,7 @@ impl Workbench {
                 _ => prefs.appearance,
             },
             screenshot: None,
-            logs_open: false,
+            logs_open: prefs.logs_open,
             help_open: false,
             fit: true,
             zoom: 1.0,
@@ -540,25 +579,27 @@ impl Workbench {
             prefs_changed: None,
             now,
             born: now,
-            sheet: motion::eased(false, motion::SHEET),
-            activity_slide: motion::eased(false, motion::SLIDE),
+            sheet: motion::faded(false, motion::SHEET),
+            activity_slide: motion::eased(prefs.logs_open, motion::SLIDE),
             histogram_slide: motion::eased(prefs.histogram_open, motion::CONTROLS_IN),
             shutter: Animation::new(false).duration(motion::SHUTTER),
-            welcome: motion::eased(false, motion::WELCOME),
+            welcome: motion::faded(false, motion::WELCOME),
             sidebar_open: prefs.sidebar_open,
             inspector_open: prefs.inspector_open,
             inspector_peek: false,
             image_mode: false,
             width: 1280.0,
+            window: prefs.window,
+            fullscreen: false,
             pointer_moved: None,
             over_controls: false,
             hovered_tile: None,
             sidebar_slide: motion::eased(prefs.sidebar_open, motion::PANEL),
             inspector_slide: motion::eased(prefs.inspector_open, motion::PANEL),
             chrome: motion::eased(true, motion::IMAGE),
-            controls: motion::eased(false, motion::CONTROLS_IN),
-            tile_hover: motion::eased(false, motion::HOVER),
-            ring: motion::eased(true, motion::RING),
+            controls: motion::faded(false, motion::CONTROLS_IN),
+            tile_hover: motion::faded(false, motion::HOVER),
+            ring: motion::faded(true, motion::RING),
         }
     }
 
@@ -588,6 +629,8 @@ impl Workbench {
             retention_days: self.retention_days,
             quota_action: self.quota_action.into(),
             recent: self.recent.clone(),
+            window: self.window,
+            logs_open: self.logs_open,
         }
     }
 
@@ -611,7 +654,7 @@ impl Workbench {
     }
 
     fn pulse(&self) -> f32 {
-        if self.screenshot.is_some() {
+        if self.screenshot.is_some() || motion::reduce_motion() {
             return 1.0;
         }
         let t = self.now.duration_since(self.born).as_secs_f32();
@@ -677,6 +720,17 @@ impl Workbench {
             time::every(interval).map(|_| Message::Tick),
             event::listen_with(|event, status, _window| match event {
                 iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                    modifiers,
+                    ..
+                }) if status == event::Status::Ignored
+                    && !modifiers.control()
+                    && !modifiers.logo()
+                    && !modifiers.alt() =>
+                {
+                    Some(Message::FocusNext(modifiers.shift()))
+                }
+                iced::Event::Keyboard(keyboard::Event::KeyPressed {
                     key,
                     physical_key,
                     modifiers,
@@ -734,6 +788,23 @@ impl Workbench {
                 "Enabling auto mode" | "Switching to manual" | "Updating auto balance"
             )
         })
+    }
+
+    fn title(&self) -> String {
+        let shown = if self.overview() {
+            Some("All cameras".to_owned())
+        } else {
+            self.snapshot.connected.as_ref().map(|c| c.model.clone())
+        };
+        match shown {
+            None => "Capturefab".into(),
+            Some(shown) if cfg!(target_os = "macos") => shown,
+            Some(shown) => format!("{shown} — Capturefab"),
+        }
+    }
+
+    fn lights(&self) -> f32 {
+        if self.fullscreen { 0.0 } else { LIGHTS }
     }
 
     fn overview(&self) -> bool {
@@ -808,7 +879,7 @@ impl Workbench {
         let selected = self.snapshot.active_camera.clone();
         self.snapshot = self.handle.snapshot();
         if self.snapshot.active_camera != selected {
-            self.ring = motion::eased(false, motion::RING).go(true, self.now);
+            self.ring = motion::faded(false, motion::RING).go(true, self.now);
         }
         let camera_id = self
             .snapshot
@@ -1134,6 +1205,37 @@ impl Workbench {
             Message::FrameArrived => self.update_frames(),
             Message::SystemTheme(mode) => self.system_dark = mode == theme::Mode::Dark,
             Message::Key { chord, captured } => return self.shortcut(chord, !captured),
+            Message::FocusNext(back) => {
+                use iced::advanced::widget::{
+                    Id, Operation, operate,
+                    operation::{focusable, scope},
+                };
+                fn within<T: Send + 'static>(
+                    sheet: bool,
+                    operation: impl Operation<T> + 'static,
+                ) -> Task<T> {
+                    if sheet {
+                        operate(scope(Id::new("sheet"), operation))
+                    } else {
+                        operate(operation)
+                    }
+                }
+                let sheet = self.sheet_open();
+                let step = move || {
+                    if back {
+                        within(sheet, focusable::focus_previous())
+                    } else {
+                        within(sheet, focusable::focus_next())
+                    }
+                };
+                return step().chain(within(sheet, focusable::count()).then(move |count| {
+                    if count.focused.is_none() && count.total > 0 {
+                        step()
+                    } else {
+                        Task::none()
+                    }
+                }));
+            }
             Message::CycleAppearance => {
                 self.appearance = match self.appearance {
                     Appearance::System => Appearance::Light,
@@ -1143,6 +1245,13 @@ impl Workbench {
             }
             Message::Help(open) => self.help_open = open,
             Message::DragWindow => return window::latest().and_then(window::drag),
+            Message::ZoomWindow => {
+                return window::latest().and_then(|id| match double_click_action() {
+                    Some("Minimize") => window::minimize(id, true),
+                    Some("None") => Task::none(),
+                    _ => window::toggle_maximize(id),
+                });
+            }
             Message::Discover => self.discover(),
             Message::IncludeSimulator(value) => {
                 self.include_simulator = value;
@@ -1420,12 +1529,25 @@ impl Workbench {
                 if self.inspector_docked() {
                     self.inspector_peek = false;
                 }
+                return window::latest().and_then(move |id| {
+                    window::is_maximized(id).then(move |maximized| {
+                        window::mode(id).map(move |mode| {
+                            Message::WindowMode(mode, (!maximized).then_some(size))
+                        })
+                    })
+                });
+            }
+            Message::WindowMode(mode, size) => {
+                self.fullscreen = mode == window::Mode::Fullscreen;
+                if let (window::Mode::Windowed, Some(size)) = (mode, size) {
+                    self.window = Some([size.width, size.height]);
+                }
             }
             Message::Pointer => self.pointer_moved = Some(self.now),
             Message::OverControls(over) => self.over_controls = over,
             Message::HoverTile(id) => {
                 if id.is_some() && id != self.hovered_tile {
-                    self.tile_hover = motion::eased(false, motion::HOVER).go(true, self.now);
+                    self.tile_hover = motion::faded(false, motion::HOVER).go(true, self.now);
                 }
                 self.hovered_tile = id;
             }
@@ -1473,6 +1595,14 @@ impl Workbench {
         let connected = self.snapshot.connected.is_some();
         match action {
             Action::Overview if self.help_open => self.help_open = false,
+            Action::Overview if self.capture_to.editing() => {
+                self.capture_to
+                    .update(destinations::Message::Cancel, &mut self.output);
+            }
+            Action::Overview if self.record_to.editing() => {
+                self.record_to
+                    .update(destinations::Message::Cancel, &mut self.forward_output);
+            }
             Action::Overview if self.capture_to.manager_open => {
                 self.capture_to
                     .update(destinations::Message::CloseManager, &mut self.output);
@@ -1671,7 +1801,7 @@ impl Workbench {
             .into();
         let t = self.sheet.interpolate(0.0f32, 1.0, self.now);
         let body = if self.help_open {
-            modal(body, self.help(p), Message::Help(false), t)
+            modal(body, self.help(p), Some(Message::Help(false)), t)
         } else {
             body
         };
@@ -1679,7 +1809,8 @@ impl Workbench {
             modal(
                 body,
                 self.capture_to.manager(dark).map(Message::CapturePicker),
-                Message::CapturePicker(destinations::Message::CloseManager),
+                (!self.capture_to.editing())
+                    .then_some(Message::CapturePicker(destinations::Message::CloseManager)),
                 t,
             )
         } else {
@@ -1689,7 +1820,8 @@ impl Workbench {
             modal(
                 body,
                 self.record_to.manager(dark).map(Message::RecordPicker),
-                Message::RecordPicker(destinations::Message::CloseManager),
+                (!self.record_to.editing())
+                    .then_some(Message::RecordPicker(destinations::Message::CloseManager)),
                 t,
             )
         } else {
@@ -1705,7 +1837,10 @@ impl Workbench {
             .width(Fill)
             .align_y(Alignment::Center);
         if cfg!(target_os = "macos") {
-            mouse_area(top).on_press(Message::DragWindow).into()
+            mouse_area(top)
+                .on_press(Message::DragWindow)
+                .on_double_click(Message::ZoomWindow)
+                .into()
         } else {
             top.into()
         }

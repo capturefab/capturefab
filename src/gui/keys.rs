@@ -327,7 +327,7 @@ impl Action {
             Action::Overview => "Back to all cameras",
             Action::ToggleStream => "Start / stop streaming",
             Action::Capture => "Capture and save",
-            Action::ToggleAuto => "Toggle auto / manual",
+            Action::ToggleAuto => "Switch between auto and manual",
             Action::SearchFeatures => "Search camera features",
             Action::FeaturesTab => "Features panel",
             Action::CaptureTab => "Capture panel",
@@ -338,10 +338,10 @@ impl Action {
             Action::ZoomActual => "Actual pixels (1:1)",
             Action::ToggleActivity => "Show / hide activity",
             Action::ToggleSidebar => "Show / hide camera list",
-            Action::ToggleInspector => "Show / hide settings",
+            Action::ToggleInspector => "Show / hide camera settings",
             Action::ImageMode => "Image only",
             Action::CopySessionCommand => "Copy session CLI command",
-            Action::Fullscreen => "Toggle full screen",
+            Action::Fullscreen => "Enter / exit full screen",
             Action::Help => "Keyboard shortcuts and help",
             Action::CloseWindow => "Close window",
         }
@@ -396,6 +396,7 @@ impl Action {
                 Key::Char('f'),
             )],
             Action::Fullscreen => vec![bare(Key::F11)],
+            Action::Help if mac => vec![cmd('?'), bare(Key::F1)],
             Action::Help => vec![bare(Key::F1), cmd('/')],
             Action::CloseWindow if mac => vec![cmd('w')],
             Action::CloseWindow if os == Os::Nix => vec![cmd('q')],
@@ -414,7 +415,7 @@ impl Action {
         })
     }
 
-    /// All bindings, e.g. "F1 / ⌘/".
+    /// All bindings, e.g. "⌘? / F1".
     pub fn shortcut(self, os: Os) -> String {
         self.bindings(os)
             .iter()
@@ -520,6 +521,7 @@ mod tests {
         assert_eq!(Action::ZoomActual.shortcut(Os::Mac), "⌥⌘0");
         assert_eq!(Action::Fullscreen.shortcut(Os::Mac), "⌃⌘F");
         assert_eq!(Action::ToggleAuto.shortcut(Os::Mac), "⇧⌘A");
+        assert_eq!(Action::Help.shortcut(Os::Mac), "⌘? / F1");
     }
 
     #[test]

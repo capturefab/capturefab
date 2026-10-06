@@ -18,7 +18,7 @@ impl Workbench {
         .spacing(8)
         .align_y(Alignment::Center);
         let header = row![
-            text("CAMERAS")
+            text("Cameras")
                 .size(style::CAPTION)
                 .font(style::SEMIBOLD)
                 .color(p.secondary),
@@ -90,11 +90,16 @@ impl Workbench {
             let detail = if connecting {
                 "Connecting…".to_string()
             } else {
-                match &camera.address {
+                let place = match &camera.address {
                     Some(address) => {
                         format!("{} · {}", camera.transport, redact_address(address))
                     }
                     None => format!("{} · S/N {}", camera.transport, camera.serial),
+                };
+                if state.is_some_and(|s| s.streaming) {
+                    format!("Streaming · {place}")
+                } else {
+                    place
                 }
             };
             let mut line = row![
@@ -121,8 +126,17 @@ impl Workbench {
             ]
             .spacing(10)
             .align_y(Alignment::Center);
-            let hint = if state.is_some() {
-                format!("{} {} · {}", camera.vendor, camera.model, "connected")
+            let hint = if let Some(state) = state {
+                format!(
+                    "{} {} · {}",
+                    camera.vendor,
+                    camera.model,
+                    if state.streaming {
+                        "streaming"
+                    } else {
+                        "connected"
+                    }
+                )
             } else {
                 format!("Connect to {} {}", camera.vendor, camera.model)
             };
@@ -150,7 +164,7 @@ impl Workbench {
             list = list.push(
                 container(
                     text("Recent")
-                        .size(style::SMALL)
+                        .size(style::CAPTION)
                         .font(style::SEMIBOLD)
                         .color(p.secondary),
                 )
@@ -273,7 +287,7 @@ impl Workbench {
                 self.titlebar(
                     container(brand)
                         .padding(iced::Padding {
-                            left: (LIGHTS - 12.0).max(6.0),
+                            left: (self.lights() - 12.0).max(6.0),
                             ..iced::Padding::ZERO
                         })
                         .into()

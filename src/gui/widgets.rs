@@ -62,10 +62,10 @@ pub(super) fn dot<'a, M: 'a>(color: Color, size: f32) -> Element<'a, M> {
         .into()
 }
 
-/// A section title: a small uppercase label above its group.
+/// A section title: a small label above its group.
 pub(super) fn heading<'a, M: 'a>(title: &'a str, p: &'static Palette) -> Element<'a, M> {
     container(
-        text(title.to_uppercase())
+        text(title)
             .size(style::CAPTION)
             .font(style::SEMIBOLD)
             .color(p.secondary),
@@ -223,7 +223,7 @@ pub(super) fn stream_button<'a>(
         .spacing(7)
         .align_y(Alignment::Center),
     )
-    .padding([7, 16])
+    .padding([5, 14])
     .style(if streaming {
         style::danger
     } else {
@@ -240,23 +240,26 @@ pub(super) fn last_frame<'a, M: 'a>() -> Element<'a, M> {
 }
 
 /// `content` centered over a dimmed copy of `base`, rising in as `shown` goes
-/// from 0 to 1; clicking outside sends `on_blur`.
+/// from 0 to 1; clicking outside sends `on_blur`, if any.
 pub(super) fn modal<'a>(
     base: Element<'a, Message>,
     content: Element<'a, Message>,
-    on_blur: Message,
+    on_blur: Option<Message>,
     shown: f32,
 ) -> Element<'a, Message> {
-    let sheet = container(opaque(content)).padding(iced::Padding {
-        top: 24.0 * (1.0 - shown),
-        ..iced::Padding::ZERO
-    });
+    let sheet = container(opaque(content))
+        .id("sheet")
+        .padding(iced::Padding {
+            top: motion::rise(24.0, shown),
+            ..iced::Padding::ZERO
+        });
+    let scrim = mouse_area(center(sheet).style(move |theme| style::scrim(theme, shown)));
     stack![
         base,
-        opaque(
-            mouse_area(center(sheet).style(move |theme| style::scrim(theme, shown)))
-                .on_press(on_blur)
-        ),
+        opaque(match on_blur {
+            Some(message) => scrim.on_press(message),
+            None => scrim,
+        }),
     ]
     .into()
 }

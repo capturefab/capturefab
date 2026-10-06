@@ -82,7 +82,7 @@ impl Workbench {
                     },
                     Message::ToggleInspector,
                 ),
-                Action::ToggleInspector.hint("Settings", os),
+                Action::ToggleInspector.hint("Camera settings", os),
             ),
         ]
         .spacing(8)
@@ -95,10 +95,13 @@ impl Workbench {
                 top: 0.0,
                 right: 10.0,
                 bottom: 0.0,
-                left: 10.0 + (LIGHTS - sidebar).max(0.0),
+                left: 10.0 + (self.lights() - sidebar).max(0.0),
             });
         let bar: Element<'a, Message> = if cfg!(target_os = "macos") {
-            mouse_area(bar).on_press(Message::DragWindow).into()
+            mouse_area(bar)
+                .on_press(Message::DragWindow)
+                .on_double_click(Message::ZoomWindow)
+                .into()
         } else {
             bar.into()
         };
@@ -195,7 +198,7 @@ impl Workbench {
             badges = badges.push(tip(
                 container(
                     row![
-                        icon(Icon::Warning, 12.0, p.danger),
+                        icon(Icon::Warning, 12.0, style::DARK.danger),
                         text(error.clone()).size(style::SMALL)
                     ]
                     .spacing(6)
@@ -243,12 +246,12 @@ impl Workbench {
                 .center_x(Fill)
                 .align_bottom(Fill)
                 .padding(iced::Padding {
-                    bottom: 16.0 + 6.0 * (1.0 - controls),
+                    bottom: 16.0 + motion::rise(6.0, controls),
                     ..iced::Padding::new(16.0)
                 }),
             );
         }
-        let flash = self.shutter.interpolate(0.0f32, 0.55, self.now);
+        let flash = self.shutter.interpolate(0.0f32, 0.25, self.now);
         if flash > 0.0 {
             layers = layers.push(container(space().width(Fill).height(Fill)).style(move |_| {
                 container::Style::default().background(Color {
@@ -396,7 +399,8 @@ impl Workbench {
         if !streaming {
             ready = ready.push(space().height(8)).push(
                 row![
-                    stream_button(false, "Start stream", Some(Message::ToggleStream), p),
+                    stream_button(false, "Start stream", Some(Message::ToggleStream), p)
+                        .padding([7, 16]),
                     button(text("Capture one frame").size(style::BODY))
                         .padding([7, 12])
                         .style(style::on_glass(false, 1.0))
@@ -602,7 +606,7 @@ impl Workbench {
             .align_x(Alignment::Center),
         );
         center(container(content).padding(iced::Padding {
-            top: 24.0 * (1.0 - t),
+            top: motion::rise(24.0, t),
             right: 24.0,
             bottom: 0.0,
             left: 24.0,

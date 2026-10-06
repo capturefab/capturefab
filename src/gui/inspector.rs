@@ -63,9 +63,17 @@ impl Workbench {
         let snapshot = &self.snapshot;
         let connected = snapshot.connected.is_some();
         let mut content = column![].spacing(12);
-        if connected {
-            content = content.push(self.auto_card(p));
+        if !connected {
+            return content
+                .push(text("Camera settings").size(style::HEADING).font(style::SEMIBOLD))
+                .push(
+                    text("Connect a camera to inspect its GenICam features, configure acquisition, and run commands.")
+                        .size(style::BODY)
+                        .color(p.secondary),
+                )
+                .into();
         }
+        content = content.push(self.auto_card(p));
         content = content.push(
             text_input("Search features", &self.search)
                 .id("feature-search")
@@ -84,21 +92,10 @@ impl Workbench {
                 button(text("Refresh").size(style::SMALL))
                     .padding([3, 8])
                     .style(style::link)
-                    .on_press_maybe(connected.then_some(Message::RefreshFeatures)),
+                    .on_press(Message::RefreshFeatures),
             ]
             .align_y(Alignment::Center),
         );
-        if !connected {
-            return content
-                .push(space().height(16))
-                .push(text("Camera settings").size(style::HEADING).font(style::SEMIBOLD))
-                .push(
-                    text("Connect a camera to inspect its GenICam features, configure acquisition, and run commands.")
-                        .size(style::BODY)
-                        .color(p.secondary),
-                )
-                .into();
-        }
         let query = self.search.to_lowercase();
         let managed = |name: &str| {
             snapshot
@@ -176,7 +173,7 @@ impl Workbench {
                             Some(Message::Auto(false))
                         },
                     ),
-                    Action::ToggleAuto.hint("Toggle auto / manual", os),
+                    Action::ToggleAuto.hint("Set exposure, gain and frame rate yourself", os),
                 ),
                 tip(
                     segment(
@@ -188,7 +185,7 @@ impl Workbench {
                             Some(Message::Auto(true))
                         },
                     ),
-                    Action::ToggleAuto.hint("Toggle auto / manual", os),
+                    Action::ToggleAuto.hint("Tune exposure, gain and frame rate automatically", os),
                 ),
             ]
             .spacing(2),
@@ -395,7 +392,7 @@ impl Workbench {
                         .padding([4, 6])
                         .style(style::link)
                         .on_press(Message::Commit(feature.name.clone())),
-                    "Apply · Enter",
+                    Action::FocusCamera.hint("Apply", Os::CURRENT),
                 ));
             }
             editor.into()
@@ -827,9 +824,9 @@ impl Workbench {
                             .size(style::CAPTION)
                             .color(p.secondary),
                         space::horizontal(),
-                        button(text("Cancel").size(style::SMALL))
+                        button(text("Stop").size(style::SMALL))
                             .padding([3, 8])
-                            .style(style::plain)
+                            .style(style::danger)
                             .on_press(Message::CancelJob(id)),
                     ]
                     .align_y(Alignment::Center),

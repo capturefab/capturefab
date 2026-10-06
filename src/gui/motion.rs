@@ -18,10 +18,36 @@ pub(super) const WELCOME: Duration = Duration::from_millis(400);
 /// Below this window width the inspector floats over the stage instead of docking.
 pub(super) const NARROW: f32 = 1100.0;
 
-pub(super) fn eased(value: bool, duration: Duration) -> Animation<bool> {
+pub(super) fn reduce_motion() -> bool {
+    static REDUCE: OnceLock<bool> = OnceLock::new();
+    *REDUCE.get_or_init(|| {
+        mac_default("com.apple.universalaccess", "reduceMotion").as_deref() == Some("1")
+    })
+}
+
+pub(super) fn faded(value: bool, duration: Duration) -> Animation<bool> {
     Animation::new(value)
         .duration(duration)
         .easing(Easing::EaseOutCubic)
+}
+
+pub(super) fn eased(value: bool, duration: Duration) -> Animation<bool> {
+    faded(
+        value,
+        if reduce_motion() {
+            Duration::ZERO
+        } else {
+            duration
+        },
+    )
+}
+
+pub(super) fn rise(by: f32, shown: f32) -> f32 {
+    if reduce_motion() {
+        0.0
+    } else {
+        by * (1.0 - shown)
+    }
 }
 
 /// Whether the stage controls should show: while the pointer is over them, or
@@ -97,7 +123,7 @@ impl Workbench {
         let wanted = controls_wanted(self.pointer_moved, now, self.over_controls);
         if wanted != self.controls.value() {
             let duration = if wanted { CONTROLS_IN } else { CONTROLS_OUT };
-            self.controls = eased(!wanted, duration).go(wanted, now);
+            self.controls = faded(!wanted, duration).go(wanted, now);
         }
         let sidebar = self.sidebar_shown();
         let targets = [

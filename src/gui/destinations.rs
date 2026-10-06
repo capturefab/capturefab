@@ -98,6 +98,7 @@ impl Source {
 impl fmt::Display for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Source::Keychain if cfg!(target_os = "macos") => "Access key (keychain)",
             Source::Keychain => "Access key (OS keychain)",
             Source::Profile => "AWS profile",
             Source::Environment => "Environment variables",
@@ -286,13 +287,15 @@ fn test(destination: Destination) -> Result<String, String> {
     match &destination.target {
         Target::Folder { path } => {
             volumes::ensure_present(path).map_err(|e| e.to_string())?;
-            std::fs::create_dir_all(path).map_err(|e| format!("cannot create the folder: {e}"))?;
+            std::fs::create_dir_all(path).map_err(|e| format!("Can't create the folder: {e}"))?;
             let probe = path.join(format!(".capturefab-write-test-{}", std::process::id()));
             std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&probe)
-                .map_err(|e| format!("cannot write here: {e}"))?;
+                .map_err(|e| {
+                    format!("Can't write to this folder: {e}. Choose a folder you can write to.")
+                })?;
             let _ = std::fs::remove_file(&probe);
             Ok(match fs2::available_space(path) {
                 Ok(free) => format!("Writable, {} free", bytes(free)),
@@ -328,6 +331,7 @@ pub enum Message {
     Retry,
     Edit(String),
     Remove(String),
+    ConfirmRemove(Option<String>),
     AddFolder,
     AddBucket,
     Name(String),
@@ -374,6 +378,7 @@ pub struct Picker {
     #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     uploads_at: Option<Instant>,
     editor: Option<Editor>,
+    removing: Option<String>,
     pub manager_open: bool,
     notice: Option<(String, bool)>,
     /// Remember the choice for the next launch (the capture panel does).
@@ -402,6 +407,7 @@ impl Picker {
             uploads_task: None,
             uploads_at: None,
             editor: None,
+            removing: None,
             manager_open: false,
             notice: None,
             remember,
@@ -494,6 +500,10 @@ impl Picker {
         }
     }
 
+    pub fn editing(&self) -> bool {
+        self.editor.is_some() || self.removing.is_some()
+    }
+
     /// Whether a background check is running, so the app keeps polling.
     pub fn busy(&self) -> bool {
         self.editor.as_ref().is_some_and(|e| e.testing.is_some())
@@ -560,6 +570,7 @@ impl Picker {
             Message::CloseManager => {
                 self.manager_open = false;
                 self.editor = None;
+                self.removing = None;
             }
             Message::Retry => {
                 #[cfg(feature = "s3")]
@@ -569,11 +580,13 @@ impl Picker {
                 }
             }
             Message::Edit(name) => {
+                self.removing = None;
                 if let Some(destination) = self.saved.iter().find(|d| d.name == name) {
                     self.editor = Some(Editor::edit(destination));
                 }
             }
             Message::Remove(name) => {
+                self.removing = None;
                 self.notice = Some(match destination::remove(&name) {
                     Ok(_) => (format!("Removed {name}; its files are untouched"), false),
                     Err(e) => (format!("{e:#}"), true),
@@ -581,7 +594,9 @@ impl Picker {
                 self.loaded = None;
                 self.tick();
             }
+            Message::ConfirmRemove(name) => self.removing = name,
             Message::AddFolder => {
+                self.removing = None;
                 if let Some(folder) = rfd::FileDialog::new()
                     .set_title("Save captures in")
                     .pick_folder()
@@ -593,8 +608,14 @@ impl Picker {
                     self.editor = Some(Editor::new_folder(name, folder));
                 }
             }
-            Message::AddBucket => self.editor = Some(Editor::new_bucket()),
-            Message::Cancel => self.editor = None,
+            Message::AddBucket => {
+                self.removing = None;
+                self.editor = Some(Editor::new_bucket());
+            }
+            Message::Cancel => {
+                self.editor = None;
+                self.removing = None;
+            }
             Message::Save => {
                 let Some(editor) = &mut self.editor else {
                     return;
@@ -751,7 +772,7 @@ impl Picker {
                     .style(style::pick)
                     .menu_style(style::menu),
                 super::tip(
-                    button(text("Manage").size(style::SMALL))
+                    button(text("Manage…").size(style::SMALL))
                         .padding([6, 8])
                         .style(style::plain)
                         .on_press(Message::OpenManager),
@@ -869,7 +890,7 @@ impl Picker {
                 .spacing(4);
                 if status.is_some_and(|s| !s.mounted) {
                     lines = lines.push(
-                        text("Drive not connected: captures will fail until it is.")
+                        text("Drive not connected. Connect it or choose another destination.")
                             .size(style::CAPTION)
                             .color(p.warn),
                     );
@@ -973,10 +994,13 @@ impl Picker {
             row![
                 text("Destinations").size(style::DISPLAY).font(style::BOLD),
                 space::horizontal(),
-                button(icon(Icon::Close, 14.0, p.secondary))
-                    .padding(6)
-                    .style(style::plain)
-                    .on_press(Message::CloseManager),
+                super::tip(
+                    button(icon(Icon::Close, 14.0, p.secondary))
+                        .padding(6)
+                        .style(style::plain)
+                        .on_press(Message::CloseManager),
+                    super::Action::Overview.hint("Close", super::Os::CURRENT),
+                ),
             ]
             .align_y(Alignment::Center),
             text(
@@ -1008,6 +1032,26 @@ impl Picker {
     fn list(&self, p: &'static Palette) -> Element<'_, Message> {
         let mut rows = column![].spacing(2);
         for destination in &self.saved {
+            let name = destination.name.clone();
+            let (first, second) = if self.removing.as_deref() == Some(name.as_str()) {
+                (
+                    button(text("Remove").size(style::SMALL))
+                        .style(style::danger)
+                        .on_press(Message::Remove(name)),
+                    button(text("Cancel").size(style::SMALL))
+                        .style(style::plain)
+                        .on_press(Message::ConfirmRemove(None)),
+                )
+            } else {
+                (
+                    button(text("Edit…").size(style::SMALL))
+                        .style(style::link)
+                        .on_press(Message::Edit(name.clone())),
+                    button(text("Remove").size(style::SMALL))
+                        .style(style::plain)
+                        .on_press(Message::ConfirmRemove(Some(name))),
+                )
+            };
             rows = rows.push(
                 container(
                     row![
@@ -1030,14 +1074,8 @@ impl Picker {
                         ]
                         .spacing(2)
                         .width(Fill),
-                        button(text("Edit").size(style::SMALL))
-                            .padding([3, 8])
-                            .style(style::link)
-                            .on_press(Message::Edit(destination.name.clone())),
-                        button(text("Remove").size(style::SMALL))
-                            .padding([3, 8])
-                            .style(style::plain)
-                            .on_press(Message::Remove(destination.name.clone())),
+                        first.padding([3, 8]),
+                        second.padding([3, 8]),
                     ]
                     .spacing(10)
                     .align_y(Alignment::Center),
@@ -1058,7 +1096,7 @@ impl Picker {
                 button(
                     row![
                         icon(Icon::Folder, 14.0, p.text),
-                        text("Add folder").size(style::BODY)
+                        text("Add folder…").size(style::BODY)
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center)
@@ -1069,7 +1107,7 @@ impl Picker {
                 button(
                     row![
                         icon(Icon::Plus, 14.0, p.text),
-                        text("Add S3 bucket").size(style::BODY)
+                        text("Add S3 bucket…").size(style::BODY)
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center)
@@ -1100,6 +1138,7 @@ impl Picker {
         let input = |placeholder: &'a str, value: &'a str, on: fn(String) -> Message| {
             text_input(placeholder, value)
                 .on_input(on)
+                .on_submit(Message::Save)
                 .size(style::BODY)
                 .padding([6, 10])
                 .style(style::input)
@@ -1172,13 +1211,20 @@ impl Picker {
                         "Secret key",
                         text_input(
                             if editor.stored_secret {
-                                "saved in keychain; type to replace"
+                                if cfg!(target_os = "macos") {
+                                    "Saved in your keychain; type to replace"
+                                } else {
+                                    "Saved in the OS keychain; type to replace"
+                                }
+                            } else if cfg!(target_os = "macos") {
+                                "Saved to your keychain"
                             } else {
-                                "saved to the OS keychain"
+                                "Saved to the OS keychain"
                             },
                             &editor.secret,
                         )
                         .on_input(Message::Secret)
+                        .on_submit(Message::Save)
                         .secure(true)
                         .size(style::BODY)
                         .padding([6, 10])
@@ -1222,10 +1268,13 @@ impl Picker {
                 "Folder",
                 row![
                     input("/Volumes/Drive/Capturefab", &editor.folder, Message::Folder),
-                    button(icon(Icon::Folder, 15.0, p.secondary))
-                        .padding(6)
-                        .style(style::plain)
-                        .on_press(Message::BrowseFolder),
+                    super::tip(
+                        button(icon(Icon::Folder, 15.0, p.secondary))
+                            .padding(6)
+                            .style(style::plain)
+                            .on_press(Message::BrowseFolder),
+                        "Choose a folder",
+                    ),
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center)
@@ -1240,14 +1289,22 @@ impl Picker {
             }));
         }
         let testing = editor.testing.is_some();
+        let cancel = button(text("Cancel").size(style::BODY))
+            .padding([7, 14])
+            .style(style::plain)
+            .on_press(Message::Cancel);
+        let save = button(text("Save").size(style::BODY))
+            .padding([7, 18])
+            .style(style::primary)
+            .on_press(Message::Save);
+        let (first, second) = if cfg!(target_os = "windows") {
+            (save, cancel)
+        } else {
+            (cancel, save)
+        };
         form.push(space().height(6))
             .push(
                 row![
-                    button(text("Cancel").size(style::BODY))
-                        .padding([7, 14])
-                        .style(style::plain)
-                        .on_press(Message::Cancel),
-                    space::horizontal(),
                     super::tip(
                         button(text(if testing { "Testing…" } else { "Test" }).size(style::BODY))
                             .padding([7, 14])
@@ -1255,10 +1312,9 @@ impl Picker {
                             .on_press_maybe((!testing).then_some(Message::Test)),
                         "Saves the secret key first, then checks the folder or bucket",
                     ),
-                    button(text("Save").size(style::BODY))
-                        .padding([7, 18])
-                        .style(style::primary)
-                        .on_press(Message::Save),
+                    space::horizontal(),
+                    first,
+                    second,
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),

@@ -37,6 +37,8 @@ pub struct Prefs {
     pub retention_days: u64,
     pub quota_action: String,
     pub recent: Vec<Recent>,
+    pub window: Option<[f32; 2]>,
+    pub logs_open: bool,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Recent {
@@ -73,6 +75,8 @@ impl Default for Prefs {
             retention_days: 7,
             quota_action: "stop".into(),
             recent: Vec::new(),
+            window: None,
+            logs_open: false,
         }
     }
 }
