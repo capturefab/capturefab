@@ -514,6 +514,17 @@ impl SessionHandle {
     pub fn latest_frame_id_for(&self, id: &str) -> Option<u64> {
         self.latest_frame_for(id).map(|f| f.id)
     }
+    /// Changes whenever any camera publishes a frame. Reads each shared ring's
+    /// sequence counter without copying pixels, so it is cheap to poll.
+    pub fn frame_sequence(&self) -> u64 {
+        self.inner
+            .feeds
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .map(|feed| u64::from(locked(feed).ring.sequence()))
+            .fold(0, u64::wrapping_add)
+    }
     fn feed(&self, id: &str) -> Option<Arc<Mutex<FrameFeed>>> {
         let feeds = self
             .inner

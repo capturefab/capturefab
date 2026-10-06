@@ -62,6 +62,7 @@ const TOP: f32 = if cfg!(target_os = "macos") {
 const SIDEBAR: f32 = 240.0;
 const INSPECTOR: f32 = 316.0;
 const GUTTER: f32 = 28.0;
+const FRAME_POLL: Duration = Duration::from_millis(2);
 const NOTICE_LIFE: Duration = Duration::from_secs(5);
 const NOTICE_FADE: Duration = Duration::from_millis(180);
 
@@ -164,6 +165,41 @@ pub fn run_capture(
     Ok(())
 }
 
+/// The session whose shared frame rings the frame watcher polls, and the
+/// shortest gap between its signals. A window has one session, so only the gap
+/// is hashed: changing it restarts the watcher.
+struct FrameWatch {
+    handle: SessionHandle,
+    gap: Duration,
+}
+
+impl std::hash::Hash for FrameWatch {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.gap.hash(state);
+    }
+}
+
+/// Sends `FrameArrived` when any camera publishes a frame: at most once per
+/// gap, and not again until the workbench has taken the last one.
+fn watch_frames(watch: &FrameWatch) -> impl iced::futures::Stream<Item = Message> + use<> {
+    let handle = watch.handle.clone();
+    let gap = watch.gap;
+    iced::stream::channel(0, async move |mut output| {
+        std::thread::spawn(move || {
+            let mut seen = handle.frame_sequence();
+            while !output.is_closed() {
+                std::thread::sleep(FRAME_POLL);
+                let sequence = handle.frame_sequence();
+                if sequence != seen && output.try_send(Message::FrameArrived).is_ok() {
+                    seen = sequence;
+                    std::thread::sleep(gap.saturating_sub(FRAME_POLL));
+                }
+            }
+        });
+        std::future::pending::<()>().await;
+    })
+}
+
 struct ScreenshotRequest {
     path: PathBuf,
     cameras: u32,
@@ -259,6 +295,7 @@ enum Num {
 enum Message {
     Tick,
     Frame,
+    FrameArrived,
     SystemTheme(theme::Mode),
     Key { chord: Chord, captured: bool },
     CycleAppearance,
@@ -604,10 +641,10 @@ impl Workbench {
             || self.screenshot.is_some()
             || self.capture_to.busy()
             || self.record_to.busy();
-        let interval = if streaming {
-            Duration::from_millis(33)
-        } else if busy {
+        let interval = if busy {
             Duration::from_millis(60)
+        } else if streaming {
+            Duration::from_millis(250)
         } else {
             Duration::from_millis(300)
         };
@@ -616,8 +653,22 @@ impl Workbench {
         } else {
             Subscription::none()
         };
+        let arrivals = if streaming {
+            // Small overview tiles gain nothing from more than 30 redraws a second.
+            let gap = Duration::from_millis(if self.overview() { 33 } else { 16 });
+            Subscription::run_with(
+                FrameWatch {
+                    handle: self.handle.clone(),
+                    gap,
+                },
+                watch_frames,
+            )
+        } else {
+            Subscription::none()
+        };
         Subscription::batch([
             frames,
+            arrivals,
             time::every(interval).map(|_| Message::Tick),
             event::listen_with(|event, status, _window| match event {
                 iced::Event::Keyboard(keyboard::Event::KeyPressed {
@@ -781,6 +832,14 @@ impl Workbench {
         {
             self.balance = status.balance;
         }
+        self.update_frames();
+        self.capture_to.tick();
+        self.record_to.tick();
+        self.save_prefs();
+        self.screenshot_tick()
+    }
+
+    fn update_frames(&mut self) {
         if self.overview() {
             self.update_previews();
             if self.frame_id.take().is_some() {
@@ -792,10 +851,6 @@ impl Workbench {
                 self.gpu.retire(&key);
             }
         }
-        self.capture_to.tick();
-        self.record_to.tick();
-        self.save_prefs();
-        self.screenshot_tick()
     }
 
     fn update_previews(&mut self) {
@@ -853,7 +908,11 @@ impl Workbench {
             frame.pixel_format,
             frame.timestamp_ns,
         );
-        let shown = frame::sampled_histogram(&frame).and_then(|histogram| {
+        let histogram = self
+            .histogram_open
+            .then(|| frame::sampled_histogram(&frame))
+            .transpose();
+        let shown = histogram.and_then(|histogram| {
             preview::present(&self.gpu, &mut self.shown, MAIN_VIEW, frame, |frame| {
                 // Decode straight into RGBA bytes: one pass, one allocation.
                 let pixels = frame::convert(frame, |[r, g, b]| [r, g, b, 255])?;
@@ -863,7 +922,9 @@ impl Workbench {
         });
         match shown {
             Ok(histogram) => {
-                self.histogram = histogram;
+                if let Some(histogram) = histogram {
+                    self.histogram = histogram;
+                }
                 self.frame_meta = Some(meta);
                 self.display_error = None;
             }
@@ -1060,6 +1121,7 @@ impl Workbench {
         match message {
             Message::Tick => return self.tick(),
             Message::Frame => {}
+            Message::FrameArrived => self.update_frames(),
             Message::SystemTheme(mode) => self.system_dark = mode == theme::Mode::Dark,
             Message::Key { chord, captured } => return self.shortcut(chord, !captured),
             Message::CycleAppearance => {
@@ -1174,7 +1236,17 @@ impl Workbench {
                 self.zoom = 1.0;
             }
             Message::Zoom(factor) => self.zoom_by(factor),
-            Message::ToggleHistogram => self.histogram_open = !self.histogram_open,
+            Message::ToggleHistogram => {
+                self.histogram_open = !self.histogram_open;
+                if self.histogram_open
+                    && let Some(histogram) = self
+                        .handle
+                        .latest_frame()
+                        .and_then(|frame| frame::sampled_histogram(&frame).ok())
+                {
+                    self.histogram = histogram;
+                }
+            }
             Message::ToggleActivity => self.logs_open = !self.logs_open,
             Message::CopyLog => {
                 return iced::clipboard::write(
@@ -1584,6 +1656,19 @@ fn save_screenshot(shot: &window::Screenshot, path: &std::path::Path) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced::futures::{FutureExt, StreamExt};
+
+    #[test]
+    fn frame_watcher_stays_quiet_without_new_frames() {
+        let watch = FrameWatch {
+            handle: SessionHandle::new(),
+            gap: Duration::from_millis(16),
+        };
+        let mut frames = Box::pin(watch_frames(&watch));
+        assert!(frames.next().now_or_never().is_none());
+        std::thread::sleep(FRAME_POLL * 10);
+        assert!(frames.next().now_or_never().is_none());
+    }
 
     #[test]
     fn number_fields_apply_only_valid_values() {

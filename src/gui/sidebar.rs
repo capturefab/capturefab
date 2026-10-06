@@ -4,10 +4,10 @@ use iced::widget::column;
 
 impl Workbench {
     pub(super) fn sidebar(&self, p: &'static Palette) -> Element<'_, Message> {
-        let mut devices = self.snapshot.devices.clone();
+        let mut devices: Vec<&CameraInfo> = self.snapshot.devices.iter().collect();
         for camera in &self.snapshot.cameras {
             if !devices.iter().any(|device| device.id == camera.info.id) {
-                devices.push(camera.info.clone());
+                devices.push(&camera.info);
             }
         }
         let discovering = self.pending("Discovering cameras");
