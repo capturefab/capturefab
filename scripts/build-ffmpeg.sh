@@ -292,7 +292,7 @@ printf 'Building FFmpeg %s (log: %s)\n' "$FFMPEG_VERSION" "$OUTPUT_DIR/logs/ffmp
 (
     cd "$BUILD_DIR/ffmpeg-$FFMPEG_VERSION"
     bash ./configure "${ffmpeg_flags[@]}"
-    make -j "$JOBS" ffmpeg
+    make -j "$JOBS" "ffmpeg$(sed -n 's/^EXESUF=//p' ffbuild/config.mak)"
     make install-progs
 ) >"$OUTPUT_DIR/logs/ffmpeg.log" 2>&1
 
