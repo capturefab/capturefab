@@ -9,7 +9,7 @@ repository = "https://github.com/capturefab/capturefab"
 
 [features]
 default = ["gui", "usb", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "s3"]
-gui = ["dep:eframe", "dep:rfd"]
+gui = ["dep:iced", "dep:bytemuck", "dep:rfd"]
 usb = ["dep:nusb"]
 # libjpeg-turbo, built from source with its NEON/SSE2/AVX2 SIMD (x86 needs NASM).
 jpeg = ["dep:turbojpeg"]
@@ -23,7 +23,9 @@ vaapi = ["dep:libloading", "jpeg"]
 s3 = ["dep:ureq", "dep:keyring"]
 # Apple's hardware JPEG engine through VideoToolbox (system frameworks; no-op off macOS).
 videotoolbox = []
-wgpu = ["gui", "eframe/wgpu"]
+# The GUI always renders with wgpu (falling back to tiny-skia without a GPU);
+# kept so existing `--features wgpu` builds keep working.
+wgpu = ["gui"]
 
 [dependencies]
 anyhow = "1"
@@ -38,7 +40,8 @@ if-addrs = "0.13"
 socket2 = "0.6"
 ctrlc = "3.4"
 getrandom = "0.3"
-eframe = { version = "0.33", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "wayland", "accesskit"] }
+iced = { version = "0.14", optional = true, default-features = false, features = ["wgpu", "tiny-skia", "crisp", "web-colors", "smol", "linux-theme-detection", "x11", "wayland", "image-without-codecs", "canvas", "advanced"] }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
 nusb = { version = "0.2.7", optional = true }
 memmap2 = "0.9"
 base64 = "0.22"
@@ -61,6 +64,12 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }
+
+[dev-dependencies]
+# Validates the GUI's WGSL frame shader in unit tests; already in the tree via wgpu.
+naga = { version = "27", features = ["wgsl-in"] }
+# Blocks on wgpu device requests in the GPU preview test.
+futures = { version = "0.3", default-features = false, features = ["executor"] }
 
 [profile.release]
 lto = "thin"

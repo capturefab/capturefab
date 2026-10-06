@@ -9,11 +9,7 @@ mod engine;
 pub mod frame;
 pub mod genicam;
 #[cfg(feature = "gui")]
-mod gpu;
-#[cfg(feature = "gui")]
 pub mod gui;
-#[cfg(feature = "gui")]
-mod gui_destinations;
 pub mod ipc;
 pub mod jpeg;
 pub mod media;

@@ -1,6 +1,6 @@
 # Capturefab
 
-> A camera workbench with an egui desktop GUI, Unix CLI, local automation sessions, and one self-contained executable per platform.
+> A camera workbench with an iced desktop GUI, Unix CLI, local automation sessions, and one self-contained executable per platform.
 
 ## Canonical resources
 

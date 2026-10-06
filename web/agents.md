@@ -1,6 +1,6 @@
 # Capturefab for agents and shell scripts
 
-Capturefab opens its egui GUI when invoked without a subcommand. Use explicit subcommands for automation. The installed binary's `schema` and `--help` output are authoritative for its supported commands.
+Capturefab opens its iced GUI when invoked without a subcommand. Use explicit subcommands for automation. The installed binary's `schema` and `--help` output are authoritative for its supported commands.
 
 ```sh
 capturefab schema --json

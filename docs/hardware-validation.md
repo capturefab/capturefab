@@ -82,15 +82,16 @@ On macOS ARM64 (Apple Silicon) with Homebrew FFmpeg 9.0.1, simulator recordings
 at 1920×1080 in Mono8 and RGB8 completed through `h264_videotoolbox` and
 `libx264` with the sensor-format FFmpeg input. A real FFmpeg integration test
 decodes every supported PFNC mapping (Mono8/10/12/16, RGB8, BGR8 and all four
-Bayer8 phases) and matches Capturefab's own conversion. The OpenGL preview
-shader was compared with CPU conversion in rendered GUI screenshots of the same
-simulator frame for Mono8, Mono12, RGB8 and BayerRG8: no pixel differed by more
-than one level. SHA-256 storage hashing used the ARMv8 SHA instructions.
+Bayer8 phases) and matches Capturefab's own conversion. The wgpu preview
+shader (`gpu_decode_matches_cpu_conversion`) rendered Mono8, Mono10/12/16, RGB8,
+BGR8 and all four Bayer8 phases through Metal at 1:1 and matched CPU conversion
+to within one level on every pixel. (The earlier egui/OpenGL shader had been
+compared the same way in screenshots.) SHA-256 storage hashing used the ARMv8 SHA instructions.
 
 Not established by these checks: NVENC and AMF packed-RGB input (guarded at
 runtime by an encoder probe that falls back to YUV input), QSV, VAAPI and Media
-Foundation with the new input formats, the preview shader on non-Apple OpenGL
-drivers or OpenGL ES, and Bayer recordings from physical cameras.
+Foundation with the new input formats, the preview shader on Vulkan, Direct3D 12,
+OpenGL or OpenGL ES drivers, and Bayer recordings from physical cameras.
 
 ## NVIDIA Jetson acceleration — 2026-10-05
 

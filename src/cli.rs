@@ -219,7 +219,8 @@ pub enum Command {
     Gui {
         #[arg(long, default_value = "gui")]
         name: String,
-        #[arg(long)]
+        /// Accepted for compatibility; the GUI always renders with wgpu
+        #[arg(long, hide = true)]
         wgpu: bool,
         /// Save a real rendered workbench screenshot, then exit (release tooling)
         #[arg(long)]
@@ -549,10 +550,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 ),
                 _ => ("gui", false, None, 1),
             };
-            ensure!(
-                !wgpu || cfg!(feature = "wgpu"),
-                "wgpu rendering is disabled in this build; compile with --features wgpu"
-            );
+            let _ = wgpu;
             let client = Client::new(&cli)?;
             let handle = client.local.as_ref().unwrap().clone();
             let _server = ipc::Server::start(handle.clone(), name)?;
@@ -564,7 +562,6 @@ pub fn run(cli: Cli) -> Result<()> {
                     handle,
                     name.into(),
                     cli.simulate,
-                    wgpu,
                     screenshot,
                     demo_cameras,
                 )?;
@@ -572,7 +569,7 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             #[cfg(not(feature = "gui"))]
             {
-                let _ = (handle, wgpu, screenshot, demo_cameras);
+                let _ = (handle, screenshot, demo_cameras);
                 anyhow::bail!(
                     "GUI support is disabled; build with default features or use a CLI subcommand"
                 )
@@ -1066,7 +1063,7 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
 }
 fn doctor() -> Value {
     let interfaces=if_addrs::get_if_addrs().map(|items|items.into_iter().filter_map(|i|match i.addr{if_addrs::IfAddr::V4(a)=>Some(json!({"name":i.name,"ip":a.ip,"netmask":a.netmask,"broadcast":a.broadcast})),_=>None}).collect::<Vec<_>>()).unwrap_or_default();
-    json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"wgpu":cfg!(feature="wgpu"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox")},"jpeg":jpeg_backends(),"session_directory":ipc::session_dir(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox.","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}})
+    json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"wgpu":cfg!(feature="gui"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox")},"jpeg":jpeg_backends(),"session_directory":ipc::session_dir(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox.","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}})
 }
 /// JPEG encoders available to this build and host, best first.
 fn jpeg_backends() -> Value {

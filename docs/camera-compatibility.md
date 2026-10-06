@@ -116,7 +116,7 @@ reports the allocation ledger. `capturefab storage configure --max-space 2GiB
 recording also has a bounded per-file reservation and stops when that reservation
 is reached; it does not currently roll into another segment automatically.
 
-The egui GUI uses the selected platform graphics renderer. FFmpeg decode and
+The iced GUI renders through wgpu on the platform graphics API, or in software without a usable GPU. FFmpeg decode and
 encoder acceleration depend on the embedded build, codec, operating system,
 driver, and available device. Automatic encoder selection tests candidates at
 runtime and falls back to software. An encoder being listed does not establish
