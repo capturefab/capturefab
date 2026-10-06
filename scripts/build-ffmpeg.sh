@@ -142,7 +142,7 @@ fetch() {
 fetch "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" "$DOWNLOAD_DIR/ffmpeg-$FFMPEG_VERSION.tar.xz" "$FFMPEG_SHA256"
 fetch "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz" "$DOWNLOAD_DIR/openssl-$OPENSSL_VERSION.tar.gz" "$OPENSSL_SHA256"
 fetch "https://github.com/Haivision/srt/archive/refs/tags/v$SRT_VERSION.tar.gz" "$DOWNLOAD_DIR/srt-$SRT_VERSION.tar.gz" "$SRT_SHA256"
-fetch "https://code.videolan.org/videolan/x264/-/archive/$X264_COMMIT/x264-$X264_COMMIT.tar.gz" "$DOWNLOAD_DIR/x264-$X264_COMMIT.tar.gz" "$X264_SHA256"
+fetch "https://github.com/mirror/x264/archive/$X264_COMMIT.tar.gz" "$DOWNLOAD_DIR/x264-$X264_COMMIT.tar.gz" "$X264_SHA256"
 for archive in "$DOWNLOAD_DIR/ffmpeg-$FFMPEG_VERSION.tar.xz" "$DOWNLOAD_DIR/openssl-$OPENSSL_VERSION.tar.gz" "$DOWNLOAD_DIR/srt-$SRT_VERSION.tar.gz" "$DOWNLOAD_DIR/x264-$X264_COMMIT.tar.gz"; do
     tar -xf "$archive" -C "$BUILD_DIR"
 done
