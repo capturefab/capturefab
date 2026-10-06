@@ -49,7 +49,7 @@ pub const LIGHT: Palette = Palette {
     hover: rgb(0xEDEDF0),
     selected: rgb(0xE3E4E9),
     field: rgb(0xF1F1F4),
-    stage: rgb(0xF0F0F3),
+    stage: rgb(0x1A1A1C),
     hairline: rgb(0xE5E5E9),
     text: rgb(0x1D1D1F),
     secondary: rgb(0x86868B),
@@ -71,7 +71,7 @@ pub const DARK: Palette = Palette {
     hover: rgb(0x323236),
     selected: rgb(0x3B3B40),
     field: rgb(0x2C2C30),
-    stage: rgb(0x151517),
+    stage: rgb(0x111113),
     hairline: rgb(0x343438),
     text: rgb(0xEDEDF0),
     secondary: rgb(0x98989F),
@@ -156,14 +156,21 @@ pub const BOLD: Font = Font {
     ..SANS
 };
 
-/// Type scale.
-pub const TITLE: f32 = 26.0;
-pub const HEADING: f32 = 15.0;
+/// Type scale. Every text size in the workbench is one of these.
+pub const DISPLAY: f32 = 22.0;
+pub const TITLE: f32 = 15.0;
+pub const HEADING: f32 = 13.0;
 pub const BODY: f32 = 13.0;
 pub const SMALL: f32 = 12.0;
 pub const CAPTION: f32 = 11.0;
 
-pub const RADIUS: f32 = 7.0;
+/// Controls; sheets, overlays and tiles use `RADIUS_LARGE`.
+pub const RADIUS: f32 = 8.0;
+pub const RADIUS_LARGE: f32 = 12.0;
+
+/// Text on the stage and its overlays, which are dark in both appearances.
+pub const ON_STAGE: Color = rgb(0xF5F5F7);
+pub const ON_STAGE_SECONDARY: Color = alpha(rgb(0xF5F5F7), 0.68);
 
 fn border(radius: f32) -> Border {
     Border {
@@ -205,9 +212,75 @@ pub fn base(theme: &Theme) -> container::Style {
 
 pub fn stage(theme: &Theme) -> container::Style {
     let p = Palette::from(theme);
+    container::Style::default()
+        .background(p.stage)
+        .color(ON_STAGE)
+}
+
+/// A camera tile's picture.
+pub fn tile(theme: &Theme) -> container::Style {
+    let p = Palette::from(theme);
     container::Style {
         background: Some(p.stage.into()),
-        border: border(12.0),
+        border: border(10.0),
+        text_color: Some(ON_STAGE),
+        ..container::Style::default()
+    }
+}
+
+/// The accent ring drawn over the selected tile; `shown` fades it.
+pub fn ring(shown: f32) -> impl Fn(&Theme) -> container::Style {
+    move |theme| container::Style {
+        border: Border {
+            color: alpha(Palette::from(theme).accent, shown),
+            width: 2.5,
+            radius: 10.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Dark glass behind controls that float over the image; `shown` fades it.
+pub fn overlay(shown: f32) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| container::Style {
+        background: Some(alpha(rgb(0x1C1C1E), 0.78 * shown).into()),
+        border: Border {
+            color: alpha(Color::WHITE, 0.08 * shown),
+            width: 1.0,
+            radius: RADIUS_LARGE.into(),
+        },
+        shadow: Shadow {
+            color: alpha(Color::BLACK, 0.35 * shown),
+            offset: Vector::new(0.0, 6.0),
+            blur_radius: 20.0,
+        },
+        text_color: Some(alpha(ON_STAGE, shown)),
+        ..container::Style::default()
+    }
+}
+
+/// The darkening under a tile's caption, so its text reads on any image.
+pub fn caption(_theme: &Theme) -> container::Style {
+    let fade = iced::gradient::Linear::new(0.0)
+        .add_stop(0.0, alpha(Color::BLACK, 0.62))
+        .add_stop(1.0, alpha(Color::BLACK, 0.0));
+    container::Style {
+        background: Some(Background::Gradient(fade.into())),
+        border: Border {
+            radius: border::Radius::default().bottom(10.0),
+            ..Border::default()
+        },
+        text_color: Some(ON_STAGE),
+        ..container::Style::default()
+    }
+}
+
+/// A rounded status label tinted with `color`, like "Streaming".
+pub fn pill(color: Color) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| container::Style {
+        background: Some(alpha(color, 0.14).into()),
+        border: border(999.0),
+        text_color: Some(color),
         ..container::Style::default()
     }
 }
@@ -232,27 +305,18 @@ pub fn code(theme: &Theme) -> container::Style {
     }
 }
 
-pub fn tile(selected: bool) -> impl Fn(&Theme) -> container::Style {
-    move |theme| {
-        let p = Palette::from(theme);
-        container::Style {
-            background: Some(p.base.into()),
-            border: if selected {
-                Border {
-                    color: p.accent,
-                    width: 2.0,
-                    radius: 12.0.into(),
-                }
-            } else {
-                hairline(p.hairline, 12.0)
-            },
-            shadow: Shadow {
-                color: alpha(p.shadow, if p.dark { 0.25 } else { 0.05 }),
-                offset: Vector::new(0.0, 1.0),
-                blur_radius: 4.0,
-            },
-            ..container::Style::default()
-        }
+/// A pane floating over the stage, like the inspector in a narrow window.
+pub fn floating(theme: &Theme) -> container::Style {
+    let p = Palette::from(theme);
+    container::Style {
+        background: Some(p.base.into()),
+        shadow: Shadow {
+            color: p.shadow,
+            offset: Vector::new(-4.0, 0.0),
+            blur_radius: 24.0,
+        },
+        text_color: Some(p.text),
+        ..container::Style::default()
     }
 }
 
@@ -446,6 +510,59 @@ pub fn segment(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Sty
             };
             button_base(None, text, 6.0)
         }
+    }
+}
+
+/// An icon or text button on dark glass; `shown` fades it with its overlay.
+pub fn on_glass(active: bool, shown: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let p = Palette::from(theme);
+        let rest = if active { p.accent } else { ON_STAGE_SECONDARY };
+        let (fill, text) = match status {
+            button::Status::Active => (None, rest),
+            button::Status::Hovered => (Some(alpha(Color::WHITE, 0.12)), ON_STAGE),
+            button::Status::Pressed => (Some(alpha(Color::WHITE, 0.2)), ON_STAGE),
+            button::Status::Disabled => (None, alpha(ON_STAGE, 0.35)),
+        };
+        button_base(
+            fill.map(|fill| alpha(fill, fill.a * shown)),
+            alpha(text, text.a * shown),
+            6.0,
+        )
+    }
+}
+
+/// A segment of a segmented control on dark glass.
+pub fn glass_segment(
+    selected: bool,
+    shown: f32,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        if selected {
+            button_base(
+                Some(alpha(Color::WHITE, 0.2 * shown)),
+                alpha(ON_STAGE, shown),
+                6.0,
+            )
+        } else {
+            on_glass(false, shown)(theme, status)
+        }
+    }
+}
+
+/// A secondary button that stays tinted in accent while `on`, like Auto.
+pub fn toggle(on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        if !on {
+            return secondary(theme, status);
+        }
+        let p = Palette::from(theme);
+        let fill = match status {
+            button::Status::Hovered => alpha(p.accent, 0.2),
+            button::Status::Pressed => alpha(p.accent, 0.28),
+            _ => p.accent_soft,
+        };
+        button_base(Some(fill), p.accent_text, RADIUS)
     }
 }
 

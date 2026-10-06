@@ -28,7 +28,7 @@ impl Workbench {
         let content = column![
             row![
                 icon(Icon::Keyboard, 24.0, p.accent),
-                text("Quick guide").size(22).font(style::BOLD),
+                text("Quick guide").size(style::DISPLAY).font(style::BOLD),
                 space::horizontal(),
                 button(icon(Icon::Close, 14.0, p.secondary))
                     .padding(6)

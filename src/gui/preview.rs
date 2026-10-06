@@ -8,7 +8,7 @@ use iced::{Color, Element, Fill, Point, Rectangle, Renderer, Size, Theme, mouse}
 use std::sync::Arc;
 
 /// Space kept around a fitted image.
-const FIT_MARGIN: f32 = 16.0;
+const FIT_MARGIN: f32 = 0.0;
 
 /// The scale at which `native` fits inside `area`.
 pub fn fit_scale(area: Size, native: Size) -> f32 {
@@ -166,10 +166,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fitted_images_center_inside_the_margin() {
+    fn fitted_images_fill_and_center() {
         let bounds = Rectangle::new(Point::new(10.0, 20.0), Size::new(416.0, 316.0));
         let image = placement(bounds, Size::new(800.0, 600.0), None);
-        assert_eq!(image.size(), Size::new(400.0, 300.0));
+        assert_eq!(image.size(), Size::new(416.0, 312.0));
         assert_eq!(image.center(), bounds.center());
         let actual = placement(bounds, Size::new(800.0, 600.0), Some(1.0));
         assert_eq!(actual.size(), Size::new(800.0, 600.0));

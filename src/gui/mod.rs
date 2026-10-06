@@ -7,6 +7,7 @@ mod help;
 mod icon;
 mod inspector;
 mod keys;
+mod motion;
 mod prefs;
 mod preview;
 mod sidebar;
@@ -53,15 +54,20 @@ use std::{
 use style::Palette;
 use widgets::*;
 
-/// Room for the macOS traffic lights, which sit over the content.
-const TOP: f32 = if cfg!(target_os = "macos") {
-    38.0
+/// Height of the title bar row. On macOS it shares the window's top edge with
+/// the traffic lights, which sit over the content.
+const BAR: f32 = if cfg!(target_os = "macos") {
+    40.0
 } else {
-    18.0
+    44.0
 };
+/// Room the macOS traffic lights need when no sidebar sits under them.
+const LIGHTS: f32 = if cfg!(target_os = "macos") { 78.0 } else { 0.0 };
 const SIDEBAR: f32 = 240.0;
+/// Height of the toolbar under the stage, for folding it away.
+const TOOLBAR: f32 = 45.0;
 const INSPECTOR: f32 = 316.0;
-const GUTTER: f32 = 28.0;
+const GUTTER: f32 = 18.0;
 const FRAME_POLL: Duration = Duration::from_millis(2);
 const NOTICE_LIFE: Duration = Duration::from_secs(5);
 const NOTICE_FADE: Duration = Duration::from_millis(180);
@@ -101,6 +107,7 @@ pub fn run_capture(
     } else {
         None
     };
+    let window_size = screenshot_size.unwrap_or(Size::new(1280.0, 840.0));
     let boot = move || {
         let capturing = screenshot.is_some();
         let mut app = Workbench::new(
@@ -109,6 +116,7 @@ pub fn run_capture(
             simulated || capturing,
             (!capturing).then(prefs::load),
         );
+        app.width = window_size.width;
         if let Some(path) = &screenshot {
             let count = demo_cameras.clamp(1, 16);
             app.screenshot = Some(ScreenshotRequest {
@@ -143,7 +151,7 @@ pub fn run_capture(
         .font(icon::FILL_BYTES)
         .antialiasing(true)
         .window(window::Settings {
-            size: screenshot_size.unwrap_or(Size::new(1280.0, 840.0)),
+            size: window_size,
             min_size: Some(Size::new(900.0, 620.0)),
             #[cfg(target_os = "macos")]
             platform_specific: window::settings::PlatformSpecific {
@@ -353,6 +361,15 @@ enum Message {
     CapturePicker(destinations::Message),
     RecordPicker(destinations::Message),
     Screenshot(window::Screenshot),
+    ToggleSidebar,
+    ToggleInspector,
+    ToggleImage,
+    Resized(Size),
+    Pointer,
+    OverControls(bool),
+    HoverTile(Option<String>),
+    FocusTile(String),
+    CaptureCamera(String),
 }
 
 struct Workbench {
@@ -426,6 +443,26 @@ struct Workbench {
     histogram_slide: Animation<bool>,
     shutter: Animation<bool>,
     welcome: Animation<bool>,
+    sidebar_open: bool,
+    /// Whether the inspector is docked open in a wide window.
+    inspector_open: bool,
+    /// Whether the inspector floats over the stage in a narrow window.
+    inspector_peek: bool,
+    /// Only the image: no panes, title bar or toolbar.
+    image_mode: bool,
+    /// Window width at the last resize.
+    width: f32,
+    pointer_moved: Option<Instant>,
+    over_controls: bool,
+    hovered_tile: Option<String>,
+    sidebar_slide: Animation<bool>,
+    inspector_slide: Animation<bool>,
+    /// Title bar and toolbar, hidden in image mode.
+    chrome: Animation<bool>,
+    controls: Animation<bool>,
+    tile_hover: Animation<bool>,
+    /// The overview's ring around the selected camera.
+    ring: Animation<bool>,
 }
 
 impl Workbench {
@@ -503,11 +540,25 @@ impl Workbench {
             prefs_changed: None,
             now,
             born: now,
-            sheet: Animation::new(false).quick(),
-            activity_slide: Animation::new(false).quick(),
-            histogram_slide: Animation::new(prefs.histogram_open).quick(),
-            shutter: Animation::new(false).duration(Duration::from_millis(320)),
-            welcome: Animation::new(false).slow(),
+            sheet: motion::eased(false, motion::SHEET),
+            activity_slide: motion::eased(false, motion::SLIDE),
+            histogram_slide: motion::eased(prefs.histogram_open, motion::CONTROLS_IN),
+            shutter: Animation::new(false).duration(motion::SHUTTER),
+            welcome: motion::eased(false, motion::WELCOME),
+            sidebar_open: prefs.sidebar_open,
+            inspector_open: prefs.inspector_open,
+            inspector_peek: false,
+            image_mode: false,
+            width: 1280.0,
+            pointer_moved: None,
+            over_controls: false,
+            hovered_tile: None,
+            sidebar_slide: motion::eased(prefs.sidebar_open, motion::PANEL),
+            inspector_slide: motion::eased(prefs.inspector_open, motion::PANEL),
+            chrome: motion::eased(true, motion::IMAGE),
+            controls: motion::eased(false, motion::CONTROLS_IN),
+            tile_hover: motion::eased(false, motion::HOVER),
+            ring: motion::eased(true, motion::RING),
         }
     }
 
@@ -517,6 +568,8 @@ impl Workbench {
             include_simulator: self.include_simulator,
             tab: self.tab,
             histogram_open: self.histogram_open,
+            sidebar_open: self.sidebar_open,
+            inspector_open: self.inspector_open,
             output: self.output.clone(),
             format: self.format.into(),
             count: self.count,
@@ -554,54 +607,6 @@ impl Workbench {
             std::thread::spawn(move || {
                 let _ = prefs::save(&prefs);
             });
-        }
-    }
-
-    fn sheet_open(&self) -> bool {
-        self.help_open || self.capture_to.manager_open || self.record_to.manager_open
-    }
-
-    fn animating(&self) -> bool {
-        let fading = self.notice.as_ref().is_some_and(|(_, error, at)| {
-            let age = self.now.duration_since(*at);
-            age < NOTICE_FADE
-                || (!error && age > NOTICE_LIFE - NOTICE_FADE * 2 && age < NOTICE_LIFE)
-        });
-        fading
-            || [
-                &self.sheet,
-                &self.activity_slide,
-                &self.histogram_slide,
-                &self.shutter,
-                &self.welcome,
-            ]
-            .iter()
-            .any(|animation| animation.is_animating(self.now))
-    }
-
-    fn sync_animations(&mut self) {
-        let now = self.now;
-        let open = self.sheet_open();
-        if open != self.sheet.value() {
-            if open {
-                self.sheet.go_mut(true, now);
-            } else {
-                self.sheet = Animation::new(false).quick();
-            }
-        }
-        if self.logs_open != self.activity_slide.value() {
-            self.activity_slide.go_mut(self.logs_open, now);
-        }
-        if self.histogram_open != self.histogram_slide.value() {
-            self.histogram_slide.go_mut(self.histogram_open, now);
-        }
-        let welcome = self.snapshot.connected.is_none() && !self.overview();
-        if welcome != self.welcome.value() {
-            if welcome {
-                self.welcome.go_mut(true, now);
-            } else {
-                self.welcome = Animation::new(false).slow();
-            }
         }
     }
 
@@ -685,6 +690,7 @@ impl Workbench {
                 _ => None,
             }),
             system::theme_changes().map(Message::SystemTheme),
+            window::resize_events().map(|(_, size)| Message::Resized(size)),
         ])
     }
 
@@ -768,7 +774,7 @@ impl Workbench {
     fn finished(&mut self, pending: &Pending, result: &serde_json::Value) {
         if pending.label == "Saving capture" {
             self.shutter = Animation::new(true)
-                .duration(Duration::from_millis(320))
+                .duration(motion::SHUTTER)
                 .go(false, self.now);
         }
         let Some(target) = &pending.target else {
@@ -799,7 +805,11 @@ impl Workbench {
 
     fn tick(&mut self) -> Task<Message> {
         self.poll();
+        let selected = self.snapshot.active_camera.clone();
         self.snapshot = self.handle.snapshot();
+        if self.snapshot.active_camera != selected {
+            self.ring = motion::eased(false, motion::RING).go(true, self.now);
+        }
         let camera_id = self
             .snapshot
             .connected
@@ -1392,6 +1402,55 @@ impl Workbench {
             Message::RecordPicker(message) => {
                 self.record_to.update(message, &mut self.forward_output)
             }
+            Message::ToggleSidebar => {
+                self.image_mode = false;
+                self.sidebar_open = !self.sidebar_open;
+            }
+            Message::ToggleInspector => {
+                self.image_mode = false;
+                if self.inspector_docked() {
+                    self.inspector_open = !self.inspector_open;
+                } else {
+                    self.inspector_peek = !self.inspector_peek;
+                }
+            }
+            Message::ToggleImage => self.image_mode = !self.image_mode,
+            Message::Resized(size) => {
+                self.width = size.width;
+                if self.inspector_docked() {
+                    self.inspector_peek = false;
+                }
+            }
+            Message::Pointer => self.pointer_moved = Some(self.now),
+            Message::OverControls(over) => self.over_controls = over,
+            Message::HoverTile(id) => {
+                if id.is_some() && id != self.hovered_tile {
+                    self.tile_hover = motion::eased(false, motion::HOVER).go(true, self.now);
+                }
+                self.hovered_tile = id;
+            }
+            Message::FocusTile(camera) => {
+                self.focus_camera = true;
+                if self.snapshot.active_camera.as_ref() != Some(&camera) {
+                    self.send("Selecting camera", SessionCommand::Select { camera });
+                }
+            }
+            Message::CaptureCamera(id) => {
+                if !self.pending("Saving capture") {
+                    self.send_to(
+                        &id,
+                        "Saving capture",
+                        SessionCommand::Capture {
+                            output: self.output.clone(),
+                            count: self.count,
+                            timeout_ms: self.timeout_ms,
+                            format: self.format.into(),
+                            storage: self.storage_policy(),
+                            destination: self.capture_to.selected.clone(),
+                        },
+                    );
+                }
+            }
             Message::Screenshot(shot) => {
                 if let Some(request) = &mut self.screenshot {
                     let path = request.path.clone();
@@ -1441,8 +1500,13 @@ impl Workbench {
                 });
             }
             Action::CloseWindow => return window::latest().and_then(window::close),
+            Action::ToggleSidebar => return self.handle_message(Message::ToggleSidebar),
+            Action::ToggleInspector => return self.handle_message(Message::ToggleInspector),
             // Sheets take the keyboard until they close.
             _ if modal => {}
+            Action::Overview if self.image_mode => self.image_mode = false,
+            Action::Overview if self.inspector_peek => self.inspector_peek = false,
+            Action::ImageMode => self.image_mode = !self.image_mode,
             Action::Discover => self.discover(),
             Action::ConnectAddress => return focus_address(),
             Action::NextCamera => self.select_relative_camera(1),
@@ -1553,17 +1617,53 @@ impl Workbench {
     fn view(&self) -> Element<'_, Message> {
         let dark = self.dark();
         let p = Palette::of(dark);
-        let body: Element<'_, Message> = row![
-            self.sidebar(p),
-            rule::vertical(1).style(style::line),
+        let sidebar = self.sidebar_slide.interpolate(0.0f32, SIDEBAR, self.now);
+        let inspector = self
+            .inspector_slide
+            .interpolate(0.0f32, INSPECTOR, self.now);
+        let docked = self.inspector_docked();
+        let mut body = row![];
+        if sidebar > 0.5 {
+            // Anchored right, so the list slides out under the window's left edge.
+            body = body.push(
+                container(self.sidebar(p))
+                    .width(sidebar)
+                    .height(Fill)
+                    .align_right(sidebar)
+                    .clip(true),
+            );
+        }
+        body = body.push(
             container(self.main(p))
                 .width(Fill)
                 .height(Fill)
                 .style(style::base),
-            rule::vertical(1).style(style::line),
-            self.inspector(p),
-        ]
-        .into();
+        );
+        if docked && inspector > 0.5 {
+            body = body.push(rule::vertical(1).style(style::line)).push(
+                container(self.inspector(p))
+                    .width(inspector)
+                    .height(Fill)
+                    .clip(true),
+            );
+        }
+        let mut layers = stack![body];
+        if !docked && inspector > 0.5 {
+            layers = layers.push(
+                container(opaque(
+                    container(self.inspector(p))
+                        .width(inspector)
+                        .height(Fill)
+                        .clip(true)
+                        .style(style::floating),
+                ))
+                .align_right(Fill),
+            );
+        }
+        // Building this 1×1 view is what turns on GPU frame decoding.
+        let body: Element<'_, Message> = layers
+            .push(shader(self.gpu.probe()).width(1).height(1))
+            .into();
         let t = self.sheet.interpolate(0.0f32, 1.0, self.now);
         let body = if self.help_open {
             modal(body, self.help(p), Message::Help(false), t)
@@ -1592,9 +1692,13 @@ impl Workbench {
         }
     }
 
-    /// Space at the top of a column; on macOS it is also the window's drag handle.
+    /// The title bar row at the top of a pane; on macOS it is also the
+    /// window's drag handle.
     fn titlebar<'a>(&self, content: Element<'a, Message>) -> Element<'a, Message> {
-        let top = column![space().height(TOP), content];
+        let top = container(content)
+            .height(BAR)
+            .width(Fill)
+            .align_y(Alignment::Center);
         if cfg!(target_os = "macos") {
             mouse_area(top).on_press(Message::DragWindow).into()
         } else {
@@ -1608,12 +1712,22 @@ impl Workbench {
         } else {
             self.single_view(p)
         };
+        let chrome = self.chrome.interpolate(0.0f32, 1.0, self.now);
         let mut main = column![content];
-        let activity = self.activity_slide.interpolate(0.0f32, 171.0, self.now);
+        let activity = self.activity_slide.interpolate(0.0f32, 171.0, self.now) * chrome;
         if activity > 0.5 {
             main = main.push(container(self.activity(p)).height(activity).clip(true));
         }
-        main.push(self.toolbar(p)).into()
+        if chrome > 0.999 {
+            main = main.push(self.toolbar(p));
+        } else if chrome > 0.001 {
+            main = main.push(
+                container(self.toolbar(p))
+                    .height(TOOLBAR * chrome)
+                    .clip(true),
+            );
+        }
+        main.into()
     }
 }
 

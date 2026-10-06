@@ -13,7 +13,7 @@ impl Workbench {
                 row![
                     icon(
                         Icon::Camera,
-                        15.0,
+                        14.0,
                         if connected { p.text } else { p.tertiary }
                     ),
                     text(if capturing {
@@ -35,21 +35,12 @@ impl Workbench {
         ),]
         .spacing(8)
         .align_y(Alignment::Center);
-        if self.overview() {
-            left = left.push(tip(
-                button(text("Focus selected").size(style::BODY))
-                    .padding([6, 12])
-                    .style(style::plain)
-                    .on_press(Message::Focus(true)),
-                Action::FocusCamera.hint("Focus selected camera", os),
-            ));
-        }
         left = left.push(tip(
             button(clipped(
                 text(self.capture_to.label(&self.output))
                     .size(style::SMALL)
-                    .font(style::MONO)
-                    .color(p.secondary),
+                    .color(p.secondary)
+                    .wrapping(text::Wrapping::None),
             ))
             .padding([4, 6])
             .style(style::plain)
@@ -116,7 +107,7 @@ impl Workbench {
                     tip(
                         icon_button(
                             Icon::Activity,
-                            15.0,
+                            16.0,
                             if self.logs_open {
                                 p.accent
                             } else {
@@ -126,13 +117,13 @@ impl Workbench {
                         ),
                         Action::ToggleActivity.hint("Session activity", os),
                     ),
-                    // Building this 1×1 view is what turns on GPU frame decoding.
-                    shader(self.gpu.probe()).width(1).height(1),
                 ]
                 .spacing(10)
                 .align_y(Alignment::Center),
             )
-            .padding([8.0, GUTTER - 6.0]),
+            .height(TOOLBAR - 1.0)
+            .align_y(Alignment::Center)
+            .padding([0.0, GUTTER - 6.0]),
         ]
         .into()
     }

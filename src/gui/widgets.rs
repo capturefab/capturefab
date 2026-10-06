@@ -1,6 +1,5 @@
 //! Small building blocks shared by the views.
 use super::*;
-use iced::widget::column;
 
 /// Tooltip in the workbench style.
 pub(super) fn focus_address() -> Task<Message> {
@@ -63,16 +62,18 @@ pub(super) fn dot<'a, M: 'a>(color: Color, size: f32) -> Element<'a, M> {
         .into()
 }
 
-/// A section title: semibold accent text over a hairline, as in Things.
+/// A section title: a small uppercase label above its group.
 pub(super) fn heading<'a, M: 'a>(title: &'a str, p: &'static Palette) -> Element<'a, M> {
-    column![
-        text(title)
-            .size(style::BODY)
+    container(
+        text(title.to_uppercase())
+            .size(style::CAPTION)
             .font(style::SEMIBOLD)
-            .color(p.accent_text),
-        rule::horizontal(1).style(style::line),
-    ]
-    .spacing(6)
+            .color(p.secondary),
+    )
+    .padding(iced::Padding {
+        top: 6.0,
+        ..iced::Padding::ZERO
+    })
     .into()
 }
 

@@ -12,14 +12,14 @@ impl Workbench {
         }
         let discovering = self.pending("Discovering cameras");
         let brand = row![
-            icon(Icon::Mark, 20.0, p.accent),
-            text("Capturefab").size(15).font(style::BOLD),
+            icon(Icon::Mark, 18.0, p.accent),
+            text("Capturefab").size(style::TITLE).font(style::BOLD),
         ]
-        .spacing(9)
+        .spacing(8)
         .align_y(Alignment::Center);
         let header = row![
-            text("Cameras")
-                .size(style::SMALL)
+            text("CAMERAS")
+                .size(style::CAPTION)
                 .font(style::SEMIBOLD)
                 .color(p.secondary),
             text(if discovering {
@@ -27,7 +27,7 @@ impl Workbench {
             } else {
                 devices.len().to_string()
             })
-            .size(style::SMALL)
+            .size(style::CAPTION)
             .color(p.tertiary),
             space::horizontal(),
             tip(
@@ -269,8 +269,16 @@ impl Workbench {
         .spacing(9);
         container(
             column![
-                self.titlebar(container(brand).padding([0, 6]).into()),
-                space().height(22),
+                // Beside the macOS traffic lights, which sit at the left.
+                self.titlebar(
+                    container(brand)
+                        .padding(iced::Padding {
+                            left: (LIGHTS - 12.0).max(6.0),
+                            ..iced::Padding::ZERO
+                        })
+                        .into()
+                ),
+                space().height(10),
                 container(header).padding([0, 4]),
                 space().height(4),
                 scrollable(list).height(Fill).style(style::scroll),

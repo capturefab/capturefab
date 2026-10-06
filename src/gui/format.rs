@@ -9,6 +9,27 @@ pub(super) fn feature_value(feature: &FeatureInfo) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
+/// A GenICam name as words: "AcquisitionFrameRate" → "Acquisition Frame Rate",
+/// keeping acronyms together: "GevSCPSPacketSize" → "Gev SCPS Packet Size".
+pub(super) fn words(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, &c) in chars.iter().enumerate() {
+        if i > 0 && c != '_' {
+            let previous = chars[i - 1];
+            let next_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+            let boundary = (c.is_uppercase()
+                && (previous.is_lowercase() || (previous.is_uppercase() && next_lower)))
+                || (c.is_ascii_digit() && previous.is_lowercase());
+            if boundary && !out.ends_with(' ') {
+                out.push(' ');
+            }
+        }
+        out.push(if c == '_' { ' ' } else { c });
+    }
+    out
+}
+
 pub(super) fn capitalize(value: &str) -> String {
     let mut chars = value.chars();
     chars
@@ -271,6 +292,17 @@ mod tests {
             transport_text(&TransportStats::default()),
             "resend 0/0 · 0 lost"
         );
+    }
+
+    #[test]
+    fn feature_names_read_as_words() {
+        assert_eq!(words("AcquisitionFrameRate"), "Acquisition Frame Rate");
+        assert_eq!(words("GevSCPSPacketSize"), "Gev SCPS Packet Size");
+        assert_eq!(words("OffsetX"), "Offset X");
+        assert_eq!(words("PixelFormat"), "Pixel Format");
+        assert_eq!(words("U3VMaxPacket"), "U3V Max Packet");
+        assert_eq!(words("Gain"), "Gain");
+        assert_eq!(words("Device_Temperature"), "Device Temperature");
     }
 
     #[test]

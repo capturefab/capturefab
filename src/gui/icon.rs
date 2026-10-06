@@ -42,6 +42,10 @@ pub enum Icon {
     Check,
     Warning,
     Keyboard,
+    Sidebar,
+    Sliders,
+    CornersOut,
+    CornersIn,
     /// The app mark: a rounded lens body.
     Mark,
 }
@@ -79,6 +83,10 @@ impl Icon {
             Icon::Check => (REGULAR, '\u{e184}'),
             Icon::Warning => (REGULAR, '\u{e4e2}'),
             Icon::Keyboard => (REGULAR, '\u{e2d8}'),
+            Icon::Sidebar => (REGULAR, '\u{ec24}'),
+            Icon::Sliders => (REGULAR, '\u{e434}'),
+            Icon::CornersOut => (REGULAR, '\u{e1d0}'),
+            Icon::CornersIn => (REGULAR, '\u{e1ce}'),
             Icon::Mark => (REGULAR, '\u{e00a}'),
         }
     }

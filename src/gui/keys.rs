@@ -230,6 +230,9 @@ pub enum Action {
     ZoomFit,
     ZoomActual,
     ToggleActivity,
+    ToggleSidebar,
+    ToggleInspector,
+    ImageMode,
     CopySessionCommand,
     Fullscreen,
     Help,
@@ -237,7 +240,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 22] = [
+    pub const ALL: [Action; 25] = [
         Action::Discover,
         Action::ConnectAddress,
         Action::NextCamera,
@@ -256,6 +259,9 @@ impl Action {
         Action::ZoomFit,
         Action::ZoomActual,
         Action::ToggleActivity,
+        Action::ToggleSidebar,
+        Action::ToggleInspector,
+        Action::ImageMode,
         Action::CopySessionCommand,
         Action::Fullscreen,
         Action::Help,
@@ -294,6 +300,9 @@ impl Action {
                 Action::ZoomOut,
                 Action::ZoomFit,
                 Action::ZoomActual,
+                Action::ToggleSidebar,
+                Action::ToggleInspector,
+                Action::ImageMode,
                 Action::ToggleActivity,
                 Action::Fullscreen,
             ],
@@ -328,6 +337,9 @@ impl Action {
             Action::ZoomFit => "Zoom to fit",
             Action::ZoomActual => "Actual pixels (1:1)",
             Action::ToggleActivity => "Show / hide activity",
+            Action::ToggleSidebar => "Show / hide camera list",
+            Action::ToggleInspector => "Show / hide settings",
+            Action::ImageMode => "Image only",
             Action::CopySessionCommand => "Copy session CLI command",
             Action::Fullscreen => "Toggle full screen",
             Action::Help => "Keyboard shortcuts and help",
@@ -372,6 +384,9 @@ impl Action {
             Action::ZoomFit => vec![cmd('0')],
             Action::ZoomActual => vec![with(cmd_alt, Key::Char('0'))],
             Action::ToggleActivity => vec![cmd('j')],
+            Action::ToggleSidebar => vec![cmd('b')],
+            Action::ToggleInspector => vec![cmd('i')],
+            Action::ImageMode => vec![bare(Key::Char('f'))],
             Action::CopySessionCommand => vec![with(cmd_shift, Key::Char('c'))],
             Action::Fullscreen if mac => vec![with(
                 Mods {

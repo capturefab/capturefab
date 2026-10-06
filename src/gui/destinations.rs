@@ -971,7 +971,7 @@ impl Picker {
         let p = Palette::of(dark);
         let mut content = column![
             row![
-                text("Destinations").size(20).font(style::BOLD),
+                text("Destinations").size(style::DISPLAY).font(style::BOLD),
                 space::horizontal(),
                 button(icon(Icon::Close, 14.0, p.secondary))
                     .padding(6)

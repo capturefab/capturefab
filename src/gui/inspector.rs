@@ -42,8 +42,8 @@ impl Workbench {
             Tab::Forward => self.forward_settings(p),
         };
         container(column![
-            self.titlebar(container(tabs).padding([0, 18]).into()),
-            space().height(14),
+            self.titlebar(container(tabs).padding([0, 16]).into()),
+            space().height(8),
             scrollable(container(content).padding(iced::Padding {
                 top: 4.0,
                 right: 20.0,
@@ -290,14 +290,14 @@ impl Workbench {
                     | "VideoMode"
             );
         let writable = (feature.writable || managed) && !locked;
-        let name = if feature.display_name.is_empty() {
-            &feature.name
+        let name = if feature.display_name.is_empty() || feature.display_name == feature.name {
+            words(&feature.name)
         } else {
-            &feature.display_name
+            feature.display_name.clone()
         };
         let kind = feature.kind.to_lowercase();
         let label = tip(
-            text(name.clone()).size(style::BODY),
+            text(name).size(style::BODY),
             format!("{}\n{}", feature.name, feature.description),
         );
         let current = feature_value(feature);
@@ -347,7 +347,6 @@ impl Workbench {
                     .unwrap_or_default()
             ))
             .size(style::SMALL)
-            .font(style::MONO)
             .color(p.secondary)
             .into()
         } else if kind == "boolean" || kind == "bool" {
@@ -383,7 +382,6 @@ impl Workbench {
                 text_input(&current, draft)
                     .on_input(move |value| Message::Draft(draft_name.clone(), value))
                     .on_submit(Message::Commit(feature.name.clone()))
-                    .font(style::MONO)
                     .size(style::SMALL)
                     .padding([5, 8])
                     .width(110)
@@ -479,7 +477,7 @@ impl Workbench {
             button(
                 center(
                     row![
-                        icon(Icon::Camera, 15.0, Color::WHITE),
+                        icon(Icon::Camera, 14.0, Color::WHITE),
                         text(if capturing { "Saving…" } else { "Capture & save" })
                             .size(style::BODY)
                             .font(style::MEDIUM),

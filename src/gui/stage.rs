@@ -1,83 +1,129 @@
-//! The single-camera stage: header, live image, zoom controls, histogram and the welcome screen.
+//! The single-camera stage: the title bar, the live image edge to edge with
+//! its controls, histogram and status floating over it, and the welcome screen.
 use super::*;
 use iced::widget::column;
 
+/// A rounded status label: a dot, a word and an optional live figure.
+pub(super) fn status_pill<'a>(
+    label: &'a str,
+    figure: Option<String>,
+    color: Color,
+    pulse: f32,
+) -> Element<'a, Message> {
+    let mut content = row![
+        dot(fade(color, pulse), 6.0),
+        text(label).size(style::SMALL).font(style::MEDIUM),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    if let Some(figure) = figure {
+        // A fixed slot, so a changing figure never shifts what follows.
+        content = content.push(text(figure).size(style::SMALL).width(58));
+    }
+    container(content)
+        .padding([3, 10])
+        .style(style::pill(color))
+        .into()
+}
+
 impl Workbench {
-    pub(super) fn header<'a>(
+    /// The row above the main area: pane toggles, what is shown, its live
+    /// status and its actions. It folds away in image mode.
+    pub(super) fn title_bar<'a>(
         &self,
-        marker: Element<'a, Message>,
         title: String,
-        subtitle: Element<'a, Message>,
+        status: Option<Element<'a, Message>>,
         actions: Element<'a, Message>,
+        p: &'static Palette,
     ) -> Element<'a, Message> {
-        self.titlebar(
-            container(
-                row![
-                    column![
-                        row![
-                            marker,
-                            clipped(text(title).size(style::TITLE).font(style::BOLD))
-                        ]
-                        .spacing(12)
-                        .align_y(Alignment::Center),
-                        subtitle,
-                    ]
-                    .spacing(4)
-                    .width(Fill),
-                    actions,
-                ]
-                .spacing(16)
-                .align_y(Alignment::Center),
-            )
-            .padding([0.0, GUTTER])
-            .into(),
-        )
+        let os = Os::CURRENT;
+        let sidebar = self.sidebar_slide.interpolate(0.0f32, SIDEBAR, self.now);
+        let mut left = row![tip(
+            icon_button(
+                Icon::Sidebar,
+                16.0,
+                if self.sidebar_open {
+                    p.text
+                } else {
+                    p.secondary
+                },
+                Message::ToggleSidebar,
+            ),
+            Action::ToggleSidebar.hint("Camera list", os),
+        )]
+        .spacing(10)
+        .align_y(Alignment::Center);
+        if !title.is_empty() {
+            left = left.push(clipped(
+                text(title)
+                    .size(style::TITLE)
+                    .font(style::BOLD)
+                    .wrapping(text::Wrapping::None),
+            ));
+        }
+        if let Some(status) = status {
+            left = left.push(status);
+        }
+        let bar = row![
+            container(left).width(Fill).clip(true),
+            actions,
+            tip(
+                icon_button(Icon::CornersOut, 16.0, p.secondary, Message::ToggleImage),
+                Action::ImageMode.hint("Image only", os),
+            ),
+            tip(
+                icon_button(
+                    Icon::Sliders,
+                    16.0,
+                    if self.inspector_shown() {
+                        p.text
+                    } else {
+                        p.secondary
+                    },
+                    Message::ToggleInspector,
+                ),
+                Action::ToggleInspector.hint("Settings", os),
+            ),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        let bar = container(bar)
+            .height(BAR)
+            .width(Fill)
+            .align_y(Alignment::Center)
+            .padding(iced::Padding {
+                top: 0.0,
+                right: 10.0,
+                bottom: 0.0,
+                left: 10.0 + (LIGHTS - sidebar).max(0.0),
+            });
+        let bar: Element<'a, Message> = if cfg!(target_os = "macos") {
+            mouse_area(bar).on_press(Message::DragWindow).into()
+        } else {
+            bar.into()
+        };
+        container(bar)
+            .height(self.chrome.interpolate(0.0f32, BAR, self.now))
+            .clip(true)
+            .into()
     }
 
     pub(super) fn single_view(&self, p: &'static Palette) -> Element<'_, Message> {
         let snapshot = &self.snapshot;
         let connected = snapshot.connected.is_some();
-        let (status, color) = if snapshot.streaming {
-            ("Streaming", p.live)
+        let status = if snapshot.streaming {
+            Some(status_pill(
+                "Streaming",
+                Some(format!("{:.1} fps", snapshot.fps)),
+                p.live,
+                self.pulse(),
+            ))
         } else if connected {
-            ("Ready", p.accent_text)
+            Some(status_pill("Ready", None, p.accent_text, 1.0))
         } else {
-            ("No camera connected", p.secondary)
+            None
         };
-        let mut subtitle = row![
-            text(status)
-                .size(style::BODY)
-                .font(style::MEDIUM)
-                .color(color)
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center);
-        if connected {
-            let (label, lost) = snapshot
-                .transport
-                .as_ref()
-                .map_or(("dropped", snapshot.dropped), |stats| {
-                    ("lost", transport_loss(stats))
-                });
-            let mut parts = vec![
-                format!("{:.1} fps", snapshot.fps),
-                format!("{} frames", grouped(snapshot.frames)),
-            ];
-            parts.push(format!("{lost} {label}"));
-            for part in parts {
-                subtitle = subtitle
-                    .push(text("·").size(style::BODY).color(p.tertiary))
-                    .push(text(part).size(style::BODY).color(p.secondary));
-            }
-            if lost > 0 {
-                subtitle = subtitle.push(dot(p.warn, 6.0));
-            }
-            if snapshot.auto.is_some() {
-                subtitle = subtitle
-                    .push(text("·").size(style::BODY).color(p.tertiary))
-                    .push(text("Auto").size(style::BODY).color(p.accent_text));
-            }
-        }
+        let os = Os::CURRENT;
         let mut actions = row![].spacing(8).align_y(Alignment::Center);
         if snapshot.cameras.len() > 1 {
             actions = actions.push(tip(
@@ -89,195 +135,283 @@ impl Workbench {
                     .spacing(7)
                     .align_y(Alignment::Center),
                 )
-                .padding([7, 12])
+                .padding([5, 10])
                 .style(style::secondary)
                 .on_press(Message::Focus(false)),
-                Action::Overview.hint("Back to all cameras", Os::CURRENT),
+                Action::Overview.hint("Back to all cameras", os),
             ));
         }
         if connected {
-            actions = actions.push(tip(
-                stream_button(
-                    snapshot.streaming,
-                    if snapshot.streaming { "Stop" } else { "Start" },
-                    Some(Message::ToggleStream),
-                    p,
-                ),
-                Action::ToggleStream.hint("Start or stop acquisition", Os::CURRENT),
-            ));
+            let auto = snapshot.auto.is_some();
+            actions = actions
+                .push(tip(
+                    button(text("Auto").size(style::BODY).font(style::MEDIUM))
+                        .padding([5, 12])
+                        .style(style::toggle(auto))
+                        .on_press_maybe((!self.auto_busy()).then_some(Message::Auto(!auto))),
+                    Action::ToggleAuto.hint("Tune exposure, gain and frame rate", os),
+                ))
+                .push(tip(
+                    stream_button(
+                        snapshot.streaming,
+                        if snapshot.streaming { "Stop" } else { "Start" },
+                        Some(Message::ToggleStream),
+                        p,
+                    ),
+                    Action::ToggleStream.hint("Start or stop acquisition", os),
+                ));
         }
         let title = snapshot
             .connected
             .as_ref()
-            .map_or("Live Preview".to_string(), |camera| camera.model.clone());
-        let marker = icon(
-            Icon::Camera,
-            24.0,
-            if connected { p.accent } else { p.tertiary },
-        );
-        let header = self.header(marker, title, subtitle.into(), actions.into());
-        let stage: Element<'_, Message> = match &self.shown {
-            Some(shown) => {
-                let mut layers = stack![responsive(move |size| {
-                    self.stage.set(size);
-                    shown.view(&self.gpu, (!self.fit).then_some(self.zoom))
-                })];
-                if !snapshot.streaming {
-                    layers = layers.push(container(last_frame()).padding(12));
-                }
-                layers.into()
-            }
+            .map_or(String::new(), |camera| camera.model.clone());
+        let header = self.title_bar(title, status, actions.into(), p);
+        let body = match &self.shown {
+            Some(shown) => self.stage(shown, p),
             None if !connected => self.welcome(p),
-            None => {
-                let mut ready = column![
-                    icon(Icon::Camera, 46.0, p.tertiary),
-                    space().height(6),
-                    text(if snapshot.streaming {
-                        "Waiting for the first frame…"
-                    } else {
-                        "Ready for your first frame"
-                    })
-                    .size(18)
-                    .font(style::SEMIBOLD),
-                ]
-                .spacing(6)
-                .align_x(Alignment::Center);
-                if !snapshot.streaming {
-                    ready = ready.push(space().height(8)).push(
-                        row![
-                            stream_button(false, "Start stream", Some(Message::ToggleStream), p),
-                            button(text("Capture one frame").size(style::BODY))
-                                .padding([7, 12])
-                                .style(style::link)
-                                .on_press_maybe(
-                                    (!self.pending("Saving capture")).then_some(Message::Capture)
-                                ),
-                        ]
-                        .spacing(10)
-                        .align_y(Alignment::Center),
-                    );
-                }
-                center(ready).into()
-            }
+            None => self.ready(p),
         };
-        let flash = self.shutter.interpolate(0.0f32, 0.55, self.now);
-        let stage: Element<'_, Message> = if flash > 0.0 {
-            stack![
-                stage,
-                container(space().width(Fill).height(Fill)).style(move |_| {
-                    container::Style::default().background(Color {
-                        a: flash,
-                        ..Color::WHITE
-                    })
-                }),
-            ]
-            .into()
-        } else {
-            stage
-        };
-        let os = Os::CURRENT;
-        let zoom_actual = !self.fit && (self.zoom - 1.0).abs() < 0.01;
-        let mut controls = row![
-            container(
-                row![
-                    tip(
-                        segment("Fit", self.fit, Message::Fit),
-                        Action::ZoomFit.hint("Zoom to fit", os)
-                    ),
-                    tip(
-                        segment("1:1", zoom_actual, Message::Actual),
-                        Action::ZoomActual.hint("Actual pixels", os)
-                    ),
-                ]
-                .spacing(2)
-            )
-            .padding(2)
-            .style(style::segment_track),
-            tip(
-                icon_button(Icon::Minus, 13.0, p.secondary, Message::Zoom(1.0 / 1.25)),
-                Action::ZoomOut.hint("Zoom out", os)
-            ),
-            tip(
-                icon_button(Icon::Plus, 13.0, p.secondary, Message::Zoom(1.25)),
-                Action::ZoomIn.hint("Zoom in", os)
-            ),
-            tip(
-                icon_button(
-                    Icon::Chart,
-                    14.0,
-                    if self.histogram_open {
-                        p.accent
-                    } else {
-                        p.secondary
-                    },
-                    Message::ToggleHistogram,
-                ),
-                "Luminance histogram"
-            ),
-            space::horizontal(),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center);
-        if let Some((id, width, height, format, _)) = self.frame_meta {
-            controls = controls.push(
-                text(format!(
-                    "{width} × {height}  ·  {}  ·  #{id}",
-                    pixel_name(format)
-                ))
-                .size(style::CAPTION)
-                .font(style::MONO)
-                .color(p.secondary),
-            );
-        }
-        let mut content = column![
-            header,
-            space().height(18),
-            container(stage)
+        column![header, body].into()
+    }
+
+    /// The live image filling the stage, with what floats over it.
+    fn stage<'a>(&'a self, shown: &'a Shown, p: &'static Palette) -> Element<'a, Message> {
+        let snapshot = &self.snapshot;
+        let image = responsive(move |size| {
+            self.stage.set(size);
+            shown.view(&self.gpu, (!self.fit).then_some(self.zoom))
+        });
+        let mut layers = stack![
+            container(image)
                 .width(Fill)
                 .height(Fill)
-                .clip(true)
-                .style(style::stage),
+                .style(style::stage)
         ];
-        if self.shown.is_some() {
-            content = content.push(space().height(10)).push(controls);
-        }
-        let histogram = self.histogram_slide.interpolate(0.0f32, 52.0, self.now);
-        if histogram > 0.5 && self.shown.is_some() {
-            content = content.push(
-                container(
-                    column![
-                        space().height(8),
-                        iced::widget::canvas(preview::Histogram {
-                            bins: self.histogram,
-                            color: Color {
-                                a: 0.55,
-                                ..p.accent
-                            },
-                        })
-                        .width(Fill)
-                        .height(44),
-                    ]
-                    .height(52),
-                )
-                .height(histogram)
-                .clip(true),
-            );
+        let mut badges = row![].spacing(6).align_y(Alignment::Center);
+        if !snapshot.streaming {
+            badges = badges.push(last_frame());
         }
         if let Some(error) = self.display_error.as_ref().or(snapshot.last_error.as_ref()) {
-            content = content.push(space().height(6)).push(tip(
-                clipped(text(error.clone()).size(style::SMALL).color(p.danger)),
+            badges = badges.push(tip(
+                container(
+                    row![
+                        icon(Icon::Warning, 12.0, p.danger),
+                        text(error.clone()).size(style::SMALL)
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .max_width(520)
+                .clip(true)
+                .padding([3, 8])
+                .style(style::badge),
                 error.clone(),
             ));
         }
-        content
-            .push(space().height(12))
-            .padding(iced::Padding {
-                top: 0.0,
-                right: GUTTER,
-                bottom: 0.0,
-                left: GUTTER,
+        layers = layers.push(container(badges).padding(12));
+        let histogram = self.histogram_slide.interpolate(0.0f32, 1.0, self.now);
+        if histogram > 0.01 {
+            layers = layers.push(
+                container(
+                    container(
+                        iced::widget::canvas(preview::Histogram {
+                            bins: self.histogram,
+                            color: Color {
+                                a: 0.7 * histogram,
+                                ..p.accent
+                            },
+                        })
+                        .width(220)
+                        .height(56),
+                    )
+                    .padding(10)
+                    .style(style::overlay(histogram)),
+                )
+                .align_right(Fill)
+                .align_top(Fill)
+                .padding(12),
+            );
+        }
+        let controls = self.controls.interpolate(0.0f32, 1.0, self.now);
+        if controls > 0.01 {
+            layers = layers.push(
+                container(
+                    mouse_area(self.stage_controls(controls))
+                        .on_enter(Message::OverControls(true))
+                        .on_exit(Message::OverControls(false)),
+                )
+                .center_x(Fill)
+                .align_bottom(Fill)
+                .padding(iced::Padding {
+                    bottom: 16.0 + 6.0 * (1.0 - controls),
+                    ..iced::Padding::new(16.0)
+                }),
+            );
+        }
+        let flash = self.shutter.interpolate(0.0f32, 0.55, self.now);
+        if flash > 0.0 {
+            layers = layers.push(container(space().width(Fill).height(Fill)).style(move |_| {
+                container::Style::default().background(Color {
+                    a: flash,
+                    ..Color::WHITE
+                })
+            }));
+        }
+        mouse_area(layers)
+            .on_move(|_| Message::Pointer)
+            .on_double_click(Message::ToggleImage)
+            .into()
+    }
+
+    /// Zoom, histogram and image mode controls with the frame's details, on
+    /// dark glass at the bottom of the stage; `shown` fades them.
+    fn stage_controls(&self, shown: f32) -> Element<'_, Message> {
+        let os = Os::CURRENT;
+        let snapshot = &self.snapshot;
+        let zoom_actual = !self.fit && (self.zoom - 1.0).abs() < 0.01;
+        let ink = |active: bool| {
+            fade(
+                if active {
+                    Palette::of(self.dark()).accent
+                } else {
+                    style::ON_STAGE_SECONDARY
+                },
+                shown,
+            )
+        };
+        let segment = |label: &'static str, selected: bool, on: Message| {
+            button(text(label).size(style::SMALL).font(if selected {
+                style::SEMIBOLD
+            } else {
+                style::SANS
+            }))
+            .padding([3, 10])
+            .style(style::glass_segment(selected, shown))
+            .on_press(on)
+        };
+        let glass = |kind: Icon, active: bool, on: Message| {
+            button(icon(kind, 14.0, ink(active)))
+                .padding(5)
+                .style(style::on_glass(active, shown))
+                .on_press(on)
+        };
+        let (label, lost) = snapshot
+            .transport
+            .as_ref()
+            .map_or(("dropped", snapshot.dropped), |stats| {
+                ("lost", transport_loss(stats))
+            });
+        let mut details = vec![];
+        if let Some((_, width, height, format, _)) = self.frame_meta {
+            details.push(format!("{width} × {height}"));
+            details.push(pixel_name(format));
+        }
+        details.push(format!("{} frames", grouped(snapshot.frames)));
+        details.push(format!("{lost} {label}"));
+        let bar = row![
+            row![
+                tip(
+                    segment("Fit", self.fit, Message::Fit),
+                    Action::ZoomFit.hint("Zoom to fit", os)
+                ),
+                tip(
+                    segment("1:1", zoom_actual, Message::Actual),
+                    Action::ZoomActual.hint("Actual pixels", os)
+                ),
+            ]
+            .spacing(2),
+            tip(
+                glass(Icon::Minus, false, Message::Zoom(1.0 / 1.25)),
+                Action::ZoomOut.hint("Zoom out", os)
+            ),
+            tip(
+                glass(Icon::Plus, false, Message::Zoom(1.25)),
+                Action::ZoomIn.hint("Zoom in", os)
+            ),
+            tip(
+                glass(Icon::Chart, self.histogram_open, Message::ToggleHistogram),
+                "Luminance histogram"
+            ),
+            space::horizontal(),
+            clipped(
+                text(details.join("  ·  "))
+                    .size(style::SMALL)
+                    .color(fade(
+                        if lost > 0 {
+                            Palette::of(self.dark()).warn
+                        } else {
+                            style::ON_STAGE_SECONDARY
+                        },
+                        shown,
+                    ))
+                    .wrapping(text::Wrapping::None)
+            ),
+            tip(
+                glass(
+                    if self.image_mode {
+                        Icon::CornersIn
+                    } else {
+                        Icon::CornersOut
+                    },
+                    false,
+                    Message::ToggleImage
+                ),
+                Action::ImageMode.hint(
+                    if self.image_mode {
+                        "Leave image only"
+                    } else {
+                        "Image only"
+                    },
+                    os
+                )
+            ),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        container(bar)
+            .max_width(640)
+            .width(Fill)
+            .padding([6, 8])
+            .style(style::overlay(shown))
+            .into()
+    }
+
+    /// A connected camera before its first frame.
+    fn ready(&self, p: &'static Palette) -> Element<'_, Message> {
+        let streaming = self.snapshot.streaming;
+        let mut ready = column![
+            icon(Icon::Camera, 40.0, style::ON_STAGE_SECONDARY),
+            space().height(6),
+            text(if streaming {
+                "Waiting for the first frame…"
+            } else {
+                "Ready for your first frame"
             })
+            .size(style::TITLE)
+            .font(style::SEMIBOLD)
+            .color(style::ON_STAGE),
+        ]
+        .spacing(6)
+        .align_x(Alignment::Center);
+        if !streaming {
+            ready = ready.push(space().height(8)).push(
+                row![
+                    stream_button(false, "Start stream", Some(Message::ToggleStream), p),
+                    button(text("Capture one frame").size(style::BODY))
+                        .padding([7, 12])
+                        .style(style::on_glass(false, 1.0))
+                        .on_press_maybe(
+                            (!self.pending("Saving capture")).then_some(Message::Capture)
+                        ),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            );
+        }
+        container(center(ready))
+            .width(Fill)
             .height(Fill)
+            .style(style::stage)
             .into()
     }
 
@@ -443,7 +577,7 @@ impl Workbench {
             icon(Icon::Mark, 44.0, fade(p.accent, t)),
             space().height(10),
             text("Connect a camera")
-                .size(22)
+                .size(style::DISPLAY)
                 .font(style::BOLD)
                 .color(fade(p.text, t)),
             text(subtitle)
