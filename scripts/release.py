@@ -71,6 +71,7 @@ def digest(path):
     return result.hexdigest()
 
 def run(args, **kwargs):
+    if kwargs.get('text'): kwargs.setdefault('encoding', 'utf-8')
     result = subprocess.run([str(x) for x in args], **kwargs)
     if result.returncode:
         # Do not echo arguments: signing tools can receive private passwords.
