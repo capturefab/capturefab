@@ -137,7 +137,10 @@ impl WorkerHandle {
             s.logs.remove(0);
         }
     }
-    fn record(&self, frame: Frame) {
+    /// Publish the latest frame. With a shared ring the frame is copied into
+    /// it and handed back, so a consumer such as the forwarder can take its
+    /// buffer; without one it is retained here.
+    fn record(&self, frame: Frame) -> Option<Frame> {
         if let Some(ring) = &self.ring
             && let Err(e) = ring.lock().unwrap_or_else(|e| e.into_inner()).write(&frame)
         {
@@ -146,7 +149,9 @@ impl WorkerHandle {
         self.counters.frames.fetch_add(1, Ordering::Relaxed);
         if self.ring.is_none() {
             *self.frame.write().unwrap_or_else(|e| e.into_inner()) = Some(frame);
+            return None;
         }
+        Some(frame)
     }
 }
 fn timeout(ms: u64) -> Result<Duration> {
@@ -281,6 +286,7 @@ fn process(
             bitrate,
             storage,
             max_file_bytes,
+            destination,
         } => {
             ensure!(
                 forwarder.is_none(),
@@ -294,6 +300,7 @@ fn process(
                 bitrate,
                 storage,
                 max_file_bytes,
+                destination,
             })?;
             camera_mut(camera)?.start()?;
             *forwarder = Some((f, fps));
@@ -469,8 +476,10 @@ fn process(
             first_at_ms,
             interval_ms,
             storage,
+            destination,
         } => {
             validate_capture(&output, count, timeout_ms, &format)?;
+            let resolved = crate::destination::resolve(destination.as_deref(), &output)?;
             storage.validate()?;
             ensure!(
                 output != "-",
@@ -493,7 +502,8 @@ fn process(
             let info = crate::scheduling::CaptureJob {
                 id: *next_job,
                 status: "pending".into(),
-                output,
+                output: resolved.output.clone(),
+                destination: resolved.destination.clone(),
                 count,
                 captured: 0,
                 first_at_ms,
@@ -505,6 +515,7 @@ fn process(
             *next_job = next_job.checked_add(1).context("job ID exhausted")?;
             jobs.push(Scheduled {
                 info: info.clone(),
+                resolved,
                 timeout_ms,
                 format,
                 storage,
@@ -582,7 +593,17 @@ fn process(
             timeout_ms,
             format,
             storage,
+            destination,
         } => {
+            ensure!(
+                output != "-" || destination.is_none(),
+                "stdout output cannot use a destination"
+            );
+            let resolved = if output == "-" {
+                crate::destination::resolve(None, &output)?
+            } else {
+                crate::destination::resolve(destination.as_deref(), &output)?
+            };
             validate_capture(&output, count, timeout_ms, &format)?;
             storage.validate()?;
             let duration = timeout(timeout_ms)?;
@@ -603,6 +624,7 @@ fn process(
                 let mut files = Vec::new();
                 let mut frames = Vec::new();
                 let mut status = None;
+                let mut queued = 0;
                 if !was_streaming && auto.is_some() {
                     // Refresh the controller's streaming state before testing convergence:
                     // a previously stable acquisition must settle again after a restart.
@@ -619,7 +641,7 @@ fn process(
                             );
                             break;
                         };
-                        h.record(frame);
+                        let _ = h.record(frame);
                     }
                 }
                 for index in 0..count {
@@ -631,15 +653,32 @@ fn process(
                     let mut metadata = serde_json::to_value(&frame)?;
                     metadata["bytes"] = json!(frame.data.len());
                     if output != "-" {
-                        let path = output_path(&output, count, index, &format);
+                        let path = output_path(&resolved.output, count, index, &format);
                         crate::storage::save(&frame, &path, &format, &storage)
                             .with_context(|| format!("save {}", path.display()))?;
+                        if let Err(e) = resolved.finished(&path) {
+                            h.log(
+                                "error",
+                                format!(
+                                    "{} saved but not queued for upload: {e:#}",
+                                    path.display()
+                                ),
+                            );
+                        } else if resolved.upload.is_some() {
+                            queued += 1;
+                        }
                         files.push(path.to_string_lossy().to_string());
                     }
                     frames.push(metadata);
-                    h.record(frame);
+                    let _ = h.record(frame);
                 }
                 let mut value = json!({"files":files,"frames":frames,"count":count});
+                if let Some(name) = &resolved.destination {
+                    value["destination"] = json!(name);
+                    if resolved.upload.is_some() {
+                        value["queued_uploads"] = json!(queued);
+                    }
+                }
                 if let Some(status) = status {
                     value["auto"] = json!(status);
                 }
@@ -657,6 +696,7 @@ fn process(
 
 struct Scheduled {
     info: crate::scheduling::CaptureJob,
+    resolved: crate::destination::Resolved,
     timeout_ms: u64,
     format: String,
     storage: crate::storage::StoragePolicy,
@@ -767,6 +807,12 @@ fn capture_jobs(h: &WorkerHandle, frame: &Frame, jobs: &mut [Scheduled], settled
         );
         match crate::storage::save(frame, &path, &job.format, &job.storage) {
             Ok(()) => {
+                if let Err(e) = job.resolved.finished(&path) {
+                    h.log(
+                        "error",
+                        format!("{} saved but not queued for upload: {e:#}", path.display()),
+                    );
+                }
                 job.info.captured += 1;
                 job.info.last_file = Some(path.to_string_lossy().into_owned());
                 job.deadline = None;
@@ -868,13 +914,16 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
                     }
                     let settled = auto.as_ref().is_none_or(AutoController::converged);
                     capture_jobs(&h, &frame, &mut jobs, settled);
-                    if let Some((f, _)) = forwarder.as_mut()
-                        && let Err(e) = f.push(&frame)
+                    // Publish first: the forwarder then takes the sensor
+                    // buffer itself instead of a copy of it.
+                    let retained = (forwarder.is_some() && h.ring.is_none()).then(|| frame.clone());
+                    if let (Some((f, _)), Some(frame)) =
+                        (forwarder.as_mut(), h.record(frame).or(retained))
+                        && let Err(e) = f.push(frame)
                     {
                         h.log("error", format!("Forwarding stopped: {e:#}"));
                         let _ = stop_forward(&h, &mut forwarder, &mut auto);
                     }
-                    h.record(frame);
                     rate_count += 1;
                     consecutive_errors = 0;
                 }
@@ -952,6 +1001,7 @@ mod tests {
                 timeout_ms: 1000,
                 format: "raw".into(),
                 storage: Default::default(),
+                destination: None,
             })
             .unwrap();
         assert_eq!(v["frames"][0]["width"], 128);
@@ -1073,6 +1123,7 @@ mod tests {
                 timeout_ms: 6000,
                 format: "raw".into(),
                 storage: Default::default(),
+                destination: None,
             })
             .unwrap();
         assert_eq!(v["frames"][0]["width"], 128);

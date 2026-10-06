@@ -19,8 +19,8 @@ FFmpeg stays a separate executable. Never enable nonfree FFmpeg components: the 
 ## Commands
 
 ```sh
-cargo build                                                   # desktop (default features: gui, usb, jpeg, nvjpeg)
-cargo build --release --no-default-features --features usb,jpeg,nvjpeg  # headless
+cargo build                                                   # desktop (default features: gui, usb, jpeg, nvjpeg, vaapi, videotoolbox)
+cargo build --release --no-default-features --features usb,jpeg,nvjpeg,vaapi,videotoolbox  # headless
 cargo test
 cargo test --test cli                                         # end-to-end binary tests (tests/cli.rs)
 cargo test --lib storage::                                    # unit tests in one module
@@ -47,6 +47,8 @@ FFmpeg: `build.rs` embeds `CAPTUREFAB_FFMPEG_BINARY` when set at build time, and
 **Camera layers.** `types.rs` defines the `RegisterIo` and `Backend` traits (xml/start/next_frame/stop). Implementations live in `transport/` (`gige.rs` GVCP/GVSP, `usb.rs` U3V via `nusb` behind the `usb` feature, `simulator.rs`), while `media.rs` provides FFmpeg-backed sources (host webcams, RTSP/SRT, files), recording and forwarding with encoder probing. `genicam.rs` parses GenICam XML (incl. zipped) into a feature node map evaluated live against `RegisterIo`. `camera.rs` ties discovery + backend + GenICam together. `onvif.rs` does WS-Discovery and SOAP profile resolution to an RTSP URI.
 
 **Storage.** All captures and recordings go through `storage.rs`: an OS-locked (`fs2`) ledger in the session dir enforcing a global byte/file budget (default 10 GiB / 10,000 files), per-recording max size, reservations, and safe deletion (identity + SHA-256 checks). Write output via `storage::save` / `create_writer`, never directly. Existing output files must never be overwritten.
+
+**Destinations and uploads.** `destination.rs` holds named folder and S3 destinations (no secrets) in the session dir; captures, schedules and recordings resolve `--destination` to a local path and, for buckets, queue the finished file in `upload.rs` (a locked, persistent queue drained by whichever GUI/`serve`/CLI process holds `uploader.lock`). `s3.rs` is a SigV4 client over `ureq`/rustls with conditional writes; secrets come from the OS keychain (`keyring`) or the AWS credential chain. Queued files are held back from retention in the storage ledger until uploaded. `volumes.rs` lists external drives and refuses writes under an unmounted mount point. All of it is behind the `s3` feature except folders and volumes.
 
 ## CLI contract
 

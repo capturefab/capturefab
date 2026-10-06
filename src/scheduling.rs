@@ -15,6 +15,8 @@ pub struct CaptureJob {
     pub next_at_ms: u64,
     pub last_file: Option<String>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
 }
 impl CaptureJob {
     pub fn active(&self) -> bool {

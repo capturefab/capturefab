@@ -1337,6 +1337,10 @@ pub struct ForwardConfig {
     pub storage: crate::storage::StoragePolicy,
     #[serde(default = "default_recording_cap")]
     pub max_file_bytes: u64,
+    /// A saved destination for local recordings; `output` is then a file
+    /// name inside it, and bucket destinations upload the finished file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
 }
 pub fn default_recording_cap() -> u64 {
     512 * 1024 * 1024
@@ -1386,6 +1390,8 @@ pub struct Forwarder {
     config: ForwardConfig,
     process: Option<EncoderProcess>,
     final_stats: ForwardStats,
+    /// The recording's destination, which may upload the finished file.
+    destination: Option<crate::destination::Resolved>,
 }
 fn codec_family(codec: &str) -> Result<&'static str> {
     match codec {
@@ -1812,7 +1818,20 @@ impl RawInput {
     }
 }
 impl Forwarder {
-    pub fn new(config: ForwardConfig) -> Result<Self> {
+    pub fn new(mut config: ForwardConfig) -> Result<Self> {
+        let destination = match config.destination.as_deref() {
+            Some(name) => {
+                ensure!(
+                    recording_output(&config.output)?.is_some(),
+                    "a destination holds recordings, not network streams; omit --destination for {}",
+                    redact_url(&config.output)
+                );
+                let resolved = crate::destination::resolve(Some(name), &config.output)?;
+                config.output = resolved.output.clone();
+                Some(resolved)
+            }
+            None => None,
+        };
         ensure!(
             config.fps.is_finite() && (0.1..=240.0).contains(&config.fps),
             "forwarding FPS must be within 0.1..240"
@@ -1839,6 +1858,7 @@ impl Forwarder {
             config,
             process: None,
             final_stats: ForwardStats::default(),
+            destination,
         })
     }
     fn spawn(&mut self, width: u32, height: u32, raw: RawInput) -> Result<()> {
@@ -2093,7 +2113,9 @@ impl Forwarder {
         });
         Ok(())
     }
-    pub fn push(&mut self, frame: &Frame) -> Result<bool> {
+    /// Queue a frame for encoding; it is owned so its buffer moves to the
+    /// writer thread without a copy.
+    pub fn push(&mut self, frame: Frame) -> Result<bool> {
         if self.process.is_none() {
             self.spawn(
                 frame.width,
@@ -2143,11 +2165,15 @@ impl Forwarder {
             crate::frame::pixel_format_name(frame.pixel_format)
         );
         // FFmpeg converts on its own threads with SIMD swscale (or the encoder
-        // hardware), so the camera thread only copies sensor bytes. Jetson's
-        // converter takes RGBA or I420, built here in one pass.
+        // hardware), so the sensor buffer itself is queued for the pipe.
+        // Jetson's converter takes RGBA or I420, built here in one pass.
         let bytes = match process.jetson {
-            Some(input) => input.bytes(frame)?,
-            None => frame.data[..length].to_vec(),
+            Some(input) => input.bytes(&frame)?,
+            None => {
+                let mut data = frame.data;
+                data.truncate(length);
+                data
+            }
         };
         let mut state = process
             .queue
@@ -2267,8 +2293,17 @@ impl Forwarder {
             let valid = status.as_ref().is_some_and(|status| status.success())
                 && error.is_none()
                 && output.storage.bytes_written() > 0;
+            let path = output.storage.path().to_path_buf();
             let result = if valid {
-                output.storage.finish()
+                output
+                    .storage
+                    .finish()
+                    .and_then(|()| match &self.destination {
+                        Some(destination) => destination
+                            .finished(&path)
+                            .context("recording saved but not queued for upload"),
+                        None => Ok(()),
+                    })
             } else {
                 output.storage.abort()
             };
@@ -2531,9 +2566,10 @@ mod tests {
             bitrate: "1M".into(),
             storage: Default::default(),
             max_file_bytes: default_recording_cap(),
+            destination: None,
         })
         .unwrap();
-        for frame in &frames {
+        for frame in frames {
             forward.push(frame).unwrap();
             thread::sleep(Duration::from_millis(110));
         }
@@ -2587,6 +2623,7 @@ mod tests {
             bitrate: "32M".into(),
             storage: Default::default(),
             max_file_bytes: default_recording_cap(),
+            destination: None,
         })
         .unwrap();
         let mut noise = 123u32;
@@ -2606,10 +2643,10 @@ mod tests {
             timestamp_ns: 0,
             data,
         };
-        forward.push(&frame).unwrap();
+        forward.push(frame.clone()).unwrap();
         let start = Instant::now();
         for _ in 0..120 {
-            forward.push(&frame).unwrap();
+            forward.push(frame.clone()).unwrap();
         }
         assert!(start.elapsed() < Duration::from_secs(2));
         assert!(forward.stats().dropped > 0);
@@ -2635,6 +2672,7 @@ mod tests {
             bitrate: "1M".into(),
             storage: Default::default(),
             max_file_bytes: default_recording_cap(),
+            destination: None,
         })
         .unwrap();
         let frame = Frame {
@@ -2645,7 +2683,7 @@ mod tests {
             timestamp_ns: 0,
             data: vec![0; 64 * 48 * 3],
         };
-        forward.push(&frame).unwrap();
+        forward.push(frame.clone()).unwrap();
         thread::sleep(Duration::from_millis(100));
         assert!(forward.stop().is_err());
         assert!(
@@ -2669,6 +2707,7 @@ mod tests {
             bitrate: "1M".into(),
             storage: Default::default(),
             max_file_bytes: 512,
+            destination: None,
         })
         .unwrap();
         let frame = Frame {
@@ -2679,10 +2718,10 @@ mod tests {
             timestamp_ns: 0,
             data: vec![127; 64 * 48 * 3],
         };
-        forward.push(&frame).unwrap();
+        forward.push(frame.clone()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         while forward.stats().error.is_none() && Instant::now() < deadline {
-            let _ = forward.push(&frame);
+            let _ = forward.push(frame.clone());
             thread::sleep(Duration::from_millis(20));
         }
         let error = forward.stop().unwrap_err().to_string();
@@ -2702,6 +2741,7 @@ mod tests {
             bitrate: "4M".into(),
             storage: Default::default(),
             max_file_bytes: default_recording_cap(),
+            destination: None,
         };
         assert!(Forwarder::new(config.clone()).is_ok());
         let mut invalid = config;

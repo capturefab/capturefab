@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from release import SEMVER
+from release import SEMVER, precedence
 
 WEB = Path(__file__).resolve().parents[1] / 'web'
 FEED_EPOCH = '2026-10-04T00:00:00Z'
@@ -69,13 +69,6 @@ FEED = '''<?xml version="1.0" encoding="utf-8"?>
 {entries}</feed>
 '''
 
-def precedence(version):
-    match = SEMVER.fullmatch(version)
-    if not match:
-        raise ValueError(f'invalid release version: {version}')
-    pre = tuple((0, int(x), '') if x.isdigit() else (1, 0, x) for x in (match[4] or '').split('.') if x)
-    return int(match[1]), int(match[2]), int(match[3]), not pre, pre
-
 def ordered(manifest):
     if manifest.get('schema_version') != 1 or not isinstance(manifest.get('releases'), list):
         raise ValueError('expected a schema_version 1 release manifest')
@@ -106,7 +99,7 @@ def row(asset):
 
 def section(release, latest):
     version = html.escape(release['version'])
-    links = [(release.get(k), label) for k, label in (('url', 'Release notes'), ('checksums_url', 'SHA256SUMS'), ('checksums_signature_url', 'Signature'), ('source_url', 'Corresponding source'))]
+    links = [(release.get(k), label) for k, label in (('url', 'Release notes'), ('checksums_url', 'SHA256SUMS'), ('checksums_signature_url', 'Signature'), ('source_url', 'Corresponding source'), ('sbom_url', 'SBOM'))]
     rows = '\n'.join(f'          {row(asset)}' for asset in release['assets'])
     return f'''      <section class="section" id="v{version}" aria-labelledby="v{version}-title">
         <div class="section-heading"><p class="eyebrow">{html.escape(release['date'])}{' / latest' if latest else ''}</p><h2 id="v{version}-title">capturefab {version}</h2></div>

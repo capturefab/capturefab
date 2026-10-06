@@ -1,0 +1,20 @@
+# Categories for GitHub's generated release notes, which the Release workflow
+# puts at the top of each draft. Pull requests are grouped by label.
+changelog:
+  exclude:
+    labels: [release, skip-changelog]
+  categories:
+    - title: Cameras and transports
+      labels: [cameras, gige, usb3, onvif]
+    - title: Hardware acceleration
+      labels: [acceleration, gpu]
+    - title: Features
+      labels: [enhancement, feature]
+    - title: Fixes
+      labels: [bug, fix]
+    - title: Documentation
+      labels: [documentation]
+    - title: Dependencies and build
+      labels: [dependencies, ci, build]
+    - title: Other changes
+      labels: ['*']

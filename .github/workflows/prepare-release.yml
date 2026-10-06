@@ -1,0 +1,84 @@
+name: Prepare release
+
+# Start a release from the GitHub UI: raise the version on a branch and open a
+# pull request. Merging it makes the Release workflow tag that commit, build
+# every target and draft the release.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, for example 0.2.0 or 0.3.0-rc.1
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Open the release pull request
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      # Pull requests opened with this workflow's token do not start CI, so
+      # CI is dispatched on the release branch explicitly.
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      REQUESTED: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Raise the version
+        id: version
+        run: |
+          change=$(python3 scripts/release.py set-version "$REQUESTED")
+          version=$(python3 scripts/release.py version)
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+            echo "::error::v$version is already tagged"
+            exit 1
+          fi
+          # Cargo.lock must still resolve without changes.
+          cargo metadata --locked --format-version 1 >/dev/null
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "change=$change" >> "$GITHUB_OUTPUT"
+      - name: Push the release branch
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          branch="release/v$VERSION"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$branch"
+          git commit -am "Release v$VERSION"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c http.extraheader="AUTHORIZATION: basic $auth" push origin "$branch"
+      - name: Open the pull request and start CI
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          CHANGE: ${{ steps.version.outputs.change }}
+        run: |
+          branch="release/v$VERSION"
+          gh label create release --color 0E8A16 --description 'Raises the version; merging it releases' --force >/dev/null
+          body=$(printf '%s\n' \
+            "Raises the version $CHANGE." \
+            '' \
+            "Merging this pull request makes the Release workflow tag the merge commit \`v$VERSION\`, build and smoke-test every target, attest the artifacts and create a draft release with generated notes. Publishing then waits for approval in the \`release\` environment." \
+            '' \
+            'CI was started on this branch by the Prepare release workflow; its checks appear on this pull request.')
+          if url=$(gh pr create --base "${{ github.event.repository.default_branch }}" --head "$branch" --title "Release v$VERSION" --label release --body "$body"); then
+            gh workflow run ci.yml --ref "$branch"
+            echo "Opened $url" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Could not open the pull request. Enable 'Allow GitHub Actions to create and approve pull requests' in the repository's Actions settings, or open it from $branch manually."
+            echo "Pushed \`$branch\`; open a pull request from it to release v$VERSION." >> "$GITHUB_STEP_SUMMARY"
+          fi

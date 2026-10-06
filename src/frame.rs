@@ -85,26 +85,84 @@ pub fn convert<P: Copy + Default + Send>(
     frame: &Frame,
     pixel: impl Fn([u8; 3]) -> P + Sync,
 ) -> Result<Vec<P>> {
+    let mut out = Vec::new();
+    convert_into(frame, &mut out, pixel)?;
+    Ok(out)
+}
+/// `convert` into a reused buffer, which is replaced by the converted image;
+/// repeated conversions of one frame size then allocate nothing.
+pub fn convert_into<P: Copy + Default + Send>(
+    frame: &Frame,
+    out: &mut Vec<P>,
+    pixel: impl Fn([u8; 3]) -> P + Sync,
+) -> Result<()> {
+    out.clear();
+    convert_to(frame, out, pixel)
+}
+/// `convert` into memory the caller already owns, exactly one pixel per
+/// element, such as a buffer shared with an accelerator, so the image is
+/// written where it is consumed instead of being copied there.
+pub fn convert_slice<P: Copy + Default + Send>(
+    frame: &Frame,
+    out: &mut [P],
+    pixel: impl Fn([u8; 3]) -> P + Sync,
+) -> Result<()> {
+    ensure!(
+        out.len() == checked_pixels(frame)?,
+        "conversion buffer does not match the image size"
+    );
+    convert_to(frame, out, pixel)
+}
+/// Where `convert_to` writes: an empty growable buffer, or a slice of exactly
+/// the image size.
+trait Sink<'a, P: 'a> {
+    /// Pixels in order.
+    fn stream(self, pixels: impl Iterator<Item = P>);
+    /// Storage for `len` pixels written out of order.
+    fn prefilled(self, len: usize) -> &'a mut [P];
+}
+impl<'a, P: Copy + Default + 'a> Sink<'a, P> for &'a mut Vec<P> {
+    // Extending from a slice iterator knows its exact length, so it neither
+    // pre-fills nor bounds-checks.
+    fn stream(self, pixels: impl Iterator<Item = P>) {
+        self.extend(pixels);
+    }
+    fn prefilled(self, len: usize) -> &'a mut [P] {
+        self.resize(len, P::default());
+        self
+    }
+}
+impl<'a, P: 'a> Sink<'a, P> for &'a mut [P] {
+    fn stream(self, pixels: impl Iterator<Item = P>) {
+        for (dst, p) in self.iter_mut().zip(pixels) {
+            *dst = p;
+        }
+    }
+    fn prefilled(self, _: usize) -> &'a mut [P] {
+        self
+    }
+}
+fn convert_to<'a, P: Copy + Default + Send + 'a>(
+    frame: &Frame,
+    out: impl Sink<'a, P>,
+    pixel: impl Fn([u8; 3]) -> P + Sync,
+) -> Result<()> {
     let pixels = checked_pixels(frame)?;
-    // Streaming formats map source to output in order; `collect` over a slice
-    // iterator knows its exact length, so it neither pre-fills nor bounds-checks.
+    // Streaming formats map source to output in order.
     match frame.pixel_format {
         MONO8 => {
             ensure!(frame.data.len() >= pixels, "truncated Mono8 frame");
-            Ok(frame.data[..pixels]
-                .iter()
-                .map(|&v| pixel([v, v, v]))
-                .collect())
+            out.stream(frame.data[..pixels].iter().map(|&v| pixel([v, v, v])));
         }
         RGB8 => {
             ensure!(frame.data.len() >= pixels * 3, "truncated RGB frame");
             let source = frame.data[..pixels * 3].as_chunks::<3>().0;
-            Ok(source.iter().map(|p| pixel([p[0], p[1], p[2]])).collect())
+            out.stream(source.iter().map(|p| pixel([p[0], p[1], p[2]])));
         }
         0x0218_0015 => {
             ensure!(frame.data.len() >= pixels * 3, "truncated RGB frame");
             let source = frame.data[..pixels * 3].as_chunks::<3>().0;
-            Ok(source.iter().map(|p| pixel([p[2], p[1], p[0]])).collect())
+            out.stream(source.iter().map(|p| pixel([p[2], p[1], p[0]])));
         }
         0x0110_0003 | 0x0110_0005 | 0x0110_0007 => {
             ensure!(
@@ -117,18 +175,15 @@ pub fn convert<P: Copy + Default + Send>(
                 _ => 8,
             };
             let source = frame.data[..pixels * 2].as_chunks::<2>().0;
-            Ok(source
-                .iter()
-                .map(|&p| {
-                    let v = (u16::from_le_bytes(p) >> shift).min(255) as u8;
-                    pixel([v, v, v])
-                })
-                .collect())
+            out.stream(source.iter().map(|&p| {
+                let v = (u16::from_le_bytes(p) >> shift).min(255) as u8;
+                pixel([v, v, v])
+            }));
         }
         0x0108_0008..=0x0108_000b => {
             ensure!(frame.data.len() >= pixels, "truncated Bayer8 frame");
-            // Interpolation writes edges and interiors out of order, so prefill.
-            let mut out = vec![P::default(); pixels];
+            // Interpolation writes edges and interiors out of order.
+            let out = out.prefilled(pixels);
             let pattern = bayer_pattern(frame.pixel_format);
             let (w, h, data) = (frame.width as usize, frame.height as usize, &frame.data);
             let color = |x: usize, y: usize| pattern[(y & 1) * 2 + (x & 1)];
@@ -184,17 +239,17 @@ pub fn convert<P: Copy + Default + Send>(
                     demosaic_row(y, line);
                 }
             }
-            Ok(out)
         }
         v => {
             bail!("unsupported PFNC format 0x{v:08x}; capture with --format raw to preserve bytes")
         }
     }
+    Ok(())
 }
 
 /// Threads for CPU-bound per-pixel work: one below half a megapixel, where
 /// spawning costs more than it saves, else up to eight available cores.
-fn worker_threads(pixels: usize) -> usize {
+pub(crate) fn worker_threads(pixels: usize) -> usize {
     if pixels < 512 * 1024 {
         return 1;
     }
@@ -631,6 +686,14 @@ mod tests {
                 };
                 let full = rgb(&frame).unwrap();
                 assert_eq!(convert(&frame, |p| p).unwrap().into_flattened(), full);
+                // Into caller-owned memory, and into a reused buffer.
+                let mut slice = vec![[7u8; 3]; (width * height) as usize];
+                convert_slice(&frame, &mut slice, |p| p).unwrap();
+                assert_eq!(slice.into_flattened(), full);
+                assert!(convert_slice(&frame, &mut [[0u8; 3]; 1][..0], |p| p).is_err());
+                let mut reused = vec![[1u8; 3]; 3];
+                convert_into(&frame, &mut reused, |p| p).unwrap();
+                assert_eq!(reused.into_flattened(), full);
                 let rgba = rgba(&frame).unwrap();
                 assert_eq!(rgba.len(), full.len() / 3 * 4);
                 assert!(

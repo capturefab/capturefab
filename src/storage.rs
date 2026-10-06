@@ -129,6 +129,9 @@ struct Entry {
     modified_ns: Option<u64>,
     #[serde(default)]
     changed: bool,
+    /// Queued for upload: retention must not delete it before then.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pending_upload: bool,
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct Ledger {
@@ -299,6 +302,7 @@ impl Manager {
             sha256: None,
             modified_ns: None,
             changed: false,
+            pending_upload: false,
         });
         if let Err(error) = locked.persist() {
             drop(file);
@@ -343,6 +347,7 @@ fn output_path(path: &Path) -> Result<(PathBuf, PathBuf)> {
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    crate::volumes::ensure_present(parent)?;
     fs::create_dir_all(parent).with_context(|| {
         format!(
             "cannot create capture directory {}; check permissions and free disk space",
@@ -351,6 +356,18 @@ fn output_path(path: &Path) -> Result<(PathBuf, PathBuf)> {
     })?;
     let base = fs::canonicalize(parent)?;
     ensure!(base.is_dir(), "capture output parent is not a directory");
+    Ok((base.clone(), base.join(name)))
+}
+/// A path's canonical directory and file name, without creating anything.
+fn resolved_existing(path: &Path) -> Result<(PathBuf, PathBuf)> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("capture path must name a file"))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let base = fs::canonicalize(parent)?;
     Ok((base.clone(), base.join(name)))
 }
 fn current_meta(entry: &Entry, verified: &mut HashSet<PathBuf>) -> Result<Option<Metadata>> {
@@ -615,7 +632,16 @@ impl Locked {
             .is_some_and(|age| now().saturating_sub(entry.created) >= age)
     }
     fn removable(entry: &Entry) -> bool {
-        entry.lease.is_none() && !entry.changed && entry.sha256.is_some()
+        entry.lease.is_none() && !entry.changed && entry.sha256.is_some() && !entry.pending_upload
+    }
+    /// The ledger entry for a finished file, by its resolved path.
+    fn find(&self, path: &Path) -> Result<usize> {
+        let (_, path) = resolved_existing(path)?;
+        self.ledger
+            .entries
+            .iter()
+            .position(|entry| entry.path == path && entry.lease.is_none())
+            .ok_or_else(|| anyhow!("{} is not a finished Capturefab capture", path.display()))
     }
     fn delete(&mut self, index: usize) -> Result<bool> {
         let entry = &mut self.ledger.entries[index];
@@ -774,6 +800,9 @@ impl StorageWriter {
         self.finalized = true;
         result
     }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
     pub fn bytes_written(&self) -> u64 {
         self.written
     }
@@ -890,6 +919,30 @@ pub fn save(frame: &Frame, path: &Path, format: &str, policy: &StoragePolicy) ->
     let mut writer = create_writer(path, policy, bytes.len() as u64)?;
     writer.write_all(&bytes)?;
     writer.finish()
+}
+/// Hold a finished capture back from retention while it waits for upload,
+/// or release it. Returns the SHA-256 recorded when the file was finished.
+pub fn hold_for_upload(path: &Path, held: bool) -> Result<String> {
+    let mut locked = Manager::global().lock()?;
+    let index = locked.find(path)?;
+    let entry = &mut locked.ledger.entries[index];
+    let sha256 = entry
+        .sha256
+        .clone()
+        .ok_or_else(|| anyhow!("{} has no recorded checksum", entry.path.display()))?;
+    if entry.pending_upload != held {
+        entry.pending_upload = held;
+        locked.persist()?;
+    }
+    Ok(sha256)
+}
+/// Delete the local copy of an uploaded capture, only if it is still exactly
+/// the file Capturefab wrote (identity, size, time and SHA-256).
+pub fn remove_uploaded(path: &Path) -> Result<bool> {
+    let mut locked = Manager::global().lock()?;
+    let index = locked.find(path)?;
+    locked.ledger.entries[index].pending_upload = false;
+    locked.delete(index)
 }
 pub fn quota_status() -> Result<Value> {
     Manager::global().lock()?.status()

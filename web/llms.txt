@@ -18,7 +18,7 @@ Run `capturefab schema --json` for the installed binary's automation contract, `
 
 Capturefab starts its GUI with no subcommand. Scripts should use explicit subcommands and `--json`. Data goes to stdout and diagnostics go to stderr. Read exit codes and JSON error results; do not assume every GenICam feature or camera transport is supported.
 
-Use `capturefab storage --json` to inspect the saved global storage ceiling and live reservations. Captures and local video recordings share that budget across processes using the same session directory. A storage-full failure has exit code 6. Retention deletion and raising a global budget require explicit user authorization.
+Captures, schedules and recordings accept `--destination NAME` for a saved folder (including external and network drives) or S3-compatible bucket; `capturefab destination list --json`, `volumes --json` and `uploads --json` describe them and the upload queue. Credentials stay in the OS credential store or standard AWS sources. Use `capturefab storage --json` to inspect the saved global storage ceiling and live reservations. Captures and local video recordings share that budget across processes using the same session directory. A storage-full failure has exit code 6. Retention deletion and raising a global budget require explicit user authorization.
 
 Auto mode is opt-in per camera: `capturefab --session NAME auto [--balance 0..1]` (0 favors image quality, 1 frame rate) and `manual [--revert]`. `status --json` reports `auto` (null in manual mode) with its recent changes. Ask before enabling it on cameras other software uses.
 

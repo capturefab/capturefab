@@ -139,6 +139,71 @@ impl AutoArgs {
     }
 }
 #[derive(Debug, Subcommand)]
+pub enum DestinationCommand {
+    /// List saved destinations
+    List,
+    /// Save a folder destination, such as a directory on an external drive or network share
+    AddFolder { name: String, path: PathBuf },
+    /// Save an S3-compatible bucket (AWS S3, Cloudflare R2, Backblaze B2, MinIO, Wasabi)
+    AddS3 {
+        name: String,
+        #[arg(long)]
+        bucket: String,
+        #[arg(long, default_value = "us-east-1")]
+        region: String,
+        /// Service URL for non-AWS services, e.g. https://ACCOUNT.r2.cloudflarestorage.com or http://nas:9000
+        #[arg(long, default_value = "")]
+        endpoint: String,
+        /// Key prefix, e.g. cameras/line-1/
+        #[arg(long, default_value = "")]
+        prefix: String,
+        /// Address the bucket in the URL path (MinIO and most non-AWS services)
+        #[arg(long)]
+        path_style: bool,
+        /// Access key ID whose secret is kept in the OS credential store
+        #[arg(long, conflicts_with_all = ["profile", "env"])]
+        access_key_id: Option<String>,
+        /// Read the secret access key from stdin and save it in the OS credential store
+        #[arg(long, requires = "access_key_id")]
+        secret_stdin: bool,
+        /// Use this profile from the AWS shared credentials file instead
+        #[arg(long, conflicts_with = "env")]
+        profile: Option<String>,
+        /// Use AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY from the uploading process
+        #[arg(long)]
+        env: bool,
+        /// Keep local copies after a verified upload
+        #[arg(long)]
+        keep_local: bool,
+        /// Save without checking that the bucket is reachable
+        #[arg(long)]
+        no_check: bool,
+    },
+    /// Remove a saved destination
+    Remove {
+        name: String,
+        /// Also delete its secret key from the OS credential store
+        #[arg(long)]
+        forget_secret: bool,
+    },
+    /// Check that a destination is reachable and writable
+    Test { name: String },
+}
+#[derive(Debug, Subcommand)]
+pub enum UploadsCommand {
+    /// Show waiting, failed and completed uploads
+    Status,
+    /// Retry failed uploads (all, or one by ID)
+    Retry { id: Option<String> },
+    /// Drop a failed upload from the queue, keeping its local file
+    Forget { id: String },
+    /// Upload everything that is due, then report
+    Wait {
+        #[arg(long, default_value = "10m")]
+        timeout: String,
+    },
+}
+#[derive(Debug, Subcommand)]
 pub enum StorageCommand {
     /// Show global policy, owned files and reservations
     Status,
@@ -225,6 +290,9 @@ pub enum Command {
         /// Bounded maximum size of a local recording file
         #[arg(long, default_value = "512MiB")]
         max_file_size: String,
+        /// Saved destination (see `destination list`); --output is then a name inside it
+        #[arg(long)]
+        destination: Option<String>,
         #[command(flatten)]
         storage: StorageArgs,
         #[command(flatten)]
@@ -262,6 +330,9 @@ pub enum Command {
         /// Time between frames, e.g. 10s; count bounds the time lapse
         #[arg(long)]
         interval: Option<String>,
+        /// Saved destination (see `destination list`); --output is then a name inside it
+        #[arg(long)]
+        destination: Option<String>,
         #[command(flatten)]
         storage: StorageArgs,
         #[command(flatten)]
@@ -271,6 +342,19 @@ pub enum Command {
     Jobs,
     /// Cancel a scheduled capture job on the selected camera
     Cancel { id: u64 },
+    /// Manage saved capture destinations: folders, external drives and S3 buckets
+    #[command(visible_alias = "destinations")]
+    Destination {
+        #[command(subcommand)]
+        command: DestinationCommand,
+    },
+    /// List mounted external, removable and network volumes
+    Volumes,
+    /// Show and manage the queue of captures waiting for upload
+    Uploads {
+        #[command(subcommand)]
+        command: Option<UploadsCommand>,
+    },
     /// Show owned file usage and reserved recording space
     Storage {
         #[command(subcommand)]
@@ -472,6 +556,8 @@ pub fn run(cli: Cli) -> Result<()> {
             let client = Client::new(&cli)?;
             let handle = client.local.as_ref().unwrap().clone();
             let _server = ipc::Server::start(handle.clone(), name)?;
+            #[cfg(feature = "s3")]
+            crate::upload::start();
             #[cfg(feature = "gui")]
             {
                 crate::gui::run_capture(
@@ -506,6 +592,15 @@ pub fn run(cli: Cli) -> Result<()> {
                 _ => crate::storage::quota_status()?,
             };
             return output(&cli, result);
+        }
+        Some(Command::Destination { command }) => {
+            return output(&cli, destination_command(command)?);
+        }
+        Some(Command::Volumes) => {
+            return output(&cli, json!({"volumes": crate::volumes::list()}));
+        }
+        Some(Command::Uploads { command }) => {
+            return output(&cli, uploads_command(command.as_ref())?);
         }
         Some(Command::Compatibility { model }) => {
             return output(&cli, crate::compatibility::guide(model.as_deref()));
@@ -552,6 +647,9 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             auto.apply(&client)?;
             let _server = ipc::Server::start(handle.clone(), name)?;
+            // A persistent session uploads what its cameras queue.
+            #[cfg(feature = "s3")]
+            crate::upload::start();
             output(
                 &cli,
                 json!({"session":name,"pid":std::process::id(),"ready":true}),
@@ -681,6 +779,7 @@ pub fn run(cli: Cli) -> Result<()> {
             bitrate,
             duration,
             max_file_size,
+            destination: saved,
             storage,
             auto,
         } => {
@@ -699,6 +798,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 storage: storage.policy()?,
                 max_file_bytes: crate::storage::parse_bytes(max_file_size)?
                     .min(storage.policy()?.max_bytes),
+                destination: saved.clone(),
             })?;
             if cli.session.is_none() {
                 if !cli.json {
@@ -725,6 +825,8 @@ pub fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 client.call(SessionCommand::StopForward)?;
+                let mut result = result;
+                wait_for_uploads(&cli, saved.as_deref(), &mut result)?;
                 output(&cli, result)?;
                 return Ok(());
             }
@@ -747,6 +849,7 @@ pub fn run(cli: Cli) -> Result<()> {
             at,
             delay,
             interval,
+            destination: saved,
             storage,
             auto,
         } => {
@@ -791,6 +894,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         .transpose()?
                         .unwrap_or(0),
                     storage: policy,
+                    destination: saved.clone(),
                 })?;
                 if cli.session.is_some() {
                     return output(&cli, result);
@@ -813,7 +917,11 @@ pub fn run(cli: Cli) -> Result<()> {
                         .and_then(|j| j.iter().find(|j| j["id"] == id))
                         .context("capture job disappeared")?;
                     match job["status"].as_str() {
-                        Some("complete") => return output(&cli, json!({"job":job})),
+                        Some("complete") => {
+                            let mut result = json!({"job":job});
+                            wait_for_uploads(&cli, saved.as_deref(), &mut result)?;
+                            return output(&cli, result);
+                        }
                         Some("failed") => anyhow::bail!(
                             "{}",
                             job["error"].as_str().unwrap_or("scheduled capture failed")
@@ -830,6 +938,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 timeout_ms: cli.timeout_ms,
                 format: format.name().into(),
                 storage: policy,
+                destination: saved.clone(),
             })?;
             if destination == "-" {
                 let frame = client
@@ -842,6 +951,10 @@ pub fn run(cli: Cli) -> Result<()> {
                     .lock()
                     .write_all(&crate::frame::encode(&frame, format.name())?)?;
                 return Ok(());
+            }
+            let mut result = result;
+            if cli.session.is_none() {
+                wait_for_uploads(&cli, saved.as_deref(), &mut result)?;
             }
             result
         }
@@ -953,7 +1066,7 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
 }
 fn doctor() -> Value {
     let interfaces=if_addrs::get_if_addrs().map(|items|items.into_iter().filter_map(|i|match i.addr{if_addrs::IfAddr::V4(a)=>Some(json!({"name":i.name,"ip":a.ip,"netmask":a.netmask,"broadcast":a.broadcast})),_=>None}).collect::<Vec<_>>()).unwrap_or_default();
-    json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"wgpu":cfg!(feature="wgpu"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg")},"jpeg":jpeg_backends(),"session_directory":ipc::session_dir(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG are used when installed.","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}})
+    json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"wgpu":cfg!(feature="wgpu"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox")},"jpeg":jpeg_backends(),"session_directory":ipc::session_dir(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox.","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}})
 }
 /// JPEG encoders available to this build and host, best first.
 fn jpeg_backends() -> Value {
@@ -964,10 +1077,24 @@ fn jpeg_backends() -> Value {
     };
     #[cfg(not(feature = "nvjpeg"))]
     let nvjpeg = json!({"available":false,"reason":"not compiled in"});
-    json!({"nvjpeg":nvjpeg,"libjpeg_turbo":cfg!(feature="jpeg"),"quality":crate::jpeg::QUALITY})
+    #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+    let videotoolbox = match crate::vtjpeg::probe() {
+        Ok(status) => json!({"available":true,"status":status,"formats":"color"}),
+        Err(error) => json!({"available":false,"reason":format!("{error:#}")}),
+    };
+    #[cfg(not(all(feature = "videotoolbox", target_os = "macos")))]
+    let videotoolbox = json!({"available":false,"reason":if cfg!(target_os="macos"){"not compiled in"}else{"macOS only"}});
+    #[cfg(feature = "vaapi")]
+    let vaapi = match crate::vajpeg::probe() {
+        Ok(status) => json!({"available":true,"status":status}),
+        Err(error) => json!({"available":false,"reason":format!("{error:#}")}),
+    };
+    #[cfg(not(feature = "vaapi"))]
+    let vaapi = json!({"available":false,"reason":"not compiled in"});
+    json!({"videotoolbox":videotoolbox,"nvjpeg":nvjpeg,"vaapi":vaapi,"libjpeg_turbo":cfg!(feature="jpeg"),"quality":crate::jpeg::QUALITY})
 }
 fn schema() -> Value {
-    let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"gui","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","jpeg","raw","pgm","ppm"],"paths":"one frame: file; multiple: directory or {frame} template; existing files fail","stdout":"--camera ... capture -n 1 -o - --format raw; no --json"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized with GUI operations."});
+    let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"gui","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"capture","output":"run-1","count":10,"timeout_ms":2000,"format":"png","destination":"archive"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","jpeg","raw","pgm","ppm"],"paths":"one frame: file; multiple: directory or {frame} template; existing files fail","stdout":"--camera ... capture -n 1 -o - --format raw; no --json","destination":"--destination NAME (or \"destination\" in capture/schedule/forward RPC): -o is a relative name inside a saved folder or S3 bucket; see destination list, volumes and uploads"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized with GUI operations."});
     contract["exit_codes"]["6"] = json!("storage quota or disk full");
     contract["selection"]["direct"] = json!(
         "--camera ID|serial|IPv4|sim:NAME|RTSP/SRT/media URI|avfoundation:INDEX|v4l2:/dev/videoN|dshow:video=NAME|onvif:ENDPOINT"
@@ -985,6 +1112,225 @@ fn schema() -> Value {
     contract
 }
 
+/// A direct CLI capture to a bucket destination uploads before exiting, so
+/// files are not left waiting for a process that never runs.
+fn wait_for_uploads(cli: &Cli, destination: Option<&str>, result: &mut Value) -> Result<()> {
+    let Some(name) = destination else {
+        return Ok(());
+    };
+    if cli.session.is_some()
+        || !matches!(
+            crate::destination::get(name)?.target,
+            crate::destination::Target::S3(_)
+        )
+    {
+        return Ok(());
+    }
+    #[cfg(not(feature = "s3"))]
+    let _ = result;
+    #[cfg(feature = "s3")]
+    {
+        if !cli.json {
+            eprintln!("Uploading to {name}...");
+        }
+        let status = crate::upload::drain(Duration::from_secs(600))?;
+        if !cli.json {
+            eprintln!(
+                "{} waiting, {} failed{}",
+                status["pending"].as_u64().unwrap_or(0) + status["uploading"].as_u64().unwrap_or(0),
+                status["failed"].as_u64().unwrap_or(0),
+                status["last_error"]
+                    .as_str()
+                    .map(|e| format!("; last error: {e}"))
+                    .unwrap_or_default()
+            );
+        }
+        result["uploads"] = status;
+    }
+    Ok(())
+}
+
+fn destination_command(command: &DestinationCommand) -> Result<Value> {
+    use crate::destination::{self, Bucket, Credentials, Destination, Target};
+    let describe = |d: &Destination| {
+        let mut value = serde_json::to_value(d).unwrap_or_default();
+        value["location"] = json!(d.describe());
+        #[cfg(feature = "s3")]
+        if let Target::S3(Bucket {
+            credentials: Credentials::Keychain { access_key_id },
+            ..
+        }) = &d.target
+        {
+            value["secret_saved"] = json!(crate::s3::has_secret(access_key_id));
+        }
+        value
+    };
+    Ok(match command {
+        DestinationCommand::List => {
+            json!({"destinations": destination::list()?.iter().map(describe).collect::<Vec<_>>()})
+        }
+        DestinationCommand::AddFolder { name, path } => {
+            let path = std::path::absolute(path)?;
+            crate::volumes::ensure_present(&path)?;
+            std::fs::create_dir_all(&path)
+                .with_context(|| format!("cannot create {}", path.display()))?;
+            let saved = Destination {
+                name: name.clone(),
+                target: Target::Folder { path },
+            };
+            destination::save(saved.clone())?;
+            json!({"destination": describe(&saved)})
+        }
+        DestinationCommand::AddS3 {
+            name,
+            bucket,
+            region,
+            endpoint,
+            prefix,
+            path_style,
+            access_key_id,
+            secret_stdin,
+            profile,
+            env,
+            keep_local,
+            no_check,
+        } => {
+            let credentials = match (access_key_id, profile, env) {
+                (Some(id), _, _) => Credentials::Keychain {
+                    access_key_id: id.clone(),
+                },
+                (_, Some(name), _) => Credentials::Profile { name: name.clone() },
+                (_, _, true) => Credentials::Environment,
+                _ => anyhow::bail!(
+                    "choose credentials: --access-key-id ID --secret-stdin, --profile NAME or --env"
+                ),
+            };
+            let saved = Destination {
+                name: name.clone(),
+                target: Target::S3(Bucket {
+                    endpoint: endpoint.clone(),
+                    region: region.clone(),
+                    bucket: bucket.clone(),
+                    prefix: prefix.clone(),
+                    path_style: *path_style,
+                    credentials,
+                    keep_local: *keep_local,
+                }),
+            };
+            saved.validate()?;
+            #[cfg(not(feature = "s3"))]
+            {
+                let _ = (secret_stdin, no_check);
+                anyhow::bail!(
+                    "S3 destinations are unsupported in this build; rebuild with --features s3"
+                );
+            }
+            #[cfg(feature = "s3")]
+            {
+                if *secret_stdin {
+                    let mut secret = String::new();
+                    io::stdin().read_line(&mut secret)?;
+                    crate::s3::store_secret(access_key_id.as_deref().unwrap_or(""), secret.trim())?;
+                }
+                let Target::S3(bucket) = &saved.target else {
+                    unreachable!()
+                };
+                let check = if *no_check {
+                    None
+                } else {
+                    Some(crate::s3::Client::new(bucket).and_then(|client| client.check()))
+                };
+                if let Some(Err(error)) = &check
+                    && crate::s3::retryable(error)
+                {
+                    anyhow::bail!(
+                        "cannot reach the bucket: {error:#}; fix the settings or save with --no-check"
+                    );
+                }
+                destination::save(saved.clone())?;
+                let mut value = json!({"destination": describe(&saved)});
+                if let Some(check) = check {
+                    value["check"] = match check {
+                        Ok(()) => json!({"ok": true}),
+                        Err(error) => json!({"ok": false, "warning": format!("{error:#}")}),
+                    };
+                }
+                value
+            }
+        }
+        DestinationCommand::Remove {
+            name,
+            forget_secret,
+        } => {
+            let removed = destination::remove(name)?;
+            #[cfg(feature = "s3")]
+            if *forget_secret
+                && let Target::S3(Bucket {
+                    credentials: Credentials::Keychain { access_key_id },
+                    ..
+                }) = &removed.target
+            {
+                crate::s3::delete_secret(access_key_id)?;
+            }
+            #[cfg(not(feature = "s3"))]
+            let _ = forget_secret;
+            json!({"removed": removed.name})
+        }
+        DestinationCommand::Test { name } => {
+            let saved = destination::get(name)?;
+            match &saved.target {
+                Target::Folder { path } => {
+                    crate::volumes::ensure_present(path)?;
+                    ensure!(path.is_dir(), "{} does not exist", path.display());
+                    let probe = path.join(format!(".capturefab-write-test-{}", std::process::id()));
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&probe)
+                        .with_context(|| format!("cannot write to {}", path.display()))?;
+                    std::fs::remove_file(&probe)?;
+                    json!({"ok": true, "free_bytes": fs2::available_space(path).ok()})
+                }
+                Target::S3(bucket) => {
+                    #[cfg(feature = "s3")]
+                    {
+                        crate::s3::Client::new(bucket)?.check()?;
+                        json!({"ok": true})
+                    }
+                    #[cfg(not(feature = "s3"))]
+                    {
+                        let _ = bucket;
+                        anyhow::bail!("S3 destinations are unsupported in this build")
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn uploads_command(command: Option<&UploadsCommand>) -> Result<Value> {
+    #[cfg(feature = "s3")]
+    {
+        Ok(match command {
+            None | Some(UploadsCommand::Status) => crate::upload::status()?,
+            Some(UploadsCommand::Retry { id }) => {
+                json!({"retried": crate::upload::retry(id.as_deref())?})
+            }
+            Some(UploadsCommand::Forget { id }) => {
+                json!({"forgotten": crate::upload::forget(id)?})
+            }
+            Some(UploadsCommand::Wait { timeout }) => crate::upload::drain(Duration::from_millis(
+                crate::scheduling::parse_duration(timeout)?,
+            ))?,
+        })
+    }
+    #[cfg(not(feature = "s3"))]
+    {
+        let _ = command;
+        anyhow::bail!("uploads are unsupported in this build; rebuild with --features s3")
+    }
+}
+
 pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
     let s = format!("{error:#}").to_ascii_lowercase();
     if s.contains("storage full") || s.contains("no space left") {
@@ -1000,6 +1346,7 @@ pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
     } else if s.contains("unsupported") || s.contains("not supported") || s.contains("disabled") {
         ("unsupported", 5)
     } else if s.contains("not found")
+        || s.contains("is not mounted")
         || s.contains("no camera")
         || s.contains("not responding")
         || s.contains("already connected")

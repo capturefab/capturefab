@@ -38,25 +38,58 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15, windows-2025]
+        # Every architecture a release ships, on free hosted runners.
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025, windows-11-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The ARM64 images do not all ship rustup.
+      - name: Install rustup if missing
+        shell: bash
+        run: |
+          if command -v rustup >/dev/null; then exit 0; fi
+          if [ "$RUNNER_OS" = Windows ]; then
+            arch=$([ "$RUNNER_ARCH" = ARM64 ] && echo aarch64 || echo x86_64)
+            curl --proto '=https' --tlsv1.2 -sSfLo "$RUNNER_TEMP/rustup-init.exe" "https://static.rust-lang.org/rustup/dist/$arch-pc-windows-msvc/rustup-init.exe"
+            "$RUNNER_TEMP/rustup-init.exe" -y --profile minimal --default-toolchain none
+            echo "$USERPROFILE/.cargo/bin" >> "$GITHUB_PATH"
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
       - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      # x86 SIMD in libjpeg-turbo is NASM assembly; ARM uses NEON intrinsics.
       - name: Install NASM for libjpeg-turbo SIMD
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && runner.arch == 'X64'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm
       - name: Install NASM for libjpeg-turbo SIMD
-        if: runner.os == 'Windows'
+        if: runner.os == 'macOS' && runner.arch == 'X64'
+        run: brew install nasm
+      - name: Install NASM for libjpeg-turbo SIMD
+        if: runner.os == 'Windows' && runner.arch == 'X64'
         shell: pwsh
         run: |
           choco install nasm --no-progress -y
           Add-Content $env:GITHUB_PATH 'C:\Program Files\NASM'
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --locked
+      # Which accelerators this runner exposes; informational, never fails.
+      - name: Report hardware acceleration
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CAPTUREFAB_SESSION_DIR: ${{ runner.temp }}/capturefab-sessions
+        run: |
+          {
+            echo "### ${{ matrix.os }} ($RUNNER_ARCH)"
+            echo '```json'
+            python=$(command -v python3 || command -v python)
+            cargo run --locked --quiet -- --json doctor | "$python" -c 'import json, sys; r = json.load(sys.stdin)["result"]; print(json.dumps({k: r[k] for k in ("os", "arch", "features", "jpeg")}, indent=2))' || echo '"doctor failed"'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY" || true
 
   headless:
     name: Headless build
@@ -71,7 +104,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo build --locked --no-default-features --features usb,jpeg,nvjpeg
+      - run: cargo build --locked --no-default-features --features usb,jpeg,nvjpeg,vaapi,videotoolbox
 
   site:
     name: Site and release scripts

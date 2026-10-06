@@ -22,6 +22,14 @@ fn main() {
         }
         return;
     }
+    #[cfg(feature = "vaapi")]
+    if std::env::args().nth(1).as_deref() == Some("__vajpeg") {
+        if let Err(e) = capturefab::vajpeg::run_helper() {
+            eprintln!("capturefab VA-API JPEG helper: {e:#}");
+            std::process::exit(1)
+        }
+        return;
+    }
     let json_mode = std::env::args().any(|a| a == "--json");
     let cli = match Cli::try_parse() {
         Ok(c) => c,

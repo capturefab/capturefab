@@ -8,13 +8,21 @@ license = "MIT"
 repository = "https://github.com/capturefab/capturefab"
 
 [features]
-default = ["gui", "usb", "jpeg", "nvjpeg"]
-gui = ["dep:eframe"]
+default = ["gui", "usb", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "s3"]
+gui = ["dep:eframe", "dep:rfd"]
 usb = ["dep:nusb"]
 # libjpeg-turbo, built from source with its NEON/SSE2/AVX2 SIMD (x86 needs NASM).
 jpeg = ["dep:turbojpeg"]
 # NVIDIA nvJPEG/CUDA, loaded at runtime in an isolated helper process; no SDK at build time.
 nvjpeg = ["dep:libloading"]
+# VA-API hardware JPEG (Intel iHD and other drivers), libva loaded at runtime in
+# an isolated helper process; libjpeg-turbo verifies its output at start-up.
+vaapi = ["dep:libloading", "jpeg"]
+# S3-compatible upload destinations: a pure-Rust HTTPS client (rustls, trusting
+# the OS certificate store) and the OS credential store for keys.
+s3 = ["dep:ureq", "dep:keyring"]
+# Apple's hardware JPEG engine through VideoToolbox (system frameworks; no-op off macOS).
+videotoolbox = []
 wgpu = ["gui", "eframe/wgpu"]
 
 [dependencies]
@@ -41,9 +49,16 @@ fs2 = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 turbojpeg = { version = "1.5", optional = true, default-features = false, features = ["cmake", "require-simd"] }
 libloading = { version = "0.8", optional = true }
+ureq = { version = "3.4", optional = true, default-features = false, features = ["rustls", "platform-verifier"] }
+keyring = { version = "4.2", optional = true }
+rfd = { version = "0.17", optional = true }
 
 # ARMv8 SHA-2 instructions for storage integrity hashing. x86 already selects
 # SHA-NI at runtime without this; the asm crate does not assemble under MSVC.
+# Drive types and labels for the capture destination's volume list.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }
 

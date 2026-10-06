@@ -61,6 +61,9 @@ pub enum SessionCommand {
         format: String,
         #[serde(default)]
         storage: crate::storage::StoragePolicy,
+        /// A saved destination (folder or S3 bucket); `output` is then a name inside it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        destination: Option<String>,
     },
     Schedule {
         output: String,
@@ -71,6 +74,9 @@ pub enum SessionCommand {
         interval_ms: u64,
         #[serde(default)]
         storage: crate::storage::StoragePolicy,
+        /// A saved destination (folder or S3 bucket); `output` is then a name inside it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        destination: Option<String>,
     },
     Jobs,
     CancelJob {
@@ -97,6 +103,9 @@ pub enum SessionCommand {
         storage: crate::storage::StoragePolicy,
         #[serde(default = "crate::media::default_recording_cap")]
         max_file_bytes: u64,
+        /// A saved destination (folder or S3 bucket); `output` is then a name inside it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        destination: Option<String>,
     },
     StopForward,
 }

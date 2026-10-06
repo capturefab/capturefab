@@ -68,6 +68,122 @@ class ReleaseTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     release.inspect_binary(path, os_, 'x86_64' if arch != 'x86_64' else 'aarch64')
 
+    @staticmethod
+    def elf(versions):
+        """A 64-bit ELF whose .gnu.version_r needs `versions` from libc.so.6."""
+        strings = b'\0libc.so.6\0' + b''.join(v.encode() + b'\0' for v in versions)
+        names = [strings.index(v.encode() + b'\0') for v in versions]
+        verneed = struct.pack('<HHIII', 1, len(versions), 1, 16, 0)
+        for i, name in enumerate(names):
+            verneed += struct.pack('<IHHII', 0, 0, i + 2, name, 16 if i + 1 < len(versions) else 0)
+        strings_at, verneed_at = 64, 64 + len(strings)
+        sections_at = verneed_at + len(verneed)
+        header = b'\x7fELF\x02\x01'.ljust(16, b'\0') + struct.pack('<HH', 2, 183)
+        header = header.ljust(0x28, b'\0') + struct.pack('<Q', sections_at)
+        header = header.ljust(0x3A, b'\0') + struct.pack('<HHH', 64, 3, 0)
+        section = lambda kind, offset, size, link, info: struct.pack('<IIQQQQIIQQ', 0, kind, 0, 0, offset, size, link, info, 1, 0)
+        sections = bytes(64) + section(3, strings_at, len(strings), 0, 0) + section(0x6FFFFFFE, verneed_at, len(verneed), 1, 1)
+        return header.ljust(64, b'\0') + strings + verneed + sections
+
+    @staticmethod
+    def macho(minimum, legacy=False):
+        """A 64-bit Mach-O with one minimum-version load command."""
+        value = minimum[0] << 16 | minimum[1] << 8
+        command = struct.pack('<IIII', 0x24, 16, value, value) if legacy else struct.pack('<IIIIII', 0x32, 24, 1, value, value, 0)
+        return MACHO_ARM64 + struct.pack('<IIIII', 0, 2, 1, len(command), 0) + bytes(4) + command
+
+    @staticmethod
+    def pe(imports, delayed=()):
+        """A PE32+ image with one section holding import and delay-import tables."""
+        base, data = 0x1000, bytearray(0x400)
+        cursor = 0x100
+        def put(blob):
+            nonlocal cursor
+            data[cursor:cursor + len(blob)] = blob
+            cursor += len(blob)
+            return base + cursor - len(blob)
+        names = [put(n.encode() + b'\0') for n in imports]
+        delayed_names = [put(n.encode() + b'\0') for n in delayed]
+        cursor = (cursor + 15) & ~15
+        table = put(b''.join(struct.pack('<IIIII', 0, 0, 0, n, 0) for n in names) + bytes(20))
+        delay_table = put(b''.join(struct.pack('<IIIIIIII', 1, n, 0, 0, 0, 0, 0, 0) for n in delayed_names) + bytes(32)) if delayed else 0
+        optional = struct.pack('<H', 0x20B).ljust(112, b'\0')
+        directories = bytearray(16 * 8)
+        directories[8:16] = struct.pack('<II', table, 0)
+        directories[13 * 8:13 * 8 + 8] = struct.pack('<II', delay_table, 0)
+        optional += bytes(directories)
+        section = b'.idata\0\0' + struct.pack('<IIII', len(data), base, len(data), 0x400) + bytes(16)
+        headers = b'MZ'.ljust(60, b'\0') + struct.pack('<I', 64) + b'PE\0\0' + struct.pack('<HHIIIHH', 0x8664, 1, 0, 0, 0, len(optional), 0) + optional + section
+        return headers.ljust(0x400, b'\0') + bytes(data)
+
+    def test_compatibility_reads_glibc_macos_minimum_and_windows_imports(self):
+        self.assertEqual(release.elf_glibc(self.elf(['GLIBC_2.17', 'GLIBC_2.28', 'GLIBC_PRIVATE'])), (2, 28))
+        self.assertEqual(release.elf_glibc(self.elf(['GLIBC_2.2.5', 'GLIBC_2.34'])), (2, 34))
+        self.assertEqual(release.macho_minimum(self.macho((11, 0))), (11, 0))
+        self.assertEqual(release.macho_minimum(self.macho((10, 15), legacy=True)), (10, 15))
+        fat = b'\xca\xfe\xba\xbe' + struct.pack('>I', 2)
+        slices = [self.macho((10, 15)), self.macho((11, 0))]
+        offsets = [64, 64 + len(slices[0])]
+        fat += b''.join(struct.pack('>IIIII', 0, 0, o, len(b), 0) for o, b in zip(offsets, slices))
+        self.assertEqual(release.macho_minimum(fat.ljust(64, b'\0') + b''.join(slices)), (11, 0))
+        self.assertEqual(release.pe_imports(self.pe(['KERNEL32.dll', 'VCRUNTIME140.dll'], ['msvcp140.dll'])), ['KERNEL32.dll', 'VCRUNTIME140.dll', 'msvcp140.dll'])
+        with tempfile.TemporaryDirectory() as temp:
+            for os_, data in [('linux', b'\x7fELF\x02\x01' + bytes(10)), ('macos', MACHO_ARM64 + struct.pack('<III', 0, 2, 5)), ('windows', b'MZ' + bytes(10))]:
+                path = Path(temp) / os_
+                path.write_bytes(data)
+                with self.assertRaisesRegex(ValueError, 'cannot read'):
+                    release.check_compatibility(path, os_, 'x86_64')
+
+    def test_compatibility_rejects_newer_systems_and_vc_runtime(self):
+        cases = [
+            ('linux', 'x86_64', self.elf(['GLIBC_2.28']), None),
+            ('linux', 'aarch64', self.elf(['GLIBC_2.31']), 'glibc 2.31'),
+            ('macos', 'aarch64', self.macho((11, 0)), None),
+            ('macos', 'x86_64', self.macho((11, 0)), 'macOS'),
+            ('windows', 'x86_64', self.pe(['KERNEL32.dll', 'api-ms-win-crt-runtime-l1-1-0.dll']), None),
+            ('windows', 'aarch64', self.pe(['KERNEL32.dll'], ['VCRUNTIME140_1.dll']), 'Visual C++'),
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            for os_, arch, data, error in cases:
+                path = Path(temp) / f'{os_}-{arch}'
+                path.write_bytes(data)
+                if error is None:
+                    release.check_compatibility(path, os_, arch)
+                else:
+                    with self.assertRaisesRegex(ValueError, error):
+                        release.check_compatibility(path, os_, arch)
+
+    def test_sbom_lists_linked_crates_with_lock_checksums_and_pinned_media(self):
+        metadata = dict(resolve=dict(root='app', nodes=[
+            dict(id='app', deps=[dict(pkg='a', dep_kinds=[dict(kind=None)]), dict(pkg='dev', dep_kinds=[dict(kind='dev')])]),
+            dict(id='a', deps=[dict(pkg='b', dep_kinds=[dict(kind=None)])]), dict(id='b', deps=[]), dict(id='dev', deps=[])]),
+            packages=[dict(id=i, name=i, version='1.0.0', license='MIT' if i != 'b' else None) for i in ['app', 'a', 'b', 'dev']])
+        lock = '[[package]]\nname = "a"\nversion = "1.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "' + 'c' * 64 + '"\n\n[[package]]\nname = "b"\nversion = "1.0.0"\n'
+        recipe = 'FFMPEG_VERSION=9.0.2\nFFMPEG_SHA256=' + 'f' * 64 + '\nX264_COMMIT=abc\n'
+        bom = release.cyclonedx(metadata, lock, recipe, '1.2.3', 'owner/repo', '00000000-0000-0000-0000-000000000000')
+        components = {c['bom-ref']: c for c in bom['components']}
+        self.assertEqual(set(components), {'pkg:cargo/a@1.0.0', 'pkg:cargo/b@1.0.0', 'media:ffmpeg', 'media:x264'})
+        self.assertEqual(components['pkg:cargo/a@1.0.0']['hashes'], [dict(alg='SHA-256', content='c' * 64)])
+        self.assertNotIn('hashes', components['pkg:cargo/b@1.0.0'])
+        self.assertNotIn('licenses', components['pkg:cargo/b@1.0.0'])
+        self.assertEqual((components['media:x264']['version'], components['media:ffmpeg']['hashes'][0]['content']), ('abc', 'f' * 64))
+        self.assertEqual(bom['dependencies'][1], dict(ref='media:ffmpeg', dependsOn=['media:x264']))
+
+    def test_set_version_raises_cargo_toml_and_lock_only_forward(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'Cargo.toml').write_text('[package]\nname = "capturefab"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\nserde = { version = "1" }\n')
+            (root / 'Cargo.lock').write_text('[[package]]\nname = "aaa"\nversion = "0.1.0"\n\n[[package]]\nname = "capturefab"\nversion = "0.1.0"\ndependencies = []\n')
+            self.assertEqual(release.set_version('v0.2.0-rc.1', root), ('0.1.0', '0.2.0-rc.1'))
+            self.assertIn('version = "0.2.0-rc.1"\nedition', (root / 'Cargo.toml').read_text())
+            self.assertIn('serde = { version = "1" }', (root / 'Cargo.toml').read_text())
+            self.assertIn('name = "aaa"\nversion = "0.1.0"', (root / 'Cargo.lock').read_text())
+            self.assertIn('name = "capturefab"\nversion = "0.2.0-rc.1"', (root / 'Cargo.lock').read_text())
+            self.assertEqual(release.set_version('0.2.0', root), ('0.2.0-rc.1', '0.2.0'))
+            for older in ['0.2.0', '0.2.0-rc.2', '0.1.9', 'banana']:
+                with self.assertRaises(ValueError):
+                    release.set_version(older, root)
+
     def test_embeds_requires_the_whole_payload(self):
         payload = os.urandom(70000)
         with tempfile.TemporaryDirectory() as temp:
@@ -148,15 +264,19 @@ class ReleaseTests(unittest.TestCase):
             (bundle / 'licenses').mkdir()
             (bundle / 'licenses' / 'NOTICE.txt').write_text('notice')
             (bundle / 'build-manifest.txt').write_text('manifest')
-            ffmpeg = MACHO_ARM64 + os.urandom(70000)
+            ffmpeg = self.macho((11, 0)) + os.urandom(70000)
             (bundle / 'bin' / 'ffmpeg').write_bytes(ffmpeg)
             binary = temp / 'capturefab'
-            binary.write_bytes(MACHO_ARM64 + b'code' + ffmpeg)
+            binary.write_bytes(self.macho((11, 0)) + b'code' + ffmpeg)
             args = SimpleNamespace(os='macos', arch='aarch64', target='aarch64-apple-darwin', version='1.2.3-rc.1', ffmpeg_bundle=bundle, output=temp / 'dist', skip_smoke=True)
             with mock.patch.object(release, 'notices', return_value='crate licenses'), mock.patch.dict(os.environ, {'MACOS_SIGN_IDENTITY': ''}):
                 item = release.package(args, binary, 'desktop')
-                (bundle / 'bin' / 'ffmpeg').write_bytes(MACHO_ARM64 + os.urandom(70000))
+                (bundle / 'bin' / 'ffmpeg').write_bytes(self.macho((11, 0)) + os.urandom(70000))
                 with self.assertRaisesRegex(ValueError, 'does not embed'):
+                    release.package(args, binary, 'headless')
+                # An embedded FFmpeg built for a newer macOS is refused too.
+                (bundle / 'bin' / 'ffmpeg').write_bytes(self.macho((13, 0)) + os.urandom(70000))
+                with self.assertRaisesRegex(ValueError, 'requires macOS'):
                     release.package(args, binary, 'headless')
             path = temp / 'dist' / item['name']
             self.assertEqual((item['validation'], item['platform_signature'], item['sha256']), ('cross-compiled', 'unsigned', release.digest(path)))
@@ -299,11 +419,16 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual((entry['checksums_url'], entry['source_url']), ('https://example.invalid/v1.2.3/SHA256SUMS', 'https://example.invalid/v1.2.3/capturefab-1.2.3-source.tar.gz'))
             self.assertNotIn('checksums_signature_url', entry)
             sums = {name: digest for digest, name in (line.split('  ') for line in (output / 'SHA256SUMS').read_text().splitlines())}
-            self.assertEqual(set(sums), {asset.name, 'capturefab-1.2.3-linux-x86_64-media-sources.tar.gz', 'capturefab-1.2.3-source.tar.gz', 'releases.json'})
+            self.assertEqual(set(sums), {asset.name, 'capturefab-1.2.3-linux-x86_64-media-sources.tar.gz', 'capturefab-1.2.3-source.tar.gz', 'capturefab-1.2.3-sbom.cdx.json', 'releases.json'})
+            self.assertEqual(entry['sbom_url'], 'https://example.invalid/v1.2.3/capturefab-1.2.3-sbom.cdx.json')
+            bom = json.loads((output / 'capturefab-1.2.3-sbom.cdx.json').read_text())
+            self.assertEqual((bom['bomFormat'], bom['metadata']['component']['purl']), ('CycloneDX', 'pkg:github/owner/repo@v1.2.3'))
+            self.assertIn('pkg:cargo/serde', {c.get('purl', '').split('@')[0] for c in bom['components']})
             self.assertEqual(sums['releases.json'], release.digest(output / 'releases.json'))
             notes = (output / 'release-notes.md').read_text()
             self.assertIn('- linux x86_64 desktop: cargo exited with status 101', notes)
             self.assertIn('gh attestation verify FILE --repo owner/repo', notes)
+            self.assertIn('--predicate-type https://cyclonedx.org/bom', notes)
             self.assertNotIn('SHA256SUMS.asc', notes)
             with self.assertRaisesRegex(ValueError, 'must be empty'):
                 release.assemble(args)

@@ -15,12 +15,20 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import uuid
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SEMVER = re.compile(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?')
 TARGETS = [(os_, arch, variant) for os_, arches in [('linux', ['x86_64', 'aarch64', 'armv7']), ('macos', ['x86_64', 'aarch64']), ('windows', ['x86_64', 'aarch64'])] for arch in arches for variant in ['desktop', 'headless']]
-FEATURES = {'desktop': ['--features', 'wgpu'], 'headless': ['--no-default-features', '--features', 'usb,jpeg,nvjpeg']}
+FEATURES = {'desktop': ['--features', 'wgpu'], 'headless': ['--no-default-features', '--features', 'usb,jpeg,nvjpeg,vaapi,videotoolbox']}
+# The oldest systems release executables must start on: glibc 2.28 (RHEL,
+# Rocky and Alma 8, Debian 10, Ubuntu 18.10 and newer) and the macOS
+# deployment targets. Windows executables must not need the Visual C++
+# redistributable, which is not part of Windows.
+GLIBC_BASELINE = (2, 28)
+MACOS_BASELINE = {'aarch64': (11, 0), 'x86_64': (10, 15)}
+VC_RUNTIME = re.compile(r'(vcruntime|msvcp|msvcr|vcomp|concrt|vccorlib)\d*(_\d+)?d?\.dll', re.I)
 LICENSE_FILE = re.compile(r'(licen[cs]e|copying|notice|unlicense)', re.I)
 
 def version(value=None):
@@ -30,6 +38,30 @@ def version(value=None):
     if not match or (match[4] and any(x.isdigit() and len(x) > 1 and x[0] == '0' for x in match[4].split('.'))):
         raise ValueError('version must follow Semantic Versioning, such as 0.1.0 or 0.2.0-rc.1')
     return value
+
+def precedence(value):
+    """A sort key that orders versions by Semantic Versioning precedence."""
+    match = SEMVER.fullmatch(value)
+    if not match:
+        raise ValueError(f'invalid release version: {value}')
+    pre = tuple((0, int(x), '') if x.isdigit() else (1, 0, x) for x in (match[4] or '').split('.') if x)
+    return int(match[1]), int(match[2]), int(match[3]), not pre, pre
+
+def set_version(value, root=ROOT):
+    """Raise the package version in Cargo.toml and Cargo.lock, for a release
+    pull request; the new version must be newer than the current one."""
+    toml, lock = root / 'Cargo.toml', root / 'Cargo.lock'
+    current = re.search(r'^version\s*=\s*"([^"]+)"', toml.read_text(), re.M)[1]
+    new = version(value)
+    if precedence(new) <= precedence(current):
+        raise ValueError(f'{new} is not newer than the current version {current}')
+    updated, count = re.subn(r'^(\[package\]\n(?:(?!\[)[^\n]*\n)*?version\s*=\s*)"[^"]+"', lambda m: f'{m[1]}"{new}"', toml.read_text(), count=1, flags=re.M)
+    locked, locked_count = re.subn(r'(\[\[package\]\]\nname = "capturefab"\nversion = )"[^"]+"', lambda m: f'{m[1]}"{new}"', lock.read_text(), count=1)
+    if count != 1 or locked_count != 1:
+        raise ValueError('cannot find the package version in Cargo.toml and Cargo.lock')
+    toml.write_text(updated)
+    lock.write_text(locked)
+    return current, new
 
 def digest(path):
     result = hashlib.sha256()
@@ -65,6 +97,102 @@ def inspect_binary(path, os_, arch):
             raise ValueError('expected a target-specific ELF, PE, or Mach-O executable')
     if (kind, found) != (os_, arch):
         raise ValueError(f'wrong executable target: {kind}/{found}, expected {os_}/{arch}')
+
+def elf_glibc(data):
+    """Newest GLIBC_x.y symbol version an ELF executable requires, or None."""
+    end = '<' if data[5] == 1 else '>'
+    if data[4] == 2:
+        (shoff,), (shentsize, shnum) = struct.unpack_from(end + 'Q', data, 0x28), struct.unpack_from(end + 'HH', data, 0x3A)
+        layout = end + 'IIQQQQII'
+    else:
+        (shoff,), (shentsize, shnum) = struct.unpack_from(end + 'I', data, 0x20), struct.unpack_from(end + 'HH', data, 0x2E)
+        layout = end + 'IIIIIIII'
+    sections = [struct.unpack_from(layout, data, shoff + i * shentsize) for i in range(shnum)]
+    newest = None
+    for _, kind, _, _, offset, size, link, count in sections:
+        if kind != 0x6FFFFFFE:  # SHT_GNU_verneed
+            continue
+        strings = sections[link][4]
+        entry = offset
+        for _ in range(count):
+            _, aux_count, _, aux, following = struct.unpack_from(end + 'HHIII', data, entry)
+            at = entry + aux
+            for _ in range(aux_count):
+                _, _, _, name, step = struct.unpack_from(end + 'IHHII', data, at)
+                text = data[strings + name:data.index(b'\0', strings + name)].decode('ascii', 'replace')
+                match = re.fullmatch(r'GLIBC_(\d+)\.(\d+)(?:\.\d+)?', text)
+                if match:
+                    found = int(match[1]), int(match[2])
+                    newest = max(newest or found, found)
+                at += step
+            if not following:
+                break
+            entry += following
+    return newest
+
+def macho_minimum(data):
+    """Minimum macOS version a Mach-O executable declares, or None; the
+    highest across the slices of a universal binary."""
+    if data[:4] == b'\xca\xfe\xba\xbe':
+        slices = [struct.unpack_from('>IIIII', data, 8 + i * 20) for i in range(struct.unpack_from('>I', data, 4)[0])]
+        found = [macho_minimum(data[offset:offset + size]) for _, _, offset, size, _ in slices]
+        return max((v for v in found if v), default=None)
+    end = '<' if data[0] == 0xCF else '>'
+    (count,), at = struct.unpack_from(end + 'I', data, 16), 32
+    for _ in range(count):
+        command, size = struct.unpack_from(end + 'II', data, at)
+        if command in (0x32, 0x24):  # LC_BUILD_VERSION (minos at 12), LC_VERSION_MIN_MACOSX (8)
+            value = struct.unpack_from(end + 'I', data, at + (12 if command == 0x32 else 8))[0]
+            return value >> 16, (value >> 8) & 0xFF
+        at += size
+    return None
+
+def pe_imports(data):
+    """DLLs a PE executable imports, including delay-loaded ones."""
+    pe = struct.unpack_from('<I', data, 60)[0]
+    sections, optional_size = struct.unpack_from('<H', data, pe + 6)[0], struct.unpack_from('<H', data, pe + 20)[0]
+    optional = pe + 24
+    directories = optional + (112 if struct.unpack_from('<H', data, optional)[0] == 0x20B else 96)
+    table = [struct.unpack_from('<IIII', data, optional + optional_size + i * 40 + 8) for i in range(sections)]
+    def offset(rva):
+        for size, address, raw_size, raw in table:
+            if address <= rva < address + max(size, raw_size):
+                return raw + rva - address
+        raise ValueError('PE address outside every section')
+    names = []
+    for index, width, name_at in [(1, 20, 12), (13, 32, 4)]:  # import, delay-import directories
+        rva = struct.unpack_from('<I', data, directories + index * 8)[0]
+        if not rva:
+            continue
+        at = offset(rva)
+        while any(data[at:at + width]):
+            name = offset(struct.unpack_from('<I', data, at + name_at)[0])
+            names.append(data[name:data.index(b'\0', name)].decode('ascii', 'replace'))
+            at += width
+    return names
+
+def check_compatibility(path, os_, arch):
+    """Refuse an executable that needs a newer system than the release baseline."""
+    data = Path(path).read_bytes()
+    name = Path(path).name
+    try:
+        check_headers(data, name, os_, arch)
+    except (struct.error, IndexError, KeyError) as error:
+        raise ValueError(f'cannot read the system requirements of {name}: {error}') from None
+
+def check_headers(data, name, os_, arch):
+    if os_ == 'linux':
+        newest = elf_glibc(data)
+        if newest and newest > GLIBC_BASELINE:
+            raise ValueError(f'{name} requires glibc {newest[0]}.{newest[1]}; releases support {GLIBC_BASELINE[0]}.{GLIBC_BASELINE[1]}')
+    elif os_ == 'macos':
+        minimum, baseline = macho_minimum(data), MACOS_BASELINE[arch]
+        if minimum is None or minimum > baseline:
+            raise ValueError(f'{name} requires macOS {minimum}; releases support {baseline[0]}.{baseline[1]}')
+    else:
+        runtime = [dll for dll in pe_imports(data) if VC_RUNTIME.fullmatch(dll)]
+        if runtime:
+            raise ValueError(f'{name} needs the Visual C++ runtime ({", ".join(runtime)}); link it statically')
 
 def embeds(binary, payload):
     data, needle = Path(binary).read_bytes(), Path(payload).read_bytes()
@@ -113,7 +241,8 @@ def source_archive(output, ver, root=ROOT):
                 archive.addfile(member, io.BytesIO(data))
     return path
 
-def license_notices(metadata):
+def linked_packages(metadata):
+    """Packages reachable from the root through normal (linked) dependencies."""
     nodes = {node['id']: node for node in metadata['resolve']['nodes']}
     packages = {package['id']: package for package in metadata['packages']}
     linked, pending = set(), [metadata['resolve']['root']]
@@ -122,6 +251,57 @@ def license_notices(metadata):
             if dep['pkg'] not in linked and any(kind['kind'] is None for kind in dep['dep_kinds']):
                 linked.add(dep['pkg'])
                 pending.append(dep['pkg'])
+    return packages, linked
+
+# Media payload components, by the build recipe's variable prefix: name,
+# license as built, and upstream location.
+MEDIA = [('FFMPEG', 'ffmpeg', 'GPL-3.0-or-later', 'https://ffmpeg.org/'), ('X264', 'x264', 'GPL-2.0-or-later', 'https://code.videolan.org/videolan/x264'),
+         ('SRT', 'srt', 'MPL-2.0', 'https://github.com/Haivision/srt'), ('OPENSSL', 'openssl', 'Apache-2.0', 'https://www.openssl.org/'),
+         ('NV_HEADERS', 'nv-codec-headers', 'MIT', 'https://github.com/FFmpeg/nv-codec-headers'), ('VULKAN_HEADERS', 'Vulkan-Headers', 'Apache-2.0 OR MIT', 'https://github.com/KhronosGroup/Vulkan-Headers'),
+         ('LIBVPL', 'libvpl', 'MIT', 'https://github.com/intel/libvpl'), ('AMF', 'AMF', 'MIT', 'https://github.com/GPUOpen-LibrariesAndSDKs/AMF')]
+
+def cyclonedx(metadata, lock, recipe, ver, repository, serial):
+    """A CycloneDX 1.6 SBOM for every platform of a release: the Rust crates
+    linked with all features, with Cargo.lock checksums, and the media
+    payload components pinned by the FFmpeg build recipe."""
+    checksums = dict(((m[1], m[2]), m[3]) for m in re.finditer(r'\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"\n(?:source = "[^"]*"\n)?(?:checksum = "([0-9a-f]{64})")?', lock))
+    packages, linked = linked_packages(metadata)
+    crates = []
+    for package in sorted((packages[i] for i in linked), key=lambda p: (p['name'], p['version'])):
+        purl = f"pkg:cargo/{package['name']}@{package['version']}"
+        item = dict(type='library', **{'bom-ref': purl}, name=package['name'], version=package['version'], purl=purl, scope='required')
+        if package.get('license'):
+            item['licenses'] = [dict(expression=package['license'])]
+        if checksums.get((package['name'], package['version'])):
+            item['hashes'] = [dict(alg='SHA-256', content=checksums[(package['name'], package['version'])])]
+        crates.append(item)
+    pinned = dict(re.findall(r'^([A-Z0-9_]+)=(\S+)$', recipe, re.M))
+    media = []
+    for prefix, name, license_, url in MEDIA:
+        version_ = pinned.get(f'{prefix}_VERSION') or pinned.get(f'{prefix}_COMMIT')
+        if not version_:
+            continue
+        item = dict(type='library', **{'bom-ref': f'media:{name}'}, name=name, version=version_, scope='required', licenses=[dict(expression=license_)],
+                    description='Part of the FFmpeg executable embedded in each package; which components a platform enables is listed in its media-build-manifest.txt.',
+                    externalReferences=[dict(type='website', url=url)])
+        if pinned.get(f'{prefix}_SHA256'):
+            item['hashes'] = [dict(alg='SHA-256', content=pinned[f'{prefix}_SHA256'])]
+        media.append(item)
+    root = dict(type='application', **{'bom-ref': 'capturefab'}, name='capturefab', version=ver, licenses=[dict(license=dict(id='MIT'))], purl=f'pkg:github/{repository}@v{ver}')
+    return {'bomFormat': 'CycloneDX', 'specVersion': '1.6', 'serialNumber': f'urn:uuid:{serial}', 'version': 1,
+            'metadata': dict(timestamp=dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'), tools=dict(components=[dict(type='application', name='capturefab scripts/release.py')]), component=root),
+            'components': crates + media,
+            'dependencies': [dict(ref='capturefab', dependsOn=[c['bom-ref'] for c in crates] + ['media:ffmpeg']), dict(ref='media:ffmpeg', dependsOn=[m['bom-ref'] for m in media if m['bom-ref'] != 'media:ffmpeg'])]}
+
+def sbom(output, ver, repository):
+    metadata = run(['cargo', 'metadata', '--format-version', '1', '--locked', '--all-features'], cwd=ROOT, capture_output=True, text=True).stdout
+    document = cyclonedx(json.loads(metadata), (ROOT / 'Cargo.lock').read_text(), (ROOT / 'scripts' / 'build-ffmpeg.sh').read_text(), ver, repository, uuid.uuid4())
+    path = output / f'capturefab-{ver}-sbom.cdx.json'
+    path.write_text(json.dumps(document, indent=1) + '\n')
+    return path
+
+def license_notices(metadata):
+    packages, linked = linked_packages(metadata)
     texts = {}
     for package in sorted((packages[i] for i in linked), key=lambda p: (p['name'], p['version'])):
         folder = Path(package['manifest_path']).parent
@@ -179,6 +359,8 @@ def package(args, binary, variant):
     inspect_binary(binary, args.os, args.arch)
     ffmpeg = Path(args.ffmpeg_bundle) / 'bin' / ('ffmpeg.exe' if args.os == 'windows' else 'ffmpeg')
     inspect_binary(ffmpeg, args.os, args.arch)
+    for executable in (binary, ffmpeg):
+        check_compatibility(executable, args.os, args.arch)
     if not embeds(binary, ffmpeg):
         raise ValueError(f'{binary} does not embed {ffmpeg}')
     if not args.skip_smoke:
@@ -359,8 +541,9 @@ def assemble(args):
         raise ValueError('no verified build assets found; refusing to create a release')
     assets = [successes.get(key) or dict(os=key[0], arch=key[1], variant=key[2], name=f'capturefab-{ver}-{key[0]}-{key[1]}-{key[2]}', available=False, reason=failures.get(key, 'Not built for this release')) for key in TARGETS]
     source = source_archive(output, ver)
+    bill = sbom(output, ver, args.repository)
     signature = 'SHA256SUMS.asc' if args.gpg_key else None
-    release = dict(version=ver, date=dt.datetime.now(dt.timezone.utc).date().isoformat(), url=f'https://github.com/{args.repository}/releases/tag/v{ver}', checksums_url=link(args.download_base, 'SHA256SUMS'), source_url=link(args.download_base, source.name), assets=assets)
+    release = dict(version=ver, date=dt.datetime.now(dt.timezone.utc).date().isoformat(), url=f'https://github.com/{args.repository}/releases/tag/v{ver}', checksums_url=link(args.download_base, 'SHA256SUMS'), source_url=link(args.download_base, source.name), sbom_url=link(args.download_base, bill.name), assets=assets)
     if signature:
         release['checksums_signature_url'] = link(args.download_base, signature)
     (output / 'releases.json').write_text(json.dumps(dict(schema_version=1, latest=ver, releases=[release]), indent=2) + '\n')
@@ -374,7 +557,8 @@ def assemble(args):
     notes += ['', 'Unavailable targets:'] + unavailable if unavailable else []
     notes += ['', 'Verification:', '- Check downloads against SHA256SUMS, for example `sha256sum --check --ignore-missing SHA256SUMS`.']
     notes += [f'- SHA256SUMS.asc is an OpenPGP signature by key {args.gpg_key}: `gpg --verify SHA256SUMS.asc SHA256SUMS`.'] if signature else []
-    notes += [f'- GitHub build provenance covers every file in SHA256SUMS: `gh attestation verify FILE --repo {args.repository}`.'] if args.provenance else []
+    notes += [f'- GitHub build provenance and an SBOM attestation cover every file in SHA256SUMS: `gh attestation verify FILE --repo {args.repository}` (add `--predicate-type https://cyclonedx.org/bom` for the SBOM).'] if args.provenance else []
+    notes += [f'- {bill.name} is a CycloneDX software bill of materials: the Rust crates linked into any variant, with Cargo.lock checksums, and the pinned media components.']
     notes += ['- Apple Developer ID, notarization and Windows Authenticode apply only where the platform signature above says so.', '', f'Corresponding source: {source.name} contains the exact Capturefab commit and vendored Cargo.lock dependency sources with an offline build configuration; each *-media-sources.tar.gz holds the verified FFmpeg, x264, SRT, OpenSSL and enabled header archives with their build manifest. Packages list Rust crate licenses in THIRD-PARTY-LICENSES.txt. See docs/hardware-validation.md for actual hardware test scope.']
     (output / 'release-notes.md').write_text('\n'.join(notes) + '\n')
     print(f'Prepared {ver}: {len(successes)} platform assets; {len(assets) - len(successes)} unavailable selections.')
@@ -395,6 +579,8 @@ def main():
     build_parser.add_argument('--repackage', action='store_true', help='sign/repackage verified archives already in --output without recompiling')
     build_parser.add_argument('--skip-smoke', action='store_true', help='cross build: label unexecuted target honestly')
     build_parser.add_argument('--output', default='dist')
+    bump = commands.add_parser('set-version', help='raise the version in Cargo.toml and Cargo.lock')
+    bump.add_argument('version')
     collect = commands.add_parser('assemble')
     collect.add_argument('--version')
     collect.add_argument('--input', required=True)
@@ -410,6 +596,9 @@ def main():
             if wanted != version():
                 raise ValueError('version must match Cargo.toml')
             print(wanted)
+        elif args.command == 'set-version':
+            current, new = set_version(args.version)
+            print(f'{current} -> {new}')
         elif args.command == 'build':
             if args.binary and args.repackage:
                 raise ValueError('--binary and --repackage cannot be combined')

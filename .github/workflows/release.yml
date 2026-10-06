@@ -3,6 +3,10 @@ name: Release
 on:
   push:
     tags: ['v*']
+    # Merging a pull request that raises the version (see prepare-release.yml)
+    # tags the merge commit and releases it. Path filters do not apply to tags.
+    branches: [main]
+    paths: [Cargo.toml]
   workflow_dispatch:
 
 permissions: {}
@@ -23,27 +27,79 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      # Build every target (false for a push to main that is not a release).
+      build: ${{ steps.version.outputs.build }}
+      # Draft, attest and publish (false for a dry run from a branch).
+      release: ${{ steps.version.outputs.release }}
+      # The tag does not exist yet: create it on this commit.
+      create-tag: ${{ steps.version.outputs.create_tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - id: version
+        env:
+          BEFORE: ${{ github.event.before }}
         run: |
-          if [ "$GITHUB_REF_TYPE" = tag ]; then set -- --version "$GITHUB_REF_NAME"; fi
-          version=$(python3 scripts/release.py version "$@")
+          build=true release=false create_tag=false
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version=$(python3 scripts/release.py version --version "$GITHUB_REF_NAME")
+            release=true
+          elif [ "$GITHUB_EVENT_NAME" = push ]; then
+            version=$(python3 scripts/release.py version)
+            previous=
+            if git fetch --quiet --depth=1 origin "$BEFORE" 2>/dev/null; then
+              previous=$(git show "$BEFORE:Cargo.toml" | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)
+            fi
+            if [ -z "$previous" ] || [ "$previous" = "$version" ]; then
+              # Unchanged, or unknown after a force push: never release by accident.
+              build=false
+              echo "Cargo.toml changed without a new version ($previous -> $version); nothing to release." >> "$GITHUB_STEP_SUMMARY"
+            elif git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+              build=false
+              echo "v$version is already tagged; push the tag again or run this workflow on it to rebuild." >> "$GITHUB_STEP_SUMMARY"
+            else
+              release=true create_tag=true
+            fi
+          else
+            # A manual run from a branch is a dry run that only leaves artifacts.
+            version=$(python3 scripts/release.py version)
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          { echo "build=$build"; echo "release=$release"; echo "create_tag=$create_tag"; } >> "$GITHUB_OUTPUT"
+
+  tag:
+    name: Tag the release commit
+    needs: version
+    if: needs.version.outputs.create-tag == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      # A tag created with this token starts no new workflow run; this run
+      # builds and releases it.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.version.outputs.version }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" >/dev/null
+          echo "Tagged $GITHUB_SHA as $TAG." >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: Build ${{ matrix.os }} ${{ matrix.arch }}
-    needs: version
+    needs: [version, tag]
+    if: ${{ !cancelled() && needs.version.outputs.build == 'true' && needs.tag.result != 'failure' }}
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: linux, arch: x86_64, target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04, container: 'ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214' }
-          - { os: linux, arch: aarch64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, container: 'ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214' }
+          # manylinux_2_28 (AlmaLinux 8, GCC 14) links against glibc 2.28: RHEL,
+          # Rocky and Alma 8, Debian 10, Ubuntu 18.10 and newer, Jetson Linux R34.
+          - { os: linux, arch: x86_64, target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04, container: 'quay.io/pypa/manylinux_2_28_x86_64:latest', python: /opt/python/cp312-cp312/bin/python3 }
+          - { os: linux, arch: aarch64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, container: 'quay.io/pypa/manylinux_2_28_aarch64:latest', python: /opt/python/cp312-cp312/bin/python3 }
           - { os: macos, arch: aarch64, target: aarch64-apple-darwin, runner: macos-15, macos: '11.0' }
           - { os: macos, arch: x86_64, target: x86_64-apple-darwin, runner: macos-15-intel, macos: '10.15' }
           - { os: windows, arch: x86_64, target: x86_64-pc-windows-msvc, runner: windows-2025 }
@@ -52,7 +108,7 @@ jobs:
     timeout-minutes: 150
     env:
       VERSION: ${{ needs.version.outputs.version }}
-      PYTHON: ${{ matrix.os == 'windows' && 'python' || 'python3' }}
+      PYTHON: ${{ matrix.python || (matrix.os == 'windows' && 'python') || 'python3' }}
       RELEASE_TARGET: ${{ matrix.target }}
       RELEASE_OS: ${{ matrix.os }}
       RELEASE_ARCH: ${{ matrix.arch }}
@@ -65,11 +121,11 @@ jobs:
     steps:
       - name: Install Linux build tools
         if: runner.os == 'Linux'
-        env:
-          DEBIAN_FRONTEND: noninteractive
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends build-essential ca-certificates cmake curl git nasm perl pkg-config python3 xz-utils
+          # The image has GCC 14, CMake, Git, Perl and CPython; OpenSSL's
+          # configure needs these Perl modules, and x86 SIMD needs NASM.
+          dnf install -y perl-IPC-Cmd perl-Data-Dumper perl-Time-Piece xz
+          if [ "$(uname -m)" = x86_64 ]; then dnf install -y nasm; fi
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Install NASM
@@ -174,7 +230,7 @@ jobs:
   assemble:
     name: Assemble release
     needs: [version, build]
-    if: ${{ !cancelled() && needs.version.result == 'success' }}
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.version.outputs.build == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -205,7 +261,7 @@ jobs:
         env:
           GPG_KEY: ${{ steps.gpg.outputs.fingerprint }}
           RELEASE_GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
-          PROVENANCE: ${{ vars.CAPTUREFAB_ATTEST == 'true' }}
+          PROVENANCE: ${{ vars.CAPTUREFAB_ATTEST != 'false' && needs.version.outputs.release == 'true' }}
         run: |
           set -- --version "$VERSION" --input dist/builds --output dist/release --repository "$GITHUB_REPOSITORY" --download-base "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/v$VERSION"
           if [ -n "$GPG_KEY" ]; then set -- "$@" --gpg-key "$GPG_KEY"; fi
@@ -219,9 +275,12 @@ jobs:
           retention-days: 30
 
   attest:
-    name: Attest build provenance
-    needs: assemble
-    if: vars.CAPTUREFAB_ATTEST == 'true'
+    name: Attest build provenance and SBOM
+    needs: [version, assemble]
+    # On by default for releases; set CAPTUREFAB_ATTEST=false to turn off. The
+    # attestations, including the repository identity, are recorded in the
+    # public Sigstore transparency log.
+    if: needs.version.outputs.release == 'true' && vars.CAPTUREFAB_ATTEST != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -236,11 +295,15 @@ jobs:
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: dist/release/SHA256SUMS
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-checksums: dist/release/SHA256SUMS
+          sbom-path: dist/release/capturefab-${{ needs.version.outputs.version }}-sbom.cdx.json
 
   draft:
     name: Upload to a draft GitHub release
-    needs: [version, assemble, attest]
-    if: ${{ !cancelled() && github.ref_type == 'tag' && needs.assemble.result == 'success' && needs.attest.result != 'failure' }}
+    needs: [version, tag, assemble, attest]
+    if: ${{ !cancelled() && needs.version.outputs.release == 'true' && needs.assemble.result == 'success' && needs.attest.result != 'failure' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -250,6 +313,21 @@ jobs:
         with:
           name: release
           path: dist/release
+      - name: Combine generated and build notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # GitHub's notes list merged pull requests since the previous tag,
+          # grouped by label as .github/release.yml configures.
+          generated=$(gh api "repos/$GH_REPO/releases/generate-notes" -f tag_name="v$VERSION" --jq .body) || generated=''
+          {
+            if [ -n "$generated" ]; then printf '%s\n\n' "$generated"; fi
+            echo '## Downloads and verification'
+            echo
+            tail -n +2 dist/release/release-notes.md
+          } > "$RUNNER_TEMP/notes.md"
       - name: Create or update the draft
         env:
           GH_TOKEN: ${{ github.token }}
@@ -257,6 +335,7 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           tag="v$VERSION"
+          notes="$RUNNER_TEMP/notes.md"
           files=()
           for file in dist/release/*; do
             if [ "$file" != dist/release/release-notes.md ]; then files+=("$file"); fi
@@ -264,7 +343,7 @@ jobs:
           state=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null || echo missing)
           case $state in
             missing)
-              flags=(--draft --verify-tag --title "Capturefab $VERSION" --notes-file dist/release/release-notes.md)
+              flags=(--draft --verify-tag --title "Capturefab $VERSION" --notes-file "$notes")
               if [[ ${VERSION%%+*} == *-* ]]; then flags+=(--prerelease); fi
               gh release create "$tag" "${files[@]}" "${flags[@]}" ;;
             true)
@@ -280,9 +359,101 @@ jobs:
                 done
                 if [ "$retained" = false ]; then gh release delete-asset "$tag" "$asset" --yes; fi
               done <<< "$existing"
-              gh release edit "$tag" --notes-file dist/release/release-notes.md
+              gh release edit "$tag" --notes-file "$notes"
               gh release upload "$tag" "${files[@]}" --clobber ;;
             *)
               echo "::error::$tag is already published; this workflow only creates or updates draft releases"
               exit 1 ;;
           esac
+          echo "Draft: $(gh release view "$tag" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish the release
+    needs: [version, draft]
+    if: ${{ !cancelled() && needs.draft.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Configure required reviewers on this environment: the job, and so the
+    # release, waits for their approval after they have reviewed the draft.
+    environment:
+      name: release
+      url: ${{ github.server_url }}/${{ github.repository }}/releases/tag/v${{ needs.version.outputs.version }}
+    permissions:
+      contents: write
+    outputs:
+      published: ${{ steps.publish.outputs.published }}
+    steps:
+      - id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+          AUTO_PUBLISH: ${{ vars.CAPTUREFAB_AUTO_PUBLISH }}
+        run: |
+          # Without required reviewers the environment would publish
+          # unattended; leave the draft unless that is explicitly wanted.
+          reviewers=$(gh api "repos/$GH_REPO/environments/release" --jq '[.protection_rules[]? | select(.type == "required_reviewers")] | length' 2>/dev/null || echo 0)
+          if [ "$reviewers" = 0 ] && [ "$AUTO_PUBLISH" != true ]; then
+            echo "::warning::The release environment has no required reviewers; v$VERSION stays a draft. Add reviewers, or set CAPTUREFAB_AUTO_PUBLISH=true to publish without approval."
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          flags=(--draft=false)
+          if [[ ${VERSION%%+*} != *-* ]]; then flags+=(--latest); fi
+          gh release edit "v$VERSION" "${flags[@]}"
+          echo "published=true" >> "$GITHUB_OUTPUT"
+          echo "Published $(gh release view "v$VERSION" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"
+
+  site:
+    name: Update the downloads page
+    needs: [version, publish]
+    if: ${{ !cancelled() && needs.publish.outputs.published == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      # Starts the Pages workflow, which deploys from the default branch.
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.version.outputs.version }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release
+          path: dist/release
+      - name: Merge the release into web/
+        run: |
+          python3 scripts/site-release.py --merge dist/release/releases.json
+          python3 scripts/test-site.py
+      - name: Commit to the default branch, or open a pull request
+        env:
+          PUBLISH_SITE: ${{ vars.CAPTUREFAB_PUBLISH_SITE }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add web
+          if git diff --cached --quiet; then echo "web/ already lists v$VERSION."; exit 0; fi
+          git commit -m "Publish v$VERSION downloads"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          if git -c http.extraheader="AUTHORIZATION: basic $auth" push origin "HEAD:$DEFAULT_BRANCH"; then
+            echo "Updated web/ on $DEFAULT_BRANCH." >> "$GITHUB_STEP_SUMMARY"
+            if [ "$PUBLISH_SITE" = true ]; then
+              gh workflow run pages.yml --ref "$DEFAULT_BRANCH"
+              echo "Started the Pages deployment." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            # A protected branch: propose the change instead.
+            branch="site/v$VERSION"
+            git -c http.extraheader="AUTHORIZATION: basic $auth" push --force origin "HEAD:refs/heads/$branch"
+            url=$(gh pr create --base "$DEFAULT_BRANCH" --head "$branch" --title "Publish v$VERSION downloads" --label release --body "Adds v$VERSION to web/releases.json, the downloads page and the feed. Run the Pages workflow after merging.") \
+              && echo "Opened $url" >> "$GITHUB_STEP_SUMMARY" \
+              || echo "::warning::Pushed $branch; open a pull request from it to update the site."
+          fi

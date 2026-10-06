@@ -279,8 +279,9 @@ fn main() {
             });
         }
     }
-    // JPEG stills: libjpeg-turbo in process, and nvJPEG through its helper
-    // once warm (set CAPTUREFAB_EXECUTABLE to the capturefab binary).
+    // JPEG stills: libjpeg-turbo in process, Apple's JPEG engine, and nvJPEG
+    // through its helper once warm (set CAPTUREFAB_EXECUTABLE to the
+    // capturefab binary).
     for (name, format) in [("Mono8", MONO8), ("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
         let f = frame(1920, 1200, format);
         #[cfg(feature = "jpeg")]
@@ -289,6 +290,19 @@ fn main() {
             f.data.len(),
             || jpeg::software(&jpeg::Raster::new(&f).unwrap()).unwrap(),
         );
+        #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+        if format != MONO8 {
+            let label = format!("jpeg/videotoolbox/{name}/1920x1200");
+            if jpeg::encode_with_backend(&f).unwrap().1 == jpeg::Backend::VideoToolbox {
+                b.run(&label, f.data.len(), || {
+                    let (bytes, backend) = jpeg::encode_with_backend(&f).unwrap();
+                    assert_eq!(backend, jpeg::Backend::VideoToolbox, "fell back to the CPU");
+                    bytes
+                });
+            } else {
+                println!("{label:<40} unavailable on this host");
+            }
+        }
         #[cfg(feature = "nvjpeg")]
         {
             let label = format!("jpeg/nvjpeg/{name}/1920x1200");

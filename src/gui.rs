@@ -366,6 +366,10 @@ struct Workbench {
     edits: HashMap<String, String>,
     edit_sources: HashMap<String, String>,
     output: String,
+    /// Where stills and schedules are saved.
+    capture_to: crate::gui_destinations::Picker,
+    /// Where local recordings are saved.
+    record_to: crate::gui_destinations::Picker,
     count: u32,
     format: String,
     timeout_ms: u64,
@@ -424,6 +428,8 @@ impl Workbench {
             edits: HashMap::new(),
             edit_sources: HashMap::new(),
             output: "capture.png".into(),
+            capture_to: crate::gui_destinations::Picker::new(true),
+            record_to: crate::gui_destinations::Picker::new(false),
             count: 1,
             format: "png".into(),
             timeout_ms: 5000,
@@ -645,6 +651,7 @@ impl Workbench {
                 timeout_ms: self.timeout_ms,
                 format: self.format.clone(),
                 storage: self.storage_policy(),
+                destination: self.capture_to.selected.clone(),
             },
         );
     }
@@ -1200,13 +1207,13 @@ impl Workbench {
         ui.add_space(11.0);
         ui.label(RichText::new("Save frames").size(16.0).strong());
         ui.label(
-            RichText::new("Capture to a local file or numbered sequence.")
+            RichText::new("Capture to a file or numbered sequence on this computer, an external or network drive, or an S3 bucket.")
                 .small()
                 .color(ui.visuals().weak_text_color()),
         );
         ui.add_space(8.0);
-        ui.label("Output path");
-        ui.add(egui::TextEdit::singleline(&mut self.output).desired_width(f32::INFINITY));
+        self.capture_to
+            .ui(ui, &mut self.output, "capture", "Output path");
         ui.add_space(6.0);
         egui::Grid::new("capture-options")
             .num_columns(2)
@@ -1330,6 +1337,7 @@ impl Workbench {
                             .saturating_add(self.schedule_delay_seconds.saturating_mul(1000)),
                         interval_ms: (self.schedule_interval_seconds * 1000.0).round() as u64,
                         storage: self.storage_policy(),
+                        destination: self.capture_to.selected.clone(),
                     },
                 );
             }
@@ -1355,11 +1363,11 @@ impl Workbench {
         ui.label(RichText::new("Forward to a recorder").size(16.0).strong());
         ui.label(RichText::new("Publish the selected camera to MediaMTX, an NVR, or another compatible destination.").small().color(ui.visuals().weak_text_color()));
         ui.add_space(9.0);
-        ui.label("Destination");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.forward_output)
-                .hint_text("rtsp://localhost:8554/camera")
-                .desired_width(f32::INFINITY),
+        self.record_to.ui(
+            ui,
+            &mut self.forward_output,
+            "record",
+            "Stream URL or recording file (rtsp://, srt://, capture.mkv)",
         );
         ui.add_space(8.0);
         egui::Grid::new("forward-options")
@@ -1458,6 +1466,7 @@ impl Workbench {
                     bitrate: self.forward_bitrate.trim().into(),
                     storage: self.storage_policy(),
                     max_file_bytes: (self.forward_file_mib * 1024.0 * 1024.0).round() as u64,
+                    destination: self.record_to.selected.clone(),
                 },
             );
         }
@@ -2026,7 +2035,7 @@ impl Workbench {
                     }
                     ui.add(
                         egui::Label::new(
-                            RichText::new(&self.output)
+                            RichText::new(self.capture_to.label(&self.output))
                                 .monospace()
                                 .size(11.0)
                                 .color(ui.visuals().weak_text_color()),
@@ -2212,7 +2221,7 @@ impl Workbench {
             }
             ui.add(
                 egui::Label::new(
-                    RichText::new(&self.output)
+                    RichText::new(self.capture_to.label(&self.output))
                         .monospace()
                         .size(11.0)
                         .color(ui.visuals().weak_text_color()),

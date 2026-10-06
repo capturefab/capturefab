@@ -124,3 +124,96 @@ Not established: NVENC (including AV1) on discrete NVIDIA GPUs or Jetson Thor,
 Vulkan Video encode on any GPU, AMD AMF on Linux, Intel QSV on Windows, and
 nvJPEG on x86_64 or Windows. These paths are probed at run time and fall back
 to the next encoder.
+
+## Apple JPEG engine and copy reduction — 2026-10-05
+
+On an Apple M4 Max (macOS ARM64), JPEG stills of color frames were encoded by
+the dedicated JPEG engine through a VideoToolbox session that requires
+hardware. `doctor` reported it available, and a persistent session produced
+1920×1080 BayerRG8 and RGB8 JPEGs that macOS decoded at full size.
+
+- Color: when given BGRA, the engine's own conversion shifted the decoded
+  image by about +5, +4 and −1 levels in R, G and B, which capped PSNR near
+  35 dB even at maximum quality. Capturefab now writes full-range BT.601
+  YCbCr 4:2:0 (JFIF) into the engine's IOSurface buffers itself. The mean
+  shift dropped to about 0.1 level, and a unit test guards it.
+- Quality: the engine quantizes in coarse steps. On two photographs at
+  1920×1200, every setting from about 0.56 to 0.82 produced identical files,
+  about 10% smaller than libjpeg-turbo at quality 90 and within 0.3–0.7 dB
+  PSNR of it; 0.83 and up gave 1.6 times larger files. Capturefab uses 0.75.
+- Speed on those photographs: RGB8 encoded in 1.9–2.3 ms against 3.4–3.7 ms
+  for libjpeg-turbo, and BayerRG8 (including CPU demosaic) in 2.4–2.6 ms
+  against 3.7–3.9 ms. On the benchmark's synthetic 1920×1200 frames the
+  medians were 2.6 vs 3.1 ms (RGB8) and 3.3 vs 3.5 ms (BayerRG8). The engine
+  has about 0.25 ms fixed cost per frame and was slower than the CPU at
+  640×480, so frames under 0.5 MP stay on libjpeg-turbo. The engine always
+  writes three components, so monochrome frames also stay on libjpeg-turbo.
+- Forwarding now moves the worker's sensor buffer to the FFmpeg writer
+  instead of copying it. A 1920×1080 BayerRG8 simulator recording through a
+  persistent session decoded 97 complete H.264 frames, and the FFmpeg
+  integration tests passed with Homebrew FFmpeg.
+
+Not established: the JPEG engine on Intel Macs (the hardware-only session
+fails there and libjpeg-turbo is used), and the nvJPEG changes made at the
+same time. The parent now converts directly into the helper's shared buffer.
+The helper page-locks that buffer with `cudaHostRegister`, and on integrated
+GPUs passes nvJPEG its device address so the pixels are not uploaded at all.
+These paths have not run on NVIDIA hardware yet. A failed registration keeps
+the previous pageable copy, and `CAPTUREFAB_NVJPEG_PIN=0` forces it.
+
+## VA-API JPEG helper — 2026-10-05
+
+The VA-API JPEG helper (`__vajpeg`, `vaapi` feature) has not run on a GPU
+with JPEG encoding. What was checked:
+
+- macOS ARM64 unit tests:
+  - Header: the generated JFIF header (quantization tables at quality 90,
+    zigzag order, Annex K Huffman tables, SOF0 sampling and SOS selectors),
+    placed in front of libjpeg-turbo's own entropy-coded data, decodes to
+    identical pixels for 64×48 and 33×17 color and 40×24 gray images.
+  - Self-check: the start-up check rejects a JPEG whose tables do not match
+    its quantization.
+  - ABI: compile-time assertions pin every libva structure to its libva 2.x
+    size.
+- Linux ARM64 (Debian container, Rust 1.99, libva 2.22, no GPU): build,
+  clippy with all features and the full test suite passed. The helper loaded
+  `libva.so.2` and `libva-drm.so.2` and bound all 28 functions. With no
+  render node, `doctor` reported "no DRM render node found". Given
+  `/dev/null` as the device, libva refused it and the helper reported "no VA
+  display" over its protocol. Without `libva-drm.so.2` it reported "libva
+  not found", and JPEG captures used libjpeg-turbo.
+
+Not established: encoding on any VA-API driver (Intel iHD or otherwise),
+which table convention a driver needs, derived-image uploads, gray
+encoding, odd frame sizes, and speed against libjpeg-turbo. The start-up
+self-check keeps a driver whose output does not decode correctly from being
+used, so these paths fall back to the CPU until validated on hardware.
+
+## Capture destinations and S3 uploads — 2026-10-05
+
+On macOS ARM64, against SeaweedFS 4.48's S3 API in a local container (path-style,
+plain http, Signature Version 4 with environment credentials):
+
+- Folder destinations wrote captures into the chosen folder (including a path with
+  a space); a folder under an unplugged `/Volumes` drive was refused, and the
+  connected external drive was listed with its free space.
+- Three captures, a scheduled four-frame time lapse and a three-second Matroska
+  recording uploaded under the configured prefix; downloaded objects were
+  byte-identical to the local files, and local staging copies were deleted after
+  upload (or kept with `--keep-local`). A persistent `serve` session uploaded its
+  queue in the background.
+- A capture whose key already existed failed with HTTP 412 and left the stored
+  object unchanged. A wrong secret failed as `SignatureDoesNotMatch` and uploaded
+  after `uploads retry` with the right one. Uploads issued while the service was
+  paused completed when it resumed.
+- A 75.5 MB file uploaded in five multipart parts with a matching SHA-256 and was
+  not replaced by a second attempt (`live_multipart_upload_and_no_overwrite`).
+- The signing code reproduces the AWS documentation's example signature, and
+  HMAC-SHA256 matches RFC 4231. The GUI's Save to panel and destination form were
+  inspected in renderer screenshots.
+
+Not established: AWS S3, Cloudflare R2, Backblaze B2 and other services (and
+virtual-hosted addressing against them), credentials stored in the macOS
+Keychain, Windows Credential Manager or Linux Secret Service, the native folder
+dialogs, Windows volume listing, and uploads over TLS. Linux ARM64 builds, lints
+and tests in a container; Windows builds only in CI.
