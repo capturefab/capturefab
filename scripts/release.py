@@ -314,7 +314,10 @@ def license_notices(metadata):
 
 def notices(target, variant):
     metadata = run(['cargo', 'metadata', '--format-version', '1', '--locked', '--filter-platform', target, *FEATURES[variant]], cwd=ROOT, capture_output=True, text=True).stdout
-    return license_notices(json.loads(metadata))
+    text = license_notices(json.loads(metadata))
+    if variant == 'desktop':
+        text += f"\n===== Phosphor Icons 2.1.2 font (MIT), assets/fonts =====\n\n{(ROOT / 'assets/fonts/Phosphor-LICENSE.txt').read_text(encoding='utf-8').strip()}\n"
+    return text
 
 def link(base, name):
     return f'{base.rstrip("/")}/{name}' if base else name
@@ -388,7 +391,7 @@ def package(args, binary, variant):
         shutil.copytree(Path(args.ffmpeg_bundle) / 'licenses', stage / 'media-licenses')
         shutil.copy2(Path(args.ffmpeg_bundle) / 'build-manifest.txt', stage / 'media-build-manifest.txt')
         (stage / 'THIRD-PARTY-LICENSES.txt').write_text(notices(args.target, variant), encoding='utf-8')
-        (stage / 'README.txt').write_text(f'Capturefab {args.version}\n{args.os}/{args.arch}; {variant}\nRun capturefab --help for CLI usage. Desktop builds open the GUI with no arguments.\nFFmpeg is embedded; no separately installed media executable or camera SDK is required.\nPlatform signature: {signed}. Verify the download against the release SHA256SUMS.\nLicenses: LICENSE (Capturefab), THIRD-PARTY-LICENSES.txt (Rust crates), media-licenses/ (FFmpeg payload).\nCorresponding source: the release source and media-sources archives. See docs/hardware-validation.md for test scope.\n')
+        (stage / 'README.txt').write_text(f'Capturefab {args.version}\n{args.os}/{args.arch}; {variant}\nRun capturefab --help for CLI usage. Desktop builds open the GUI with no arguments.\nFFmpeg is embedded; no separately installed media executable or camera SDK is required.\nPlatform signature: {signed}. Verify the download against the release SHA256SUMS.\nLicenses: LICENSE (Capturefab), THIRD-PARTY-LICENSES.txt (Rust crates and bundled fonts), media-licenses/ (FFmpeg payload).\nCorresponding source: the release source and media-sources archives. See docs/hardware-validation.md for test scope.\n')
         if args.os == 'macos' and variant == 'desktop':
             app = stage / 'Capturefab.app' / 'Contents'
             (app / 'MacOS').mkdir(parents=True)

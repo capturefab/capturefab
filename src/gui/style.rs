@@ -278,8 +278,9 @@ pub fn sheet(theme: &Theme) -> container::Style {
     }
 }
 
-pub fn scrim(theme: &Theme) -> container::Style {
-    container::Style::default().background(Palette::from(theme).scrim)
+pub fn scrim(theme: &Theme, shown: f32) -> container::Style {
+    let scrim = Palette::from(theme).scrim;
+    container::Style::default().background(alpha(scrim, scrim.a * shown))
 }
 
 pub fn tooltip(theme: &Theme) -> container::Style {
@@ -380,6 +381,20 @@ pub fn link(theme: &Theme, status: button::Status) -> button::Style {
         button::Status::Hovered => button_base(Some(p.accent_soft), p.accent_text, 6.0),
         button::Status::Pressed => button_base(Some(alpha(p.accent, 0.24)), p.accent_text, 6.0),
         button::Status::Disabled => button_base(None, p.tertiary, 6.0),
+    }
+}
+
+pub fn card(theme: &Theme, status: button::Status) -> button::Style {
+    let p = Palette::from(theme);
+    let rest = if p.dark { p.field } else { p.base };
+    let (fill, edge) = match status {
+        button::Status::Hovered => (rest, alpha(p.accent, 0.55)),
+        button::Status::Pressed => (mix(rest, p.accent, 0.08), p.accent),
+        _ => (rest, p.hairline),
+    };
+    button::Style {
+        border: hairline(edge, 10.0),
+        ..button_base(Some(fill), p.text, 10.0)
     }
 }
 

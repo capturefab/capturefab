@@ -45,15 +45,15 @@ def render(lines):
     for index, line in enumerate(lines):
         y = BAR + PAD + FONT + index * LINE
         if line.startswith('$ '):
-            rows.append(f'<text x="{PAD}" y="{y}" xml:space="preserve" fill="#a0d68d">$ <tspan fill="#e6ece1">{escape(line[2:])}</tspan></text>')
+            rows.append(f'<text x="{PAD}" y="{y}" xml:space="preserve" fill="#6aa1fa">$ <tspan fill="#ededf0">{escape(line[2:])}</tspan></text>')
         else:
-            rows.append(f'<text x="{PAD}" y="{y}" xml:space="preserve" fill="#a5b19e">{escape(line)}</text>')
+            rows.append(f'<text x="{PAD}" y="{y}" xml:space="preserve" fill="#98989f">{escape(line)}</text>')
     return f'''<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{height(lines)}" viewBox="0 0 {WIDTH} {height(lines)}" role="img" aria-labelledby="title">
 <title id="title">capturefab discovery, configuration, and capture commands against the built-in simulator</title>
-<rect width="{WIDTH}" height="{height(lines)}" rx="10" fill="#111612"/>
-<path d="M0 10a10 10 0 0 1 10-10h{WIDTH - 20}a10 10 0 0 1 10 10v{BAR - 10}h-{WIDTH}z" fill="#1b251a"/>
-<circle cx="24" cy="20" r="6" fill="#354030"/><circle cx="44" cy="20" r="6" fill="#354030"/><circle cx="64" cy="20" r="6" fill="#354030"/>
-<text x="{WIDTH // 2}" y="25" text-anchor="middle" fill="#a5b19e" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13">capturefab</text>
+<rect width="{WIDTH}" height="{height(lines)}" rx="12" fill="#1e1e20"/>
+<path d="M0 12a12 12 0 0 1 12-12h{WIDTH - 24}a12 12 0 0 1 12 12v{BAR - 12}h-{WIDTH}z" fill="#29292c"/>
+<circle cx="24" cy="20" r="6" fill="#3b3b40"/><circle cx="44" cy="20" r="6" fill="#3b3b40"/><circle cx="64" cy="20" r="6" fill="#3b3b40"/>
+<text x="{WIDTH // 2}" y="25" text-anchor="middle" fill="#98989f" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13">capturefab</text>
 <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="{FONT}">
 {chr(10).join(rows)}
 </g>

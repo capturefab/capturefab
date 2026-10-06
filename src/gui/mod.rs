@@ -3,6 +3,7 @@ mod destinations;
 mod gpu;
 mod icon;
 mod keys;
+mod prefs;
 mod preview;
 mod style;
 
@@ -12,7 +13,7 @@ use crate::{
     genicam::FeatureInfo,
     session::{SessionCommand, SessionHandle, SessionSnapshot},
     storage::StoragePolicy,
-    types::{MONO8, RGB8, TransportStats},
+    types::{CameraInfo, MONO8, RGB8, TransportStats},
 };
 use anyhow::Result;
 use destinations::Picker;
@@ -22,11 +23,12 @@ use iced::widget::{
     responsive, row, rule, scrollable, shader, slider, space, stack, text, text_input, tooltip,
 };
 use iced::{
-    Alignment, Color, Element, Fill, Length, Size, Subscription, Task, Theme, event, keyboard,
-    system, theme, time, window,
+    Alignment, Animation, Color, Element, Fill, Length, Size, Subscription, Task, Theme, event,
+    keyboard, system, theme, time, window,
 };
 use icon::{Icon, icon};
 use keys::{Action, Chord, Os};
+use prefs::{Prefs, Recent};
 use preview::Shown;
 use std::{
     cell::Cell,
@@ -50,6 +52,8 @@ const TOP: f32 = if cfg!(target_os = "macos") {
 const SIDEBAR: f32 = 240.0;
 const INSPECTOR: f32 = 316.0;
 const GUTTER: f32 = 28.0;
+const NOTICE_LIFE: Duration = Duration::from_secs(5);
+const NOTICE_FADE: Duration = Duration::from_millis(180);
 
 pub fn run(handle: SessionHandle, session_label: String, simulated: bool) -> Result<()> {
     run_capture(handle, session_label, simulated, None, 0)
@@ -92,6 +96,7 @@ pub fn run_capture(
             handle.clone(),
             session_label.clone(),
             simulated || capturing,
+            (!capturing).then(prefs::load),
         );
         if let Some(path) = &screenshot {
             let count = demo_cameras.clamp(1, 16);
@@ -114,13 +119,7 @@ pub fn run_capture(
                 );
             }
         } else {
-            app.send(
-                "Discovering cameras",
-                SessionCommand::Discover {
-                    timeout_ms: 700,
-                    simulated,
-                },
-            );
+            app.discover();
         }
         (app, system::theme().map(Message::SystemTheme))
     };
@@ -129,6 +128,8 @@ pub fn run_capture(
         .subscription(Workbench::subscription)
         .theme(Workbench::theme)
         .default_font(style::SANS)
+        .font(icon::REGULAR_BYTES)
+        .font(icon::FILL_BYTES)
         .antialiasing(true)
         .window(window::Settings {
             size: screenshot_size.unwrap_or(Size::new(1280.0, 840.0)),
@@ -166,6 +167,7 @@ struct ScreenshotRequest {
 struct Pending {
     label: String,
     receiver: Receiver<anyhow::Result<serde_json::Value>>,
+    target: Option<String>,
 }
 
 /// GPU slot of the single-camera view; camera tiles use their camera IDs.
@@ -179,14 +181,16 @@ struct CameraPreview {
     error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum Tab {
     Features,
     Capture,
     Forward,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum Appearance {
     System,
     Light,
@@ -244,6 +248,7 @@ enum Num {
 #[derive(Debug, Clone)]
 enum Message {
     Tick,
+    Frame,
     SystemTheme(theme::Mode),
     Key { chord: Chord, captured: bool },
     CycleAppearance,
@@ -251,7 +256,10 @@ enum Message {
     DragWindow,
     Discover,
     IncludeSimulator(bool),
+    TrySimulator,
+    EnterAddress,
     CameraRow(String),
+    Forget(String),
     Disconnect(String),
     Address(String),
     ConnectAddress,
@@ -361,41 +369,59 @@ struct Workbench {
     previews: HashMap<String, CameraPreview>,
     pending: Vec<Pending>,
     notice: Option<(String, bool, Instant)>,
+    recent: Vec<Recent>,
+    saved: Option<Prefs>,
+    prefs_changed: Option<Instant>,
+    now: Instant,
+    born: Instant,
+    sheet: Animation<bool>,
+    activity_slide: Animation<bool>,
+    histogram_slide: Animation<bool>,
+    shutter: Animation<bool>,
+    welcome: Animation<bool>,
 }
 
 impl Workbench {
-    fn new(handle: SessionHandle, session: String, simulated: bool) -> Self {
+    fn new(handle: SessionHandle, session: String, simulated: bool, saved: Option<Prefs>) -> Self {
+        let prefs = saved.clone().unwrap_or_default();
+        let defaults = Prefs::default();
+        let pick = |choices: &[Choice], value: &str, fallback: &str| {
+            find(choices, value)
+                .or_else(|| find(choices, fallback))
+                .map_or("", |choice| choice.value)
+        };
+        let now = Instant::now();
         Self {
             handle,
             session,
             snapshot: SessionSnapshot::default(),
             observed_camera: None,
-            include_simulator: simulated,
+            include_simulator: simulated || prefs.include_simulator,
             address: String::new(),
             search: String::new(),
-            tab: Tab::Features,
+            tab: prefs.tab,
             edits: HashMap::new(),
             edit_sources: HashMap::new(),
-            output: "capture.png".into(),
             capture_to: Picker::new(true, false),
             record_to: Picker::new(false, true),
-            count: 1,
-            format: "png",
-            timeout_ms: 5000,
-            forward_output: "rtsp://127.0.0.1:8554/capturefab".into(),
-            forward_codec: "h264",
-            forward_encoder: "auto".into(),
-            forward_fps: 30.0,
-            forward_bitrate: "4M".into(),
-            forward_file_mib: 512.0,
-            quota_gib: 10.0,
-            quota_files: 10_000,
-            retention_enabled: false,
-            retention_days: 7,
-            quota_action: "stop",
+            count: prefs.count,
+            format: pick(&FORMATS, &prefs.format, &defaults.format),
+            timeout_ms: prefs.timeout_ms,
+            forward_codec: pick(&CODECS, &prefs.forward_codec, &defaults.forward_codec),
+            forward_encoder: prefs.forward_encoder,
+            forward_fps: prefs.forward_fps,
+            forward_bitrate: prefs.forward_bitrate,
+            forward_file_mib: prefs.forward_file_mib,
+            quota_gib: prefs.quota_gib,
+            quota_files: prefs.quota_files,
+            retention_enabled: prefs.retention_enabled,
+            retention_days: prefs.retention_days,
+            quota_action: pick(&ON_FULL, &prefs.quota_action, &defaults.quota_action),
             schedule_enabled: false,
-            schedule_delay_seconds: 5,
-            schedule_interval_seconds: 60.0,
+            schedule_delay_seconds: prefs.schedule_delay_seconds,
+            schedule_interval_seconds: prefs.schedule_interval_seconds,
+            output: prefs.output,
+            forward_output: prefs.forward_output,
             drafts: HashMap::new(),
             balance: crate::auto::DEFAULT_BALANCE,
             balance_dragging: false,
@@ -406,7 +432,7 @@ impl Workbench {
             appearance: match std::env::var("CAPTUREFAB_APPEARANCE").as_deref() {
                 Ok("light") => Appearance::Light,
                 Ok("dark") => Appearance::Dark,
-                _ => Appearance::System,
+                _ => prefs.appearance,
             },
             screenshot: None,
             logs_open: false,
@@ -414,7 +440,7 @@ impl Workbench {
             fit: true,
             zoom: 1.0,
             stage: Cell::new(Size::new(800.0, 600.0)),
-            histogram_open: false,
+            histogram_open: prefs.histogram_open,
             focus_camera: false,
             histogram: [0; 64],
             shown: None,
@@ -425,7 +451,129 @@ impl Workbench {
             previews: HashMap::new(),
             pending: Vec::new(),
             notice: None,
+            recent: prefs.recent,
+            saved,
+            prefs_changed: None,
+            now,
+            born: now,
+            sheet: Animation::new(false).quick(),
+            activity_slide: Animation::new(false).quick(),
+            histogram_slide: Animation::new(prefs.histogram_open).quick(),
+            shutter: Animation::new(false).duration(Duration::from_millis(320)),
+            welcome: Animation::new(false).slow(),
         }
+    }
+
+    fn prefs(&self) -> Prefs {
+        Prefs {
+            appearance: self.appearance,
+            include_simulator: self.include_simulator,
+            tab: self.tab,
+            histogram_open: self.histogram_open,
+            output: self.output.clone(),
+            format: self.format.into(),
+            count: self.count,
+            timeout_ms: self.timeout_ms,
+            schedule_delay_seconds: self.schedule_delay_seconds,
+            schedule_interval_seconds: self.schedule_interval_seconds,
+            forward_output: self.forward_output.clone(),
+            forward_codec: self.forward_codec.into(),
+            forward_encoder: self.forward_encoder.clone(),
+            forward_fps: self.forward_fps,
+            forward_bitrate: self.forward_bitrate.clone(),
+            forward_file_mib: self.forward_file_mib,
+            quota_gib: self.quota_gib,
+            quota_files: self.quota_files,
+            retention_enabled: self.retention_enabled,
+            retention_days: self.retention_days,
+            quota_action: self.quota_action.into(),
+            recent: self.recent.clone(),
+        }
+    }
+
+    fn save_prefs(&mut self) {
+        let Some(saved) = &self.saved else {
+            return;
+        };
+        let prefs = self.prefs();
+        if &prefs == saved {
+            self.prefs_changed = None;
+            return;
+        }
+        let changed = *self.prefs_changed.get_or_insert(self.now);
+        if self.now.duration_since(changed) >= Duration::from_millis(600) {
+            self.prefs_changed = None;
+            self.saved = Some(prefs.clone());
+            std::thread::spawn(move || {
+                let _ = prefs::save(&prefs);
+            });
+        }
+    }
+
+    fn sheet_open(&self) -> bool {
+        self.help_open || self.capture_to.manager_open || self.record_to.manager_open
+    }
+
+    fn animating(&self) -> bool {
+        let fading = self.notice.as_ref().is_some_and(|(_, error, at)| {
+            let age = self.now.duration_since(*at);
+            age < NOTICE_FADE
+                || (!error && age > NOTICE_LIFE - NOTICE_FADE * 2 && age < NOTICE_LIFE)
+        });
+        fading
+            || [
+                &self.sheet,
+                &self.activity_slide,
+                &self.histogram_slide,
+                &self.shutter,
+                &self.welcome,
+            ]
+            .iter()
+            .any(|animation| animation.is_animating(self.now))
+    }
+
+    fn sync_animations(&mut self) {
+        let now = self.now;
+        let open = self.sheet_open();
+        if open != self.sheet.value() {
+            if open {
+                self.sheet.go_mut(true, now);
+            } else {
+                self.sheet = Animation::new(false).quick();
+            }
+        }
+        if self.logs_open != self.activity_slide.value() {
+            self.activity_slide.go_mut(self.logs_open, now);
+        }
+        if self.histogram_open != self.histogram_slide.value() {
+            self.histogram_slide.go_mut(self.histogram_open, now);
+        }
+        let welcome = self.snapshot.connected.is_none() && !self.overview();
+        if welcome != self.welcome.value() {
+            if welcome {
+                self.welcome.go_mut(true, now);
+            } else {
+                self.welcome = Animation::new(false).slow();
+            }
+        }
+    }
+
+    fn pulse(&self) -> f32 {
+        if self.screenshot.is_some() {
+            return 1.0;
+        }
+        let t = self.now.duration_since(self.born).as_secs_f32();
+        0.7 + 0.3 * (t * std::f32::consts::TAU / 1.8).cos()
+    }
+
+    fn notice_alpha(&self, at: Instant, error: bool) -> f32 {
+        let age = self.now.duration_since(at).as_secs_f32();
+        let fade = NOTICE_FADE.as_secs_f32();
+        let rise = (age / fade).min(1.0);
+        if error {
+            return rise;
+        }
+        rise.min(((NOTICE_LIFE.as_secs_f32() - age) / (fade * 2.0)).clamp(0.0, 1.0))
     }
 
     fn dark(&self) -> bool {
@@ -453,7 +601,13 @@ impl Workbench {
         } else {
             Duration::from_millis(300)
         };
+        let frames = if self.animating() {
+            window::frames().map(|_| Message::Frame)
+        } else {
+            Subscription::none()
+        };
         Subscription::batch([
+            frames,
             time::every(interval).map(|_| Message::Tick),
             event::listen_with(|event, status, _window| match event {
                 iced::Event::Keyboard(keyboard::Event::KeyPressed {
@@ -478,7 +632,11 @@ impl Workbench {
         match self.handle.submit(command) {
             Ok(receiver) => {
                 self.notice = None;
-                self.pending.push(Pending { label, receiver });
+                self.pending.push(Pending {
+                    label,
+                    receiver,
+                    target: None,
+                });
             }
             Err(err) => self.notice = Some((err.to_string(), true, Instant::now())),
         }
@@ -491,6 +649,7 @@ impl Workbench {
                 self.pending.push(Pending {
                     label: label.into(),
                     receiver,
+                    target: None,
                 });
             }
             Err(error) => self.notice = Some((error.to_string(), true, Instant::now())),
@@ -520,6 +679,9 @@ impl Workbench {
             match self.pending[i].receiver.try_recv() {
                 Ok(result) => {
                     let pending = self.pending.swap_remove(i);
+                    if let Ok(value) = &result {
+                        self.finished(&pending, value);
+                    }
                     self.notice = Some(match result {
                         Ok(_) => (format!("{} · done", pending.label), false, Instant::now()),
                         Err(err) => (format!("{}: {err:#}", pending.label), true, Instant::now()),
@@ -536,10 +698,42 @@ impl Workbench {
         if self
             .notice
             .as_ref()
-            .is_some_and(|(_, error, at)| !*error && at.elapsed() > Duration::from_secs(5))
+            .is_some_and(|(_, error, at)| !*error && at.elapsed() > NOTICE_LIFE)
         {
             self.notice = None;
         }
+    }
+
+    fn finished(&mut self, pending: &Pending, result: &serde_json::Value) {
+        if pending.label == "Saving capture" {
+            self.shutter = Animation::new(true)
+                .duration(Duration::from_millis(320))
+                .go(false, self.now);
+        }
+        let Some(target) = &pending.target else {
+            return;
+        };
+        if self.address.trim() == target {
+            self.address.clear();
+        }
+        let Ok(camera) = serde_json::from_value::<CameraInfo>(result["connected"].clone()) else {
+            return;
+        };
+        let detail = match &camera.address {
+            Some(address) => format!("{} · {}", camera.transport, redact_address(address)),
+            None => format!("{} · S/N {}", camera.transport, camera.serial),
+        };
+        let mut prefs = Prefs {
+            recent: std::mem::take(&mut self.recent),
+            ..Prefs::default()
+        };
+        prefs.remember(Recent {
+            target: target.clone(),
+            label: camera.model,
+            detail,
+            transport: camera.transport,
+        });
+        self.recent = prefs.recent;
     }
 
     fn tick(&mut self) -> Task<Message> {
@@ -590,6 +784,7 @@ impl Workbench {
         }
         self.capture_to.tick();
         self.record_to.tick();
+        self.save_prefs();
         self.screenshot_tick()
     }
 
@@ -682,10 +877,19 @@ impl Workbench {
         self.send(
             "Connecting camera",
             SessionCommand::Connect {
-                camera,
+                camera: camera.clone(),
                 timeout_ms: 5000,
             },
         );
+        if let Some(pending) = self.pending.last_mut() {
+            pending.target = Some(camera);
+        }
+    }
+
+    fn connecting(&self, id: &str) -> bool {
+        self.pending
+            .iter()
+            .any(|pending| pending.target.as_deref() == Some(id))
     }
 
     fn toggle_stream(&mut self) {
@@ -836,8 +1040,16 @@ impl Workbench {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        self.now = Instant::now();
+        let task = self.handle_message(message);
+        self.sync_animations();
+        task
+    }
+
+    fn handle_message(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => return self.tick(),
+            Message::Frame => {}
             Message::SystemTheme(mode) => self.system_dark = mode == theme::Mode::Dark,
             Message::Key { chord, captured } => return self.shortcut(chord, !captured),
             Message::CycleAppearance => {
@@ -850,7 +1062,16 @@ impl Workbench {
             Message::Help(open) => self.help_open = open,
             Message::DragWindow => return window::latest().and_then(window::drag),
             Message::Discover => self.discover(),
-            Message::IncludeSimulator(value) => self.include_simulator = value,
+            Message::IncludeSimulator(value) => {
+                self.include_simulator = value;
+                self.discover();
+            }
+            Message::TrySimulator => {
+                self.include_simulator = true;
+                self.connect("sim:0".into());
+            }
+            Message::EnterAddress => return focus_address(),
+            Message::Forget(target) => self.recent.retain(|recent| recent.target != target),
             Message::CameraRow(id) => {
                 if !self.snapshot.cameras.iter().any(|c| c.info.id == id) {
                     self.connect(id);
@@ -1141,12 +1362,7 @@ impl Workbench {
             // Sheets take the keyboard until they close.
             _ if modal => {}
             Action::Discover => self.discover(),
-            Action::ConnectAddress => {
-                return Task::batch([
-                    operation::focus("connect-address"),
-                    operation::select_all("connect-address"),
-                ]);
-            }
+            Action::ConnectAddress => return focus_address(),
             Action::NextCamera => self.select_relative_camera(1),
             Action::PreviousCamera => self.select_relative_camera(-1),
             Action::FocusCamera if self.overview() => self.focus_camera = true,
@@ -1266,8 +1482,9 @@ impl Workbench {
             self.inspector(p),
         ]
         .into();
+        let t = self.sheet.interpolate(0.0f32, 1.0, self.now);
         let body = if self.help_open {
-            modal(body, self.help(p), Message::Help(false))
+            modal(body, self.help(p), Message::Help(false), t)
         } else {
             body
         };
@@ -1276,6 +1493,7 @@ impl Workbench {
                 body,
                 self.capture_to.manager(dark).map(Message::CapturePicker),
                 Message::CapturePicker(destinations::Message::CloseManager),
+                t,
             )
         } else {
             body
@@ -1285,6 +1503,7 @@ impl Workbench {
                 body,
                 self.record_to.manager(dark).map(Message::RecordPicker),
                 Message::RecordPicker(destinations::Message::CloseManager),
+                t,
             )
         } else {
             body
@@ -1332,7 +1551,11 @@ impl Workbench {
                 button(icon(
                     Icon::Refresh,
                     14.0,
-                    if discovering { p.accent } else { p.secondary },
+                    if discovering {
+                        fade(p.accent, self.pulse())
+                    } else {
+                        p.secondary
+                    },
                 ))
                 .padding(5)
                 .style(style::plain)
@@ -1345,16 +1568,28 @@ impl Workbench {
         let mut list = column![].spacing(2);
         if devices.is_empty() {
             list = list.push(
-                column![
-                    text("No cameras yet").size(style::BODY).font(style::MEDIUM),
-                    text("Connect a camera, then discover. Include the simulator to explore without hardware.")
-                        .size(style::SMALL)
-                        .color(p.secondary),
-                ]
-                .spacing(4)
-                .padding([10, 10]),
+                container(
+                    text(if discovering {
+                        "Looking for cameras…"
+                    } else {
+                        "No cameras found"
+                    })
+                    .size(style::SMALL)
+                    .color(p.secondary),
+                )
+                .padding([8, 10]),
             );
         }
+        let recent: Vec<&Recent> = self
+            .recent
+            .iter()
+            .filter(|recent| {
+                !devices.iter().any(|device| {
+                    device.id == recent.target
+                        || device.address.as_deref() == Some(recent.target.as_str())
+                })
+            })
+            .collect();
         for camera in devices {
             let active = self.snapshot.active_camera.as_ref() == Some(&camera.id);
             let state = self
@@ -1362,14 +1597,22 @@ impl Workbench {
                 .cameras
                 .iter()
                 .find(|c| c.info.id == camera.id);
+            let connecting = self.connecting(&camera.id);
             let color = match state {
-                Some(state) if state.streaming => p.live,
+                Some(state) if state.streaming => fade(p.live, self.pulse()),
                 Some(_) => p.accent,
+                None if connecting => fade(p.accent, self.pulse()),
                 None => p.tertiary,
             };
-            let detail = match &camera.address {
-                Some(address) => format!("{} · {}", camera.transport, redact_address(address)),
-                None => format!("{} · S/N {}", camera.transport, camera.serial),
+            let detail = if connecting {
+                "Connecting…".to_string()
+            } else {
+                match &camera.address {
+                    Some(address) => {
+                        format!("{} · {}", camera.transport, redact_address(address))
+                    }
+                    None => format!("{} · S/N {}", camera.transport, camera.serial),
+                }
             };
             let mut line = row![
                 dot(color, 8.0),
@@ -1383,7 +1626,12 @@ impl Workbench {
                                 style::MEDIUM
                             })
                     ),
-                    clipped(text(detail).size(style::CAPTION).color(p.secondary)),
+                    clipped(
+                        text(detail)
+                            .size(style::CAPTION)
+                            .color(p.secondary)
+                            .wrapping(text::Wrapping::None)
+                    ),
                 ]
                 .spacing(1)
                 .width(Fill),
@@ -1397,12 +1645,14 @@ impl Workbench {
             };
             if state.is_some() {
                 line = line.push(tip(
-                    button(icon(Icon::Eject, 11.0, p.tertiary))
-                        .padding(5)
+                    button(icon(Icon::Eject, 13.0, p.tertiary))
+                        .padding(4)
                         .style(style::plain)
                         .on_press(Message::Disconnect(camera.id.clone())),
                     "Disconnect",
                 ));
+            } else if !connecting {
+                line = line.push(icon(Icon::Plug, 13.0, p.tertiary));
             }
             list = list.push(tip(
                 button(line)
@@ -1413,6 +1663,68 @@ impl Workbench {
                 hint,
             ));
         }
+        if !recent.is_empty() {
+            list = list.push(
+                container(
+                    text("Recent")
+                        .size(style::SMALL)
+                        .font(style::SEMIBOLD)
+                        .color(p.secondary),
+                )
+                .padding(iced::Padding {
+                    top: 14.0,
+                    right: 4.0,
+                    bottom: 4.0,
+                    left: 4.0,
+                }),
+            );
+        }
+        for entry in recent {
+            let connecting = self.connecting(&entry.target);
+            let line = row![
+                icon(
+                    Icon::Recent,
+                    13.0,
+                    if connecting {
+                        fade(p.accent, self.pulse())
+                    } else {
+                        p.tertiary
+                    }
+                ),
+                column![
+                    clipped(text(entry.label.clone()).size(style::BODY)),
+                    clipped(
+                        text(if connecting {
+                            "Connecting…".to_string()
+                        } else {
+                            entry.detail.clone()
+                        })
+                        .size(style::CAPTION)
+                        .color(p.secondary)
+                        .wrapping(text::Wrapping::None)
+                    ),
+                ]
+                .spacing(1)
+                .width(Fill),
+                tip(
+                    button(icon(Icon::Close, 11.0, p.tertiary))
+                        .padding(5)
+                        .style(style::plain)
+                        .on_press(Message::Forget(entry.target.clone())),
+                    "Forget",
+                ),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center);
+            list = list.push(tip(
+                button(line)
+                    .width(Fill)
+                    .padding([7, 10])
+                    .style(style::row(false))
+                    .on_press(Message::CameraRow(entry.target.clone())),
+                format!("Reconnect {}", entry.label),
+            ));
+        }
         let appearance = match self.appearance {
             Appearance::System => (Icon::Contrast, "Appearance: match system"),
             Appearance::Light => (Icon::Sun, "Appearance: light"),
@@ -1421,6 +1733,7 @@ impl Workbench {
         let footer = column![
             text_input("Add camera, IP or stream URL", &self.address)
                 .id("connect-address")
+                .icon(icon::input_icon(Icon::Plus))
                 .on_input(Message::Address)
                 .on_submit(Message::ConnectAddress)
                 .size(style::BODY)
@@ -1500,8 +1813,9 @@ impl Workbench {
             self.single_view(p)
         };
         let mut main = column![content];
-        if self.logs_open {
-            main = main.push(self.activity(p));
+        let activity = self.activity_slide.interpolate(0.0f32, 171.0, self.now);
+        if activity > 0.5 {
+            main = main.push(container(self.activity(p)).height(activity).clip(true));
         }
         main.push(self.toolbar(p)).into()
     }
@@ -1545,7 +1859,7 @@ impl Workbench {
         } else if connected {
             ("Ready", p.accent_text)
         } else {
-            ("Select a camera to begin", p.secondary)
+            ("No camera connected", p.secondary)
         };
         let mut subtitle = row![
             text(status)
@@ -1598,15 +1912,17 @@ impl Workbench {
                 Action::Overview.hint("Back to all cameras", Os::CURRENT),
             ));
         }
-        actions = actions.push(tip(
-            stream_button(
-                snapshot.streaming,
-                if snapshot.streaming { "Stop" } else { "Start" },
-                connected.then_some(Message::ToggleStream),
-                p,
-            ),
-            Action::ToggleStream.hint("Start or stop acquisition", Os::CURRENT),
-        ));
+        if connected {
+            actions = actions.push(tip(
+                stream_button(
+                    snapshot.streaming,
+                    if snapshot.streaming { "Stop" } else { "Start" },
+                    Some(Message::ToggleStream),
+                    p,
+                ),
+                Action::ToggleStream.hint("Start or stop acquisition", Os::CURRENT),
+            ));
+        }
         let title = snapshot
             .connected
             .as_ref()
@@ -1628,29 +1944,53 @@ impl Workbench {
                 }
                 layers.into()
             }
-            None => center(
-                column![
+            None if !connected => self.welcome(p),
+            None => {
+                let mut ready = column![
                     icon(Icon::Camera, 46.0, p.tertiary),
                     space().height(6),
-                    text(if connected {
-                        "Ready for your first frame"
+                    text(if snapshot.streaming {
+                        "Waiting for the first frame…"
                     } else {
-                        "Your camera, in focus"
+                        "Ready for your first frame"
                     })
                     .size(18)
                     .font(style::SEMIBOLD),
-                    text(if connected {
-                        "Start a stream or capture a frame"
-                    } else {
-                        "Discover and connect a camera in the sidebar"
-                    })
-                    .size(style::BODY)
-                    .color(p.secondary),
                 ]
                 .spacing(6)
-                .align_x(Alignment::Center),
-            )
-            .into(),
+                .align_x(Alignment::Center);
+                if !snapshot.streaming {
+                    ready = ready.push(space().height(8)).push(
+                        row![
+                            stream_button(false, "Start stream", Some(Message::ToggleStream), p),
+                            button(text("Capture one frame").size(style::BODY))
+                                .padding([7, 12])
+                                .style(style::link)
+                                .on_press_maybe(
+                                    (!self.pending("Saving capture")).then_some(Message::Capture)
+                                ),
+                        ]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                    );
+                }
+                center(ready).into()
+            }
+        };
+        let flash = self.shutter.interpolate(0.0f32, 0.55, self.now);
+        let stage: Element<'_, Message> = if flash > 0.0 {
+            stack![
+                stage,
+                container(space().width(Fill).height(Fill)).style(move |_| {
+                    container::Style::default().background(Color {
+                        a: flash,
+                        ..Color::WHITE
+                    })
+                }),
+            ]
+            .into()
+        } else {
+            stage
         };
         let os = Os::CURRENT;
         let zoom_actual = !self.fit && (self.zoom - 1.0).abs() < 0.01;
@@ -1714,20 +2054,30 @@ impl Workbench {
                 .height(Fill)
                 .clip(true)
                 .style(style::stage),
-            space().height(10),
-            controls,
         ];
-        if self.histogram_open && self.shown.is_some() {
-            content = content.push(space().height(8)).push(
-                iced::widget::canvas(preview::Histogram {
-                    bins: self.histogram,
-                    color: Color {
-                        a: 0.55,
-                        ..p.accent
-                    },
-                })
-                .width(Fill)
-                .height(44),
+        if self.shown.is_some() {
+            content = content.push(space().height(10)).push(controls);
+        }
+        let histogram = self.histogram_slide.interpolate(0.0f32, 52.0, self.now);
+        if histogram > 0.5 && self.shown.is_some() {
+            content = content.push(
+                container(
+                    column![
+                        space().height(8),
+                        iced::widget::canvas(preview::Histogram {
+                            bins: self.histogram,
+                            color: Color {
+                                a: 0.55,
+                                ..p.accent
+                            },
+                        })
+                        .width(Fill)
+                        .height(44),
+                    ]
+                    .height(52),
+                )
+                .height(histogram)
+                .clip(true),
             );
         }
         if let Some(error) = self.display_error.as_ref().or(snapshot.last_error.as_ref()) {
@@ -1746,6 +2096,202 @@ impl Workbench {
             })
             .height(Fill)
             .into()
+    }
+
+    fn welcome(&self, p: &'static Palette) -> Element<'_, Message> {
+        let t = self.welcome.interpolate(0.0f32, 1.0, self.now);
+        let discovering = self.pending("Discovering cameras");
+        let found: Vec<_> = self
+            .snapshot
+            .devices
+            .iter()
+            .filter(|device| {
+                !self
+                    .snapshot
+                    .cameras
+                    .iter()
+                    .any(|camera| camera.info.id == device.id)
+            })
+            .take(4)
+            .collect();
+        let recent: Vec<_> = self
+            .recent
+            .iter()
+            .filter(|recent| {
+                !self.snapshot.devices.iter().any(|device| {
+                    device.id == recent.target
+                        || device.address.as_deref() == Some(recent.target.as_str())
+                })
+            })
+            .take(4 - found.len())
+            .collect();
+        let subtitle = if discovering {
+            "Looking for GigE Vision and USB3 Vision cameras…".to_string()
+        } else if found.is_empty() {
+            "No cameras found yet. Try the simulator, or enter an address or stream URL.".into()
+        } else if found.len() == 1 {
+            "Found 1 camera. Click it to connect.".into()
+        } else {
+            format!("Found {} cameras. Click one to connect.", found.len())
+        };
+        let card = |kind: Icon, title: String, detail: String, target: String| {
+            let connecting = self.connecting(&target);
+            button(
+                row![
+                    icon(
+                        kind,
+                        20.0,
+                        fade(p.accent, t * if connecting { self.pulse() } else { 1.0 })
+                    ),
+                    column![
+                        clipped(
+                            text(title)
+                                .size(style::BODY)
+                                .font(style::MEDIUM)
+                                .color(fade(p.text, t))
+                        ),
+                        clipped(
+                            text(if connecting {
+                                "Connecting…".to_string()
+                            } else {
+                                detail
+                            })
+                            .size(style::CAPTION)
+                            .color(fade(p.secondary, t))
+                        ),
+                    ]
+                    .spacing(2)
+                    .width(Fill),
+                    icon(Icon::ChevronRight, 13.0, fade(p.tertiary, t)),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+            )
+            .width(Fill)
+            .padding([10, 14])
+            .style(style::card)
+            .on_press(Message::CameraRow(target))
+        };
+        let mut cards = column![].spacing(8).width(Fill);
+        for device in &found {
+            let detail = match &device.address {
+                Some(address) => format!("{} · {}", device.transport, redact_address(address)),
+                None => format!("{} · S/N {}", device.transport, device.serial),
+            };
+            cards = cards.push(card(
+                Icon::transport(device.transport),
+                device.model.clone(),
+                detail,
+                device.id.clone(),
+            ));
+        }
+        if !recent.is_empty() {
+            cards = cards.push(
+                container(
+                    text("Recent")
+                        .size(style::SMALL)
+                        .font(style::SEMIBOLD)
+                        .color(fade(p.secondary, t)),
+                )
+                .padding(iced::Padding {
+                    top: if found.is_empty() { 0.0 } else { 8.0 },
+                    left: 2.0,
+                    ..iced::Padding::ZERO
+                }),
+            );
+        }
+        for entry in &recent {
+            cards = cards.push(card(
+                Icon::transport(entry.transport),
+                entry.label.clone(),
+                entry.detail.clone(),
+                entry.target.clone(),
+            ));
+        }
+        let simulator_first = found.is_empty() && recent.is_empty() && !discovering;
+        let action = |kind: Icon, label: &'static str, on: Option<Message>, primary: bool| {
+            button(
+                row![
+                    icon(kind, 15.0, if primary { Color::WHITE } else { p.secondary }),
+                    text(label).size(style::BODY).font(style::MEDIUM),
+                ]
+                .spacing(7)
+                .align_y(Alignment::Center),
+            )
+            .padding([7, 12])
+            .style(if primary {
+                style::primary
+            } else {
+                style::secondary
+            })
+            .on_press_maybe(on)
+        };
+        let os = Os::CURRENT;
+        let actions = row![
+            tip(
+                action(
+                    Icon::Refresh,
+                    "Search again",
+                    (!discovering).then_some(Message::Discover),
+                    false
+                ),
+                Action::Discover.hint("Find GigE Vision and USB3 Vision devices", os),
+            ),
+            action(
+                Icon::Cube,
+                "Try a simulated camera",
+                (!self.connecting("sim:0")).then_some(Message::TrySimulator),
+                simulator_first,
+            ),
+            tip(
+                action(
+                    Icon::Plus,
+                    "Enter an address",
+                    Some(Message::EnterAddress),
+                    false
+                ),
+                Action::ConnectAddress.hint("IP address, RTSP, SRT or HTTP stream URL", os),
+            ),
+        ]
+        .spacing(8)
+        .wrap()
+        .vertical_spacing(8);
+        let mut content = column![
+            icon(Icon::Mark, 44.0, fade(p.accent, t)),
+            space().height(10),
+            text("Connect a camera")
+                .size(22)
+                .font(style::BOLD)
+                .color(fade(p.text, t)),
+            text(subtitle)
+                .size(style::BODY)
+                .color(fade(p.secondary, t))
+                .align_x(Alignment::Center),
+            space().height(14),
+        ]
+        .spacing(4)
+        .align_x(Alignment::Center)
+        .max_width(460);
+        if !found.is_empty() || !recent.is_empty() {
+            content = content.push(cards).push(space().height(14));
+        }
+        content = content.push(actions).push(space().height(18)).push(
+            text(format!(
+                "GigE cameras need an address on this computer's subnet. USB3 cameras need operating system access. {} opens the quick guide.",
+                Action::Help.shortcut(os)
+            ))
+            .size(style::CAPTION)
+            .color(fade(p.tertiary, t))
+            .align_x(Alignment::Center),
+        );
+        center(container(content).padding(iced::Padding {
+            top: 24.0 * (1.0 - t),
+            right: 24.0,
+            bottom: 0.0,
+            left: 24.0,
+        }))
+        .clip(true)
+        .into()
     }
 
     fn overview_view(&self, p: &'static Palette) -> Element<'_, Message> {
@@ -1880,7 +2426,14 @@ impl Workbench {
             ),
         );
         let mut title = row![
-            dot(if camera.streaming { p.live } else { p.tertiary }, 8.0),
+            dot(
+                if camera.streaming {
+                    fade(p.live, self.pulse())
+                } else {
+                    p.tertiary
+                },
+                8.0
+            ),
             clipped(
                 text(camera.info.model.clone())
                     .size(14)
@@ -2037,15 +2590,23 @@ impl Workbench {
             .on_press(Message::Tab(Tab::Capture)),
             Action::CaptureTab.hint("Where captures are saved", os),
         ));
-        let status: Element<'_, Message> = if let Some((message, error, _)) = &self.notice {
-            clipped(text(message.clone()).size(style::SMALL).color(if *error {
-                p.danger
-            } else {
-                p.secondary
-            }))
+        let status: Element<'_, Message> = if let Some((message, error, at)) = &self.notice {
+            let alpha = self.notice_alpha(*at, *error);
+            let color = fade(if *error { p.danger } else { p.secondary }, alpha);
+            row![
+                icon(
+                    if *error { Icon::Warning } else { Icon::Check },
+                    13.0,
+                    fade(if *error { p.danger } else { p.live }, alpha),
+                ),
+                clipped(text(message.clone()).size(style::SMALL).color(color)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .into()
         } else if let Some(pending) = self.pending.first() {
             row![
-                dot(p.accent, 6.0),
+                dot(fade(p.accent, self.pulse()), 6.0),
                 text(format!("{}…", pending.label))
                     .size(style::SMALL)
                     .color(p.secondary)
@@ -2231,6 +2792,7 @@ impl Workbench {
         content = content.push(
             text_input("Search features", &self.search)
                 .id("feature-search")
+                .icon(icon::input_icon(Icon::Search))
                 .on_input(Message::Search)
                 .size(style::BODY)
                 .padding([7, 10])
@@ -3030,6 +3592,7 @@ impl Workbench {
         let [cameras, acquisition, view, window] = Action::SECTIONS;
         let content = column![
             row![
+                icon(Icon::Keyboard, 24.0, p.accent),
                 text("Quick guide").size(22).font(style::BOLD),
                 space::horizontal(),
                 button(icon(Icon::Close, 14.0, p.secondary))
@@ -3037,6 +3600,7 @@ impl Workbench {
                     .style(style::plain)
                     .on_press(Message::Help(false)),
             ]
+            .spacing(10)
             .align_y(Alignment::Center),
             text("Discover a camera, connect, then start a stream. The simulator is available without camera hardware.")
                 .size(style::BODY)
@@ -3092,6 +3656,13 @@ fn num_valid(key: Num, text: &str) -> bool {
 // Small building blocks
 
 /// Tooltip in the workbench style.
+fn focus_address() -> Task<Message> {
+    Task::batch([
+        operation::focus("connect-address"),
+        operation::select_all("connect-address"),
+    ])
+}
+
 fn tip<'a, M: 'a>(content: impl Into<Element<'a, M>>, tip: impl ToString) -> Element<'a, M> {
     tooltip(
         content,
@@ -3123,6 +3694,13 @@ fn checkbox<'a, M: 'a>(
 /// Single-line text that is cut off at its container's edge.
 fn clipped<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Element<'a, M> {
     container(content).clip(true).into()
+}
+
+fn fade(color: Color, amount: f32) -> Color {
+    Color {
+        a: color.a * amount,
+        ..color
+    }
 }
 
 fn dot<'a, M: 'a>(color: Color, size: f32) -> Element<'a, M> {
@@ -3305,15 +3883,24 @@ fn last_frame<'a, M: 'a>() -> Element<'a, M> {
         .into()
 }
 
-/// `content` centered over a dimmed copy of `base`; clicking outside sends `on_blur`.
+/// `content` centered over a dimmed copy of `base`, rising in as `shown` goes
+/// from 0 to 1; clicking outside sends `on_blur`.
 fn modal<'a>(
     base: Element<'a, Message>,
     content: Element<'a, Message>,
     on_blur: Message,
+    shown: f32,
 ) -> Element<'a, Message> {
+    let sheet = container(opaque(content)).padding(iced::Padding {
+        top: 24.0 * (1.0 - shown),
+        ..iced::Padding::ZERO
+    });
     stack![
         base,
-        opaque(mouse_area(center(opaque(content)).style(style::scrim)).on_press(on_blur)),
+        opaque(
+            mouse_area(center(sheet).style(move |theme| style::scrim(theme, shown)))
+                .on_press(on_blur)
+        ),
     ]
     .into()
 }

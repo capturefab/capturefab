@@ -22,7 +22,7 @@ PAGE = '''<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <meta name="description" content="Published Capturefab builds with SHA-256 checksums, signatures, and corresponding source.">
-  <title>capturefab — downloads</title>
+  <title>Capturefab — Downloads</title>
   <link rel="stylesheet" href="style.css">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="canonical" href="{site}downloads.html">
@@ -32,22 +32,23 @@ PAGE = '''<!doctype html>
   <a class="skip-link" href="#main">Skip to content</a>
   <div class="shell">
     <header class="site-header">
-      <a class="wordmark" href="index.html" aria-label="Capturefab home"><span class="prompt" aria-hidden="true">&gt;_</span> capturefab</a>
+      <a class="wordmark" href="index.html" aria-label="Capturefab home"><svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#2f7bf5"/><circle cx="16" cy="16" r="8" fill="none" stroke="#fff" stroke-width="3"/><circle cx="16" cy="16" r="3" fill="#fff"/></svg>Capturefab</a>
       <nav aria-label="Main navigation">
+        <a href="index.html#features">Features</a>
         <a href="index.html#download">Download</a>
         <a href="index.html#quickstart">Quickstart</a>
-        <a href="index.html#automation">Agents</a>
-        <a href="https://github.com/capturefab/capturefab">Source <span aria-hidden="true">↗</span></a>
+        <a href="index.html#automation">Automate</a>
+        <a href="https://github.com/capturefab/capturefab">GitHub <span aria-hidden="true">↗</span></a>
       </nav>
     </header>
     <main id="main">
       <section class="hero" aria-labelledby="downloads-title">
-        <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> Releases <span class="separator">/</span> {status}</p>
+        <p class="eyebrow"><span class="pill"><span class="status-dot" aria-hidden="true"></span> Releases <span class="separator">/</span> {status}</span></p>
         <h1 id="downloads-title">All downloads.</h1>
-        <p class="lead">Every published build with its SHA-256 checksum. Desktop includes the GUI; headless is for servers, scripts, and devices without a display.</p>
+        <p class="lead">Every published build with its SHA-256 checksum. Desktop includes the GUI and the CLI; headless is for servers, scripts and devices without a display.</p>
       </section>
 {body}    </main>
-    <footer class="site-footer"><p><span class="prompt" aria-hidden="true">&gt;_</span> capturefab <span class="separator">/</span> MIT</p><div><a href="https://github.com/capturefab/capturefab">Source</a><a href="https://github.com/capturefab/capturefab/issues">Issues</a><a href="feed.xml">Releases / Atom</a><a href="agents.md">For agents</a></div></footer>
+    <footer class="site-footer"><p><svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#2f7bf5"/><circle cx="16" cy="16" r="8" fill="none" stroke="#fff" stroke-width="3"/><circle cx="16" cy="16" r="3" fill="#fff"/></svg>Capturefab · MIT license</p><div><a href="https://github.com/capturefab/capturefab">Source</a><a href="https://github.com/capturefab/capturefab/issues">Issues</a><a href="downloads.html">Downloads</a><a href="feed.xml">Releases feed</a><a href="agents.md">For agents</a></div></footer>
   </div>
 </body>
 </html>

@@ -526,14 +526,17 @@ impl Encoder {
 
     /// Initialize one render node with JPEG encoding.
     fn open_device(api: Api, path: &std::path::Path) -> Result<(Self, String)> {
-        use std::os::fd::AsRawFd;
         let device = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .context("cannot open")?;
+        #[cfg(unix)]
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&device);
+        #[cfg(not(unix))]
+        let fd = -1;
         // SAFETY: a valid DRM descriptor that outlives the display.
-        let display = unsafe { (api.get_display_drm)(device.as_raw_fd()) };
+        let display = unsafe { (api.get_display_drm)(fd) };
         ensure!(!display.is_null(), "no VA display");
         // From here the display is terminated by Drop on any failure.
         let mut encoder = Self {
