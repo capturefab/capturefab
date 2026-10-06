@@ -366,7 +366,9 @@ pub fn resolve_with(destination: &Destination, output: &str) -> Result<Resolved>
             && relative.is_relative()
             && !relative.components().any(|c| matches!(
                 c,
-                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                std::path::Component::ParentDir
+                    | std::path::Component::Prefix(_)
+                    | std::path::Component::RootDir
             )),
         "with a destination, the output is a name inside it (for example captures/run-1 or shot-{{frame}}.png), not {output}"
     );
