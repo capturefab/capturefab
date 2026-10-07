@@ -56,9 +56,9 @@ python3 scripts/test-site.py
 
 A release contains, per target, `capturefab-VERSION-OS-ARCH-{desktop,headless}` archives (`.tar.gz` on Linux, `.zip` elsewhere; macOS desktop adds `Capturefab.app`) and `capturefab-VERSION-OS-ARCH-media-sources.tar.gz`, plus `capturefab-VERSION-source.tar.gz` (the exact committed tree, all `Cargo.lock` dependency sources in `vendor/`, and an offline Cargo configuration), `releases.json`, `capturefab-VERSION-sbom.cdx.json` (a CycloneDX bill of materials: the Rust crates linked into any variant with their `Cargo.lock` checksums, and the pinned FFmpeg, x264, SRT, OpenSSL and GPU header versions with their source checksums), and `SHA256SUMS` covering every file. Assembly refuses uncommitted changes and missing or modified corresponding-source archives. The FFmpeg source archives must match the build recipe's pinned checksums, including enabled GPU headers. Each package holds `LICENSE`, `THIRD-PARTY-LICENSES.txt` (license texts of the Rust crates compiled into that executable), `media-licenses/` and the FFmpeg build manifest.
 
-## Optional signing and provenance
+## Signing and provenance
 
-Nothing is signed unless these repository secrets exist. Identities come only from the supplied credentials. The platform signing steps have not yet run with real credentials, so inspect the first signed draft before publishing it.
+Releases require Apple signing and notarization: without the `MACOS_CERTIFICATE_*` and `MACOS_NOTARY_*` secrets the Release workflow stops before building, because Gatekeeper blocks unsigned or unnotarized downloads ("cannot be verified" / "Apple could not verify"). Set the repository variable `CAPTUREFAB_ALLOW_UNSIGNED_MACOS=true` to release unsigned macOS builds anyway. Other signing is optional. Identities come only from the supplied credentials. The platform signing steps have not yet run with real credentials, so inspect the first signed draft before publishing it.
 
 | Secret | Effect |
 | --- | --- |
@@ -68,6 +68,29 @@ Nothing is signed unless these repository secrets exist. Identities come only fr
 | `RELEASE_GPG_PRIVATE_KEY`, `RELEASE_GPG_PASSPHRASE` | Detached OpenPGP signature `SHA256SUMS.asc`. Publish the public key separately |
 
 The workflow compiles and packages before importing any signing material; the signing pass uses `build --repackage` to verify and reuse each variant's existing archive without invoking a compiler. Rerunning a draft removes generated platform archives that are no longer available and an obsolete checksum signature, then uploads the newly verified files. Unrelated draft attachments are preserved. Platform signatures appear per artifact as `unsigned`, `apple-developer-id`, `apple-notarized` or `authenticode`.
+
+On macOS the signing pass signs the executable and `Capturefab.app` with the hardened runtime, a secure timestamp and the camera entitlement, verifies them with `codesign --verify --strict`, submits each archive to the notary service and fails unless the submission is `Accepted` (printing the notary log otherwise). The desktop app is then stapled and must pass `stapler validate` and `spctl --assess`, the same Gatekeeper check a downloaded copy faces, before the archive is rebuilt. A bare command-line executable cannot hold a stapled ticket, so Gatekeeper looks up its notarization online the first time it runs.
+
+### Setting up Apple signing
+
+Needs an Apple Developer Program membership; the Account Holder creates the certificate.
+
+1. In Keychain Access → Certificate Assistant → Request a Certificate From a Certificate Authority, save a CSR to disk. At [developer.apple.com → Certificates](https://developer.apple.com/account/resources/certificates/add) choose **Developer ID Application** (not Apple Development or Apple Distribution), upload the CSR and open the downloaded certificate so it joins your login keychain with its private key.
+2. Check it with `security find-identity -v -p codesigning`; it reads `Developer ID Application: NAME (TEAMID)`. In Keychain Access, export that identity (certificate with its key) as a `.p12` with a strong password.
+3. At [App Store Connect → Users and Access → Integrations → Team Keys](https://appstoreconnect.apple.com/access/integrations/api), create a key with the Developer role. Note its Key ID and the Issuer ID shown above the list, and download the `.p8` (it can be downloaded only once).
+4. As a repository admin, store the secrets and protect publishing:
+
+```sh
+base64 -i DeveloperID.p12 | gh secret set MACOS_CERTIFICATE_P12_BASE64 --repo capturefab/capturefab
+gh secret set MACOS_CERTIFICATE_PASSWORD --repo capturefab/capturefab        # prompts for the .p12 password
+gh secret set MACOS_NOTARY_KEY --repo capturefab/capturefab < AuthKey_KEYID.p8
+gh secret set MACOS_NOTARY_KEY_ID --repo capturefab/capturefab --body KEYID
+gh secret set MACOS_NOTARY_ISSUER --repo capturefab/capturefab --body ISSUER-UUID
+```
+
+Then add required reviewers to the `release` environment (Settings → Environments → release), or set the variable `CAPTUREFAB_AUTO_PUBLISH=true`. Without either, releases stay drafts and the site is not updated. Set `CAPTUREFAB_PUBLISH_SITE=true` and the `CLOUDFLARE_API_TOKEN` secret so the downloads page deploys after publishing.
+
+To check notarization locally before relying on CI: `xcrun notarytool store-credentials capturefab-notary --key AuthKey_KEYID.p8 --key-id KEYID --issuer ISSUER-UUID`, then run `release.py build` with `MACOS_SIGN_IDENTITY` set to the identity hash and `MACOS_NOTARY_PROFILE=capturefab-notary`. After downloading a release, `spctl --assess --type execute -vv Capturefab.app` should report `source=Notarized Developer ID`.
 
 Every release is attested by default: GitHub build provenance and an SBOM attestation (the CycloneDX file above) for every file in `SHA256SUMS`, verifiable with `gh attestation verify FILE --repo OWNER/REPO`, adding `--predicate-type https://cyclonedx.org/bom` for the SBOM. Dry runs are not attested. In a public repository the attestations, including the repository identity, are recorded in the public Sigstore transparency log; set the repository variable `CAPTUREFAB_ATTEST=false` to turn them off. Private repositories need a GitHub plan that supports attestations, or that variable.
 

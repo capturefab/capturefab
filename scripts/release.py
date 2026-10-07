@@ -358,6 +358,22 @@ def smoke(binary):
 
 def codesign(path, entitlements):
     run(['codesign', '--force', '--options', 'runtime', '--timestamp', '--entitlements', entitlements, '--sign', os.environ['MACOS_SIGN_IDENTITY'], path])
+    run(['codesign', '--verify', '--strict', '--deep', path])
+
+def notarize(path):
+    profile = ['--keychain-profile', os.environ['MACOS_NOTARY_PROFILE']]
+    # notarytool exits 0 for a finished but rejected submission; read its status.
+    result = json.loads(run(['xcrun', 'notarytool', 'submit', path, *profile, '--wait', '--output-format', 'json'], capture_output=True, text=True).stdout)
+    if result.get('status') != 'Accepted':
+        if result.get('id'):
+            subprocess.run(['xcrun', 'notarytool', 'log', result['id'], *profile])
+        raise RuntimeError(f'notarization of {Path(path).name} ended with status {result.get("status")!r}')
+
+def gatekeeper(app):
+    # spctl accepts a Developer ID app only when it is notarized, so this is
+    # the check a downloaded copy will face; stapler proves offline validity.
+    run(['xcrun', 'stapler', 'validate', app])
+    run(['spctl', '--assess', '--type', 'execute', '--verbose', app])
 
 def package(args, binary, variant):
     inspect_binary(binary, args.os, args.arch)
@@ -406,10 +422,12 @@ def package(args, binary, variant):
         path = output / (stem + ('.zip' if args.os in ['macos', 'windows'] else '.tar.gz'))
         archive_tree(stage, path, stem)
         if args.os == 'macos' and signed == 'apple-developer-id' and os.environ.get('MACOS_NOTARY_PROFILE'):
-            run(['xcrun', 'notarytool', 'submit', path, '--keychain-profile', os.environ['MACOS_NOTARY_PROFILE'], '--wait'])
+            notarize(path)
             # Staple the app, then recreate the archive with its ticket included.
+            # The bare executable cannot hold a ticket; Gatekeeper fetches it online.
             if variant == 'desktop':
                 run(['xcrun', 'stapler', 'staple', app.parent])
+                gatekeeper(app.parent)
                 archive_tree(stage, path, stem)
             signed = 'apple-notarized'
     return record(path, args.os, args.arch, variant, target=args.target, platform_signature=signed, validation='cross-compiled' if args.skip_smoke else 'native-smoke-passed')
