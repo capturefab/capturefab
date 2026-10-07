@@ -158,6 +158,24 @@ pub(super) fn transport_text(stats: &TransportStats) -> String {
     )
 }
 
+/// What a sparkline shows: `what` over its span, its range as `value`
+/// formats it, and the marked samples where `flagged` happened.
+pub(super) fn trend(
+    history: &super::sparkline::History,
+    what: &str,
+    value: impl Fn(f32) -> String,
+    flagged: &str,
+) -> String {
+    let mut about = format!("{what}, last {} s", history.seconds().max(1));
+    if let Some((lo, hi)) = history.range() {
+        about += &format!(": {} to {}", value(lo), value(hi));
+    }
+    match history.flagged() {
+        0 => about,
+        n => format!("{about}\nMarked: {flagged} ({n})"),
+    }
+}
+
 pub(super) fn number(value: f64) -> String {
     if value.fract() == 0.0 {
         format!("{value:.0}")
@@ -228,6 +246,23 @@ pub(super) fn redact_address(value: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn trends_name_their_span_range_and_marks() {
+        let start = Instant::now();
+        let mut history = super::super::sparkline::History::default();
+        history.offer(start, 30.0, 0);
+        history.offer(start + Duration::from_secs(2), 24.5, 3);
+        assert_eq!(
+            trend(
+                &history,
+                "Frame rate",
+                |v| format!("{v:.1} fps"),
+                "lost frames"
+            ),
+            "Frame rate, last 2 s: 24.5 fps to 30.0 fps\nMarked: lost frames (1)"
+        );
+    }
 
     #[test]
     fn auto_feature_grouping_and_text() {

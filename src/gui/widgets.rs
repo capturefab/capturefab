@@ -263,3 +263,29 @@ pub(super) fn modal<'a>(
     ]
     .into()
 }
+
+/// `history` as a sparkline of `width` × `height`, explained by `about` on
+/// hover; blank space of the same size until there is a line to draw.
+pub(super) fn spark<'a, M: 'a>(
+    history: Option<&'a sparkline::History>,
+    color: Color,
+    flag: Color,
+    size: (f32, f32),
+    about: impl Fn(&sparkline::History) -> String,
+) -> Element<'a, M> {
+    let (width, height) = size;
+    match history.filter(|history| history.ready()) {
+        Some(history) => tip(
+            iced::widget::canvas(sparkline::Sparkline {
+                history,
+                color,
+                flag,
+                floor: 1.0,
+            })
+            .width(width)
+            .height(height),
+            about(history),
+        ),
+        None => space().width(width).height(height).into(),
+    }
+}

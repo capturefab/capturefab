@@ -11,6 +11,7 @@ mod motion;
 mod prefs;
 mod preview;
 mod sidebar;
+mod sparkline;
 mod stage;
 mod style;
 mod toolbar;
@@ -468,6 +469,8 @@ struct Workbench {
     frame_id: Option<u64>,
     display_error: Option<String>,
     previews: HashMap<String, CameraPreview>,
+    /// Each streaming camera's recent frame rate, by camera id.
+    throughput: HashMap<String, sparkline::History>,
     pending: Vec<Pending>,
     notice: Option<(String, bool, Instant)>,
     recent: Vec<Recent>,
@@ -572,6 +575,7 @@ impl Workbench {
             frame_id: None,
             display_error: None,
             previews: HashMap::new(),
+            throughput: HashMap::new(),
             pending: Vec::new(),
             notice: None,
             recent: prefs.recent,
@@ -913,11 +917,39 @@ impl Workbench {
         {
             self.balance = status.balance;
         }
+        self.sample_throughput();
         self.update_frames();
         self.capture_to.tick();
         self.record_to.tick();
         self.save_prefs();
         self.screenshot_tick()
+    }
+
+    /// Add the newest frame rate of each streaming camera to its history,
+    /// flagging samples where frames were lost; stopping clears it.
+    fn sample_throughput(&mut self) {
+        let now = Instant::now();
+        let snapshot = &self.snapshot;
+        self.throughput.retain(|id, _| {
+            snapshot
+                .cameras
+                .iter()
+                .any(|camera| camera.streaming && &camera.info.id == id)
+        });
+        for camera in snapshot.cameras.iter().filter(|camera| camera.streaming) {
+            let lost = camera
+                .transport
+                .as_ref()
+                .map_or(camera.dropped, transport_loss);
+            // The rate reads zero until the worker has timed a few frames.
+            if camera.fps <= 0.0 && !self.throughput.contains_key(&camera.info.id) {
+                continue;
+            }
+            self.throughput
+                .entry(camera.info.id.clone())
+                .or_default()
+                .offer(now, camera.fps, lost);
+        }
     }
 
     fn update_frames(&mut self) {

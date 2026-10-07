@@ -5,6 +5,7 @@
 //! Disk scans, bucket checks and queue status run on background threads, so a
 //! slow network share or service never stalls the interface.
 use super::icon::{Icon, icon};
+use super::sparkline::History;
 use super::style::{self, Palette};
 use crate::destination::{self, Bucket, Credentials, Destination, Target};
 use crate::volumes::{self, Volume};
@@ -377,6 +378,8 @@ pub struct Picker {
     uploads_task: Option<Receiver<Option<Value>>>,
     #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     uploads_at: Option<Instant>,
+    /// Bytes waiting to upload, while any are.
+    backlog: History,
     editor: Option<Editor>,
     removing: Option<String>,
     pub manager_open: bool,
@@ -406,6 +409,8 @@ impl Picker {
             uploads: None,
             uploads_task: None,
             uploads_at: None,
+            // Status is read every two seconds or so; take every reading.
+            backlog: History::every(Duration::from_secs(1), Duration::from_secs(120)),
             editor: None,
             removing: None,
             manager_open: false,
@@ -476,6 +481,9 @@ impl Picker {
         if let Some(task) = &self.uploads_task
             && let Ok(status) = task.try_recv()
         {
+            if let Some(status) = &status {
+                self.sample_uploads(status);
+            }
             self.uploads = status;
             self.uploads_task = None;
         }
@@ -927,6 +935,23 @@ impl Picker {
         }
     }
 
+    /// Add the bytes waiting to upload to their history, flagging readings
+    /// where uploads failed; an empty queue clears it. The queue counts a
+    /// file only once it is fully sent, so this shows whether uploads keep
+    /// up rather than a transfer speed.
+    fn sample_uploads(&mut self, status: &Value) {
+        let count = |key: &str| status[key].as_u64().unwrap_or(0);
+        if count("pending") + count("uploading") == 0 {
+            self.backlog.clear();
+        } else {
+            self.backlog.offer(
+                Instant::now(),
+                count("waiting_bytes") as f64,
+                count("failures"),
+            );
+        }
+    }
+
     /// Waiting and failed uploads, with a retry button.
     fn upload_status<'a>(
         &'a self,
@@ -968,6 +993,33 @@ impl Picker {
             );
         }
         let mut lines = column![head].spacing(4);
+        if waiting > 0
+            && let Some(left) = self.backlog.last()
+        {
+            lines = lines.push(
+                row![
+                    super::spark(
+                        Some(&self.backlog),
+                        p.accent,
+                        p.danger,
+                        (140.0, 18.0),
+                        |history| {
+                            super::format::trend(
+                                history,
+                                "Waiting to upload, all buckets",
+                                |left| bytes(left as u64),
+                                "failed uploads",
+                            )
+                        },
+                    ),
+                    text(format!("{} to go", bytes(left as u64)))
+                        .size(style::CAPTION)
+                        .color(p.secondary),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
         if failed > 0
             && let Some(error) = items
                 .iter()

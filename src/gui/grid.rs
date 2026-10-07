@@ -1,6 +1,6 @@
 //! The multi-camera overview: every camera's image as large as the window
 //! allows, captioned over the picture, with actions on hover.
-use super::stage::status_pill;
+use super::stage::{fps_spark, status_pill};
 use super::*;
 use iced::widget::column;
 
@@ -30,6 +30,7 @@ impl Workbench {
         let status = status_pill(
             if streaming > 0 { "Streaming" } else { "Ready" },
             Some(format!("{streaming} of {}", snapshot.cameras.len())),
+            None,
             if streaming > 0 { p.live } else { p.accent_text },
             if streaming > 0 { self.pulse() } else { 1.0 },
         );
@@ -185,6 +186,14 @@ impl Workbench {
                     .size(style::SMALL)
                     .color(style::DARK.warn),
             );
+        }
+        if camera.streaming {
+            caption = caption.push(fps_spark(
+                self.throughput.get(id),
+                style::DARK.live,
+                style::DARK.warn,
+                (52.0, 14.0),
+            ));
         }
         caption = caption.push(
             text(format!("{:.1} fps", camera.fps))

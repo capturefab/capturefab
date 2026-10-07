@@ -7,6 +7,7 @@ use iced::widget::column;
 pub(super) fn status_pill<'a>(
     label: &'a str,
     figure: Option<String>,
+    chart: Option<Element<'a, Message>>,
     color: Color,
     pulse: f32,
 ) -> Element<'a, Message> {
@@ -16,6 +17,9 @@ pub(super) fn status_pill<'a>(
     ]
     .spacing(6)
     .align_y(Alignment::Center);
+    if let Some(chart) = chart {
+        content = content.push(chart);
+    }
     if let Some(figure) = figure {
         // A fixed slot, so a changing figure never shifts what follows.
         content = content.push(text(figure).size(style::SMALL).width(58));
@@ -24,6 +28,23 @@ pub(super) fn status_pill<'a>(
         .padding([3, 10])
         .style(style::pill(color))
         .into()
+}
+
+/// A camera's recent frame rate, with lost frames marked.
+pub(super) fn fps_spark<'a>(
+    history: Option<&'a sparkline::History>,
+    color: Color,
+    flag: Color,
+    size: (f32, f32),
+) -> Element<'a, Message> {
+    spark(history, color, flag, size, |history| {
+        trend(
+            history,
+            "Frame rate",
+            |fps| format!("{fps:.1} fps"),
+            "lost frames",
+        )
+    })
 }
 
 impl Workbench {
@@ -115,14 +136,19 @@ impl Workbench {
         let snapshot = &self.snapshot;
         let connected = snapshot.connected.is_some();
         let status = if snapshot.streaming {
+            let history = snapshot
+                .connected
+                .as_ref()
+                .and_then(|camera| self.throughput.get(&camera.id));
             Some(status_pill(
                 "Streaming",
                 Some(format!("{:.1} fps", snapshot.fps)),
+                Some(fps_spark(history, p.live, p.warn, (64.0, 14.0))),
                 p.live,
                 self.pulse(),
             ))
         } else if connected {
-            Some(status_pill("Ready", None, p.accent_text, 1.0))
+            Some(status_pill("Ready", None, None, p.accent_text, 1.0))
         } else {
             None
         };

@@ -60,6 +60,9 @@ struct Queue {
     uploaded: u64,
     #[serde(default)]
     uploaded_bytes: u64,
+    /// Times an upload has failed for good; retries don't lower it.
+    #[serde(default)]
+    failures: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
 }
@@ -171,6 +174,7 @@ pub fn status() -> Result<Value> {
             "waiting_bytes": waiting_bytes,
             "uploaded": queue.uploaded,
             "uploaded_bytes": queue.uploaded_bytes,
+            "failures": queue.failures,
             "last_error": queue.last_error,
             "uploader_running": active,
             "items": recent,
@@ -327,6 +331,7 @@ fn run() {
                             now() + (5u64 << entry.attempts.min(8)).min(MAX_BACKOFF);
                     } else {
                         entry.state = State::Failed;
+                        queue.failures += 1;
                     }
                     entry.error = Some(text.clone());
                     queue.last_error = Some(format!("{}: {text}", item.key));
