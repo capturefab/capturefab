@@ -4,7 +4,7 @@ use super::gpu::GpuFrames;
 use crate::types::Frame;
 use anyhow::Result;
 use iced::widget::{canvas, image, shader};
-use iced::{Color, Element, Fill, Point, Rectangle, Renderer, Size, Theme, mouse};
+use iced::{Element, Fill, Point, Rectangle, Renderer, Size, Theme, mouse};
 use std::sync::Arc;
 
 /// Space kept around a fitted image.
@@ -125,38 +125,6 @@ impl<Message> canvas::Program<Message> for Picture {
             placement(local, self.native, self.scale),
             canvas::Image::new(self.handle.clone()).filter_method(image::FilterMethod::Linear),
         );
-        vec![frame.into_geometry()]
-    }
-}
-
-/// Luminance histogram bars.
-pub struct Histogram {
-    pub bins: [u32; 64],
-    pub color: Color,
-}
-
-impl<Message> canvas::Program<Message> for Histogram {
-    type State = ();
-
-    fn draw(
-        &self,
-        _state: &(),
-        renderer: &Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<canvas::Geometry> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
-        let max = self.bins.iter().copied().max().unwrap_or(1).max(1) as f32;
-        let width = bounds.width / self.bins.len() as f32;
-        for (i, value) in self.bins.iter().enumerate() {
-            let height = *value as f32 / max * bounds.height;
-            frame.fill_rectangle(
-                Point::new(i as f32 * width, bounds.height - height),
-                Size::new((width - 1.0).max(0.5), height),
-                self.color,
-            );
-        }
         vec![frame.into_geometry()]
     }
 }

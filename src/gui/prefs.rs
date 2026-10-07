@@ -1,3 +1,4 @@
+use super::scopes::{DEFAULT_REGION, Metric};
 use super::{Appearance, Tab};
 use crate::types::Transport;
 use anyhow::Result;
@@ -16,7 +17,10 @@ pub struct Prefs {
     pub appearance: Appearance,
     pub include_simulator: bool,
     pub tab: Tab,
-    pub histogram_open: bool,
+    pub exposure_open: bool,
+    pub focus_open: bool,
+    pub focus_region: [f32; 4],
+    pub focus_metric: Metric,
     pub sidebar_open: bool,
     pub inspector_open: bool,
     pub output: String,
@@ -54,7 +58,10 @@ impl Default for Prefs {
             appearance: Appearance::System,
             include_simulator: false,
             tab: Tab::Features,
-            histogram_open: false,
+            exposure_open: true,
+            focus_open: false,
+            focus_region: DEFAULT_REGION,
+            focus_metric: Metric::default(),
             sidebar_open: true,
             inspector_open: true,
             output: "capture.png".into(),

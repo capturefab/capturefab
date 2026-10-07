@@ -10,6 +10,7 @@ mod keys;
 mod motion;
 mod prefs;
 mod preview;
+mod scopes;
 mod sidebar;
 mod sparkline;
 mod stage;
@@ -340,7 +341,10 @@ enum Message {
     Frame,
     FrameArrived,
     SystemTheme(theme::Mode),
-    Key { chord: Chord, captured: bool },
+    Key {
+        chord: Chord,
+        captured: bool,
+    },
     FocusNext(bool),
     CycleAppearance,
     Help(bool),
@@ -364,7 +368,12 @@ enum Message {
     Fit,
     Actual,
     Zoom(f32),
-    ToggleHistogram,
+    ToggleExposure,
+    ToggleFocusRegion,
+    /// The focus region, normalized to the frame.
+    FocusRegion(iced::Rectangle),
+    FocusMetric(scopes::Metric),
+    ResetFocusPeak,
     ToggleActivity,
     CopyLog,
     CopySessionCommand,
@@ -460,9 +469,11 @@ struct Workbench {
     /// Size of the preview stage at the last layout, so zooming from Fit
     /// starts where the image already is.
     stage: Cell<Size>,
-    histogram_open: bool,
+    exposure_open: bool,
     focus_camera: bool,
-    histogram: [u32; 64],
+    exposure: Option<frame::Exposure>,
+    /// The focus region and its scores.
+    focus: scopes::FocusMeter,
     shown: Option<Shown>,
     gpu: GpuFrames,
     frame_meta: Option<(u64, u32, u32, u32, u64)>,
@@ -480,7 +491,8 @@ struct Workbench {
     born: Instant,
     sheet: Animation<bool>,
     activity_slide: Animation<bool>,
-    histogram_slide: Animation<bool>,
+    exposure_slide: Animation<bool>,
+    focus_slide: Animation<bool>,
     shutter: Animation<bool>,
     welcome: Animation<bool>,
     sidebar_open: bool,
@@ -566,9 +578,14 @@ impl Workbench {
             fit: true,
             zoom: 1.0,
             stage: Cell::new(Size::new(800.0, 600.0)),
-            histogram_open: prefs.histogram_open,
+            exposure_open: prefs.exposure_open,
             focus_camera: false,
-            histogram: [0; 64],
+            exposure: None,
+            focus: scopes::FocusMeter::new(
+                prefs.focus_open,
+                prefs.focus_region,
+                prefs.focus_metric,
+            ),
             shown: None,
             gpu: GpuFrames::new(),
             frame_meta: None,
@@ -585,7 +602,8 @@ impl Workbench {
             born: now,
             sheet: motion::faded(false, motion::SHEET),
             activity_slide: motion::eased(prefs.logs_open, motion::SLIDE),
-            histogram_slide: motion::eased(prefs.histogram_open, motion::CONTROLS_IN),
+            exposure_slide: motion::eased(prefs.exposure_open, motion::CONTROLS_IN),
+            focus_slide: motion::eased(prefs.focus_open, motion::CONTROLS_IN),
             shutter: Animation::new(false).duration(motion::SHUTTER),
             welcome: motion::faded(false, motion::WELCOME),
             sidebar_open: prefs.sidebar_open,
@@ -612,7 +630,10 @@ impl Workbench {
             appearance: self.appearance,
             include_simulator: self.include_simulator,
             tab: self.tab,
-            histogram_open: self.histogram_open,
+            exposure_open: self.exposure_open,
+            focus_open: self.focus.open,
+            focus_region: self.focus.saved_region(),
+            focus_metric: self.focus.metric,
             sidebar_open: self.sidebar_open,
             inspector_open: self.inspector_open,
             output: self.output.clone(),
@@ -898,6 +919,8 @@ impl Workbench {
             self.shown = None;
             self.frame_meta = None;
             self.display_error = None;
+            self.exposure = None;
+            self.focus.reset();
             self.gpu.retire(MAIN_VIEW);
         }
         // Keep untouched editors in sync with CLI/agent changes without destroying drafts.
@@ -1021,27 +1044,48 @@ impl Workbench {
             frame.pixel_format,
             frame.timestamp_ns,
         );
-        let histogram = self
-            .histogram_open
-            .then(|| frame::sampled_histogram(&frame))
-            .transpose();
-        let shown = histogram.and_then(|histogram| {
-            preview::present(&self.gpu, &mut self.shown, MAIN_VIEW, frame, |frame| {
-                // Decode straight into RGBA bytes: one pass, one allocation.
-                let pixels = frame::convert(frame, |[r, g, b]| [r, g, b, 255])?;
-                Ok((frame.width, frame.height, pixels.into_flattened()))
-            })?;
-            Ok(histogram)
+        // Scores from a frame of another size or format are not comparable.
+        if self
+            .frame_meta
+            .is_some_and(|(_, width, height, format, _)| {
+                (width, height, format) != (meta.1, meta.2, meta.3)
+            })
+        {
+            self.focus.reset();
+        }
+        self.measure(&frame);
+        let shown = preview::present(&self.gpu, &mut self.shown, MAIN_VIEW, frame, |frame| {
+            // Decode straight into RGBA bytes: one pass, one allocation.
+            let pixels = frame::convert(frame, |[r, g, b]| [r, g, b, 255])?;
+            Ok((frame.width, frame.height, pixels.into_flattened()))
         });
         match shown {
-            Ok(histogram) => {
-                if let Some(histogram) = histogram {
-                    self.histogram = histogram;
-                }
+            Ok(()) => {
                 self.frame_meta = Some(meta);
                 self.display_error = None;
             }
             Err(err) => self.display_error = Some(err.to_string()),
+        }
+    }
+
+    /// Update the open scopes from `frame`. A frame they cannot measure
+    /// still shows; presenting it reports any real decoding problem.
+    fn measure(&mut self, frame: &crate::types::Frame) {
+        if self.exposure_open {
+            self.exposure = frame::exposure(frame).ok();
+        }
+        if self.focus.open
+            && let Ok(score) = frame::sharpness(frame, self.focus.pixels(frame.width, frame.height))
+        {
+            self.focus.record(score);
+        }
+    }
+
+    /// Measure the latest frame again after a scope changes, so a stopped
+    /// stream still shows current values.
+    fn remeasure(&mut self) {
+        if let Some(frame) = self.handle.latest_frame() {
+            self.measure(&frame);
         }
     }
 
@@ -1145,6 +1189,27 @@ impl Workbench {
         let next = (current as isize + step).rem_euclid(count as isize) as usize;
         let camera = self.snapshot.cameras[next].info.id.clone();
         self.send("Selecting camera", SessionCommand::Select { camera });
+    }
+
+    fn toggle_exposure(&mut self) {
+        self.exposure_open = !self.exposure_open;
+        if self.exposure_open
+            && let Some(frame) = self.handle.latest_frame()
+        {
+            self.exposure = frame::exposure(&frame).ok();
+        }
+    }
+
+    fn toggle_focus_region(&mut self) {
+        self.focus.open = !self.focus.open;
+        self.focus.reset();
+        if self.focus.open
+            && let Some(frame) = self.handle.latest_frame()
+            && let Ok(score) =
+                frame::sharpness(&frame, self.focus.pixels(frame.width, frame.height))
+        {
+            self.focus.record(score);
+        }
     }
 
     fn zoom_by(&mut self, factor: f32) {
@@ -1387,16 +1452,17 @@ impl Workbench {
                 self.zoom = 1.0;
             }
             Message::Zoom(factor) => self.zoom_by(factor),
-            Message::ToggleHistogram => {
-                self.histogram_open = !self.histogram_open;
-                if self.histogram_open
-                    && let Some(histogram) = self
-                        .handle
-                        .latest_frame()
-                        .and_then(|frame| frame::sampled_histogram(&frame).ok())
-                {
-                    self.histogram = histogram;
-                }
+            Message::ToggleExposure => self.toggle_exposure(),
+            Message::ToggleFocusRegion => self.toggle_focus_region(),
+            Message::FocusRegion(region) => {
+                self.focus.region = region;
+                self.focus.reset();
+                self.remeasure();
+            }
+            Message::FocusMetric(metric) => self.focus.metric = metric,
+            Message::ResetFocusPeak => {
+                self.focus.reset();
+                self.remeasure();
             }
             Message::ToggleActivity => self.logs_open = !self.logs_open,
             Message::CopyLog => {
@@ -1669,6 +1735,8 @@ impl Workbench {
             Action::Overview if self.image_mode => self.image_mode = false,
             Action::Overview if self.inspector_peek => self.inspector_peek = false,
             Action::ImageMode => self.image_mode = !self.image_mode,
+            Action::ToggleExposure => self.toggle_exposure(),
+            Action::ToggleFocusRegion => self.toggle_focus_region(),
             Action::Discover => self.discover(),
             Action::ConnectAddress => return focus_address(),
             Action::NextCamera => self.select_relative_camera(1),
