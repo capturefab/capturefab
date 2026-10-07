@@ -10,6 +10,7 @@ mod keys;
 mod motion;
 mod prefs;
 mod preview;
+mod refresh;
 mod scopes;
 mod sidebar;
 mod sparkline;
@@ -49,6 +50,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, TryRecvError},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -70,7 +72,10 @@ const SIDEBAR: f32 = 240.0;
 const TOOLBAR: f32 = 45.0;
 const INSPECTOR: f32 = 316.0;
 const GUTTER: f32 = 18.0;
+/// Longest wait between checks for a new camera frame.
 const FRAME_POLL: Duration = Duration::from_millis(2);
+/// Small overview tiles gain nothing from more than 30 redraws a second.
+const OVERVIEW_INTERVAL: Duration = Duration::from_micros(33_333);
 const NOTICE_LIFE: Duration = Duration::from_secs(5);
 const NOTICE_FADE: Duration = Duration::from_millis(180);
 
@@ -174,6 +179,7 @@ pub fn run_capture(
             Task::batch([
                 system::theme().map(Message::SystemTheme),
                 window::allow_automatic_tabbing(false),
+                screen_refresh(),
             ]),
         )
     };
@@ -210,38 +216,48 @@ pub fn run_capture(
 }
 
 /// The session whose shared frame rings the frame watcher polls, and the
-/// shortest gap between its signals. A window has one session, so only the gap
-/// is hashed: changing it restarts the watcher.
+/// shortest gap between its signals. A window has one session, and the gap is
+/// read live rather than hashed, so following the display never restarts the
+/// watcher.
 struct FrameWatch {
     handle: SessionHandle,
-    gap: Duration,
+    /// Nanoseconds; see `Workbench::frame_gap`.
+    gap: Arc<AtomicU64>,
 }
 
 impl std::hash::Hash for FrameWatch {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.gap.hash(state);
-    }
+    fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {}
 }
 
 /// Sends `FrameArrived` when any camera publishes a frame: at most once per
 /// gap, and not again until the workbench has taken the last one.
 fn watch_frames(watch: &FrameWatch) -> impl iced::futures::Stream<Item = Message> + use<> {
     let handle = watch.handle.clone();
-    let gap = watch.gap;
+    let gap = watch.gap.clone();
     iced::stream::channel(0, async move |mut output| {
         std::thread::spawn(move || {
             let mut seen = handle.frame_sequence();
             while !output.is_closed() {
-                std::thread::sleep(FRAME_POLL);
+                let gap = Duration::from_nanos(gap.load(Ordering::Relaxed));
+                // Finer checks at high refresh rates keep frames on their vsync.
+                let poll = (gap / 8).clamp(Duration::from_millis(1), FRAME_POLL);
+                std::thread::sleep(poll);
                 let sequence = handle.frame_sequence();
                 if sequence != seen && output.try_send(Message::FrameArrived).is_ok() {
                     seen = sequence;
-                    std::thread::sleep(gap.saturating_sub(FRAME_POLL));
+                    std::thread::sleep(gap.saturating_sub(poll));
                 }
             }
         });
         std::future::pending::<()>().await;
     })
+}
+
+/// Ask the platform for the refresh interval of the window's screen.
+fn screen_refresh() -> Task<Message> {
+    window::latest()
+        .and_then(|id| window::run(id, refresh::screen_period))
+        .map(Message::ScreenRefresh)
 }
 
 struct ScreenshotRequest {
@@ -338,8 +354,13 @@ enum Num {
 #[derive(Debug, Clone)]
 enum Message {
     Tick,
-    Frame,
+    /// A redraw paced by the display, at the given time.
+    Frame(Instant),
     FrameArrived,
+    /// The window opened, moved or changed scale, perhaps onto another display.
+    Displaced,
+    /// The refresh interval the window's screen reports, if any.
+    ScreenRefresh(Option<Duration>),
     SystemTheme(theme::Mode),
     Key {
         chord: Chord,
@@ -476,6 +497,9 @@ struct Workbench {
     focus: scopes::FocusMeter,
     shown: Option<Shown>,
     gpu: GpuFrames,
+    refresh: refresh::Refresh,
+    /// Nanoseconds between new-frame announcements, read by the frame watcher.
+    frame_gap: Arc<AtomicU64>,
     frame_meta: Option<(u64, u32, u32, u32, u64)>,
     frame_id: Option<u64>,
     display_error: Option<String>,
@@ -588,6 +612,8 @@ impl Workbench {
             ),
             shown: None,
             gpu: GpuFrames::new(),
+            refresh: refresh::Refresh::default(),
+            frame_gap: Arc::default(),
             frame_meta: None,
             frame_id: None,
             display_error: None,
@@ -721,18 +747,17 @@ impl Workbench {
         } else {
             Duration::from_millis(300)
         };
-        let frames = if self.animating() {
-            window::frames().map(|_| Message::Frame)
+        // Redraws also measure the display until its refresh rate is known.
+        let frames = if self.animating() || !self.refresh.calibrated() {
+            window::frames().map(Message::Frame)
         } else {
             Subscription::none()
         };
         let arrivals = if streaming {
-            // Small overview tiles gain nothing from more than 30 redraws a second.
-            let gap = Duration::from_millis(if self.overview() { 33 } else { 16 });
             Subscription::run_with(
                 FrameWatch {
                     handle: self.handle.clone(),
-                    gap,
+                    gap: self.frame_gap.clone(),
                 },
                 watch_frames,
             )
@@ -744,6 +769,11 @@ impl Workbench {
             arrivals,
             time::every(interval).map(|_| Message::Tick),
             event::listen_with(|event, status, _window| match event {
+                iced::Event::Window(
+                    window::Event::Opened { .. }
+                    | window::Event::Moved(_)
+                    | window::Event::Rescaled(_),
+                ) => Some(Message::Displaced),
                 iced::Event::Keyboard(keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Tab),
                     modifiers,
@@ -830,6 +860,20 @@ impl Workbench {
 
     fn lights(&self) -> f32 {
         if self.fullscreen { 0.0 } else { LIGHTS }
+    }
+
+    /// How long the frame watcher waits between announcing new frames: one
+    /// refresh, or the overview's slower interval, less a quarter refresh.
+    /// Sleep overshoot and polling would otherwise often land just after a
+    /// vsync and hold the frame for a whole extra refresh.
+    fn frame_gap(&self) -> Duration {
+        let period = self.refresh.period();
+        let interval = if self.overview() {
+            period.max(OVERVIEW_INTERVAL)
+        } else {
+            period
+        };
+        interval - period / 4
     }
 
     fn overview(&self) -> bool {
@@ -1000,16 +1044,13 @@ impl Workbench {
             kept
         });
         for camera in &snapshot.cameras {
-            let Some(id) = self.handle.latest_frame_id_for(&camera.info.id) else {
-                continue;
-            };
-            let preview = self.previews.entry(camera.info.id.clone()).or_default();
-            if preview.frame_id == Some(id) {
-                continue;
-            }
             let Some(frame) = self.handle.latest_frame_for(&camera.info.id) else {
                 continue;
             };
+            let preview = self.previews.entry(camera.info.id.clone()).or_default();
+            if preview.frame_id == Some(frame.id) {
+                continue;
+            }
             preview.frame_id = Some(frame.id);
             let meta = (frame.id, frame.width, frame.height, frame.pixel_format);
             let shown =
@@ -1027,15 +1068,12 @@ impl Workbench {
     }
 
     fn update_frame(&mut self) {
-        let Some(id) = self.handle.latest_frame_id() else {
-            return;
-        };
-        if Some(id) == self.frame_id {
-            return;
-        }
         let Some(frame) = self.handle.latest_frame() else {
             return;
         };
+        if Some(frame.id) == self.frame_id {
+            return;
+        }
         self.frame_id = Some(frame.id);
         let meta = (
             frame.id,
@@ -1292,13 +1330,20 @@ impl Workbench {
         self.now = Instant::now();
         let task = self.handle_message(message);
         self.sync_animations();
+        self.frame_gap
+            .store(self.frame_gap().as_nanos() as u64, Ordering::Relaxed);
         task
     }
 
     fn handle_message(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => return self.tick(),
-            Message::Frame => {}
+            Message::Frame(at) => self.refresh.redraw(at),
+            Message::Displaced => {
+                self.refresh.recalibrate();
+                return screen_refresh();
+            }
+            Message::ScreenRefresh(period) => self.refresh.report(period),
             Message::FrameArrived => self.update_frames(),
             Message::SystemTheme(mode) => self.system_dark = mode == theme::Mode::Dark,
             Message::Key { chord, captured } => return self.shortcut(chord, !captured),
@@ -2016,7 +2061,7 @@ mod tests {
     fn frame_watcher_stays_quiet_without_new_frames() {
         let watch = FrameWatch {
             handle: SessionHandle::new(),
-            gap: Duration::from_millis(16),
+            gap: Arc::new(AtomicU64::new(16_000_000)),
         };
         let mut frames = Box::pin(watch_frames(&watch));
         assert!(frames.next().now_or_never().is_none());

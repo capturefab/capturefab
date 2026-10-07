@@ -227,7 +227,9 @@ impl Backend for Simulator {
         }
         self.frame_id += 1;
         let period = (1.0 / self.f64(0x120)).max(self.f64(0x110) / 1e6);
-        self.next = Instant::now() + Duration::from_secs_f64(period);
+        // Keep to the frame clock, as a sensor does, instead of adding the time
+        // spent drawing; after a stall, restart it rather than catch up.
+        self.next = (self.next + Duration::from_secs_f64(period)).max(Instant::now());
         Ok(Frame {
             id: self.frame_id,
             width,

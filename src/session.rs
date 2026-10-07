@@ -502,17 +502,11 @@ impl SessionHandle {
         let id = self.inner.state.read().ok()?.active_camera.clone()?;
         self.latest_frame_for(&id)
     }
-    pub fn latest_frame_id(&self) -> Option<u64> {
-        self.latest_frame().map(|f| f.id)
-    }
     /// Newest frame from a camera's shared ring. Never waits for the worker's
     /// command pipe, so previews keep updating while commands run.
     pub fn latest_frame_for(&self, id: &str) -> Option<Arc<Frame>> {
         let feed = self.feed(id)?;
         locked(&feed).poll()
-    }
-    pub fn latest_frame_id_for(&self, id: &str) -> Option<u64> {
-        self.latest_frame_for(id).map(|f| f.id)
     }
     /// Changes whenever any camera publishes a frame. Reads each shared ring's
     /// sequence counter without copying pixels, so it is cheap to poll.
