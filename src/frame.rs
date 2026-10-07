@@ -331,17 +331,133 @@ fn pixel_at(frame: &Frame, x: usize, y: usize) -> [u8; 3] {
         _ => bayer_bounded(frame, bayer_pattern(frame.pixel_format), x, y),
     }
 }
-/// 64-bin luminance histogram over at most 65,536 evenly strided pixels,
-/// decoded individually so no full RGB image is needed.
-pub fn sampled_histogram(frame: &Frame) -> Result<[u32; 64]> {
+/// 8-bit luminance of an RGB pixel, with the weights the histograms use.
+fn luma([r, g, b]: [u8; 3]) -> usize {
+    (r as usize * 54 + g as usize * 183 + b as usize * 19) >> 8
+}
+
+/// A sample at or below this in every channel is crushed to black.
+const CRUSHED: u8 = 1;
+/// A sample at or above this in any channel is blown out.
+const BLOWN: u8 = 254;
+
+/// How a frame is exposed, from at most 65,536 evenly strided pixels decoded
+/// individually so no full RGB image is needed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Exposure {
+    /// 64-bin luminance histogram.
+    pub luma: [u32; 64],
+    /// Red, green and blue histograms; None for monochrome formats.
+    pub channels: Option<[[u32; 64]; 3]>,
+    /// Mean luminance, 0–1.
+    pub mean: f32,
+    /// Shares of samples crushed to black and blown out, 0–1.
+    pub shadows: f32,
+    pub highlights: f32,
+}
+
+pub fn exposure(frame: &Frame) -> Result<Exposure> {
     validated_bytes_per_pixel(frame)?;
     let (w, pixels) = (frame.width as usize, checked_pixels(frame)?);
-    let mut bins = [0; 64];
+    let mono = matches!(
+        frame.pixel_format,
+        MONO8 | 0x0110_0003 | 0x0110_0005 | 0x0110_0007
+    );
+    let (mut luma_bins, mut channels) = ([0; 64], [[0; 64]; 3]);
+    let (mut sum, mut samples, mut shadows, mut highlights) = (0u64, 0u32, 0u32, 0u32);
     for i in (0..pixels).step_by((pixels / 65_536).max(1)) {
-        let [r, g, b] = pixel_at(frame, i % w, i / w);
-        bins[(r as usize * 54 + g as usize * 183 + b as usize * 19) >> 10] += 1;
+        let rgb = pixel_at(frame, i % w, i / w);
+        let y = luma(rgb);
+        luma_bins[y >> 2] += 1;
+        for (bins, value) in channels.iter_mut().zip(rgb) {
+            bins[value as usize >> 2] += 1;
+        }
+        sum += y as u64;
+        samples += 1;
+        shadows += u32::from(rgb.iter().all(|&v| v <= CRUSHED));
+        highlights += u32::from(rgb.iter().any(|&v| v >= BLOWN));
     }
-    Ok(bins)
+    let share = |count: u32| count as f32 / samples.max(1) as f32;
+    Ok(Exposure {
+        luma: luma_bins,
+        channels: (!mono).then_some(channels),
+        mean: sum as f32 / samples.max(1) as f32 / 255.0,
+        shadows: share(shadows),
+        highlights: share(highlights),
+    })
+}
+
+/// How sharp a region is by four common focus measures, each larger when
+/// sharper, in 8-bit luminance units. Absolute values depend on the scene;
+/// compare them while focusing on one subject.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Sharpness {
+    /// Variance of the 4-neighbour Laplacian.
+    pub laplacian: f32,
+    /// Tenengrad: mean squared Sobel gradient magnitude.
+    pub tenengrad: f32,
+    /// Brenner: mean squared difference between pixels two apart.
+    pub brenner: f32,
+    /// Normalized variance: luminance variance over its mean.
+    pub variance: f32,
+}
+
+/// Sharpness of the `[x, y, width, height]` pixel region, clamped to the frame.
+/// At most 65,536 evenly spaced pixels are measured, each against its
+/// full-resolution neighbours, so fine detail still counts in large regions.
+pub fn sharpness(frame: &Frame, region: [u32; 4]) -> Result<Sharpness> {
+    validated_bytes_per_pixel(frame)?;
+    checked_pixels(frame)?;
+    let (w, h) = (frame.width, frame.height);
+    ensure!(w >= 3 && h >= 3, "frame is too small to measure sharpness");
+    // Keep a one-pixel border so every 3×3 neighbourhood is inside the frame.
+    let x0 = region[0].clamp(1, w - 2);
+    let y0 = region[1].clamp(1, h - 2);
+    let x1 = region[0].saturating_add(region[2]).clamp(x0 + 1, w - 1);
+    let y1 = region[1].saturating_add(region[3]).clamp(y0 + 1, h - 1);
+    let area = (x1 - x0) as f64 * (y1 - y0) as f64;
+    let step = (area / 65_536.0).sqrt().ceil().max(1.0) as usize;
+    let at = |x: usize, y: usize| luma(pixel_at(frame, x, y)) as f64;
+    let (mut n, mut lap, mut lap2, mut ten, mut bren, mut sum, mut sum2) =
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    // Shift each row and column of the sampling grid by a different phase
+    // within the stride, so periodic detail (a one-pixel checkerboard or
+    // stripes) is never sampled at only one of its phases.
+    let (x0, y0, x1, y1) = (x0 as usize, y0 as usize, x1 as usize, y1 as usize);
+    let grid = (0..(y1 - y0).div_ceil(step))
+        .flat_map(|row| (0..(x1 - x0).div_ceil(step)).map(move |column| (row, column)));
+    for (row, column) in grid {
+        let (x, y) = (
+            x0 + column * step + row % step,
+            y0 + row * step + column % step,
+        );
+        if x >= x1 || y >= y1 {
+            continue;
+        }
+        {
+            let [a, b, c] = [at(x - 1, y - 1), at(x, y - 1), at(x + 1, y - 1)];
+            let [d, e, f] = [at(x - 1, y), at(x, y), at(x + 1, y)];
+            let [g, k, i] = [at(x - 1, y + 1), at(x, y + 1), at(x + 1, y + 1)];
+            let laplacian = b + d + f + k - 4.0 * e;
+            let gx = (c + 2.0 * f + i) - (a + 2.0 * d + g);
+            let gy = (g + 2.0 * k + i) - (a + 2.0 * b + c);
+            n += 1.0;
+            lap += laplacian;
+            lap2 += laplacian * laplacian;
+            ten += gx * gx + gy * gy;
+            bren += ((f - d).powi(2) + (k - b).powi(2)) / 2.0;
+            sum += e;
+            sum2 += e * e;
+        }
+    }
+    let mean = sum / n;
+    let variance = (sum2 / n - mean * mean).max(0.0);
+    Ok(Sharpness {
+        laplacian: (lap2 / n - (lap / n).powi(2)).max(0.0) as f32,
+        tenengrad: (ten / n) as f32,
+        brenner: (bren / n) as f32,
+        variance: if mean > 0.0 { variance / mean } else { 0.0 } as f32,
+    })
 }
 pub fn preview_rgba(frame: &Frame, max_width: u32, max_height: u32) -> Result<(u32, u32, Vec<u8>)> {
     let (max_width, max_height) = (max_width.max(1), max_height.max(1));
@@ -748,12 +864,100 @@ mod tests {
                     bins[(p[0] as usize * 54 + p[1] as usize * 183 + p[2] as usize * 19) >> 10] +=
                         1;
                 }
-                assert_eq!(sampled_histogram(&frame).unwrap(), bins);
+                assert_eq!(exposure(&frame).unwrap().luma, bins);
             }
         }
         assert!(!convertible(0));
-        assert!(sampled_histogram(&f(0, vec![0; 6])).is_err());
-        assert!(sampled_histogram(&f(RGB8, vec![0; 5])).is_err());
+        assert!(exposure(&f(0, vec![0; 6])).is_err());
+        assert!(exposure(&f(RGB8, vec![0; 5])).is_err());
+    }
+    #[test]
+    fn exposure_reports_channels_clipping_and_mean() {
+        // Black, white, mid grey and pure red.
+        let frame = Frame {
+            width: 4,
+            ..f(RGB8, vec![0, 0, 0, 255, 255, 255, 128, 128, 128, 255, 0, 0])
+        };
+        let exposure = exposure(&frame).unwrap();
+        let channels = exposure.channels.unwrap();
+        assert_eq!(
+            (channels[0][63], channels[1][63], channels[2][0]),
+            (2, 1, 2)
+        );
+        assert_eq!((exposure.shadows, exposure.highlights), (0.25, 0.5));
+        // Luminance of black, white, grey and red.
+        let expected = (255 + 128 + ((255 * 54) >> 8)) as f32 / 4.0 / 255.0;
+        assert!((exposure.mean - expected).abs() < 1e-6);
+        let mono = super::exposure(&f(MONO8, vec![0, 255])).unwrap();
+        assert!(mono.channels.is_none());
+        assert_eq!((mono.shadows, mono.highlights), (0.5, 0.5));
+    }
+    #[test]
+    fn sharpness_prefers_crisp_detail_in_the_region() {
+        let (w, h) = (64u32, 48u32);
+        let image = |sharp: bool| Frame {
+            width: w,
+            height: h,
+            ..f(
+                MONO8,
+                (0..w * h)
+                    .map(|i| {
+                        let (x, y) = (i % w, i / w);
+                        let edge = |v: u32| match (sharp, v % 8) {
+                            (true, p) => {
+                                if p < 4 {
+                                    40
+                                } else {
+                                    220
+                                }
+                            }
+                            // The same pattern as a soft ramp.
+                            (false, p) => [130, 160, 190, 160, 130, 100, 70, 100][p as usize],
+                        };
+                        // Detail only on the left; the right half is flat.
+                        if x < w / 2 { edge(x + y) } else { 128 }
+                    })
+                    .collect(),
+            )
+        };
+        let left = [0, 0, w / 2, h];
+        let crisp = sharpness(&image(true), left).unwrap();
+        let soft = sharpness(&image(false), left).unwrap();
+        for (crisp, soft) in [
+            (crisp.laplacian, soft.laplacian),
+            (crisp.tenengrad, soft.tenengrad),
+            (crisp.brenner, soft.brenner),
+            (crisp.variance, soft.variance),
+        ] {
+            assert!(crisp > soft && soft > 0.0, "{crisp} > {soft}");
+        }
+        let flat = sharpness(&image(true), [w / 2 + 2, 0, w / 2, h]).unwrap();
+        assert_eq!(flat, Sharpness::default());
+        // Regions past the frame are clamped rather than rejected.
+        assert!(sharpness(&image(true), [u32::MAX, u32::MAX, 9, 9]).is_ok());
+        assert!(
+            sharpness(&image(true), [0, 0, u32::MAX, u32::MAX])
+                .unwrap()
+                .laplacian
+                > 0.0
+        );
+        assert!(sharpness(&f(MONO8, vec![0, 0]), [0, 0, 2, 1]).is_err());
+        // One-pixel detail over a region large enough for an even stride.
+        let (w, h) = (512u32, 512u32);
+        for pattern in [|x: u32, y: u32| (x + y) % 2, |_x: u32, y: u32| y % 2] {
+            let fine = Frame {
+                width: w,
+                height: h,
+                ..f(
+                    MONO8,
+                    (0..w * h)
+                        .map(|i| pattern(i % w, i / w) as u8 * 200)
+                        .collect(),
+                )
+            };
+            let score = sharpness(&fine, [0, 0, w, h]).unwrap();
+            assert!(score.laplacian > 0.0 && score.variance > 0.0, "{score:?}");
+        }
     }
     #[test]
     fn histogram_bins_sampled_luminance() {

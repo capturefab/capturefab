@@ -46,6 +46,8 @@ pub enum Icon {
     Sliders,
     CornersOut,
     CornersIn,
+    Scan,
+    Reset,
     /// The app mark: a rounded lens body.
     Mark,
 }
@@ -87,6 +89,8 @@ impl Icon {
             Icon::Sliders => (REGULAR, '\u{e434}'),
             Icon::CornersOut => (REGULAR, '\u{e1d0}'),
             Icon::CornersIn => (REGULAR, '\u{e1ce}'),
+            Icon::Scan => (REGULAR, '\u{ebb6}'),
+            Icon::Reset => (REGULAR, '\u{e038}'),
             Icon::Mark => (REGULAR, '\u{e00a}'),
         }
     }

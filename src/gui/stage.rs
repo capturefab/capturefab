@@ -1,5 +1,5 @@
 //! The single-camera stage: the title bar, the live image edge to edge with
-//! its controls, histogram and status floating over it, and the welcome screen.
+//! its controls, scopes and status floating over it, and the welcome screen.
 use super::*;
 use iced::widget::column;
 
@@ -170,7 +170,7 @@ impl Workbench {
             .map_or(String::new(), |camera| camera.model.clone());
         let header = self.title_bar(title, status, actions.into(), p);
         let body = match &self.shown {
-            Some(shown) => self.stage(shown, p),
+            Some(shown) => self.stage(shown),
             None if !connected => self.welcome(p),
             None => self.ready(p),
         };
@@ -178,7 +178,7 @@ impl Workbench {
     }
 
     /// The live image filling the stage, with what floats over it.
-    fn stage<'a>(&'a self, shown: &'a Shown, p: &'static Palette) -> Element<'a, Message> {
+    fn stage<'a>(&'a self, shown: &'a Shown) -> Element<'a, Message> {
         let snapshot = &self.snapshot;
         let image = responsive(move |size| {
             self.stage.set(size);
@@ -190,6 +190,9 @@ impl Workbench {
                 .height(Fill)
                 .style(style::stage)
         ];
+        if let Some(region) = self.focus_overlay(shown) {
+            layers = layers.push(region);
+        }
         let mut badges = row![].spacing(6).align_y(Alignment::Center);
         if !snapshot.streaming {
             badges = badges.push(last_frame());
@@ -212,28 +215,8 @@ impl Workbench {
             ));
         }
         layers = layers.push(container(badges).padding(12));
-        let histogram = self.histogram_slide.interpolate(0.0f32, 1.0, self.now);
-        if histogram > 0.01 {
-            layers = layers.push(
-                container(
-                    container(
-                        iced::widget::canvas(preview::Histogram {
-                            bins: self.histogram,
-                            color: Color {
-                                a: 0.7 * histogram,
-                                ..p.accent
-                            },
-                        })
-                        .width(220)
-                        .height(56),
-                    )
-                    .padding(10)
-                    .style(style::overlay(histogram)),
-                )
-                .align_right(Fill)
-                .align_top(Fill)
-                .padding(12),
-            );
+        if let Some(scopes) = self.scopes() {
+            layers = layers.push(scopes);
         }
         let controls = self.controls.interpolate(0.0f32, 1.0, self.now);
         if controls > 0.01 {
@@ -266,7 +249,7 @@ impl Workbench {
             .into()
     }
 
-    /// Zoom, histogram and image mode controls with the frame's details, on
+    /// Zoom, scope and image mode controls with the frame's details, on
     /// dark glass at the bottom of the stage; `shown` fades them.
     fn stage_controls(&self, shown: f32) -> Element<'_, Message> {
         let os = Os::CURRENT;
@@ -332,8 +315,12 @@ impl Workbench {
                 Action::ZoomIn.hint("Zoom in", os)
             ),
             tip(
-                glass(Icon::Chart, self.histogram_open, Message::ToggleHistogram),
-                "Luminance histogram"
+                glass(Icon::Chart, self.exposure_open, Message::ToggleExposure),
+                Action::ToggleExposure.hint("Exposure histogram", os)
+            ),
+            tip(
+                glass(Icon::Scan, self.focus.open, Message::ToggleFocusRegion),
+                Action::ToggleFocusRegion.hint("Focus region", os)
             ),
             space::horizontal(),
             clipped(

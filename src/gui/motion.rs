@@ -88,7 +88,8 @@ impl Workbench {
             || [
                 &self.sheet,
                 &self.activity_slide,
-                &self.histogram_slide,
+                &self.exposure_slide,
+                &self.focus_slide,
                 &self.shutter,
                 &self.welcome,
                 &self.sidebar_slide,
@@ -128,7 +129,8 @@ impl Workbench {
         let sidebar = self.sidebar_shown();
         let targets = [
             (self.logs_open, &mut self.activity_slide),
-            (self.histogram_open, &mut self.histogram_slide),
+            (self.exposure_open, &mut self.exposure_slide),
+            (self.focus.open, &mut self.focus_slide),
             (sidebar, &mut self.sidebar_slide),
             (!self.image_mode, &mut self.chrome),
         ];

@@ -233,6 +233,8 @@ pub enum Action {
     ToggleSidebar,
     ToggleInspector,
     ImageMode,
+    ToggleExposure,
+    ToggleFocusRegion,
     CopySessionCommand,
     Fullscreen,
     Help,
@@ -240,7 +242,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 25] = [
+    pub const ALL: [Action; 27] = [
         Action::Discover,
         Action::ConnectAddress,
         Action::NextCamera,
@@ -262,6 +264,8 @@ impl Action {
         Action::ToggleSidebar,
         Action::ToggleInspector,
         Action::ImageMode,
+        Action::ToggleExposure,
+        Action::ToggleFocusRegion,
         Action::CopySessionCommand,
         Action::Fullscreen,
         Action::Help,
@@ -303,6 +307,8 @@ impl Action {
                 Action::ToggleSidebar,
                 Action::ToggleInspector,
                 Action::ImageMode,
+                Action::ToggleExposure,
+                Action::ToggleFocusRegion,
                 Action::ToggleActivity,
                 Action::Fullscreen,
             ],
@@ -340,6 +346,8 @@ impl Action {
             Action::ToggleSidebar => "Show / hide camera list",
             Action::ToggleInspector => "Show / hide camera settings",
             Action::ImageMode => "Image only",
+            Action::ToggleExposure => "Show / hide exposure histogram",
+            Action::ToggleFocusRegion => "Show / hide focus region and scores",
             Action::CopySessionCommand => "Copy session CLI command",
             Action::Fullscreen => "Enter / exit full screen",
             Action::Help => "Keyboard shortcuts and help",
@@ -387,6 +395,8 @@ impl Action {
             Action::ToggleSidebar => vec![cmd('b')],
             Action::ToggleInspector => vec![cmd('i')],
             Action::ImageMode => vec![bare(Key::Char('f'))],
+            Action::ToggleExposure => vec![bare(Key::Char('h'))],
+            Action::ToggleFocusRegion => vec![bare(Key::Char('r'))],
             Action::CopySessionCommand => vec![with(cmd_shift, Key::Char('c'))],
             Action::Fullscreen if mac => vec![with(
                 Mods {
