@@ -290,6 +290,26 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(info['CFBundleIdentifier'], source['CFBundleIdentifier'])
             self.assertEqual((info['CFBundleShortVersionString'], info['CFBundlePackageType']), ('1.2.3', 'APPL'))
 
+    def test_notarization_requires_an_accepted_submission(self):
+        calls = []
+
+        def fake(args, **kwargs):
+            calls.append([str(x) for x in args])
+            return SimpleNamespace(returncode=0, stdout=json.dumps(dict(id='abc', status=status)))
+        with mock.patch.dict(os.environ, {'MACOS_NOTARY_PROFILE': 'profile'}), mock.patch.object(release.subprocess, 'run', side_effect=fake):
+            status = 'Accepted'
+            release.notarize(Path('app.zip'))
+            self.assertEqual(calls[-1][:3], ['xcrun', 'notarytool', 'submit'])
+            status = 'Invalid'
+            with self.assertRaisesRegex(RuntimeError, "status 'Invalid'"):
+                release.notarize(Path('app.zip'))
+            # The rejection log is printed for diagnosis.
+            self.assertEqual(calls[-1][:4], ['xcrun', 'notarytool', 'log', 'abc'])
+
+    def test_info_plist_explains_camera_and_local_network_access(self):
+        info = plistlib.loads((release.ROOT / 'assets' / 'Info.plist').read_bytes())
+        self.assertTrue(info['NSCameraUsageDescription'] and info['NSLocalNetworkUsageDescription'])
+
     def assemble_fixture(self, temp, **options):
         builds = temp / 'builds' / 'build-linux-x86_64'
         builds.mkdir(parents=True)

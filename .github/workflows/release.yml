@@ -67,6 +67,17 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           { echo "build=$build"; echo "release=$release"; echo "create_tag=$create_tag"; } >> "$GITHUB_OUTPUT"
+      - name: Require Apple signing and notarization for releases
+        if: steps.version.outputs.release == 'true' && vars.CAPTUREFAB_ALLOW_UNSIGNED_MACOS != 'true'
+        env:
+          MACOS_SIGNING: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' }}
+          MACOS_NOTARIZING: ${{ secrets.MACOS_NOTARY_KEY != '' && secrets.MACOS_NOTARY_KEY_ID != '' && secrets.MACOS_NOTARY_ISSUER != '' }}
+        run: |
+          # Unsigned or unnotarized macOS downloads are blocked by Gatekeeper.
+          if [ "$MACOS_SIGNING" != true ] || [ "$MACOS_NOTARIZING" != true ]; then
+            echo "::error::Releases need the MACOS_CERTIFICATE_* and MACOS_NOTARY_* secrets (docs/release.md). Set the repository variable CAPTUREFAB_ALLOW_UNSIGNED_MACOS=true to release unsigned macOS builds anyway."
+            exit 1
+          fi
 
   tag:
     name: Tag the release commit
@@ -89,7 +100,7 @@ jobs:
   build:
     name: Build ${{ matrix.os }} ${{ matrix.arch }}
     needs: [version, tag]
-    if: ${{ !cancelled() && needs.version.outputs.build == 'true' && needs.tag.result != 'failure' }}
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.version.outputs.build == 'true' && needs.tag.result != 'failure' }}
     permissions:
       contents: read
     strategy:
@@ -194,8 +205,8 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
           security list-keychains -d user -s "$keychain"
           security default-keychain -d user -s "$keychain"
-          identity=$(security find-identity -v -p codesigning "$keychain" | awk 'NR == 1 && length($2) == 40 {print $2}')
-          if [ -z "$identity" ]; then echo "::error::MACOS_CERTIFICATE_P12_BASE64 holds no valid code signing identity"; exit 1; fi
+          identity=$(security find-identity -v -p codesigning "$keychain" | awk '/"Developer ID Application: / && length($2) == 40 {print $2; exit}')
+          if [ -z "$identity" ]; then echo "::error::MACOS_CERTIFICATE_P12_BASE64 holds no valid Developer ID Application identity"; exit 1; fi
           echo "MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
           if [ -n "$MACOS_NOTARY_KEY" ]; then
             printf '%s' "$MACOS_NOTARY_KEY" > "$RUNNER_TEMP/notary.p8"
