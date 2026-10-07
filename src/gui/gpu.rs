@@ -1,8 +1,11 @@
 //! GPU presentation of camera frames.
 //!
 //! Frames are uploaded in their sensor layout as integer textures and decoded
-//! in a fragment shader that reproduces `frame::convert` bit for bit, followed
-//! by the bilinear filtering iced applies to its own images. The CPU only hands
+//! by a shader that reproduces `frame::convert` bit for bit, followed by the
+//! bilinear filtering iced applies to its own images. Bayer frames shown near
+//! full size are decoded once per frame into an 8-bit RGBA texture, so redraws
+//! at high refresh rates and during animations filter it instead of repeating
+//! the demosaic for every screen pixel; see `decode_once`. The CPU only hands
 //! sensor bytes to the driver: no demosaic, no RGBA expansion, and a quarter of
 //! the upload for 8-bit mono and Bayer. When iced falls back to its software
 //! renderer the shader never runs, `available` stays false, and the workbench
@@ -38,17 +41,33 @@ struct Varyings {
     @location(0) uv: vec2<f32>,
 };
 
+fn corner(index: u32) -> vec2<f32> {
+    return vec2<f32>(f32(index & 1u), f32(index >> 1u));
+}
+
+// Decode pass: covers the decoded texture, one fragment per sensor pixel.
+@vertex
+fn vs_decode(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    return vec4<f32>(corner(index) * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs_decode(@builtin(position) position: vec4<f32>) -> @location(0) vec4<u32> {
+    return vec4<u32>(decode(vec2<i32>(position.xy)), 255u);
+}
+
+// Drawing: the image rectangle on screen.
 @vertex
 fn vs(@builtin(vertex_index) index: u32) -> Varyings {
-    let corner = vec2<f32>(f32(index & 1u), f32(index >> 1u));
+    let c = corner(index);
     var out: Varyings;
     out.position = vec4<f32>(
-        mix(u.rect.x, u.rect.z, corner.x),
-        mix(u.rect.y, u.rect.w, corner.y),
+        mix(u.rect.x, u.rect.z, c.x),
+        mix(u.rect.y, u.rect.w, c.y),
         0.0,
         1.0,
     );
-    out.uv = corner;
+    out.uv = c;
     return out;
 }
 
@@ -99,26 +118,48 @@ fn linear(c: vec3<f32>) -> vec3<f32> {
     return select(pow((c + 0.055) / 1.055, vec3<f32>(2.4)), c / 12.92, c <= vec3<f32>(0.04045));
 }
 
-@fragment
-fn fs(in: Varyings) -> @location(0) vec4<f32> {
-    // Linear filtering with clamp-to-edge over decoded 8-bit pixels, as iced
-    // samples its own images.
-    let pos = in.uv * vec2<f32>(u.size) - 0.5;
+// One decoded pixel: from the decode pass, or decoded here when `direct`.
+fn pixel(p: vec2<i32>, direct: bool) -> vec3<f32> {
+    let q = clamp(p, vec2<i32>(0), u.size - vec2<i32>(1));
+    if (direct) {
+        return vec3<f32>(decode(q));
+    }
+    return vec3<f32>(textureLoad(frame, q, 0).rgb);
+}
+
+// Linear filtering with clamp-to-edge over decoded 8-bit pixels, as iced
+// samples its own images.
+fn filtered(uv: vec2<f32>, direct: bool) -> vec4<f32> {
+    let pos = uv * vec2<f32>(u.size) - 0.5;
     let base = floor(pos);
     let f = pos - base;
     let i0 = vec2<i32>(base);
-    let hi = u.size - vec2<i32>(1);
-    let c00 = vec3<f32>(decode(clamp(i0, vec2<i32>(0), hi)));
-    let c10 = vec3<f32>(decode(clamp(i0 + vec2<i32>(1, 0), vec2<i32>(0), hi)));
-    let c01 = vec3<f32>(decode(clamp(i0 + vec2<i32>(0, 1), vec2<i32>(0), hi)));
-    let c11 = vec3<f32>(decode(clamp(i0 + vec2<i32>(1, 1), vec2<i32>(0), hi)));
+    let c00 = pixel(i0, direct);
+    let c10 = pixel(i0 + vec2<i32>(1, 0), direct);
+    let c01 = pixel(i0 + vec2<i32>(0, 1), direct);
+    let c11 = pixel(i0 + vec2<i32>(1, 1), direct);
     var rgb = mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y) / 255.0;
     if (u.flags.x != 0) {
         rgb = linear(rgb);
     }
     return vec4<f32>(rgb, 1.0);
 }
+
+// Draws from the decode pass's texture.
+@fragment
+fn fs(in: Varyings) -> @location(0) vec4<f32> {
+    return filtered(in.uv, false);
+}
+
+// Draws from the sensor texture.
+@fragment
+fn fs_direct(in: Varyings) -> @location(0) vec4<f32> {
+    return filtered(in.uv, true);
+}
 "#;
+
+/// The shader's `kind` for Bayer mosaics.
+const BAYER: i32 = 3;
 
 /// How a pixel format is stored on the GPU and decoded by the shader.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -159,7 +200,7 @@ impl Layout {
             RGB8 => Some(packed(1)),
             0x0218_0015 => Some(packed(2)),
             0x0108_0008..=0x0108_000b => Some(Self {
-                kind: 3,
+                kind: BAYER,
                 cfa: crate::frame::bayer_pattern(pixel_format).map(|c| c as i32),
                 ..gray(wgpu::TextureFormat::R8Uint, 1, 0)
             }),
@@ -295,20 +336,99 @@ pub struct Primitive {
 }
 
 struct Slot {
+    /// Sensor bytes as uploaded.
     texture: wgpu::Texture,
     /// Allocated texture size and format.
     storage: (u32, u32, wgpu::TextureFormat),
     uniforms: wgpu::Buffer,
+    /// Reads the sensor texture, to draw directly or to decode.
     bind_group: wgpu::BindGroup,
+    /// The frame decoded once, while that is cheaper than per redraw.
+    decoded: Option<Decoded>,
+    /// The sensor texture holds a frame not yet decoded.
+    stale: bool,
+    /// Draw from `decoded` this frame.
+    once: bool,
     layout: Layout,
     size: (u32, u32),
 }
 
+/// A frame decoded to 8-bit RGB, one texel per pixel.
+struct Decoded {
+    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+}
+
+/// Format of the decoded texture: exact 8-bit values, filtered in the shader.
+const DECODED: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Uint;
+
+/// Whether to decode each frame once into a texture rather than per screen
+/// pixel on every redraw. Only the Bayer demosaic is worth it, at nine texel
+/// reads per decoded pixel against one to three for the other formats. Drawing
+/// directly decodes the four pixels each screen pixel filters, so decoding the
+/// whole frame instead pays off unless the image is shown at under half size
+/// each way, as in overview tiles of high-resolution cameras.
+fn decode_once(layout: Layout, size: (u32, u32), shown: f32) -> bool {
+    layout.kind == BAYER && f64::from(size.0) * f64::from(size.1) <= f64::from(shown) * 4.0
+}
+
+fn texture(
+    device: &wgpu::Device,
+    (width, height): (u32, u32),
+    format: wgpu::TextureFormat,
+    usage: wgpu::TextureUsages,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("capturefab frame"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | usage,
+        view_formats: &[],
+    })
+}
+
+fn bind(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    view: &wgpu::TextureView,
+    uniforms: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("capturefab frame"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: uniforms.as_entire_binding(),
+            },
+        ],
+    })
+}
+
 pub struct Pipeline {
+    /// Draws a decoded texture.
     pipeline: wgpu::RenderPipeline,
+    /// Draws a sensor texture, decoding as it goes.
+    direct: wgpu::RenderPipeline,
+    /// Decodes a sensor texture into a decoded one.
+    decode: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     srgb: bool,
     slots: HashMap<String, Slot>,
+    /// Lets tests check direct drawing of frames `decode_once` would cache.
+    #[cfg(test)]
+    direct_only: bool,
 }
 
 impl shader::Pipeline for Pipeline {
@@ -347,41 +467,50 @@ impl shader::Pipeline for Pipeline {
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("capturefab frame"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..wgpu::PrimitiveState::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+        let pipeline = |vs, fs, format| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("capturefab frame"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some(vs),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some(fs),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..wgpu::PrimitiveState::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let decode = pipeline("vs_decode", "fs_decode", DECODED);
+        let direct = pipeline("vs", "fs_direct", format);
+        let pipeline = pipeline("vs", "fs", format);
         MAX_SIDE.store(device.limits().max_texture_dimension_2d, Ordering::Relaxed);
         AVAILABLE.store(true, Ordering::Relaxed);
         Self {
             pipeline,
+            direct,
+            decode,
             bind_group_layout,
             srgb: format.is_srgb(),
             slots: HashMap::new(),
+            #[cfg(test)]
+            direct_only: false,
         }
     }
 }
@@ -395,7 +524,7 @@ impl shader::Primitive for Primitive {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         bounds: &Rectangle,
-        _viewport: &Viewport,
+        viewport: &Viewport,
     ) {
         let frame = {
             let mut shared = self.gpu.shared();
@@ -404,15 +533,26 @@ impl shader::Primitive for Primitive {
             }
             shared.pending.remove(&self.key)
         };
-        if let Some(frame) = frame
-            && let Err(error) = pipeline.upload(device, queue, &self.key, &frame)
-        {
-            eprintln!("capturefab: GPU preview upload failed: {error}");
-            pipeline.slots.remove(&self.key);
-        }
-        let Some(slot) = pipeline.slots.get(&self.key) else {
+        let uploaded = match frame.map(|frame| pipeline.upload(device, queue, &self.key, &frame)) {
+            Some(Ok(())) => true,
+            Some(Err(error)) => {
+                eprintln!("capturefab: GPU preview upload failed: {error}");
+                pipeline.slots.remove(&self.key);
+                false
+            }
+            None => false,
+        };
+        let Some(slot) = pipeline.slots.get_mut(&self.key) else {
             return;
         };
+        slot.stale |= uploaded;
+        let scale = viewport.scale_factor();
+        let shown = self.image.width * self.image.height * scale * scale;
+        slot.once = decode_once(slot.layout, slot.size, shown);
+        #[cfg(test)]
+        {
+            slot.once &= !pipeline.direct_only;
+        }
         // Clip space spans the widget: x right and y up, from -1 to 1.
         let x = |v: f32| (v - bounds.x) / bounds.width * 2.0 - 1.0;
         let y = |v: f32| 1.0 - (v - bounds.y) / bounds.height * 2.0;
@@ -431,12 +571,63 @@ impl shader::Primitive for Primitive {
             flags: [i32::from(pipeline.srgb), 0, 0, 0],
         };
         queue.write_buffer(&slot.uniforms, 0, bytemuck::bytes_of(&uniforms));
+        if !slot.once {
+            slot.decoded = None;
+            return;
+        }
+        if slot.decoded.is_none() {
+            let view = texture(
+                device,
+                slot.size,
+                DECODED,
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+            )
+            .create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = bind(device, &pipeline.bind_group_layout, &view, &slot.uniforms);
+            slot.decoded = Some(Decoded { view, bind_group });
+            slot.stale = true;
+        }
+        if let Some(decoded) = &slot.decoded
+            && slot.stale
+        {
+            // Redraws until the next frame only filter the result. Submitting
+            // here also flushes the texture and uniform writes first.
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("capturefab frame decode"),
+            });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("capturefab frame decode"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &decoded.view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&pipeline.decode);
+                pass.set_bind_group(0, &slot.bind_group, &[]);
+                pass.draw(0..4, 0..1);
+            }
+            queue.submit([encoder.finish()]);
+            slot.stale = false;
+        }
     }
 
     fn draw(&self, pipeline: &Pipeline, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
         if let Some(slot) = pipeline.slots.get(&self.key) {
-            render_pass.set_pipeline(&pipeline.pipeline);
-            render_pass.set_bind_group(0, &slot.bind_group, &[]);
+            let (draw, bind_group) = match &slot.decoded {
+                Some(decoded) if slot.once => (&pipeline.pipeline, &decoded.bind_group),
+                _ => (&pipeline.direct, &slot.bind_group),
+            };
+            render_pass.set_pipeline(draw);
+            render_pass.set_bind_group(0, bind_group, &[]);
             render_pass.draw(0..4, 0..1);
         }
         true
@@ -461,25 +652,18 @@ impl Pipeline {
             .get(..row as usize * height as usize)
             .ok_or("truncated frame")?;
         let storage = (width, height, layout.format);
+        let size = (frame.width, frame.height);
         if self
             .slots
             .get(key)
-            .is_none_or(|slot| slot.storage != storage)
+            .is_none_or(|slot| slot.storage != storage || slot.size != size)
         {
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("capturefab frame"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: layout.format,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
+            let texture = texture(
+                device,
+                (width, height),
+                layout.format,
+                wgpu::TextureUsages::COPY_DST,
+            );
             let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("capturefab frame uniforms"),
                 size: std::mem::size_of::<Uniforms>() as u64,
@@ -487,20 +671,7 @@ impl Pipeline {
                 mapped_at_creation: false,
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("capturefab frame"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: uniforms.as_entire_binding(),
-                    },
-                ],
-            });
+            let bind_group = bind(device, &self.bind_group_layout, &view, &uniforms);
             self.slots.insert(
                 key.to_owned(),
                 Slot {
@@ -508,14 +679,16 @@ impl Pipeline {
                     storage,
                     uniforms,
                     bind_group,
+                    decoded: None,
+                    stale: true,
+                    once: false,
                     layout,
-                    size: (frame.width, frame.height),
+                    size,
                 },
             );
         }
         let slot = self.slots.get_mut(key).ok_or("missing slot")?;
         slot.layout = layout;
-        slot.size = (frame.width, frame.height);
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &slot.texture,
@@ -567,6 +740,16 @@ mod tests {
     }
 
     #[test]
+    fn only_bayer_near_full_size_is_decoded_once() {
+        let bayer = Layout::of(0x0108_0009).unwrap();
+        let mono = Layout::of(MONO8).unwrap();
+        assert!(decode_once(bayer, (1920, 1080), 1920.0 * 1080.0));
+        assert!(decode_once(bayer, (1920, 1080), 960.0 * 540.0));
+        assert!(!decode_once(bayer, (4000, 3000), 320.0 * 240.0));
+        assert!(!decode_once(mono, (1920, 1080), 1920.0 * 1080.0));
+    }
+
+    #[test]
     fn shader_validates() {
         let module = naga::front::wgsl::parse_str(SHADER).expect("parse");
         naga::valid::Validator::new(
@@ -577,8 +760,9 @@ mod tests {
         .expect("validate");
     }
 
-    /// Renders every supported format through the real pipeline at 1:1 and
-    /// compares each pixel with `frame::convert`. Skipped without a GPU.
+    /// Renders every supported format through the real pipeline at 1:1, both
+    /// decoded once and directly, and compares each pixel with
+    /// `frame::convert`. Skipped without a GPU.
     #[test]
     fn gpu_decode_matches_cpu_conversion() {
         use futures::executor::block_on;
@@ -603,7 +787,7 @@ mod tests {
             seed ^= seed << 5;
             seed
         };
-        for (pixel_format, bytes_per_pixel, mask) in [
+        let formats = [
             (MONO8, 1, 0xff),
             (0x0110_0003, 2, 0x3ff),
             (0x0110_0005, 2, 0xfff),
@@ -614,7 +798,11 @@ mod tests {
             (0x0108_0009, 1, 0xff),
             (0x0108_000a, 1, 0xff),
             (0x0108_000b, 1, 0xff),
-        ] {
+        ];
+        let cases = [false, true]
+            .into_iter()
+            .flat_map(|direct_only| formats.map(|format| (direct_only, format)));
+        for (direct_only, (pixel_format, bytes_per_pixel, mask)) in cases {
             let samples = (width * height) as usize * if bytes_per_pixel == 3 { 3 } else { 1 };
             let data: Vec<u8> = (0..samples)
                 .flat_map(|_| {
@@ -646,7 +834,12 @@ mod tests {
                 image: bounds,
             };
             let viewport = Viewport::with_physical_size(iced::Size::new(width, height), 1.0);
+            pipeline.direct_only = direct_only;
             primitive.prepare(&mut pipeline, &device, &queue, &bounds, &viewport);
+            // A redraw without a new frame reuses the decoded texture.
+            primitive.prepare(&mut pipeline, &device, &queue, &bounds, &viewport);
+            let bayer = Layout::of(pixel_format).unwrap().kind == BAYER;
+            assert_eq!(pipeline.slots["test"].once, bayer && !direct_only);
             let target = device.create_texture(&wgpu::TextureDescriptor {
                 label: None,
                 size: wgpu::Extent3d {
@@ -721,7 +914,10 @@ mod tests {
                     }
                 }
             }
-            assert!(worst <= 1, "{pixel_format:#010x}: off by {worst}");
+            assert!(
+                worst <= 1,
+                "{pixel_format:#010x} (direct only: {direct_only}): off by {worst}"
+            );
         }
     }
 }
