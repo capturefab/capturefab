@@ -159,7 +159,7 @@ cargo test
 cargo clippy --all-features --all-targets -- -D warnings
 ```
 
-Source development builds can use `CAPTUREFAB_FFMPEG=/absolute/path/to/ffmpeg`. Release builds embed `CAPTUREFAB_FFMPEG_BINARY`, or the automatic path `target/ffmpeg/<target>/bin/ffmpeg[.exe]`. `CAPTUREFAB_FFMPEG_LICENSE` embeds the matching notice. The source build script pins and checksums FFmpeg, SRT, OpenSSL and x264, and includes source/license/build metadata with distributed binaries.
+The `jpeg` feature, enabled in both builds above, compiles libjpeg-turbo from source and needs a C compiler and CMake, plus NASM on x86 for its SIMD code. Source development builds can use `CAPTUREFAB_FFMPEG=/absolute/path/to/ffmpeg`. Release builds embed `CAPTUREFAB_FFMPEG_BINARY`, or the automatic path `target/ffmpeg/<target>/bin/ffmpeg[.exe]`. `CAPTUREFAB_FFMPEG_LICENSE` embeds the matching notice. The source build script pins and checksums FFmpeg, SRT, OpenSSL and x264, and includes source/license/build metadata with distributed binaries.
 
 The release tooling uses SemVer, a cross-platform build matrix, checksums, authenticated signing, actual rendered GUI and terminal screenshots, GitHub Releases and a static site on Cloudflare Workers with an Atom feed. Build tools are development dependencies; they are not runtime dependencies. Platform-specific signing credentials are optional configuration, not keys fabricated by this repository. See the release scripts and workflows for the exact configured build matrix.
 

@@ -6,13 +6,16 @@
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#1e1e20" media="(prefers-color-scheme: dark)">
-  <meta name="description" content="Capturefab is an open-source camera workbench: a native desktop app and a scriptable CLI in one binary for GigE Vision, USB3 Vision, webcams, ONVIF, RTSP and SRT cameras.">
-  <meta property="og:title" content="Capturefab — the camera workbench">
-  <meta property="og:description" content="Discover, configure, capture, record and automate machine vision cameras, webcams and network streams from one self-contained binary.">
+  <meta name="description" content="Capturefab is an open-source camera workbench for GigE Vision, USB3 Vision, ONVIF, RTSP, SRT and host cameras: a desktop app and a scriptable CLI in one self-contained binary, with no vendor SDK.">
+  <meta property="og:title" content="Capturefab, the camera workbench">
+  <meta property="og:description" content="Find, tune, capture, record and forward from industrial cameras, webcams and network streams. One binary runs the desktop app and the CLI.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://capturefab.com/">
   <meta property="og:image" content="https://capturefab.com/images/gui.png">
-  <title>Capturefab — the camera workbench</title>
+  <meta property="og:image:width" content="2560">
+  <meta property="og:image:height" content="1680">
+  <meta name="twitter:card" content="summary_large_image">
+  <title>Capturefab, the camera workbench</title>
   <link rel="stylesheet" href="style.css">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="canonical" href="https://capturefab.com/">
@@ -26,48 +29,91 @@
       <a class="wordmark" href="#" aria-label="Capturefab home"><svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#2f7bf5"/><circle cx="16" cy="16" r="8" fill="none" stroke="#fff" stroke-width="3"/><circle cx="16" cy="16" r="3" fill="#fff"/></svg>Capturefab</a>
       <nav aria-label="Main navigation">
         <a href="#features">Features</a>
+        <a href="#how">How it works</a>
         <a href="#download">Download</a>
         <a href="#quickstart">Quickstart</a>
         <a href="#automation">Automate</a>
-        <a href="https://github.com/capturefab/capturefab">GitHub <span aria-hidden="true">↗</span></a>
+        <a href="#faq">FAQ</a>
+        <a href="https://github.com/capturefab/capturefab">GitHub</a>
       </nav>
     </header>
     <main id="main">
       <section class="hero" aria-labelledby="hero-title">
-        <p class="eyebrow"><span class="pill"><span class="status-dot" aria-hidden="true"></span> Open source · MIT <span class="separator">/</span> <span id="release-version">source checkout</span></span></p>
-        <h1 id="hero-title">The camera workbench for machine vision, and every other camera.</h1>
-        <p class="lead">Discover, configure, capture and record from GigE Vision and USB3 Vision cameras, webcams and network streams. A native desktop app and a scriptable CLI in one self-contained binary, with no vendor SDK to install.</p>
-        <div class="actions">
-          <a class="button primary" href="#download">Download <span aria-hidden="true">↓</span></a>
-          <a class="button" href="#quickstart">Quickstart</a>
+        <div>
+          <h1 id="hero-title">A workbench for industrial cameras, webcams and streams</h1>
+          <p class="lead">Capturefab finds GigE Vision, USB3 Vision, ONVIF, RTSP, SRT and host cameras, shows their live GenICam features, and captures, records or forwards from them. One self-contained binary is both the desktop app and the CLI. No vendor SDK, no Aravis, no Python.</p>
+          <div class="actions">
+            <a class="button primary" href="#download">Download</a>
+            <a class="button" href="#quickstart">Read the quickstart</a>
+          </div>
+          <p class="hero-note">MIT licensed. Written in Rust. <a href="https://github.com/capturefab/capturefab">Source on GitHub</a>.</p>
         </div>
-        <ul class="capability-line" aria-label="Camera input families">
-          <li>GigE Vision</li><li>USB3 Vision</li><li>GenICam</li><li>ONVIF / RTSP</li><li>SRT</li><li>Webcams &amp; capture cards</li>
-        </ul>
+        <figure class="viewfinder">
+          <div class="pattern" role="img" aria-label="The simulator's test pattern: concentric rings over a checkerboard with a crosshair, shown as a live preview tile">
+            <div class="pattern-bar" aria-hidden="true"><span><span class="status-dot"></span>Pattern camera</span><span class="fps">22.5 fps</span></div>
+          </div>
+          <figcaption>The built-in simulator, <code>sim:0</code>, is the first camera most people open. Every command on this page works against it before a real camera is plugged in.</figcaption>
+        </figure>
       </section>
 
       <section class="showcase" aria-label="Capturefab desktop screenshot">
-        <figure><a href="images/gui.png" aria-label="Open full-size GUI screenshot"><img src="images/gui.png" alt="Capturefab desktop workbench with a camera sidebar, three simulated camera previews and a feature inspector" width="2560" height="1680"></a><figcaption>Three simulated cameras streaming side by side, with live GenICam features in the inspector.</figcaption></figure>
+        <figure><a href="images/gui.png" aria-label="Open the full-size screenshot"><img src="images/gui.png" alt="The Capturefab desktop app: a camera list on the left, three simulated camera previews streaming in the middle, and a feature inspector on the right showing exposure, gain, frame rate and pixel format" width="2560" height="1680" fetchpriority="high" decoding="async"></a><figcaption>Three simulated cameras streaming in one window. The inspector edits GenICam features live and shows which ones need the stream stopped first.</figcaption></figure>
       </section>
 
       <section id="features" class="section" aria-labelledby="features-title">
-        <div class="section-heading"><p class="eyebrow">Features</p><h2 id="features-title">Everything between the sensor and the file.</h2></div>
-        <p class="section-intro">The GigE Vision, USB3 Vision and GenICam stack is written in Rust. Webcams, streams, decoding and encoding use a bundled FFmpeg executable. Nothing else needs to be installed.</p>
-        <div class="feature-grid">
-          <article class="feature"><div class="feature-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="13" rx="3"/><circle cx="12" cy="12.5" r="3.5"/><path d="M8 6l1.5-2h5L16 6"/></svg></div><h3>Industrial cameras, natively</h3><p>GVCP/GVSP and U3V with live GenICam feature trees, packet resend and loss counters. No Aravis or vendor SDK.</p><code>capturefab discover</code></article>
-          <article class="feature"><div class="feature-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5a10 10 0 0 1 14 0M8 15.5a5.5 5.5 0 0 1 8 0"/><circle cx="12" cy="19" r="1"/></svg></div><h3>Webcams and streams</h3><p>Built-in and USB webcams, HDMI capture cards, ONVIF discovery, RTSP, SRT and video files.</p><code>capturefab native</code></article>
-          <article class="feature"><div class="feature-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></div><h3>Auto exposure and frame rate</h3><p>Opt-in per camera. Balance image quality against frame rate; it backs off on packet loss and can revert.</p><code>auto --balance 0.25</code></article>
-          <article class="feature"><div class="feature-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5M9 2h6"/></svg></div><h3>Capture now, later or on a schedule</h3><p>Delays, intervals and timelapses with explicit timezones. Jobs report progress and can be cancelled.</p><code>capture --interval 10s</code></article>
-          <article class="feature"><div class="feature-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="14" height="12" rx="3"/><path d="M16 10.5l6-3.5v10l-6-3.5"/></svg></div><h3>Record and forward</h3><p>Record MKV or MP4, or publish to MediaMTX, an NVR or SRT. Hardware encoders are probed before use, with a software fallback.</p><code>forward --encoder auto</code></article>
-          <article class="feature"><div class="feature-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 18a5 5 0 1 1 .8-9.9A6 6 0 0 1 19 10a4 4 0 0 1-1 8z"/><path d="M12 11v6M9.5 13.5L12 11l2.5 2.5"/></svg></div><h3>External drives and S3</h3><p>Save to folders, removable drives or S3-compatible buckets. Secrets stay in the OS keychain and objects are never replaced.</p><code>--destination archive</code></article>
-          <article class="feature"><div class="feature-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg></div><h3>Storage that can't run away</h3><p>A shared 10 GiB, 10,000-file budget by default. Existing files are never overwritten, and nothing is deleted without permission.</p><code>capturefab storage</code></article>
-          <article class="feature"><div class="feature-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></svg></div><h3>One process per camera</h3><p>Each camera runs in its own worker with a shared-memory frame ring, so one stalled camera never blocks another.</p><code>status --json</code></article>
+        <div class="section-heading"><h2 id="features-title">Everything between the sensor and the file</h2><p>The GigE Vision, USB3 Vision and GenICam stack is Capturefab's own Rust code. Webcams, network streams, decoding and encoding run through a bundled FFmpeg executable in its own process. Nothing else has to be installed.</p></div>
+        <div class="pillars">
+          <div class="pillar">
+            <h3>What it connects to</h3>
+            <dl>
+              <dt>GigE Vision</dt><dd>GVCP and GVSP with packet-size negotiation, packet resend and loss counters. Validated on Basler cameras.</dd>
+              <dt>USB3 Vision</dt><dd>U3V over the operating system's USB stack: USB permissions on Linux, IOKit on macOS, WinUSB on Windows. No kernel driver of its own.</dd>
+              <dt>GenICam</dt><dd>Plain or zipped XML parsed into a live feature tree, with bounds, selectors, converters and access modes evaluated against the camera.</dd>
+              <dt>ONVIF, RTSP and SRT</dt><dd>WS-Discovery, profile resolution and authenticated SOAP. Credentials are redacted in logs, status output and the UI.</dd>
+              <dt>Webcams and capture cards</dt><dd>AVFoundation on macOS, V4L2 on Linux and DirectShow on Windows, including HDMI capture devices for a mirrorless camera.</dd>
+              <dt>Video files</dt><dd>Any file FFmpeg can decode behaves like a camera, which makes pipelines testable without hardware.</dd>
+            </dl>
+          </div>
+          <div class="pillar">
+            <h3>What it does</h3>
+            <dl>
+              <dt>Capture</dt><dd>PNG, JPEG, raw, PGM or PPM frames now, after a delay, at a fixed time or on an interval. Schedules use explicit time zones and report progress.</dd>
+              <dt>Auto exposure and frame rate</dt><dd>Opt in per camera and pick a balance between image quality and frame rate. It prefers the camera's own auto functions, backs off on packet loss and can revert every change.</dd>
+              <dt>Record</dt><dd>MKV, MP4, TS or WebM through a bounded writer with a per-file size limit.</dd>
+              <dt>Forward</dt><dd>Publish to MediaMTX, an NVR or any RTSP, SRT, RTMP or UDP endpoint. Hardware encoders are probed before use, with a software fallback.</dd>
+              <dt>Save anywhere</dt><dd>Named folders, external drives and S3-compatible buckets, with a persistent upload queue that retries.</dd>
+              <dt>Many cameras at once</dt><dd>Sixteen cameras in one session by default, each streaming in its own process, in the app or headless.</dd>
+            </dl>
+          </div>
+          <div class="pillar">
+            <h3>What it promises</h3>
+            <dl>
+              <dt>Never overwrites</dt><dd>An existing output file or bucket object is never replaced. A name collision is an error, not a silent loss.</dd>
+              <dt>Bounded storage</dt><dd>Captures and recordings share a budget, 10 GiB and 10,000 files by default. When it is full, Capturefab stops and says so instead of deleting anything.</dd>
+              <dt>Secrets stay out of files</dt><dd>Bucket credentials live in the OS keychain or the AWS credential chain. Stream URLs are redacted in logs, status and the UI.</dd>
+              <dt>Isolation per camera</dt><dd>A stalled or crashing camera cannot take another camera, the app or your script down with it.</dd>
+              <dt>Nothing phones home</dt><dd>No telemetry, no update checks, and this site runs no analytics.</dd>
+              <dt>Honest support claims</dt><dd>Hardware support is only claimed after a real test, and the <a href="https://github.com/capturefab/capturefab/blob/main/docs/hardware-validation.md">record is public</a>.</dd>
+            </dl>
+          </div>
         </div>
       </section>
 
+      <section id="how" class="section" aria-labelledby="how-title">
+        <div class="section-heading"><h2 id="how-title">How it works</h2><p>Every camera gets its own operating-system process. Commands travel over a small pipe; frames never do.</p></div>
+        <div class="flow">
+          <div class="node"><strong>Desktop app, CLI, scripts and agents</strong>All of them send the same commands. A script can attach to the window you already have open through a local, token-authenticated session, so you watch what it does.</div>
+          <div class="arrow" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
+          <div class="node"><strong>Coordinator</strong>Owns one child process per connected camera and talks to each one with newline-delimited JSON over its stdin and stdout.</div>
+          <div class="arrow" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
+          <div class="node"><strong>One worker process per camera</strong>Exclusively owns the transport, the GenICam feature tree, scheduled jobs and forwarding.<ul><li>GigE and USB3 Vision are handled in Rust, in this process.</li><li>Webcams, streams and encoders run in a bundled FFmpeg process beside it.</li></ul></div>
+        </div>
+        <div class="ring"><span class="slots" aria-hidden="true"><i></i><i></i><i></i></span><span><strong>Shared-memory frame ring.</strong> Each worker writes frames into a three-slot ring that the app and CLI read directly. The newest frame always wins, so a slow consumer never builds up a backlog.</span></div>
+        <p class="flow-note">A headless session (<code>capturefab serve --name bench</code>) is the same thing without the window. Captures and recordings from any process go through one locked storage ledger, which is how the budget and the never-overwrite rule hold across processes.</p>
+      </section>
+
       <section id="download" class="section" aria-labelledby="download-title">
-        <div class="section-heading"><p class="eyebrow">Download</p><h2 id="download-title">One file. No installer.</h2></div>
-        <p class="section-intro">Pick the computer that will run Capturefab. Desktop includes the GUI and the CLI; headless is for servers, scripts and devices without a display.</p>
+        <div class="section-heading"><h2 id="download-title">Download</h2><p>One file per platform. No installer, no runtime, no SDK. Desktop builds include the app and the CLI; headless builds are the CLI alone, for servers and devices without a display. Latest release: <span id="release-version">checking</span>.</p></div>
         <div class="download-card">
           <form class="platform-form" aria-label="Select a download">
             <label>Operating system<select id="os-select" name="os"><option value="">Choose OS</option><option value="macos">macOS</option><option value="windows">Windows</option><option value="linux">Linux</option></select></label>
@@ -77,78 +123,123 @@
           <p class="platform-hint" id="platform-hint">Apple silicon Macs use ARM64; Intel Macs use x64. Raspberry Pi and Jetson with a 64-bit OS use Linux ARM64.</p>
           <div class="download-result" aria-live="polite" aria-atomic="true">
             <div><p class="result-label" id="download-label">Published downloads</p><p id="download-description">The release manifest is loading.</p><p class="asset-detail" id="asset-detail" hidden></p></div>
-            <a id="primary-download" class="button primary" hidden>Download <span aria-hidden="true">↓</span></a>
+            <a id="primary-download" class="button primary" hidden>Download</a>
           </div>
           <div id="verify-box" class="verify-box" hidden>
-            <p>Verify the downloaded file.</p><pre><code id="verify-command"></code></pre>
+            <p>Verify the file before you run it.</p><pre><code id="verify-command"></code></pre>
             <p class="checksum" id="checksum-text"></p><div class="verify-links" id="verify-links"></div>
           </div>
         </div>
         <details class="all-builds"><summary>All published builds</summary><div class="table-scroll"><table><caption>Available release assets and verification files</caption><thead><tr><th scope="col">System</th><th scope="col">Processor</th><th scope="col">Build</th><th scope="col">File</th><th scope="col">Verify</th></tr></thead><tbody id="asset-table"><tr><td colspan="5">Loading the release manifest…</td></tr></tbody></table></div></details>
-        <p class="small-note">Every download is checksummed in the <a href="releases.json">release manifest</a>; a target appears only after its binary is built and validated. <a href="downloads.html">All downloads</a> · <a href="https://github.com/capturefab/capturefab#build-test-and-release">Build from source</a> · <a href="feed.xml">Atom release feed</a></p>
+        <p class="small-note">Every download is checksummed in the <a href="releases.json">release manifest</a> and carries GitHub build provenance. A platform appears only after its binary is built and validated. See <a href="downloads.html">all downloads</a> or subscribe to the <a href="feed.xml">Atom release feed</a>.</p>
         <noscript><p class="notice">JavaScript is optional. Open <a href="downloads.html">all downloads</a> for published files, or the <a href="releases.json">release manifest</a> for download URLs and SHA-256 checksums.</p></noscript>
+        <div class="source-build">
+          <div><h3>Or build it yourself</h3><p>Builds need a stable Rust toolchain, a C compiler and CMake, plus NASM on x86, because the JPEG encoder compiles libjpeg-turbo from source. Industrial cameras work without FFmpeg; webcams, streams and recording need a bundled or <code>CAPTUREFAB_FFMPEG</code>-supplied binary. The <a href="https://github.com/capturefab/capturefab#build-test-and-release">build guide</a> covers both.</p></div>
+          <div class="code-wrap"><pre><code>git clone https://github.com/capturefab/capturefab
+cd capturefab
+# desktop app and CLI
+cargo build --release
+# headless CLI
+cargo build --release --no-default-features --features usb,jpeg
+target/release/capturefab --camera sim:0 capture -o first.png</code></pre><button class="copy-button" type="button" aria-label="Copy the build commands">Copy</button></div>
+        </div>
       </section>
 
       <section id="quickstart" class="section" aria-labelledby="quickstart-title">
-        <div class="section-heading"><p class="eyebrow">Quickstart</p><h2 id="quickstart-title">A few commands to a frame.</h2></div>
-        <p class="section-intro">No camera nearby? Use <code>--camera sim:0</code> for the built-in simulator.</p>
-        <div class="guide-grid">
-          <article class="guide-card"><h3>Open the desktop app</h3><p>Run it with no arguments to discover cameras, preview them and inspect their settings.</p><div class="code-wrap"><pre><code>capturefab</code></pre><button class="copy-button" type="button" aria-label="Copy GUI launch command">Copy</button></div></article>
-          <article class="guide-card"><h3>Discover cameras</h3><p>Network, USB3 Vision and host cameras, as structured results for scripts.</p><div class="code-wrap"><pre><code>capturefab discover --json</code></pre><button class="copy-button" type="button" aria-label="Copy discovery command">Copy</button></div></article>
-          <article class="guide-card wide"><h3>Read, configure, capture</h3><p>Use a discovered ID, a unique serial or a GigE camera's IP address. Feature names vary by camera; <code>features</code> lists the available controls.</p><div class="code-wrap"><pre><code>capturefab --camera 192.168.1.10 features
+        <div class="section-heading"><h2 id="quickstart-title">From nothing to a frame</h2><p>Six steps, each one a command you can paste. Replace the camera address with one from discovery, or keep <code>sim:0</code> and follow along without hardware.</p></div>
+        <ol class="steps">
+          <li><div class="step"><div><h3>Open the workbench</h3><p>Run it with no arguments. It finds cameras on your network and USB ports, previews them, and shows their settings in the inspector.</p></div><div class="code-wrap"><pre><code>capturefab</code></pre><button class="copy-button" type="button" aria-label="Copy the launch command">Copy</button></div></div></li>
+          <li><div class="step"><div><h3>Find cameras</h3><p>Discovery covers GigE Vision, USB3 Vision and the simulator. Host cameras and ONVIF devices have their own listings. Add <code>--json</code> to any of them for structured results.</p></div><div class="code-wrap"><pre><code>capturefab discover
+capturefab native            # webcams and capture cards
+capturefab onvif discover    # IP cameras on the LAN</code></pre><button class="copy-button" type="button" aria-label="Copy the discovery commands">Copy</button></div></div></li>
+          <li><div class="step"><div><h3>Inspect and set features</h3><p>Pick a camera by discovered ID, serial number or IP address. Feature names come from the camera's own GenICam description, so list them first.</p></div><div class="code-wrap"><pre><code>capturefab --camera 192.168.1.10 features
 capturefab --camera 192.168.1.10 get Width Height ExposureTime
-capturefab --camera 192.168.1.10 set ExposureTime=5000
-capturefab --camera 192.168.1.10 capture -n 10 -o frames</code></pre><button class="copy-button" type="button" aria-label="Copy configuration and capture commands">Copy</button></div></article>
-          <article class="guide-card"><h3>Open a network stream</h3><p>Use a stream URL directly, or resolve an ONVIF camera's profiles.</p><div class="code-wrap"><pre><code>capturefab --camera 'rtsp://camera/live' capture -o frame.png
-capturefab onvif discover --json
-capturefab --camera 'onvif:http://camera/onvif/device_service' capture -o onvif.png</code></pre><button class="copy-button" type="button" aria-label="Copy network camera commands">Copy</button></div></article>
-          <article class="guide-card"><h3>Use a host camera</h3><p>List cameras managed by the operating system, then use the native locator.</p><div class="code-wrap"><pre><code>capturefab native --json
-# macOS
-capturefab --camera avfoundation:0 capture -o webcam.png
-# Linux, including driver-backed USB or CSI cameras
-capturefab --camera v4l2:/dev/video0 capture -o webcam.png
-# Windows
-capturefab --camera 'dshow:video=Camera Name' capture -o webcam.png</code></pre><button class="copy-button" type="button" aria-label="Copy native camera commands">Copy</button></div></article>
-          <article class="guide-card"><h3>Schedule a timelapse to a drive</h3><p>Save a folder destination once, then capture into it on an interval.</p><div class="code-wrap"><pre><code>capturefab destination add-folder usb "/Volumes/CAMDISK/Capturefab"
-capturefab --camera sim:0 capture --interval 10s -n 360 -o timelapse --destination usb</code></pre><button class="copy-button" type="button" aria-label="Copy timelapse commands">Copy</button></div></article>
-          <article class="guide-card"><h3>Check this computer</h3><p>Report compiled-in features, network interfaces, USB access and the JPEG engines this host can use.</p><div class="code-wrap"><pre><code>capturefab doctor --json</code></pre><button class="copy-button" type="button" aria-label="Copy doctor command">Copy</button></div></article>
-        </div>
-        <details class="forwarding"><summary>Forward a camera to MediaMTX or an NVR</summary><p>Publish to an existing RTSP server, SRT endpoint or a local video file. Automatic encoder selection probes usable hardware and falls back to software.</p><div class="code-wrap"><pre><code>capturefab --camera 192.168.1.10 forward \
+capturefab --camera 192.168.1.10 set ExposureTime=5000 Gain=0</code></pre><button class="copy-button" type="button" aria-label="Copy the feature commands">Copy</button></div></div></li>
+          <li><div class="step"><div><h3>Capture frames</h3><p>One frame to a file, ten to a folder, or a timelapse into a saved destination such as an external drive. Nothing is ever overwritten.</p><p>Host cameras use a native locator instead of an address: <code>avfoundation:0</code> on macOS, <code>v4l2:/dev/video0</code> on Linux, <code>dshow:video=Camera Name</code> on Windows.</p></div><div class="code-wrap"><pre><code>capturefab --camera 192.168.1.10 capture -o frame.png
+capturefab --camera 192.168.1.10 capture -n 10 -o frames
+capturefab destination add-folder usb "/Volumes/CAMDISK/Capturefab"
+capturefab --camera 192.168.1.10 capture --interval 10s -n 360 \
+  -o timelapse --destination usb</code></pre><button class="copy-button" type="button" aria-label="Copy the capture commands">Copy</button></div></div></li>
+          <li><div class="step"><div><h3>Record or forward</h3><p>Record to a bounded local file, or publish the camera to a server such as MediaMTX. Automatic encoder selection probes the hardware on this host and falls back to software.</p></div><div class="code-wrap"><pre><code>capturefab --camera 192.168.1.10 record -o clip.mkv --duration 30s
+capturefab --camera 192.168.1.10 forward \
   --output rtsp://localhost:8554/camera \
-  --encoder auto --fps 30 --bitrate 4M --duration 60</code></pre><button class="copy-button" type="button" aria-label="Copy frame forwarding command">Copy</button></div></details>
+  --encoder auto --fps 30 --bitrate 4M</code></pre><button class="copy-button" type="button" aria-label="Copy the recording and forwarding commands">Copy</button></div></div></li>
+          <li><div class="step"><div><h3>Hand it to a script</h3><p>Leave the app open and drive it from a terminal, a cron job or a coding agent. The commands are the same; the camera stays connected in the window.</p><p><code>doctor</code> reports what this host can do: compiled-in features, network interfaces, USB access and the JPEG and video encoders that passed a probe.</p></div><div class="code-wrap"><pre><code>capturefab sessions
+capturefab --session gui connect 192.168.1.10
+capturefab --session gui capture -n 10 -o frames --json
+capturefab doctor --json</code></pre><button class="copy-button" type="button" aria-label="Copy the session commands">Copy</button></div></div></li>
+        </ol>
       </section>
 
       <section id="automation" class="section" aria-labelledby="automation-title">
-        <div class="section-heading"><p class="eyebrow">Automate</p><h2 id="automation-title">Keep the window open. Hand over the controls.</h2></div>
-        <p class="section-intro">The desktop app exposes a local, token-authenticated session. Shell scripts and coding agents can inspect it, connect cameras, change features and capture frames while you watch.</p>
+        <div class="section-heading"><h2 id="automation-title">Built to be scripted</h2><p>The CLI is a versioned contract. Results go to stdout as JSON, diagnostics go to stderr, and the exit code tells you what kind of thing went wrong before you parse anything.</p></div>
         <div class="automation-grid">
           <div>
-            <div class="code-wrap"><pre><code>capturefab sessions --json
-capturefab --session gui status --json
-capturefab --session gui connect 192.168.1.10
-capturefab --session gui set ExposureTime=5000
-capturefab --session gui capture -n 10 -o frames
-capturefab schema --json</code></pre><button class="copy-button" type="button" aria-label="Copy session automation commands">Copy</button></div>
-            <div class="automation-notes"><p><strong>Unix conventions.</strong> Structured results on stdout, diagnostics on stderr, meaningful exit codes, pipes, native shell completions and headless sessions with <code>serve</code>.</p><p><strong>Agent readable.</strong> A versioned schema and session API, plus instructions for Claude Code, Codex, OpenCode and any tool that can run a CLI.</p></div>
-            <div class="text-links"><a href="agents.md">Agent instructions →</a><a href="llms.txt">llms.txt →</a></div>
+            <div class="code-wrap"><pre><code>$ capturefab --camera sim:0 get Width --json
+{"ok":true,"result":{"features":[{"name":"Width","value":640}]},"version":1}
+
+$ capturefab --camera 40123456 capture -o x.png --json
+{"error":{"code":"unavailable","message":"camera '40123456' not found or ambiguous; run capturefab discover"},"ok":false,"version":1}
+$ echo $?
+3</code></pre></div>
+            <div class="automation-notes"><p><strong>Unix conventions.</strong> Pipes work: <code>capture -o - --format raw</code> streams a frame to stdout. Shell completions ship for bash, zsh, fish and PowerShell. <code>serve</code> runs a headless session with the same interface as the app.</p><p><strong>Readable by agents.</strong> <code>capturefab schema --json</code> prints the full command and session contract for the installed binary. The site's agent instructions tell Claude Code, Codex, OpenCode and similar tools how to use an open session safely.</p></div>
+            <div class="text-links"><a href="agents.md">Agent instructions</a><a href="llms.txt">llms.txt</a></div>
           </div>
-          <figure><a href="images/cli.svg" aria-label="Open full-size CLI example"><img src="images/cli.svg" alt="Capturefab discovery, configuration and capture commands against the built-in simulator in a terminal" width="1200" height="712" loading="lazy"></a></figure>
+          <figure><a href="images/cli.svg" aria-label="Open the full-size terminal example"><img src="images/cli.svg" alt="A terminal running capturefab discover, get, set and capture against the built-in simulator, ending with the JSON result of a captured 640 by 480 frame" width="1200" height="712" loading="lazy"></a></figure>
         </div>
+        <div class="table-scroll"><table class="codes"><caption>Exit codes</caption><thead><tr><th scope="col">Code</th><th scope="col">Category</th><th scope="col">Typical cause</th></tr></thead><tbody>
+          <tr><td>0</td><td>success</td><td>The command completed. Also used when stdout was a pipe that closed early.</td></tr>
+          <tr><td>1</td><td>operation_failed</td><td>A camera, file or I/O error that does not fit a more specific category.</td></tr>
+          <tr><td>2</td><td>usage</td><td>Invalid arguments or an unknown command.</td></tr>
+          <tr><td>3</td><td>unavailable</td><td>No such camera or session, the camera is controlled by another application, or the destination drive is not mounted.</td></tr>
+          <tr><td>4</td><td>timeout</td><td>No frame or reply within the deadline.</td></tr>
+          <tr><td>5</td><td>unsupported</td><td>A pixel format, video mode or feature this camera or build cannot do.</td></tr>
+          <tr><td>6</td><td>storage_full</td><td>The storage budget or the disk is full. Nothing was deleted.</td></tr>
+        </tbody></table></div>
       </section>
 
-      <section id="platforms" class="section" aria-labelledby="compatibility-title">
-        <div class="section-heading"><p class="eyebrow">Platforms</p><h2 id="compatibility-title">Wherever the camera is.</h2></div>
+      <section id="platforms" class="section" aria-labelledby="platforms-title">
+        <div class="section-heading"><h2 id="platforms-title">Where it runs</h2><p>The app renders with the GPU through Metal, Vulkan, Direct3D 12 or OpenGL and falls back to software. Hardware video and JPEG encoders are used only when a real probe on this host succeeds.</p></div>
         <ul class="platform-list">
-          <li><strong>macOS</strong><span>Apple silicon on macOS 11 and later, Intel on 10.15 and later. Host cameras through AVFoundation.</span></li>
-          <li><strong>Windows</strong><span>x64 on Windows 10 and later; Windows 11 on ARM runs it through emulation. Host cameras through DirectShow.</span></li>
-          <li><strong>Linux</strong><span>x64 and ARM64 with glibc 2.28 or newer. USB and CSI cameras through V4L2 drivers.</span></li>
-          <li><strong>Jetson &amp; Pi</strong><span>The Linux ARM64 build on Jetson Linux R34+ or a 64-bit Pi OS. Headless builds suit remote capture; 32-bit ARM builds from source.</span></li>
+          <li><strong>macOS</strong><span>Apple silicon on macOS 11 and later, Intel on 10.15 and later. Host cameras through AVFoundation; the Apple JPEG engine and VideoToolbox when available.</span></li>
+          <li><strong>Windows</strong><span>x64 on Windows 10 and later. Windows 11 on ARM runs the x64 build through emulation. Host cameras through DirectShow; USB3 Vision cameras need the WinUSB driver.</span></li>
+          <li><strong>Linux</strong><span>x64 and ARM64 with glibc 2.28 or newer. USB and CSI cameras through V4L2; VA-API JPEG and NVENC, QSV, VAAPI or Vulkan video where the driver supports it.</span></li>
+          <li><strong>Jetson and Raspberry Pi</strong><span>The Linux ARM64 build on Jetson Linux R34 or newer and 64-bit Pi OS. Jetson uses nvJPEG and its hardware video encoders. 32-bit ARM builds from source.</span></li>
         </ul>
-        <p class="small-note">The GUI renders with the GPU and falls back to software. Hardware video encoders and JPEG engines are used only when a real probe succeeds on the host, with a software fallback.</p>
-        <p class="validation"><span class="status-dot" aria-hidden="true"></span><span><strong>Tested on real hardware:</strong> Basler GigE cameras on macOS ARM64 and Jetson Linux ARM64, and a Logitech C920 webcam on macOS. USB3 Vision, ONVIF and Windows hardware are still validation targets. See the <a href="https://github.com/capturefab/capturefab/blob/main/docs/hardware-validation.md">validation record</a>.</span></p>
+      </section>
+
+      <section id="validated" class="section" aria-labelledby="validated-title">
+        <div class="section-heading"><h2 id="validated-title">Tested on real hardware</h2><p>Unit and integration tests run on every commit across all six release platforms. This table is the shorter list: what has actually been exercised against physical cameras and accelerators, from the <a href="https://github.com/capturefab/capturefab/blob/main/docs/hardware-validation.md">validation record</a>.</p></div>
+        <div class="table-scroll"><table class="validated"><caption>Hardware checks as of October 2026</caption><thead><tr><th scope="col">Hardware</th><th scope="col">Host</th><th scope="col">What was checked</th></tr></thead><tbody>
+          <tr><td>Three Basler a2A1920-51gc GigE cameras</td><td>Jetson, Linux ARM64</td><td>Discovery, compressed GenICam XML, 1920×1200 BayerRG8 capture, three cameras streaming in one session, auto exposure at every balance, packet resend recovering about 95% of requested packets under 1% injected loss, and a clean revert of every changed feature.</td></tr>
+          <tr><td>Aravis software cameras</td><td>macOS ARM64</td><td>Discovery of two fixtures at once, streaming in Mono8, RGB8, BayerRG8 and Mono16, heartbeat, control release and reopen.</td></tr>
+          <tr><td>Logitech C920 and FaceTime HD webcams</td><td>macOS ARM64</td><td>Mode listing, 1080p and 720p capture, a video-mode change with decoder restart, and an actionable timeout when the laptop lid was closed.</td></tr>
+          <tr><td>NVIDIA Jetson AGX Orin</td><td>JetPack 7, Linux ARM64</td><td>nvJPEG stills in a helper process at 2 to 6 ms a frame, and H.264 and HEVC recordings through the Jetson hardware encoders after NVENC and Vulkan were correctly rejected by the probe.</td></tr>
+          <tr><td>Apple silicon</td><td>macOS ARM64</td><td>VideoToolbox H.264 and software H.264 recordings from Mono8 and RGB8, and the GPU preview shader matching CPU conversion within one level on every pixel for all supported formats.</td></tr>
+        </tbody></table></div>
+        <p class="not-yet"><span class="mark" aria-hidden="true"></span><span><strong>Not yet validated on hardware:</strong> USB3 Vision cameras, ONVIF cameras, Windows hosts, jumbo frames, and chunk, multipart or GenDC payloads. The code paths exist and have tests, but the site does not claim them until a physical check is on record.</span></p>
+      </section>
+
+      <section id="faq" class="section" aria-labelledby="faq-title">
+        <div class="section-heading"><h2 id="faq-title">Questions people ask first</h2></div>
+        <div class="faq">
+          <details><summary>Do I need Aravis, a vendor SDK or FFmpeg installed?</summary><p>No. GigE Vision, USB3 Vision and GenICam are implemented in Capturefab itself. Release binaries bundle FFmpeg for webcams, streams and encoding and run it as a separate process. You still need the operating system's own graphics, USB and camera drivers, and on Windows the WinUSB driver for USB3 Vision cameras.</p></details>
+          <details><summary>Is it free to use commercially?</summary><p>Yes. Capturefab is MIT licensed. The bundled FFmpeg executable is GPLv3 and is never linked into Capturefab; each release ships its complete corresponding source, build configuration and notices so that redistribution stays compliant.</p></details>
+          <details><summary>Can a script control the window I already have open?</summary><p>Yes. The app exposes a local session on the loopback interface, authenticated with a private token in your session directory. <code>capturefab sessions</code> lists it, and any command with <code>--session NAME</code> runs against it. Commands and their results appear in the app's activity log.</p></details>
+          <details><summary>What happens when the disk fills up?</summary><p>Capturefab stops the capture or recording and returns exit code 6 with a message that names the limit. It never deletes anything on its own. Retention that removes the oldest files is opt-in with <code>--delete-oldest</code>, and even then only files Capturefab created, whose checksum still matches, are candidates.</p></details>
+          <details><summary>Does it run on a Raspberry Pi or Jetson?</summary><p>Yes, with the Linux ARM64 build on a 64-bit OS. CSI cameras work when the OS exposes them as a V4L2 device; libcamera-only pipelines are not supported. On Jetson, JPEG stills use nvJPEG and recordings use the hardware video encoders. 32-bit ARM builds from source.</p></details>
+          <details><summary>Can I use a DSLR or mirrorless camera?</summary><p>Through its clean HDMI output and a UVC capture card, which then appears as a host camera. Proprietary USB tethering protocols are not implemented. <code>capturefab compatibility GX85</code> prints the camera-side settings for a Panasonic GX85, and the <a href="https://github.com/capturefab/capturefab/blob/main/docs/camera-compatibility.md">compatibility guide</a> covers the general route.</p></details>
+          <details><summary>How do I verify a download?</summary><p>Each asset in the <a href="releases.json">release manifest</a> has a SHA-256 checksum, and the download panel shows the matching command for your platform. Releases also carry GitHub build-provenance attestations: <code>gh attestation verify FILE --repo capturefab/capturefab</code>.</p></details>
+          <details><summary>Why one process per camera?</summary><p>Camera transports block, hang and occasionally crash, and vendor firmware is not always well behaved. Keeping each camera in its own process means a bad one cannot stall the app, the CLI or another camera, and the shared-memory frame ring keeps that isolation from costing throughput.</p></details>
+        </div>
       </section>
     </main>
-    <footer class="site-footer"><p><svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#2f7bf5"/><circle cx="16" cy="16" r="8" fill="none" stroke="#fff" stroke-width="3"/><circle cx="16" cy="16" r="3" fill="#fff"/></svg>Capturefab · MIT license</p><div><a href="https://github.com/capturefab/capturefab">Source</a><a href="https://github.com/capturefab/capturefab/issues">Issues</a><a href="downloads.html">Downloads</a><a href="feed.xml">Releases feed</a><a href="agents.md">For agents</a></div></footer>
+    <footer class="site-footer">
+      <div class="brand"><p><svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#2f7bf5"/><circle cx="16" cy="16" r="8" fill="none" stroke="#fff" stroke-width="3"/><circle cx="16" cy="16" r="3" fill="#fff"/></svg>Capturefab</p><small>MIT licensed. The bundled FFmpeg is GPLv3 and ships with its source. This site sets no cookies and loads nothing from third parties.</small></div>
+      <div><h4>Project</h4><ul><li><a href="https://github.com/capturefab/capturefab">Source</a></li><li><a href="https://github.com/capturefab/capturefab/issues">Issues</a></li><li><a href="downloads.html">All downloads</a></li><li><a href="feed.xml">Releases feed</a></li></ul></div>
+      <div><h4>Documentation</h4><ul><li><a href="https://github.com/capturefab/capturefab#readme">CLI reference</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/hardware-validation.md">Hardware validation</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/camera-compatibility.md">Camera compatibility</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md">FFmpeg build and licensing</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/release.md">Release process</a></li></ul></div>
+      <div><h4>For agents</h4><ul><li><a href="agents.md">Agent instructions</a></li><li><a href="llms.txt">llms.txt</a></li><li><a href="releases.json">Release manifest</a></li></ul></div>
+    </footer>
   </div>
 </body>
 </html>

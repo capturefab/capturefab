@@ -145,10 +145,11 @@
       release = data.releases.find((item) => item.version === data.latest) || data.releases[0] || null;
       if (release && typeof release.version !== 'string') throw new Error('invalid release');
       assets = Array.isArray(release?.assets) ? release.assets.filter((item) => item && typeof item.name === 'string').map((asset) => ({ ...asset, os: osAliases[asset.os] || asset.os, arch: archAliases[asset.arch] || asset.arch })) : [];
-      text('release-version', release ? `v${release.version}` : 'source checkout');
+      text('release-version', release ? `v${release.version}` : 'none published yet');
       renderTable(); renderSelection();
     })
     .catch(() => {
+      text('release-version', 'see the manifest');
       text('download-label', 'Open the release manifest');
       text('download-description', 'Automatic selection is unavailable. The manifest contains published download URLs and checksums.');
       clearDownload();
