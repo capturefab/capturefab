@@ -57,4 +57,4 @@ The CLI is a public, versioned automation contract (see `capturefab schema`, `we
 - Exit codes come from `cli::error_code`, which classifies by error message text: 1 operation_failed, 2 usage, 3 unavailable, 4 timeout, 5 unsupported, 6 storage_full. Wording of error messages therefore affects exit codes.
 - Credentials in URLs must be redacted (`media::redact_url`) in logs, status and UI.
 
-When changing commands or output shapes, keep `schema` output, `README.md`, `web/agents.md` and `web/llms.txt` consistent. `docs/hardware-validation.md` distinguishes real-hardware results from simulated tests; don't claim hardware support that hasn't been validated.
+When changing commands or output shapes, keep `schema` output, `README.md`, `web/agents.md` and `web/llms.txt` consistent. Avoid publishing camera testing results or compatibility claims while the software is under rapid development.

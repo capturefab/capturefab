@@ -43,7 +43,10 @@ impl Workbench {
                 .padding(5)
                 .style(style::plain)
                 .on_press_maybe((!discovering).then_some(Message::Discover)),
-                Action::Discover.hint("Find GigE Vision and USB3 Vision devices", Os::CURRENT),
+                Action::Discover.hint(
+                    "Find host, GigE Vision, USB3 Vision and ONVIF cameras",
+                    Os::CURRENT
+                ),
             ),
         ]
         .spacing(6)

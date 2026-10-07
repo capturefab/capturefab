@@ -889,10 +889,8 @@ impl Workbench {
                     if let Ok(value) = &result {
                         self.finished(&pending, value);
                     }
-                    self.notice = Some(match result {
-                        Ok(_) => (format!("{} · done", pending.label), false, Instant::now()),
-                        Err(err) => (format!("{}: {err:#}", pending.label), true, Instant::now()),
-                    });
+                    let (message, attention) = command_notice(&pending.label, &result);
+                    self.notice = Some((message, attention, Instant::now()));
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.pending.swap_remove(i);
@@ -2052,10 +2050,52 @@ fn save_screenshot(shot: &window::Screenshot, path: &std::path::Path) -> Result<
     Ok(())
 }
 
+fn command_notice(label: &str, result: &Result<serde_json::Value>) -> (String, bool) {
+    match result {
+        Ok(value) => {
+            let warnings = value["warnings"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if warnings.is_empty() {
+                (format!("{label} · done"), false)
+            } else {
+                (format!("{label}: {}", warnings.join(" · ")), true)
+            }
+        }
+        Err(error) => (format!("{label}: {error:#}"), true),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use iced::futures::{FutureExt, StreamExt};
+
+    #[test]
+    fn discovery_warnings_remain_visible_after_success() {
+        let (message, attention) = command_notice(
+            "Discovering cameras",
+            &Ok(serde_json::json!({
+                "devices": [{"id": "sim:0"}],
+                "warnings": ["Native discovery timed out", "USB access denied"]
+            })),
+        );
+        assert!(attention);
+        assert!(message.contains("Native discovery timed out"));
+        assert!(message.contains("USB access denied"));
+        let (message, attention) = command_notice(
+            "Discovering cameras",
+            &Ok(serde_json::json!({"warnings": []})),
+        );
+        assert!(!attention);
+        assert_eq!(message, "Discovering cameras · done");
+    }
 
     #[test]
     fn frame_watcher_stays_quiet_without_new_frames() {

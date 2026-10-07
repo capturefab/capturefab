@@ -8,10 +8,11 @@ use std::{net::Ipv4Addr, time::Duration};
 pub fn discover(timeout: Duration, simulated: bool) -> Result<(Vec<CameraInfo>, Vec<String>)> {
     let mut devices = Vec::new();
     let mut warnings = Vec::new();
-    let (gige, onvif) = std::thread::scope(|s| {
+    let (gige, onvif, native) = std::thread::scope(|s| {
         let g = s.spawn(|| crate::transport::gige::discover(timeout));
         let o = s.spawn(|| crate::onvif::camera_infos(timeout));
-        (g.join(), o.join())
+        let n = s.spawn(|| crate::media::native_devices_with_timeout(timeout));
+        (g.join(), o.join(), n.join())
     });
     for (label, result) in [("GigE", gige), ("ONVIF", onvif)] {
         match result {
@@ -28,21 +29,25 @@ pub fn discover(timeout: Duration, simulated: bool) -> Result<(Vec<CameraInfo>, 
     if simulated {
         devices.push(crate::transport::simulator::info());
     }
-    if let Ok(native) = crate::media::native_devices_with_timeout(timeout)
-        && let Some(items) = native["devices"].as_array()
-    {
-        for d in items {
-            if let Some(id) = d["id"].as_str() {
-                devices.push(CameraInfo {
-                    id: id.into(),
-                    transport: Transport::Media,
-                    vendor: std::env::consts::OS.into(),
-                    model: d["name"].as_str().unwrap_or("Host camera").into(),
-                    serial: id.into(),
-                    address: Some(id.into()),
-                });
+    match native {
+        Ok(Ok(native)) => {
+            if let Some(items) = native["devices"].as_array() {
+                for d in items {
+                    if let Some(id) = d["id"].as_str() {
+                        devices.push(CameraInfo {
+                            id: id.into(),
+                            transport: Transport::Media,
+                            vendor: std::env::consts::OS.into(),
+                            model: d["name"].as_str().unwrap_or("Host camera").into(),
+                            serial: id.into(),
+                            address: Some(id.into()),
+                        });
+                    }
+                }
             }
         }
+        Ok(Err(error)) => warnings.push(format!("Native camera discovery: {error:#}")),
+        Err(_) => warnings.push("Native camera discovery worker stopped".into()),
     }
     devices.sort_by(|a, b| a.id.cmp(&b.id));
     devices.dedup_by(|a, b| a.id == b.id);
@@ -81,7 +86,17 @@ impl Camera {
         };
         let backend: Box<dyn Backend> = match info.transport {
             Transport::Simulator => Box::new(crate::transport::simulator::Simulator::default()),
-            Transport::Media => crate::media::open_url(selector, timeout)?,
+            Transport::Media => {
+                if crate::onvif::is_source(&info.id) {
+                    let (info, backend) = crate::onvif::connect(&info.id, timeout)?;
+                    return Self::from_backend(info, backend);
+                }
+                if crate::media::is_source(selector) {
+                    crate::media::open_url(selector, timeout)?
+                } else {
+                    crate::media::open(&info, timeout)?
+                }
+            }
             Transport::GigE => crate::transport::gige::open(&info, timeout)?,
             Transport::Usb3 => {
                 #[cfg(feature = "usb")]
@@ -191,5 +206,61 @@ impl Camera {
 impl Drop for Camera {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires FFmpeg"]
+    fn discovered_media_opens_by_id_and_serial() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "capturefab-camera-{}-{nonce}.ppm",
+            std::process::id()
+        ));
+        let mut ppm = b"P6\n16 16\n255\n".to_vec();
+        ppm.extend(vec![127; 16 * 16 * 3]);
+        std::fs::write(&path, ppm).unwrap();
+        let info = crate::media::info(path.to_str().unwrap()).unwrap();
+        for selector in [&info.id, &info.serial] {
+            let mut camera = Camera::open(
+                selector,
+                std::slice::from_ref(&info),
+                Duration::from_secs(3),
+            )
+            .unwrap();
+            camera.start().unwrap();
+            let frame = camera.next_frame(Duration::from_secs(3)).unwrap();
+            assert_eq!((frame.width, frame.height), (16, 16));
+            assert_eq!(frame.data, vec![127; 16 * 16 * 3]);
+            camera.stop().unwrap();
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn discovered_onvif_serial_uses_onvif_transport() {
+        let info = CameraInfo {
+            id: "onvif:https://camera/service".into(),
+            transport: Transport::Media,
+            vendor: "ONVIF".into(),
+            model: "Network camera".into(),
+            serial: "network-serial".into(),
+            address: Some("https://camera/service".into()),
+        };
+        let error = Camera::open(
+            &info.serial,
+            std::slice::from_ref(&info),
+            Duration::from_millis(100),
+        )
+        .err()
+        .expect("HTTPS SOAP should be rejected before any network request");
+        assert!(error.to_string().contains("HTTPS ONVIF SOAP"), "{error:#}");
     }
 }

@@ -292,6 +292,14 @@ fn command(exe: &Executable) -> Command {
     cmd
 }
 fn bounded_output(exe: &Executable, args: &[String], timeout: Duration) -> Result<(bool, String)> {
+    let (success, output, _) = timed_output(exe, args, timeout)?;
+    Ok((success, output))
+}
+fn timed_output(
+    exe: &Executable,
+    args: &[String],
+    timeout: Duration,
+) -> Result<(bool, String, bool)> {
     let mut child = command(exe)
         .args(args)
         .stdout(Stdio::piped())
@@ -310,11 +318,13 @@ fn bounded_output(exe: &Executable, args: &[String], timeout: Duration) -> Resul
     let out = reader(Box::new(stdout));
     let err = reader(Box::new(stderr));
     let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
     let success = loop {
         if let Some(status) = child.try_wait()? {
             break status.success();
         }
         if Instant::now() >= deadline {
+            timed_out = true;
             let _ = child.kill();
             let _ = child.wait();
             break false;
@@ -323,7 +333,11 @@ fn bounded_output(exe: &Executable, args: &[String], timeout: Duration) -> Resul
     };
     let mut bytes = out.join().unwrap_or_default();
     bytes.extend(err.join().unwrap_or_default());
-    Ok((success, String::from_utf8_lossy(&bytes).to_string()))
+    Ok((
+        success,
+        String::from_utf8_lossy(&bytes).to_string(),
+        timed_out,
+    ))
 }
 pub fn ffmpeg_info() -> Result<Value> {
     let exe = executable()?;
@@ -387,7 +401,16 @@ pub fn native_devices_with_timeout(timeout: Duration) -> Result<Value> {
             },
         ]
         .map(str::to_string);
-        let (_, listing) = bounded_output(&exe, &args, timeout)?;
+        let (_, listing, timed_out) = timed_output(&exe, &args, timeout)?;
+        ensure!(
+            !timed_out,
+            "native camera discovery timed out after {} s; check camera permissions and host drivers, or retry with a larger --timeout-ms",
+            timeout.as_secs_f64()
+        );
+        ensure!(
+            !listing.contains("Unknown input format"),
+            "FFmpeg does not support the {backend} native camera input; use a build containing this host camera backend"
+        );
         let devices = if backend == "avfoundation" {
             avfoundation_devices(&listing)
         } else {
@@ -781,6 +804,7 @@ struct Mode {
     width: u32,
     height: u32,
     fps: Option<(f64, f64)>,
+    input_format: Option<usize>,
 }
 impl Mode {
     fn size(&self) -> (u32, u32) {
@@ -847,6 +871,7 @@ fn avfoundation_modes(log: &str) -> Vec<Mode> {
             width,
             height,
             fps: Some((high, high)),
+            input_format: None,
         })
     }) {
         if modes
@@ -873,11 +898,12 @@ fn dshow_modes(log: &str) -> Vec<Mode> {
                 width,
                 height,
                 fps: Some((low.min(high), high)),
+                input_format: None,
             })
         })
         .fold(Vec::new(), merge)
 }
-fn v4l2_modes(log: &str) -> (Vec<Mode>, Option<String>) {
+fn v4l2_modes(log: &str) -> (Vec<Mode>, Vec<String>) {
     let mut formats = log
         .lines()
         .filter_map(|line| {
@@ -897,19 +923,32 @@ fn v4l2_modes(log: &str) -> (Vec<Mode>, Option<String>) {
                     width,
                     height,
                     fps: None,
+                    input_format: None,
                 })
                 .fold(Vec::new(), merge);
             (name != "Unsupported" && !modes.is_empty()).then_some((compressed, name, modes))
         })
         .collect::<Vec<_>>();
     formats.sort_by_key(|format| format.0);
-    formats
-        .into_iter()
-        .next()
-        .map(|(_, name, modes)| (modes, Some(name.into())))
-        .unwrap_or_default()
+    let mut names = Vec::new();
+    let mut modes = Vec::new();
+    let mut sizes = HashSet::new();
+    for (_, name, choices) in formats {
+        let index = names.len();
+        names.push(name.to_string());
+        for mut mode in choices {
+            // Prefer a raw format when the same size is available in both,
+            // while retaining sizes available only in a compressed format.
+            if sizes.insert(mode.size()) {
+                mode.input_format = Some(index);
+                modes.push(mode);
+            }
+        }
+    }
+    (modes, names)
 }
-fn probe(source: &str) -> (Vec<Mode>, Option<String>) {
+
+fn probe(source: &str) -> (Vec<Mode>, Vec<String>) {
     let Ok(Some((format, input))) = native_input(source) else {
         return Default::default();
     };
@@ -929,26 +968,68 @@ fn probe(source: &str) -> (Vec<Mode>, Option<String>) {
         return Default::default();
     };
     match format {
-        "avfoundation" => (avfoundation_modes(&log), None),
+        "avfoundation" => (avfoundation_modes(&log), Vec::new()),
         "v4l2" => v4l2_modes(&log),
-        _ => (dshow_modes(&log), None),
+        _ => (dshow_modes(&log), Vec::new()),
     }
 }
-fn native_failure(log: &str, stalled: bool, name: &str, timeout: Duration) -> Option<String> {
-    if log.contains("Cannot use ") {
-        Some(
-            "camera access denied: allow this app in System Settings > Privacy & Security > Camera"
-                .into(),
-        )
-    } else if ["Cannot Use ", "Device or resource busy", "already in use"]
+fn native_failure(log: &str, stalled: bool, source: &str, timeout: Duration) -> Option<String> {
+    let lower = log.to_ascii_lowercase();
+    let platform = scheme(source);
+    if log.contains("Cannot use ")
+        || [
+            "permission denied",
+            "access denied",
+            "operation not permitted",
+            "0x80070005",
+        ]
         .iter()
-        .any(|text| log.contains(text))
+        .any(|text| lower.contains(text))
+    {
+        let guidance = match platform.as_deref() {
+            Some("v4l2") => {
+                "check access to the video node and membership in its owning group (commonly video)"
+            }
+            Some("dshow") => {
+                "allow desktop apps to access the camera in Windows Settings > Privacy & security > Camera"
+            }
+            _ => "allow this app in System Settings > Privacy & Security > Camera",
+        };
+        Some(format!("camera access denied: {guidance}"))
+    } else if log.contains("Cannot Use ")
+        || ["device or resource busy", "already in use"]
+            .iter()
+            .any(|text| lower.contains(text))
     {
         Some("camera is in use by another application".into())
+    } else if [
+        "video device not found",
+        "could not find video device",
+        "no such file or directory",
+    ]
+    .iter()
+    .any(|text| lower.contains(text))
+    {
+        Some(format!(
+            "camera device not found: {}; reconnect the device and run capturefab native to obtain its current locator",
+            device_name(source)
+        ))
     } else {
-        stalled.then(|| format!("no frames from {name} (timed out after {} s): the camera may be suspended (for example a closed MacBook lid), in use, or blocked by permissions", timeout.as_secs_f64()))
+        let guidance = if platform.as_deref() == Some("avfoundation") {
+            "the camera may be suspended (for example a closed MacBook lid), in use, or blocked by permissions"
+        } else {
+            "check camera permissions, whether another app is using it, and the selected video mode"
+        };
+        stalled.then(|| {
+            format!(
+                "no frames from {} (timed out after {} s): {guidance}",
+                device_name(source),
+                timeout.as_secs_f64()
+            )
+        })
     }
 }
+
 #[derive(Clone, Copy, Default)]
 struct NativeOptions {
     size: Option<(u32, u32)>,
@@ -1010,7 +1091,7 @@ struct MediaBackend {
     running: bool,
     modes: Vec<Mode>,
     mode: Option<usize>,
-    format: Option<String>,
+    formats: Vec<String>,
 }
 impl MediaBackend {
     fn configure(&mut self, options: NativeOptions) -> Result<()> {
@@ -1069,7 +1150,12 @@ impl MediaBackend {
         {
             options.extend(["-video_size".into(), format!("{width}x{height}")]);
         }
-        if let Some(format) = &self.format {
+        let format = self
+            .mode
+            .and_then(|index| self.modes[index].input_format)
+            .and_then(|index| self.formats.get(index))
+            .or_else(|| self.formats.first());
+        if let Some(format) = format {
             options.extend(["-input_format".into(), format.clone()]);
         }
         if self.source.starts_with("avfoundation:") {
@@ -1092,7 +1178,7 @@ impl MediaBackend {
                     .is_none();
                 decoder.stop();
                 let log = decoder.log.text(&self.source);
-                native_failure(&log, stalled, device_name(&self.source), timeout)
+                native_failure(&log, stalled, &self.source, timeout)
                     .map_or(error, |message| anyhow!(message))
             })?
         } else {
@@ -1150,10 +1236,10 @@ pub fn open_url(source: &str, timeout: Duration) -> Result<Box<dyn Backend>> {
         running: false,
         modes: Vec::new(),
         mode: None,
-        format: None,
+        formats: Vec::new(),
     };
     if let Some(options) = options {
-        (backend.modes, backend.format) = probe(&backend.source);
+        (backend.modes, backend.formats) = probe(&backend.source);
         backend.configure(options)?;
     }
     backend.launch()?;
@@ -2803,7 +2889,7 @@ Error opening input files: Input/output error
             running: false,
             modes,
             mode: None,
-            format: None,
+            formats: Vec::new(),
         }
     }
     #[test]
@@ -2839,6 +2925,7 @@ Error opening input files: Input/output error
                     width,
                     height,
                     fps: Some((fps, fps)),
+                    input_format: None,
                 }
             });
         assert_eq!(slow[best(&slow, |_| true).unwrap()].label(), "640x480@15");
@@ -2906,6 +2993,7 @@ Error opening input files: Input/output error
                     width: 160 * i,
                     height: 90 * i,
                     fps: Some((5.0, 60.0)),
+                    input_format: None,
                 })
                 .collect(),
         );
@@ -2953,9 +3041,9 @@ Error opening input files: Input/output error
             "[video4linux2,v4l2 @ 0x5581d1c2a0] Raw       :     yuyv422 :           YUYV 4:2:2 : 640x480 1280x720 640x480\n",
             "[video4linux2,v4l2 @ 0x5581d1c2a0] Raw       :        gray :            8-bit Greyscale : {8-1920, 8}x{8-1080, 8}\n",
         ));
-        assert_eq!(labels(&modes), ["640x480", "1280x720"]);
+        assert_eq!(labels(&modes), ["640x480", "1280x720", "1920x1080"]);
         let mut camera = native("v4l2:/dev/video0", modes);
-        camera.format = format;
+        camera.formats = format;
         camera.configure(NativeOptions::default()).unwrap();
         assert_eq!(
             camera.input_options(),
@@ -2977,6 +3065,101 @@ Error opening input files: Input/output error
                 "-input_format",
                 "yuyv422"
             ]
+        );
+        let nodes = crate::genicam::NodeMap::parse(&camera.xml().unwrap()).unwrap();
+        assert_eq!(
+            nodes.choices(&mut camera, "VideoMode").unwrap(),
+            ["640x480", "1280x720", "1920x1080"]
+        );
+        nodes.set(&mut camera, "VideoMode", "1920x1080").unwrap();
+        assert_eq!(
+            camera.input_options(),
+            [
+                "-framerate",
+                "60",
+                "-video_size",
+                "1920x1080",
+                "-input_format",
+                "mjpeg"
+            ]
+        );
+        nodes.set(&mut camera, "VideoMode", "640x480").unwrap();
+        assert_eq!(
+            camera.input_options(),
+            [
+                "-framerate",
+                "60",
+                "-video_size",
+                "640x480",
+                "-input_format",
+                "yuyv422"
+            ]
+        );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn discovery_command_distinguishes_timeout_from_expected_nonzero_exit() {
+        let exe = Executable {
+            path: "/bin/sh".into(),
+            directory: None,
+        };
+        let start = Instant::now();
+        let (success, _, timed_out) = timed_output(
+            &exe,
+            &["-c".into(), "exec sleep 5".into()],
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        assert!(!success);
+        assert!(timed_out);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let (success, log, timed_out) = timed_output(
+            &exe,
+            &["-c".into(), "echo devices; exit 1".into()],
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(!success);
+        assert!(!timed_out);
+        assert_eq!(log.trim(), "devices");
+    }
+    #[test]
+    fn native_errors_give_platform_specific_recovery() {
+        for (source, log, guidance) in [
+            (
+                "v4l2:/dev/video0",
+                "Cannot open video device /dev/video0: Permission denied",
+                "owning group",
+            ),
+            (
+                "dshow:video=Webcam",
+                "Could not run graph (sometimes caused by a device already in use): 0x80070005",
+                "Windows Settings",
+            ),
+        ] {
+            let message = native_failure(log, false, source, Duration::from_secs(2)).unwrap();
+            assert!(message.contains(guidance));
+            assert_eq!(crate::cli::error_code(&anyhow!(message)).1, 3);
+            let timeout = native_failure("", true, source, Duration::from_secs(2)).unwrap();
+            assert!(!timeout.contains("MacBook"));
+            assert!(timeout.contains("selected video mode"));
+        }
+        let busy = native_failure(
+            "Device or resource busy",
+            false,
+            "v4l2:/dev/video0",
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(crate::cli::error_code(&anyhow!(busy)).1, 3);
+        assert!(
+            native_failure(
+                "unknown decoding error",
+                false,
+                "v4l2:/dev/video0",
+                Duration::from_secs(2)
+            )
+            .is_none()
         );
     }
     #[test]
@@ -3019,7 +3202,7 @@ Error opening input files: Input/output error
             "Integrated Webcam"
         );
         let timeout = Duration::from_secs(5);
-        let failure = |log| native_failure(log, false, "FaceTime HD Camera", timeout);
+        let failure = |log| native_failure(log, false, "avfoundation:FaceTime HD Camera", timeout);
         assert_eq!(
             failure("[in#0 @ 0x1] Failed to create AV capture input device: Cannot use FaceTime HD Camera").unwrap(),
             "camera access denied: allow this app in System Settings > Privacy & Security > Camera"
@@ -3028,8 +3211,10 @@ Error opening input files: Input/output error
             failure("[in#0 @ 0x1] Failed to create AV capture input device: Cannot Use FaceTime HD Camera").unwrap(),
             "camera is in use by another application"
         );
-        assert!(failure("[in#0 @ 0x1] Video device not found").is_none());
-        let stalled = native_failure("", true, "FaceTime HD Camera", timeout).unwrap();
+        let missing = failure("[in#0 @ 0x1] Video device not found").unwrap();
+        assert!(missing.contains("run capturefab native"));
+        assert_eq!(crate::cli::error_code(&anyhow!(missing)).1, 3);
+        let stalled = native_failure("", true, "avfoundation:FaceTime HD Camera", timeout).unwrap();
         assert_eq!(
             stalled,
             "no frames from FaceTime HD Camera (timed out after 5 s): the camera may be suspended (for example a closed MacBook lid), in use, or blocked by permissions"

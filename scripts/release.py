@@ -392,7 +392,7 @@ def package(args, binary, variant):
         shutil.copytree(Path(args.ffmpeg_bundle) / 'licenses', stage / 'media-licenses')
         shutil.copy2(Path(args.ffmpeg_bundle) / 'build-manifest.txt', stage / 'media-build-manifest.txt')
         (stage / 'THIRD-PARTY-LICENSES.txt').write_text(notices(args.target, variant), encoding='utf-8')
-        (stage / 'README.txt').write_text(f'Capturefab {args.version}\n{args.os}/{args.arch}; {variant}\nRun capturefab --help for CLI usage. Desktop builds open the GUI with no arguments.\nFFmpeg is embedded; no separately installed media executable or camera SDK is required.\nPlatform signature: {signed}. Verify the download against the release SHA256SUMS.\nLicenses: LICENSE (Capturefab), THIRD-PARTY-LICENSES.txt (Rust crates and bundled fonts), media-licenses/ (FFmpeg payload).\nCorresponding source: the release source and media-sources archives. See docs/hardware-validation.md for test scope.\n')
+        (stage / 'README.txt').write_text(f'Capturefab {args.version}\n{args.os}/{args.arch}; {variant}\nRun capturefab --help for CLI usage. Desktop builds open the GUI with no arguments.\nFFmpeg is embedded; no separately installed media executable or camera SDK is required.\nPlatform signature: {signed}. Verify the download against the release SHA256SUMS.\nLicenses: LICENSE (Capturefab), THIRD-PARTY-LICENSES.txt (Rust crates and bundled fonts), media-licenses/ (FFmpeg payload).\nCorresponding source: the release source and media-sources archives.\n')
         if args.os == 'macos' and variant == 'desktop':
             app = stage / 'Capturefab.app' / 'Contents'
             (app / 'MacOS').mkdir(parents=True)
@@ -563,7 +563,7 @@ def assemble(args):
     notes += [f'- SHA256SUMS.asc is an OpenPGP signature by key {args.gpg_key}: `gpg --verify SHA256SUMS.asc SHA256SUMS`.'] if signature else []
     notes += [f'- GitHub build provenance and an SBOM attestation cover every file in SHA256SUMS: `gh attestation verify FILE --repo {args.repository}` (add `--predicate-type https://cyclonedx.org/bom` for the SBOM).'] if args.provenance else []
     notes += [f'- {bill.name} is a CycloneDX software bill of materials: the Rust crates linked into any variant, with Cargo.lock checksums, and the pinned media components.']
-    notes += ['- Apple Developer ID, notarization and Windows Authenticode apply only where the platform signature above says so.', '', f'Corresponding source: {source.name} contains the exact Capturefab commit and vendored Cargo.lock dependency sources with an offline build configuration; each *-media-sources.tar.gz holds the verified FFmpeg, x264, SRT, OpenSSL and enabled header archives with their build manifest. Packages list Rust crate licenses in THIRD-PARTY-LICENSES.txt. See docs/hardware-validation.md for actual hardware test scope.']
+    notes += ['- Apple Developer ID, notarization and Windows Authenticode apply only where the platform signature above says so.', '', f'Corresponding source: {source.name} contains the exact Capturefab commit and vendored Cargo.lock dependency sources with an offline build configuration; each *-media-sources.tar.gz holds the verified FFmpeg, x264, SRT, OpenSSL and enabled header archives with their build manifest. Packages list Rust crate licenses in THIRD-PARTY-LICENSES.txt.']
     (output / 'release-notes.md').write_text('\n'.join(notes) + '\n')
     print(f'Prepared {ver}: {len(successes)} platform assets; {len(assets) - len(successes)} unavailable selections.')
 

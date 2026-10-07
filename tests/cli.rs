@@ -433,3 +433,94 @@ fn auto_mode_session_contract() {
             .starts_with(b"\x89PNG\r\n\x1a\n")
     );
 }
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn discovery_reports_native_backend_failure_without_hiding_other_cameras() {
+    let dir = std::env::temp_dir().join(format!(
+        "capturefab-discovery-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+        .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_FFMPEG", dir.join("missing-ffmpeg"))
+        .args(["--json", "serve", "--name", "discovery"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&ready).unwrap()["result"]["ready"],
+        true
+    );
+    let _fixture = Fixture {
+        child,
+        dir: dir.clone(),
+    };
+    let output = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+        .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_FFMPEG", dir.join("missing-ffmpeg"))
+        .args([
+            "--json",
+            "--session",
+            "discovery",
+            "--simulate",
+            "--timeout-ms",
+            "100",
+            "discover",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["ok"], true);
+    assert!(
+        response["result"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| {
+                let text = warning.as_str().unwrap();
+                text.contains("Native camera discovery") && text.contains("cannot launch FFmpeg")
+            }),
+        "{response}"
+    );
+    assert!(
+        response["result"]["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|device| device["id"] == "sim:0"),
+        "{response}"
+    );
+    json(
+        &dir,
+        &["--json", "--session", "discovery", "connect", "sim:0"],
+    );
+    // A connected worker refreshes its own logs; coordinator diagnostics must
+    // survive these snapshots as well as the initial discovery response.
+    json(&dir, &["--json", "--session", "discovery", "get", "Width"]);
+    let status = json(&dir, &["--json", "--session", "discovery", "status"]);
+    assert!(
+        status["logs"].as_array().unwrap().iter().any(|entry| {
+            entry["level"] == "warn"
+                && entry["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Native camera discovery")
+        }),
+        "{status}"
+    );
+}

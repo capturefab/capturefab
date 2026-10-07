@@ -46,7 +46,7 @@
             <a class="button primary" href="#download">Download</a>
             <a class="button" href="#quickstart">Read the quickstart</a>
           </div>
-          <p class="hero-note">MIT licensed. Written in Rust. <a href="https://github.com/capturefab/capturefab">Source on GitHub</a>.</p>
+          <p class="hero-note">Under rapid development. Camera support and behavior may change between releases. MIT licensed. Written in Rust. <a href="https://github.com/capturefab/capturefab">Source on GitHub</a>.</p>
         </div>
         <figure class="viewfinder">
           <div class="pattern" role="img" aria-label="The simulator's test pattern: concentric rings over a checkerboard with a crosshair, shown as a live preview tile">
@@ -66,7 +66,7 @@
           <div class="pillar">
             <h3>What it connects to</h3>
             <dl>
-              <dt>GigE Vision</dt><dd>GVCP and GVSP with packet-size negotiation, packet resend and loss counters. Validated on Basler cameras.</dd>
+              <dt>GigE Vision</dt><dd>GVCP and GVSP with packet-size negotiation, packet resend and loss counters.</dd>
               <dt>USB3 Vision</dt><dd>U3V over the operating system's USB stack: USB permissions on Linux, IOKit on macOS, WinUSB on Windows. No kernel driver of its own.</dd>
               <dt>GenICam</dt><dd>Plain or zipped XML parsed into a live feature tree, with bounds, selectors, converters and access modes evaluated against the camera.</dd>
               <dt>ONVIF, RTSP and SRT</dt><dd>WS-Discovery, profile resolution and authenticated SOAP. Credentials are redacted in logs, status output and the UI.</dd>
@@ -93,7 +93,6 @@
               <dt>Secrets stay out of files</dt><dd>Bucket credentials live in the OS keychain or the AWS credential chain. Stream URLs are redacted in logs, status and the UI.</dd>
               <dt>Isolation per camera</dt><dd>A stalled or crashing camera cannot take another camera, the app or your script down with it.</dd>
               <dt>Nothing phones home</dt><dd>No telemetry, no update checks, and this site runs no analytics.</dd>
-              <dt>Honest support claims</dt><dd>Hardware support is only claimed after a real test, and the <a href="https://github.com/capturefab/capturefab/blob/main/docs/hardware-validation.md">record is public</a>.</dd>
             </dl>
           </div>
         </div>
@@ -131,7 +130,7 @@
           </div>
         </div>
         <details class="all-builds"><summary>All published builds</summary><div class="table-scroll"><table><caption>Available release assets and verification files</caption><thead><tr><th scope="col">System</th><th scope="col">Processor</th><th scope="col">Build</th><th scope="col">File</th><th scope="col">Verify</th></tr></thead><tbody id="asset-table"><tr><td colspan="5">Loading the release manifest…</td></tr></tbody></table></div></details>
-        <p class="small-note">Every download is checksummed in the <a href="releases.json">release manifest</a> and carries GitHub build provenance. A platform appears only after its binary is built and validated. See <a href="downloads.html">all downloads</a> or subscribe to the <a href="feed.xml">Atom release feed</a>.</p>
+        <p class="small-note">Every download is checksummed in the <a href="releases.json">release manifest</a> and carries GitHub build provenance. See <a href="downloads.html">all downloads</a> or subscribe to the <a href="feed.xml">Atom release feed</a>.</p>
         <noscript><p class="notice">JavaScript is optional. Open <a href="downloads.html">all downloads</a> for published files, or the <a href="releases.json">release manifest</a> for download URLs and SHA-256 checksums.</p></noscript>
         <div class="source-build">
           <div><h3>Or build it yourself</h3><p>Builds need a stable Rust toolchain, a C compiler and CMake, plus NASM on x86, because the JPEG encoder compiles libjpeg-turbo from source. Industrial cameras work without FFmpeg; webcams, streams and recording need a bundled or <code>CAPTUREFAB_FFMPEG</code>-supplied binary. The <a href="https://github.com/capturefab/capturefab#build-test-and-release">build guide</a> covers both.</p></div>
@@ -198,28 +197,6 @@ $ echo $?
         </tbody></table></div>
       </section>
 
-      <section id="platforms" class="section" aria-labelledby="platforms-title">
-        <div class="section-heading"><h2 id="platforms-title">Where it runs</h2><p>The app renders with the GPU through Metal, Vulkan, Direct3D 12 or OpenGL and falls back to software. Hardware video and JPEG encoders are used only when a real probe on this host succeeds.</p></div>
-        <ul class="platform-list">
-          <li><strong>macOS</strong><span>Apple silicon on macOS 11 and later, Intel on 10.15 and later. Host cameras through AVFoundation; the Apple JPEG engine and VideoToolbox when available.</span></li>
-          <li><strong>Windows</strong><span>x64 on Windows 10 and later. Windows 11 on ARM runs the x64 build through emulation. Host cameras through DirectShow; USB3 Vision cameras need the WinUSB driver.</span></li>
-          <li><strong>Linux</strong><span>x64 and ARM64 with glibc 2.28 or newer. USB and CSI cameras through V4L2; VA-API JPEG and NVENC, QSV, VAAPI or Vulkan video where the driver supports it.</span></li>
-          <li><strong>Jetson and Raspberry Pi</strong><span>The Linux ARM64 build on Jetson Linux R34 or newer and 64-bit Pi OS. Jetson uses nvJPEG and its hardware video encoders. 32-bit ARM builds from source.</span></li>
-        </ul>
-      </section>
-
-      <section id="validated" class="section" aria-labelledby="validated-title">
-        <div class="section-heading"><h2 id="validated-title">Tested on real hardware</h2><p>Unit and integration tests run on every commit across all six release platforms. This table is the shorter list: what has actually been exercised against physical cameras and accelerators, from the <a href="https://github.com/capturefab/capturefab/blob/main/docs/hardware-validation.md">validation record</a>.</p></div>
-        <div class="table-scroll"><table class="validated"><caption>Hardware checks as of October 2026</caption><thead><tr><th scope="col">Hardware</th><th scope="col">Host</th><th scope="col">What was checked</th></tr></thead><tbody>
-          <tr><td>Three Basler a2A1920-51gc GigE cameras</td><td>Jetson, Linux ARM64</td><td>Discovery, compressed GenICam XML, 1920×1200 BayerRG8 capture, three cameras streaming in one session, auto exposure at every balance, packet resend recovering about 95% of requested packets under 1% injected loss, and a clean revert of every changed feature.</td></tr>
-          <tr><td>Aravis software cameras</td><td>macOS ARM64</td><td>Discovery of two fixtures at once, streaming in Mono8, RGB8, BayerRG8 and Mono16, heartbeat, control release and reopen.</td></tr>
-          <tr><td>Logitech C920 and FaceTime HD webcams</td><td>macOS ARM64</td><td>Mode listing, 1080p and 720p capture, a video-mode change with decoder restart, and an actionable timeout when the laptop lid was closed.</td></tr>
-          <tr><td>NVIDIA Jetson AGX Orin</td><td>JetPack 7, Linux ARM64</td><td>nvJPEG stills in a helper process at 2 to 6 ms a frame, and H.264 and HEVC recordings through the Jetson hardware encoders after NVENC and Vulkan were correctly rejected by the probe.</td></tr>
-          <tr><td>Apple silicon</td><td>macOS ARM64</td><td>VideoToolbox H.264 and software H.264 recordings from Mono8 and RGB8, and the GPU preview shader matching CPU conversion within one level on every pixel for all supported formats.</td></tr>
-        </tbody></table></div>
-        <p class="not-yet"><span class="mark" aria-hidden="true"></span><span><strong>Not yet validated on hardware:</strong> USB3 Vision cameras, ONVIF cameras, Windows hosts, jumbo frames, and chunk, multipart or GenDC payloads. The code paths exist and have tests, but the site does not claim them until a physical check is on record.</span></p>
-      </section>
-
       <section id="faq" class="section" aria-labelledby="faq-title">
         <div class="section-heading"><h2 id="faq-title">Questions people ask first</h2></div>
         <div class="faq">
@@ -227,8 +204,6 @@ $ echo $?
           <details><summary>Is it free to use commercially?</summary><p>Yes. Capturefab is MIT licensed. The bundled FFmpeg executable is GPLv3 and is never linked into Capturefab; each release ships its complete corresponding source, build configuration and notices so that redistribution stays compliant.</p></details>
           <details><summary>Can a script control the window I already have open?</summary><p>Yes. The app exposes a local session on the loopback interface, authenticated with a private token in your session directory. <code>capturefab sessions</code> lists it, and any command with <code>--session NAME</code> runs against it. Commands and their results appear in the app's activity log.</p></details>
           <details><summary>What happens when the disk fills up?</summary><p>Capturefab stops the capture or recording and returns exit code 6 with a message that names the limit. It never deletes anything on its own. Retention that removes the oldest files is opt-in with <code>--delete-oldest</code>, and even then only files Capturefab created, whose checksum still matches, are candidates.</p></details>
-          <details><summary>Does it run on a Raspberry Pi or Jetson?</summary><p>Yes, with the Linux ARM64 build on a 64-bit OS. CSI cameras work when the OS exposes them as a V4L2 device; libcamera-only pipelines are not supported. On Jetson, JPEG stills use nvJPEG and recordings use the hardware video encoders. 32-bit ARM builds from source.</p></details>
-          <details><summary>Can I use a DSLR or mirrorless camera?</summary><p>Through its clean HDMI output and a UVC capture card, which then appears as a host camera. Proprietary USB tethering protocols are not implemented. <code>capturefab compatibility GX85</code> prints the camera-side settings for a Panasonic GX85, and the <a href="https://github.com/capturefab/capturefab/blob/main/docs/camera-compatibility.md">compatibility guide</a> covers the general route.</p></details>
           <details><summary>How do I verify a download?</summary><p>Each asset in the <a href="releases.json">release manifest</a> has a SHA-256 checksum, and the download panel shows the matching command for your platform. Releases also carry GitHub build-provenance attestations: <code>gh attestation verify FILE --repo capturefab/capturefab</code>.</p></details>
           <details><summary>Why one process per camera?</summary><p>Camera transports block, hang and occasionally crash, and vendor firmware is not always well behaved. Keeping each camera in its own process means a bad one cannot stall the app, the CLI or another camera, and the shared-memory frame ring keeps that isolation from costing throughput.</p></details>
         </div>
@@ -237,7 +212,7 @@ $ echo $?
     <footer class="site-footer">
       <div class="brand"><p><svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#2f7bf5"/><circle cx="16" cy="16" r="8" fill="none" stroke="#fff" stroke-width="3"/><circle cx="16" cy="16" r="3" fill="#fff"/></svg>Capturefab</p><small>MIT licensed. The bundled FFmpeg is GPLv3 and ships with its source. This site sets no cookies and loads nothing from third parties.</small></div>
       <div><h4>Project</h4><ul><li><a href="https://github.com/capturefab/capturefab">Source</a></li><li><a href="https://github.com/capturefab/capturefab/issues">Issues</a></li><li><a href="downloads.html">All downloads</a></li><li><a href="feed.xml">Releases feed</a></li></ul></div>
-      <div><h4>Documentation</h4><ul><li><a href="https://github.com/capturefab/capturefab#readme">CLI reference</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/hardware-validation.md">Hardware validation</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/camera-compatibility.md">Camera compatibility</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md">FFmpeg build and licensing</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/release.md">Release process</a></li></ul></div>
+      <div><h4>Documentation</h4><ul><li><a href="https://github.com/capturefab/capturefab#readme">CLI reference</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md">FFmpeg build and licensing</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/release.md">Release process</a></li></ul></div>
       <div><h4>For agents</h4><ul><li><a href="agents.md">Agent instructions</a></li><li><a href="llms.txt">llms.txt</a></li><li><a href="releases.json">Release manifest</a></li></ul></div>
     </footer>
   </div>

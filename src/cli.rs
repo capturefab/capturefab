@@ -228,7 +228,7 @@ pub enum Command {
         #[arg(long,default_value_t=1,value_parser=clap::value_parser!(u32).range(1..=16))]
         screenshot_cameras: u32,
     },
-    /// Discover GigE Vision and USB3 Vision cameras
+    /// Discover GigE Vision, USB3 Vision, ONVIF and host cameras
     #[command(visible_aliases=["list","cameras"])]
     Discover,
     /// Show camera identity and all readable features
@@ -1348,6 +1348,8 @@ pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
         || s.contains("not responding")
         || s.contains("already connected")
         || s.contains("controlled by another application")
+        || s.contains("camera access denied")
+        || s.contains("camera is in use by another application")
     {
         ("unavailable", 3)
     } else {

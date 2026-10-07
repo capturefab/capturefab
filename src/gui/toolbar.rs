@@ -50,17 +50,19 @@ impl Workbench {
         let status: Element<'_, Message> = if let Some((message, error, at)) = &self.notice {
             let alpha = self.notice_alpha(*at, *error);
             let color = fade(if *error { p.danger } else { p.secondary }, alpha);
-            row![
-                icon(
-                    if *error { Icon::Warning } else { Icon::Check },
-                    13.0,
-                    fade(if *error { p.danger } else { p.live }, alpha),
-                ),
-                clipped(text(message.clone()).size(style::SMALL).color(color)),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center)
-            .into()
+            tip(
+                row![
+                    icon(
+                        if *error { Icon::Warning } else { Icon::Check },
+                        13.0,
+                        fade(if *error { p.danger } else { p.live }, alpha),
+                    ),
+                    clipped(text(message.clone()).size(style::SMALL).color(color)),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+                message.clone(),
+            )
         } else if let Some(pending) = self.pending.first() {
             row![
                 dot(fade(p.accent, self.pulse()), 6.0),

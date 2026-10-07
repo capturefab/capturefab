@@ -4,7 +4,7 @@ A camera workbench with a native iced desktop and a scriptable CLI. Open `captur
 
 Capturefab is MIT-licensed. Its GigE Vision, USB3 Vision and GenICam implementation is Rust; media decoding, host-driver camera access and encoding use a bundled, source-built FFmpeg executable. Release binaries require no separately installed Aravis, FFmpeg, libusb, vendor SDK or Python. Operating-system graphics and camera drivers remain necessary.
 
-This is an initial implementation, not complete Aravis or vendor-SDK feature parity. Real Basler GigE acquisition and Aravis simulator interoperability have been tested. USB3 Vision, ONVIF hardware and Windows hardware remain validation targets. See [hardware validation](docs/hardware-validation.md) and [camera compatibility](docs/camera-compatibility.md).
+This is an initial implementation, not complete Aravis or vendor-SDK feature parity. The software is under rapid development; camera support and behavior may change between releases.
 
 ## Start here
 
@@ -163,7 +163,7 @@ The `jpeg` feature, enabled in both builds above, compiles libjpeg-turbo from so
 
 The release tooling uses SemVer, a cross-platform build matrix, checksums, authenticated signing, actual rendered GUI and terminal screenshots, GitHub Releases and a static site on Cloudflare Workers with an Atom feed. Build tools are development dependencies; they are not runtime dependencies. Platform-specific signing credentials are optional configuration, not keys fabricated by this repository. See the release scripts and workflows for the exact configured build matrix.
 
-Local automated verification includes public CLI calls, isolated camera subprocesses, shared-memory cleanup, concurrent acquisition, scheduling, retention, ONVIF HTTP/auth mocks and media decoding/encoding. The [hardware validation report](docs/hardware-validation.md) separates these from actual camera tests. Aravis is used only as an independent test simulator/reference, never linked into Capturefab.
+Local automated verification includes public CLI calls, isolated camera subprocesses, shared-memory cleanup, concurrent acquisition, scheduling, retention, ONVIF HTTP/auth mocks and media decoding/encoding. Aravis is used only as an independent test simulator/reference, never linked into Capturefab.
 
 ## License
 

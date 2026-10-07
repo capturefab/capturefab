@@ -644,6 +644,7 @@ pub fn resolve(
     let doc = xml_document(&profiles)?;
     let mut result = Vec::new();
     let mut names = BTreeSet::new();
+    let mut stream_error = None;
     for node in doc
         .descendants()
         .filter(|n| n.is_element() && n.tag_name().name() == "Profiles")
@@ -674,29 +675,43 @@ pub fn resolve(
             "<trt:GetStreamUri><trt:StreamSetup><tt:Stream>RTP-Unicast</tt:Stream><tt:Transport><tt:Protocol>RTSP</tt:Protocol></tt:Transport></trt:StreamSetup><trt:ProfileToken>{}</trt:ProfileToken></trt:GetStreamUri>",
             escape(token)
         );
-        let stream = soap(
-            &media,
-            MEDIA_NS,
-            "GetStreamUri",
-            &content,
-            credentials,
-            timeout,
-        )?;
-        let stream = xml_document(&stream)?;
-        let uri = stream
-            .descendants()
-            .find(|n| n.is_element() && n.tag_name().name() == "Uri")
-            .and_then(|n| n.text())
-            .context("ONVIF GetStreamUri returned no URI")?
-            .trim()
-            .to_string();
-        ensure!(
-            matches!(
-                uri.split(':').next(),
-                Some("rtsp" | "rtsps" | "http" | "https")
-            ),
-            "ONVIF camera returned an unsupported streaming URI"
-        );
+        // Cameras may advertise stale or non-streamable profiles alongside usable
+        // ones. A failed profile must not hide the remaining streams. Explicit
+        // selection still reports that profile's original error.
+        let uri = (|| -> Result<String> {
+            let stream = soap(
+                &media,
+                MEDIA_NS,
+                "GetStreamUri",
+                &content,
+                credentials,
+                timeout,
+            )?;
+            let stream = xml_document(&stream)?;
+            let uri = stream
+                .descendants()
+                .find(|n| n.is_element() && n.tag_name().name() == "Uri")
+                .and_then(|n| n.text())
+                .context("ONVIF GetStreamUri returned no URI")?
+                .trim()
+                .to_string();
+            ensure!(
+                matches!(
+                    uri.split(':').next(),
+                    Some("rtsp" | "rtsps" | "http" | "https")
+                ),
+                "ONVIF camera returned an unsupported streaming URI"
+            );
+            Ok(uri)
+        })();
+        let uri = match uri {
+            Ok(uri) => uri,
+            Err(error) if profile.is_some() => return Err(error),
+            Err(error) => {
+                stream_error = Some(error);
+                continue;
+            }
+        };
         result.push(OnvifStream {
             token: token.into(),
             name,
@@ -705,6 +720,11 @@ pub fn resolve(
             height,
             uri,
         });
+    }
+    if result.is_empty()
+        && let Some(error) = stream_error
+    {
+        return Err(error.context("ONVIF camera exposes no usable Media1 stream profiles"));
     }
     ensure!(
         !result.is_empty(),
@@ -807,15 +827,33 @@ fn authenticated_uri(uri: &str, credentials: Option<&Credentials>) -> Result<Str
         &rest[end..]
     ))
 }
+/// Try profiles in the camera's advertised order. Opening a media source reads
+/// its first frame, so success establishes that this stream can actually decode.
+fn open_stream<T>(
+    streams: &[OnvifStream],
+    mut open: impl FnMut(&OnvifStream) -> Result<T>,
+) -> Result<(&OnvifStream, T)> {
+    let mut last_error = None;
+    for stream in streams {
+        match open(stream) {
+            Ok(backend) => return Ok((stream, backend)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("ONVIF camera exposes no stream profiles")))
+        .context("could not open any ONVIF stream profile")
+}
+
 pub fn connect(
     source: &str,
     timeout: Duration,
 ) -> Result<(crate::types::CameraInfo, Box<dyn crate::types::Backend>)> {
     let (endpoint, credentials) = source_endpoint(source)?;
     let streams = resolve(&endpoint, credentials.as_ref(), None, timeout)?;
-    let profile = &streams[0];
-    let uri = authenticated_uri(&profile.uri, credentials.as_ref())?;
-    let backend = crate::media::open_url(&uri, timeout)?;
+    let (profile, backend) = open_stream(&streams, |profile| {
+        let uri = authenticated_uri(&profile.uri, credentials.as_ref())?;
+        crate::media::open_url(&uri, timeout)
+    })?;
     let safe_endpoint = crate::media::redact_url(&endpoint);
     let hash = safe_endpoint.bytes().fold(0xcbf29ce484222325u64, |h, b| {
         (h ^ b as u64).wrapping_mul(0x100000001b3)
@@ -1033,6 +1071,127 @@ mod tests {
             (streams[0].width, streams[0].height),
             (Some(640), Some(480))
         );
+    }
+    #[test]
+    fn connection_tries_streams_until_one_decodes() {
+        let streams =
+            ["unreachable", "unsupported", "working", "unused"].map(|token| OnvifStream {
+                token: token.into(),
+                name: token.into(),
+                encoding: None,
+                width: None,
+                height: None,
+                uri: format!("rtsp://camera/{token}"),
+            });
+        let mut attempts = Vec::new();
+        let (profile, backend) = open_stream(&streams, |stream| {
+            attempts.push(stream.token.clone());
+            match stream.token.as_str() {
+                "working" => Ok(42),
+                "unsupported" => bail!("unsupported codec"),
+                _ => bail!("connection timed out"),
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, ["unreachable", "unsupported", "working"]);
+        assert_eq!(profile.token, "working");
+        assert_eq!(backend, 42);
+
+        let error = open_stream::<()>(&streams[..2], |_| bail!("decoder failed")).unwrap_err();
+        assert_eq!(error.to_string(), "could not open any ONVIF stream profile");
+        assert_eq!(error.root_cause().to_string(), "decoder failed");
+        assert!(open_stream::<()>(&[], |_| unreachable!()).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg and permission to bind localhost sockets"]
+    fn ffmpeg_connection_falls_back_to_decodable_profile() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let streams = ["broken", "working"].map(|token| OnvifStream {
+            token: token.into(),
+            name: token.into(),
+            encoding: None,
+            width: None,
+            height: None,
+            uri: format!("http://{address}/{token}"),
+        });
+        let server = std::thread::spawn(move || {
+            for path in ["/broken", "/working"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&stream);
+                let request = read_line(&mut reader, 4096).unwrap();
+                assert!(std::str::from_utf8(&request).unwrap().contains(path));
+                while read_line(&mut reader, 8192).unwrap() != b"\r\n" {}
+                drop(reader);
+                if path == "/broken" {
+                    write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                } else {
+                    let mut ppm = b"P6\n16 16\n255\n".to_vec();
+                    ppm.extend(vec![127; 16 * 16 * 3]);
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: image/x-portable-pixmap\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", ppm.len()).unwrap();
+                    stream.write_all(&ppm).unwrap();
+                }
+            }
+        });
+        let (profile, mut backend) = open_stream(&streams, |profile| {
+            crate::media::open_url(&profile.uri, Duration::from_secs(3))
+        })
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(profile.token, "working");
+        backend.start(16 * 16 * 3).unwrap();
+        let frame = backend.next_frame(Duration::from_secs(3)).unwrap();
+        assert_eq!((frame.width, frame.height), (16, 16));
+        assert_eq!(frame.data, vec![127; 16 * 16 * 3]);
+        backend.stop().unwrap();
+    }
+
+    #[test]
+    fn profile_failures_do_not_hide_usable_streams() {
+        // Exercise failures both before and after a usable profile, explicit
+        // selection, and the all-failed case through the actual SOAP transport.
+        for (selected, usable) in [(None, true), (Some("broken"), true), (None, false)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/service", listener.local_addr().unwrap());
+            let media = endpoint.clone();
+            let server = std::thread::spawn(move || {
+                let count = if selected.is_some() { 3 } else { 5 };
+                for _ in 0..count {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let (_, headers, body) = mock_request(&stream);
+                    let response = if headers["soapaction"].contains("GetCapabilities") {
+                        format!("<Envelope><Media><XAddr>{media}</XAddr></Media></Envelope>")
+                    } else if headers["soapaction"].contains("GetProfiles") {
+                        "<Envelope><Profiles token='broken'/><Profiles token='main'/><Profiles token='stale'/></Envelope>".into()
+                    } else if body.contains("<trt:ProfileToken>main</trt:ProfileToken>") && usable {
+                        "<Envelope><Uri>rtsp://camera/live</Uri></Envelope>".into()
+                    } else {
+                        "<Envelope><Fault><Reason><Text>No stream available</Text></Reason></Fault></Envelope>".into()
+                    };
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+                }
+            });
+            let result = resolve(&endpoint, None, selected, Duration::from_secs(2));
+            server.join().unwrap();
+            if selected.is_none() && usable {
+                let streams = result.unwrap();
+                assert_eq!(streams.len(), 1);
+                assert_eq!(streams[0].token, "main");
+                assert_eq!(streams[0].uri, "rtsp://camera/live");
+            } else {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(error.contains("No stream available"), "{error}");
+                assert_eq!(error.contains("no usable Media1"), selected.is_none());
+            }
+        }
     }
     #[test]
     fn soap_http_basic_and_timeout() {

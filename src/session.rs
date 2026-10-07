@@ -323,6 +323,7 @@ struct Coordinator {
     pending: AtomicUsize,
     connecting: Mutex<()>,
     poller: OnceLock<std::thread::Thread>,
+    discovery_logs: Mutex<Vec<LogEntry>>,
 }
 impl Drop for Coordinator {
     fn drop(&mut self) {
@@ -370,6 +371,7 @@ impl SessionHandle {
                 pending: AtomicUsize::new(0),
                 connecting: Mutex::new(()),
                 poller: OnceLock::new(),
+                discovery_logs: Mutex::new(Vec::new()),
             }),
         };
         let weak = Arc::downgrade(&h.inner);
@@ -468,6 +470,19 @@ impl SessionHandle {
             state.auto = None;
             state.transport = None;
         }
+        // Active worker snapshots replace their own logs. Keep discovery
+        // diagnostics independently so connecting a camera cannot erase them.
+        for entry in locked(&self.inner.discovery_logs).iter() {
+            if !state.logs.iter().any(|existing| {
+                existing.time == entry.time
+                    && existing.level == entry.level
+                    && existing.message == entry.message
+            }) {
+                state.logs.push(entry.clone());
+            }
+        }
+        let excess = state.logs.len().saturating_sub(200);
+        state.logs.drain(..excess);
         state
     }
     fn target(&self, target: Option<&str>) -> Result<Arc<Mutex<Process>>> {
@@ -619,11 +634,20 @@ impl SessionHandle {
                 );
                 let (devices, warnings) =
                     crate::camera::discover(Duration::from_millis(timeout_ms), simulated)?;
-                self.inner
-                    .state
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .devices = devices.clone();
+                {
+                    let mut state = self.inner.state.write().unwrap_or_else(|e| e.into_inner());
+                    state.devices = devices.clone();
+                    let mut logs = locked(&self.inner.discovery_logs);
+                    for warning in &warnings {
+                        logs.push(LogEntry {
+                            time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                            level: "warn".into(),
+                            message: warning.clone(),
+                        });
+                    }
+                    let excess = logs.len().saturating_sub(200);
+                    logs.drain(..excess);
+                }
                 Ok(json!({"devices":devices,"warnings":warnings}))
             }
             SessionCommand::Connect { camera, timeout_ms } => {

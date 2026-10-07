@@ -72,11 +72,11 @@ capturefab --camera 'onvif:http://camera/onvif/device_service' capture -o onvif.
 capturefab native --json
 ```
 
-ONVIF locators with credentials use `onvif://USER:PASS@HOST[:PORT]/onvif/device_service`; percent-encode reserved characters in the user name or password. Published session metadata redacts credentials. ONVIF SOAP currently supports HTTP, WS UsernameToken PasswordDigest, and HTTP Basic/Digest authentication. HTTPS SOAP and Media2-only devices are not supported by this implementation. Actual camera coverage is recorded separately in the validation document.
+ONVIF locators with credentials use `onvif://USER:PASS@HOST[:PORT]/onvif/device_service`; percent-encode reserved characters in the user name or password. Published session metadata redacts credentials. ONVIF SOAP currently supports HTTP, WS UsernameToken PasswordDigest, and HTTP Basic/Digest authentication. HTTPS SOAP and Media2-only devices are not supported by this implementation.
 
 Native camera locators are `avfoundation:0` on macOS, `v4l2:/dev/video0` on Linux, and `dshow:video=Camera Name` on Windows. CSI cameras require an operating system driver exposing a suitable V4L2 device. Native enumeration and capture may require operating system camera permissions.
 
-Native locators accept `?size=WIDTHxHEIGHT&fps=RATE`. Inspect `features` for advertised `VideoMode` choices and set a supported mode, `Width`, `Height`, or `AcquisitionFrameRate` before acquisition; stop a live session before changing them. V4L2 format listings do not establish frame-rate bounds. GigE transport status includes packet size, receive buffer, bounded resend and loss counters; resend recovery has been validated on a physical Basler GigE camera (see docs/hardware-validation.md).
+Native locators accept `?size=WIDTHxHEIGHT&fps=RATE`. Inspect `features` for advertised `VideoMode` choices and set a supported mode, `Width`, `Height`, or `AcquisitionFrameRate` before acquisition; stop a live session before changing them. V4L2 format listings do not establish frame-rate bounds. GigE transport status includes packet size, receive buffer, bounded resend and loss counters.
 
 Media inputs and forwarding use bundled FFmpeg in release builds. Inspect `capturefab ffmpeg --json` to see the actual build's protocols and encoders. SRT support depends on the bundled FFmpeg configuration.
 

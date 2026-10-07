@@ -3,9 +3,7 @@
 Capturefab chooses an input transport, rather than assuming every camera speaks
 GenICam. The commands below capture from operating system camera devices and
 network streams as well as industrial cameras. Run `capturefab doctor --json` and
-`capturefab ffmpeg --json` to inspect the installed build's capabilities. The
-[hardware validation record](hardware-validation.md) distinguishes device tests
-from protocol and simulated tests.
+`capturefab ffmpeg --json` to inspect the installed build's capabilities. Camera support and behavior may change between releases during rapid development.
 
 | Camera connection | Capturefab path | Configuration available today |
 | --- | --- | --- |
@@ -25,6 +23,13 @@ does not require Aravis, libusb, a separately installed FFmpeg, or a camera vend
 SDK in a release containing the matching embedded FFmpeg.
 
 ## Built-in cameras and capture devices
+
+General discovery runs network and host camera enumeration concurrently. If a
+host backend cannot launch, is missing from FFmpeg, or times out, `capturefab
+discover --json` retains other results and reports the failure in `warnings`.
+The desktop keeps these warnings visible in its status notice and activity log;
+hover over a clipped notice to read the full message. For slow host enumeration,
+retry with a larger `--timeout-ms`.
 
 List native camera locators first:
 
@@ -55,8 +60,12 @@ Native locators accept optional `size` and `fps`, for example
 device's supported `VideoMode` choices, then use `--set VideoMode=WIDTHxHEIGHT@FPS`
 for capture or `set VideoMode=...` in a stopped persistent session. AVFoundation
 choices reflect frame rates the bundled FFmpeg input honors; V4L2 lists dimensions
-without frame-rate bounds, so its driver still determines accepted rates.
+without frame-rate bounds, so its driver still determines accepted rates. V4L2
+keeps sizes advertised across raw and compressed inputs and selects the matching
+input format when the mode changes; when both offer the same size, raw is preferred.
 Unavailable cameras report permission, busy, or frame timeout diagnostics.
+Discovered host and ONVIF devices can also be selected by their unique serial;
+Capturefab uses the discovered locator and the matching transport to open them.
 
 ## Raspberry Pi and Jetson CSI cameras
 
@@ -101,6 +110,16 @@ USB tethering commands or make its exposure controls into GenICam features.
 Other DSLR and mirrorless models may provide clean HDMI, a native UVC mode, a
 vendor webcam driver, or a network stream; use whichever documented route is
 actually exposed by that model and operating system.
+
+## ONVIF stream profiles
+
+Automatic ONVIF resolution tries every advertised Media1 profile and returns the
+ones with usable stream URIs. A failed profile does not prevent connection through
+another profile. When inspecting a specific profile with `capturefab onvif resolve
+http://HOST/onvif/device_service --profile TOKEN`, its failure is reported directly. If no profile resolves, the
+error includes the last stream-resolution failure. Connecting automatically tries
+resolved streams in the camera's advertised order until one supplies a decodable
+frame. If every stream fails to open, the error retains the last opening failure.
 
 ## Storage and acceleration
 
