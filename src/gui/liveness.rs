@@ -190,6 +190,12 @@ impl Liveness {
         self.lost = lost;
     }
 
+    /// Whether a frame was counted or reached the screen after `at`, in
+    /// this stream: a stream just started has shown none yet.
+    pub(super) fn framed_since(&self, at: Instant) -> bool {
+        self.frame_at > at && self.frame_at > self.started
+    }
+
     /// Read as silent since `at` with fresh counters, for a screenshot
     /// scene that holds the camera still.
     pub(super) fn silent_since(&mut self, at: Instant) {
@@ -330,6 +336,7 @@ pub(super) fn streaming_camera(frames: u64, dropped: u64, fps: f64) -> CameraSna
         transport: None,
         ring_dropped: 0,
         stale: false,
+        error_logged: None,
     }
 }
 

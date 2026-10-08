@@ -515,6 +515,9 @@ enum Message {
     ToggleActivity,
     /// Open the activity log; never closes it.
     ShowActivity,
+    /// Open the activity log on a camera's log, by camera ID: it shows only
+    /// the selected camera's, so this selects the camera first.
+    CameraActivity(String),
     CopyLog,
     CopySessionCommand,
     Copy(String),
@@ -560,7 +563,7 @@ enum Message {
     FocusTile(String),
     CaptureCamera(String),
     DismissNotice,
-    /// Hide a camera's error badge, by camera ID, until its error changes.
+    /// Hide a camera's error badge, by camera ID, until the error recurs.
     DismissStageError(String),
     /// The guide's body scrolled away from its top, or back.
     HelpScrolled(bool),
@@ -1559,7 +1562,7 @@ impl Workbench {
             self.zoom
         };
         self.fit = false;
-        self.zoom = (from * factor).clamp(0.1, 8.0);
+        self.zoom = (from * factor).clamp(stage::ZOOM_MIN, stage::ZOOM_MAX);
     }
 
     fn storage_policy(&self) -> StoragePolicy {
@@ -1788,13 +1791,24 @@ impl Workbench {
                 self.focus.reset();
                 self.remeasure();
             }
-            Message::FocusMetric(metric) => self.focus.metric = metric,
+            Message::FocusMetric(metric) => self.focus.set_metric(metric),
             Message::ResetFocusPeak => {
                 self.focus.reset();
                 self.remeasure();
             }
             Message::ToggleActivity => self.logs_open = !self.logs_open,
-            Message::ShowActivity => self.logs_open = true,
+            // Image mode hides the log, so showing it leaves image mode.
+            Message::ShowActivity => {
+                self.logs_open = true;
+                self.image_mode = false;
+            }
+            Message::CameraActivity(camera) => {
+                self.logs_open = true;
+                self.image_mode = false;
+                if self.snapshot.active_camera.as_ref() != Some(&camera) {
+                    self.send(Job::Select, SessionCommand::Select { camera });
+                }
+            }
             Message::CopyLog => {
                 self.note_copied(notice::COPIED_LOG);
                 return iced::clipboard::write(
@@ -2270,6 +2284,11 @@ mod tests {
         bench.logs_open = true;
         let _ = bench.handle_message(Message::ShowActivity);
         assert!(bench.logs_open, "stays open");
+        // The log has no room in image mode, so showing it leaves.
+        bench.logs_open = false;
+        bench.image_mode = true;
+        let _ = bench.handle_message(Message::ShowActivity);
+        assert!(bench.logs_open && !bench.image_mode);
         bench.image_mode = true;
         bench.width = 1280.0;
         bench.inspector_open = false;

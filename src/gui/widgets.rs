@@ -470,8 +470,8 @@ pub(super) fn stream_button<'a>(
 }
 
 pub(super) fn last_frame<'a, M: 'a>() -> Element<'a, M> {
-    container(text("Last frame").size(style::CAPTION).font(style::MEDIUM))
-        .padding([3, 8])
+    container(text("Last frame").size(style::SMALL))
+        .padding([2, 8])
         .style(style::badge)
         .into()
 }

@@ -23,6 +23,7 @@ pub(super) fn one_line<'a>(
         color,
         width: Length::Shrink,
         align_x: text::Alignment::Default,
+        yields: false,
     }
 }
 
@@ -33,11 +34,21 @@ pub(super) struct OneLine<'a> {
     color: Color,
     width: Length,
     align_x: text::Alignment,
+    /// See `yield_room`.
+    yields: bool,
 }
 
 impl OneLine<'_> {
     pub(super) fn width(mut self, width: impl Into<Length>) -> Self {
         self.width = width.into();
+        self
+    }
+
+    /// In a row, takes only the room the items beside it leave, so it is
+    /// what gets cut, yet stays as wide as its text, so the items after it
+    /// still follow right after. The row must be free to fill its room.
+    pub(super) fn yield_room(mut self) -> Self {
+        self.yields = true;
         self
     }
 
@@ -132,7 +143,13 @@ where
     }
 
     fn size(&self) -> Size<Length> {
-        Size::new(self.width, Length::Shrink)
+        // Fluid, so a row lays it out after the items that are not.
+        let width = if self.yields {
+            Length::Fill
+        } else {
+            self.width
+        };
+        Size::new(width, Length::Shrink)
     }
 
     fn layout(
@@ -156,9 +173,8 @@ where
                 wrapping: text::Wrapping::None,
             })
         };
-        layout::sized(limits, self.width, Length::Shrink, |limits| {
-            let room = limits.max().width;
-            let content: &str = &self.content;
+        let content: &str = &self.content;
+        let mut fitted = |room: f32| {
             let fresh = state.content != content
                 || state.size != size
                 || state.font != font
@@ -195,6 +211,14 @@ where
                 state.paragraph.min_width(),
                 text::LineHeight::default().to_absolute(Pixels(size)).0,
             )
+        };
+        if self.yields {
+            // A row gives a fluid item all the room left as its minimum
+            // too; the text takes only its own width of it.
+            return layout::Node::new(fitted(limits.max().width));
+        }
+        layout::sized(limits, self.width, Length::Shrink, |limits| {
+            fitted(limits.max().width)
         })
     }
 
