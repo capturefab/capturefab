@@ -2,6 +2,76 @@
 use super::*;
 use iced::widget::column;
 
+/// How many failed connect targets the camera list remembers.
+const FAILURES_KEPT: usize = 8;
+
+/// The sidebar-welcome package's own state: the camera list and the welcome
+/// screen. Add fields here, register their motions below and point them in
+/// `sync_side`.
+#[derive(Default)]
+pub(super) struct SideState {
+    /// The last discovery's problems, each in full: its warnings, or the
+    /// error it failed with. Replaced whenever a discovery finishes.
+    #[allow(dead_code)] // adopted by the sidebar-welcome package
+    pub(super) discovery_issues: Vec<String>,
+    /// Connect targets (IDs or addresses) whose last attempt failed, with
+    /// the whole error and when. Kept by `failed()`; a retry, a success or
+    /// editing the address clears one.
+    pub(super) connect_failures: HashMap<String, (String, Instant)>,
+}
+
+impl SideState {
+    super::motion::registry! {
+        motions: [],
+        flashes: [],
+    }
+
+    /// Keep `error` for `target`, forgetting the oldest beyond `FAILURES_KEPT`.
+    pub(super) fn connect_failed(&mut self, target: &str, error: String, now: Instant) {
+        self.connect_failures
+            .insert(target.to_owned(), (error, now));
+        while self.connect_failures.len() > FAILURES_KEPT {
+            let Some(oldest) = self
+                .connect_failures
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(target, _)| target.clone())
+            else {
+                break;
+            };
+            self.connect_failures.remove(&oldest);
+        }
+    }
+}
+
+/// The sidebar-welcome package's hooks into the shared update cycle; empty
+/// until it needs them.
+impl Workbench {
+    /// Point the sidebar-welcome package's motions at what they show; from
+    /// `sync_animations`.
+    pub(super) fn sync_side(&mut self) {}
+
+    /// The sidebar-welcome package's bookkeeping on the slow tick, after the
+    /// snapshot refresh; from `tick()`.
+    pub(super) fn tick_side(&mut self) {}
+
+    /// A command finished, after the shared bookkeeping (`finished`,
+    /// `failed`) and before its notice; from `settle()`.
+    pub(super) fn result_side(
+        &mut self,
+        _pending: &Pending,
+        _result: &anyhow::Result<serde_json::Value>,
+    ) {
+    }
+
+    /// Take a screenshot scene word the sidebar-welcome package owns: `late` is
+    /// false while the scene is set up and true once its cameras stream.
+    /// Returns whether the word was taken; see `apply_scene`.
+    pub(super) fn scene_side(&mut self, _word: &str, _late: bool) -> bool {
+        false
+    }
+}
+
 impl Workbench {
     pub(super) fn sidebar(&self, p: &'static Palette) -> Element<'_, Message> {
         let mut devices: Vec<&CameraInfo> = self.snapshot.devices.iter().collect();
@@ -230,6 +300,7 @@ impl Workbench {
             Appearance::Light => (Icon::Sun, "Appearance: light"),
             Appearance::Dark => (Icon::Moon, "Appearance: dark"),
         };
+        let session_copied = self.copied.is_some() && self.just_copied(&self.session_command());
         let footer = column![
             text_input("Add camera, IP or stream URL", &self.address)
                 .id("connect-address")
@@ -256,14 +327,22 @@ impl Workbench {
                     appearance.1,
                 ),
                 tip(
-                    button(icon(Icon::Copy, 15.0, p.secondary))
-                        .padding(6)
-                        .style(style::plain)
-                        .on_press(Message::CopySessionCommand),
-                    Action::CopySessionCommand.hint(
-                        "Copy a command that controls this visible session",
-                        Os::CURRENT,
-                    ),
+                    button(if session_copied {
+                        icon(Icon::Check, 15.0, p.live)
+                    } else {
+                        icon(Icon::Copy, 15.0, p.secondary)
+                    })
+                    .padding(6)
+                    .style(style::plain)
+                    .on_press(Message::CopySessionCommand),
+                    if session_copied {
+                        "Copied".to_owned()
+                    } else {
+                        Action::CopySessionCommand.hint(
+                            "Copy a command that controls this visible session",
+                            Os::CURRENT,
+                        )
+                    },
                 ),
                 tip(
                     button(icon(Icon::Help, 15.0, p.secondary))

@@ -30,6 +30,37 @@ pub(super) struct Scene {
     late: Vec<String>,
     /// Keep the scene's pending commands from ever finishing.
     held: Vec<mpsc::Sender<Result<serde_json::Value>>>,
+    /// What the selected camera reports as forwarding to, whatever it does.
+    forwarding: Option<String>,
+    /// The selected camera reports that it stopped streaming.
+    stopped: bool,
+    /// Turn on auto mode on every camera as the streams start.
+    pub(super) auto: bool,
+}
+
+impl Scene {
+    /// Make the snapshot say what the scene holds in place; from `tick()`
+    /// after every refresh, so it never reverts.
+    pub(super) fn patch(&self, snapshot: &mut SessionSnapshot) {
+        if self.forwarding.is_none() && !self.stopped {
+            return;
+        }
+        let active = snapshot.active_camera.clone();
+        let selected = snapshot
+            .cameras
+            .iter_mut()
+            .filter(|camera| Some(&camera.info.id) == active.as_ref());
+        for camera in selected {
+            if self.forwarding.is_some() {
+                camera.forwarding = self.forwarding.clone();
+            }
+            camera.streaming &= !self.stopped;
+        }
+        if self.forwarding.is_some() {
+            snapshot.forwarding = self.forwarding.clone();
+        }
+        snapshot.streaming &= !self.stopped;
+    }
 }
 
 /// An error long enough to test that notices stay on one line.
@@ -47,12 +78,24 @@ impl Workbench {
     ///   warnings), `error`, `notice-long` (an error too long for the bar)
     /// - activity: `searching` (with `welcome`: discovery never finishes),
     ///   `pending` (stopping the selected camera's stream never finishes),
-    ///   `saved` (the selected camera just saved a capture), `copied`
-    ///   (the session command was just copied), `stalled` (the selected
-    ///   camera's frames stopped arriving)
+    ///   `starting` (the selected camera stopped, and starting it never
+    ///   finishes), `saved` (the selected camera just saved a capture),
+    ///   `copied` (the session command was just copied), `stalled` (the
+    ///   selected camera's frames stopped arriving), `auto` (every camera in
+    ///   auto mode), `forwarding` (the selected camera forwards to a URL),
+    ///   `recording` (the selected camera records to a file)
+    /// - failures: `write-error` (setting the selected camera's exposure
+    ///   time was refused) and `connect-failed` (connecting to a typed
+    ///   address failed), each with its error notice; `editor` (the S3
+    ///   bucket editor open, its save refused for a missing field)
+    ///
+    /// Other words go to each area's `scene_*` hook, first as the scene is
+    /// set up and, if no area took them, again once the cameras stream.
     pub(super) fn apply_scene(&mut self, scene: &[&str]) {
         for word in scene {
             match *word {
+                // Taken by `run_capture`, which then connects no cameras.
+                "welcome" => {}
                 "help" => self.help_open = true,
                 "capture" => self.tab = Tab::Capture,
                 "forward" => self.tab = Tab::Forward,
@@ -77,16 +120,17 @@ impl Workbench {
                     "Saving capture",
                     &Ok(json!({"files": ["capture-0001.png"], "count": 1})),
                 )),
-                "warning" => self.scene_notice(command_notice(
-                    "Discovering cameras",
-                    &Ok(json!({
+                // Settled, so the discovery's issues are kept as well.
+                "warning" => self.scene_settle(
+                    unanswered("Discovering cameras"),
+                    Ok(json!({
                         "devices": [{"id": "sim:0"}],
                         "warnings": [
                             "USB discovery: access denied; check the device permissions",
                             "Native camera discovery worker stopped",
                         ],
                     })),
-                )),
+                ),
                 "error" => self.scene_notice(command_notice(
                     "Saving capture",
                     &Err(anyhow::anyhow!("the camera stopped responding")),
@@ -97,9 +141,59 @@ impl Workbench {
                 )),
                 "searching" => self.hold("Discovering cameras", None),
                 "stalled" => self.scene.stalled = true,
-                "saved" | "copied" | "pending" => self.scene.late.push((*word).into()),
-                _ => {}
+                "auto" => self.scene.auto = true,
+                "forwarding" => {
+                    self.scene.forwarding =
+                        Some("rtsp://operator:secret@192.168.1.20:8554/line-1".into())
+                }
+                "recording" => self.scene.forwarding = Some("recordings/line-1.mkv".into()),
+                "connect-failed" => {
+                    let target = "192.168.10.50";
+                    self.address = target.into();
+                    self.scene_settle(
+                        Pending {
+                            target: Some(target.into()),
+                            ..unanswered("Connecting camera")
+                        },
+                        Err(anyhow::anyhow!(
+                            "no GigE Vision camera answered at 192.168.10.50 within 5 s"
+                        )),
+                    );
+                }
+                "editor" => {
+                    self.capture_to
+                        .update(destinations::Message::OpenManager, &mut self.output);
+                    self.capture_to
+                        .update(destinations::Message::AddBucket, &mut self.output);
+                    self.capture_to
+                        .update(destinations::Message::Save, &mut self.output);
+                }
+                "saved" | "copied" | "pending" | "starting" | "write-error" => {
+                    self.scene.late.push((*word).into())
+                }
+                word if self.area_scene(word, false) => {}
+                word => self.scene.late.push(word.into()),
             }
+        }
+    }
+
+    /// Offer a scene word to each area's hook; whether one took it.
+    fn area_scene(&mut self, word: &str, late: bool) -> bool {
+        self.scene_chrome(word, late)
+            || self.scene_side(word, late)
+            || self.scene_stage(word, late)
+            || self.scene_inspector(word, late)
+            || self.scene_sheets(word, late)
+    }
+
+    /// Settle `pending` with `result`, as if it had just finished, and keep
+    /// its notice for the scene.
+    fn scene_settle(&mut self, pending: Pending, result: Result<serde_json::Value>) {
+        self.scene.notice = false;
+        self.settle(&pending, &result);
+        if self.notice.is_some() {
+            self.notice_shown.set(1.0);
+            self.scene.notice = true;
         }
     }
 
@@ -113,18 +207,36 @@ impl Workbench {
                     self.last_saved = Saved::from_result(camera.clone(), &result, self.now);
                     self.scene_notice(command_notice("Saving capture", &Ok(result)));
                 }
-                "copied" => {
-                    self.note_copied(self.session_command());
-                    self.scene_notice(Some(("Session command copied".into(), None, Level::Done)));
-                }
-                "pending" => {
+                // Copy buttons confirm in place, with no notice.
+                "copied" => self.note_copied(self.session_command()),
+                "pending" | "starting" => {
                     if !self.scene.notice {
                         self.notice = None;
                         self.notice_shown.set(0.0);
                     }
-                    self.hold("Stopping stream", camera.clone());
+                    if word == "starting" {
+                        self.scene.stopped = true;
+                        self.scene.patch(&mut self.snapshot);
+                        self.hold("Starting stream", camera.clone());
+                    } else {
+                        self.hold("Stopping stream", camera.clone());
+                    }
                 }
-                _ => {}
+                "write-error" => {
+                    let feature = "ExposureTime";
+                    self.edits.insert(feature.into(), "5".into());
+                    self.scene_settle(
+                        Pending {
+                            camera: camera.clone(),
+                            feature: Some(feature.into()),
+                            ..unanswered("Setting ExposureTime")
+                        },
+                        Err(anyhow::anyhow!("5 is below the minimum of 10")),
+                    );
+                }
+                word => {
+                    self.area_scene(word, true);
+                }
             }
         }
         if self.scene.stalled
@@ -154,11 +266,10 @@ impl Workbench {
         let (sender, receiver) = mpsc::channel();
         self.scene.held.push(sender);
         self.pending.push(Pending {
-            label: label.into(),
-            receiver,
-            target: None,
             camera,
-            feature: None,
+            at: self.now,
+            receiver,
+            ..unanswered(label)
         });
     }
 
@@ -208,6 +319,15 @@ impl Workbench {
                     .collect::<Vec<_>>()
                 {
                     self.send_to(&id, "Starting demo stream", SessionCommand::Start);
+                    if self.scene.auto {
+                        self.send_to(
+                            &id,
+                            "Enabling auto mode",
+                            SessionCommand::Auto {
+                                balance: Some(self.balance),
+                            },
+                        );
+                    }
                 }
                 request.streams_started = Some(Instant::now());
             } else if request
@@ -234,6 +354,19 @@ impl Workbench {
         }
         self.screenshot = Some(request);
         task
+    }
+}
+
+/// A command under `label` whose answer never comes, to fill in for a scene.
+fn unanswered(label: &str) -> Pending {
+    Pending {
+        label: label.into(),
+        receiver: mpsc::channel().1,
+        target: None,
+        camera: None,
+        feature: None,
+        at: Instant::now(),
+        batch: false,
     }
 }
 
@@ -279,6 +412,35 @@ mod tests {
         bench.observe_liveness();
         bench.frame_seen("sim:0");
         assert!(bench.stalled("sim:0").is_some(), "frames do not revive it");
+    }
+
+    #[test]
+    fn failure_and_state_words_set_up_what_they_name() {
+        let mut bench = bench();
+        bench.apply_scene(&["connect-failed", "warning", "forwarding", "starting"]);
+        assert!(bench.side.connect_failures.contains_key("192.168.10.50"));
+        assert_eq!(bench.address, "192.168.10.50");
+        assert_eq!(bench.side.discovery_issues.len(), 2);
+        assert_eq!(
+            bench.notice.as_ref().map(|n| n.level),
+            Some(Level::Error),
+            "the error stands over the later warning"
+        );
+        bench.snapshot.forwarding = None;
+        bench.scene.patch(&mut bench.snapshot);
+        assert!(bench.snapshot.forwarding.is_some());
+        assert!(bench.snapshot.cameras[0].forwarding.is_some());
+
+        bench.apply_scene(&["write-error"]);
+        bench.observe_liveness();
+        bench.stage_scene();
+        assert!(bench.pending_for("Starting stream", "sim:0"));
+        assert!(!bench.snapshot.cameras[0].streaming && !bench.snapshot.streaming);
+        assert!(bench.inspect.write_errors.contains_key("ExposureTime"));
+        assert_eq!(
+            bench.notice.as_ref().map(|n| n.text.as_str()),
+            Some("Could not set Exposure Time: 5 is below the minimum of 10")
+        );
     }
 
     #[test]

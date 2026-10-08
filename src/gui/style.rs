@@ -29,7 +29,9 @@ pub struct Palette {
     pub stage: Color,
     pub hairline: Color,
     pub text: Color,
-    /// Text that informs: hints, captions, values. At least 4.5:1 on the base.
+    /// Text that informs: hints, captions, values. At least 4.5:1 on every
+    /// panel surface, including hovered and selected rows, fields, wells,
+    /// segment tracks and gray buttons.
     pub secondary: Color,
     /// Marks that are not text: placeholders, disabled labels, chevrons and
     /// decorative icons. Below 4.5:1 (light 3.3:1 on the base, 3.0:1 on the
@@ -42,6 +44,8 @@ pub struct Palette {
     /// Filled buttons with white labels, deep enough for 4.5:1.
     pub accent_fill: Color,
     pub accent_soft: Color,
+    /// Status colors, for marks: dots, glyphs, tints and borders. Text and
+    /// small icons in them go through `ink`, which keeps them at 4.5:1.
     pub live: Color,
     pub warn: Color,
     pub danger: Color,
@@ -59,7 +63,7 @@ pub const LIGHT: Palette = Palette {
     stage: rgb(0x1A1A1C),
     hairline: rgb(0xE5E5E9),
     text: rgb(0x1D1D1F),
-    secondary: rgb(0x6E6E73),
+    secondary: rgb(0x636368),
     tertiary: rgb(0x8E8E93),
     accent: rgb(0x2F7BF5),
     accent_text: rgb(0x1F6AE0),
@@ -82,7 +86,7 @@ pub const DARK: Palette = Palette {
     stage: rgb(0x111113),
     hairline: rgb(0x343438),
     text: rgb(0xEDEDF0),
-    secondary: rgb(0x98989F),
+    secondary: rgb(0xA6A6AD),
     tertiary: rgb(0x7C7C83),
     accent: rgb(0x4C8DF8),
     accent_text: rgb(0x6AA1FA),
@@ -96,8 +100,16 @@ pub const DARK: Palette = Palette {
 };
 
 /// Everything drawn on the stage and its glass: tiles, captions, overlays and
-/// the controls floating over the image. The stage is dark in both appearances.
-pub const STAGE: &Palette = &DARK;
+/// the controls floating over the image. The stage is dark in both
+/// appearances. Its `text` and `secondary` are `ON_STAGE` and
+/// `ON_STAGE_SECONDARY`, which read over glass on a bright picture; its
+/// `tertiary` is for marks only, and glyphs that show an active state use
+/// `accent_text`, not `accent`.
+pub const STAGE: &Palette = &Palette {
+    text: ON_STAGE,
+    secondary: ON_STAGE_SECONDARY,
+    ..DARK
+};
 
 /// The strongest tint text sits on: a hovered pill or button.
 const TINT: f32 = 0.22;
@@ -110,9 +122,10 @@ impl Palette {
         Self::of(theme.extended_palette().is_dark)
     }
 
-    /// `color` for text and icons on a 12–22% tint of itself, like a status
-    /// pill or the danger button: deepened (light) or lightened (dark) just
-    /// enough to read at 4.5:1 over the base and the sidebar.
+    /// `color` for text and icons: deepened (light) or lightened (dark) just
+    /// enough to read at 4.5:1 on any panel surface (`grounds`), and on a
+    /// 12–22% tint of itself over the base or the sidebar, like a status pill
+    /// or the danger button.
     pub fn ink(&self, color: Color) -> Color {
         let toward = if self.dark {
             Color::WHITE
@@ -120,19 +133,30 @@ impl Palette {
             Color::BLACK
         };
         let tint = Color { a: 1.0, ..color };
-        let grounds = [self.base, self.sidebar].map(|surface| luminance(mix(surface, tint, TINT)));
+        let tinted = [self.base, self.sidebar].map(|surface| luminance(mix(surface, tint, TINT)));
         let mut amount = 0.0;
+        let plain = self.grounds().map(luminance);
         loop {
             let ink = Color {
                 a: color.a,
                 ..mix(tint, toward, amount)
             };
             let lum = luminance(ink);
-            if amount >= 0.6 || grounds.iter().all(|&ground| contrast(lum, ground) >= 4.5) {
+            if amount >= 0.6
+                || tinted
+                    .iter()
+                    .chain(&plain)
+                    .all(|&ground| contrast(lum, ground) >= 4.5)
+            {
                 return ink;
             }
             amount += 0.02;
         }
+    }
+
+    /// The panel surfaces text sits on plainly: base, sidebar, field and well.
+    fn grounds(&self) -> [Color; 4] {
+        [self.base, self.sidebar, self.field, well_fill(self)]
     }
 }
 
@@ -337,11 +361,19 @@ pub fn glass(shown: f32, solid: bool) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
-/// The darkening under a tile's caption, so its text reads on any image.
+/// How dark the shade under a tile's caption is, from its bottom edge (0)
+/// to its top (1): held deep across the text row, then fading out.
+const CAPTION_SHADE: [(f32, f32); 3] = [(0.0, 0.7), (0.55, 0.55), (1.0, 0.0)];
+
+/// The darkening under a tile's caption, so its text reads on any image:
+/// `STAGE.text` at 4.5:1 even over white. Secondary text there needs a
+/// `badge` behind it over bright pictures.
 pub fn caption(_theme: &Theme) -> container::Style {
-    let fade = iced::gradient::Linear::new(0.0)
-        .add_stop(0.0, alpha(Color::BLACK, 0.62))
-        .add_stop(1.0, alpha(Color::BLACK, 0.0));
+    let fade = CAPTION_SHADE
+        .iter()
+        .fold(iced::gradient::Linear::new(0.0), |fade, &(at, dark)| {
+            fade.add_stop(at, alpha(Color::BLACK, dark))
+        });
     container::Style {
         background: Some(Background::Gradient(fade.into())),
         border: Border {
@@ -375,11 +407,16 @@ pub fn edge_fade(surface: Color) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
+/// The fill of a `well`.
+fn well_fill(p: &Palette) -> Color {
+    if p.dark { p.field } else { rgb(0xF7F7F9) }
+}
+
 /// A grouped block within a panel, like the auto exposure controls.
 pub fn well(theme: &Theme) -> container::Style {
     let p = Palette::from(theme);
     container::Style {
-        background: Some(if p.dark { p.field } else { rgb(0xF7F7F9) }.into()),
+        background: Some(well_fill(p).into()),
         border: border(RADIUS_MEDIUM),
         ..container::Style::default()
     }
@@ -661,7 +698,7 @@ pub fn segment_label(lit: f32) -> impl Fn(&Theme, button::Status) -> button::Sty
 pub fn on_glass(active: bool, shown: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_theme, status| {
         let rest = if active {
-            STAGE.accent
+            STAGE.accent_text
         } else {
             ON_STAGE_SECONDARY
         };
@@ -694,6 +731,37 @@ pub fn glass_segment(
         } else {
             on_glass(false, shown)(theme, status)
         }
+    }
+}
+
+/// The groove of a segmented control on dark glass; `shown` fades it.
+pub fn glass_track(shown: f32) -> container::Style {
+    container::Style {
+        background: Some(alpha(Color::WHITE, 0.06 * shown).into()),
+        border: border(RADIUS),
+        ..container::Style::default()
+    }
+}
+
+/// The thumb of a segmented control on dark glass; `shown` fades it.
+pub fn glass_thumb(shown: f32) -> container::Style {
+    container::Style {
+        background: Some(alpha(Color::WHITE, 0.2 * shown).into()),
+        border: border(RADIUS_SMALL),
+        ..container::Style::default()
+    }
+}
+
+/// A label of a segmented control on dark glass: `lit` as for
+/// `segment_label`, `shown` fading it with its overlay.
+pub fn glass_label(lit: f32, shown: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let text = match status {
+            button::Status::Hovered | button::Status::Pressed => STAGE.text,
+            button::Status::Disabled => alpha(STAGE.text, 0.35),
+            button::Status::Active => mix(STAGE.secondary, STAGE.text, lit),
+        };
+        button_base(None, alpha(text, text.a * shown), RADIUS_SMALL)
     }
 }
 
@@ -978,10 +1046,18 @@ mod tests {
             for color in [p.live, p.warn, p.danger, p.accent, p.accent_text] {
                 let ink = p.ink(color);
                 for surface in [p.base, p.sidebar] {
-                    for amount in [0.0, 0.12, 0.14, 0.18, 0.22] {
+                    for amount in [0.12, 0.14, 0.18, 0.22] {
                         let r = ratio(ink, tint(color, amount, surface));
                         assert!(r >= 4.5, "{color:?} at {amount} (dark {}): {r:.2}", p.dark);
                     }
+                }
+                for surface in p.grounds() {
+                    let r = ratio(ink, surface);
+                    assert!(
+                        r >= 4.5,
+                        "{color:?} on {surface:?} (dark {}): {r:.2}",
+                        p.dark
+                    );
                 }
             }
         }
@@ -1009,10 +1085,49 @@ mod tests {
     #[test]
     fn secondary_text_reads_on_panels() {
         for p in [&LIGHT, &DARK] {
-            for surface in [p.base, p.sidebar] {
+            let track = if p.dark { p.field } else { rgb(0xEDEDF0) };
+            for surface in [
+                p.base,
+                p.sidebar,
+                p.hover,
+                p.selected,
+                p.field,
+                well_fill(p),
+                track,
+                gray(p),
+            ] {
                 let r = ratio(p.secondary, surface);
-                assert!(r >= 4.5, "dark {}: {r:.2}", p.dark);
+                assert!(r >= 4.5, "{surface:?} (dark {}): {r:.2}", p.dark);
             }
         }
+    }
+
+    /// `color`, perhaps translucent, as it shows over `surface`.
+    fn over(color: Color, surface: Color) -> Color {
+        tint(color, color.a, surface)
+    }
+
+    #[test]
+    fn stage_text_reads_on_glass_over_bright_pictures() {
+        for picture in [Color::WHITE, rgb(0xC0C0C0), rgb(0x808080)] {
+            let glass = over(alpha(rgb(0x1C1C1E), 0.78), picture);
+            for text in [STAGE.text, STAGE.secondary] {
+                let r = ratio(over(text, glass), glass);
+                assert!(r >= 4.5, "{text:?} over {picture:?}: {r:.2}");
+            }
+            // Active glyphs are marks: 3:1.
+            let r = ratio(STAGE.accent_text, glass);
+            assert!(r >= 3.0, "active glyph over {picture:?}: {r:.2}");
+        }
+    }
+
+    #[test]
+    fn caption_text_reads_over_white_pictures() {
+        // The text row sits around the middle of the caption's shade.
+        let [(_, bottom), (stop, held), _] = CAPTION_SHADE;
+        let dark = bottom + (held - bottom) * (0.5 / stop);
+        let shade = over(alpha(Color::BLACK, dark), Color::WHITE);
+        let r = ratio(STAGE.text, shade);
+        assert!(r >= 4.5, "{r:.2}");
     }
 }

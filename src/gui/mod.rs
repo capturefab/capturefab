@@ -49,7 +49,7 @@ use icon::{Icon, icon};
 use keys::{Action, Chord, Os};
 use liveness::Liveness;
 use motion::{Kind, Motion};
-use notice::{Level, Notice, Saved, command_notice};
+use notice::{Batch, Level, Notice, Saved, command_notice};
 use prefs::{Prefs, Recent};
 use preview::Shown;
 use scene::{Scene, ScreenshotRequest};
@@ -291,6 +291,10 @@ struct Pending {
     camera: Option<String>,
     /// The feature a write or command button acts on.
     feature: Option<String>,
+    /// When it was sent.
+    at: Instant,
+    /// One of several sent together, reported as one; see `send_batch`.
+    batch: bool,
 }
 
 /// GPU slot of the single-camera view; camera tiles use their camera IDs.
@@ -413,10 +417,16 @@ enum Message {
     FocusMetric(scopes::Metric),
     ResetFocusPeak,
     ToggleActivity,
+    /// Open the activity log; never closes it.
+    #[allow(dead_code)] // adopted by the chrome and sidebar-welcome packages
+    ShowActivity,
     CopyLog,
     CopySessionCommand,
     Copy(String),
     Tab(Tab),
+    /// Show the inspector on `Tab`, from anywhere.
+    #[allow(dead_code)] // adopted by the chrome and inspector packages
+    ShowTab(Tab),
     Search(String),
     RefreshFeatures,
     Auto(bool),
@@ -457,6 +467,19 @@ enum Message {
     CaptureCamera(String),
     #[allow(dead_code)] // adopted by the chrome package's dismiss button
     DismissNotice,
+    // Each area adds its messages under its own heading, and handles them
+    // under the same heading in `handle_message`, so areas never edit the
+    // same lines.
+
+    // Chrome: titlebar.rs, toolbar.rs
+
+    // Camera list and welcome: sidebar.rs, welcome.rs
+
+    // Stage: stage.rs, grid.rs, scopes.rs
+
+    // Inspector: inspector.rs
+
+    // Sheets: help.rs, destinations.rs
 }
 
 struct Workbench {
@@ -528,6 +551,9 @@ struct Workbench {
     /// Whether each streaming camera's frames keep coming, by camera id.
     liveness: HashMap<String, Liveness>,
     pending: Vec<Pending>,
+    /// Commands sent to several cameras at once, by label, until the last
+    /// one finishes.
+    batches: HashMap<String, Batch>,
     notice: Option<Notice>,
     notice_shown: Motion,
     /// The last value put on the clipboard, and when.
@@ -543,7 +569,6 @@ struct Workbench {
     accessibility_read: Instant,
     /// What a screenshot scene holds in place.
     scene: Scene,
-    sheet: Motion,
     activity_slide: Motion,
     exposure_slide: Motion,
     focus_slide: Motion,
@@ -569,11 +594,20 @@ struct Workbench {
     sidebar_slide: Motion,
     inspector_slide: Motion,
     /// Title bar and toolbar, hidden in image mode.
-    chrome: Motion,
+    bars: Motion,
     controls: Motion,
     tile_hover: Motion,
-    /// The overview's ring around the selected camera.
+    /// The selection drawing in after it changes: the ring around the
+    /// selected tile; see `selection_level`.
     ring: Motion,
+    /// The camera selected before the current one, while `ring` draws in.
+    ring_from: Option<String>,
+    // Each area's own state, in its own file. Add fields there, not here.
+    chrome: titlebar::ChromeState,
+    side: sidebar::SideState,
+    stage_ui: stage::StageState,
+    inspect: inspector::InspectorState,
+    sheets: help::SheetState,
 }
 
 impl Workbench {
@@ -656,6 +690,7 @@ impl Workbench {
             throughput: HashMap::new(),
             liveness: HashMap::new(),
             pending: Vec::new(),
+            batches: HashMap::new(),
             notice: None,
             notice_shown: Motion::new(0.0, motion::NOTICE_IN, motion::NOTICE_OUT, Kind::Fade),
             copied: None,
@@ -667,7 +702,6 @@ impl Workbench {
             born: now,
             accessibility_read: now,
             scene: Scene::default(),
-            sheet: Motion::new(0.0, motion::SHEET, motion::SHEET_OUT, Kind::Fade),
             activity_slide: Motion::new(
                 shown(prefs.logs_open),
                 motion::SLIDE,
@@ -712,10 +746,16 @@ impl Workbench {
                 motion::PANEL_OUT,
                 Kind::Move,
             ),
-            chrome: Motion::new(1.0, motion::IMAGE, motion::IMAGE_OUT, Kind::Move),
+            bars: Motion::new(1.0, motion::IMAGE, motion::IMAGE_OUT, Kind::Move),
             controls: Motion::new(0.0, motion::CONTROLS_IN, motion::CONTROLS_OUT, Kind::Fade),
             tile_hover: Motion::new(0.0, motion::HOVER, motion::HOVER_OUT, Kind::Fade),
             ring: Motion::new(1.0, motion::RING, motion::RING_OUT, Kind::Fade),
+            ring_from: None,
+            chrome: Default::default(),
+            side: Default::default(),
+            stage_ui: Default::default(),
+            inspect: Default::default(),
+            sheets: Default::default(),
         }
     }
 
@@ -909,13 +949,15 @@ impl Workbench {
         };
         match submitted {
             Ok(receiver) => {
-                self.clear_done_notice();
+                self.give_way();
                 self.pending.push(Pending {
                     label,
                     receiver,
                     target: None,
                     camera: acts_on,
                     feature,
+                    at: self.now,
+                    batch: false,
                 });
                 self.pending.last_mut()
             }
@@ -930,6 +972,19 @@ impl Workbench {
 
     fn pending(&self, label: &str) -> bool {
         self.pending.iter().any(|p| p.label == label)
+    }
+
+    /// Whether a command under `label` is on its way to `camera`.
+    fn pending_for(&self, label: &str, camera: &str) -> bool {
+        self.pending
+            .iter()
+            .any(|p| p.label == label && p.camera.as_deref() == Some(camera))
+    }
+
+    /// `command` in a code block whose copy button confirms in place.
+    fn copyable<'a>(&self, command: String, p: &'static Palette) -> Element<'a, Message> {
+        let copied = self.just_copied(&command);
+        code_block(command, copied, p)
     }
 
     fn auto_busy(&self) -> bool {
@@ -979,25 +1034,44 @@ impl Workbench {
     fn poll(&mut self) {
         let mut i = 0;
         while i < self.pending.len() {
-            match self.pending[i].receiver.try_recv() {
-                Ok(result) => {
-                    let pending = self.pending.swap_remove(i);
-                    if let Ok(value) = &result {
-                        self.finished(&pending, value);
-                    }
-                    if let Some((text, detail, level)) = command_notice(&pending.label, &result) {
-                        self.set_notice(text, detail, level);
-                    }
-                }
+            let result = match self.pending[i].receiver.try_recv() {
+                Ok(result) => result,
                 Err(TryRecvError::Disconnected) => {
-                    self.pending.swap_remove(i);
-                    self.set_notice("Session worker disconnected", None, Level::Error);
+                    Err(anyhow::anyhow!("the session worker disconnected"))
                 }
-                Err(TryRecvError::Empty) => i += 1,
-            }
+                Err(TryRecvError::Empty) => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let pending = self.pending.swap_remove(i);
+            self.settle(&pending, &result);
         }
     }
 
+    /// Everything that follows a finished command: the shared bookkeeping,
+    /// each area's, then its notice.
+    fn settle(&mut self, pending: &Pending, result: &Result<serde_json::Value>) {
+        match result {
+            Ok(value) => self.finished(pending, value),
+            Err(error) => self.failed(pending, error),
+        }
+        self.result_chrome(pending, result);
+        self.result_side(pending, result);
+        self.result_stage(pending, result);
+        self.result_inspector(pending, result);
+        self.result_sheets(pending, result);
+        let notice = if pending.batch {
+            self.batch_result(&pending.label, result)
+        } else {
+            command_notice(&pending.label, result)
+        };
+        if let Some((text, detail, level)) = notice {
+            self.set_notice(text, detail, level);
+        }
+    }
+
+    /// Shared bookkeeping for a command that worked, before its notice.
     fn finished(&mut self, pending: &Pending, result: &serde_json::Value) {
         if pending.label == "Saving capture" {
             self.shutter.replay(1.0, 0.0, self.now);
@@ -1005,9 +1079,21 @@ impl Workbench {
                 self.last_saved = Some(saved);
             }
         }
+        if pending.label == "Discovering cameras" {
+            self.side.discovery_issues = result["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|warning| warning.as_str().map(str::to_owned))
+                .collect();
+        }
+        if let Some(feature) = &pending.feature {
+            self.inspect.write_errors.remove(feature);
+        }
         let Some(target) = &pending.target else {
             return;
         };
+        self.side.connect_failures.remove(target);
         if self.address.trim() == target {
             self.address.clear();
         }
@@ -1031,6 +1117,23 @@ impl Workbench {
         self.recent = prefs.recent;
     }
 
+    /// Shared bookkeeping for a command that failed, before its notice: the
+    /// failure kept where the control that sent it can show it.
+    fn failed(&mut self, pending: &Pending, error: &anyhow::Error) {
+        let full = format!("{error:#}");
+        if pending.label == "Discovering cameras" {
+            self.side.discovery_issues = vec![full.clone()];
+        }
+        if let Some(feature) = &pending.feature {
+            self.inspect
+                .write_errors
+                .insert(feature.clone(), full.clone());
+        }
+        if let Some(target) = &pending.target {
+            self.side.connect_failed(target, full, self.now);
+        }
+    }
+
     fn tick(&mut self) -> Task<Message> {
         self.poll();
         self.age_notice();
@@ -1039,7 +1142,9 @@ impl Workbench {
         self.poll_accessibility();
         let selected = self.snapshot.active_camera.clone();
         self.snapshot = self.handle.snapshot();
+        self.scene.patch(&mut self.snapshot);
         if self.snapshot.active_camera != selected {
+            self.ring_from = selected;
             self.ring.replay(0.0, 1.0, self.now);
         }
         let camera_id = self
@@ -1051,6 +1156,7 @@ impl Workbench {
             self.observed_camera = camera_id;
             self.edits.clear();
             self.edit_sources.clear();
+            self.inspect.write_errors.clear();
             self.frame_id = None;
             self.shown = None;
             self.frame_meta = None;
@@ -1081,6 +1187,11 @@ impl Workbench {
         self.update_frames();
         self.capture_to.tick();
         self.record_to.tick();
+        self.tick_chrome();
+        self.tick_side();
+        self.tick_stage();
+        self.tick_inspector();
+        self.tick_sheets();
         self.save_prefs();
         self.screenshot_tick()
     }
@@ -1097,10 +1208,7 @@ impl Workbench {
                 .any(|camera| camera.streaming && &camera.info.id == id)
         });
         for camera in snapshot.cameras.iter().filter(|camera| camera.streaming) {
-            let lost = camera
-                .transport
-                .as_ref()
-                .map_or(camera.dropped, transport_loss);
+            let lost = liveness::camera_loss(camera);
             // The rate reads zero until the worker has timed a few frames.
             if camera.fps <= 0.0 && !self.throughput.contains_key(&camera.info.id) {
                 continue;
@@ -1242,6 +1350,7 @@ impl Workbench {
     fn connect(&mut self, camera: String) {
         self.edits.clear();
         self.edit_sources.clear();
+        self.side.connect_failures.remove(&camera);
         if let Some(pending) = self.submit(
             None,
             "Connecting camera".into(),
@@ -1379,9 +1488,13 @@ impl Workbench {
         format!("capturefab --session {} status", shell_quote(&self.session))
     }
 
-    fn copy_session_command(&mut self) -> Task<Message> {
+    /// Copy the session command. Copy buttons confirm in place; `announce`
+    /// confirms in the toolbar instead, for the keyboard shortcut.
+    fn copy_session_command(&mut self, announce: bool) -> Task<Message> {
         let command = self.session_command();
-        self.set_notice("Session command copied", None, Level::Done);
+        if announce {
+            self.set_notice("Session command copied", None, Level::Done);
+        }
         self.note_copied(command.clone());
         iced::clipboard::write(command)
     }
@@ -1519,7 +1632,11 @@ impl Workbench {
             Message::Disconnect(id) => {
                 self.send_to(&id, "Disconnecting", SessionCommand::Disconnect)
             }
-            Message::Address(value) => self.address = value,
+            Message::Address(value) => {
+                // Editing the address retires its failure.
+                self.side.connect_failures.remove(self.address.trim());
+                self.address = value;
+            }
             Message::ConnectAddress => {
                 let address = self.address.trim().to_owned();
                 if !address.is_empty() {
@@ -1546,53 +1663,36 @@ impl Workbench {
                 },
             ),
             Message::AllStreams(start) => {
-                for id in self
+                let cameras = self
                     .snapshot
                     .cameras
                     .iter()
                     .filter(|camera| camera.streaming != start)
                     .map(|camera| camera.info.id.clone())
-                    .collect::<Vec<_>>()
-                {
-                    self.send_to(
-                        &id,
-                        if start {
-                            "Starting streams"
-                        } else {
-                            "Stopping streams"
-                        },
-                        if start {
-                            SessionCommand::Start
-                        } else {
-                            SessionCommand::Stop
-                        },
-                    );
+                    .collect();
+                if start {
+                    self.send_batch(cameras, "Starting streams", || SessionCommand::Start);
+                } else {
+                    self.send_batch(cameras, "Stopping streams", || SessionCommand::Stop);
                 }
             }
             Message::AllAuto(auto) => {
-                for id in self
+                let cameras = self
                     .snapshot
                     .cameras
                     .iter()
                     .filter(|camera| camera.auto.is_none() == auto)
                     .map(|camera| camera.info.id.clone())
-                    .collect::<Vec<_>>()
-                {
-                    self.send_to(
-                        &id,
-                        if auto {
-                            "Enabling auto mode"
-                        } else {
-                            "Switching to manual"
-                        },
-                        if auto {
-                            SessionCommand::Auto {
-                                balance: Some(self.balance),
-                            }
-                        } else {
-                            SessionCommand::Manual { revert: false }
-                        },
-                    );
+                    .collect();
+                let balance = Some(self.balance);
+                if auto {
+                    self.send_batch(cameras, "Enabling auto mode", || SessionCommand::Auto {
+                        balance,
+                    });
+                } else {
+                    self.send_batch(cameras, "Switching to manual", || SessionCommand::Manual {
+                        revert: false,
+                    });
                 }
             }
             Message::Fit => self.fit = true,
@@ -1614,6 +1714,7 @@ impl Workbench {
                 self.remeasure();
             }
             Message::ToggleActivity => self.logs_open = !self.logs_open,
+            Message::ShowActivity => self.logs_open = true,
             Message::CopyLog => {
                 self.note_copied(notice::COPIED_LOG);
                 return iced::clipboard::write(
@@ -1625,17 +1726,26 @@ impl Workbench {
                         .join("\n"),
                 );
             }
-            Message::CopySessionCommand => return self.copy_session_command(),
+            Message::CopySessionCommand => return self.copy_session_command(false),
             Message::Copy(value) => {
-                self.set_notice("Copied", None, Level::Done);
                 self.note_copied(value.clone());
                 return iced::clipboard::write(value);
             }
             Message::Tab(tab) => self.tab = tab,
+            Message::ShowTab(tab) => {
+                self.tab = tab;
+                self.image_mode = false;
+                if self.inspector_docked() {
+                    self.inspector_open = true;
+                } else {
+                    self.inspector_peek = true;
+                }
+            }
             Message::Search(value) => self.search = value,
             Message::RefreshFeatures => {
                 self.edits.clear();
                 self.edit_sources.clear();
+                self.inspect.write_errors.clear();
                 self.send("Refreshing features", SessionCommand::Features);
             }
             Message::Auto(on) => {
@@ -1665,6 +1775,7 @@ impl Workbench {
             }
             Message::ToggleAutoChanges => self.auto_changes_open = !self.auto_changes_open,
             Message::Draft(feature, value) => {
+                self.inspect.write_errors.remove(&feature);
                 self.edits.insert(feature, value);
             }
             Message::Commit(feature) => {
@@ -1836,6 +1947,15 @@ impl Workbench {
                 }
             }
             Message::DismissNotice => self.dismiss_notice(),
+            // Chrome: titlebar.rs, toolbar.rs
+
+            // Camera list and welcome: sidebar.rs, welcome.rs
+
+            // Stage: stage.rs, grid.rs, scopes.rs
+
+            // Inspector: inspector.rs
+
+            // Sheets: help.rs, destinations.rs
         }
         Task::none()
     }
@@ -1867,7 +1987,7 @@ impl Workbench {
                 );
             }
             Action::Help => self.help_open = !self.help_open,
-            Action::CopySessionCommand => return self.copy_session_command(),
+            Action::CopySessionCommand => return self.copy_session_command(true),
             Action::Fullscreen => {
                 return window::latest().and_then(|id| {
                     window::mode(id).then(move |mode| {
@@ -1962,7 +2082,8 @@ impl Workbench {
         }
         let mut layers = stack![body];
         if !docked && inspector > 0.5 {
-            // Below the title bar, so its buttons, including the one that closes this, stay reachable.
+            // Between the title bar and the toolbar, so the button that
+            // closes it and the notices stay in reach.
             layers = layers.push(
                 container(opaque(
                     container(self.inspector(p))
@@ -1974,6 +2095,7 @@ impl Workbench {
                 .align_right(Fill)
                 .padding(iced::Padding {
                     top: BAR,
+                    bottom: TOOLBAR * self.bars.get(self.now),
                     ..iced::Padding::ZERO
                 }),
             );
@@ -1982,7 +2104,7 @@ impl Workbench {
         let body: Element<'_, Message> = layers
             .push(shader(self.gpu.probe()).width(1).height(1))
             .into();
-        let t = self.sheet.get(self.now);
+        let t = self.sheets.shown.get(self.now);
         let body = if self.help_open {
             modal(body, self.help(p), Some(Message::Help(false)), t)
         } else {
@@ -2035,20 +2157,16 @@ impl Workbench {
         } else {
             self.single_view(p)
         };
-        let chrome = self.chrome.get(self.now);
+        let bars = self.bars.get(self.now);
         let mut main = column![content];
-        let activity = self.activity_slide.lerp(0.0, 171.0, self.now) * chrome;
+        let activity = self.activity_slide.lerp(0.0, 171.0, self.now) * bars;
         if activity > 0.5 {
             main = main.push(container(self.activity(p)).height(activity).clip(true));
         }
-        if chrome > 0.999 {
+        if bars > 0.999 {
             main = main.push(self.toolbar(p));
-        } else if chrome > 0.001 {
-            main = main.push(
-                container(self.toolbar(p))
-                    .height(TOOLBAR * chrome)
-                    .clip(true),
-            );
+        } else if bars > 0.001 {
+            main = main.push(container(self.toolbar(p)).height(TOOLBAR * bars).clip(true));
         }
         main.into()
     }
@@ -2090,6 +2208,23 @@ mod tests {
         assert!(frames.next().now_or_never().is_none());
         std::thread::sleep(FRAME_POLL * 10);
         assert!(frames.next().now_or_never().is_none());
+    }
+
+    #[test]
+    fn show_messages_open_without_toggling() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        bench.logs_open = true;
+        let _ = bench.handle_message(Message::ShowActivity);
+        assert!(bench.logs_open, "stays open");
+        bench.image_mode = true;
+        bench.width = 1280.0;
+        bench.inspector_open = false;
+        let _ = bench.handle_message(Message::ShowTab(Tab::Forward));
+        assert_eq!(bench.tab, Tab::Forward);
+        assert!(bench.inspector_open && !bench.image_mode);
+        bench.width = 960.0;
+        let _ = bench.handle_message(Message::ShowTab(Tab::Capture));
+        assert!(bench.inspector_peek, "floats in a narrow window");
     }
 
     #[test]

@@ -1,79 +1,58 @@
 //! The single-camera stage: the live image edge to edge with its controls,
 //! scopes and status floating over it.
-use super::titlebar::{fps_spark, status_pill};
 use super::*;
 use iced::widget::column;
 
+/// The stage package's own state: the single-camera stage, the overview grid
+/// and the scopes. Add fields here, register their motions below and point them
+/// in `sync_stage`. It derives `Default` while empty; write `Default` by hand
+/// once it holds a `Motion`.
+#[derive(Default)]
+pub(super) struct StageState {}
+
+impl StageState {
+    super::motion::registry! {
+        motions: [],
+        flashes: [],
+    }
+}
+
+/// The stage package's hooks into the shared update cycle; empty until it needs
+/// them.
+impl Workbench {
+    /// Point the stage package's motions at what they show; from
+    /// `sync_animations`.
+    pub(super) fn sync_stage(&mut self) {}
+
+    /// The stage package's bookkeeping on the slow tick, after the snapshot
+    /// refresh; from `tick()`.
+    pub(super) fn tick_stage(&mut self) {}
+
+    /// A command finished, after the shared bookkeeping (`finished`,
+    /// `failed`) and before its notice; from `settle()`.
+    pub(super) fn result_stage(
+        &mut self,
+        _pending: &Pending,
+        _result: &anyhow::Result<serde_json::Value>,
+    ) {
+    }
+
+    /// Take a screenshot scene word the stage package owns: `late` is false
+    /// while the scene is set up and true once its cameras stream. Returns
+    /// whether the word was taken; see `apply_scene`.
+    pub(super) fn scene_stage(&mut self, _word: &str, _late: bool) -> bool {
+        false
+    }
+}
+
 impl Workbench {
     pub(super) fn single_view(&self, p: &'static Palette) -> Element<'_, Message> {
-        let snapshot = &self.snapshot;
-        let connected = snapshot.connected.is_some();
-        let status = if snapshot.streaming {
-            let history = snapshot
-                .connected
-                .as_ref()
-                .and_then(|camera| self.throughput.get(&camera.id));
-            Some(status_pill(
-                "Streaming",
-                Some(format!("{:.1} fps", snapshot.fps)),
-                Some(fps_spark(history, p.live, p.warn, (64.0, 14.0))),
-                p.live,
-                1.0,
-            ))
-        } else if connected {
-            Some(status_pill("Ready", None, None, p.accent_text, 1.0))
-        } else {
-            None
-        };
-        let os = Os::CURRENT;
-        let mut actions = row![].spacing(8).align_y(Alignment::Center);
-        if snapshot.cameras.len() > 1 {
-            actions = actions.push(tip(
-                button(
-                    row![
-                        icon(Icon::Grid, 14.0, p.text),
-                        text("All cameras").size(style::BODY)
-                    ]
-                    .spacing(7)
-                    .align_y(Alignment::Center),
-                )
-                .padding([5, 10])
-                .style(style::secondary)
-                .on_press(Message::Focus(false)),
-                Action::Overview.hint("Back to all cameras", os),
-            ));
-        }
-        if connected {
-            let auto = snapshot.auto.is_some();
-            actions = actions
-                .push(tip(
-                    button(text("Auto").size(style::BODY).font(style::MEDIUM))
-                        .padding([5, 12])
-                        .style(style::toggle(auto))
-                        .on_press_maybe((!self.auto_busy()).then_some(Message::Auto(!auto))),
-                    Action::ToggleAuto.hint("Tune exposure, gain and frame rate", os),
-                ))
-                .push(tip(
-                    stream_button(
-                        snapshot.streaming,
-                        if snapshot.streaming { "Stop" } else { "Start" },
-                        Some(Message::ToggleStream),
-                        p,
-                    ),
-                    Action::ToggleStream.hint("Start or stop acquisition", os),
-                ));
-        }
-        let title = snapshot
-            .connected
-            .as_ref()
-            .map_or(String::new(), |camera| camera.model.clone());
-        let header = self.title_bar(title, status, actions.into(), p);
         let body = match &self.shown {
             Some(shown) => self.stage(shown),
-            None if !connected => self.welcome(p),
+            None if self.snapshot.connected.is_none() => self.welcome(p),
             None => self.ready(p),
         };
-        column![header, body].into()
+        column![self.single_bar(p), body].into()
     }
 
     /// The live image filling the stage, with what floats over it.

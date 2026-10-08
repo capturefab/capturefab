@@ -2,6 +2,52 @@
 use super::*;
 use iced::widget::column;
 
+/// The inspector package's own state. Add fields here, register their motions
+/// below and point them in `sync_inspector`.
+#[derive(Default)]
+pub(super) struct InspectorState {
+    /// The last write or command that failed on each feature, as the whole
+    /// error; show its first line at the row. Kept by `failed()` and cleared
+    /// by the feature's next success, a new draft, a refresh or another
+    /// camera.
+    pub(super) write_errors: HashMap<String, String>,
+}
+
+impl InspectorState {
+    super::motion::registry! {
+        motions: [],
+        flashes: [],
+    }
+}
+
+/// The inspector package's hooks into the shared update cycle; empty until it
+/// needs them.
+impl Workbench {
+    /// Point the inspector package's motions at what they show; from
+    /// `sync_animations`.
+    pub(super) fn sync_inspector(&mut self) {}
+
+    /// The inspector package's bookkeeping on the slow tick, after the snapshot
+    /// refresh; from `tick()`.
+    pub(super) fn tick_inspector(&mut self) {}
+
+    /// A command finished, after the shared bookkeeping (`finished`,
+    /// `failed`) and before its notice; from `settle()`.
+    pub(super) fn result_inspector(
+        &mut self,
+        _pending: &Pending,
+        _result: &anyhow::Result<serde_json::Value>,
+    ) {
+    }
+
+    /// Take a screenshot scene word the inspector package owns: `late` is false
+    /// while the scene is set up and true once its cameras stream. Returns
+    /// whether the word was taken; see `apply_scene`.
+    pub(super) fn scene_inspector(&mut self, _word: &str, _late: bool) -> bool {
+        false
+    }
+}
+
 impl Workbench {
     pub(super) fn inspector(&self, p: &'static Palette) -> Element<'_, Message> {
         let os = Os::CURRENT;
@@ -228,7 +274,8 @@ impl Workbench {
                 if !status.changes.is_empty() {
                     card = card.push(disclosure(
                         format!("Auto changes ({})", status.changes.len()),
-                        self.auto_changes_open,
+                        None,
+                        if self.auto_changes_open { 1.0 } else { 0.0 },
                         Message::ToggleAutoChanges,
                         p,
                     ));
@@ -547,7 +594,7 @@ impl Workbench {
                     .size(style::SMALL)
                     .color(p.secondary),
             )
-            .push(code_block(self.session_command(), p));
+            .push(self.copyable(self.session_command(), p));
         content.into()
     }
 
@@ -621,7 +668,7 @@ impl Workbench {
                         text("Forwarding")
                             .size(style::SMALL)
                             .font(style::SEMIBOLD)
-                            .color(p.live),
+                            .color(p.ink(p.live)),
                     ]
                     .spacing(7)
                     .align_y(Alignment::Center),
@@ -681,7 +728,7 @@ impl Workbench {
                     .size(style::SMALL)
                     .color(p.secondary),
             )
-            .push(code_block("capturefab doctor".into(), p))
+            .push(self.copyable("capturefab doctor".into(), p))
             .into()
     }
 
@@ -697,8 +744,9 @@ impl Workbench {
             }
         );
         let mut content = column![disclosure(
-            "Storage & retention".into(),
-            self.storage_open,
+            "Storage & retention",
+            None,
+            if self.storage_open { 1.0 } else { 0.0 },
             Message::ToggleStorage,
             p
         ),]
@@ -833,7 +881,11 @@ impl Workbench {
                 );
             }
             if let Some(error) = job["error"].as_str() {
-                card = card.push(text(error.to_owned()).size(style::CAPTION).color(p.danger));
+                card = card.push(
+                    text(error.to_owned())
+                        .size(style::CAPTION)
+                        .color(p.ink(p.danger)),
+                );
             }
             content = content.push(container(card).padding(12).width(Fill).style(style::well));
         }

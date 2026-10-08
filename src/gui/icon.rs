@@ -32,6 +32,7 @@ pub enum Icon {
     Contrast,
     ChevronRight,
     ChevronDown,
+    ChevronLeft,
     Broadcast,
     Folder,
     Eject,
@@ -43,7 +44,11 @@ pub enum Icon {
     Video,
     Cube,
     Check,
+    /// An error: a mark in a circle. Warnings use the triangle, so severity
+    /// reads by shape as well as color.
     Warning,
+    /// A warning: a mark in a triangle.
+    WarningTriangle,
     Keyboard,
     Sidebar,
     Sliders,
@@ -51,6 +56,15 @@ pub enum Icon {
     CornersIn,
     Scan,
     Reset,
+    #[allow(dead_code)] // adopted by the inspector package
+    Lock,
+    #[allow(dead_code)] // adopted by the sheets package
+    CloudArrowUp,
+    #[allow(dead_code)] // adopted by the sheets package
+    FolderPlus,
+    /// Drives: local, external or network storage.
+    #[allow(dead_code)] // adopted by the sheets package
+    HardDrives,
     /// The app mark: a rounded lens body.
     Mark,
 }
@@ -75,6 +89,7 @@ impl Icon {
             Icon::Contrast => (REGULAR, '\u{e18c}'),
             Icon::ChevronRight => (REGULAR, '\u{e13a}'),
             Icon::ChevronDown => (REGULAR, '\u{e136}'),
+            Icon::ChevronLeft => (REGULAR, '\u{e138}'),
             Icon::Broadcast => (REGULAR, '\u{e0f2}'),
             Icon::Folder => (REGULAR, '\u{e24a}'),
             Icon::Eject => (REGULAR, '\u{e212}'),
@@ -87,6 +102,7 @@ impl Icon {
             Icon::Cube => (REGULAR, '\u{e1da}'),
             Icon::Check => (REGULAR, '\u{e184}'),
             Icon::Warning => (REGULAR, '\u{e4e2}'),
+            Icon::WarningTriangle => (REGULAR, '\u{e4e0}'),
             Icon::Keyboard => (REGULAR, '\u{e2d8}'),
             Icon::Sidebar => (REGULAR, '\u{ec24}'),
             Icon::Sliders => (REGULAR, '\u{e434}'),
@@ -94,6 +110,10 @@ impl Icon {
             Icon::CornersIn => (REGULAR, '\u{e1ce}'),
             Icon::Scan => (REGULAR, '\u{ebb6}'),
             Icon::Reset => (REGULAR, '\u{e038}'),
+            Icon::Lock => (REGULAR, '\u{e2fa}'),
+            Icon::CloudArrowUp => (REGULAR, '\u{e1ae}'),
+            Icon::FolderPlus => (REGULAR, '\u{e258}'),
+            Icon::HardDrives => (REGULAR, '\u{e2a0}'),
             Icon::Mark => (REGULAR, '\u{e00a}'),
         }
     }

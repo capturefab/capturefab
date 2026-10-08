@@ -1,6 +1,6 @@
 //! The multi-camera overview: every camera's image as large as the window
 //! allows, captioned over the picture, with actions on hover.
-use super::titlebar::{fps_spark, status_pill};
+use super::titlebar::fps_spark;
 use super::*;
 use iced::widget::column;
 
@@ -25,39 +25,9 @@ pub(super) fn layout(count: usize, aspect: f32, area: Size) -> (usize, Size) {
 
 impl Workbench {
     pub(super) fn overview_view(&self, p: &'static Palette) -> Element<'_, Message> {
-        let snapshot = &self.snapshot;
-        let streaming = snapshot.cameras.iter().filter(|c| c.streaming).count();
-        let status = status_pill(
-            if streaming > 0 { "Streaming" } else { "Ready" },
-            Some(format!("{streaming} of {}", snapshot.cameras.len())),
-            None,
-            if streaming > 0 { p.live } else { p.accent_text },
-            1.0,
-        );
-        let start = snapshot.cameras.iter().any(|camera| !camera.streaming);
-        let manual = snapshot.cameras.iter().any(|camera| camera.auto.is_none());
-        let actions = row![
-            button(
-                text(if manual { "Auto all" } else { "Manual all" })
-                    .size(style::BODY)
-                    .font(style::MEDIUM)
-            )
-            .padding([5, 12])
-            .style(style::toggle(!manual))
-            .on_press(Message::AllAuto(manual)),
-            stream_button(
-                !start,
-                if start { "Start all" } else { "Stop all" },
-                Some(Message::AllStreams(start)),
-                p,
-            ),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
-        let header = self.title_bar("All cameras".into(), Some(status), actions.into(), p);
-        let grid = responsive(move |size| self.grid(size, p));
+        let grid = responsive(move |size| self.grid(size));
         column![
-            header,
+            self.overview_bar(p),
             container(grid)
                 .padding(GAP)
                 .width(Fill)
@@ -67,7 +37,9 @@ impl Workbench {
         .into()
     }
 
-    fn grid(&self, size: Size, p: &'static Palette) -> Element<'_, Message> {
+    /// Everything drawn here is on the stage, so it takes its colors from
+    /// `style::STAGE` whatever the appearance.
+    fn grid(&self, size: Size) -> Element<'_, Message> {
         let cameras = &self.snapshot.cameras;
         let aspect = cameras
             .iter()
@@ -85,7 +57,7 @@ impl Workbench {
         for chunk in cameras.chunks(columns) {
             let mut line = row![].spacing(GAP);
             for camera in chunk {
-                line = line.push(self.tile(camera, tile, p));
+                line = line.push(self.tile(camera, tile));
             }
             grid = grid.push(line);
         }
@@ -98,7 +70,6 @@ impl Workbench {
         &'a self,
         camera: &'a crate::session::CameraSnapshot,
         size: Size,
-        p: &'static Palette,
     ) -> Element<'a, Message> {
         let id = &camera.info.id;
         let active = self.snapshot.active_camera.as_ref() == Some(id);
@@ -137,10 +108,7 @@ impl Workbench {
                 camera.info.model, camera.info.serial, camera.worker_pid
             ),
         );
-        let lost = camera
-            .transport
-            .as_ref()
-            .map_or(camera.dropped, transport_loss);
+        let lost = liveness::camera_loss(camera);
         let mut caption = row![
             dot(
                 if camera.streaming {
@@ -165,7 +133,7 @@ impl Workbench {
                 text("Out")
                     .size(style::CAPTION)
                     .font(style::SEMIBOLD)
-                    .color(p.accent),
+                    .color(style::STAGE.accent_text),
             );
         }
         if camera.auto.is_some() {
@@ -173,7 +141,7 @@ impl Workbench {
                 text("Auto")
                     .size(style::CAPTION)
                     .font(style::SEMIBOLD)
-                    .color(p.accent),
+                    .color(style::STAGE.accent_text),
             );
         }
         if lost > 0 {

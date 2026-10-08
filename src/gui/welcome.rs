@@ -24,8 +24,18 @@ impl Workbench {
         if !streaming {
             ready = ready.push(space().height(8)).push(
                 row![
-                    stream_button(false, "Start stream", Some(Message::ToggleStream), p)
-                        .padding([7, 16]),
+                    stream_button(
+                        false,
+                        "Start stream",
+                        Some(Message::ToggleStream),
+                        self.snapshot
+                            .active_camera
+                            .as_deref()
+                            .is_some_and(|id| self.pending_for("Starting stream", id)),
+                        self.spin(),
+                        p,
+                    )
+                    .padding([7, 16]),
                     button(text("Capture one frame").size(style::BODY))
                         .padding([7, 12])
                         .style(style::on_glass(false, 1.0))

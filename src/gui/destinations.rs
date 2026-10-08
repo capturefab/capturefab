@@ -391,6 +391,15 @@ pub struct Picker {
 }
 
 impl Picker {
+    // The picker's own motions and flashes, which the workbench's registry
+    // includes; the sheets package adds them here.
+    super::motion::registry! {
+        motions: [],
+        flashes: [],
+    }
+}
+
+impl Picker {
     pub fn new(remember: bool, recording: bool) -> Self {
         Self {
             saved: destination::list().unwrap_or_default(),

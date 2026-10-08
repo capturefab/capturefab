@@ -51,7 +51,7 @@ impl Workbench {
             let alpha = self.notice_alpha();
             let (glyph, tint, ink) = match notice.level {
                 Level::Done => (Icon::Check, p.live, p.secondary),
-                Level::Warning => (Icon::Warning, p.warn, p.secondary),
+                Level::Warning => (Icon::WarningTriangle, p.warn, p.secondary),
                 Level::Error => (Icon::Warning, p.danger, p.danger),
             };
             tip(
@@ -68,7 +68,8 @@ impl Workbench {
                 .align_y(Alignment::Center),
                 notice.about(),
             )
-        } else if let Some(pending) = self.pending.first() {
+        } else if let Some(pending) = self.pending.iter().max_by_key(|pending| pending.at) {
+            // The newest command, most likely the one just asked for.
             row![
                 dot(fade(p.accent, self.pulse()), 6.0),
                 one_line(
@@ -174,10 +175,17 @@ impl Workbench {
                     row![
                         text("Activity").size(style::BODY).font(style::SEMIBOLD),
                         space::horizontal(),
-                        button(text("Copy log").size(style::SMALL))
-                            .padding([3, 8])
-                            .style(style::link)
-                            .on_press(Message::CopyLog),
+                        button(
+                            text(if self.just_copied(notice::COPIED_LOG) {
+                                "Copied"
+                            } else {
+                                "Copy log"
+                            })
+                            .size(style::SMALL)
+                        )
+                        .padding([3, 8])
+                        .style(style::link)
+                        .on_press(Message::CopyLog),
                     ]
                     .align_y(Alignment::Center),
                     scrollable(lines)

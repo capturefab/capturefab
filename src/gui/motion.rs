@@ -4,9 +4,10 @@
 //!
 //! Rules: animate state changes only, once, and settle. Entrances take
 //! 120–280 ms and exits are faster; both ease out. Every `Motion` and
-//! `Flashes` field joins the `registry!` list below, which is what keeps
-//! redraws running while something moves and stops them once it settles.
-//! Reduce Motion keeps fades and snaps movement.
+//! `Flashes` field joins a `registry!` list: the workbench's below, or the
+//! one beside an area's own state in its file. That is what keeps redraws
+//! running while something moves and stops them once it settles. Reduce
+//! Motion keeps fades and snaps movement.
 use super::*;
 use iced::animation::Easing;
 use std::{borrow::Borrow, hash::Hash, sync::atomic::AtomicBool};
@@ -286,41 +287,68 @@ pub(super) fn controls_wanted(moved: Option<Instant>, now: Instant, hovering: bo
     hovering || moved.is_some_and(|moved| now.saturating_duration_since(moved) < CONTROLS_IDLE)
 }
 
-/// Lists every `Motion` and `Flashes` field once, generating the iterators
-/// that `animating()`, `tick()` and the settle test walk. Paths may reach
-/// into nested state, e.g. `focus.lock`.
+/// Lists every `Motion` and `Flashes` field of a struct once, generating
+/// the iterators that `animating()`, `tick()` and the settle test walk.
+/// Paths may reach into nested state, e.g. `focus.lock`. `areas` names
+/// fields whose own registries join this one. An area registers what it adds
+/// beside its state, in its own file:
+///
+/// ```ignore
+/// impl ChromeState {
+///     motion::registry! {
+///         motions: [live],
+///         flashes: [],
+///     }
+/// }
+/// ```
 macro_rules! registry {
     (
         motions: [$($($motion:ident).+),* $(,)?],
-        flashes: [$($($flash:ident).+),* $(,)?] $(,)?
+        flashes: [$($($flash:ident).+),* $(,)?]
+        $(, areas: [$($area:ident),* $(,)?])? $(,)?
     ) => {
-        /// Every `Motion`.
-        pub(super) fn motions(&self) -> impl Iterator<Item = &Motion> {
-            [$(&self.$($motion).+),*].into_iter()
+        /// Every `Motion` registered here.
+        pub(super) fn motions(&self) -> impl Iterator<Item = &$crate::gui::motion::Motion> {
+            std::iter::empty::<&$crate::gui::motion::Motion>()
+                $(.chain(std::iter::once(&self.$($motion).+)))*
+                $($(.chain(self.$area.motions()))*)?
         }
 
         #[cfg(test)]
-        fn motions_mut(&mut self) -> impl Iterator<Item = &mut Motion> {
-            [$(&mut self.$($motion).+),*].into_iter()
+        pub(super) fn motions_mut(
+            &mut self,
+        ) -> impl Iterator<Item = &mut $crate::gui::motion::Motion> {
+            std::iter::empty::<&mut $crate::gui::motion::Motion>()
+                $(.chain(std::iter::once(&mut self.$($motion).+)))*
+                $($(.chain(self.$area.motions_mut()))*)?
         }
 
-        /// Every `Flashes` set.
-        pub(super) fn flashes(&self) -> impl Iterator<Item = &dyn Flashing> {
-            std::iter::empty::<&dyn Flashing>()
-                $(.chain(std::iter::once(&self.$($flash).+ as &dyn Flashing)))*
+        /// Every `Flashes` set registered here.
+        pub(super) fn flashes(&self) -> impl Iterator<Item = &dyn $crate::gui::motion::Flashing> {
+            std::iter::empty::<&dyn $crate::gui::motion::Flashing>()
+                $(.chain(std::iter::once(
+                    &self.$($flash).+ as &dyn $crate::gui::motion::Flashing,
+                )))*
+                $($(.chain(self.$area.flashes()))*)?
         }
 
-        fn flashes_mut(&mut self) -> impl Iterator<Item = &mut dyn Flashing> {
-            std::iter::empty::<&mut dyn Flashing>()
-                $(.chain(std::iter::once(&mut self.$($flash).+ as &mut dyn Flashing)))*
+        pub(super) fn flashes_mut(
+            &mut self,
+        ) -> impl Iterator<Item = &mut dyn $crate::gui::motion::Flashing> {
+            std::iter::empty::<&mut dyn $crate::gui::motion::Flashing>()
+                $(.chain(std::iter::once(
+                    &mut self.$($flash).+ as &mut dyn $crate::gui::motion::Flashing,
+                )))*
+                $($(.chain(self.$area.flashes_mut()))*)?
         }
     };
 }
+pub(super) use registry;
 
 impl Workbench {
+    // Shared motions only; areas register theirs beside their own state.
     registry! {
         motions: [
-            sheet,
             activity_slide,
             exposure_slide,
             focus_slide,
@@ -328,13 +356,14 @@ impl Workbench {
             welcome,
             sidebar_slide,
             inspector_slide,
-            chrome,
+            bars,
             controls,
             tile_hover,
             ring,
             notice_shown,
         ],
         flashes: [],
+        areas: [chrome, side, stage_ui, inspect, sheets, capture_to, record_to],
     }
 
     pub(super) fn sheet_open(&self) -> bool {
@@ -386,10 +415,25 @@ impl Workbench {
         self.pointer_moved = Some(self.now);
     }
 
+    /// How selected camera `id` reads, from 0 to 1: the selection draws in
+    /// on the newly selected camera as it fades from the one before, in step
+    /// with the overview's ring. For the tile ring, sidebar rows and the
+    /// inspector, so all three move together.
+    #[allow(dead_code)] // adopted by the stage, sidebar-welcome and inspector packages
+    pub(super) fn selection_level(&self, id: &str) -> f32 {
+        let t = self.ring.get(self.now);
+        if self.snapshot.active_camera.as_deref() == Some(id) {
+            t
+        } else if self.ring_from.as_deref() == Some(id) {
+            1.0 - t
+        } else {
+            0.0
+        }
+    }
+
     /// The step a spinner shows: one of 8, advancing every 120 ms. The slow
     /// tick runs at its busy rate while anything is pending, so spinners
     /// step without per-frame redraws. Screenshots hold it at 0.
-    #[allow(dead_code)] // adopted by the area packages
     pub(super) fn spin(&self) -> usize {
         if self.screenshot.is_some() {
             return 0;
@@ -397,16 +441,14 @@ impl Workbench {
         (self.now.saturating_duration_since(self.born).as_millis() / 120 % 8) as usize
     }
 
-    /// Point each motion at the state it shows.
+    /// Point each motion at the state it shows, then let each area point its own.
     pub(super) fn sync_animations(&mut self) {
         let now = self.now;
-        let sheet = self.sheet_open();
         let welcome = self.snapshot.connected.is_none() && !self.overview();
         let controls = controls_wanted(self.pointer_moved, now, self.over_controls);
         let sidebar = self.sidebar_shown();
         let inspector = self.inspector_shown();
         let targets = [
-            (sheet, &mut self.sheet),
             (welcome, &mut self.welcome),
             (controls, &mut self.controls),
             (self.logs_open, &mut self.activity_slide),
@@ -414,11 +456,16 @@ impl Workbench {
             (self.focus.open, &mut self.focus_slide),
             (sidebar, &mut self.sidebar_slide),
             (inspector, &mut self.inspector_slide),
-            (!self.image_mode, &mut self.chrome),
+            (!self.image_mode, &mut self.bars),
         ];
         for (shown, motion) in targets {
             motion.show(shown, now);
         }
+        self.sync_chrome();
+        self.sync_side();
+        self.sync_stage();
+        self.sync_inspector();
+        self.sync_sheets();
     }
 }
 
@@ -535,6 +582,52 @@ mod tests {
         assert!(!flashes.is_empty(), "kept for held()");
         flashes.prune(start + FLASH_KEEP);
         assert!(flashes.is_empty());
+    }
+
+    #[test]
+    fn sheets_snap_shut_and_rise_from_the_start() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        let start = bench.now;
+        bench.help_open = true;
+        bench.sync_animations();
+        bench.now = start + SHEET / 2;
+        let half = bench.sheets.shown.get(bench.now);
+        assert!(half > 0.0 && half < 1.0);
+        bench.help_open = false;
+        bench.sync_animations();
+        assert_eq!(
+            bench.sheets.shown.get(bench.now),
+            0.0,
+            "nothing draws an exit"
+        );
+        assert!(!bench.sheets.shown.animating(bench.now));
+        bench.capture_to.manager_open = true;
+        bench.sync_animations();
+        assert_eq!(
+            bench.sheets.shown.get(bench.now),
+            0.0,
+            "rises from the start"
+        );
+        assert!(bench.sheets.shown.animating(bench.now + SHEET / 2));
+    }
+
+    #[test]
+    fn selection_moves_from_the_previous_camera() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        let start = bench.now;
+        bench.snapshot.active_camera = Some("b".into());
+        bench.ring_from = Some("a".into());
+        bench.ring.replay(0.0, 1.0, start);
+        assert_eq!(bench.selection_level("b"), 0.0);
+        assert_eq!(bench.selection_level("a"), 1.0);
+        bench.now = start + RING / 2;
+        let (to, from) = (bench.selection_level("b"), bench.selection_level("a"));
+        assert!(to > 0.0 && to < 1.0);
+        assert!((to + from - 1.0).abs() < 1e-6, "a cross-fade");
+        bench.now = start + RING;
+        assert_eq!(bench.selection_level("b"), 1.0);
+        assert_eq!(bench.selection_level("a"), 0.0);
+        assert_eq!(bench.selection_level("c"), 0.0);
     }
 
     #[test]
