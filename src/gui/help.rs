@@ -275,6 +275,25 @@ mod tests {
     }
 
     #[test]
+    fn esc_leaves_a_sheet_even_from_the_field_it_focused() {
+        let mut bench = bench();
+        let esc = Action::Overview.bindings(Os::CURRENT)[0];
+        bench.capture_to.manager_open = true;
+        let _ = bench.handle_message(Message::CapturePicker(destinations::Message::AddBucket));
+        assert!(bench.capture_to.editing());
+        // The focused field took the key to leave itself.
+        let _ = bench.shortcut(esc, false);
+        assert!(!bench.capture_to.editing(), "back to the list");
+        assert!(bench.capture_to.manager_open);
+        let _ = bench.shortcut(esc, false);
+        assert!(!bench.capture_to.manager_open, "closed");
+        // Outside a sheet, Esc in a field only leaves the field.
+        bench.image_mode = true;
+        let _ = bench.shortcut(esc, false);
+        assert!(bench.image_mode);
+    }
+
+    #[test]
     fn the_notes_chevron_turns_and_settles() {
         let mut bench = bench();
         let _ = bench.handle_message(Message::Help(true));

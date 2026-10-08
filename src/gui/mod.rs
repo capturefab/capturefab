@@ -2040,6 +2040,10 @@ impl Workbench {
 
     fn shortcut(&mut self, chord: Chord, keyboard_free: bool) -> Task<Message> {
         let modal = self.sheet_open();
+        // In a sheet Esc cancels or closes it, even from the field it
+        // focused on opening, which took the key to leave itself.
+        let keyboard_free = keyboard_free
+            || (modal && chord.key == keys::Key::Escape && chord.mods == keys::Mods::NONE);
         let Some(action) = Action::find(&chord, keyboard_free, Os::CURRENT) else {
             return Task::none();
         };
