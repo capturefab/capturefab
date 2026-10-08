@@ -128,7 +128,9 @@ impl Workbench {
                         || device.address.as_deref() == Some(recent.target.as_str())
                 })
             })
-            .take(4 - found.len())
+            // With nothing found, the searching or not-found slot holds the
+            // first card's place, so there are never more than four slots.
+            .take(4 - found.len().max(1))
             .collect();
         // A quick search keeps what the screen said; its button spins.
         let searching_shown = discovering && self.searching_shown();
@@ -217,7 +219,7 @@ impl Workbench {
                 &device.model,
                 place(device),
                 &device.id,
-                spin,
+                self.connecting_to(device),
                 p,
             );
             let arrival = self.side.arrival(&device.id, now);
@@ -250,11 +252,14 @@ impl Workbench {
                 &entry.label,
                 recent_place(entry),
                 &entry.target,
-                spin,
+                self.connecting(&entry.target),
                 p,
             ));
         }
-        extra += (found.len() + recent.len()).saturating_sub(1) as f32 * (CARD + 8.0);
+        // `ANCHORED` holds the first slot: a found camera's card, or the
+        // searching or not-found slot that stands in for one.
+        let slots = found.len().max(1) + recent.len();
+        extra += (slots - 1) as f32 * (CARD + 8.0);
         let os = Os::CURRENT;
         let action = |kind: Icon, label: &'static str, on: Message, busy: bool, primary: bool| {
             let ink = if primary { Color::WHITE } else { p.secondary };
@@ -338,31 +343,30 @@ impl Workbench {
     }
 
     /// A camera to connect: its transport, model and where it is. While it
-    /// connects a spinner takes the glyph; if it failed, the error takes
-    /// the detail line.
+    /// is `connecting` a spinner takes the glyph; if it failed, the error
+    /// takes the detail line.
     fn welcome_card<'a>(
         &self,
         kind: Icon,
         title: &'a str,
         detail: String,
         target: &'a str,
-        spin: usize,
+        connecting: bool,
         p: &'static Palette,
     ) -> Element<'a, Message> {
-        let connecting = self.connecting(target);
         let failure = (!connecting)
             .then(|| self.side.connect_failures.get(target))
             .flatten();
         let (glyph, detail, ink): (Element<'a, Message>, String, Color) = if connecting {
             (
-                icon::spinner(16.0, p.secondary, spin),
+                icon::spinner(16.0, p.secondary, self.spin()),
                 "Connecting…".into(),
                 p.secondary,
             )
         } else if let Some((error, _)) = failure {
             (
                 Level::Error.mark(20.0, p),
-                first_line(error).to_owned(),
+                capitalize(first_line(error)),
                 Level::Error.color(p),
             )
         } else {
@@ -461,4 +465,42 @@ fn not_found<'a>(p: &'static Palette) -> Element<'a, Message> {
     .height(CARD)
     .center_y(CARD)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Transport;
+
+    fn bench() -> Workbench {
+        Workbench::new(SessionHandle::new(), "test".into(), true, None)
+    }
+
+    fn recent(target: &str) -> Recent {
+        Recent {
+            target: target.into(),
+            label: "acA1920-40gc".into(),
+            detail: format!("GigE · {target}"),
+            transport: Transport::GigE,
+        }
+    }
+
+    #[test]
+    fn the_height_estimate_counts_the_slot_that_stands_in_for_a_card() {
+        let mut bench = bench();
+        let p = &style::LIGHT;
+        let extra = |bench: &Workbench| bench.welcome_content(p).1;
+        assert_eq!(extra(&bench), 0.0, "the slot alone is anchored");
+        bench.recent = vec![recent("10.0.0.1"), recent("10.0.0.2")];
+        let waiting = extra(&bench);
+        // The slot and two recents under their heading.
+        assert_eq!(waiting, 30.0 + 2.0 * (CARD + 8.0));
+        // The first camera found takes the slot, so nothing moves.
+        bench.snapshot.devices = vec![crate::transport::simulator::info_named("sim:1")];
+        assert_eq!(extra(&bench), waiting);
+        // Never more than four slots, the stand-in counted.
+        bench.snapshot.devices.clear();
+        bench.recent = (0..6).map(|n| recent(&format!("10.0.0.{n}"))).collect();
+        assert_eq!(extra(&bench), 30.0 + 3.0 * (CARD + 8.0));
+    }
 }
