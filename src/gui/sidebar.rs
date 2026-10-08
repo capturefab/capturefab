@@ -19,6 +19,9 @@ const SHAKE_BY: f32 = 5.0;
 /// How long the address must rest before the hint says it is not understood,
 /// so a half-typed IP address is not called wrong.
 const TYPING_PAUSE: Duration = Duration::from_millis(1000);
+/// How long the address must rest before the disk is asked whether it is a
+/// file, so a path being typed is not looked up at every key.
+const FILE_PAUSE: Duration = Duration::from_millis(300);
 /// How long a discovery runs before the welcome screen says it is
 /// searching, so a quick one does not flash its placeholder.
 const SEARCH_SHOWN: Duration = Duration::from_millis(200);
@@ -54,8 +57,8 @@ pub(super) struct SideState {
     /// error it failed with. Replaced whenever a discovery finishes.
     pub(super) discovery_issues: Vec<String>,
     /// Connect targets (IDs or addresses) whose last attempt failed, with
-    /// the whole error and when. Kept by `failed()`; a retry, a success or
-    /// editing the address clears one.
+    /// the whole error and when. Kept by `failed()`; a retry, a success,
+    /// editing the address or the camera connecting any other way clears one.
     pub(super) connect_failures: HashMap<String, (String, Instant)>,
     /// Cameras discovery newly found, growing into the list and onto the
     /// welcome screen, by ID; `ISSUES` for the welcome's discovery callout.
@@ -72,6 +75,10 @@ pub(super) struct SideState {
     hint: (String, Option<String>),
     /// When the address last changed.
     typed_at: Option<Instant>,
+    /// The disk answering whether the address, as asked, is a file.
+    file_probe: Option<(String, Receiver<bool>)>,
+    /// The disk's last answer, and the address it was about.
+    file_answer: Option<(String, bool)>,
     /// Whether a camera was connected at the last tick.
     had_camera: bool,
     /// The stage dimming from the welcome screen's surface to its own as the
@@ -91,6 +98,8 @@ impl Default for SideState {
             shakes: Flashes::new(SHAKE),
             hint: (String::new(), None),
             typed_at: None,
+            file_probe: None,
+            file_answer: None,
             had_camera: false,
             stage_in: Motion::new(1.0, motion::IMAGE, motion::IMAGE_OUT, Kind::Fade),
         }
@@ -120,6 +129,52 @@ impl SideState {
         }
     }
 
+    /// Whether the disk said `typed` is a file; `None` until it answers.
+    fn is_file(&self, typed: &str) -> Option<bool> {
+        self.file_answer
+            .as_ref()
+            .filter(|(asked, _)| asked == typed)
+            .map(|(_, file)| *file)
+    }
+
+    /// Take the disk's answer on whether an address is a file, if it came,
+    /// and ask about `typed` once it has rested for `FILE_PAUSE`, nothing
+    /// else reads it and no other answer is awaited; `ask` looks off the UI
+    /// thread, since a network path can take seconds. Returns whether an
+    /// answer about `typed` came. From `tick_side`.
+    fn poll_file(
+        &mut self,
+        typed: &str,
+        now: Instant,
+        ask: impl FnOnce(String) -> Receiver<bool>,
+    ) -> bool {
+        let mut answered = false;
+        if let Some((asked, answer)) = &self.file_probe {
+            match answer.try_recv() {
+                Ok(file) => {
+                    answered = asked == typed;
+                    self.file_answer = Some((asked.clone(), file));
+                    self.file_probe = None;
+                }
+                Err(TryRecvError::Disconnected) => self.file_probe = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        let rested = self
+            .typed_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= FILE_PAUSE);
+        let unread = self.hint.0.trim() == typed && self.hint.1.is_none();
+        if rested
+            && unread
+            && !typed.is_empty()
+            && self.file_probe.is_none()
+            && self.is_file(typed).is_none()
+        {
+            self.file_probe = Some((typed.to_owned(), ask(typed.to_owned())));
+        }
+        answered
+    }
+
     /// How far a camera that is arriving has come, from 0 to 1; 1 for any
     /// other. Free while nothing arrives.
     pub(super) fn arrival(&self, id: &str, now: Instant) -> f32 {
@@ -144,23 +199,45 @@ fn shake_offset(level: f32) -> f32 {
     SHAKE_BY * left * left * ((1.0 - left) * 3.0 * std::f32::consts::TAU).sin()
 }
 
+/// Ask the disk whether `path` is a file, on a thread of its own.
+fn probe_file(path: String) -> Receiver<bool> {
+    let (sender, receiver) = mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("capturefab-address".into())
+        .spawn(move || {
+            let _ = sender.send(std::path::Path::new(&path).is_file());
+        });
+    receiver
+}
+
 /// The camera list's and welcome screen's hooks into the shared update cycle.
 impl Workbench {
     /// Point the camera list's and welcome screen's motions at what they show; from
     /// `sync_animations`. Also reads a changed address, here rather than in
-    /// the view, since recognizing a file checks the disk.
+    /// the view; whether it is a file is asked on the tick (`poll_file`).
     pub(super) fn sync_side(&mut self) {
         if self.side.hint.0 != self.address {
-            let reading = read_address(self.address.trim(), &self.snapshot.devices);
+            let typed = self.address.trim();
+            let reading = read_address(typed, &self.snapshot.devices, self.side.is_file(typed));
             self.side.hint = (self.address.clone(), reading);
             self.side.typed_at = Some(self.now);
         }
+    }
+
+    /// Reveal the sidebar's address field and focus it, from the welcome
+    /// screen's "Enter an address" and its shortcut. The sidebar joins the
+    /// view as it heads open, so the focus finds the field at once.
+    pub(super) fn enter_address(&mut self) -> Task<Message> {
+        self.image_mode = false;
+        self.sidebar_open = true;
+        focus_address()
     }
 
     /// The camera list's and welcome screen's bookkeeping on the slow tick,
     /// after the snapshot refresh; from `tick()`.
     pub(super) fn tick_side(&mut self) {
         let now = self.now;
+        let typed = self.address.trim();
         // Newly found cameras arrive one after another, in list order.
         let side = &mut self.side;
         let mut fresh = 0;
@@ -179,10 +256,22 @@ impl Workbench {
                 .map(|device| device.id.clone())
                 .collect();
             // A serial typed before discovery found it reads as known now.
-            if !self.address.trim().is_empty() {
-                side.hint.1 = read_address(self.address.trim(), &self.snapshot.devices);
+            if !typed.is_empty() {
+                side.hint.1 = read_address(typed, &self.snapshot.devices, side.is_file(typed));
             }
         }
+        if side.poll_file(typed, now, probe_file) {
+            side.hint.1 = read_address(typed, &self.snapshot.devices, side.is_file(typed));
+        }
+        // A camera connected since, however it was, retires its failures.
+        let cameras = &self.snapshot.cameras;
+        side.connect_failures.retain(|target, _| {
+            !cameras.iter().any(|camera| {
+                camera.info.id == *target
+                    || camera.info.serial == *target
+                    || camera.info.address.as_deref() == Some(target.as_str())
+            })
+        });
         let issues = !side.discovery_issues.is_empty();
         if issues && !side.had_issues {
             side.arrived.hit(ISSUES.to_owned(), now);
@@ -298,8 +387,9 @@ pub(super) fn recent_place(recent: &Recent) -> String {
 }
 
 /// What connecting to `input` will try, following `Camera::open`'s order;
-/// `None` when it is none of the things it accepts. Never shows credentials.
-fn read_address(input: &str, devices: &[CameraInfo]) -> Option<String> {
+/// `None` when it is none of the things it accepts. `file` is the disk's
+/// answer on whether `input` is a file, if it came. Never shows credentials.
+fn read_address(input: &str, devices: &[CameraInfo], file: Option<bool>) -> Option<String> {
     if input.is_empty() {
         return None;
     }
@@ -309,7 +399,7 @@ fn read_address(input: &str, devices: &[CameraInfo]) -> Option<String> {
     if input.starts_with("sim:") {
         return Some("Will try a simulated camera".into());
     }
-    if crate::media::is_source(input) {
+    if crate::media::is_url_source(input) {
         return Some(match input.split_once(':') {
             Some((scheme, rest)) if rest.starts_with("//") => {
                 let scheme = scheme.to_ascii_lowercase();
@@ -332,6 +422,9 @@ fn read_address(input: &str, devices: &[CameraInfo]) -> Option<String> {
             }
             _ => "Will try the video file".into(),
         });
+    }
+    if file == Some(true) {
+        return Some("Will try the video file".into());
     }
     if let Ok(ip) = input
         .trim_start_matches("gige:")
@@ -388,17 +481,16 @@ fn quiet_checkbox<'a>(
 }
 
 /// What a connected camera's trailing slot shows, if anything: a glyph, its
-/// color and what it means.
+/// color and what it means. `error` is the one its stage badge would show
+/// (`camera_error`), so one already told, retired or dismissed is not. A
+/// stall is its dot's to show, so the slot keeps a recording's mark.
 fn camera_status(
     camera: &crate::session::CameraSnapshot,
-    stalled: Option<Duration>,
+    error: Option<&str>,
     p: &'static Palette,
 ) -> Option<(Element<'static, Message>, String)> {
-    if let Some(silent) = stalled {
-        return Some((Level::Warning.mark(12.0, p), silence(silent)));
-    }
-    // An old error says little while frames flow.
-    if let Some(error) = camera.last_error.as_ref().filter(|_| !camera.streaming) {
+    // While frames flow, the stage has the say.
+    if let Some(error) = error.filter(|_| !camera.streaming) {
         return Some((Level::Error.mark(12.0, p), format!("Last error: {error}")));
     }
     let output = Output::of(camera.forwarding.as_ref()?);
@@ -424,8 +516,22 @@ impl Workbench {
         !self.side.searched || running.is_some_and(|running| running >= SEARCH_SHOWN)
     }
 
+    /// Whether the address hint may say the typed text is not understood:
+    /// it rested for `TYPING_PAUSE`, nothing reads it, and the disk said it
+    /// is no file.
+    fn address_unknown(&self) -> bool {
+        let typed = self.address.trim();
+        !typed.is_empty()
+            && self.side.hint.1.is_none()
+            && self.side.is_file(typed) == Some(false)
+            && self
+                .side
+                .typed_at
+                .is_some_and(|at| self.now.saturating_duration_since(at) >= TYPING_PAUSE)
+    }
+
     /// Whether a connect to `camera`, by ID or address, is on its way.
-    fn connecting_to(&self, camera: &CameraInfo) -> bool {
+    pub(super) fn connecting_to(&self, camera: &CameraInfo) -> bool {
         self.connecting(&camera.id)
             || camera
                 .address
@@ -609,15 +715,19 @@ impl Workbench {
         let (detail, ink) = if connecting {
             ("Connecting…".to_owned(), p.secondary)
         } else if let Some((error, _)) = failure {
-            (first_line(error).to_owned(), p.ink(p.danger))
+            (capitalize(first_line(error)), p.ink(p.danger))
         } else {
             (place(camera), p.secondary)
         };
-        let status = state.and_then(|state| camera_status(state, stalled, p));
+        let status = state.and_then(|state| camera_status(state, self.camera_error(id), p));
         let mut hint = match state {
             Some(_) => format!("{} {} · {}", camera.vendor, camera.model, dot_state.about()),
             None => format!("Connect to {} {}", camera.vendor, camera.model),
         };
+        // The dot says it stalled; for how long is here.
+        if let Some(silent) = stalled {
+            hint = format!("{hint}\n{}", silence(silent));
+        }
         if let Some((_, about)) = &status {
             hint = format!("{hint}\n{about}");
         } else if let Some((error, _)) = failure {
@@ -729,7 +839,7 @@ impl Workbench {
         } else if let Some((error, _)) = failure {
             (
                 status_dot(CameraState::Failed, 8.0, p),
-                first_line(error).to_owned(),
+                capitalize(first_line(error)),
                 p.ink(p.danger),
             )
         } else {
@@ -819,7 +929,13 @@ impl Workbench {
             tip_above(
                 row![
                     Level::Error.mark(11.0, p),
-                    one_line(first_line(error), style::CAPTION, style::SANS, ink).width(Fill),
+                    one_line(
+                        capitalize(first_line(error)),
+                        style::CAPTION,
+                        style::SANS,
+                        ink
+                    )
+                    .width(Fill),
                 ]
                 .spacing(5)
                 .align_y(Alignment::Center),
@@ -829,11 +945,7 @@ impl Workbench {
             let (reading, ink) = match (&self.side.hint, typed.is_empty()) {
                 (_, true) => (ADDRESS_HINT, p.secondary),
                 ((_, Some(reading)), _) => (reading.as_str(), p.secondary),
-                ((_, None), _)
-                    if self.side.typed_at.is_some_and(|at| {
-                        self.now.saturating_duration_since(at) >= TYPING_PAUSE
-                    }) =>
-                {
+                ((_, None), _) if self.address_unknown() => {
                     ("Not an address, URL, file or serial", p.ink(p.warn))
                 }
                 ((_, None), _) => (ADDRESS_HINT, p.secondary),
@@ -848,9 +960,10 @@ impl Workbench {
             Appearance::Dark => (Icon::Moon, "Appearance: dark"),
         };
         let command = self.session_command();
-        let copied = self.copied.is_some() && self.just_copied(&command);
+        let copied = self.just_copied(&command);
         // The session's name and a copy of the command that drives it, in
-        // one control that confirms in place.
+        // one control; a copy swaps only the glyph and tooltip, so nothing
+        // moves from under the pointer.
         let session = tip_above(
             button(
                 row![
@@ -859,16 +972,12 @@ impl Workbench {
                     } else {
                         icon(Icon::Copy, 13.0, p.secondary)
                     },
-                    if copied {
-                        one_line("Copied", style::CAPTION, style::SANS, p.secondary)
-                    } else {
-                        one_line(
-                            format!("session {}", self.session),
-                            style::CAPTION,
-                            style::MONO,
-                            p.secondary,
-                        )
-                    },
+                    one_line(
+                        format!("session {}", self.session),
+                        style::CAPTION,
+                        style::MONO,
+                        p.secondary,
+                    ),
                 ]
                 .spacing(5)
                 .align_y(Alignment::Center),
@@ -876,7 +985,11 @@ impl Workbench {
             .padding([5, 6])
             .style(style::plain)
             .on_press(Message::CopySessionCommand),
-            Action::CopySessionCommand.hint(&format!("Copy {command}"), Os::CURRENT),
+            if copied {
+                "Copied".to_owned()
+            } else {
+                Action::CopySessionCommand.hint(&format!("Copy {command}"), Os::CURRENT)
+            },
         );
         let settings = row![
             tip_above(
@@ -958,7 +1071,10 @@ mod tests {
     #[test]
     fn addresses_read_in_the_order_connecting_tries_them() {
         let devices = [device("sim:0", "SIM0")];
-        let read = |input: &str| read_address(input, &devices);
+        // With the disk's answer, as `poll_file` brings it.
+        let read = |input: &str| {
+            read_address(input, &devices, Some(std::path::Path::new(input).is_file()))
+        };
         let cases = [
             ("", None),
             (
@@ -989,6 +1105,73 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(read(input).as_deref(), expected, "{input:?}");
         }
+        // Reading never asks the disk itself.
+        assert_eq!(read_address("Cargo.toml", &devices, None), None);
+    }
+
+    #[test]
+    fn the_disk_is_asked_about_files_once_typing_rests() {
+        let mut bench = bench();
+        let start = bench.now;
+        bench.address = "Cargo.toml".into();
+        bench.sync_side();
+        assert_eq!(bench.side.hint.1, None, "unknown while typing");
+        let answer = |file: bool| {
+            let (sender, receiver) = mpsc::channel();
+            let _ = sender.send(file);
+            receiver
+        };
+        let mut asked = Vec::new();
+        let typed = "Cargo.toml";
+        bench
+            .side
+            .poll_file(typed, start + FILE_PAUSE - ms(1), |text| {
+                asked.push(text);
+                answer(true)
+            });
+        assert!(asked.is_empty(), "still typing");
+        assert!(!bench.side.poll_file(typed, start + FILE_PAUSE, |text| {
+            asked.push(text);
+            answer(true)
+        }));
+        assert_eq!(asked, ["Cargo.toml"]);
+        // The tick takes the answer into the hint.
+        bench.tick_side();
+        assert_eq!(bench.side.is_file(typed), Some(true));
+        assert!(bench.side.file_probe.is_none());
+        assert_eq!(
+            bench.side.hint.1.as_deref(),
+            Some("Will try the video file")
+        );
+        // An answer about text edited since reads nothing and asks again.
+        bench.address = "Cargo".into();
+        bench.sync_side();
+        bench
+            .side
+            .poll_file("Cargo", start + FILE_PAUSE * 2, |_| answer(false));
+        bench.address = "Cargo.lock".into();
+        bench.sync_side();
+        let later = bench.now + FILE_PAUSE;
+        assert!(!bench.side.poll_file("Cargo.lock", later, |text| {
+            assert_eq!(text, "Cargo.lock");
+            answer(false)
+        }));
+        assert_eq!(bench.side.is_file("Cargo"), Some(false));
+        assert!(
+            bench
+                .side
+                .poll_file("Cargo.lock", later, |_| unreachable!())
+        );
+        // Not a file: the hint says so once typing has rested.
+        assert!(!bench.address_unknown(), "rested only for the disk");
+        bench.now = later + TYPING_PAUSE;
+        assert!(bench.address_unknown());
+        // Text something else reads asks nothing.
+        bench.address = "192.168.1.20".into();
+        bench.sync_side();
+        bench
+            .side
+            .poll_file("192.168.1.20", bench.now + FILE_PAUSE, |_| unreachable!());
     }
 
     #[test]
@@ -1234,5 +1417,87 @@ mod tests {
             Some("Will try GigE Vision at 192.168.1.20")
         );
         assert_eq!(bench.side.typed_at, Some(bench.now));
+    }
+
+    #[test]
+    fn a_row_marks_only_the_errors_its_badge_would_show() {
+        let mut bench = bench();
+        let start = bench.now;
+        let mut camera = super::super::liveness::streaming_camera(10, 0, 30.0);
+        camera.streaming = false;
+        bench.snapshot.cameras = vec![camera];
+        let status = |bench: &Workbench| {
+            let camera = &bench.snapshot.cameras[0];
+            camera_status(camera, bench.camera_error("sim:0"), &style::LIGHT)
+                .map(|(_, about)| about)
+        };
+        // Past the stage's settle delay.
+        let settled = ms(500);
+        // A refused write its notice told: the worker keeps it, the row does not.
+        let refused = "ExposureTime violates Min=10";
+        let write = Pending {
+            camera: Some("sim:0".into()),
+            at: start,
+            ..Pending::unanswered(Job::Set("ExposureTime".into()))
+        };
+        bench.settle(&write, &Err(anyhow::anyhow!(refused)));
+        bench.snapshot.cameras[0].last_error = Some(refused.into());
+        bench.tick_stage();
+        bench.now = start + settled;
+        bench.tick_stage();
+        assert_eq!(status(&bench), None);
+        // One no notice told, such as another client's: marked once it settles.
+        bench.snapshot.cameras[0].last_error = Some("Link down".into());
+        bench.tick_stage();
+        assert_eq!(status(&bench), None, "not before it settles");
+        bench.now += settled;
+        bench.tick_stage();
+        assert_eq!(status(&bench).as_deref(), Some("Last error: Link down"));
+        // Dismissed on the stage, it leaves the row too.
+        bench.dismiss_stage_error("sim:0");
+        assert_eq!(status(&bench), None);
+    }
+
+    #[test]
+    fn a_stalled_row_keeps_its_recording_mark() {
+        let mut camera = super::super::liveness::streaming_camera(10, 0, 30.0);
+        camera.forwarding = Some("recordings/line-1.mkv".into());
+        let about = camera_status(&camera, Some("Frame timeout"), &style::DARK)
+            .map(|(_, about)| about)
+            .unwrap_or_default();
+        assert!(about.starts_with("Recording to "), "{about}");
+    }
+
+    #[test]
+    fn failures_retire_once_their_camera_connects_any_way() {
+        let mut bench = bench();
+        let now = bench.now;
+        let mut camera = super::super::liveness::streaming_camera(0, 0, 0.0);
+        camera.info.id = "gige:00305311aabb".into();
+        camera.info.serial = "40012345".into();
+        camera.info.address = Some("192.168.1.40".into());
+        for target in ["gige:00305311aabb", "40012345", "192.168.1.40", "sim:3"] {
+            bench.side.connect_failed(target, "camera busy".into(), now);
+        }
+        bench.tick_side();
+        assert_eq!(bench.side.connect_failures.len(), 4, "none connected yet");
+        // Connected by IP, or by another client: its ID's failure goes too.
+        bench.snapshot.cameras = vec![camera];
+        bench.tick_side();
+        let left: Vec<_> = bench.side.connect_failures.keys().collect();
+        assert_eq!(left, ["sim:3"]);
+    }
+
+    #[test]
+    fn entering_an_address_opens_the_sidebar() {
+        let mut bench = bench();
+        bench.sidebar_open = false;
+        bench.image_mode = true;
+        bench.sync_animations();
+        assert_eq!(bench.sidebar_slide.target(), 0.0);
+        let _ = bench.handle_message(Message::EnterAddress);
+        bench.sync_animations();
+        assert!(bench.sidebar_shown());
+        assert_eq!(bench.sidebar_slide.target(), 1.0);
     }
 }

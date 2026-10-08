@@ -1737,7 +1737,7 @@ impl Workbench {
                 self.include_simulator = true;
                 self.connect("sim:0".into());
             }
-            Message::EnterAddress => return focus_address(),
+            Message::EnterAddress => return self.enter_address(),
             Message::Forget(target) => self.recent.retain(|recent| recent.target != target),
             Message::CameraRow(id) => {
                 if !self.snapshot.cameras.iter().any(|c| c.info.id == id) {
@@ -2118,7 +2118,7 @@ impl Workbench {
             Action::ToggleExposure => self.toggle_exposure(),
             Action::ToggleFocusRegion => self.toggle_focus_region(),
             Action::Discover => self.discover(),
-            Action::ConnectAddress => return focus_address(),
+            Action::ConnectAddress => return self.enter_address(),
             Action::NextCamera => self.select_relative_camera(1),
             Action::PreviousCamera => self.select_relative_camera(-1),
             Action::FocusCamera if self.overview() => self.focus_camera = true,
@@ -2162,7 +2162,8 @@ impl Workbench {
         let inspector = self.inspector_slide.lerp(0.0, INSPECTOR, self.now);
         let docked = self.inspector_docked();
         let mut body = row![];
-        if sidebar > 0.5 {
+        // Also while it heads open, so focusing its address field finds it.
+        if sidebar > 0.5 || self.sidebar_slide.target() > 0.5 {
             // Anchored right, so the list slides out under the window's left edge.
             body = body.push(
                 container(self.sidebar(p))
