@@ -18,9 +18,12 @@ use iced::widget::{button, column, container, pick_list, row, space, text, text_
 use iced::{Alignment, Element, Fill, Length, Theme};
 use serde_json::Value;
 use std::{
+    collections::BTreeMap,
     fmt,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     sync::mpsc::{Receiver, TryRecvError, channel},
+    sync::{Mutex, PoisonError},
     thread,
     time::{Duration, Instant},
 };
@@ -520,7 +523,7 @@ impl Editor {
             Target::Folder { path } => Some(path.clone()),
             Target::S3(_) => None,
         };
-        let secret = self.secret_to_store();
+        let secret = SecretWrite::queue(self.secret_to_store());
         move || {
             if let Some(path) = folder {
                 volumes::ensure_present(&path)?;
@@ -600,17 +603,64 @@ impl Editor {
     }
 }
 
+/// A typed secret to store under its access key ID, numbered on the UI
+/// thread in the order editors asked for stores.
+struct SecretWrite {
+    access_key_id: String,
+    secret: String,
+    ticket: u64,
+}
+
+impl SecretWrite {
+    fn queue(secret: Option<(String, String)>) -> Option<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        secret.map(|(access_key_id, secret)| Self {
+            access_key_id,
+            secret,
+            ticket: NEXT.fetch_add(1, Ordering::Relaxed),
+        })
+    }
+
+    /// Store with `store`, one write at a time, unless a store asked for
+    /// later already wrote this key: an editor drops a store it no longer
+    /// wants, but its thread may still be waiting on a keychain prompt, and
+    /// must not land over the newer secret.
+    fn store_in_order(
+        self,
+        written: &Mutex<BTreeMap<String, u64>>,
+        store: impl FnOnce(&str, &str) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let mut written = written.lock().unwrap_or_else(PoisonError::into_inner);
+        if written
+            .get(&self.access_key_id)
+            .is_some_and(|&ticket| ticket > self.ticket)
+        {
+            return Ok(());
+        }
+        store(&self.access_key_id, &self.secret)?;
+        written.insert(self.access_key_id, self.ticket);
+        Ok(())
+    }
+}
+
 /// Store a typed secret under its access key ID in the OS credential store;
 /// whether one was. It can wait on a keychain prompt, so off the UI thread.
-fn store_secret(secret: Option<(String, String)>) -> anyhow::Result<bool> {
-    #[cfg(feature = "s3")]
-    if let Some((id, secret)) = secret {
-        crate::s3::store_secret(&id, &secret)?;
-        return Ok(true);
-    }
-    #[cfg(not(feature = "s3"))]
-    let _ = secret;
-    Ok(false)
+fn store_secret(write: Option<SecretWrite>) -> anyhow::Result<bool> {
+    static WRITTEN: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+    // Without S3 support there is no bucket to store a secret for.
+    let Some(write) = write.filter(|_| cfg!(feature = "s3")) else {
+        return Ok(false);
+    };
+    write.store_in_order(&WRITTEN, keychain_store)?;
+    Ok(true)
+}
+
+#[cfg(feature = "s3")]
+use crate::s3::store_secret as keychain_store;
+
+#[cfg(not(feature = "s3"))]
+fn keychain_store(_access_key_id: &str, _secret: &str) -> anyhow::Result<()> {
+    Ok(())
 }
 
 /// Check a destination: write a probe file to a folder, or reach a bucket.
@@ -1073,7 +1123,7 @@ impl Picker {
                     Err(error) => return editor.refuse(error),
                 };
                 // Testing a bucket needs the key, so store a typed secret first.
-                let secret = editor.secret_to_store();
+                let secret = SecretWrite::queue(editor.secret_to_store());
                 if secret.is_some() {
                     editor.key_probe = None;
                 }
@@ -2184,6 +2234,32 @@ mod tests {
 
     fn ms(value: u64) -> Duration {
         Duration::from_millis(value)
+    }
+
+    #[test]
+    fn a_superseded_secret_store_never_lands_over_a_newer_one() {
+        let queue =
+            |id: &str, secret: &str| SecretWrite::queue(Some((id.into(), secret.into()))).unwrap();
+        let older = queue("AKIA", "old");
+        let newer = queue("AKIA", "new");
+        let other = queue("AKIB", "b");
+        let written = Mutex::new(BTreeMap::new());
+        let stored = std::cell::RefCell::new(Vec::new());
+        let store = |id: &str, secret: &str| {
+            stored.borrow_mut().push(format!("{id}={secret}"));
+            Ok(())
+        };
+        // The newer store's thread runs first; the older one then finds it
+        // superseded, while an unrelated key still stores.
+        newer.store_in_order(&written, store).unwrap();
+        older.store_in_order(&written, store).unwrap();
+        other.store_in_order(&written, store).unwrap();
+        assert_eq!(*stored.borrow(), ["AKIA=new", "AKIB=b"]);
+        // In order, both store and the newer one is last.
+        let (first, second) = (queue("AKIC", "1"), queue("AKIC", "2"));
+        first.store_in_order(&written, store).unwrap();
+        second.store_in_order(&written, store).unwrap();
+        assert_eq!(stored.borrow()[2..], ["AKIC=1", "AKIC=2"]);
     }
 
     /// A bucket that validates, changed by `change`.
