@@ -2033,7 +2033,7 @@ impl Workbench {
             Message::DismissNotice => self.dismiss_notice(),
             Message::DismissStageError(id) => self.dismiss_stage_error(&id),
             Message::HelpScrolled(scrolled) => self.sheets.scrolled = scrolled,
-            Message::HelpMore(open) => self.sheets.more = open,
+            Message::HelpMore(open) => return self.show_help_notes(open),
         }
         Task::none()
     }

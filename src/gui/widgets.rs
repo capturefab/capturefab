@@ -13,6 +13,8 @@ const SHEET_FOOTER: f32 = 1.0 + 12.0 + 32.0 + 12.0;
 const SHEET_INSET: f32 = 24.0;
 /// How far a sheet rises into place as it opens.
 const SHEET_RISE: f32 = 12.0;
+/// The scrolling body of the sheet that shows; only one shows at a time.
+pub(super) const SHEET_BODY: &str = "sheet-body";
 
 pub(super) fn focus_address() -> Task<Message> {
     Task::batch([
@@ -578,7 +580,8 @@ impl<'a, M: Clone + 'a> SheetFrame<'a, M> {
         self
     }
 
-    /// Report whether the body is scrolled away from its top as it scrolls.
+    /// Report whether the body is scrolled away from its top: once as the
+    /// sheet shows, then only as its top edge leaves or returns.
     pub(super) fn on_scroll(mut self, on_scroll: impl Fn(bool) -> M + 'a) -> Self {
         self.on_scroll = Some(Box::new(on_scroll));
         self
@@ -624,17 +627,32 @@ impl<'a, M: Clone + 'a> From<SheetFrame<'a, M>> for Element<'a, M> {
                 Action::Overview.hint("Close", Os::CURRENT),
             ));
         let room = max_height - SHEET_HEADER - if footer.is_some() { SHEET_FOOTER } else { 0.0 };
-        let mut body = scrollable(container(body).width(Fill).padding(iced::Padding {
-            top: 0.0,
-            right: SHEET_INSET,
-            bottom: SHEET_INSET,
-            left: SHEET_INSET,
-        }))
+        // A marker of no size at the body's top edge tells when it scrolls
+        // under the header: only on the change, not on every scroll step.
+        // Half a pixel of slack absorbs rounding at the top.
+        let mut content = column![];
+        if let Some(on_scroll) = on_scroll {
+            let under = on_scroll(true);
+            content = content.push(
+                iced::widget::sensor(space())
+                    .anticipate(0.5)
+                    .on_hide(under)
+                    .on_show(move |_| on_scroll(false)),
+            );
+        }
+        let body = scrollable(
+            container(content.push(body))
+                .width(Fill)
+                .padding(iced::Padding {
+                    top: 0.0,
+                    right: SHEET_INSET,
+                    bottom: SHEET_INSET,
+                    left: SHEET_INSET,
+                }),
+        )
+        .id(SHEET_BODY)
         .width(Fill)
         .style(style::sheet_scroll);
-        if let Some(on_scroll) = on_scroll {
-            body = body.on_scroll(move |viewport| on_scroll(viewport.absolute_offset().y > 0.5));
-        }
         // A hairline under the header once the body scrolls beneath it; the
         // same height either way, so nothing moves.
         let edge: Element<'a, M> = if scrolled {

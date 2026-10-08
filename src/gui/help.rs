@@ -92,6 +92,17 @@ impl Workbench {
         }
     }
 
+    /// Open or close the guide's notes on connecting cameras. They are its
+    /// last item, so opening them scrolls them into view.
+    pub(super) fn show_help_notes(&mut self, open: bool) -> Task<Message> {
+        self.sheets.more = open;
+        if open {
+            operation::snap_to_end(SHEET_BODY)
+        } else {
+            Task::none()
+        }
+    }
+
     /// Hand a message to the capture (`recording` false) or recording
     /// destination picker, focusing the first field of an editor it opens.
     pub(super) fn picker(
