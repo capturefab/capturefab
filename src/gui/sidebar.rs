@@ -85,7 +85,7 @@ impl Workbench {
                 .find(|c| c.info.id == camera.id);
             let connecting = self.connecting(&camera.id);
             let color = match state {
-                Some(state) if state.streaming => fade(p.live, self.pulse()),
+                Some(state) if state.streaming => p.live,
                 Some(_) => p.accent,
                 None if connecting => fade(p.accent, self.pulse()),
                 None => p.tertiary,

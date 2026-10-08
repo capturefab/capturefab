@@ -32,7 +32,7 @@ impl Workbench {
             Some(format!("{streaming} of {}", snapshot.cameras.len())),
             None,
             if streaming > 0 { p.live } else { p.accent_text },
-            if streaming > 0 { self.pulse() } else { 1.0 },
+            1.0,
         );
         let start = snapshot.cameras.iter().any(|camera| !camera.streaming);
         let manual = snapshot.cameras.iter().any(|camera| camera.auto.is_none());
@@ -144,7 +144,7 @@ impl Workbench {
         let mut caption = row![
             dot(
                 if camera.streaming {
-                    fade(style::DARK.live, self.pulse())
+                    style::DARK.live
                 } else {
                     style::ON_STAGE_SECONDARY
                 },

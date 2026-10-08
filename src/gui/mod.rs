@@ -7,7 +7,9 @@ mod help;
 mod icon;
 mod inspector;
 mod keys;
+mod liveness;
 mod motion;
+mod notice;
 mod prefs;
 mod preview;
 mod refresh;
@@ -44,10 +46,12 @@ use iced::{
 };
 use icon::{Icon, icon};
 use keys::{Action, Chord, Os};
+use liveness::Liveness;
 use motion::{Kind, Motion};
+use notice::{Level, Notice, Saved, command_notice};
 use prefs::{Prefs, Recent};
 use preview::Shown;
-use scene::ScreenshotRequest;
+use scene::{Scene, ScreenshotRequest};
 use std::{
     cell::Cell,
     collections::HashMap,
@@ -81,8 +85,6 @@ const GUTTER: f32 = 18.0;
 const FRAME_POLL: Duration = Duration::from_millis(2);
 /// Small overview tiles gain nothing from more than 30 redraws a second.
 const OVERVIEW_INTERVAL: Duration = Duration::from_micros(33_333);
-const NOTICE_LIFE: Duration = Duration::from_secs(5);
-const NOTICE_FADE: Duration = Duration::from_millis(180);
 
 fn mac_default(domain: &str, key: &str) -> Option<String> {
     if !cfg!(target_os = "macos") {
@@ -156,6 +158,7 @@ pub fn run_capture(
             saved.clone(),
         );
         app.width = window_size.width;
+        app.height = window_size.height;
         if let Some(path) = &screenshot {
             let scene = std::env::var("CAPTUREFAB_SCREENSHOT_SCENE").unwrap_or_default();
             let scene: Vec<&str> = scene.split(',').map(str::trim).collect();
@@ -166,7 +169,7 @@ pub fn run_capture(
                 demo_cameras.clamp(1, 16)
             };
             app.apply_scene(&scene);
-            if welcome {
+            if welcome && !scene.contains(&"searching") {
                 app.discover();
             }
             app.screenshot = Some(ScreenshotRequest {
@@ -174,6 +177,7 @@ pub fn run_capture(
                 cameras: count,
                 started: Instant::now(),
                 streams_started: None,
+                staged: false,
                 requested: false,
                 save: None,
                 outcome: app_outcome.clone(),
@@ -276,10 +280,16 @@ fn screen_refresh() -> Task<Message> {
         .map(Message::ScreenRefresh)
 }
 
+/// A command on its way to the session, filled in once where it is sent.
 struct Pending {
     label: String,
     receiver: Receiver<anyhow::Result<serde_json::Value>>,
+    /// The address or ID a connect asked for.
     target: Option<String>,
+    /// The camera the command acts on, when known.
+    camera: Option<String>,
+    /// The feature a write or command button acts on.
+    feature: Option<String>,
 }
 
 /// GPU slot of the single-camera view; camera tiles use their camera IDs.
@@ -444,6 +454,8 @@ enum Message {
     HoverTile(Option<String>),
     FocusTile(String),
     CaptureCamera(String),
+    #[allow(dead_code)] // adopted by the chrome package's dismiss button
+    DismissNotice,
 }
 
 struct Workbench {
@@ -512,8 +524,15 @@ struct Workbench {
     previews: HashMap<String, CameraPreview>,
     /// Each streaming camera's recent frame rate, by camera id.
     throughput: HashMap<String, sparkline::History>,
+    /// Whether each streaming camera's frames keep coming, by camera id.
+    liveness: HashMap<String, Liveness>,
     pending: Vec<Pending>,
-    notice: Option<(String, bool, Instant)>,
+    notice: Option<Notice>,
+    notice_shown: Motion,
+    /// The last value put on the clipboard, and when.
+    copied: Option<(String, Instant)>,
+    /// The last capture that saved files.
+    last_saved: Option<Saved>,
     recent: Vec<Recent>,
     saved: Option<Prefs>,
     prefs_changed: Option<Instant>,
@@ -521,6 +540,8 @@ struct Workbench {
     born: Instant,
     /// When the accessibility settings were last read.
     accessibility_read: Instant,
+    /// What a screenshot scene holds in place.
+    scene: Scene,
     sheet: Motion,
     activity_slide: Motion,
     exposure_slide: Motion,
@@ -536,6 +557,9 @@ struct Workbench {
     image_mode: bool,
     /// Window width at the last resize.
     width: f32,
+    /// Window height at the last resize.
+    #[allow(dead_code)] // adopted by the sheets package
+    height: f32,
     window: Option<[f32; 2]>,
     fullscreen: bool,
     pointer_moved: Option<Instant>,
@@ -629,14 +653,19 @@ impl Workbench {
             display_error: None,
             previews: HashMap::new(),
             throughput: HashMap::new(),
+            liveness: HashMap::new(),
             pending: Vec::new(),
             notice: None,
+            notice_shown: Motion::new(0.0, motion::NOTICE_IN, motion::NOTICE_OUT, Kind::Fade),
+            copied: None,
+            last_saved: None,
             recent: prefs.recent,
             saved,
             prefs_changed: None,
             now,
             born: now,
             accessibility_read: now,
+            scene: Scene::default(),
             sheet: Motion::new(0.0, motion::SHEET, motion::SHEET_OUT, Kind::Fade),
             activity_slide: Motion::new(
                 shown(prefs.logs_open),
@@ -664,6 +693,7 @@ impl Workbench {
             inspector_peek: false,
             image_mode: false,
             width: 1280.0,
+            height: 840.0,
             window: prefs.window,
             fullscreen: false,
             pointer_moved: None,
@@ -741,22 +771,14 @@ impl Workbench {
         }
     }
 
+    /// A slow breath for transient pending indicators (connecting,
+    /// searching); live states stay steady. It advances on the busy tick.
     fn pulse(&self) -> f32 {
         if self.screenshot.is_some() || motion::reduce_motion() {
             return 1.0;
         }
         let t = self.now.duration_since(self.born).as_secs_f32();
         0.7 + 0.3 * (t * std::f32::consts::TAU / 1.8).cos()
-    }
-
-    fn notice_alpha(&self, at: Instant, error: bool) -> f32 {
-        let age = self.now.duration_since(at).as_secs_f32();
-        let fade = NOTICE_FADE.as_secs_f32();
-        let rise = (age / fade).min(1.0);
-        if error {
-            return rise;
-        }
-        rise.min(((NOTICE_LIFE.as_secs_f32() - age) / (fade * 2.0)).clamp(0.0, 1.0))
     }
 
     fn dark(&self) -> bool {
@@ -773,6 +795,8 @@ impl Workbench {
 
     fn subscription(&self) -> Subscription<Message> {
         let streaming = self.snapshot.cameras.iter().any(|camera| camera.streaming);
+        // Pending commands (connecting, discovering) tick fast enough to
+        // step spinners and pulses without per-frame redraws.
         let busy = !self.pending.is_empty()
             || self.screenshot.is_some()
             || self.capture_to.busy()
@@ -840,32 +864,66 @@ impl Workbench {
         ])
     }
 
+    /// Send `command` to the selected camera, or to the session for
+    /// discovery, connecting and selection.
     fn send(&mut self, label: impl Into<String>, command: SessionCommand) {
-        let label = label.into();
-        match self.handle.submit(command) {
+        self.submit(None, label.into(), command);
+    }
+
+    fn send_to(&mut self, camera: &str, label: impl Into<String>, command: SessionCommand) {
+        self.submit(Some(camera), label.into(), command);
+    }
+
+    /// Submit `command` and track it as pending under `label`, noting the
+    /// camera and feature it acts on; returns the entry, so a send site can
+    /// add what only it knows. The session routes commands without a camera
+    /// the same way: to the selected camera, except discovery, connecting
+    /// and selection.
+    fn submit(
+        &mut self,
+        camera: Option<&str>,
+        label: String,
+        command: SessionCommand,
+    ) -> Option<&mut Pending> {
+        let acts_on = match (camera, &command) {
+            (Some(camera), _) => Some(camera.to_owned()),
+            (
+                None,
+                SessionCommand::Connect { .. }
+                | SessionCommand::Discover { .. }
+                | SessionCommand::Status,
+            ) => None,
+            (None, SessionCommand::Select { camera }) => Some(camera.clone()),
+            (None, _) => self.snapshot.active_camera.clone(),
+        };
+        let feature = match &command {
+            SessionCommand::Set { feature, .. } | SessionCommand::Execute { feature } => {
+                Some(feature.clone())
+            }
+            _ => None,
+        };
+        let submitted = match camera {
+            Some(camera) => self.handle.submit_to(camera, command),
+            None => self.handle.submit(command),
+        };
+        match submitted {
             Ok(receiver) => {
-                self.notice = None;
+                self.clear_done_notice();
                 self.pending.push(Pending {
                     label,
                     receiver,
                     target: None,
+                    camera: acts_on,
+                    feature,
                 });
+                self.pending.last_mut()
             }
-            Err(err) => self.notice = Some((err.to_string(), true, Instant::now())),
-        }
-    }
-
-    fn send_to(&mut self, camera: &str, label: impl Into<String>, command: SessionCommand) {
-        match self.handle.submit_to(camera, command) {
-            Ok(receiver) => {
-                self.notice = None;
-                self.pending.push(Pending {
-                    label: label.into(),
-                    receiver,
-                    target: None,
-                });
+            Err(error) => {
+                if let Some((text, detail, level)) = command_notice(&label, &Err(error)) {
+                    self.set_notice(text, detail, level);
+                }
+                None
             }
-            Err(error) => self.notice = Some((error.to_string(), true, Instant::now())),
         }
     }
 
@@ -926,29 +984,25 @@ impl Workbench {
                     if let Ok(value) = &result {
                         self.finished(&pending, value);
                     }
-                    let (message, attention) = command_notice(&pending.label, &result);
-                    self.notice = Some((message, attention, Instant::now()));
+                    if let Some((text, detail, level)) = command_notice(&pending.label, &result) {
+                        self.set_notice(text, detail, level);
+                    }
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.pending.swap_remove(i);
-                    self.notice =
-                        Some(("Session worker disconnected".into(), true, Instant::now()));
+                    self.set_notice("Session worker disconnected", None, Level::Error);
                 }
                 Err(TryRecvError::Empty) => i += 1,
             }
-        }
-        if self
-            .notice
-            .as_ref()
-            .is_some_and(|(_, error, at)| !*error && at.elapsed() > NOTICE_LIFE)
-        {
-            self.notice = None;
         }
     }
 
     fn finished(&mut self, pending: &Pending, result: &serde_json::Value) {
         if pending.label == "Saving capture" {
             self.shutter.replay(1.0, 0.0, self.now);
+            if let Some(saved) = Saved::from_result(pending.camera.clone(), result, self.now) {
+                self.last_saved = Some(saved);
+            }
         }
         let Some(target) = &pending.target else {
             return;
@@ -978,6 +1032,8 @@ impl Workbench {
 
     fn tick(&mut self) -> Task<Message> {
         self.poll();
+        self.age_notice();
+        self.age_copied();
         self.prune_flashes();
         self.poll_accessibility();
         let selected = self.snapshot.active_camera.clone();
@@ -1020,6 +1076,7 @@ impl Workbench {
             self.balance = status.balance;
         }
         self.sample_throughput();
+        self.observe_liveness();
         self.update_frames();
         self.capture_to.tick();
         self.record_to.tick();
@@ -1030,7 +1087,7 @@ impl Workbench {
     /// Add the newest frame rate of each streaming camera to its history,
     /// flagging samples where frames were lost; stopping clears it.
     fn sample_throughput(&mut self) {
-        let now = Instant::now();
+        let now = self.now;
         let snapshot = &self.snapshot;
         self.throughput.retain(|id, _| {
             snapshot
@@ -1087,6 +1144,12 @@ impl Workbench {
                 continue;
             }
             preview.frame_id = Some(frame.id);
+            liveness::seen(
+                &mut self.liveness,
+                self.scene.frozen.as_ref(),
+                &camera.info.id,
+                self.now,
+            );
             let meta = (frame.id, frame.width, frame.height, frame.pixel_format);
             let shown =
                 preview::present(gpu, &mut preview.shown, &camera.info.id, frame, |frame| {
@@ -1110,6 +1173,9 @@ impl Workbench {
             return;
         }
         self.frame_id = Some(frame.id);
+        if let Some(id) = &self.observed_camera {
+            liveness::seen(&mut self.liveness, self.scene.frozen.as_ref(), id, self.now);
+        }
         let meta = (
             frame.id,
             frame.width,
@@ -1175,14 +1241,14 @@ impl Workbench {
     fn connect(&mut self, camera: String) {
         self.edits.clear();
         self.edit_sources.clear();
-        self.send(
-            "Connecting camera",
+        if let Some(pending) = self.submit(
+            None,
+            "Connecting camera".into(),
             SessionCommand::Connect {
                 camera: camera.clone(),
                 timeout_ms: 5000,
             },
-        );
-        if let Some(pending) = self.pending.last_mut() {
+        ) {
             pending.target = Some(camera);
         }
     }
@@ -1313,8 +1379,10 @@ impl Workbench {
     }
 
     fn copy_session_command(&mut self) -> Task<Message> {
-        self.notice = Some(("Session command copied".into(), false, Instant::now()));
-        iced::clipboard::write(self.session_command())
+        let command = self.session_command();
+        self.set_notice("Session command copied", None, Level::Done);
+        self.note_copied(command.clone());
+        iced::clipboard::write(command)
     }
 
     fn num_text(&self, key: Num) -> String {
@@ -1546,6 +1614,7 @@ impl Workbench {
             }
             Message::ToggleActivity => self.logs_open = !self.logs_open,
             Message::CopyLog => {
+                self.note_copied(notice::COPIED_LOG);
                 return iced::clipboard::write(
                     self.snapshot
                         .logs
@@ -1557,7 +1626,8 @@ impl Workbench {
             }
             Message::CopySessionCommand => return self.copy_session_command(),
             Message::Copy(value) => {
-                self.notice = Some(("Copied".into(), false, Instant::now()));
+                self.set_notice("Copied", None, Level::Done);
+                self.note_copied(value.clone());
                 return iced::clipboard::write(value);
             }
             Message::Tab(tab) => self.tab = tab,
@@ -1620,7 +1690,9 @@ impl Workbench {
                         feature: feature.clone(),
                     },
                 };
-                self.send(format!("Executing {feature}"), command);
+                if let Some(pending) = self.submit(None, format!("Executing {feature}"), command) {
+                    pending.feature = Some(feature);
+                }
             }
             Message::Num(key, value) => {
                 if self.set_num(key, &value) {
@@ -1704,6 +1776,7 @@ impl Workbench {
             Message::ToggleImage => self.image_mode = !self.image_mode,
             Message::Resized(size) => {
                 self.width = size.width;
+                self.height = size.height;
                 if self.inspector_docked() {
                     self.inspector_peek = false;
                 }
@@ -1761,6 +1834,7 @@ impl Workbench {
                     request.save = Some(receiver);
                 }
             }
+            Message::DismissNotice => self.dismiss_notice(),
         }
         Task::none()
     }
@@ -2000,52 +2074,10 @@ fn num_valid(key: Num, text: &str) -> bool {
     }
 }
 
-fn command_notice(label: &str, result: &Result<serde_json::Value>) -> (String, bool) {
-    match result {
-        Ok(value) => {
-            let warnings = value["warnings"]
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| item.as_str())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if warnings.is_empty() {
-                (format!("{label} · done"), false)
-            } else {
-                (format!("{label}: {}", warnings.join(" · ")), true)
-            }
-        }
-        Err(error) => (format!("{label}: {error:#}"), true),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use iced::futures::{FutureExt, StreamExt};
-
-    #[test]
-    fn discovery_warnings_remain_visible_after_success() {
-        let (message, attention) = command_notice(
-            "Discovering cameras",
-            &Ok(serde_json::json!({
-                "devices": [{"id": "sim:0"}],
-                "warnings": ["Native discovery timed out", "USB access denied"]
-            })),
-        );
-        assert!(attention);
-        assert!(message.contains("Native discovery timed out"));
-        assert!(message.contains("USB access denied"));
-        let (message, attention) = command_notice(
-            "Discovering cameras",
-            &Ok(serde_json::json!({"warnings": []})),
-        );
-        assert!(!attention);
-        assert_eq!(message, "Discovering cameras · done");
-    }
 
     #[test]
     fn frame_watcher_stays_quiet_without_new_frames() {

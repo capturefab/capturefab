@@ -18,7 +18,7 @@ impl Workbench {
                 Some(format!("{:.1} fps", snapshot.fps)),
                 Some(fps_spark(history, p.live, p.warn, (64.0, 14.0))),
                 p.live,
-                self.pulse(),
+                1.0,
             ))
         } else if connected {
             Some(status_pill("Ready", None, None, p.accent_text, 1.0))

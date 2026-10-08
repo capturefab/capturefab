@@ -47,21 +47,26 @@ impl Workbench {
             .on_press(Message::Tab(Tab::Capture)),
             Action::CaptureTab.hint("Where captures are saved", os),
         ));
-        let status: Element<'_, Message> = if let Some((message, error, at)) = &self.notice {
-            let alpha = self.notice_alpha(*at, *error);
-            let color = fade(if *error { p.danger } else { p.secondary }, alpha);
+        let status: Element<'_, Message> = if let Some(notice) = &self.notice {
+            let alpha = self.notice_alpha();
+            let (glyph, tint, ink) = match notice.level {
+                Level::Done => (Icon::Check, p.live, p.secondary),
+                Level::Warning => (Icon::Warning, p.warn, p.secondary),
+                Level::Error => (Icon::Warning, p.danger, p.danger),
+            };
             tip(
                 row![
-                    icon(
-                        if *error { Icon::Warning } else { Icon::Check },
-                        13.0,
-                        fade(if *error { p.danger } else { p.live }, alpha),
+                    icon(glyph, 13.0, fade(tint, alpha)),
+                    clipped(
+                        text(notice.text.clone())
+                            .size(style::SMALL)
+                            .color(fade(ink, alpha))
+                            .wrapping(text::Wrapping::None)
                     ),
-                    clipped(text(message.clone()).size(style::SMALL).color(color)),
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center),
-                message.clone(),
+                notice.about(),
             )
         } else if let Some(pending) = self.pending.first() {
             row![

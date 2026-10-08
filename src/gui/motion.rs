@@ -33,6 +33,14 @@ pub(super) const SLIDE: Duration = Duration::from_millis(200);
 pub(super) const SLIDE_OUT: Duration = Duration::from_millis(160);
 pub(super) const SHUTTER: Duration = Duration::from_millis(320);
 pub(super) const WELCOME: Duration = Duration::from_millis(400);
+pub(super) const NOTICE_IN: Duration = Duration::from_millis(160);
+pub(super) const NOTICE_OUT: Duration = Duration::from_millis(200);
+/// How long a done or warning notice stays before it fades.
+pub(super) const NOTICE_LIFE: Duration = Duration::from_secs(5);
+/// How long a copy button reads as copied.
+pub(super) const COPIED: Duration = Duration::from_millis(1500);
+/// How long a capture control reads as saved.
+pub(super) const SAVED: Duration = Duration::from_millis(1600);
 /// How long `Flashes` remembers a hit, which bounds what `held` can answer.
 pub(super) const FLASH_KEEP: Duration = Duration::from_secs(3);
 /// How often the system's accessibility display settings are read again.
@@ -159,7 +167,6 @@ impl Motion {
     }
 
     /// Where the value is heading, or rests.
-    #[allow(dead_code)] // read by the notice and the area packages
     pub(super) fn target(&self) -> f32 {
         self.animation.value()
     }
@@ -326,6 +333,7 @@ impl Workbench {
             controls,
             tile_hover,
             ring,
+            notice_shown,
         ],
         flashes: [],
     }
@@ -354,13 +362,7 @@ impl Workbench {
     /// Whether anything moves, which keeps redraws coming every display frame.
     pub(super) fn animating(&self) -> bool {
         let now = self.now;
-        let fading = self.notice.as_ref().is_some_and(|(_, error, at)| {
-            let age = now.duration_since(*at);
-            age < NOTICE_FADE
-                || (!error && age > NOTICE_LIFE - NOTICE_FADE * 2 && age < NOTICE_LIFE)
-        });
-        fading
-            || self.motions().any(|motion| motion.animating(now))
+        self.motions().any(|motion| motion.animating(now))
             || self.flashes().any(|flashes| flashes.animating(now))
     }
 
@@ -383,6 +385,17 @@ impl Workbench {
     /// Show the stage controls for `CONTROLS_IDLE`, as moving the pointer does.
     pub(super) fn wake_controls(&mut self) {
         self.pointer_moved = Some(self.now);
+    }
+
+    /// The step a spinner shows: one of 8, advancing every 120 ms. The slow
+    /// tick runs at its busy rate while anything is pending, so spinners
+    /// step without per-frame redraws. Screenshots hold it at 0.
+    #[allow(dead_code)] // adopted by the area packages
+    pub(super) fn spin(&self) -> usize {
+        if self.screenshot.is_some() {
+            return 0;
+        }
+        (self.now.saturating_duration_since(self.born).as_millis() / 120 % 8) as usize
     }
 
     /// Point each motion at the state it shows.
