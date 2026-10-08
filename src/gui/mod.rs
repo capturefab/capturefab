@@ -1228,6 +1228,9 @@ impl Workbench {
     }
 
     fn tick(&mut self) -> Task<Message> {
+        if self.shot_staged() {
+            return self.screenshot_tick();
+        }
         self.poll();
         self.age_notice();
         self.age_copied();
@@ -1647,7 +1650,8 @@ impl Workbench {
                 return screen_refresh();
             }
             Message::ScreenRefresh(period) => self.refresh.report(period),
-            Message::FrameArrived => self.update_frames(),
+            Message::FrameArrived if !self.shot_staged() => self.update_frames(),
+            Message::FrameArrived => {}
             Message::SystemTheme(mode) => self.system_dark = mode == theme::Mode::Dark,
             Message::Key { chord, captured } => return self.shortcut(chord, !captured),
             Message::FocusNext(back) => {

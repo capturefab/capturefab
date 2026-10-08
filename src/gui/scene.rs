@@ -281,6 +281,16 @@ impl Workbench {
         self.pending.last_mut().expect("just held")
     }
 
+    /// Whether a screenshot scene is staged: the workbench then holds still
+    /// until the shot. The capture renders the layers last drawn again, and
+    /// they keep their text only weakly, so text laid out anew since that
+    /// draw (a frame count, say) would come out blank.
+    pub(super) fn shot_staged(&self) -> bool {
+        self.screenshot
+            .as_ref()
+            .is_some_and(|request| request.staged)
+    }
+
     pub(super) fn screenshot_tick(&mut self) -> Task<Message> {
         let Some(mut request) = self.screenshot.take() else {
             return Task::none();
