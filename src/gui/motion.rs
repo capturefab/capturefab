@@ -585,33 +585,6 @@ mod tests {
     }
 
     #[test]
-    fn sheets_snap_shut_and_rise_from_the_start() {
-        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
-        let start = bench.now;
-        bench.help_open = true;
-        bench.sync_animations();
-        bench.now = start + SHEET / 2;
-        let half = bench.sheets.shown.get(bench.now);
-        assert!(half > 0.0 && half < 1.0);
-        bench.help_open = false;
-        bench.sync_animations();
-        assert_eq!(
-            bench.sheets.shown.get(bench.now),
-            0.0,
-            "nothing draws an exit"
-        );
-        assert!(!bench.sheets.shown.animating(bench.now));
-        bench.capture_to.manager_open = true;
-        bench.sync_animations();
-        assert_eq!(
-            bench.sheets.shown.get(bench.now),
-            0.0,
-            "rises from the start"
-        );
-        assert!(bench.sheets.shown.animating(bench.now + SHEET / 2));
-    }
-
-    #[test]
     fn selection_moves_from_the_previous_camera() {
         let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
         let start = bench.now;

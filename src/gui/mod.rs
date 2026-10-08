@@ -480,6 +480,10 @@ enum Message {
     // Inspector: inspector.rs
 
     // Sheets: help.rs, destinations.rs
+    /// The guide's body scrolled away from its top, or back.
+    HelpScrolled(bool),
+    /// Open or close the guide's notes on connecting cameras.
+    HelpMore(bool),
 }
 
 struct Workbench {
@@ -1602,7 +1606,7 @@ impl Workbench {
                     Appearance::Dark => Appearance::System,
                 }
             }
-            Message::Help(open) => self.help_open = open,
+            Message::Help(open) => self.show_help(open),
             Message::DragWindow => return window::latest().and_then(window::drag),
             Message::ZoomWindow => {
                 return window::latest().and_then(|id| match double_click_action() {
@@ -1869,10 +1873,8 @@ impl Workbench {
                 }
             }
             Message::StopForward => self.send("Stopping forwarding", SessionCommand::StopForward),
-            Message::CapturePicker(message) => self.capture_to.update(message, &mut self.output),
-            Message::RecordPicker(message) => {
-                self.record_to.update(message, &mut self.forward_output)
-            }
+            Message::CapturePicker(message) => return self.picker(false, message),
+            Message::RecordPicker(message) => return self.picker(true, message),
             Message::ToggleSidebar => {
                 self.image_mode = false;
                 self.sidebar_open = !self.sidebar_open;
@@ -1956,12 +1958,14 @@ impl Workbench {
             // Inspector: inspector.rs
 
             // Sheets: help.rs, destinations.rs
+            Message::HelpScrolled(scrolled) => self.sheets.scrolled = scrolled,
+            Message::HelpMore(open) => self.sheets.more = open,
         }
         Task::none()
     }
 
     fn shortcut(&mut self, chord: Chord, keyboard_free: bool) -> Task<Message> {
-        let modal = self.help_open || self.capture_to.manager_open || self.record_to.manager_open;
+        let modal = self.sheet_open();
         let Some(action) = Action::find(&chord, keyboard_free, Os::CURRENT) else {
             return Task::none();
         };
@@ -1986,7 +1990,7 @@ impl Workbench {
                     &mut self.forward_output,
                 );
             }
-            Action::Help => self.help_open = !self.help_open,
+            Action::Help => self.show_help(!self.help_open),
             Action::CopySessionCommand => return self.copy_session_command(true),
             Action::Fullscreen => {
                 return window::latest().and_then(|id| {
@@ -2104,34 +2108,7 @@ impl Workbench {
         let body: Element<'_, Message> = layers
             .push(shader(self.gpu.probe()).width(1).height(1))
             .into();
-        let t = self.sheets.shown.get(self.now);
-        let body = if self.help_open {
-            modal(body, self.help(p), Some(Message::Help(false)), t)
-        } else {
-            body
-        };
-        let body = if self.capture_to.manager_open {
-            modal(
-                body,
-                self.capture_to.manager(dark).map(Message::CapturePicker),
-                (!self.capture_to.editing())
-                    .then_some(Message::CapturePicker(destinations::Message::CloseManager)),
-                t,
-            )
-        } else {
-            body
-        };
-        if self.record_to.manager_open {
-            modal(
-                body,
-                self.record_to.manager(dark).map(Message::RecordPicker),
-                (!self.record_to.editing())
-                    .then_some(Message::RecordPicker(destinations::Message::CloseManager)),
-                t,
-            )
-        } else {
-            body
-        }
+        self.sheets(body, p)
     }
 
     /// The title bar row at the top of a pane; on macOS it is also the

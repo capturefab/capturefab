@@ -2,25 +2,41 @@
 //! recordings on this computer, in a folder on an external or network drive,
 //! or in an S3-compatible bucket.
 //!
-//! Disk scans, bucket checks and queue status run on background threads, so a
-//! slow network share or service never stalls the interface.
-use super::icon::{Icon, icon};
+//! Disk scans, bucket checks, keychain lookups and queue status run on
+//! background threads, so a slow network share, service or credential store
+//! never stalls the interface.
+use super::icon::{self, Icon, icon};
+use super::motion::Flashes;
 use super::sparkline::History;
 use super::style::{self, Palette};
+use super::widgets::{SheetFrame, disclosure, fade, field_error, one_line, sheet_frame};
 use crate::destination::{self, Bucket, Credentials, Destination, Target};
 use crate::volumes::{self, Volume};
 use iced::widget::{
-    button, column, container, pick_list, row, scrollable, space, text, text_input,
+    button, column, container, keyed_column, pick_list, row, space, text, text_input,
 };
-use iced::{Alignment, Element, Fill, Length};
+use iced::{Alignment, Element, Fill, Length, Theme};
 use serde_json::Value;
 use std::{
     fmt,
     path::{Path, PathBuf},
-    sync::mpsc::{Receiver, channel},
+    sync::mpsc::{Receiver, TryRecvError, channel},
     thread,
     time::{Duration, Instant},
 };
+
+/// How long the access key ID must rest before the keychain is asked
+/// whether it holds the key's secret, so typing never waits on it.
+const KEY_PAUSE: Duration = Duration::from_millis(400);
+/// How long a just-saved destination's row glows in the list.
+const SAVED_GLOW: Duration = Duration::from_millis(1000);
+/// The key prefix new buckets start with.
+const DEFAULT_PREFIX: &str = "capturefab/";
+/// Ids of the editor fields that take focus as it opens.
+const NAME_FIELD: &str = "destination-name";
+const BUCKET_FIELD: &str = "destination-bucket";
+/// Width of the destination sheets.
+const SHEET_WIDTH: f32 = 560.0;
 
 /// Run `work` on a thread; poll the receiver for its result.
 fn background<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Receiver<T> {
@@ -85,6 +101,23 @@ const PROVIDERS: [(&str, &str, &str, bool); 5] = [
     ("Other S3-compatible", "https://", "us-east-1", true),
 ];
 
+/// The `PROVIDERS` entry a saved bucket's endpoint belongs to.
+fn provider_of(endpoint: &str) -> usize {
+    let url = endpoint.trim_end_matches('/');
+    if url.is_empty() {
+        0
+    } else if url.ends_with(".r2.cloudflarestorage.com") {
+        1
+    } else if url.ends_with(".backblazeb2.com") {
+        2
+    } else {
+        PROVIDERS
+            .iter()
+            .position(|(_, preset, _, _)| *preset == url)
+            .unwrap_or(PROVIDERS.len() - 1)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     Keychain,
@@ -129,11 +162,56 @@ impl fmt::Display for Choice {
     }
 }
 
+/// A field of the editor that a refused destination can point at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Field {
+    Name,
+    Folder,
+    Endpoint,
+    Region,
+    Bucket,
+    Prefix,
+    AccessKey,
+    Profile,
+}
+
+impl Field {
+    /// The field a message from `Destination::validate` is about, by its
+    /// opening words, as `cli::error_code` classifies errors.
+    fn of(message: &str) -> Option<Field> {
+        const OPENINGS: [(&str, Field); 8] = [
+            ("destination names", Field::Name),
+            ("a folder destination", Field::Folder),
+            ("S3 endpoint", Field::Endpoint),
+            ("S3 region", Field::Region),
+            ("S3 bucket", Field::Bucket),
+            ("S3 key prefix", Field::Prefix),
+            ("S3 access key", Field::AccessKey),
+            ("AWS profile", Field::Profile),
+        ];
+        OPENINGS
+            .iter()
+            .find(|(opening, _)| message.starts_with(opening))
+            .map(|&(_, field)| field)
+    }
+}
+
+/// `message` starting with a capital, for showing on its own.
+fn sentence(message: &str) -> String {
+    let mut chars = message.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
 /// The add/edit form.
 struct Editor {
     /// The name being edited, when changing an existing destination.
     original: Option<String>,
     name: String,
+    /// The name was typed, so it no longer follows the bucket.
+    name_touched: bool,
     s3: bool,
     folder: String,
     provider: usize,
@@ -147,8 +225,18 @@ struct Editor {
     secret: String,
     /// Whether the keychain holds a secret for `access_key_id`.
     stored_secret: bool,
+    /// When the access key ID last changed, until the keychain is asked.
+    key_changed: Option<Instant>,
+    /// The keychain answering whether it holds a secret for an access key ID.
+    key_probe: Option<(String, Receiver<bool>)>,
     profile: String,
     keep_local: bool,
+    /// The key prefix and addressing style show.
+    advanced: bool,
+    /// Fields the last save or test refused, and why, in form order.
+    invalid: Vec<(Field, String)>,
+    /// The last check's outcome or a refusal no field explains; true for
+    /// a problem.
     message: Option<(String, bool)>,
     testing: Option<Receiver<Result<String, String>>>,
 }
@@ -158,28 +246,34 @@ impl Editor {
         Self {
             original: None,
             name,
+            name_touched: true,
             s3: false,
             folder: folder.to_string_lossy().into_owned(),
             provider: 0,
             endpoint: String::new(),
             region: "us-east-1".into(),
             bucket: String::new(),
-            prefix: "capturefab/".into(),
+            prefix: DEFAULT_PREFIX.into(),
             path_style: false,
             source: Source::Keychain,
             access_key_id: String::new(),
             secret: String::new(),
             stored_secret: false,
+            key_changed: None,
+            key_probe: None,
             profile: "default".into(),
             keep_local: false,
+            advanced: false,
+            invalid: Vec::new(),
             message: None,
             testing: None,
         }
     }
+    /// A new bucket, named after the bucket until a name is typed.
     fn new_bucket() -> Self {
         Self {
             s3: true,
-            name: "bucket".into(),
+            name_touched: false,
             ..Self::new_folder(String::new(), PathBuf::new())
         }
     }
@@ -196,19 +290,17 @@ impl Editor {
                 editor.prefix = bucket.prefix.clone();
                 editor.path_style = bucket.path_style;
                 editor.keep_local = bucket.keep_local;
-                editor.provider = PROVIDERS
-                    .iter()
-                    .position(|(_, endpoint, _, _)| {
-                        !endpoint.is_empty()
-                            && bucket.endpoint.starts_with(
-                                endpoint.trim_end_matches("ACCOUNT_ID.r2.cloudflarestorage.com"),
-                            )
-                    })
-                    .unwrap_or(if bucket.endpoint.is_empty() { 0 } else { 4 });
+                editor.provider = provider_of(&bucket.endpoint);
+                editor.advanced = editor.custom_advanced();
                 match &bucket.credentials {
                     Credentials::Keychain { access_key_id } => {
                         editor.access_key_id = access_key_id.clone();
-                        editor.check_stored_secret();
+                        // Asked at once: nothing is being typed yet.
+                        editor.key_edited(
+                            Instant::now()
+                                .checked_sub(KEY_PAUSE)
+                                .unwrap_or_else(Instant::now),
+                        );
                     }
                     Credentials::Profile { name } => {
                         editor.source = Source::Profile;
@@ -220,27 +312,81 @@ impl Editor {
         }
         editor
     }
-    fn check_stored_secret(&mut self) {
-        #[cfg(feature = "s3")]
-        {
-            self.stored_secret = !self.access_key_id.trim().is_empty()
-                && crate::s3::has_secret(self.access_key_id.trim());
+
+    /// Whether the Advanced fields differ from what a new bucket of this
+    /// service starts with, so they show without being asked for.
+    fn custom_advanced(&self) -> bool {
+        self.prefix.trim() != DEFAULT_PREFIX || self.path_style != PROVIDERS[self.provider].3
+    }
+
+    /// The access key ID changed at `at`: whether the keychain holds its
+    /// secret is unknown until typing rests for `KEY_PAUSE`.
+    fn key_edited(&mut self, at: Instant) {
+        self.stored_secret = false;
+        if cfg!(feature = "s3") {
+            self.key_changed = Some(at);
         }
     }
-    fn destination(&self) -> anyhow::Result<Destination> {
+
+    /// The access key ID to ask the keychain about at `now`, once typing
+    /// has rested and no other answer is awaited.
+    fn key_due(&self, now: Instant) -> Option<String> {
+        let rested = self
+            .key_changed
+            .is_some_and(|at| now.saturating_duration_since(at) >= KEY_PAUSE);
+        (rested && self.key_probe.is_none()).then(|| self.access_key_id.trim().to_owned())
+    }
+
+    /// Take the keychain's answer, if it came, and ask again once due;
+    /// `ask` starts a lookup off the UI thread. From `Picker::tick`.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
+    fn poll_key(&mut self, now: Instant, ask: impl FnOnce(String) -> Receiver<bool>) {
+        if let Some((id, answer)) = &self.key_probe {
+            match answer.try_recv() {
+                Ok(stored) => {
+                    // An answer about a key ID since edited is stale.
+                    if id.as_str() == self.access_key_id.trim() {
+                        self.stored_secret = stored;
+                    }
+                    self.key_probe = None;
+                }
+                Err(TryRecvError::Disconnected) => self.key_probe = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(id) = self.key_due(now) {
+            self.key_changed = None;
+            if !id.is_empty() {
+                self.key_probe = Some((id.clone(), ask(id)));
+            }
+        }
+    }
+
+    /// The destination as typed, with a valid stand-in for each of
+    /// `stand_ins`, so validation reaches the fields after them.
+    fn build(&self, stand_ins: &[Field]) -> Destination {
+        let value = |field: Field, typed: &str, stand_in: &str| -> String {
+            if stand_ins.contains(&field) {
+                stand_in.into()
+            } else {
+                typed.trim().into()
+            }
+        };
         let target = if self.s3 {
             Target::S3(Bucket {
-                endpoint: self.endpoint.trim().into(),
-                region: self.region.trim().into(),
-                bucket: self.bucket.trim().into(),
-                prefix: self.prefix.trim().trim_start_matches('/').into(),
+                endpoint: value(Field::Endpoint, &self.endpoint, ""),
+                region: value(Field::Region, &self.region, "us-east-1"),
+                bucket: value(Field::Bucket, &self.bucket, "bucket"),
+                prefix: value(Field::Prefix, &self.prefix, "")
+                    .trim_start_matches('/')
+                    .into(),
                 path_style: self.path_style,
                 credentials: match self.source {
                     Source::Keychain => Credentials::Keychain {
-                        access_key_id: self.access_key_id.trim().into(),
+                        access_key_id: value(Field::AccessKey, &self.access_key_id, "AKIA"),
                     },
                     Source::Profile => Credentials::Profile {
-                        name: self.profile.trim().into(),
+                        name: value(Field::Profile, &self.profile, "default"),
                     },
                     Source::Environment => Credentials::Environment,
                 },
@@ -248,15 +394,81 @@ impl Editor {
             })
         } else {
             Target::Folder {
-                path: PathBuf::from(self.folder.trim()),
+                path: if stand_ins.contains(&Field::Folder) {
+                    std::env::temp_dir()
+                } else {
+                    PathBuf::from(self.folder.trim())
+                },
             }
         };
-        let destination = Destination {
-            name: self.name.trim().into(),
+        Destination {
+            name: value(Field::Name, &self.name, "destination"),
             target,
-        };
+        }
+    }
+
+    fn destination(&self) -> anyhow::Result<Destination> {
+        let destination = self.build(&[]);
         destination.validate()?;
         Ok(destination)
+    }
+
+    /// Every field the destination can't be saved with, and why: validation
+    /// stops at the first, so each found field gets a stand-in and it runs
+    /// again.
+    fn problems(&self) -> Vec<(Field, String)> {
+        let mut found: Vec<(Field, String)> = Vec::new();
+        loop {
+            let fields: Vec<Field> = found.iter().map(|(field, _)| *field).collect();
+            let Err(error) = self.build(&fields).validate() else {
+                break;
+            };
+            let message = error.to_string();
+            match Field::of(&message) {
+                Some(field) if !fields.contains(&field) => found.push((field, message)),
+                _ => break,
+            }
+        }
+        // A name that follows an unusable bucket is the bucket's problem.
+        if !self.name_touched && found.iter().any(|(field, _)| *field == Field::Bucket) {
+            found.retain(|(field, _)| *field != Field::Name);
+        }
+        found
+    }
+
+    /// Show why a save or test was refused: on the fields at fault when
+    /// validation names them, else under the form.
+    fn refuse(&mut self, error: anyhow::Error) {
+        let message = format!("{error:#}");
+        let problems = if Field::of(&message).is_some() {
+            self.problems()
+        } else {
+            Vec::new()
+        };
+        if problems.is_empty() {
+            self.message = Some((sentence(&message), true));
+        } else {
+            self.advanced |= problems.iter().any(|(field, _)| *field == Field::Prefix);
+            self.invalid = problems;
+            self.message = None;
+        }
+    }
+
+    /// `field` was edited: its refusal no longer applies, nor does the last
+    /// check's outcome.
+    fn edited(&mut self, field: Option<Field>) {
+        if let Some(field) = field {
+            self.invalid.retain(|(f, _)| *f != field);
+        }
+        self.message = None;
+    }
+
+    /// Why `field` was refused, if it was.
+    fn refusal(&self, field: Field) -> Option<&str> {
+        self.invalid
+            .iter()
+            .find(|(f, _)| *f == field)
+            .map(|(_, message)| message.as_str())
     }
     /// Save the destination (and a typed secret, into the OS credential
     /// store); returns the saved name.
@@ -349,9 +561,13 @@ pub enum Message {
     Profile(String),
     PathStyle(bool),
     KeepLocal(bool),
+    /// Show or hide the editor's key prefix and addressing style.
+    Advanced(bool),
     Save,
     Test,
     Cancel,
+    /// The sheet's body scrolled away from its top, or back.
+    Scrolled(bool),
 }
 
 /// Free space and presence of the selected folder, refreshed in the background.
@@ -383,7 +599,14 @@ pub struct Picker {
     editor: Option<Editor>,
     removing: Option<String>,
     pub manager_open: bool,
+    /// The outcome of the manager's last change; true for a problem.
     notice: Option<(String, bool)>,
+    /// Destinations just saved, whose rows glow for a moment.
+    saved_glow: Flashes<String>,
+    /// The sheet's body has scrolled under its header.
+    scrolled: bool,
+    /// The field to focus once an editor that just opened shows.
+    focus: Option<&'static str>,
     /// Remember the choice for the next launch (the capture panel does).
     remember: bool,
     /// Files are recordings, not stills; changes a few labels.
@@ -392,10 +615,10 @@ pub struct Picker {
 
 impl Picker {
     // The picker's own motions and flashes, which the workbench's registry
-    // includes; the sheets package adds them here.
+    // includes.
     super::motion::registry! {
         motions: [],
-        flashes: [],
+        flashes: [saved_glow],
     }
 }
 
@@ -424,6 +647,9 @@ impl Picker {
             removing: None,
             manager_open: false,
             notice: None,
+            saved_glow: Flashes::new(SAVED_GLOW),
+            scrolled: false,
+            focus: None,
             remember,
             recording,
         }
@@ -507,13 +733,25 @@ impl Picker {
         }
         if let Some(editor) = &mut self.editor
             && let Some(task) = &editor.testing
-            && let Ok(result) = task.try_recv()
         {
-            editor.message = Some(match result {
-                Ok(text) => (text, false),
-                Err(text) => (text, true),
+            let outcome = match task.try_recv() {
+                Ok(Ok(text)) => Some((text, false)),
+                Ok(Err(text)) => Some((sentence(&text), true)),
+                Err(TryRecvError::Disconnected) => {
+                    Some(("The check stopped without an answer".into(), true))
+                }
+                Err(TryRecvError::Empty) => None,
+            };
+            if outcome.is_some() {
+                editor.message = outcome;
+                editor.testing = None;
+            }
+        }
+        #[cfg(feature = "s3")]
+        if let Some(editor) = &mut self.editor {
+            editor.poll_key(Instant::now(), |id| {
+                background(move || crate::s3::has_secret(&id))
             });
-            editor.testing = None;
         }
     }
 
@@ -521,9 +759,33 @@ impl Picker {
         self.editor.is_some() || self.removing.is_some()
     }
 
-    /// Whether a background check is running, so the app keeps polling.
+    /// Whether a background check or keychain lookup is running or due, so
+    /// the app keeps polling.
     pub fn busy(&self) -> bool {
-        self.editor.as_ref().is_some_and(|e| e.testing.is_some())
+        self.editor.as_ref().is_some_and(|e| {
+            e.testing.is_some() || e.key_probe.is_some() || e.key_changed.is_some()
+        })
+    }
+
+    /// The id of the field to focus, once, after an editor opened.
+    pub fn take_focus(&mut self) -> Option<&'static str> {
+        self.focus.take()
+    }
+
+    /// Show `editor` in the manager, scrolled to its top, its first field
+    /// to be focused.
+    fn open_editor(&mut self, editor: Editor) {
+        self.focus = Some(if editor.s3 { BUCKET_FIELD } else { NAME_FIELD });
+        self.editor = Some(editor);
+        self.removing = None;
+        self.scrolled = false;
+    }
+
+    /// Back to the list, scrolled to its top.
+    fn close_editor(&mut self) {
+        self.editor = None;
+        self.removing = None;
+        self.scrolled = false;
     }
 
     /// Where a capture with this output goes, for compact displays.
@@ -583,12 +845,13 @@ impl Picker {
             Message::OpenManager => {
                 self.manager_open = true;
                 self.notice = None;
+                self.scrolled = false;
             }
             Message::CloseManager => {
                 self.manager_open = false;
-                self.editor = None;
-                self.removing = None;
+                self.close_editor();
             }
+            Message::Scrolled(scrolled) => self.scrolled = scrolled,
             Message::Retry => {
                 #[cfg(feature = "s3")]
                 {
@@ -599,7 +862,7 @@ impl Picker {
             Message::Edit(name) => {
                 self.removing = None;
                 if let Some(destination) = self.saved.iter().find(|d| d.name == name) {
-                    self.editor = Some(Editor::edit(destination));
+                    self.open_editor(Editor::edit(destination));
                 }
             }
             Message::Remove(name) => {
@@ -622,17 +885,11 @@ impl Picker {
                         .file_name()
                         .map(|n| safe_name(&n.to_string_lossy()))
                         .unwrap_or_else(|| "folder".into());
-                    self.editor = Some(Editor::new_folder(name, folder));
+                    self.open_editor(Editor::new_folder(name, folder));
                 }
             }
-            Message::AddBucket => {
-                self.removing = None;
-                self.editor = Some(Editor::new_bucket());
-            }
-            Message::Cancel => {
-                self.editor = None;
-                self.removing = None;
-            }
+            Message::AddBucket => self.open_editor(Editor::new_bucket()),
+            Message::Cancel => self.close_editor(),
             Message::Save => {
                 let Some(editor) = &mut self.editor else {
                     return;
@@ -640,17 +897,22 @@ impl Picker {
                 match editor.save() {
                     Ok(name) => {
                         self.notice = Some((format!("Saved {name}"), false));
-                        self.editor = None;
+                        self.saved_glow.hit(name.clone(), Instant::now());
+                        self.close_editor();
                         self.loaded = None;
                         self.tick();
                         self.select(Some(name), output);
                     }
-                    Err(error) => editor.message = Some((format!("{error:#}"), true)),
+                    Err(error) => editor.refuse(error),
                 }
             }
             Message::Test => {
                 let Some(editor) = &mut self.editor else {
                     return;
+                };
+                let destination = match editor.destination() {
+                    Ok(destination) => destination,
+                    Err(error) => return editor.refuse(error),
                 };
                 // Testing a bucket needs the key, so store a typed secret first.
                 #[cfg(feature = "s3")]
@@ -660,53 +922,102 @@ impl Picker {
                             editor.secret.clear();
                             editor.stored_secret = true;
                         }
-                        Err(e) => editor.message = Some((format!("{e:#}"), true)),
+                        Err(e) => {
+                            editor.message = Some((sentence(&format!("{e:#}")), true));
+                            return;
+                        }
                     }
                 }
-                match editor.destination() {
-                    Ok(destination) => {
-                        editor.message = None;
-                        editor.testing = Some(background(move || test(destination)));
-                    }
-                    Err(error) => editor.message = Some((format!("{error:#}"), true)),
-                }
+                editor.message = None;
+                editor.invalid.clear();
+                editor.testing = Some(background(move || test(destination)));
             }
             message => {
                 let Some(editor) = &mut self.editor else {
                     return;
                 };
-                match message {
-                    Message::Name(value) => editor.name = value,
-                    Message::Folder(value) => editor.folder = value,
+                let field = match message {
+                    Message::Name(value) => {
+                        editor.name = value;
+                        editor.name_touched = true;
+                        Some(Field::Name)
+                    }
+                    Message::Folder(value) => {
+                        editor.folder = value;
+                        Some(Field::Folder)
+                    }
                     Message::BrowseFolder => {
-                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                            editor.folder = folder.to_string_lossy().into_owned();
-                        }
+                        let Some(folder) = rfd::FileDialog::new().pick_folder() else {
+                            return;
+                        };
+                        editor.folder = folder.to_string_lossy().into_owned();
+                        Some(Field::Folder)
                     }
                     Message::Provider(Provider(index)) => {
-                        if index != editor.provider {
-                            let (_, endpoint, region, path_style) = PROVIDERS[index];
-                            editor.provider = index;
-                            editor.endpoint = endpoint.into();
-                            editor.region = region.into();
-                            editor.path_style = path_style;
+                        if index == editor.provider {
+                            return;
                         }
+                        let (_, endpoint, region, path_style) = PROVIDERS[index];
+                        editor.provider = index;
+                        editor.endpoint = endpoint.into();
+                        editor.region = region.into();
+                        editor.path_style = path_style;
+                        editor.edited(Some(Field::Region));
+                        Some(Field::Endpoint)
                     }
-                    Message::Endpoint(value) => editor.endpoint = value,
-                    Message::Region(value) => editor.region = value,
-                    Message::Bucket(value) => editor.bucket = value,
-                    Message::Prefix(value) => editor.prefix = value,
-                    Message::Source(source) => editor.source = source,
+                    Message::Endpoint(value) => {
+                        editor.endpoint = value;
+                        Some(Field::Endpoint)
+                    }
+                    Message::Region(value) => {
+                        editor.region = value;
+                        Some(Field::Region)
+                    }
+                    Message::Bucket(value) => {
+                        if !editor.name_touched {
+                            editor.name = safe_name(value.trim());
+                            editor.edited(Some(Field::Name));
+                        }
+                        editor.bucket = value;
+                        Some(Field::Bucket)
+                    }
+                    Message::Prefix(value) => {
+                        editor.prefix = value;
+                        Some(Field::Prefix)
+                    }
+                    Message::Source(source) => {
+                        editor.source = source;
+                        None
+                    }
                     Message::AccessKey(value) => {
                         editor.access_key_id = value;
-                        editor.check_stored_secret();
+                        editor.key_edited(Instant::now());
+                        Some(Field::AccessKey)
                     }
-                    Message::Secret(value) => editor.secret = value,
-                    Message::Profile(value) => editor.profile = value,
-                    Message::PathStyle(value) => editor.path_style = value,
-                    Message::KeepLocal(value) => editor.keep_local = value,
-                    _ => {}
-                }
+                    Message::Secret(value) => {
+                        editor.secret = value;
+                        None
+                    }
+                    Message::Profile(value) => {
+                        editor.profile = value;
+                        Some(Field::Profile)
+                    }
+                    Message::PathStyle(value) => {
+                        editor.path_style = value;
+                        None
+                    }
+                    Message::KeepLocal(value) => {
+                        editor.keep_local = value;
+                        None
+                    }
+                    // Opening the group changes nothing a check looked at.
+                    Message::Advanced(open) => {
+                        editor.advanced = open;
+                        return;
+                    }
+                    _ => return,
+                };
+                editor.edited(field);
             }
         }
     }
@@ -745,8 +1056,8 @@ impl Picker {
             }
             Err(error) => {
                 // Show the form so the name or folder can be adjusted.
-                editor.message = Some((format!("{error:#}"), true));
-                self.editor = Some(editor);
+                editor.refuse(error);
+                self.open_editor(editor);
                 self.manager_open = true;
             }
         }
@@ -800,6 +1111,11 @@ impl Picker {
             .align_y(Alignment::Center),
         ]
         .spacing(6);
+        let (local_example, named_example) = if self.recording {
+            ("rtsp://host:8554/camera or recording.mkv", "recording.mkv")
+        } else {
+            ("capture.png", "capture.png")
+        };
         match self.selected_destination() {
             None => {
                 content = content
@@ -807,7 +1123,7 @@ impl Picker {
                     .push(label(local_label, p))
                     .push(
                         row![
-                            text_input("capture.png", output)
+                            text_input(local_example, output)
                                 .on_input(Message::Output)
                                 .size(style::BODY)
                                 .padding([6, 10])
@@ -836,7 +1152,7 @@ impl Picker {
                         p,
                     ))
                     .push(
-                        text_input("capture.png", output)
+                        text_input(named_example, output)
                             .on_input(Message::Output)
                             .size(style::BODY)
                             .padding([6, 10])
@@ -851,25 +1167,30 @@ impl Picker {
                 .iter()
                 .enumerate()
                 .fold(row![], |drives, (index, volume)| {
-                    let kind = if volume.kind == "network" {
-                        "network"
+                    let (glyph, kind) = if volume.kind == "network" {
+                        (Icon::Network, "network")
                     } else {
-                        "drive"
+                        (Icon::HardDrives, "external")
                     };
                     drives.push(super::tip(
                         button(
-                            text(format!(
-                                "{} · {} free · {kind}",
-                                volume.name,
-                                bytes(volume.free_bytes)
-                            ))
-                            .size(style::CAPTION),
+                            row![
+                                icon(glyph, 12.0, p.secondary),
+                                text(format!(
+                                    "{} · {} free",
+                                    volume.name,
+                                    bytes(volume.free_bytes)
+                                ))
+                                .size(style::CAPTION),
+                            ]
+                            .spacing(5)
+                            .align_y(Alignment::Center),
                         )
                         .padding([4, 8])
                         .style(style::secondary)
                         .on_press(Message::UseVolume(index)),
                         format!(
-                            "Save to a Capturefab folder on {} ({} of {})",
+                            "Save to a Capturefab folder on this {kind} drive: {} ({} of {} free)",
                             volume.path.display(),
                             bytes(volume.free_bytes),
                             bytes(volume.total_bytes)
@@ -1048,176 +1369,218 @@ impl Picker {
         lines.into()
     }
 
-    /// The destination manager, shown as a sheet over the workbench.
-    pub fn manager(&self, dark: bool) -> Element<'_, Message> {
+    /// The destination manager, shown as a sheet over the workbench: the
+    /// list, or an editor in its place. `max_height` follows the window,
+    /// `spin` steps a running check's spinner and `now` fades the glow on a
+    /// row just saved.
+    pub fn manager(
+        &self,
+        dark: bool,
+        max_height: f32,
+        spin: usize,
+        now: Instant,
+    ) -> Element<'_, Message> {
         let p = Palette::of(dark);
-        let mut content = column![
-            row![
-                text("Destinations").size(style::DISPLAY).font(style::BOLD),
-                space::horizontal(),
-                super::tip(
-                    button(icon(Icon::Close, 14.0, p.secondary))
-                        .padding(6)
-                        .style(style::plain)
-                        .on_press(Message::CloseManager),
-                    super::Action::Overview.hint("Close", super::Os::CURRENT),
-                ),
-            ]
-            .align_y(Alignment::Center),
+        let page = match &self.editor {
+            None => self.list(p, now),
+            Some(editor) => self.form(editor, p, spin),
+        }
+        .size(SHEET_WIDTH, max_height)
+        .scrolled(self.scrolled)
+        .on_scroll(Message::Scrolled);
+        // Keyed by page: to iced each page is a new sheet, which opens at its
+        // top with nothing focused from the page before.
+        keyed_column([(self.editor.is_some(), page.into())]).into()
+    }
+
+    fn list(&self, p: &'static Palette, now: Instant) -> SheetFrame<'_, Message> {
+        let mut body = column![
             text(
-                "Save captures and recordings in a folder (including external and network drives) or upload them to an S3-compatible bucket. Files are always written locally first, within your storage limits.",
+                "Save captures and recordings to a folder or drive, or upload them to an S3 bucket."
             )
             .size(style::SMALL)
             .color(p.secondary),
         ]
-        .spacing(10);
+        .spacing(14);
         if let Some((message, error)) = &self.notice {
-            content = content.push(text(message.clone()).size(style::SMALL).color(if *error {
-                p.danger
-            } else {
-                p.accent_text
-            }));
+            let outcome = if *error { Status::Failed } else { Status::Done };
+            body = body.push(status(message.clone(), outcome, 0, p));
         }
-        content = content.push(space().height(4));
-        content = match &self.editor {
-            None => content.push(self.list(p)),
-            Some(editor) => content.push(self.form(editor, p)),
-        };
-        container(scrollable(content.padding(24)).style(style::scroll))
-            .width(520)
-            .max_height(640)
-            .style(style::sheet)
-            .into()
-    }
-
-    fn list(&self, p: &'static Palette) -> Element<'_, Message> {
-        let mut rows = column![].spacing(2);
-        for destination in &self.saved {
-            let name = destination.name.clone();
-            let (first, second) = if self.removing.as_deref() == Some(name.as_str()) {
-                (
-                    button(text("Remove").size(style::SMALL))
-                        .style(style::danger)
-                        .on_press(Message::Remove(name)),
-                    button(text("Cancel").size(style::SMALL))
-                        .style(style::plain)
-                        .on_press(Message::ConfirmRemove(None)),
-                )
-            } else {
-                (
-                    button(text("Edit…").size(style::SMALL))
-                        .style(style::link)
-                        .on_press(Message::Edit(name.clone())),
-                    button(text("Remove").size(style::SMALL))
-                        .style(style::plain)
-                        .on_press(Message::ConfirmRemove(Some(name))),
-                )
-            };
-            rows = rows.push(
-                container(
-                    row![
-                        icon(
-                            if matches!(destination.target, Target::S3(_)) {
-                                Icon::Broadcast
-                            } else {
-                                Icon::Folder
-                            },
-                            15.0,
-                            p.accent,
-                        ),
-                        column![
-                            text(destination.name.clone())
-                                .size(style::BODY)
-                                .font(style::SEMIBOLD),
-                            text(destination.describe())
-                                .size(style::CAPTION)
-                                .color(p.secondary),
-                        ]
-                        .spacing(2)
-                        .width(Fill),
-                        first.padding([3, 8]),
-                        second.padding([3, 8]),
-                    ]
-                    .spacing(10)
-                    .align_y(Alignment::Center),
-                )
-                .padding([8, 4]),
-            );
-        }
+        let frame = |body| sheet_frame("Destinations", Message::CloseManager, body, p);
         if self.saved.is_empty() {
-            rows = rows.push(
-                text("No saved destinations yet.")
-                    .size(style::SMALL)
-                    .color(p.secondary),
+            return frame(
+                body.push(
+                    column![
+                        choice(
+                            Icon::Folder,
+                            "Folder or drive",
+                            "This computer, an external or a network drive",
+                            Message::AddFolder,
+                            p,
+                        ),
+                        choice(
+                            Icon::CloudArrowUp,
+                            "S3 bucket",
+                            "Amazon S3, Cloudflare R2, Backblaze B2, MinIO and others",
+                            Message::AddBucket,
+                            p,
+                        ),
+                    ]
+                    .spacing(8),
+                ),
             );
         }
-        column![
-            rows,
+        let rows = self.saved.iter().fold(column![].spacing(2), |rows, d| {
+            rows.push(self.row(d, p, now))
+        });
+        let add = |glyph, label, on| {
+            button(
+                row![icon(glyph, 14.0, p.text), text(label).size(style::BODY)]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+            )
+            .padding([7, 12])
+            .style(style::secondary)
+            .on_press(on)
+        };
+        frame(body.push(rows)).footer(
             row![
-                button(
-                    row![
-                        icon(Icon::Folder, 14.0, p.text),
-                        text("Add folder…").size(style::BODY)
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center)
-                )
-                .padding([7, 12])
-                .style(style::secondary)
-                .on_press(Message::AddFolder),
-                button(
-                    row![
-                        icon(Icon::Plus, 14.0, p.text),
-                        text("Add S3 bucket…").size(style::BODY)
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center)
-                )
-                .padding([7, 12])
-                .style(style::secondary)
-                .on_press(Message::AddBucket),
+                add(Icon::FolderPlus, "Add folder…", Message::AddFolder),
+                add(Icon::CloudArrowUp, "Add S3 bucket…", Message::AddBucket),
             ]
             .spacing(8),
-        ]
-        .spacing(14)
+        )
+    }
+
+    /// A saved destination, glowing for a moment after it was saved.
+    fn row<'a>(
+        &'a self,
+        destination: &'a Destination,
+        p: &'static Palette,
+        now: Instant,
+    ) -> Element<'a, Message> {
+        let name = destination.name.clone();
+        let (first, second) = if self.removing.as_deref() == Some(name.as_str()) {
+            (
+                button(text("Remove").size(style::SMALL))
+                    .style(style::danger)
+                    .on_press(Message::Remove(name)),
+                button(text("Cancel").size(style::SMALL))
+                    .style(style::plain)
+                    .on_press(Message::ConfirmRemove(None)),
+            )
+        } else {
+            (
+                button(text("Edit…").size(style::SMALL))
+                    .style(style::link)
+                    .on_press(Message::Edit(name.clone())),
+                button(text("Remove").size(style::SMALL))
+                    .style(style::plain)
+                    .on_press(Message::ConfirmRemove(Some(name))),
+            )
+        };
+        let description = destination.describe();
+        let glow = self.saved_glow.level(destination.name.as_str(), now);
+        container(
+            row![
+                icon(
+                    if matches!(destination.target, Target::S3(_)) {
+                        Icon::CloudArrowUp
+                    } else {
+                        Icon::Folder
+                    },
+                    15.0,
+                    p.accent,
+                ),
+                column![
+                    text(destination.name.as_str())
+                        .size(style::BODY)
+                        .font(style::SEMIBOLD),
+                    super::tip(
+                        one_line(
+                            description.clone(),
+                            style::CAPTION,
+                            style::SANS,
+                            p.secondary
+                        )
+                        .width(Fill),
+                        description,
+                    ),
+                ]
+                .spacing(2)
+                .width(Fill),
+                first.padding([3, 8]),
+                second.padding([3, 8]),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .padding([8, 10])
+        .style(move |_| container::Style {
+            background: (glow > 0.0).then(|| fade(p.accent_soft, glow).into()),
+            border: iced::border::rounded(style::RADIUS),
+            ..container::Style::default()
+        })
         .into()
     }
 
-    fn form<'a>(&'a self, editor: &'a Editor, p: &'static Palette) -> Element<'a, Message> {
+    fn form<'a>(
+        &'a self,
+        editor: &'a Editor,
+        p: &'static Palette,
+        spin: usize,
+    ) -> SheetFrame<'a, Message> {
         let field = |label: &'a str, control: Element<'a, Message>| -> Element<'a, Message> {
             row![
                 text(label)
                     .size(style::BODY)
                     .color(p.secondary)
-                    .width(Length::Fixed(110.0)),
+                    .width(Length::Fixed(LABEL)),
                 control,
             ]
             .spacing(12)
             .align_y(Alignment::Center)
             .into()
         };
-        let input = |placeholder: &'a str, value: &'a str, on: fn(String) -> Message| {
+        // A field with why it was refused under its control, if it was.
+        let checked = |kind: Field, row: Element<'a, Message>| -> Element<'a, Message> {
+            match editor.refusal(kind) {
+                Some(message) => column![row, field("", field_error(sentence(message), p))]
+                    .spacing(4)
+                    .into(),
+                None => row,
+            }
+        };
+        let input = |placeholder: &'a str, value: &'a str, on: fn(String) -> Message, kind| {
+            let look: fn(&Theme, text_input::Status) -> text_input::Style =
+                if editor.refusal(kind).is_some() {
+                    style::input_invalid
+                } else {
+                    style::input
+                };
             text_input(placeholder, value)
                 .on_input(on)
                 .on_submit(Message::Save)
                 .size(style::BODY)
                 .padding([6, 10])
-                .style(style::input)
+                .style(look)
         };
-        let mut form = column![
-            text(if editor.s3 { "S3 bucket" } else { "Folder" })
-                .size(style::HEADING)
-                .font(style::SEMIBOLD)
-                .color(p.accent_text),
+        let name_example = if editor.name_touched {
+            "archive"
+        } else {
+            "Same as the bucket"
+        };
+        let name = checked(
+            Field::Name,
             field(
                 "Name",
                 super::tip(
-                    input("archive", &editor.name, Message::Name),
+                    input(name_example, &editor.name, Message::Name, Field::Name).id(NAME_FIELD),
                     "Letters, digits, '.', '-' and '_'. Used with --destination on the command line.",
                 ),
             ),
-        ]
-        .spacing(10);
+        );
+        let mut form = column![].spacing(10);
         if editor.s3 {
             form = form.push(field(
                 "Service",
@@ -1234,23 +1597,41 @@ impl Picker {
                 .into(),
             ));
             if editor.provider != 0 {
-                form = form.push(field(
-                    "Endpoint",
-                    input("https://", &editor.endpoint, Message::Endpoint).into(),
+                form = form.push(checked(
+                    Field::Endpoint,
+                    field(
+                        "Endpoint",
+                        input(
+                            "https://",
+                            &editor.endpoint,
+                            Message::Endpoint,
+                            Field::Endpoint,
+                        )
+                        .into(),
+                    ),
                 ));
             }
             form = form
-                .push(field(
-                    "Region",
-                    input("us-east-1", &editor.region, Message::Region).into(),
+                .push(checked(
+                    Field::Bucket,
+                    field(
+                        "Bucket",
+                        input(
+                            "bucket-name",
+                            &editor.bucket,
+                            Message::Bucket,
+                            Field::Bucket,
+                        )
+                        .id(BUCKET_FIELD)
+                        .into(),
+                    ),
                 ))
-                .push(field(
-                    "Bucket",
-                    input("bucket", &editor.bucket, Message::Bucket).into(),
-                ))
-                .push(field(
-                    "Key prefix",
-                    input("cameras/line-1/", &editor.prefix, Message::Prefix).into(),
+                .push(checked(
+                    Field::Region,
+                    field(
+                        "Region",
+                        input("us-east-1", &editor.region, Message::Region, Field::Region).into(),
+                    ),
                 ))
                 .push(field(
                     "Credentials",
@@ -1263,24 +1644,13 @@ impl Picker {
                         .into(),
                 ));
             form = match editor.source {
-                Source::Keychain => form
-                    .push(field(
-                        "Access key ID",
-                        input("AKIA…", &editor.access_key_id, Message::AccessKey).into(),
-                    ))
-                    .push(field(
-                        "Secret key",
+                Source::Keychain => {
+                    let mut secret = row![
                         text_input(
                             if editor.stored_secret {
-                                if cfg!(target_os = "macos") {
-                                    "Saved in your keychain; type to replace"
-                                } else {
-                                    "Saved in the OS keychain; type to replace"
-                                }
-                            } else if cfg!(target_os = "macos") {
-                                "Saved to your keychain"
+                                "Type to replace"
                             } else {
-                                "Saved to the OS keychain"
+                                "Secret access key"
                             },
                             &editor.secret,
                         )
@@ -1290,32 +1660,46 @@ impl Picker {
                         .size(style::BODY)
                         .padding([6, 10])
                         .style(style::input)
-                        .into(),
-                    )),
-                Source::Profile => form.push(field(
-                    "Profile",
-                    input("default", &editor.profile, Message::Profile).into(),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center);
+                    if editor.stored_secret {
+                        secret = secret.push(stored_badge(p));
+                    }
+                    form.push(checked(
+                        Field::AccessKey,
+                        field(
+                            "Access key ID",
+                            input(
+                                "AKIA…",
+                                &editor.access_key_id,
+                                Message::AccessKey,
+                                Field::AccessKey,
+                            )
+                            .into(),
+                        ),
+                    ))
+                    .push(field("Secret key", secret.into()))
+                    .push(field("", caption(KEYCHAIN_NOTE, p)))
+                }
+                Source::Profile => form.push(checked(
+                    Field::Profile,
+                    field(
+                        "Profile",
+                        input("default", &editor.profile, Message::Profile, Field::Profile).into(),
+                    ),
                 )),
                 Source::Environment => form.push(field(
                     "",
-                    text("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY of the process that uploads")
-                        .size(style::SMALL)
-                        .color(p.secondary)
-                        .into(),
+                    caption(
+                        "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY of the process that uploads",
+                        p,
+                    ),
                 )),
             };
+            let open = editor.advanced;
             form = form
-                .push(field(
-                    "",
-                    super::tip(
-                        super::checkbox(
-                            "Path-style addressing",
-                            editor.path_style,
-                            Message::PathStyle,
-                        ),
-                        "Needed by MinIO and most non-AWS services",
-                    ),
-                ))
+                .push(name)
                 .push(field(
                     "",
                     super::checkbox(
@@ -1323,33 +1707,81 @@ impl Picker {
                         editor.keep_local,
                         Message::KeepLocal,
                     ),
+                ))
+                .push(disclosure(
+                    "Advanced",
+                    (!open).then(|| advanced_summary(editor)),
+                    if open { 1.0 } else { 0.0 },
+                    Message::Advanced(!open),
+                    p,
                 ));
+            if open {
+                form = form
+                    .push(checked(
+                        Field::Prefix,
+                        field(
+                            "Key prefix",
+                            input(
+                                "cameras/line-1/",
+                                &editor.prefix,
+                                Message::Prefix,
+                                Field::Prefix,
+                            )
+                            .into(),
+                        ),
+                    ))
+                    .push(field(
+                        "",
+                        super::tip(
+                            super::checkbox(
+                                "Path-style addressing",
+                                editor.path_style,
+                                Message::PathStyle,
+                            ),
+                            "Needed by MinIO and most non-AWS services",
+                        ),
+                    ));
+            }
         } else {
-            form = form.push(field(
-                "Folder",
-                row![
-                    input("/Volumes/Drive/Capturefab", &editor.folder, Message::Folder),
-                    super::tip(
-                        button(icon(Icon::Folder, 15.0, p.secondary))
-                            .padding(6)
-                            .style(style::plain)
-                            .on_press(Message::BrowseFolder),
-                        "Choose a folder",
-                    ),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center)
-                .into(),
+            form = form.push(name).push(checked(
+                Field::Folder,
+                field(
+                    "Folder",
+                    row![
+                        input(
+                            "/Volumes/Drive/Capturefab",
+                            &editor.folder,
+                            Message::Folder,
+                            Field::Folder
+                        ),
+                        super::tip(
+                            button(icon(Icon::Folder, 15.0, p.secondary))
+                                .padding(6)
+                                .style(style::plain)
+                                .on_press(Message::BrowseFolder),
+                            "Choose a folder",
+                        ),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center)
+                    .into(),
+                ),
             ));
         }
-        if let Some((message, error)) = &editor.message {
-            form = form.push(text(message.clone()).size(style::SMALL).color(if *error {
-                p.danger
-            } else {
-                p.live
-            }));
-        }
         let testing = editor.testing.is_some();
+        let outcome = if testing {
+            let doing = if editor.s3 {
+                "Checking the bucket…"
+            } else {
+                "Checking the folder…"
+            };
+            status(doing.into(), Status::Working, spin, p)
+        } else if let Some((message, error)) = &editor.message {
+            let outcome = if *error { Status::Failed } else { Status::Done };
+            status(message.clone(), outcome, spin, p)
+        } else {
+            space().into()
+        };
         let cancel = button(text("Cancel").size(style::BODY))
             .padding([7, 14])
             .style(style::plain)
@@ -1363,27 +1795,423 @@ impl Picker {
         } else {
             (cancel, save)
         };
-        form.push(space().height(6))
-            .push(
-                row![
-                    super::tip(
-                        button(text(if testing { "Testing…" } else { "Test" }).size(style::BODY))
-                            .padding([7, 14])
-                            .style(style::secondary)
-                            .on_press_maybe((!testing).then_some(Message::Test)),
-                        "Saves the secret key first, then checks the folder or bucket",
+        let footer = row![
+            super::tip(
+                button(text("Test").size(style::BODY))
+                    .padding([7, 14])
+                    .style(style::secondary)
+                    .on_press_maybe((!testing).then_some(Message::Test)),
+                if editor.s3 {
+                    "Check that the bucket can be reached with these credentials"
+                } else {
+                    "Check that the folder can be written to"
+                },
+            ),
+            container(outcome).width(Fill).padding([0, 4]),
+            first,
+            second,
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        let title = match &editor.original {
+            Some(name) => format!("Edit {name}"),
+            None if editor.s3 => "New S3 bucket".into(),
+            None => "New folder".into(),
+        };
+        sheet_frame(title, Message::CloseManager, form, p)
+            .back(Some(Message::Cancel))
+            .footer(footer)
+    }
+
+    /// Put the manager in a named state for a screenshot; see
+    /// `Workbench::scene_sheets`. Whether `word` was one of its own:
+    /// `destinations-list` (two saved destinations, one just saved; it
+    /// saves them in the session folder, so give the screenshot its own),
+    /// `folder-editor`, `bucket-editor` (filled in, its secret stored and
+    /// checked) and `testing` (after an editor word: its check never ends).
+    pub(super) fn scene(&mut self, word: &str) -> bool {
+        match word {
+            "destinations-list" => {
+                for (name, target) in [
+                    (
+                        "archive",
+                        Target::Folder {
+                            path: "/Volumes/Archive/Capturefab".into(),
+                        },
                     ),
-                    space::horizontal(),
-                    first,
-                    second,
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            )
-            .into()
+                    (
+                        "line-1",
+                        Target::S3(Bucket {
+                            endpoint: "https://ACCOUNT_ID.r2.cloudflarestorage.com".into(),
+                            region: "auto".into(),
+                            bucket: "line-1-captures".into(),
+                            prefix: DEFAULT_PREFIX.into(),
+                            path_style: true,
+                            credentials: Credentials::Keychain {
+                                access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
+                            },
+                            keep_local: false,
+                        }),
+                    ),
+                ] {
+                    let _ = destination::save(Destination {
+                        name: name.into(),
+                        target,
+                    });
+                }
+                self.saved = destination::list().unwrap_or_default();
+                self.notice = Some(("Saved line-1".into(), false));
+            }
+            "folder-editor" => self.open_editor(Editor::new_folder(
+                "archive".into(),
+                "/Volumes/Archive/Capturefab".into(),
+            )),
+            "bucket-editor" => {
+                let mut editor = Editor::new_bucket();
+                editor.bucket = "line-1-captures".into();
+                editor.name = safe_name(&editor.bucket);
+                editor.access_key_id = "AKIAIOSFODNN7EXAMPLE".into();
+                editor.stored_secret = true;
+                editor.message = Some(("Connected to line-1-captures".into(), false));
+                self.open_editor(editor);
+            }
+            "testing" => {
+                if let Some(editor) = &mut self.editor {
+                    let (sender, receiver) = channel();
+                    // Never answered: the check runs for the whole scene.
+                    std::mem::forget(sender);
+                    editor.message = None;
+                    editor.testing = Some(receiver);
+                }
+            }
+            _ => return false,
+        }
+        self.manager_open = true;
+        true
     }
 }
 
+/// Width of the editor's label column.
+const LABEL: f32 = 110.0;
+
+/// Where Test and Save keep a typed secret key.
+const KEYCHAIN_NOTE: &str = if cfg!(target_os = "macos") {
+    "Test and Save store it in your macOS keychain, not in settings."
+} else {
+    "Test and Save store it in the OS credential store, not in settings."
+};
+
 fn label<'a>(value: &'a str, p: &'static Palette) -> Element<'a, Message> {
     text(value).size(style::SMALL).color(p.secondary).into()
+}
+
+fn caption<'a>(value: &'a str, p: &'static Palette) -> Element<'a, Message> {
+    text(value).size(style::CAPTION).color(p.secondary).into()
+}
+
+/// What a status line reports.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Status {
+    Working,
+    Done,
+    Failed,
+}
+
+/// An outcome in the toolbar's manner: a glyph, then the text. `spin` steps
+/// the spinner while working.
+fn status<'a>(
+    message: String,
+    status: Status,
+    spin: usize,
+    p: &'static Palette,
+) -> Element<'a, Message> {
+    let ink = if status == Status::Failed {
+        p.ink(p.danger)
+    } else {
+        p.secondary
+    };
+    let glyph = match status {
+        Status::Working => icon::spinner(13.0, p.secondary, spin),
+        Status::Done => icon(Icon::Check, 13.0, p.live),
+        Status::Failed => icon(Icon::Warning, 13.0, ink),
+    };
+    row![
+        // On the first line, should the text wrap.
+        container(glyph)
+            .height(Length::Fixed(style::SMALL * 1.3))
+            .align_y(Alignment::Center),
+        text(message).size(style::SMALL).color(ink),
+    ]
+    .spacing(6)
+    .into()
+}
+
+/// One way to start a destination, in the welcome screen's card style.
+fn choice<'a>(
+    glyph: Icon,
+    title: &'a str,
+    detail: &'a str,
+    on: Message,
+    p: &'static Palette,
+) -> Element<'a, Message> {
+    button(
+        row![
+            icon(glyph, 20.0, p.accent),
+            column![
+                text(title).size(style::BODY).font(style::MEDIUM),
+                text(detail).size(style::CAPTION).color(p.secondary),
+            ]
+            .spacing(2)
+            .width(Fill),
+            icon(Icon::ChevronRight, 13.0, p.tertiary),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    )
+    .width(Fill)
+    .padding([10, 14])
+    .style(style::card)
+    .on_press(on)
+    .into()
+}
+
+/// Says that the credential store holds the access key's secret.
+fn stored_badge<'a>(p: &'static Palette) -> Element<'a, Message> {
+    super::tip(
+        container(
+            row![
+                icon(Icon::Check, 11.0, p.ink(p.live)),
+                text(if cfg!(target_os = "macos") {
+                    "In keychain"
+                } else {
+                    "Stored"
+                })
+                .size(style::CAPTION),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
+        )
+        .padding([2, 8])
+        .style(style::pill(p.live)),
+        "A secret is stored for this access key ID. Leave the field empty to keep it.",
+    )
+}
+
+/// The Advanced group's values, shown while it is closed.
+fn advanced_summary(editor: &Editor) -> String {
+    let prefix = match editor.prefix.trim() {
+        "" => "No key prefix",
+        prefix => prefix,
+    };
+    if editor.path_style {
+        format!("{prefix} · path-style")
+    } else {
+        prefix.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ms(value: u64) -> Duration {
+        Duration::from_millis(value)
+    }
+
+    /// A bucket that validates, changed by `change`.
+    fn bucket(change: impl FnOnce(&mut Editor)) -> Editor {
+        let mut editor = Editor::new_bucket();
+        editor.bucket = "line-1".into();
+        editor.access_key_id = "AKIA".into();
+        editor.name = "line-1".into();
+        editor.name_touched = true;
+        change(&mut editor);
+        editor
+    }
+
+    fn fields(editor: &Editor) -> Vec<Field> {
+        editor
+            .problems()
+            .into_iter()
+            .map(|(field, _)| field)
+            .collect()
+    }
+
+    /// A change to a valid editor.
+    type Change = fn(&mut Editor);
+
+    #[test]
+    fn every_refusal_lands_on_its_field() {
+        assert!(bucket(|_| {}).destination().is_ok());
+        let cases: [(Change, Field); 8] = [
+            (|e| e.name = String::new(), Field::Name),
+            (
+                |e| {
+                    e.provider = 4;
+                    e.endpoint = "ftp://nas".into();
+                },
+                Field::Endpoint,
+            ),
+            (|e| e.endpoint = "https://user@nas".into(), Field::Endpoint),
+            (|e| e.region = String::new(), Field::Region),
+            (|e| e.bucket = "Line 1".into(), Field::Bucket),
+            (|e| e.prefix = "a/../b".into(), Field::Prefix),
+            (|e| e.access_key_id = String::new(), Field::AccessKey),
+            (
+                |e| {
+                    e.source = Source::Profile;
+                    e.profile = String::new();
+                },
+                Field::Profile,
+            ),
+        ];
+        for (change, field) in cases {
+            assert_eq!(fields(&bucket(change)), [field]);
+        }
+        let folder = Editor::new_folder("archive".into(), "relative".into());
+        assert_eq!(fields(&folder), [Field::Folder]);
+    }
+
+    #[test]
+    fn a_refused_save_marks_every_field_at_fault() {
+        let mut editor = bucket(|e| {
+            e.name = String::new();
+            e.region = String::new();
+            e.access_key_id = String::new();
+        });
+        editor.refuse(editor.destination().unwrap_err());
+        assert_eq!(
+            editor.invalid.iter().map(|(f, _)| *f).collect::<Vec<_>>(),
+            [Field::Name, Field::Region, Field::AccessKey]
+        );
+        assert!(editor.message.is_none(), "nothing left for the footer");
+        assert_eq!(
+            editor.refusal(Field::Region),
+            Some("S3 region must be a name such as us-east-1 or auto")
+        );
+        editor.edited(Some(Field::Region));
+        assert!(editor.refusal(Field::Region).is_none());
+        assert!(editor.refusal(Field::Name).is_some(), "only the edited one");
+        // Refusals no field explains go under the form, as a sentence.
+        editor.refuse(anyhow::anyhow!("cannot create /x: denied"));
+        assert_eq!(
+            editor.message,
+            Some(("Cannot create /x: denied".into(), true))
+        );
+        // A refused prefix opens the group it hides in.
+        let mut editor = bucket(|e| e.prefix = "a/../b".into());
+        editor.refuse(editor.destination().unwrap_err());
+        assert!(editor.advanced);
+    }
+
+    #[test]
+    fn a_new_bucket_is_named_after_it_until_a_name_is_typed() {
+        let mut picker = Picker::new(false, false);
+        let mut output = String::new();
+        picker.update(Message::AddBucket, &mut output);
+        assert_eq!(picker.take_focus(), Some(BUCKET_FIELD));
+        assert_eq!(picker.take_focus(), None, "once");
+        // Saving with nothing typed blames the bucket, not the name that
+        // follows it.
+        picker.update(Message::Save, &mut output);
+        let editor = picker.editor.as_ref().unwrap();
+        assert!(editor.refusal(Field::Bucket).is_some());
+        assert!(editor.refusal(Field::Name).is_none());
+        picker.update(Message::Bucket("Line 1".into()), &mut output);
+        let editor = picker.editor.as_ref().unwrap();
+        assert_eq!(editor.name, "Line-1");
+        assert!(editor.refusal(Field::Bucket).is_none(), "edited");
+        picker.update(Message::Name("archive".into()), &mut output);
+        picker.update(Message::Bucket("line-2".into()), &mut output);
+        assert_eq!(picker.editor.as_ref().unwrap().name, "archive");
+        // Back to the list, and a folder's editor focuses its name.
+        picker.update(Message::Cancel, &mut output);
+        assert!(picker.editor.is_none());
+        picker.scene("folder-editor");
+        assert_eq!(picker.take_focus(), Some(NAME_FIELD));
+        assert!(picker.manager_open);
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn the_keychain_is_asked_once_typing_rests() {
+        let start = Instant::now();
+        let mut editor = bucket(|e| e.access_key_id = "AKIA1".into());
+        editor.stored_secret = true;
+        editor.key_edited(start);
+        assert!(!editor.stored_secret, "unknown while typing");
+        let answer = |stored: bool| {
+            let (sender, receiver) = channel();
+            let _ = sender.send(stored);
+            receiver
+        };
+        let mut asked = Vec::new();
+        editor.poll_key(start + KEY_PAUSE - ms(1), |id| {
+            asked.push(id);
+            answer(true)
+        });
+        assert!(asked.is_empty(), "still typing");
+        editor.poll_key(start + KEY_PAUSE, |id| {
+            asked.push(id);
+            answer(true)
+        });
+        assert_eq!(asked, ["AKIA1"]);
+        assert!(editor.key_probe.is_some() && editor.key_changed.is_none());
+        editor.poll_key(start + KEY_PAUSE + ms(60), |_| unreachable!());
+        assert!(editor.stored_secret);
+        assert!(editor.key_probe.is_none());
+        // An answer about a key ID edited since is dropped.
+        let later = start + ms(1000);
+        editor.access_key_id = "AKIA2".into();
+        editor.key_edited(later);
+        editor.poll_key(later + KEY_PAUSE, |_| answer(true));
+        editor.access_key_id = "AKIA3".into();
+        editor.key_edited(later + KEY_PAUSE);
+        editor.poll_key(later + KEY_PAUSE + ms(10), |_| unreachable!());
+        assert!(!editor.stored_secret);
+        // An empty key ID has no secret and asks nothing.
+        editor.access_key_id = " ".into();
+        editor.key_edited(later);
+        editor.poll_key(later + KEY_PAUSE * 2, |_| unreachable!());
+        assert!(editor.key_probe.is_none() && editor.key_changed.is_none());
+    }
+
+    #[test]
+    fn the_picker_polls_while_a_lookup_is_due() {
+        let mut picker = Picker::new(false, false);
+        assert!(!picker.busy());
+        let mut editor = bucket(|_| {});
+        editor.key_changed = Some(Instant::now());
+        picker.editor = Some(editor);
+        assert!(picker.busy());
+    }
+
+    #[test]
+    fn a_saved_row_glows_once_and_settles() {
+        let mut picker = Picker::new(false, false);
+        let start = Instant::now();
+        picker.saved_glow.hit("archive".into(), start);
+        let animating = |picker: &Picker, at| picker.flashes().any(|f| f.animating(at));
+        assert!(animating(&picker, start + ms(1)));
+        assert!(picker.saved_glow.level("archive", start + SAVED_GLOW / 2) > 0.0);
+        assert_eq!(picker.saved_glow.level("line-1", start), 0.0);
+        assert!(!animating(&picker, start + SAVED_GLOW));
+    }
+
+    #[test]
+    fn saved_buckets_find_their_service() {
+        assert_eq!(provider_of(""), 0);
+        assert_eq!(provider_of("https://abc.r2.cloudflarestorage.com/"), 1);
+        assert_eq!(provider_of("https://s3.eu-central-003.backblazeb2.com"), 2);
+        assert_eq!(provider_of("http://nas.local:9000"), 3);
+        assert_eq!(provider_of("https://minio.example.com"), 4);
+        let editor = bucket(|e| e.prefix = "line-1/".into());
+        assert!(editor.custom_advanced());
+        assert!(!bucket(|_| {}).custom_advanced());
+        assert_eq!(
+            advanced_summary(&bucket(|e| e.path_style = true)),
+            "capturefab/ · path-style"
+        );
+        assert_eq!(sentence("cannot reach"), "Cannot reach");
+    }
 }
