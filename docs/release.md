@@ -62,7 +62,7 @@ Releases require Apple signing and notarization: without the `MACOS_CERTIFICATE_
 
 | Secret | Effect |
 | --- | --- |
-| `MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_PASSWORD` | Imports a Developer ID Application certificate into a temporary keychain and signs the executable and `Capturefab.app` with the hardened runtime and the camera entitlement |
+| `MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_P12_PASSWORD` | Imports a Developer ID Application certificate into a temporary keychain and signs the executable and `Capturefab.app` with the hardened runtime and the camera entitlement |
 | `MACOS_NOTARY_KEY`, `MACOS_NOTARY_KEY_ID`, `MACOS_NOTARY_ISSUER` | App Store Connect API key (`.p8` contents) for `notarytool`; the desktop app is stapled |
 | `WINDOWS_CERTIFICATE_PFX_BASE64`, `WINDOWS_CERTIFICATE_PASSWORD` | Authenticode signing with `signtool` and a DigiCert RFC 3161 timestamp. Requires a certificate with an exportable key; HSM-only certificates need a different signing step |
 | `RELEASE_GPG_PRIVATE_KEY`, `RELEASE_GPG_PASSPHRASE` | Detached OpenPGP signature `SHA256SUMS.asc`. Publish the public key separately |
@@ -82,7 +82,7 @@ Needs an Apple Developer Program membership; the Account Holder creates the cert
 
 ```sh
 base64 -i DeveloperID.p12 | gh secret set MACOS_CERTIFICATE_P12_BASE64 --repo capturefab/capturefab
-gh secret set MACOS_CERTIFICATE_PASSWORD --repo capturefab/capturefab        # prompts for the .p12 password
+gh secret set MACOS_CERTIFICATE_P12_PASSWORD --repo capturefab/capturefab        # prompts for the .p12 password
 gh secret set MACOS_NOTARY_KEY --repo capturefab/capturefab < AuthKey_KEYID.p8
 gh secret set MACOS_NOTARY_KEY_ID --repo capturefab/capturefab --body KEYID
 gh secret set MACOS_NOTARY_ISSUER --repo capturefab/capturefab --body ISSUER-UUID
