@@ -45,7 +45,7 @@ impl Workbench {
     }
 
     pub(super) fn welcome(&self, p: &'static Palette) -> Element<'_, Message> {
-        let t = self.welcome.interpolate(0.0f32, 1.0, self.now);
+        let t = self.welcome.get(self.now);
         let discovering = self.pending("Discovering cameras");
         let found: Vec<_> = self
             .snapshot

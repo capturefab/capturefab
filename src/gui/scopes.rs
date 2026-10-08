@@ -199,8 +199,8 @@ fn percent(share: f32) -> String {
 impl Workbench {
     /// The scope cards stacked in the stage's top right corner.
     pub(super) fn scopes(&self) -> Option<Element<'_, Message>> {
-        let exposure = self.exposure_slide.interpolate(0.0f32, 1.0, self.now);
-        let focus = self.focus_slide.interpolate(0.0f32, 1.0, self.now);
+        let exposure = self.exposure_slide.get(self.now);
+        let focus = self.focus_slide.get(self.now);
         let mut cards = column![].spacing(8).width(WIDTH);
         if exposure > 0.01
             && let Some(card) = self.exposure_card(exposure)
@@ -392,7 +392,7 @@ impl Workbench {
 
     /// The draggable focus region over the image, when shown.
     pub(super) fn focus_overlay(&self, shown: &Shown) -> Option<Element<'_, Message>> {
-        let t = self.focus_slide.interpolate(0.0f32, 1.0, self.now);
+        let t = self.focus_slide.get(self.now);
         if t <= 0.01 {
             return None;
         }

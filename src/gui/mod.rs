@@ -44,6 +44,7 @@ use iced::{
 };
 use icon::{Icon, icon};
 use keys::{Action, Chord, Os};
+use motion::{Kind, Motion};
 use prefs::{Prefs, Recent};
 use preview::Shown;
 use scene::ScreenshotRequest;
@@ -518,12 +519,14 @@ struct Workbench {
     prefs_changed: Option<Instant>,
     now: Instant,
     born: Instant,
-    sheet: Animation<bool>,
-    activity_slide: Animation<bool>,
-    exposure_slide: Animation<bool>,
-    focus_slide: Animation<bool>,
-    shutter: Animation<bool>,
-    welcome: Animation<bool>,
+    /// When the accessibility settings were last read.
+    accessibility_read: Instant,
+    sheet: Motion,
+    activity_slide: Motion,
+    exposure_slide: Motion,
+    focus_slide: Motion,
+    shutter: Motion,
+    welcome: Motion,
     sidebar_open: bool,
     /// Whether the inspector is docked open in a wide window.
     inspector_open: bool,
@@ -538,14 +541,14 @@ struct Workbench {
     pointer_moved: Option<Instant>,
     over_controls: bool,
     hovered_tile: Option<String>,
-    sidebar_slide: Animation<bool>,
-    inspector_slide: Animation<bool>,
+    sidebar_slide: Motion,
+    inspector_slide: Motion,
     /// Title bar and toolbar, hidden in image mode.
-    chrome: Animation<bool>,
-    controls: Animation<bool>,
-    tile_hover: Animation<bool>,
+    chrome: Motion,
+    controls: Motion,
+    tile_hover: Motion,
     /// The overview's ring around the selected camera.
-    ring: Animation<bool>,
+    ring: Motion,
 }
 
 impl Workbench {
@@ -558,6 +561,8 @@ impl Workbench {
                 .map_or("", |choice| choice.value)
         };
         let now = Instant::now();
+        motion::refresh_accessibility();
+        let shown = |open: bool| if open { 1.0 } else { 0.0 };
         Self {
             handle,
             session,
@@ -631,12 +636,29 @@ impl Workbench {
             prefs_changed: None,
             now,
             born: now,
-            sheet: motion::faded(false, motion::SHEET),
-            activity_slide: motion::eased(prefs.logs_open, motion::SLIDE),
-            exposure_slide: motion::eased(prefs.exposure_open, motion::CONTROLS_IN),
-            focus_slide: motion::eased(prefs.focus_open, motion::CONTROLS_IN),
-            shutter: Animation::new(false).duration(motion::SHUTTER),
-            welcome: motion::faded(false, motion::WELCOME),
+            accessibility_read: now,
+            sheet: Motion::new(0.0, motion::SHEET, motion::SHEET_OUT, Kind::Fade),
+            activity_slide: Motion::new(
+                shown(prefs.logs_open),
+                motion::SLIDE,
+                motion::SLIDE_OUT,
+                Kind::Move,
+            ),
+            exposure_slide: Motion::new(
+                shown(prefs.exposure_open),
+                motion::SCOPE,
+                motion::SCOPE_OUT,
+                Kind::Fade,
+            ),
+            focus_slide: Motion::new(
+                shown(prefs.focus_open),
+                motion::SCOPE,
+                motion::SCOPE_OUT,
+                Kind::Fade,
+            ),
+            shutter: Motion::new(0.0, motion::SHUTTER, motion::SHUTTER, Kind::Fade),
+            // Replaced at once when a camera connects; it enters afresh each time.
+            welcome: Motion::new(0.0, motion::WELCOME, Duration::ZERO, Kind::Fade),
             sidebar_open: prefs.sidebar_open,
             inspector_open: prefs.inspector_open,
             inspector_peek: false,
@@ -647,12 +669,22 @@ impl Workbench {
             pointer_moved: None,
             over_controls: false,
             hovered_tile: None,
-            sidebar_slide: motion::eased(prefs.sidebar_open, motion::PANEL),
-            inspector_slide: motion::eased(prefs.inspector_open, motion::PANEL),
-            chrome: motion::eased(true, motion::IMAGE),
-            controls: motion::faded(false, motion::CONTROLS_IN),
-            tile_hover: motion::faded(false, motion::HOVER),
-            ring: motion::faded(true, motion::RING),
+            sidebar_slide: Motion::new(
+                shown(prefs.sidebar_open),
+                motion::PANEL,
+                motion::PANEL_OUT,
+                Kind::Move,
+            ),
+            inspector_slide: Motion::new(
+                shown(prefs.inspector_open),
+                motion::PANEL,
+                motion::PANEL_OUT,
+                Kind::Move,
+            ),
+            chrome: Motion::new(1.0, motion::IMAGE, motion::IMAGE_OUT, Kind::Move),
+            controls: Motion::new(0.0, motion::CONTROLS_IN, motion::CONTROLS_OUT, Kind::Fade),
+            tile_hover: Motion::new(0.0, motion::HOVER, motion::HOVER_OUT, Kind::Fade),
+            ring: Motion::new(1.0, motion::RING, motion::RING_OUT, Kind::Fade),
         }
     }
 
@@ -916,9 +948,7 @@ impl Workbench {
 
     fn finished(&mut self, pending: &Pending, result: &serde_json::Value) {
         if pending.label == "Saving capture" {
-            self.shutter = Animation::new(true)
-                .duration(motion::SHUTTER)
-                .go(false, self.now);
+            self.shutter.replay(1.0, 0.0, self.now);
         }
         let Some(target) = &pending.target else {
             return;
@@ -948,10 +978,12 @@ impl Workbench {
 
     fn tick(&mut self) -> Task<Message> {
         self.poll();
+        self.prune_flashes();
+        self.poll_accessibility();
         let selected = self.snapshot.active_camera.clone();
         self.snapshot = self.handle.snapshot();
         if self.snapshot.active_camera != selected {
-            self.ring = motion::faded(false, motion::RING).go(true, self.now);
+            self.ring.replay(0.0, 1.0, self.now);
         }
         let camera_id = self
             .snapshot
@@ -1689,11 +1721,11 @@ impl Workbench {
                     self.window = Some([size.width, size.height]);
                 }
             }
-            Message::Pointer => self.pointer_moved = Some(self.now),
+            Message::Pointer => self.wake_controls(),
             Message::OverControls(over) => self.over_controls = over,
             Message::HoverTile(id) => {
                 if id.is_some() && id != self.hovered_tile {
-                    self.tile_hover = motion::faded(false, motion::HOVER).go(true, self.now);
+                    self.tile_hover.replay(0.0, 1.0, self.now);
                 }
                 self.hovered_tile = id;
             }
@@ -1825,10 +1857,8 @@ impl Workbench {
     fn view(&self) -> Element<'_, Message> {
         let dark = self.dark();
         let p = Palette::of(dark);
-        let sidebar = self.sidebar_slide.interpolate(0.0f32, SIDEBAR, self.now);
-        let inspector = self
-            .inspector_slide
-            .interpolate(0.0f32, INSPECTOR, self.now);
+        let sidebar = self.sidebar_slide.lerp(0.0, SIDEBAR, self.now);
+        let inspector = self.inspector_slide.lerp(0.0, INSPECTOR, self.now);
         let docked = self.inspector_docked();
         let mut body = row![];
         if sidebar > 0.5 {
@@ -1877,7 +1907,7 @@ impl Workbench {
         let body: Element<'_, Message> = layers
             .push(shader(self.gpu.probe()).width(1).height(1))
             .into();
-        let t = self.sheet.interpolate(0.0f32, 1.0, self.now);
+        let t = self.sheet.get(self.now);
         let body = if self.help_open {
             modal(body, self.help(p), Some(Message::Help(false)), t)
         } else {
@@ -1930,9 +1960,9 @@ impl Workbench {
         } else {
             self.single_view(p)
         };
-        let chrome = self.chrome.interpolate(0.0f32, 1.0, self.now);
+        let chrome = self.chrome.get(self.now);
         let mut main = column![content];
-        let activity = self.activity_slide.interpolate(0.0f32, 171.0, self.now) * chrome;
+        let activity = self.activity_slide.lerp(0.0, 171.0, self.now) * chrome;
         if activity > 0.5 {
             main = main.push(container(self.activity(p)).height(activity).clip(true));
         }

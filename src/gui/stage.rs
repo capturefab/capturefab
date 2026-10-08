@@ -117,7 +117,7 @@ impl Workbench {
         if let Some(scopes) = self.scopes() {
             layers = layers.push(scopes);
         }
-        let controls = self.controls.interpolate(0.0f32, 1.0, self.now);
+        let controls = self.controls.get(self.now);
         if controls > 0.01 {
             layers = layers.push(
                 container(
@@ -133,7 +133,7 @@ impl Workbench {
                 }),
             );
         }
-        let flash = self.shutter.interpolate(0.0f32, 0.25, self.now);
+        let flash = self.shutter.lerp(0.0, 0.25, self.now);
         if flash > 0.0 {
             layers = layers.push(container(space().width(Fill).height(Fill)).style(move |_| {
                 container::Style::default().background(Color {

@@ -57,7 +57,7 @@ impl Workbench {
         p: &'static Palette,
     ) -> Element<'a, Message> {
         let os = Os::CURRENT;
-        let sidebar = self.sidebar_slide.interpolate(0.0f32, SIDEBAR, self.now);
+        let sidebar = self.sidebar_slide.lerp(0.0, SIDEBAR, self.now);
         let mut left = row![tip(
             icon_button(
                 Icon::Sidebar,
@@ -126,7 +126,7 @@ impl Workbench {
             bar.into()
         };
         container(bar)
-            .height(self.chrome.interpolate(0.0f32, BAR, self.now))
+            .height(self.chrome.lerp(0.0, BAR, self.now))
             .clip(true)
             .into()
     }

@@ -118,11 +118,7 @@ impl Workbench {
             )
             .into(),
         };
-        let ring = if active {
-            self.ring.interpolate(0.0f32, 1.0, self.now)
-        } else {
-            0.0
-        };
+        let ring = if active { self.ring.get(self.now) } else { 0.0 };
         let picture = tip(
             button(
                 container(picture)
@@ -225,7 +221,7 @@ impl Workbench {
         }
         layers = layers.push(container(badges).padding(10));
         if hovered {
-            let shown = self.tile_hover.interpolate(0.0f32, 1.0, self.now);
+            let shown = self.tile_hover.get(self.now);
             let glass = |kind: Icon, hint: &'static str, on: Message| {
                 tip(
                     button(icon(kind, 14.0, fade(style::ON_STAGE, shown)))

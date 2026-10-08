@@ -56,10 +56,11 @@ ureq = { version = "3.4", optional = true, default-features = false, features = 
 keyring = { version = "4.2", optional = true }
 rfd = { version = "0.17", optional = true }
 
-# The refresh rate of the GUI window's screen; already in the tree via rfd.
+# The refresh rate of the GUI window's screen, and the Reduce Motion and Reduce
+# Transparency settings; already in the tree via rfd.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", optional = true }
-objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "NSResponder", "NSScreen", "NSView", "NSWindow"] }
+objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "NSAccessibility", "NSResponder", "NSScreen", "NSView", "NSWindow", "NSWorkspace"] }
 
 # ARMv8 SHA-2 instructions for storage integrity hashing. x86 already selects
 # SHA-NI at runtime without this; the asm crate does not assemble under MSVC.
