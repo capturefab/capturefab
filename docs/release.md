@@ -22,15 +22,15 @@ All actions are pinned to full commit SHAs. Checkouts do not persist credentials
 | macOS ARM64 | `macos-15` | Apple clang | macOS 11.0 and newer |
 | macOS x86_64 | `macos-15-intel` | Apple clang, NASM | macOS 10.15 and newer |
 | Windows x86_64 | `windows-2025` | MSVC for Capturefab, MSYS2 UCRT64 GCC for FFmpeg | Windows 10 and newer, and Windows 11 on ARM through emulation; no Visual C++ redistributable needed |
+| Windows ARM64 | `windows-11-arm` | MSVC for Capturefab, MSYS2 CLANGARM64 LLVM for FFmpeg | Windows 11 on ARM; no Visual C++ redistributable needed |
 
 `scripts/release.py build` enforces these floors on both the Capturefab executable and the FFmpeg it embeds: the newest `GLIBC_` symbol version an ELF requires, the minimum macOS a Mach-O declares, and on Windows that no Visual C++ runtime DLL (`VCRUNTIME140.dll`, `MSVCP140.dll` and similar) is imported or delay-loaded. `.cargo/config.toml` links the C runtime statically on Windows for that reason. A dependency or toolchain change that raises a floor fails the build instead of shipping a binary that will not start.
 
 Each target builds a desktop (`--features wgpu`) and a headless (`--no-default-features --features usb,jpeg,nvjpeg,vaapi,videotoolbox`) variant. `scripts/release.py build` embeds the target's FFmpeg, checks that the executable contains exactly that FFmpeg, runs `--version`, `ffmpeg` (SRT input and output must be present) and a two-frame simulator capture, then packages. The `wgpu` feature is kept for these build commands; the GUI always renders through wgpu. Desktop Linux builds need no X11, Wayland, Vulkan or OpenGL development packages: the GUI loads those libraries from the system at run time. A target without a successful build is listed as unavailable, with the packaging error when there is one.
 
-Not built by the workflow, so the manifest lists them as unavailable:
+Not built by the workflow, so the manifest lists it as unavailable:
 
 - **Linux ARMv7.** GitHub has no ARMv7 runner. A cross build would be unexecuted; build natively on the device, or cross-compile and package with `--skip-smoke`, which labels the result `cross-compiled`.
-- **Windows ARM64.** CI tests Capturefab on `windows-11-arm`, but the FFmpeg recipe cannot build there yet: under MSYS2 CLANGARM64, x264's configure detects the emulated x86_64 shell as the host unless `--host` is passed, and OpenSSL needs `OPENSSL_TARGET=mingwarm64`. The x86_64 build runs on Windows 11 on ARM through emulation meanwhile.
 
 ## One-time repository setup
 

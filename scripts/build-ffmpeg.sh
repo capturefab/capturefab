@@ -34,7 +34,7 @@ Build pinned FFmpeg, x264, SRT, and OpenSSL from source. Output: bin/ffmpeg,
 source archives, licenses, build logs, and a manifest. Requires Bash, a C/C++
 compiler, make, CMake >= 3.15, pkg-config, Perl, curl, tar, and xz.
 
-Environment: BUILD_DIR, DOWNLOAD_DIR, JOBS, CC, CXX, AR, RANLIB, STRIP,
+Environment: BUILD_DIR, DOWNLOAD_DIR, JOBS, CC, CXX, AR, RANLIB, STRIP, OBJDUMP,
 TARGET_OS (darwin/linux/mingw32), TARGET_ARCH (x86_64/aarch64/arm),
 CROSS_PREFIX, HOST_TRIPLE, OPENSSL_TARGET, CMAKE_TOOLCHAIN_FILE,
 MACOSX_DEPLOYMENT_TARGET, FULL_STATIC (Linux, default 0), RUN_CHECKS (0/1).
@@ -86,6 +86,7 @@ CXX=${CXX:-"${CROSS_PREFIX}c++"}
 AR=${AR:-"${CROSS_PREFIX}ar"}
 RANLIB=${RANLIB:-"${CROSS_PREFIX}ranlib"}
 STRIP=${STRIP:-"${CROSS_PREFIX}strip"}
+OBJDUMP=${OBJDUMP:-"${CROSS_PREFIX}objdump"}
 for tool in "$CC" "$CXX" "$AR" "$RANLIB"; do
     command -v "$tool" >/dev/null || die "missing target tool: $tool"
 done
@@ -192,7 +193,8 @@ ffmpeg_flags=(--prefix="$OUTPUT_DIR" --arch="$TARGET_ARCH" --target-os="$TARGET_
     --disable-ffplay --disable-ffprobe --disable-doc --disable-debug)
 if [[ $ENABLE_NVENC == 1 ]]; then ffmpeg_flags+=(--enable-ffnvcodec --enable-nvenc --enable-nvdec --enable-cuvid); fi
 if [[ $ENABLE_AMF == 1 ]]; then ffmpeg_flags+=(--enable-amf); fi
-if [[ $ENABLE_MF == 1 ]]; then ffmpeg_flags+=(--enable-mediafoundation); fi
+# mfenc.c uses D3D11 types without declaring the dependency; QSV enabled it on x64.
+if [[ $ENABLE_MF == 1 ]]; then ffmpeg_flags+=(--enable-mediafoundation --enable-d3d11va); fi
 if [[ $ENABLE_VULKAN == 1 ]]; then ffmpeg_flags+=(--enable-vulkan); fi
 if [[ $ENABLE_QSV == 1 ]]; then ffmpeg_flags+=(--enable-libvpl --enable-d3d11va --enable-dxva2); fi
 x264_flags=(--prefix="$PREFIX" --enable-static --enable-pic --disable-cli --disable-opencl)
@@ -213,12 +215,17 @@ case $TARGET_OS:$TARGET_ARCH in
     linux:aarch64) OPENSSL_TARGET=${OPENSSL_TARGET:-linux-aarch64} ;;
     linux:x86_64) OPENSSL_TARGET=${OPENSSL_TARGET:-linux-x86_64} ;;
     linux:arm) OPENSSL_TARGET=${OPENSSL_TARGET:-linux-armv4} ;;
-    mingw32:*)
-        OPENSSL_TARGET=${OPENSSL_TARGET:-mingw64}
+    mingw32:x86_64|mingw32:aarch64)
+        if [[ $TARGET_ARCH == aarch64 ]]; then OPENSSL_TARGET=${OPENSSL_TARGET:-mingwarm64}; else OPENSSL_TARGET=${OPENSSL_TARGET:-mingw64}; fi
         link_flags="$link_flags -static -static-libgcc -static-libstdc++"
         ffmpeg_flags+=(--enable-indev=dshow)
         cmake_flags+=(-DENABLE_STDCXX_SYNC=ON)
-        [[ $TARGET_ARCH != aarch64 ]] || openssl_flags+=(no-asm) ;;
+        if [[ $TARGET_ARCH == aarch64 ]]; then
+            openssl_flags+=(no-asm)
+            # The WinRT screen-capture filter's <version> include finds FFmpeg's
+            # VERSION file on case-insensitive NTFS under LLVM's libc++.
+            ffmpeg_flags+=(--disable-filter=gfxcapture)
+        fi ;;
     *) die 'unsupported OS/architecture pair' ;;
 esac
 if [[ $TARGET_OS == linux ]]; then ffmpeg_flags+=(--enable-indev=v4l2 --enable-v4l2-m2m); fi
@@ -227,6 +234,10 @@ if [[ -n $CROSS_PREFIX ]]; then
     [[ -n ${CMAKE_TOOLCHAIN_FILE:-} ]] || die 'cross builds require CMAKE_TOOLCHAIN_FILE'
     ffmpeg_flags+=(--enable-cross-compile --cross-prefix="$CROSS_PREFIX")
     x264_flags+=(--host="$HOST_TRIPLE" --cross-prefix="$CROSS_PREFIX")
+elif [[ $TARGET_OS == mingw32 ]]; then
+    # x264 guesses the host from uname, which reports x86_64 when the MSYS2
+    # shell runs under emulation on Windows ARM64.
+    x264_flags+=(--host="$TARGET_ARCH-w64-mingw32")
 fi
 if [[ -n ${CMAKE_TOOLCHAIN_FILE:-} ]]; then cmake_flags+=(-DCMAKE_TOOLCHAIN_FILE="$CMAKE_TOOLCHAIN_FILE"); fi
 if [[ $TARGET_OS == darwin ]]; then
@@ -276,8 +287,9 @@ if [[ $TARGET_OS == linux ]]; then
 fi
 if [[ $TARGET_OS == mingw32 ]]; then
     # SRT's pc file lists libgcc_s, the import library for libgcc's DLL, whose
-    # unwinder clashes with the static libgcc_eh that -static links.
-    sed 's|-lgcc_s|-lgcc_eh|g' "$PREFIX/lib/pkgconfig/srt.pc" > "$PREFIX/lib/pkgconfig/srt.pc.tmp"
+    # unwinder clashes with the static libgcc_eh that -static links. SRT calls
+    # winpthreads directly, which libstdc++ pulls in but LLVM's libc++ does not.
+    sed -e 's|-lgcc_s|-lgcc_eh|g' -e 's|^Libs.private:.*|& -lpthread|' "$PREFIX/lib/pkgconfig/srt.pc" > "$PREFIX/lib/pkgconfig/srt.pc.tmp"
     mv "$PREFIX/lib/pkgconfig/srt.pc.tmp" "$PREFIX/lib/pkgconfig/srt.pc"
 fi
 if [[ $ENABLE_QSV == 1 ]]; then
@@ -348,8 +360,8 @@ if [[ $run_checks == 1 ]]; then
                 if grep -E 'NEEDED.*(libsrt|libssl|libcrypto|libx264|libstdc\+\+|libgcc_s|libvulkan|libva|libvpl)' "$OUTPUT_DIR/logs/linked-libraries.txt"; then die 'third-party shared library found'; fi
             fi ;;
         mingw32)
-            "${CROSS_PREFIX}objdump" -p "$binary" > "$OUTPUT_DIR/logs/linked-libraries.txt"
-            if grep -Ei 'DLL Name:.*(libstdc|libgcc|libwinpthread|libsrt|libssl|libcrypto|libx264|vulkan-1|libvpl)' "$OUTPUT_DIR/logs/linked-libraries.txt"; then die 'non-system DLL found'; fi ;;
+            "$OBJDUMP" -p "$binary" > "$OUTPUT_DIR/logs/linked-libraries.txt"
+            if grep -Ei 'DLL Name:.*(libstdc|libgcc|libc\+\+|libunwind|libwinpthread|libsrt|libssl|libcrypto|libx264|vulkan-1|libvpl)' "$OUTPUT_DIR/logs/linked-libraries.txt"; then die 'non-system DLL found'; fi ;;
     esac
 fi
 printf 'FFmpeg ready: %s\nEmbed with: CAPTUREFAB_FFMPEG_BINARY=%q CAPTUREFAB_FFMPEG_LICENSE=%q cargo build --release\n' "$binary" "$binary" "$OUTPUT_DIR/licenses/NOTICE.txt"
