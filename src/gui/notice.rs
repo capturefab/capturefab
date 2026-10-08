@@ -111,6 +111,25 @@ pub(super) struct Batch {
     failures: Vec<String>,
 }
 
+impl Batch {
+    /// The error notice counting its failures, listed in full as its
+    /// detail; `None` when all worked.
+    fn failed(&self, job: &Job) -> Option<(String, Option<String>, Level)> {
+        let first = self.failures.first()?;
+        let failed = self.failures.len();
+        let text = match job {
+            Job::Start => format!("Could not start {failed} of {} streams", self.total),
+            Job::Stop => format!("Could not stop {failed} of {} streams", self.total),
+            _ => format!("{} on {failed} of {} cameras", failure(job), self.total),
+        };
+        Some((
+            format!("{text}: {first}"),
+            Some(self.failures.join("\n")),
+            Level::Error,
+        ))
+    }
+}
+
 impl Workbench {
     /// Show a notice. One already showing swaps its text in place rather
     /// than fading out and in again.
@@ -167,7 +186,8 @@ impl Workbench {
     }
 
     /// Send `command` to each of `cameras` to do `job`, as one batch with
-    /// one notice; see `batch_result`.
+    /// one notice; see `batch_result`. Cameras the session refuses count as
+    /// failures in that notice, so a later member cannot hide them.
     pub(super) fn send_batch(
         &mut self,
         cameras: Vec<String>,
@@ -175,15 +195,28 @@ impl Workbench {
         command: impl Fn() -> SessionCommand,
     ) {
         for camera in cameras {
-            let sent = self
-                .submit(Some(&camera), job.clone(), command())
-                .map(|pending| pending.batch = true)
-                .is_some();
-            if sent {
-                let batch = self.batches.entry(job.clone()).or_default();
-                batch.total += 1;
-                batch.left += 1;
+            let refused = match self.try_submit(Some(&camera), job.clone(), command()) {
+                Ok(pending) => {
+                    pending.batch = true;
+                    None
+                }
+                Err(error) => Some(first_line(&format!("{error:#}")).to_owned()),
+            };
+            let batch = self.batches.entry(job.clone()).or_default();
+            batch.total += 1;
+            match refused {
+                Some(failure) => batch.failures.push(failure),
+                None => batch.left += 1,
             }
+        }
+        // No reply will come to close a batch the session refused in full.
+        if self.batches.get(&job).is_some_and(|batch| batch.left == 0)
+            && let Some((text, detail, level)) = self
+                .batches
+                .remove(&job)
+                .and_then(|batch| batch.failed(&job))
+        {
+            self.set_notice(text, detail, level);
         }
     }
 
@@ -207,20 +240,7 @@ impl Workbench {
             return None;
         }
         let batch = self.batches.remove(job)?;
-        let Some(first) = batch.failures.first() else {
-            return command_notice(job, result);
-        };
-        let failed = batch.failures.len();
-        let text = match job {
-            Job::Start => format!("Could not start {failed} of {} streams", batch.total),
-            Job::Stop => format!("Could not stop {failed} of {} streams", batch.total),
-            _ => format!("{} on {failed} of {} cameras", failure(job), batch.total),
-        };
-        Some((
-            format!("{text}: {first}"),
-            Some(batch.failures.join("\n")),
-            Level::Error,
-        ))
+        batch.failed(job).or_else(|| command_notice(job, result))
     }
 
     /// Start fading done and warning notices at `NOTICE_LIFE`, and drop a
@@ -719,6 +739,16 @@ mod tests {
             Some("Session command copied"),
             "from the keyboard"
         );
+
+        // The camera list's session control confirms in place: an error
+        // keeps the toolbar.
+        bench.set_notice("Capture failed: busy", None, Level::Error);
+        let _ = bench.copy_session_command(true);
+        assert_eq!(text(&bench), Some("Capture failed: busy"));
+        // With the list hidden, only the toolbar can confirm.
+        bench.sidebar_open = false;
+        let _ = bench.copy_session_command(true);
+        assert_eq!(text(&bench), Some("Session command copied"));
     }
 
     #[test]
@@ -756,6 +786,41 @@ mod tests {
         bench.settle(&pending, &Ok(json!({"streaming": true})));
         assert!(bench.notice.is_none(), "the pill says it");
         assert!(bench.batches.is_empty());
+
+        // The session refused one of three: the others' replies count it.
+        bench.batches.insert(
+            Job::Start,
+            Batch {
+                total: 3,
+                left: 2,
+                failures: vec!["camera command queue is full".into()],
+            },
+        );
+        let pending = Pending {
+            batch: true,
+            ..Pending::unanswered(Job::Start)
+        };
+        bench.settle(&pending, &Ok(json!({"streaming": true})));
+        bench.settle(&pending, &Ok(json!({"streaming": true})));
+        assert_eq!(
+            text(&bench),
+            Some("Could not start 1 of 3 streams: camera command queue is full")
+        );
+    }
+
+    #[test]
+    fn a_batch_the_session_refuses_is_reported_at_once() {
+        let mut bench = bench();
+        bench.handle.shutdown();
+        let cameras = vec!["sim:0".to_owned(), "sim:1".to_owned()];
+        bench.send_batch(cameras, Job::Stop, || SessionCommand::Stop);
+        assert!(bench.pending.is_empty() && bench.batches.is_empty());
+        let notice = bench.notice.as_ref().expect("a notice");
+        assert_eq!(
+            notice.text,
+            "Could not stop 2 of 2 streams: session is shutting down"
+        );
+        assert_eq!(notice.level, Level::Error);
     }
 
     #[test]

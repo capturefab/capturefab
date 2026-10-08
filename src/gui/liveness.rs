@@ -15,6 +15,10 @@ const RATE_SETTLE: Duration = Duration::from_secs(1);
 /// How long a stream's chart says its frame rate is on its way; past it,
 /// with no rate yet, the chart's slot is plainly empty.
 const RATE_WAIT: Duration = STALL_START;
+/// How long a busy worker's repeated reports may follow its last fresh one
+/// before liveness reads as unknown: the status poll itself holds each
+/// worker for a moment every poll. Kept under `STALL_FLOOR`.
+const BUSY_GRACE: Duration = Duration::from_secs(1);
 /// How long after the last lost frame a loss still counts as recent.
 pub(super) const LOSS_RECENT: Duration = Duration::from_secs(10);
 
@@ -80,6 +84,9 @@ impl CameraState {
 struct Pace {
     /// The exposure time, when the camera reports one.
     exposure: Option<Duration>,
+    /// The frame interval its frame rate setting asks for, while that
+    /// setting is on.
+    frame_interval: Option<Duration>,
     /// The camera waits for triggers, so silence is expected.
     triggered: bool,
 }
@@ -87,6 +94,7 @@ struct Pace {
 impl Pace {
     fn of(features: &[FeatureInfo]) -> Self {
         let mut pace = Pace::default();
+        let mut rate_on = true;
         for feature in features {
             match feature.name.as_str() {
                 "ExposureTime" | "ExposureTimeAbs" if pace.exposure.is_none() => {
@@ -104,12 +112,29 @@ impl Pace {
                         .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
                         .map(|seconds| Duration::from_secs_f64(seconds.min(3600.0)));
                 }
+                "AcquisitionFrameRate" | "AcquisitionFrameRateAbs"
+                    if pace.frame_interval.is_none() =>
+                {
+                    pace.frame_interval = feature
+                        .value
+                        .as_ref()
+                        .and_then(serde_json::Value::as_f64)
+                        .filter(|hz| hz.is_finite() && *hz > 0.0)
+                        .map(|hz| Duration::from_secs_f64((1.0 / hz).min(3600.0)));
+                }
+                // Off, the camera runs as fast as it can, whatever the rate says.
+                "AcquisitionFrameRateEnable" => {
+                    rate_on = feature.value != Some(serde_json::Value::Bool(false));
+                }
                 "TriggerMode" => {
                     pace.triggered =
                         feature.value.as_ref().and_then(serde_json::Value::as_str) == Some("On");
                 }
                 _ => {}
             }
+        }
+        if !rate_on {
+            pace.frame_interval = None;
         }
         pace
     }
@@ -137,8 +162,10 @@ pub(super) struct Liveness {
     /// The last interval between two rises of the frame counter.
     gap: Option<Duration>,
     pace: Pace,
-    /// The last report was a busy worker's repeat, so liveness is unknown.
+    /// The last report was a busy worker's repeat.
     busy: bool,
+    /// When the last fresh report came.
+    fresh_at: Instant,
 }
 
 impl Liveness {
@@ -158,6 +185,7 @@ impl Liveness {
             gap: None,
             pace: Pace::of(&camera.features),
             busy: camera.stale,
+            fresh_at: now,
         }
     }
 
@@ -166,6 +194,7 @@ impl Liveness {
         if camera.stale {
             return;
         }
+        self.fresh_at = now;
         self.pace = Pace::of(&camera.features);
         // A reading of zero only says a window passed without a frame.
         if camera.fps > 0.0 && now.saturating_duration_since(self.started) >= RATE_SETTLE {
@@ -197,19 +226,25 @@ impl Liveness {
         self.busy = false;
     }
 
+    /// Whether its counters are too old to tell anything at `now`: its
+    /// worker has been busy for longer than `BUSY_GRACE`.
+    fn unknown(&self, now: Instant) -> bool {
+        self.busy && now.saturating_duration_since(self.fresh_at) >= BUSY_GRACE
+    }
+
     /// How long without a new frame counts as stalled: three frame
-    /// intervals at the slowest pace seen lately and twice the exposure,
-    /// never under `STALL_FLOOR`; `STALL_START` until the pace is known.
+    /// intervals at the slowest pace seen lately or set, and twice the
+    /// exposure, never under `STALL_FLOOR`. Never under `STALL_START` until
+    /// a gap between frames is measured: one frame in one of the worker's
+    /// one-second windows only bounds a slow camera's interval from below.
     fn limit(&self) -> Duration {
-        let paced = match self.rate.max(self.gap) {
-            Some(interval) => STALL_FLOOR.max(interval * 3),
-            None => STALL_START,
+        let paced = match (self.gap, self.rate) {
+            (Some(gap), rate) => STALL_FLOOR.max(gap.max(rate.unwrap_or_default()) * 3),
+            (None, rate) => STALL_START.max(rate.unwrap_or_default() * 3),
         };
-        paced.max(
-            self.pace
-                .exposure
-                .map_or(Duration::ZERO, |exposure| exposure * 2),
-        )
+        let set = self.pace.frame_interval.unwrap_or_default() * 3;
+        let exposure = self.pace.exposure.unwrap_or_default() * 2;
+        paced.max(set).max(exposure)
     }
 }
 
@@ -264,11 +299,11 @@ impl Workbench {
 
     /// How long a streaming camera has gone without a new frame, once that
     /// passes its limit (see `Liveness::limit`). `None` while that cannot be
-    /// told: its worker is busy with a command from here or from another
-    /// client, so its counters are old, or it waits for triggers.
+    /// told: its worker has been busy with a command from here or from
+    /// another client, so its counters are old, or it waits for triggers.
     pub(super) fn stalled(&self, id: &str) -> Option<Duration> {
         let live = self.liveness.get(id)?;
-        if live.busy
+        if live.unknown(self.now)
             || live.pace.triggered
             || self
                 .pending
@@ -378,6 +413,9 @@ mod tests {
         assert_eq!(live.limit(), STALL_START, "pace not known yet");
         camera.frames = 40;
         live.observe(&camera, start + ms(1000));
+        assert_eq!(live.limit(), STALL_START, "no gap measured yet");
+        camera.frames = 48;
+        live.observe(&camera, start + ms(1250));
         assert_eq!(live.limit(), STALL_FLOOR);
         live.rate = Some(ms(2000));
         assert_eq!(live.limit(), ms(6000));
@@ -404,6 +442,73 @@ mod tests {
             report(&mut bench, start, at, streaming_camera(frames, 0, fps));
             assert_eq!(bench.stalled(id), None, "at {at:?}");
         }
+    }
+
+    /// Report a free-running camera with a frame every `every` ticks of
+    /// 250 ms, the first one tick in, as the worker's one-second windows
+    /// see it, for `ticks` ticks; true if it ever read as stalled.
+    fn ever_stalled(features: Vec<FeatureInfo>, every: u64, ticks: u64) -> bool {
+        let mut bench = bench();
+        let start = bench.now;
+        let camera = |frames: u64, fps: f64| CameraSnapshot {
+            features: features.clone(),
+            ..streaming_camera(frames, 0, fps)
+        };
+        report(&mut bench, start, ms(0), camera(0, 0.0));
+        let mut frames = 0;
+        let mut stalled = false;
+        for step in 1..=ticks {
+            if step % every == 1 {
+                frames += 1;
+            }
+            // One frame in the window that held it, none in the others.
+            let fps = if (step - 1) % every < 4 { 0.95 } else { 0.0 };
+            report(&mut bench, start, ms(step * 250), camera(frames, fps));
+            stalled |= bench.stalled("sim:0").is_some();
+        }
+        stalled
+    }
+
+    #[test]
+    fn very_slow_streams_do_not_read_as_stalled_as_they_start() {
+        // 0.25 fps: a one-frame window must not set the limit before a
+        // gap between frames is known.
+        assert!(!ever_stalled(Vec::new(), 16, 16 * 3));
+        // 0.1 fps: its frame rate setting covers the first long gap.
+        let rate = vec![feature("AcquisitionFrameRate", json!(0.1))];
+        assert!(!ever_stalled(rate, 40, 40 * 3));
+        // Without that setting, the same camera does read as stalled.
+        assert!(ever_stalled(Vec::new(), 40, 40 * 3));
+    }
+
+    #[test]
+    fn a_frame_rate_setting_sets_the_pace_only_while_on() {
+        let rate = feature("AcquisitionFrameRate", json!(0.25));
+        assert_eq!(
+            Pace::of(std::slice::from_ref(&rate)).frame_interval,
+            Some(ms(4000))
+        );
+        let abs = feature("AcquisitionFrameRateAbs", json!(10.0));
+        assert_eq!(Pace::of(&[abs]).frame_interval, Some(ms(100)));
+        for enable in [json!(true), json!(false)] {
+            let on = enable == json!(true);
+            let enable = feature("AcquisitionFrameRateEnable", enable);
+            for features in [
+                [rate.clone(), enable.clone()],
+                [enable.clone(), rate.clone()],
+            ] {
+                let interval = Pace::of(&features).frame_interval;
+                assert_eq!(interval.is_some(), on, "{features:?}");
+            }
+        }
+        assert_eq!(
+            Pace::of(&[feature("AcquisitionFrameRate", json!(0.0))]),
+            Pace::default()
+        );
+        let mut live = Liveness::new(&streaming_camera(0, 0, 0.0), Instant::now());
+        live.gap = Some(ms(100));
+        live.pace = Pace::of(&[rate]);
+        assert_eq!(live.limit(), ms(12_000));
     }
 
     #[test]
@@ -469,6 +574,39 @@ mod tests {
         triggered.features = vec![feature("TriggerMode", json!("On"))];
         report(&mut bench, start, ms(20_000), triggered);
         assert_eq!(bench.stalled(id), None, "waits for triggers");
+    }
+
+    #[test]
+    fn a_status_poll_holding_the_worker_does_not_hide_a_stall() {
+        let mut bench = bench();
+        let start = bench.now;
+        let id = "sim:0";
+        for step in 0..=4u64 {
+            report(
+                &mut bench,
+                start,
+                ms(step * 250),
+                streaming_camera(step * 8, 0, 30.0),
+            );
+        }
+        let mut at = ms(1000);
+        while bench.stalled(id).is_none() {
+            at += ms(250);
+            report(&mut bench, start, at, streaming_camera(32, 0, 0.0));
+        }
+        // The status poll holds the worker as this tick asks.
+        let mut busy = streaming_camera(32, 0, 0.0);
+        busy.stale = true;
+        let fresh = at;
+        at += ms(250);
+        report(&mut bench, start, at, busy.clone());
+        assert_eq!(bench.stalled(id), Some(at - ms(1000)), "a moment's hold");
+        // A longer hold leaves it unknown.
+        while at - fresh < BUSY_GRACE {
+            at += ms(250);
+            report(&mut bench, start, at, busy.clone());
+        }
+        assert_eq!(bench.stalled(id), None, "busy for a while");
     }
 
     #[test]
