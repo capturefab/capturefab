@@ -312,11 +312,12 @@ pub fn ring(shown: f32) -> impl Fn(&Theme) -> container::Style {
 }
 
 /// Dark glass behind controls that float over the image; `shown` fades it.
+/// Opaque while the system asks to reduce transparency.
 pub fn overlay(shown: f32) -> impl Fn(&Theme) -> container::Style {
-    glass(shown, false)
+    glass(shown, super::motion::reduce_transparency())
 }
 
-/// `overlay`, opaque when `solid`, for Reduce Transparency.
+/// `overlay` with its transparency chosen: opaque when `solid`.
 pub fn glass(shown: f32, solid: bool) -> impl Fn(&Theme) -> container::Style {
     let (fill, edge) = if solid { (1.0, 0.14) } else { (0.78, 0.08) };
     move |_theme| container::Style {

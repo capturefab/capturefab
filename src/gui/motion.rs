@@ -75,8 +75,7 @@ pub(super) fn reduce_motion() -> bool {
     REDUCE_MOTION.load(Ordering::Relaxed)
 }
 
-/// Whether glass and scrims should be opaque.
-#[allow(dead_code)] // adopted by the area packages
+/// Whether glass should be opaque; `style::overlay` reads it.
 pub(super) fn reduce_transparency() -> bool {
     REDUCE_TRANSPARENCY.load(Ordering::Relaxed)
 }

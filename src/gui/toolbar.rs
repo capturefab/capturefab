@@ -57,11 +57,11 @@ impl Workbench {
             tip(
                 row![
                     icon(glyph, 13.0, fade(tint, alpha)),
-                    clipped(
-                        text(notice.text.clone())
-                            .size(style::SMALL)
-                            .color(fade(ink, alpha))
-                            .wrapping(text::Wrapping::None)
+                    one_line(
+                        notice.text.as_str(),
+                        style::SMALL,
+                        style::SANS,
+                        fade(ink, alpha)
                     ),
                 ]
                 .spacing(6)
@@ -71,9 +71,12 @@ impl Workbench {
         } else if let Some(pending) = self.pending.first() {
             row![
                 dot(fade(p.accent, self.pulse()), 6.0),
-                text(format!("{}…", pending.label))
-                    .size(style::SMALL)
-                    .color(p.secondary)
+                one_line(
+                    format!("{}…", pending.label),
+                    style::SMALL,
+                    style::SANS,
+                    p.secondary
+                ),
             ]
             .spacing(7)
             .align_y(Alignment::Center)
@@ -130,7 +133,8 @@ impl Workbench {
             )
             .height(TOOLBAR - 1.0)
             .align_y(Alignment::Center)
-            .padding([0.0, GUTTER - 6.0]),
+            .padding([0.0, GUTTER - 6.0])
+            .clip(true),
         ]
         .into()
     }

@@ -223,7 +223,7 @@ impl Workbench {
     fn exposure_card(&self, shown: f32) -> Option<Element<'_, Message>> {
         let exposure = self.exposure.as_ref()?;
         let ink = |color: Color| fade(color, shown);
-        let warn = style::DARK.warn;
+        let warn = style::STAGE.warn;
         let clip = |label: &'static str, share: f32| {
             let over = share > CLIP_WARN;
             row![
@@ -342,7 +342,7 @@ impl Workbench {
                 .size(style::DISPLAY)
                 .font(style::SEMIBOLD)
                 .color(ink(if sharp {
-                    style::DARK.live
+                    style::STAGE.live
                 } else {
                     style::ON_STAGE
                 })),
@@ -355,7 +355,7 @@ impl Workbench {
                 .size(style::SMALL)
                 .font(style::MEDIUM)
                 .color(ink(if sharp {
-                    style::DARK.live
+                    style::STAGE.live
                 } else {
                     style::ON_STAGE
                 })),
@@ -378,7 +378,7 @@ impl Workbench {
         let trace = canvas::Canvas::new(Trace {
             values: meter.trace(),
             peak: meter.peak(),
-            color: if sharp { style::DARK.live } else { accent },
+            color: if sharp { style::STAGE.live } else { accent },
             shown,
         })
         .width(Fill)
@@ -408,7 +408,7 @@ impl Workbench {
                 scale: (!self.fit).then_some(self.zoom),
                 label,
                 color: if self.focus.in_focus() {
-                    style::DARK.live
+                    style::STAGE.live
                 } else {
                     accent
                 },

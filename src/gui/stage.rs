@@ -100,7 +100,7 @@ impl Workbench {
             badges = badges.push(tip(
                 container(
                     row![
-                        icon(Icon::Warning, 12.0, style::DARK.danger),
+                        icon(Icon::Warning, 12.0, style::STAGE.danger),
                         text(error.clone()).size(style::SMALL)
                     ]
                     .spacing(6)
