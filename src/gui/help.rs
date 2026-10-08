@@ -19,6 +19,8 @@ pub(super) struct SheetState {
     pub(super) scrolled: bool,
     /// The guide's "Connecting cameras" notes are open.
     pub(super) more: bool,
+    /// The notes' chevron: 0 closed, 1 open.
+    pub(super) more_turn: Motion,
 }
 
 impl Default for SheetState {
@@ -27,13 +29,14 @@ impl Default for SheetState {
             shown: Motion::new(0.0, motion::SHEET, motion::SHEET_OUT, Kind::Fade),
             scrolled: false,
             more: false,
+            more_turn: Motion::new(0.0, motion::RING, motion::RING_OUT, Kind::Move),
         }
     }
 }
 
 impl SheetState {
     super::motion::registry! {
-        motions: [shown],
+        motions: [shown, more_turn],
         flashes: [],
     }
 }
@@ -44,7 +47,11 @@ impl Workbench {
     /// `sync_animations`. The scrim fades in with a sheet and out after it;
     /// a sheet opening while the scrim still fades out takes over from there.
     pub(super) fn sync_sheets(&mut self) {
-        self.sheets.shown.show(self.sheet_open(), self.now);
+        let now = self.now;
+        self.sheets.shown.show(self.sheet_open(), now);
+        self.sheets.more_turn.show(self.sheets.more, now);
+        self.capture_to.sync(now);
+        self.record_to.sync(now);
     }
 
     /// Take a screenshot scene word for the sheets: `late` is false
@@ -61,6 +68,7 @@ impl Workbench {
             "help-more" => {
                 self.help_open = true;
                 self.sheets.more = true;
+                self.sheets.more_turn.set(1.0);
                 true
             }
             word => self.capture_to.scene(word),
@@ -79,6 +87,19 @@ impl Workbench {
         if open {
             self.sheets.scrolled = false;
             self.sheets.more = false;
+            // Closed already: no turn while the sheet fades in.
+            self.sheets.more_turn.set(0.0);
+        }
+    }
+
+    /// Open or close the guide's notes on connecting cameras. They are its
+    /// last item, so opening them scrolls them into view.
+    pub(super) fn show_help_notes(&mut self, open: bool) -> Task<Message> {
+        self.sheets.more = open;
+        if open {
+            operation::snap_to_end(SHEET_BODY)
+        } else {
+            Task::none()
         }
     }
 
@@ -183,15 +204,7 @@ impl Workbench {
                 column![section(view), section(panels)].spacing(18).width(Fill),
             ]
             .spacing(32),
-            text(format!(
-                "{}, {} and {} act on the workbench when no field has keyboard focus. Press {} or click elsewhere to leave a field.",
-                Action::ToggleStream.key_label(os),
-                Action::FocusCamera.key_label(os),
-                Action::Overview.key_label(os),
-                Action::Overview.key_label(os)
-            ))
-            .size(style::SMALL)
-            .color(p.secondary),
+            text(plain_keys_note(os)).size(style::SMALL).color(p.secondary),
             heading("Control this window from a terminal or agent", p),
             text("Copy the session command to attach your terminal or coding agent. Session commands update this window and share its camera connection.")
                 .size(style::BODY),
@@ -200,7 +213,7 @@ impl Workbench {
             disclosure(
                 "Connecting cameras",
                 None,
-                if more { 1.0 } else { 0.0 },
+                self.sheets.more_turn.get(self.now),
                 Message::HelpMore(!more),
                 p,
             ),
@@ -220,6 +233,30 @@ impl Workbench {
             .on_scroll(Message::HelpScrolled)
             .into()
     }
+}
+
+/// The guide's note on plain keys: they act on the workbench only while no
+/// field has keyboard focus. Lists every one the guide shows, in its order.
+fn plain_keys_note(os: Os) -> String {
+    let keys: Vec<String> = Action::SECTIONS
+        .iter()
+        .flat_map(|(_, actions)| actions.iter())
+        .filter(|action| {
+            action
+                .display_binding(os)
+                .is_some_and(|chord| chord.needs_free_keyboard())
+        })
+        .map(|action| action.key_label(os))
+        .collect();
+    let keys = match keys.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        Some((last, _)) => last.clone(),
+        None => String::new(),
+    };
+    format!(
+        "{keys} act on the workbench when no field has keyboard focus. Press {} or click elsewhere to leave a field.",
+        Action::Overview.key_label(os)
+    )
 }
 
 #[cfg(test)]
@@ -262,6 +299,56 @@ mod tests {
         let _ = bench.handle_message(Message::Help(false));
         let _ = bench.handle_message(Message::Help(true));
         assert!(!bench.sheets.scrolled && !bench.sheets.more);
+    }
+
+    #[test]
+    fn esc_leaves_a_sheet_even_from_the_field_it_focused() {
+        let mut bench = bench();
+        let esc = Action::Overview.bindings(Os::CURRENT)[0];
+        bench.capture_to.manager_open = true;
+        let _ = bench.handle_message(Message::CapturePicker(destinations::Message::AddBucket));
+        assert!(bench.capture_to.editing());
+        // The focused field took the key to leave itself.
+        let _ = bench.shortcut(esc, false);
+        assert!(!bench.capture_to.editing(), "back to the list");
+        assert!(bench.capture_to.manager_open);
+        let _ = bench.shortcut(esc, false);
+        assert!(!bench.capture_to.manager_open, "closed");
+        // Outside a sheet, Esc in a field only leaves the field.
+        bench.image_mode = true;
+        let _ = bench.shortcut(esc, false);
+        assert!(bench.image_mode);
+    }
+
+    #[test]
+    fn the_notes_chevron_turns_and_settles() {
+        let mut bench = bench();
+        let _ = bench.handle_message(Message::Help(true));
+        bench.sync_animations();
+        let start = bench.now;
+        let _ = bench.handle_message(Message::HelpMore(true));
+        bench.sync_animations();
+        let mid = bench.sheets.more_turn.get(start + motion::RING / 2);
+        assert!(mid > 0.0 && mid < 1.0, "turns: {mid}");
+        bench.now = start + motion::RING;
+        assert_eq!(bench.sheets.more_turn.get(bench.now), 1.0);
+        assert!(!bench.sheets.more_turn.animating(bench.now));
+        // Reopened, the guide shows its notes closed without turning them.
+        let _ = bench.handle_message(Message::Help(false));
+        let _ = bench.handle_message(Message::Help(true));
+        bench.sync_animations();
+        assert_eq!(bench.sheets.more_turn.get(bench.now), 0.0);
+        assert!(!bench.sheets.more_turn.animating(bench.now));
+    }
+
+    #[test]
+    fn the_guide_names_every_key_a_field_takes() {
+        assert_eq!(
+            plain_keys_note(Os::Mac),
+            "↩, Esc, Space, F, H and R act on the workbench when no field has keyboard focus. Press Esc or click elsewhere to leave a field."
+        );
+        // F1 and F11 work from a field, so they are not named.
+        assert!(plain_keys_note(Os::Windows).starts_with("Enter, Esc, Space, F, H and R act"));
     }
 
     #[test]

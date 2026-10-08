@@ -1318,8 +1318,8 @@ impl Workbench {
         self.sample_throughput();
         self.observe_liveness();
         self.update_frames();
-        self.capture_to.tick();
-        self.record_to.tick();
+        self.capture_to.tick(&mut self.output);
+        self.record_to.tick(&mut self.forward_output);
         self.tick_chrome();
         self.tick_side();
         self.tick_stage();
@@ -2086,13 +2086,17 @@ impl Workbench {
             Message::DismissNotice => self.dismiss_notice(),
             Message::DismissStageError(id) => self.dismiss_stage_error(&id),
             Message::HelpScrolled(scrolled) => self.sheets.scrolled = scrolled,
-            Message::HelpMore(open) => self.sheets.more = open,
+            Message::HelpMore(open) => return self.show_help_notes(open),
         }
         Task::none()
     }
 
     fn shortcut(&mut self, chord: Chord, keyboard_free: bool) -> Task<Message> {
         let modal = self.sheet_open();
+        // In a sheet Esc cancels or closes it, even from the field it
+        // focused on opening, which took the key to leave itself.
+        let keyboard_free = keyboard_free
+            || (modal && chord.key == keys::Key::Escape && chord.mods == keys::Mods::NONE);
         let Some(action) = Action::find(&chord, keyboard_free, Os::CURRENT) else {
             return Task::none();
         };
