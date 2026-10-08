@@ -396,7 +396,7 @@ impl Workbench {
         let reading = row![
             text(meter.latest().map_or("–".into(), score))
                 .size(if compact {
-                    style::TITLE + 3.0
+                    style::TITLE
                 } else {
                     style::DISPLAY
                 })
@@ -967,7 +967,7 @@ impl canvas::Program<Message> for RegionEditor {
         frame.fill_text(canvas::Text {
             content: label,
             position: Point::new(at.x + tag.width / 2.0, at.y + tag.height / 2.0),
-            color: a(style::ON_STAGE, 1.0),
+            color: a(style::STAGE.text, 1.0),
             size: size.into(),
             font: style::MONO,
             align_x: TextAlign::Center,

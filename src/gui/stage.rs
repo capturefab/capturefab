@@ -473,7 +473,7 @@ impl Workbench {
         container(
             row![
                 tip(message, error),
-                tip(details, "Show it in Activity"),
+                tip(details, "Show the full error in Activity"),
                 tip(close, "Dismiss")
             ]
             .spacing(4)
