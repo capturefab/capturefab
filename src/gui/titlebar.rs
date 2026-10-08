@@ -57,12 +57,14 @@ impl Workbench {
             self.single_phase().is_some_and(Phase::live)
         };
         self.chrome.live.show(live, now);
-        if self.screenshot.is_some() {
+        let still = self.screenshot.is_some();
+        if still {
             // A still shows where the pill rests, not a frame of its change.
             self.chrome.live.set(if live { 1.0 } else { 0.0 });
         }
         if self.image_mode {
-            if self.chrome.entered.is_none() {
+            // A still of image mode shows it at rest; `image-hint` shows entering it.
+            if self.chrome.entered.is_none() && !still {
                 self.chrome.entered = Some(now);
                 // Show the way out at once: the stage controls hold its button.
                 self.wake_controls();
