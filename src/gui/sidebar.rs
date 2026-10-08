@@ -16,6 +16,9 @@ const STAGGERED: usize = 4;
 const SHAKE: Duration = Duration::from_millis(280);
 /// How far the address field moves at most as it shakes.
 const SHAKE_BY: f32 = 5.0;
+/// How long the address must rest before the hint says it is not understood,
+/// so a half-typed IP address is not called wrong.
+const TYPING_PAUSE: Duration = Duration::from_millis(1000);
 /// How long a discovery runs before the welcome screen says it is
 /// searching, so a quick one does not flash its placeholder.
 const SEARCH_SHOWN: Duration = Duration::from_millis(200);
@@ -67,6 +70,10 @@ pub(super) struct SideState {
     searched: bool,
     /// The address field shaking "no" after a connect to it failed, by target.
     shakes: Flashes<String>,
+    /// The address the hint was read from, and what it will try, if anything.
+    hint: (String, Option<String>),
+    /// When the address last changed.
+    typed_at: Option<Instant>,
 }
 
 impl Default for SideState {
@@ -79,6 +86,8 @@ impl Default for SideState {
             had_issues: false,
             searched: false,
             shakes: Flashes::new(SHAKE),
+            hint: (String::new(), None),
+            typed_at: None,
         }
     }
 }
@@ -133,8 +142,15 @@ fn shake_offset(level: f32) -> f32 {
 /// The sidebar-welcome package's hooks into the shared update cycle.
 impl Workbench {
     /// Point the sidebar-welcome package's motions at what they show; from
-    /// `sync_animations`.
-    pub(super) fn sync_side(&mut self) {}
+    /// `sync_animations`. Also reads a changed address, here rather than in
+    /// the view, since recognizing a file checks the disk.
+    pub(super) fn sync_side(&mut self) {
+        if self.side.hint.0 != self.address {
+            let reading = read_address(self.address.trim(), &self.snapshot.devices);
+            self.side.hint = (self.address.clone(), reading);
+            self.side.typed_at = Some(self.now);
+        }
+    }
 
     /// The sidebar-welcome package's bookkeeping on the slow tick, after the
     /// snapshot refresh; from `tick()`.
@@ -157,6 +173,10 @@ impl Workbench {
                 .iter()
                 .map(|device| device.id.clone())
                 .collect();
+            // A serial typed before discovery found it reads as known now.
+            if !self.address.trim().is_empty() {
+                side.hint.1 = read_address(self.address.trim(), &self.snapshot.devices);
+            }
         }
         let issues = !side.discovery_issues.is_empty();
         if issues && !side.had_issues {
@@ -192,6 +212,8 @@ impl Workbench {
     ///   never finishes
     /// - `side-card-failed`: connecting to the simulator failed
     /// - `side-recent`: two recent cameras, a GigE one and a stream
+    /// - `side-address`: a GigE address typed in the address field
+    /// - `side-unknown`: something the address field does not understand
     pub(super) fn scene_side(&mut self, word: &str, late: bool) -> bool {
         if late {
             return false;
@@ -229,6 +251,8 @@ impl Workbench {
                     },
                 ]
             }
+            "side-address" => self.address = "192.168.1.20".into(),
+            "side-unknown" => self.address = "line-7 camera".into(),
             _ => return false,
         }
         true
@@ -249,6 +273,15 @@ pub(super) fn short_address(address: &str) -> String {
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
     format!("{host}{}", path.trim_end_matches('/'))
+}
+
+/// Just the host (and port) of `address`, as `short_address` gives it.
+fn host(address: &str) -> String {
+    let short = short_address(address);
+    match short.split_once('/') {
+        Some((host, _)) => host.to_owned(),
+        None => short,
+    }
 }
 
 /// Where a camera is, identifier first: its address or serial, then its
@@ -275,6 +308,54 @@ pub(super) fn recent_place(recent: &Recent) -> String {
 /// The first line of an error, for a one-line slot; the tooltip has it all.
 pub(super) fn first_line(error: &str) -> &str {
     error.lines().next().unwrap_or(error)
+}
+
+/// What connecting to `input` will try, following `Camera::open`'s order;
+/// `None` when it is none of the things it accepts. Never shows credentials.
+fn read_address(input: &str, devices: &[CameraInfo]) -> Option<String> {
+    if input.is_empty() {
+        return None;
+    }
+    if crate::onvif::is_source(input) {
+        return Some(format!("Will try ONVIF at {}", host(input)));
+    }
+    if input.starts_with("sim:") {
+        return Some("Will try a simulated camera".into());
+    }
+    if crate::media::is_source(input) {
+        return Some(match input.split_once(':') {
+            Some((scheme, rest)) if rest.starts_with("//") => {
+                let scheme = scheme.to_ascii_lowercase();
+                match scheme.as_str() {
+                    "file" => "Will try the video file".into(),
+                    _ => format!(
+                        "Will try {} at {}",
+                        scheme.to_ascii_uppercase(),
+                        short_address(input)
+                    ),
+                }
+            }
+            Some((scheme, _))
+                if matches!(
+                    scheme.to_ascii_lowercase().as_str(),
+                    "avfoundation" | "v4l2" | "dshow"
+                ) =>
+            {
+                "Will try a webcam".into()
+            }
+            _ => "Will try the video file".into(),
+        });
+    }
+    if let Ok(ip) = input
+        .trim_start_matches("gige:")
+        .parse::<std::net::Ipv4Addr>()
+    {
+        return Some(format!("Will try GigE Vision at {ip}"));
+    }
+    devices
+        .iter()
+        .find(|device| device.id == input || device.serial == input)
+        .map(|device| format!("Will try {} · S/N {}", device.model, device.serial))
 }
 
 /// A hollow status dot: a camera that is not connected.
@@ -786,7 +867,19 @@ impl Workbench {
                 format!("Could not connect: {error}"),
             )
         } else {
-            one_line(ADDRESS_HINT, style::CAPTION, style::SANS, p.secondary)
+            let (reading, ink) = match (&self.side.hint, typed.is_empty()) {
+                (_, true) => (ADDRESS_HINT, p.secondary),
+                ((_, Some(reading)), _) => (reading.as_str(), p.secondary),
+                ((_, None), _)
+                    if self.side.typed_at.is_some_and(|at| {
+                        self.now.saturating_duration_since(at) >= TYPING_PAUSE
+                    }) =>
+                {
+                    ("Not an address, URL, file or serial", p.ink(p.warn))
+                }
+                ((_, None), _) => (ADDRESS_HINT, p.secondary),
+            };
+            one_line(reading, style::CAPTION, style::SANS, ink)
                 .width(Fill)
                 .into()
         };
@@ -904,6 +997,42 @@ mod tests {
     }
 
     #[test]
+    fn addresses_read_in_the_order_connecting_tries_them() {
+        let devices = [device("sim:0", "SIM0")];
+        let read = |input: &str| read_address(input, &devices);
+        let cases = [
+            ("", None),
+            (
+                "onvif://admin:secret@192.168.1.30/onvif/device_service",
+                Some("Will try ONVIF at 192.168.1.30"),
+            ),
+            (
+                "onvif:http://camera.local/onvif/device_service",
+                Some("Will try ONVIF at camera.local"),
+            ),
+            ("sim:3", Some("Will try a simulated camera")),
+            (
+                "rtsp://operator:secret@cam.local:554/line-1?token=abc",
+                Some("Will try RTSP at cam.local:554/line-1"),
+            ),
+            ("srt://10.0.0.5:9000", Some("Will try SRT at 10.0.0.5:9000")),
+            ("file:///videos/line.mkv", Some("Will try the video file")),
+            ("avfoundation:0", Some("Will try a webcam")),
+            // Tests run in the package root.
+            ("Cargo.toml", Some("Will try the video file")),
+            ("gige:10.0.0.2", Some("Will try GigE Vision at 10.0.0.2")),
+            ("192.168.1.20", Some("Will try GigE Vision at 192.168.1.20")),
+            ("SIM0", Some("Will try Pattern camera · S/N SIM0")),
+            ("sim0", None),
+            ("192.168.1", None),
+            ("line-7 camera", None),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(read(input).as_deref(), expected, "{input:?}");
+        }
+    }
+
+    #[test]
     fn short_addresses_keep_where_and_drop_secrets() {
         assert_eq!(
             short_address("rtsp://user:pass@cam.local:554/stream?token=1#x"),
@@ -918,6 +1047,7 @@ mod tests {
             short_address("onvif://admin:p@ss@10.0.0.9/onvif/device_service"),
             "10.0.0.9/onvif/device_service"
         );
+        assert_eq!(host("onvif:http://cam/service"), "cam");
     }
 
     #[test]
@@ -1091,5 +1221,29 @@ mod tests {
         assert_eq!(shake_offset(0.0), 0.0);
         assert!(shake_offset(1.0).abs() < 1e-5);
         assert!(shake_offset(0.5).abs() <= SHAKE_BY);
+    }
+
+    #[test]
+    fn the_address_hint_waits_for_a_pause_before_saying_no() {
+        let mut bench = bench();
+        let start = bench.now;
+        bench.address = "192.168".into();
+        bench.sync_side();
+        assert_eq!(bench.side.hint, ("192.168".into(), None));
+        assert_eq!(bench.side.typed_at, Some(start));
+        bench.now = start + TYPING_PAUSE;
+        bench.sync_side();
+        assert_eq!(
+            bench.side.typed_at,
+            Some(start),
+            "unchanged text keeps its time"
+        );
+        bench.address = "192.168.1.20".into();
+        bench.sync_side();
+        assert_eq!(
+            bench.side.hint.1.as_deref(),
+            Some("Will try GigE Vision at 192.168.1.20")
+        );
+        assert_eq!(bench.side.typed_at, Some(bench.now));
     }
 }
