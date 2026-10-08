@@ -133,6 +133,14 @@ pub struct CameraSnapshot {
     pub auto: Option<crate::auto::AutoStatus>,
     #[serde(default)]
     pub transport: Option<crate::types::TransportStats>,
+    /// Frames the shared ring replaced before this process read them, which
+    /// `dropped` includes. Kept for this process's own views; not serialized.
+    #[serde(skip)]
+    pub ring_dropped: u64,
+    /// The worker was busy, so this entry repeats its last report. Kept for
+    /// this process's own views; not serialized.
+    #[serde(skip)]
+    pub stale: bool,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -428,12 +436,13 @@ impl SessionHandle {
             if let Ok(p) = w.try_lock() {
                 let s = &p.snapshot;
                 if let Some(info) = &s.connected {
+                    let ring_dropped = u64::from(locked(&p.feed).ring.dropped());
                     let camera = CameraSnapshot {
                         info: info.clone(),
                         features: s.features.clone(),
                         streaming: s.streaming,
                         frames: s.frames,
-                        dropped: s.dropped + locked(&p.feed).ring.dropped() as u64,
+                        dropped: s.dropped + ring_dropped,
                         fps: s.fps,
                         last_error: s.last_error.clone(),
                         worker_pid: p.child.id(),
@@ -441,6 +450,8 @@ impl SessionHandle {
                         jobs: s.jobs.clone(),
                         auto: s.auto.clone(),
                         transport: s.transport.clone(),
+                        ring_dropped,
+                        stale: false,
                     };
                     if state.active_camera.as_deref() == Some(&id) {
                         state.connected = s.connected.clone();
@@ -459,7 +470,10 @@ impl SessionHandle {
                     state.cameras.push(camera);
                 }
             } else if let Some(c) = previous.cameras.iter().find(|c| c.info.id == id) {
-                state.cameras.push(c.clone());
+                state.cameras.push(CameraSnapshot {
+                    stale: true,
+                    ..c.clone()
+                });
             }
         }
         if state.active_camera.is_none() {

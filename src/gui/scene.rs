@@ -131,10 +131,11 @@ impl Workbench {
             && let Some(id) = camera
             && let Some(live) = self.liveness.get_mut(&id)
         {
-            live.frame_at = self
-                .now
-                .checked_sub(Duration::from_secs(8))
-                .unwrap_or(self.born);
+            live.silent_since(
+                self.now
+                    .checked_sub(Duration::from_secs(8))
+                    .unwrap_or(self.born),
+            );
             self.scene.frozen = Some(id);
         }
     }
