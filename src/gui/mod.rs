@@ -1095,9 +1095,22 @@ impl Workbench {
         code_block(command, copied, p)
     }
 
-    /// Whether auto mode is being switched or tuned on any camera.
+    /// Whether auto mode is being switched or tuned on any camera; for the
+    /// overview's Auto all.
     fn auto_busy(&self) -> bool {
         self.pending.iter().any(|p| p.job.is_auto())
+    }
+
+    /// Whether auto mode is being switched or tuned on the selected camera,
+    /// which its Auto controls go by. Each camera has its own worker, so
+    /// another camera's command never holds them up.
+    fn auto_busy_here(&self) -> bool {
+        let camera = self.snapshot.active_camera.as_deref();
+        camera.is_some()
+            && self
+                .pending
+                .iter()
+                .any(|p| p.job.is_auto() && p.camera.as_deref() == camera)
     }
 
     fn title(&self) -> String {
@@ -1283,7 +1296,7 @@ impl Workbench {
         }
         if let Some(status) = &self.snapshot.auto
             && !self.balance_dragging
-            && !self.auto_busy()
+            && !self.auto_busy_here()
         {
             self.balance = status.balance;
         }
@@ -1507,7 +1520,7 @@ impl Workbench {
     }
 
     fn toggle_auto(&mut self) {
-        if self.auto_busy() {
+        if self.auto_busy_here() {
             return;
         }
         if self.snapshot.auto.is_some() {
@@ -1843,7 +1856,7 @@ impl Workbench {
                 self.send(Job::RefreshFeatures, SessionCommand::Features);
             }
             Message::Auto(on) => {
-                if !self.auto_busy() && on != self.snapshot.auto.is_some() {
+                if !self.auto_busy_here() && on != self.snapshot.auto.is_some() {
                     self.toggle_auto();
                 }
             }

@@ -349,14 +349,17 @@ impl Workbench {
                     .font(style::MONO)
                     .color(p.secondary)
                     .width(Length::Fixed(58.0)),
-                    container(mark).width(Length::Fixed(11.0)),
+                    container(mark)
+                        .width(Length::Fixed(11.0))
+                        // Centered on the first line, should the message wrap.
+                        .height(Length::Fixed(style::line_height(style::CAPTION)))
+                        .align_y(Alignment::Center),
                     text(entry.message.as_str())
                         .size(style::CAPTION)
                         .font(style::MONO)
                         .color(ink),
                 ]
-                .spacing(6)
-                .align_y(Alignment::Center),
+                .spacing(6),
             );
         }
         column![
