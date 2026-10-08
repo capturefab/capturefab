@@ -154,7 +154,17 @@ fn validate_source(url: &str) -> Result<()> {
     }
     Ok(())
 }
+/// Whether `output` is a local file a forward records to (a path or a
+/// `file:` URL) rather than a URL it streams to.
+pub fn is_recording(output: &str) -> bool {
+    matches!(scheme(output).as_deref(), None | Some("file"))
+}
 pub fn is_source(url: &str) -> bool {
+    is_url_source(url) || std::path::Path::new(url).is_file()
+}
+/// Whether `url` names a source by its scheme alone, without asking the
+/// disk whether it is a file.
+pub fn is_url_source(url: &str) -> bool {
     scheme(url).is_some_and(|s| {
         matches!(
             s.as_str(),
@@ -173,7 +183,7 @@ pub fn is_source(url: &str) -> bool {
                 | "v4l2"
                 | "dshow"
         )
-    }) || std::path::Path::new(url).is_file()
+    })
 }
 pub fn info(url: &str) -> Result<CameraInfo> {
     validate_source(url)?;
@@ -1840,7 +1850,7 @@ fn output_args(output: &str) -> Result<Vec<String>> {
     Ok(args)
 }
 fn recording_output(output: &str) -> Result<Option<(PathBuf, &'static str)>> {
-    if !matches!(scheme(output).as_deref(), None | Some("file")) {
+    if !is_recording(output) {
         return Ok(None);
     }
     let path = if scheme(output).as_deref() == Some("file") {

@@ -192,6 +192,41 @@ impl<Message> canvas::Program<Message> for Sparkline<'_> {
     }
 }
 
+/// The empty chart a line is about to draw on: its zero line, dotted, so
+/// the slot reads as a chart on its way rather than a rule. Drawn again only
+/// when its size or color changes.
+pub struct Baseline {
+    pub color: Color,
+}
+
+impl<Message> canvas::Program<Message> for Baseline {
+    type State = (canvas::Cache, std::cell::Cell<Option<(Size, Color)>>);
+
+    fn draw(
+        &self,
+        (cache, drawn): &Self::State,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let key = Some((bounds.size(), self.color));
+        if drawn.replace(key) != key {
+            cache.clear();
+        }
+        vec![cache.draw(renderer, bounds.size(), |frame| {
+            // On the line's own inset, where its zero falls.
+            let inset = 2.0;
+            let y = (bounds.height - inset - 1.0).round();
+            let mut x = inset;
+            while x + 1.5 <= bounds.width - inset {
+                frame.fill_rectangle(Point::new(x, y), Size::new(1.5, 1.5), self.color);
+                x += 4.0;
+            }
+        })]
+    }
+}
+
 /// Where each sample lands in `size`: placed by its age, so the newest is
 /// always at the right edge and a gap in sampling shows as a long segment.
 fn points(history: &History, size: Size, floor: f32) -> Vec<Point> {

@@ -1,9 +1,12 @@
 //! Phosphor icons (MIT, assets/fonts) drawn as font glyphs, so they stay crisp
 //! at any size and take their color from the palette. The app mark is drawn.
 use crate::types::Transport;
-use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
+use iced::widget::canvas::{self, Frame, Geometry, LineCap, Path, Stroke};
 use iced::widget::{container, text, text_input};
-use iced::{Color, Element, Font, Point, Rectangle, Renderer, Size, Theme, alignment, mouse};
+use iced::{
+    Color, Element, Font, Point, Rectangle, Renderer, Size, Theme, Vector, alignment, mouse,
+};
+use std::cell::Cell;
 
 pub const REGULAR_BYTES: &[u8] = include_bytes!("../../assets/fonts/Phosphor.ttf");
 pub const FILL_BYTES: &[u8] = include_bytes!("../../assets/fonts/Phosphor-Fill.ttf");
@@ -29,18 +32,22 @@ pub enum Icon {
     Contrast,
     ChevronRight,
     ChevronDown,
+    ChevronLeft,
     Broadcast,
     Folder,
     Eject,
     Search,
     Recent,
-    Plug,
     Network,
     Usb,
     Video,
     Cube,
     Check,
+    /// An error: a mark in a circle. Warnings use the triangle, so severity
+    /// reads by shape as well as color.
     Warning,
+    /// A warning: a mark in a triangle.
+    WarningTriangle,
     Keyboard,
     Sidebar,
     Sliders,
@@ -48,6 +55,11 @@ pub enum Icon {
     CornersIn,
     Scan,
     Reset,
+    Lock,
+    CloudArrowUp,
+    FolderPlus,
+    /// Drives: local, external or network storage.
+    HardDrives,
     /// The app mark: a rounded lens body.
     Mark,
 }
@@ -72,18 +84,19 @@ impl Icon {
             Icon::Contrast => (REGULAR, '\u{e18c}'),
             Icon::ChevronRight => (REGULAR, '\u{e13a}'),
             Icon::ChevronDown => (REGULAR, '\u{e136}'),
+            Icon::ChevronLeft => (REGULAR, '\u{e138}'),
             Icon::Broadcast => (REGULAR, '\u{e0f2}'),
             Icon::Folder => (REGULAR, '\u{e24a}'),
             Icon::Eject => (REGULAR, '\u{e212}'),
             Icon::Search => (REGULAR, '\u{e30c}'),
             Icon::Recent => (REGULAR, '\u{e1a0}'),
-            Icon::Plug => (REGULAR, '\u{e946}'),
             Icon::Network => (REGULAR, '\u{edde}'),
             Icon::Usb => (REGULAR, '\u{e956}'),
             Icon::Video => (REGULAR, '\u{e4da}'),
             Icon::Cube => (REGULAR, '\u{e1da}'),
             Icon::Check => (REGULAR, '\u{e184}'),
             Icon::Warning => (REGULAR, '\u{e4e2}'),
+            Icon::WarningTriangle => (REGULAR, '\u{e4e0}'),
             Icon::Keyboard => (REGULAR, '\u{e2d8}'),
             Icon::Sidebar => (REGULAR, '\u{ec24}'),
             Icon::Sliders => (REGULAR, '\u{e434}'),
@@ -91,6 +104,10 @@ impl Icon {
             Icon::CornersIn => (REGULAR, '\u{e1ce}'),
             Icon::Scan => (REGULAR, '\u{ebb6}'),
             Icon::Reset => (REGULAR, '\u{e038}'),
+            Icon::Lock => (REGULAR, '\u{e2fa}'),
+            Icon::CloudArrowUp => (REGULAR, '\u{e1ae}'),
+            Icon::FolderPlus => (REGULAR, '\u{e258}'),
+            Icon::HardDrives => (REGULAR, '\u{e2a0}'),
             Icon::Mark => (REGULAR, '\u{e00a}'),
         }
     }
@@ -169,5 +186,96 @@ impl<Message> canvas::Program<Message> for Mark {
         );
         frame.fill(&Path::circle(p(8.0, 8.0), 1.3 * s), Color::WHITE);
         vec![frame.into_geometry()]
+    }
+}
+
+/// Spokes in the activity indicator, one lit per step.
+const SPOKES: usize = 8;
+
+/// A macOS-style activity indicator: eight spokes fading behind the one lit
+/// at `phase`. The caller steps `phase` from a tick it already runs; this
+/// draws a still frame and requests no redraws itself.
+pub fn spinner<'a, Message: 'a>(size: f32, color: Color, phase: usize) -> Element<'a, Message> {
+    canvas::Canvas::new(Spinner {
+        color,
+        phase: phase % SPOKES,
+    })
+    .width(size)
+    .height(size)
+    .into()
+}
+
+struct Spinner {
+    color: Color,
+    phase: usize,
+}
+
+/// Opacity of `spoke` while `phase` is lit: full at the head, fading over
+/// the steps since each was lit.
+fn glow(phase: usize, spoke: usize) -> f32 {
+    let age = (phase + SPOKES - spoke % SPOKES) % SPOKES;
+    1.0 - age as f32 * 0.1
+}
+
+/// The drawn spokes, kept until the phase or color changes.
+#[derive(Default)]
+struct Spun {
+    cache: canvas::Cache,
+    key: Cell<Option<(usize, Color)>>,
+}
+
+impl<Message> canvas::Program<Message> for Spinner {
+    type State = Spun;
+
+    fn draw(
+        &self,
+        state: &Spun,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let key = Some((self.phase, self.color));
+        if state.key.replace(key) != key {
+            state.cache.clear();
+        }
+        let geometry = state.cache.draw(renderer, bounds.size(), |frame| {
+            let side = bounds.width.min(bounds.height);
+            let center = frame.center();
+            let (inner, outer) = (side * 0.24, side * 0.46);
+            for spoke in 0..SPOKES {
+                let angle = spoke as f32 * std::f32::consts::TAU / SPOKES as f32
+                    - std::f32::consts::FRAC_PI_2;
+                let along = Vector::new(angle.cos(), angle.sin());
+                let color = Color {
+                    a: self.color.a * glow(self.phase, spoke),
+                    ..self.color
+                };
+                frame.stroke(
+                    &Path::line(center + along * inner, center + along * outer),
+                    Stroke::default()
+                        .with_color(color)
+                        .with_width(side * 0.11)
+                        .with_line_cap(LineCap::Round),
+                );
+            }
+        });
+        vec![geometry]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spinner_fades_behind_the_lit_spoke() {
+        assert_eq!(glow(3, 3), 1.0);
+        assert!((glow(3, 2) - 0.9).abs() < 1e-6);
+        // The spoke just ahead of the head was lit longest ago.
+        assert!((glow(3, 4) - 0.3).abs() < 1e-6);
+        assert_eq!(glow(0, 0), glow(SPOKES, 0));
+        let total: f32 = (0..SPOKES).map(|spoke| glow(5, spoke)).sum();
+        assert!((total - 5.2).abs() < 1e-5);
     }
 }

@@ -98,14 +98,114 @@ pub(super) fn feature_group(name: &str) -> &'static str {
     }
 }
 
+/// A feature value as text that parses back to the same value, so it can be
+/// edited and sent as is. Whole floats read as whole numbers, 10000.0 as
+/// "10000"; a fraction or an exponent stays.
 pub(super) fn value_text(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(value) => value.clone(),
-        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::Number(value) => {
+            let text = value.to_string();
+            match text.strip_suffix(".0") {
+                Some("-0") => "0".into(),
+                Some(whole) => whole.into(),
+                None => text,
+            }
+        }
         serde_json::Value::Bool(value) => value.to_string(),
         serde_json::Value::Null => "—".into(),
         _ => value.to_string(),
     }
+}
+
+/// A GenICam unit as people write it: "us" → "µs".
+pub(super) fn unit_label(unit: &str) -> &str {
+    match unit {
+        "us" | "usec" => "µs",
+        other => other,
+    }
+}
+
+/// A bound in a range caption: whole numbers from 10,000 up are grouped,
+/// "1,000,000"; type limits such as FLT_MAX and bounds too small for
+/// `number` read in exponent form, "3.4e38" and "1e-4", as fields show
+/// them; the rest read as `number` has them. For captions only; fields keep
+/// plain digits, so they parse.
+pub(super) fn range_number(value: f64) -> String {
+    // Folds -0 into 0.
+    let value = if value == 0.0 { 0.0 } else { value };
+    let magnitude = value.abs();
+    if magnitude >= 1e15 || (magnitude > 0.0 && magnitude < 0.001) {
+        format!("{value:.1e}").replace(".0e", "e")
+    } else if value.fract() == 0.0 && magnitude >= 10_000.0 {
+        let digits = grouped(magnitude as u64);
+        if value < 0.0 {
+            format!("-{digits}")
+        } else {
+            digits
+        }
+    } else {
+        number(value)
+    }
+}
+
+/// A feature's range and unit for the caption under its field, such as
+/// "10 – 1,000,000 µs"; empty when it has neither.
+pub(super) fn range_text(feature: &FeatureInfo) -> String {
+    let range = match (feature.min, feature.max) {
+        (Some(min), Some(max)) => format!("{} – {}", range_number(min), range_number(max)),
+        (Some(min), None) => format!("min {}", range_number(min)),
+        (None, Some(max)) => format!("max {}", range_number(max)),
+        _ => String::new(),
+    };
+    match feature.unit.as_deref().map(unit_label) {
+        Some(unit) if range.is_empty() => unit.to_owned(),
+        Some(unit) => format!("{range} {unit}"),
+        None => range,
+    }
+}
+
+/// Features a camera cannot change while it streams: the image's geometry
+/// and format.
+pub(super) fn stream_locked(name: &str) -> bool {
+    matches!(
+        name,
+        "Width"
+            | "Height"
+            | "OffsetX"
+            | "OffsetY"
+            | "PixelFormat"
+            | "BinningHorizontal"
+            | "BinningVertical"
+            | "DecimationHorizontal"
+            | "DecimationVertical"
+            | "VideoMode"
+    )
+}
+
+/// Where a feature sorts within its group: in the order a camera is set up,
+/// then everything else.
+pub(super) fn feature_rank(name: &str) -> usize {
+    const ORDER: [&str; 14] = [
+        "Width",
+        "Height",
+        "OffsetX",
+        "OffsetY",
+        "PixelFormat",
+        "Binning",
+        "Decimation",
+        "AcquisitionStart",
+        "AcquisitionMode",
+        "AcquisitionFrameRate",
+        "ExposureAuto",
+        "ExposureTime",
+        "GainAuto",
+        "Gain",
+    ];
+    ORDER
+        .iter()
+        .position(|prefix| name.starts_with(prefix))
+        .unwrap_or(ORDER.len())
 }
 
 pub(super) fn auto_summary(status: &AutoStatus) -> String {
@@ -137,7 +237,8 @@ pub(super) fn change_text(change: &AutoChange, unit: Option<&str>) -> String {
         change.feature,
         value_text(change.from.as_ref().unwrap_or(&serde_json::Value::Null)),
         value_text(&change.to),
-        unit.map(|u| format!(" {u}")).unwrap_or_default()
+        unit.map(|u| format!(" {}", unit_label(u)))
+            .unwrap_or_default()
     )
 }
 
@@ -242,10 +343,153 @@ pub(super) fn redact_address(value: &str) -> String {
     }
 }
 
+/// `address` without its scheme, credentials, query or fragment: the host,
+/// any port, and the path. Safe to show, as `redact_address` is.
+pub(super) fn short_address(address: &str) -> String {
+    let rest = address.strip_prefix("onvif:").unwrap_or(address);
+    let rest = rest
+        .strip_prefix("//")
+        .or_else(|| rest.split_once("://").map(|(_, rest)| rest))
+        .unwrap_or(rest);
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{host}{}", path.trim_end_matches('/'))
+}
+
+/// What tells a camera from others of its model, the same everywhere it
+/// shows: its short address when it has one (stream and ONVIF inputs have
+/// only a hash for a serial), else its serial, as "S/N SIM0".
+pub(super) fn identity(camera: &CameraInfo) -> String {
+    match &camera.address {
+        Some(address) => short_address(address),
+        None => format!("S/N {}", camera.serial),
+    }
+}
+
+/// `identity(camera)` when another of the connected `cameras` is the same
+/// model, so its model alone would not tell them apart.
+pub(super) fn twin_identity(
+    cameras: &[crate::session::CameraSnapshot],
+    camera: &CameraInfo,
+) -> Option<String> {
+    let same = cameras
+        .iter()
+        .filter(|other| other.info.model == camera.model)
+        .count();
+    (same > 1).then(|| identity(camera))
+}
+
+/// What a camera's output is: a file it records to, or a URL it forwards
+/// to, told apart by the rule the forwarder itself uses. Safe to show: a
+/// URL's credentials are hidden.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Output {
+    Recording(String),
+    Forwarding(String),
+}
+
+impl Output {
+    pub(super) fn of(target: &str) -> Self {
+        if crate::media::is_recording(target) {
+            Output::Recording(target.to_owned())
+        } else {
+            Output::Forwarding(redact_address(target))
+        }
+    }
+
+    pub(super) fn recording(&self) -> bool {
+        matches!(self, Output::Recording(_))
+    }
+
+    /// "Recording" or "Forwarding".
+    pub(super) fn title(&self) -> &'static str {
+        match self {
+            Output::Recording(_) => "Recording",
+            Output::Forwarding(_) => "Forwarding",
+        }
+    }
+
+    /// The file or URL.
+    pub(super) fn target(&self) -> &str {
+        match self {
+            Output::Recording(target) | Output::Forwarding(target) => target,
+        }
+    }
+
+    /// "Recording to clip.mkv", "Forwarding to rtsp://[redacted]@cam/live".
+    pub(super) fn about(&self) -> String {
+        format!("{} to {}", self.title(), self.target())
+    }
+}
+
+/// A count and its noun: "1 camera", "1,204 features".
+pub(super) fn plural(n: u64, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{} {many}", grouped(n))
+    }
+}
+
+/// The first line of an error, for a one-line slot; a tooltip or the
+/// activity log has it all.
+pub(super) fn first_line(error: &str) -> &str {
+    error.lines().next().unwrap_or(error)
+}
+
+/// A short span of time: "4 s", "3 min", "2 h".
+pub(super) fn span(duration: Duration) -> String {
+    match duration.as_secs() {
+        seconds @ 0..60 => format!("{seconds} s"),
+        seconds @ 60..3600 => format!("{} min", seconds / 60),
+        seconds => format!("{} h", seconds / 3600),
+    }
+}
+
+/// What a stalled camera's badge, row and pill say: "No new frame for 6 s".
+pub(super) fn silence(silent: Duration) -> String {
+    format!(
+        "No new frame for {}",
+        span(silent.max(Duration::from_secs(1)))
+    )
+}
+
+/// A writable feature named `name` of GenICam `kind` holding `value`, for tests.
+#[cfg(test)]
+pub(super) fn sample_feature(name: &str, kind: &str, value: serde_json::Value) -> FeatureInfo {
+    FeatureInfo {
+        name: name.into(),
+        display_name: String::new(),
+        kind: kind.into(),
+        value: Some(value),
+        writable: true,
+        description: String::new(),
+        unit: None,
+        min: None,
+        max: None,
+        inc: None,
+        choices: Vec::new(),
+        error: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn spans_read_in_the_largest_whole_unit() {
+        let ms = Duration::from_millis;
+        assert_eq!(span(ms(6400)), "6 s");
+        assert_eq!(span(Duration::from_secs(130)), "2 min");
+        assert_eq!(span(Duration::from_secs(7300)), "2 h");
+        assert_eq!(silence(ms(6400)), "No new frame for 6 s");
+        assert_eq!(silence(ms(300)), "No new frame for 1 s");
+    }
 
     #[test]
     fn trends_name_their_span_range_and_marks() {
@@ -294,7 +538,7 @@ mod tests {
         };
         assert_eq!(
             change_text(&change, Some("us")),
-            "12:00:01 AutoExposureTimeUpperLimit 5000 → 19800.5 us"
+            "12:00:01 AutoExposureTimeUpperLimit 5000 → 19800.5 µs"
         );
         let change = AutoChange {
             from: None,
@@ -348,6 +592,190 @@ mod tests {
         assert_eq!(grouped(10_000_000), "10,000,000");
         assert_eq!(capitalize("stable"), "Stable");
         assert_eq!(capitalize(""), "");
+    }
+
+    #[test]
+    fn whole_floats_read_as_whole_numbers_and_parse_back() {
+        assert_eq!(value_text(&json!(10000.0)), "10000");
+        assert_eq!(value_text(&json!(30.0)), "30");
+        assert_eq!(value_text(&json!(0.0)), "0");
+        assert_eq!(value_text(&json!(-0.0)), "0");
+        assert_eq!(value_text(&json!(-4.0)), "-4");
+        assert_eq!(value_text(&json!(2.5)), "2.5");
+        assert_eq!(value_text(&json!(15000)), "15000");
+        assert_eq!(value_text(&json!(1e21)), "1e+21");
+        assert_eq!(value_text(&json!("Mono8")), "Mono8");
+        assert_eq!(value_text(&json!(true)), "true");
+        for value in [
+            10000.0,
+            0.1,
+            -0.5,
+            30.0,
+            1e15,
+            1e16,
+            123456.789,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            -1e-7,
+        ] {
+            let text = value_text(&json!(value));
+            assert_eq!(text.parse::<f64>().ok(), Some(value), "{text}");
+        }
+        // The draft a write leaves matches the camera's value once read back.
+        let feature = sample_feature("ExposureTime", "Float", json!(15000.0));
+        assert_eq!(feature_value(&feature), "15000");
+    }
+
+    #[test]
+    fn ranges_read_with_grouped_digits_and_real_units() {
+        let feature = |min, max, unit: Option<&str>| FeatureInfo {
+            min,
+            max,
+            unit: unit.map(str::to_owned),
+            ..sample_feature("ExposureTime", "Float", json!(1))
+        };
+        assert_eq!(
+            range_text(&feature(Some(10.0), Some(1_000_000.0), Some("us"))),
+            "10 – 1,000,000 µs"
+        );
+        assert_eq!(
+            range_text(&feature(Some(0.0), Some(24.0), Some("dB"))),
+            "0 – 24 dB"
+        );
+        assert_eq!(
+            range_text(&feature(Some(-20_000.0), Some(0.5), None)),
+            "-20,000 – 0.5"
+        );
+        assert_eq!(range_text(&feature(None, Some(9999.0), None)), "max 9999");
+        assert_eq!(range_text(&feature(None, None, Some("Hz"))), "Hz");
+        assert_eq!(range_text(&feature(None, None, None)), "");
+        assert_eq!(range_number(1e20), "1e20", "too large to group");
+        assert_eq!(range_number(3.402_823_5e38), "3.4e38", "FLT_MAX");
+        assert_eq!(range_number(i64::MAX as f64), "9.2e18");
+        assert_eq!(range_number(-0.0), "0");
+        assert_eq!(range_number(0.0), "0");
+        assert_eq!(range_number(0.0001), "1e-4", "not rounded to 0");
+        assert_eq!(range_number(-0.0004), "-4e-4", "nor to -0");
+        assert_eq!(range_number(0.001), "0.001");
+        assert_eq!(range_number(999_999_999_999_999.0), "999,999,999,999,999");
+        assert_eq!(
+            range_text(&feature(Some(-0.0), Some(f64::from(f32::MAX)), None)),
+            "0 – 3.4e38"
+        );
+        assert_eq!(unit_label("Hz"), "Hz");
+    }
+
+    #[test]
+    fn features_sort_the_way_a_camera_is_set_up() {
+        let mut names = vec![
+            "Height",
+            "PixelFormat",
+            "Width",
+            "TestPattern",
+            "OffsetX",
+            "WidthMax",
+        ];
+        names.sort_by_key(|name| feature_rank(name));
+        assert_eq!(
+            names,
+            [
+                "Width",
+                "WidthMax",
+                "Height",
+                "OffsetX",
+                "PixelFormat",
+                "TestPattern"
+            ]
+        );
+        let mut names = vec![
+            "Gain",
+            "AcquisitionStart",
+            "ExposureTime",
+            "AcquisitionFrameRate",
+            "GainAuto",
+            "ExposureAuto",
+            "BlackLevel",
+        ];
+        names.sort_by_key(|name| feature_rank(name));
+        assert_eq!(
+            names,
+            [
+                "AcquisitionStart",
+                "AcquisitionFrameRate",
+                "ExposureAuto",
+                "ExposureTime",
+                "GainAuto",
+                "Gain",
+                "BlackLevel"
+            ]
+        );
+        assert!(stream_locked("PixelFormat") && !stream_locked("Gain"));
+    }
+
+    fn camera(model: &str, serial: &str, address: Option<&str>) -> CameraInfo {
+        CameraInfo {
+            id: serial.to_lowercase(),
+            transport: crate::types::Transport::Media,
+            vendor: String::new(),
+            model: model.into(),
+            serial: serial.into(),
+            address: address.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn cameras_go_by_address_or_serial_and_twins_say_which() {
+        let rtsp = |serial: &str, host: &str| {
+            camera(
+                "RTSP input",
+                serial,
+                Some(&format!("rtsp://[redacted]@{host}:554/live")),
+            )
+        };
+        let snapshot = |info: CameraInfo| crate::session::CameraSnapshot {
+            info,
+            ..super::super::liveness::streaming_camera(0, 0, 0.0)
+        };
+        let streams = [
+            rtsp("3fa9c0d2e4b1a7f0", "cam1"),
+            rtsp("9c4f2e7a1b03d8e6", "cam2"),
+        ];
+        let sim = camera("Pattern camera", "SIM0", None);
+        assert_eq!(identity(&streams[0]), "cam1:554/live", "never the hash");
+        assert_eq!(identity(&sim), "S/N SIM0");
+        let cameras: Vec<_> = streams
+            .iter()
+            .chain([&sim])
+            .cloned()
+            .map(snapshot)
+            .collect();
+        assert_eq!(
+            twin_identity(&cameras, &streams[1]).as_deref(),
+            Some("cam2:554/live")
+        );
+        assert_eq!(twin_identity(&cameras, &sim), None, "its model is its own");
+        assert_eq!(twin_identity(&cameras[2..], &sim), None);
+    }
+
+    #[test]
+    fn outputs_are_recordings_by_the_forwarder_rule() {
+        let url = Output::of("rtsp://user:secret@host/live");
+        assert!(!url.recording());
+        assert_eq!(url.about(), "Forwarding to rtsp://[redacted]@host/live");
+        assert_eq!(Output::of("clip.mkv"), Output::Recording("clip.mkv".into()));
+        let file = Output::of("file:///tmp/clip.mkv");
+        assert!(file.recording(), "a file URL is a recording");
+        assert_eq!(file.title(), "Recording");
+        assert!(!Output::of("srt://10.0.0.5:9000").recording());
+    }
+
+    #[test]
+    fn counts_name_their_noun() {
+        assert_eq!(plural(1, "feature", "features"), "1 feature");
+        assert_eq!(plural(0, "feature", "features"), "0 features");
+        assert_eq!(plural(1204, "feature", "features"), "1,204 features");
+        assert_eq!(first_line("no answer\nwithin 5 s"), "no answer");
+        assert_eq!(first_line(""), "");
     }
 
     #[test]

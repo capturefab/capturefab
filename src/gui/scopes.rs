@@ -1,22 +1,34 @@
-//! Calibration scopes floating over the stage: an exposure histogram with
-//! clipping, and focus scores for a region the user drags over the image.
+//! Calibration scopes floating over the stage: a histogram of the picture's
+//! levels with clipping, and focus scores for a region the user drags over
+//! the image.
 use super::*;
 use crate::frame::{Exposure, Sharpness};
 use iced::advanced::text::Alignment as TextAlign;
 use iced::widget::canvas::{self, Frame, Geometry, LineCap, LineDash, Path, Stroke, gradient};
 use iced::widget::{Row, column};
-use iced::{Point, Rectangle, Renderer, alignment, mouse};
+use iced::{Point, Rectangle, Renderer, Vector, alignment, mouse};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 /// Width of a scope card.
 const WIDTH: f32 = 272.0;
+/// Width of a scope card on a small stage; see `COMPACT_STAGE`.
+const COMPACT_WIDTH: f32 = 236.0;
+/// How far the cards sit in from the stage's edges, and on a small stage.
+const PADDING: f32 = 12.0;
+const COMPACT_PADDING: f32 = 8.0;
+/// A stage narrower or shorter than this gets compact scope cards, so the
+/// picture stays in view.
+const COMPACT_STAGE: Size = Size::new(700.0, 560.0);
 /// Clipping above this share of samples is called out.
 const CLIP_WARN: f32 = 0.005;
 /// Focus scores kept for the trace.
 const HISTORY: usize = 120;
-/// At this share of the peak a region reads as in focus.
+/// At this share of the peak a region comes into focus...
 const IN_FOCUS: f32 = 0.97;
+/// ...and below this one it leaves it again, so scores jittering around
+/// the peak do not flicker between the two.
+const IN_FOCUS_EXIT: f32 = 0.90;
 /// Frames measured before the peak means anything.
 const SETTLE: usize = 10;
 /// Smallest region side, in sensor pixels.
@@ -84,6 +96,10 @@ pub struct FocusMeter {
     pub metric: Metric,
     history: VecDeque<Sharpness>,
     peak: Sharpness,
+    /// In focus, with hysteresis; see `IN_FOCUS_EXIT`.
+    sharp: bool,
+    /// How many times the region came back into focus after leaving it.
+    locks: u64,
 }
 
 impl FocusMeter {
@@ -94,6 +110,8 @@ impl FocusMeter {
             metric,
             history: VecDeque::with_capacity(HISTORY),
             peak: Sharpness::default(),
+            sharp: false,
+            locks: 0,
         }
     }
 
@@ -115,6 +133,7 @@ impl FocusMeter {
     }
 
     pub fn record(&mut self, score: Sharpness) {
+        let settled = self.history.len() >= SETTLE;
         if self.history.len() == HISTORY {
             self.history.pop_front();
         }
@@ -124,11 +143,20 @@ impl FocusMeter {
         peak.tenengrad = peak.tenengrad.max(score.tenengrad);
         peak.brenner = peak.brenner.max(score.brenner);
         peak.variance = peak.variance.max(score.variance);
+        let was = self.sharp;
+        let enough = if was { IN_FOCUS_EXIT } else { IN_FOCUS };
+        self.sharp =
+            self.history.len() >= SETTLE && self.share().is_some_and(|share| share >= enough);
+        // Settling at a fresh peak is no lock-on; coming back to it is.
+        if self.sharp && !was && settled {
+            self.locks += 1;
+        }
     }
 
     pub fn reset(&mut self) {
         self.history.clear();
         self.peak = Sharpness::default();
+        self.sharp = false;
     }
 
     pub fn latest(&self) -> Option<f32> {
@@ -146,10 +174,23 @@ impl FocusMeter {
             .map(|latest| if peak > 0.0 { latest / peak } else { 0.0 })
     }
 
+    /// Chart another measure. Its verdict is judged afresh on the scores
+    /// so far, and a switch is no lock-on.
+    pub fn set_metric(&mut self, metric: Metric) {
+        self.metric = metric;
+        self.sharp =
+            self.history.len() >= SETTLE && self.share().is_some_and(|share| share >= IN_FOCUS);
+    }
+
     /// Whether the latest score is near a peak established over several
     /// frames; a lone first frame is its own peak and says nothing.
     pub fn in_focus(&self) -> bool {
-        self.history.len() >= SETTLE && self.share().is_some_and(|share| share >= IN_FOCUS)
+        self.sharp
+    }
+
+    /// How many times the region came back into focus, for the lock-on.
+    pub fn locks(&self) -> u64 {
+        self.locks
     }
 
     fn trace(&self) -> Vec<f32> {
@@ -196,66 +237,85 @@ fn percent(share: f32) -> String {
     }
 }
 
+/// Whether a `stage` this size gets compact scope cards.
+fn compact(stage: Size) -> bool {
+    stage.width < COMPACT_STAGE.width || stage.height < COMPACT_STAGE.height
+}
+
 impl Workbench {
-    /// The scope cards stacked in the stage's top right corner.
-    pub(super) fn scopes(&self) -> Option<Element<'_, Message>> {
-        let exposure = self.exposure_slide.interpolate(0.0f32, 1.0, self.now);
-        let focus = self.focus_slide.interpolate(0.0f32, 1.0, self.now);
-        let mut cards = column![].spacing(8).width(WIDTH);
-        if exposure > 0.01
-            && let Some(card) = self.exposure_card(exposure)
-        {
-            cards = cards.push(card);
+    /// The width the scope cards take from the right edge of a `stage` this
+    /// size, their padding included; 0 while none shows.
+    pub(super) fn scope_room(&self, stage: Size) -> f32 {
+        let exposure = self.exposure_slide.get(self.now) > 0.01 && self.exposure.is_some();
+        if !exposure && self.focus_slide.get(self.now) <= 0.01 {
+            0.0
+        } else if compact(stage) {
+            COMPACT_WIDTH + COMPACT_PADDING
+        } else {
+            WIDTH + PADDING
         }
-        if focus > 0.01 {
-            cards = cards.push(self.focus_card(focus));
-        }
-        (exposure > 0.01 || focus > 0.01).then(|| {
-            // Opaque, so clicks on a card never reach the focus region under it.
-            container(opaque(cards))
-                .align_right(Fill)
-                .align_top(Fill)
-                .padding(12)
-                .into()
-        })
     }
 
-    fn exposure_card(&self, shown: f32) -> Option<Element<'_, Message>> {
+    /// The scope cards stacked in the stage's top right corner, compact on
+    /// a small stage.
+    pub(super) fn scopes(&self) -> Option<Element<'_, Message>> {
+        let exposure = self.exposure_slide.get(self.now);
+        let focus = self.focus_slide.get(self.now);
+        if exposure <= 0.01 && focus <= 0.01 {
+            return None;
+        }
+        Some(
+            responsive(move |stage| {
+                let compact = compact(stage);
+                let mut cards = column![]
+                    .spacing(if compact { 6 } else { 8 })
+                    .width(if compact { COMPACT_WIDTH } else { WIDTH });
+                if exposure > 0.01
+                    && let Some(card) = self.exposure_card(exposure, compact)
+                {
+                    cards = cards.push(card);
+                }
+                if focus > 0.01 {
+                    cards = cards.push(self.focus_card(focus, compact));
+                }
+                // Opaque, so clicks on a card never reach the focus region under it.
+                container(opaque(cards))
+                    .align_right(Fill)
+                    .align_top(Fill)
+                    .padding(if compact { COMPACT_PADDING } else { PADDING })
+                    .into()
+            })
+            .into(),
+        )
+    }
+
+    fn exposure_card(&self, shown: f32, compact: bool) -> Option<Element<'_, Message>> {
         let exposure = self.exposure.as_ref()?;
         let ink = |color: Color| fade(color, shown);
-        let warn = style::DARK.warn;
+        let stage = style::STAGE;
         let clip = |label: &'static str, share: f32| {
             let over = share > CLIP_WARN;
+            let color = ink(if over { stage.warn } else { stage.secondary });
             row![
-                dot(
-                    ink(if over {
-                        warn
-                    } else {
-                        style::ON_STAGE_SECONDARY
-                    }),
-                    5.0
-                ),
+                dot(color, 5.0),
                 text(format!("{label} {}", percent(share)))
                     .size(style::CAPTION)
                     .font(if over { style::MEDIUM } else { style::SANS })
-                    .color(ink(if over {
-                        warn
-                    } else {
-                        style::ON_STAGE_SECONDARY
-                    })),
+                    .color(color),
             ]
             .spacing(5)
             .align_y(Alignment::Center)
         };
+        // Not "Exposure": that is the control in the inspector.
         let header = row![
-            text("Exposure")
+            text("Histogram")
                 .size(style::SMALL)
                 .font(style::SEMIBOLD)
-                .color(ink(style::ON_STAGE)),
+                .color(ink(stage.text)),
             space::horizontal(),
             text(format!("Mean {:.0}%", exposure.mean * 100.0))
                 .size(style::CAPTION)
-                .color(ink(style::ON_STAGE_SECONDARY)),
+                .color(ink(stage.secondary)),
         ]
         .align_y(Alignment::Center);
         let footer = row![
@@ -273,23 +333,23 @@ impl Workbench {
         let scope = canvas::Canvas::new(ExposureScope {
             exposure: exposure.clone(),
             shown,
-            warn,
+            warn: stage.warn,
         })
         .width(Fill)
-        .height(72);
+        .height(if compact { 44 } else { 72 });
         Some(
-            container(column![header, scope, footer].spacing(8))
-                .padding(12)
+            container(column![header, scope, footer].spacing(if compact { 6 } else { 8 }))
+                .padding(if compact { 10 } else { 12 })
                 .width(Fill)
                 .style(style::overlay(shown))
                 .into(),
         )
     }
 
-    fn focus_card(&self, shown: f32) -> Element<'_, Message> {
+    fn focus_card(&self, shown: f32, compact: bool) -> Element<'_, Message> {
         let meter = &self.focus;
         let ink = |color: Color| fade(color, shown);
-        let accent = Palette::of(self.dark()).accent;
+        let stage = style::STAGE;
         let share = meter.share();
         let sharp = meter.in_focus();
         let metrics = Row::with_children(Metric::ALL.map(|metric| {
@@ -304,10 +364,11 @@ impl Workbench {
                             style::SANS
                         })
                         .width(Fill)
-                        .align_x(Alignment::Center),
+                        .align_x(Alignment::Center)
+                        .wrapping(text::Wrapping::None),
                 )
                 .width(Fill)
-                .padding([3, 2])
+                .padding([3, if compact { 0 } else { 2 }])
                 .style(style::glass_segment(selected, shown))
                 .on_press(Message::FocusMetric(metric)),
                 metric.hint(),
@@ -318,17 +379,17 @@ impl Workbench {
             text("Focus")
                 .size(style::SMALL)
                 .font(style::SEMIBOLD)
-                .color(ink(style::ON_STAGE)),
+                .color(ink(stage.text)),
             space::horizontal(),
             tip(
-                button(icon(Icon::Reset, 12.0, ink(style::ON_STAGE_SECONDARY)))
+                button(icon(Icon::Reset, 12.0, ink(stage.secondary)))
                     .padding(3)
                     .style(style::on_glass(false, shown))
                     .on_press(Message::ResetFocusPeak),
                 "Reset peak",
             ),
             tip(
-                button(icon(Icon::Close, 12.0, ink(style::ON_STAGE_SECONDARY)))
+                button(icon(Icon::Close, 12.0, ink(stage.secondary)))
                     .padding(3)
                     .style(style::on_glass(false, shown))
                     .on_press(Message::ToggleFocusRegion),
@@ -337,15 +398,38 @@ impl Workbench {
         ]
         .spacing(2)
         .align_y(Alignment::Center);
+        let lit = ink(if sharp { stage.live } else { stage.text });
+        let verdict: Element<'_, Message> = if sharp {
+            row![
+                icon(Icon::Check, 11.0, ink(stage.live)),
+                text("In focus")
+                    .size(style::CAPTION)
+                    .color(ink(stage.secondary)),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            text(if meter.history.len() >= SETTLE {
+                "Adjust to raise the score"
+            } else if share.is_some() {
+                "Measuring…"
+            } else {
+                "Waiting for a frame"
+            })
+            .size(style::CAPTION)
+            .color(ink(stage.secondary))
+            .into()
+        };
         let reading = row![
             text(meter.latest().map_or("–".into(), score))
-                .size(style::DISPLAY)
-                .font(style::SEMIBOLD)
-                .color(ink(if sharp {
-                    style::DARK.live
+                .size(if compact {
+                    style::TITLE
                 } else {
-                    style::ON_STAGE
-                })),
+                    style::DISPLAY
+                })
+                .font(style::SEMIBOLD)
+                .color(lit),
             space::horizontal(),
             column![
                 text(share.map_or(String::new(), |share| format!(
@@ -354,22 +438,8 @@ impl Workbench {
                 )))
                 .size(style::SMALL)
                 .font(style::MEDIUM)
-                .color(ink(if sharp {
-                    style::DARK.live
-                } else {
-                    style::ON_STAGE
-                })),
-                text(if sharp {
-                    "In focus"
-                } else if meter.history.len() >= SETTLE {
-                    "Adjust to raise the score"
-                } else if share.is_some() {
-                    "Measuring…"
-                } else {
-                    "Waiting for a frame"
-                })
-                .size(style::CAPTION)
-                .color(ink(style::ON_STAGE_SECONDARY)),
+                .color(lit),
+                verdict,
             ]
             .align_x(Alignment::End)
             .spacing(1),
@@ -378,21 +448,22 @@ impl Workbench {
         let trace = canvas::Canvas::new(Trace {
             values: meter.trace(),
             peak: meter.peak(),
-            color: if sharp { style::DARK.live } else { accent },
+            color: if sharp { stage.live } else { stage.accent },
             shown,
         })
         .width(Fill)
-        .height(40);
-        container(column![header, metrics, reading, trace].spacing(8))
-            .padding(12)
+        .height(if compact { 26 } else { 40 });
+        container(column![header, metrics, reading, trace].spacing(if compact { 6 } else { 8 }))
+            .padding(if compact { 10 } else { 12 })
             .width(Fill)
             .style(style::overlay(shown))
             .into()
     }
 
-    /// The draggable focus region over the image, when shown.
+    /// The draggable focus region over the image, when shown. It reads the
+    /// picture's own scale, so it stays on the picture while a zoom eases.
     pub(super) fn focus_overlay(&self, shown: &Shown) -> Option<Element<'_, Message>> {
-        let t = self.focus_slide.interpolate(0.0f32, 1.0, self.now);
+        let t = self.focus_slide.get(self.now);
         if t <= 0.01 {
             return None;
         }
@@ -400,19 +471,19 @@ impl Workbench {
             (Some(latest), Some(share)) => format!("{}  {:.0}%", score(latest), share * 100.0),
             _ => self.focus.metric.label().into(),
         };
-        let accent = Palette::of(self.dark()).accent;
         Some(
             canvas::Canvas::new(RegionEditor {
                 region: self.focus.region,
                 native: shown.size(),
-                scale: (!self.fit).then_some(self.zoom),
+                scale: self.view_scale(),
                 label,
                 color: if self.focus.in_focus() {
-                    style::DARK.live
+                    style::STAGE.live
                 } else {
-                    accent
+                    style::STAGE.accent
                 },
                 shown: t,
+                lock: self.stage_ui.lock.get(self.now),
             })
             .width(Fill)
             .height(Fill)
@@ -652,6 +723,9 @@ struct RegionEditor {
     label: String,
     color: Color,
     shown: f32,
+    /// The lock-on as it plays, from 1 to 0: the corners swell and a halo
+    /// glows, both peaking early on; under Reduce Motion only the halo.
+    lock: f32,
 }
 
 impl RegionEditor {
@@ -862,8 +936,22 @@ impl canvas::Program<Message> for RegionEditor {
                 .with_color(a(Color::WHITE, 0.6))
                 .with_width(1.0),
         );
+        // Locking on: 0 at either end, 1 at the height of it.
+        let bump = (self.lock.clamp(0.0, 1.0) * std::f32::consts::PI).sin();
+        if bump > 0.01 {
+            frame.stroke(
+                &Path::rectangle(
+                    r.position() - Vector::new(3.0, 3.0),
+                    Size::new(r.width + 6.0, r.height + 6.0),
+                ),
+                Stroke::default()
+                    .with_color(a(self.color, 0.5 * bump))
+                    .with_width(1.0),
+            );
+        }
+        let swell = if motion::reduce_motion() { 0.0 } else { bump };
         // Viewfinder corners.
-        let arm = 14.0f32.min(r.width / 3.0).min(r.height / 3.0);
+        let arm = (14.0 + 6.0 * swell).min(r.width / 3.0).min(r.height / 3.0);
         let corners = Path::new(|path| {
             for (x, y, sx, sy) in [
                 (r.x, r.y, 1.0, 1.0),
@@ -880,7 +968,7 @@ impl canvas::Program<Message> for RegionEditor {
             &corners,
             Stroke::default()
                 .with_color(a(self.color, 1.0))
-                .with_width(3.0)
+                .with_width(3.0 + swell)
                 .with_line_cap(LineCap::Round),
         );
         // The score on a tag above the region, or its size while dragging.
@@ -907,7 +995,7 @@ impl canvas::Program<Message> for RegionEditor {
         frame.fill_text(canvas::Text {
             content: label,
             position: Point::new(at.x + tag.width / 2.0, at.y + tag.height / 2.0),
-            color: a(style::ON_STAGE, 1.0),
+            color: a(style::STAGE.text, 1.0),
             size: size.into(),
             font: style::MONO,
             align_x: TextAlign::Center,
@@ -964,6 +1052,7 @@ mod tests {
             label: String::new(),
             color: Color::WHITE,
             shown: 1.0,
+            lock: 0.0,
         }
     }
 
@@ -1037,7 +1126,25 @@ mod tests {
             });
         }
         assert!(meter.in_focus());
+        assert_eq!(meter.locks(), 0, "settling at the peak is no lock-on");
+        // Hysteresis: in focus down to IN_FOCUS_EXIT, out until IN_FOCUS.
+        let record = |meter: &mut FocusMeter, tenengrad| {
+            meter.record(Sharpness {
+                tenengrad,
+                ..Sharpness::default()
+            });
+            meter.in_focus()
+        };
+        assert!(record(&mut meter, 38.0), "0.95 stays in focus");
+        assert!(!record(&mut meter, 35.0), "0.875 leaves it");
+        assert!(!record(&mut meter, 38.0), "0.95 is not back yet");
+        assert_eq!(meter.locks(), 0);
+        assert!(record(&mut meter, 39.5), "0.9875 is");
+        assert_eq!(meter.locks(), 1, "and locks on");
+        assert!(record(&mut meter, 39.6));
+        assert_eq!(meter.locks(), 1, "once");
         meter.reset();
+        assert!(!meter.in_focus());
         assert_eq!(meter.share(), None);
         let tiny = FocusMeter::new(false, [0.5, 0.5, 0.004, 0.007], Metric::default());
         assert_eq!(tiny.saved_region(), [0.5, 0.5, 0.004, 0.007]);
@@ -1047,5 +1154,46 @@ mod tests {
         assert_eq!(score(1203.4), "1203");
         assert_eq!(score(12_345.0), "12.3k");
         assert_eq!(percent(0.0004), "<0.1%");
+    }
+
+    #[test]
+    fn switching_the_metric_judges_focus_afresh_without_a_lock_on() {
+        let mut meter = FocusMeter::new(true, DEFAULT_REGION, Metric::Tenengrad);
+        let record = |meter: &mut FocusMeter, laplacian| {
+            meter.record(Sharpness {
+                tenengrad: 40.0,
+                laplacian,
+                ..Sharpness::default()
+            })
+        };
+        // Tenengrad steady at its peak; the Laplacian well below its own.
+        record(&mut meter, 100.0);
+        for _ in 0..SETTLE {
+            record(&mut meter, 70.0);
+        }
+        assert!(meter.in_focus());
+        assert_eq!(meter.locks(), 0);
+        meter.set_metric(Metric::Laplacian);
+        assert!(!meter.in_focus(), "70% of the Laplacian's peak");
+        meter.set_metric(Metric::Tenengrad);
+        assert!(meter.in_focus());
+        assert_eq!(meter.locks(), 0, "a switch is no lock-on");
+        record(&mut meter, 70.0);
+        assert_eq!(meter.locks(), 0, "nor is the next frame");
+    }
+
+    #[test]
+    fn scope_cards_take_their_corner_only_while_shown() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        let (large, small) = (Size::new(1200.0, 800.0), Size::new(600.0, 500.0));
+        bench.exposure_slide.set(0.0);
+        bench.focus_slide.set(0.0);
+        assert_eq!(bench.scope_room(large), 0.0);
+        // A histogram with nothing to chart yet shows no card.
+        bench.exposure_slide.set(1.0);
+        assert_eq!(bench.scope_room(large), 0.0);
+        bench.focus_slide.set(1.0);
+        assert_eq!(bench.scope_room(large), WIDTH + PADDING);
+        assert_eq!(bench.scope_room(small), COMPACT_WIDTH + COMPACT_PADDING);
     }
 }
