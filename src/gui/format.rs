@@ -127,11 +127,18 @@ pub(super) fn unit_label(unit: &str) -> &str {
 }
 
 /// A bound in a range caption: whole numbers from 10,000 up are grouped,
-/// "1,000,000"; the rest read as `number` has them. For captions only;
-/// fields keep plain digits, so they parse.
+/// "1,000,000"; type limits such as FLT_MAX and bounds too small for
+/// `number` read in exponent form, "3.4e38" and "1e-4", as fields show
+/// them; the rest read as `number` has them. For captions only; fields keep
+/// plain digits, so they parse.
 pub(super) fn range_number(value: f64) -> String {
-    if value.fract() == 0.0 && (10_000.0..1e15).contains(&value.abs()) {
-        let digits = grouped(value.abs() as u64);
+    // Folds -0 into 0.
+    let value = if value == 0.0 { 0.0 } else { value };
+    let magnitude = value.abs();
+    if magnitude >= 1e15 || (magnitude > 0.0 && magnitude < 0.001) {
+        format!("{value:.1e}").replace(".0e", "e")
+    } else if value.fract() == 0.0 && magnitude >= 10_000.0 {
+        let digits = grouped(magnitude as u64);
         if value < 0.0 {
             format!("-{digits}")
         } else {
@@ -642,7 +649,19 @@ mod tests {
         assert_eq!(range_text(&feature(None, Some(9999.0), None)), "max 9999");
         assert_eq!(range_text(&feature(None, None, Some("Hz"))), "Hz");
         assert_eq!(range_text(&feature(None, None, None)), "");
-        assert_eq!(range_number(1e20), number(1e20), "too large to group");
+        assert_eq!(range_number(1e20), "1e20", "too large to group");
+        assert_eq!(range_number(3.402_823_5e38), "3.4e38", "FLT_MAX");
+        assert_eq!(range_number(i64::MAX as f64), "9.2e18");
+        assert_eq!(range_number(-0.0), "0");
+        assert_eq!(range_number(0.0), "0");
+        assert_eq!(range_number(0.0001), "1e-4", "not rounded to 0");
+        assert_eq!(range_number(-0.0004), "-4e-4", "nor to -0");
+        assert_eq!(range_number(0.001), "0.001");
+        assert_eq!(range_number(999_999_999_999_999.0), "999,999,999,999,999");
+        assert_eq!(
+            range_text(&feature(Some(-0.0), Some(f64::from(f32::MAX)), None)),
+            "0 – 3.4e38"
+        );
         assert_eq!(unit_label("Hz"), "Hz");
     }
 
