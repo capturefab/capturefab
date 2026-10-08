@@ -1,6 +1,6 @@
 //! The multi-camera overview: every camera's image as large as the window
 //! allows, captioned over the picture, with actions on hover.
-use super::stage::{fps_spark, status_pill};
+use super::titlebar::{fps_spark, status_pill};
 use super::*;
 use iced::widget::column;
 

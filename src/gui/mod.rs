@@ -16,7 +16,9 @@ mod sidebar;
 mod sparkline;
 mod stage;
 mod style;
+mod titlebar;
 mod toolbar;
+mod welcome;
 mod widgets;
 
 use crate::{
