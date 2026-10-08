@@ -218,27 +218,29 @@ pub(super) fn status_pill<'a>(
         .into()
 }
 
-/// A camera's recent frame rate, with lost frames marked; a faint line
-/// until there are enough readings for a trend, so the slot never looks
-/// broken.
+/// A camera's recent frame rate, with lost frames marked. Until there are
+/// enough readings for a trend, the chart's dotted zero line while its
+/// rate is `coming` (see `Workbench::rate_coming`), then an empty slot of
+/// the same size, so nothing after it moves.
 pub(super) fn fps_spark<'a>(
     history: Option<&'a sparkline::History>,
+    coming: bool,
     color: Color,
     flag: Color,
     size: (f32, f32),
 ) -> Element<'a, Message> {
     if !history.is_some_and(sparkline::History::ready) {
         let (width, height) = size;
+        if !coming {
+            return space().width(width).height(height).into();
+        }
         return tip(
-            container(rule::horizontal(1).style(move |_| rule::Style {
-                color: fade(color, 0.3),
-                radius: iced::border::Radius::default(),
-                fill_mode: rule::FillMode::Full,
-                snap: true,
-            }))
+            iced::widget::canvas(sparkline::Baseline {
+                color: fade(color, 0.55),
+            })
             .width(width)
-            .center_y(height),
-            "Collecting frame rate…",
+            .height(height),
+            "No frame rate yet",
         );
     }
     spark(history, color, flag, size, |history| {
@@ -506,15 +508,14 @@ impl Workbench {
             let on = phase.state().color(p);
             // Drawn while it folds away too.
             let live = reveal > 0.001;
-            let history = snapshot
-                .active_camera
-                .as_ref()
-                .and_then(|id| self.throughput.get(id));
+            let id = snapshot.active_camera.as_deref().unwrap_or_default();
+            let history = self.throughput.get(id);
+            let coming = self.rate_coming(id);
             let pill = status_pill(
                 phase.label(),
                 live.then(|| format!("{:.1} fps", snapshot.fps)),
                 chart.then_some(FIGURE),
-                (live && chart).then(|| fps_spark(history, on, p.warn, (64.0, 14.0))),
+                (live && chart).then(|| fps_spark(history, coming, on, p.warn, (64.0, 14.0))),
                 style::mix(p.accent_text, on, tint),
                 reveal,
             );

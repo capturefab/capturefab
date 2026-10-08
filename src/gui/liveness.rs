@@ -12,6 +12,9 @@ const STALL_START: Duration = Duration::from_secs(5);
 /// The worker times its rate over windows of a second or more, so readings
 /// in a stream's first second can describe the stream before.
 const RATE_SETTLE: Duration = Duration::from_secs(1);
+/// How long a stream's chart says its frame rate is on its way; past it,
+/// with no rate yet, the chart's slot is plainly empty.
+const RATE_WAIT: Duration = STALL_START;
 /// How long after the last lost frame a loss still counts as recent.
 pub(super) const LOSS_RECENT: Duration = Duration::from_secs(10);
 
@@ -278,6 +281,16 @@ impl Workbench {
         (silent > live.limit()).then_some(silent)
     }
 
+    /// Whether streaming camera `id`'s frame rate may still be on its way:
+    /// its stream started within `RATE_WAIT` and its frames have not
+    /// stopped. Its chart says so until the rate shows.
+    pub(super) fn rate_coming(&self, id: &str) -> bool {
+        self.liveness
+            .get(id)
+            .is_some_and(|live| self.now.saturating_duration_since(live.started) < RATE_WAIT)
+            && self.stalled(id).is_none()
+    }
+
     /// The state of a connected camera, as its status dot shows it.
     pub(super) fn camera_state(&self, camera: &CameraSnapshot) -> CameraState {
         if !camera.streaming {
@@ -484,6 +497,18 @@ mod tests {
             assert_eq!(CameraState::Failed.color(p), p.danger);
         }
         assert!(CameraState::Offline.hollow() && !CameraState::Idle.hollow());
+    }
+
+    #[test]
+    fn a_frame_rate_is_only_coming_for_a_while() {
+        let mut bench = bench();
+        let start = bench.now;
+        assert!(!bench.rate_coming("sim:0"), "not streaming");
+        report(&mut bench, start, ms(0), streaming_camera(0, 0, 0.0));
+        assert!(bench.rate_coming("sim:0"));
+        // No frame ever comes: the chart stops promising one.
+        report(&mut bench, start, RATE_WAIT, streaming_camera(0, 0, 0.0));
+        assert!(!bench.rate_coming("sim:0"));
     }
 
     #[test]

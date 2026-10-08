@@ -277,6 +277,7 @@ impl Workbench {
             // In the dot's color: amber once frames stop, as on the pill.
             caption = caption.push(fps_spark(
                 self.throughput.get(&camera.info.id),
+                self.rate_coming(&camera.info.id),
                 state.color(stage),
                 stage.warn,
                 (52.0, 14.0),
