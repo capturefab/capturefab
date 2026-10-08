@@ -1172,7 +1172,9 @@ impl Workbench {
                     continue;
                 }
             };
-            let pending = self.pending.swap_remove(i);
+            // In the order sent, so a newer write of a feature settles
+            // after an older one (see `settles_row`).
+            let pending = self.pending.remove(i);
             self.settle(&pending, &result);
         }
     }
@@ -1320,12 +1322,13 @@ impl Workbench {
         self.update_frames();
         self.capture_to.tick(&mut self.output);
         self.record_to.tick(&mut self.forward_output);
+        let pages = self.pickers_to_top();
         self.tick_chrome();
         self.tick_side();
         self.tick_stage();
         self.tick_inspector();
         self.save_prefs();
-        self.screenshot_tick()
+        Task::batch([pages, self.screenshot_tick()])
     }
 
     /// Add the newest frame rate of each streaming camera to its history,
@@ -1619,9 +1622,10 @@ impl Workbench {
     fn copy_session_command(&mut self, announce: bool) -> Task<Message> {
         let command = self.session_command();
         if announce {
-            // With the camera list hidden, its session control cannot
+            // With the camera list closed, its session control cannot
             // confirm in place, so the toolbar must, even over an error.
-            if !self.sidebar_shown() {
+            // Image mode hides the toolbar too, so the error stays.
+            if !self.sidebar_open && !self.image_mode {
                 self.give_way();
             }
             self.set_notice("Session command copied", None, Level::Done);
@@ -2104,12 +2108,10 @@ impl Workbench {
         match action {
             Action::Overview if self.help_open => self.help_open = false,
             Action::Overview if self.capture_to.editing() => {
-                self.capture_to
-                    .update(destinations::Message::Cancel, &mut self.output);
+                return self.picker(false, destinations::Message::Cancel);
             }
             Action::Overview if self.record_to.editing() => {
-                self.record_to
-                    .update(destinations::Message::Cancel, &mut self.forward_output);
+                return self.picker(true, destinations::Message::Cancel);
             }
             Action::Overview if self.capture_to.manager_open => {
                 self.capture_to

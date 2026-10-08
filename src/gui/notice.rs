@@ -745,8 +745,16 @@ mod tests {
         bench.set_notice("Capture failed: busy", None, Level::Error);
         let _ = bench.copy_session_command(true);
         assert_eq!(text(&bench), Some("Capture failed: busy"));
-        // With the list hidden, only the toolbar can confirm.
+        // Image mode hides the toolbar as well: no one would see the copy
+        // replace the error.
+        bench.image_mode = true;
+        let _ = bench.copy_session_command(true);
+        assert_eq!(text(&bench), Some("Capture failed: busy"));
         bench.sidebar_open = false;
+        let _ = bench.copy_session_command(true);
+        assert_eq!(text(&bench), Some("Capture failed: busy"), "still hidden");
+        // With the list closed, only the toolbar can confirm.
+        bench.image_mode = false;
         let _ = bench.copy_session_command(true);
         assert_eq!(text(&bench), Some("Session command copied"));
     }

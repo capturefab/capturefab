@@ -302,13 +302,13 @@ impl Phase {
         }
     }
 
-    /// The camera state whose dot color the pill takes once live, so it
-    /// agrees with the camera's dot elsewhere.
+    /// The camera state whose dot color is the live end of the pill's tint,
+    /// so it agrees with the camera's dot elsewhere. At rest the other
+    /// phases show none of it, and a stop fades from it rather than cutting.
     fn state(self) -> CameraState {
         match self {
-            Phase::Streaming => CameraState::Live,
             Phase::Waiting(_) => CameraState::Stalled,
-            Phase::Ready | Phase::Starting | Phase::Stopping => CameraState::Idle,
+            _ => CameraState::Live,
         }
     }
 
@@ -426,10 +426,26 @@ fn tag_style(color: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
     }
 }
 
-/// Rough width of `text` set at `size`, for deciding what fits: the system
-/// font averages a little under half an em a character.
+/// Rough width of `text` set at `size`, for deciding what fits. It errs
+/// wide, by classes of characters as the system font's semibold sets them,
+/// so a title the bar makes room for is never cut short: model names and
+/// serials run to capitals and digits, which take well over half an em.
 fn rough(text: &str, size: f32) -> f32 {
-    text.chars().count() as f32 * size * 0.46
+    let ems: f32 = text
+        .chars()
+        .map(|c| match c {
+            'i' | 'j' | 'l' | 'I' | ' ' | '.' | ',' | ':' | ';' | '\'' | '!' | '|' => 0.25,
+            'f' | 'r' | 't' | '/' | '(' | ')' => 0.36,
+            '-' => 0.46,
+            'm' | 'w' | 'M' => 0.86,
+            'W' => 0.96,
+            'a'..='z' => 0.55,
+            '0'..='9' => 0.64,
+            'A'..='Z' => 0.7,
+            _ => 1.0,
+        })
+        .sum();
+    ems * size
 }
 
 /// What the single-camera title bar keeps; see `Workbench::bar_fit`.
@@ -1072,6 +1088,8 @@ mod tests {
         assert_eq!(bench.single_phase(), Some(Phase::Stopping));
         assert_eq!(Phase::Stopping.pending(), Some(true));
         assert!(!Phase::Stopping.live(), "folds as soon as Stop is pressed");
+        // But fades from live, not from idle.
+        assert_eq!(Phase::Stopping.state(), CameraState::Live);
         // Start all and Stop all reach the camera shown too.
         bench.pending.clear();
         bench.snapshot.streaming = false;
@@ -1202,7 +1220,7 @@ mod tests {
         let two = bench.bar_fit(title, Some("Streaming"), &both);
         assert_eq!(keeps(two), (false, true, true, true), "the labels go first");
         assert!(two.title >= whole);
-        bench.width = 1280.0;
+        bench.width = 1320.0;
         let fit = bench.bar_fit(title, Some("Waiting for frames"), &both);
         assert_eq!(
             keeps(fit),
@@ -1214,18 +1232,32 @@ mod tests {
         let fit = bench.bar_fit(title, Some("Waiting for frames"), &both);
         assert_eq!(keeps(fit), (false, false, false, false));
         assert!(fit.title > 0.0, "the word and glyphs fit");
-        // Whatever the width, things go in order, and the title gives way last.
-        for width in (900..=1800).step_by(10) {
-            bench.width = width as f32;
-            for label in ["Ready", "Streaming", "Waiting for frames"] {
-                let fit = bench.bar_fit(title, Some(label), &both);
-                let (labels, chart, figure, serial) = keeps(fit);
-                assert!(!labels || chart, "{width}: {fit:?}");
-                assert!(!chart || figure, "{width}: {fit:?}");
-                assert!(!figure || serial, "{width}: {fit:?}");
-                assert!(fit.title >= whole || !serial, "{width}: {fit:?}");
+        // Whatever the width, things go in order, and the title gives way
+        // last, model names of capitals and digits included.
+        for title in [title, "MV-CA050-10GC", "mvBlueCOUGAR-X104dG"] {
+            let whole = rough(title, style::TITLE);
+            for width in (900..=1800).step_by(10) {
+                bench.width = width as f32;
+                for label in ["Ready", "Streaming", "Waiting for frames"] {
+                    let fit = bench.bar_fit(title, Some(label), &both);
+                    let (labels, chart, figure, serial) = keeps(fit);
+                    assert!(!labels || chart, "{width}: {fit:?}");
+                    assert!(!chart || figure, "{width}: {fit:?}");
+                    assert!(!figure || serial, "{width}: {fit:?}");
+                    assert!(fit.title >= whole || !serial, "{width}: {fit:?}");
+                }
             }
         }
+        // Errs wide of the names as set in the title's semibold.
+        for (name, set) in [
+            ("Pattern camera", 100.7),
+            ("MV-CA050-10GC", 121.9),
+            ("mvBlueCOUGAR-X104dG", 174.5),
+            ("BFS-PGE-31S4C-C", 130.6),
+        ] {
+            assert!(rough(name, style::TITLE) >= set, "{name}");
+        }
+        assert!(rough("S/N 0123ABCD4567", style::BODY) >= 116.1);
         // Alone, with the sidebar closed, everything fits.
         bench.snapshot.cameras.truncate(1);
         bench.sidebar_slide.set(0.0);

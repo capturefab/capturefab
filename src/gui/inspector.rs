@@ -35,11 +35,12 @@ pub(super) struct InspectorState {
     /// The camera whose last capture failed, and the whole error, shown
     /// under the capture button until that camera's next capture works.
     capture_failed: Option<(Option<String>, String)>,
-    /// The stream-lockable features the shown camera could change when it
-    /// was last seen idle, and that camera. The stream locks only these, so
-    /// a source that never lets them change offers no Stop to unlock them.
-    lockable: HashSet<String>,
-    lockable_for: Option<String>,
+    /// The stream-lockable features each camera could change when seen
+    /// idle, by camera ID. The stream locks only these, so a source that
+    /// never lets them change offers no Stop to unlock them. Only ever
+    /// added to while the camera is connected: a feature list read while it
+    /// streamed can outlast the stream.
+    lockable: HashMap<String, HashSet<String>>,
     /// The tab thumb's place: a tab's index.
     tab_thumb: Motion,
     /// The Manual/Auto thumb's place: 1 for auto. It moves as soon as a
@@ -72,8 +73,7 @@ impl Default for InspectorState {
             write_errors: HashMap::new(),
             accepted: Flashes::new(ACCEPTED),
             capture_failed: None,
-            lockable: HashSet::new(),
-            lockable_for: None,
+            lockable: HashMap::new(),
             tab_thumb: Motion::new(0.0, THUMB, THUMB, Kind::Move),
             mode_thumb: Motion::new(0.0, THUMB, THUMB, Kind::Move),
             placed: false,
@@ -265,17 +265,19 @@ impl Workbench {
                     && (camera.stale || camera.forwarding.as_deref() == Some(output.as_str()))
             })
         });
-        let inspect = &mut self.inspect;
-        if inspect.lockable_for != self.snapshot.active_camera {
-            inspect.lockable.clear();
-            inspect.lockable_for = self.snapshot.active_camera.clone();
-        }
-        if !self.snapshot.streaming {
-            for feature in features.iter().filter(|f| stream_locked(&f.name)) {
-                if !feature.writable {
-                    inspect.lockable.remove(&feature.name);
-                } else if !inspect.lockable.contains(&feature.name) {
-                    inspect.lockable.insert(feature.name.clone());
+        let active = self.snapshot.active_camera.as_ref();
+        let lockable = &mut self.inspect.lockable;
+        lockable.retain(|id, _| {
+            Some(id) == active || cameras.iter().any(|camera| &camera.info.id == id)
+        });
+        if let Some(id) = active.filter(|_| !self.snapshot.streaming) {
+            let known = lockable.entry(id.clone()).or_default();
+            for feature in features
+                .iter()
+                .filter(|f| f.writable && stream_locked(&f.name))
+            {
+                if !known.contains(&feature.name) {
+                    known.insert(feature.name.clone());
                 }
             }
         }
@@ -326,7 +328,13 @@ impl Workbench {
     fn stream_locks(&self, feature: &FeatureInfo) -> bool {
         self.snapshot.streaming
             && stream_locked(&feature.name)
-            && (feature.writable || self.inspect.lockable.contains(&feature.name))
+            && (feature.writable
+                || self
+                    .snapshot
+                    .active_camera
+                    .as_ref()
+                    .and_then(|id| self.inspect.lockable.get(id))
+                    .is_some_and(|known| known.contains(&feature.name)))
     }
 
     /// A command finished, after the shared bookkeeping (`finished`,
@@ -1215,22 +1223,20 @@ impl Workbench {
             .spacing(10)
             .align_y(Alignment::Center);
         // A refusal takes the notes' place; Apply stays beside it.
-        let caption: Option<Element<'_, Message>> = if refused.is_some()
-            || !notes.is_empty()
-            || trailing.is_some()
-        {
-            let line: Element<'_, Message> = match refused {
-                Some(error) => field_error(error.lines().next().unwrap_or_default().to_owned(), p),
-                None => Row::with_children(notes).spacing(8).wrap().into(),
+        let caption: Option<Element<'_, Message>> =
+            if refused.is_some() || !notes.is_empty() || trailing.is_some() {
+                let line: Element<'_, Message> = match refused {
+                    Some(error) => field_error(capitalize(first_line(error)), p),
+                    None => Row::with_children(notes).spacing(8).wrap().into(),
+                };
+                let mut caption = row![container(line).width(Fill)].align_y(Alignment::Start);
+                if let Some(trailing) = trailing {
+                    caption = caption.push(trailing);
+                }
+                Some(caption.into())
+            } else {
+                None
             };
-            let mut caption = row![container(line).width(Fill)].align_y(Alignment::Start);
-            if let Some(trailing) = trailing {
-                caption = caption.push(trailing);
-            }
-            Some(caption.into())
-        } else {
-            None
-        };
         match caption {
             Some(caption) => column![head, caption].spacing(2).into(),
             None => head.into(),
@@ -1416,7 +1422,7 @@ impl Workbench {
             .as_ref()
             .filter(|(camera, _)| here(camera))
         {
-            let first = error.lines().next().unwrap_or_default().to_owned();
+            let first = capitalize(first_line(error));
             let line = if capturing {
                 quiet_error(first, p)
             } else {
@@ -1984,6 +1990,44 @@ mod tests {
     }
 
     #[test]
+    fn replies_settle_in_the_order_sent() {
+        // A capture keeps the worker busy while two writes queue behind it,
+        // and all three answer in one poll. Either way round, only the
+        // newer write has the last word.
+        for newer_taken in [true, false] {
+            let mut bench = bench();
+            let capture = asked_of(&mut bench, "sim:0", Job::Capture, None);
+            bench.edits.insert("ExposureTime".into(), "5".into());
+            let older = sent(&mut bench, "ExposureTime");
+            bench.now += Duration::from_millis(1);
+            bench.edits.insert("ExposureTime".into(), "15000".into());
+            let newer = sent(&mut bench, "ExposureTime");
+            let (taken, refused) = if newer_taken {
+                (newer, older)
+            } else {
+                (older, newer)
+            };
+            capture
+                .send(Ok(json!({"files": ["capture-0001.png"], "count": 1})))
+                .unwrap();
+            refused.send(Err(anyhow::anyhow!("out of range"))).unwrap();
+            taken.send(Ok(json!({"value": 15000.0}))).unwrap();
+            bench.poll();
+            assert!(bench.pending.is_empty());
+            let error = bench.inspect.write_errors.get("ExposureTime");
+            let glow = bench.inspect.accepted.level("ExposureTime", bench.now);
+            if newer_taken {
+                assert_eq!(error, None);
+                assert_eq!(draft(&bench), Some("15000"));
+                assert_eq!(glow, 1.0);
+            } else {
+                assert_eq!(error.map(String::as_str), Some("out of range"));
+                assert_eq!(glow, 0.0, "the older one taken does not glow");
+            }
+        }
+    }
+
+    #[test]
     fn writes_settle_only_the_rows_of_their_own_camera() {
         let mut bench = bench();
         bench.edits.insert("ExposureTime".into(), "5".into());
@@ -2110,7 +2154,11 @@ mod tests {
     #[test]
     fn the_stream_locks_only_what_it_keeps_from_changing() {
         let mut bench = bench();
+        let mut other = liveness::streaming_camera(10, 0, 30.0);
+        other.info.id = "sim:1".into();
+        bench.snapshot.cameras = vec![liveness::streaming_camera(10, 0, 30.0), other];
         // Width can change while idle; Height, as on an RTSP source, never.
+        bench.inspect.lockable.clear();
         bench.snapshot.features[4].writable = false;
         bench.tick_inspector();
         bench.snapshot.streaming = true;
@@ -2121,12 +2169,29 @@ mod tests {
         // Read again mid-stream, the camera reports Width locked.
         bench.snapshot.features[1].writable = false;
         bench.tick_inspector();
-        assert!(bench.stream_locks(&bench.snapshot.features[1].clone()));
+        let locked = bench.snapshot.features[1].clone();
+        assert!(bench.stream_locks(&locked));
         assert!(!bench.stream_locks(&bench.snapshot.features[3].clone()));
+        // Stopped, the list still holds that mid-stream read; started
+        // again, Width is still the stream's to unlock.
+        bench.snapshot.streaming = false;
+        bench.tick_inspector();
+        bench.snapshot.streaming = true;
+        bench.tick_inspector();
+        assert!(bench.stream_locks(&locked));
         // Another camera, never seen idle, goes by what it reports.
         bench.snapshot.active_camera = Some("sim:1".into());
         bench.tick_inspector();
-        assert!(!bench.stream_locks(&bench.snapshot.features[1].clone()));
+        assert!(!bench.stream_locks(&locked));
+        // Back to the first while it streams: what it showed idle holds.
+        bench.snapshot.active_camera = Some("sim:0".into());
+        bench.tick_inspector();
+        assert!(bench.stream_locks(&locked));
+        // A camera that leaves is forgotten.
+        bench.snapshot.active_camera = Some("sim:1".into());
+        bench.snapshot.cameras.remove(0);
+        bench.tick_inspector();
+        assert!(!bench.inspect.lockable.contains_key("sim:0"));
     }
 
     #[test]

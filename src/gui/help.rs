@@ -8,6 +8,16 @@ const SHEET_MARGIN: f32 = 40.0;
 /// The least height a sheet gets, however short the window.
 const SHEET_MIN: f32 = 320.0;
 
+/// Snap the sheet's body to its top when `picker` changed pages: to iced
+/// the list and an editor are one sheet, which would keep the scroll.
+fn page_top(picker: &mut Picker) -> Task<Message> {
+    if picker.take_to_top() {
+        operation::snap_to(SHEET_BODY, operation::RelativeOffset::START)
+    } else {
+        Task::none()
+    }
+}
+
 /// State for the sheets: the quick guide and the destination sheets (whose
 /// pickers keep their own, see `Picker`).
 pub(super) struct SheetState {
@@ -116,10 +126,20 @@ impl Workbench {
             (&mut self.capture_to, &mut self.output)
         };
         picker.update(message, output);
+        let top = page_top(picker);
         match picker.take_focus() {
-            Some(id) => Task::batch([operation::focus(id), operation::select_all(id)]),
-            None => Task::none(),
+            Some(id) => Task::batch([top, operation::focus(id), operation::select_all(id)]),
+            None => top,
         }
+    }
+
+    /// Bring a destination sheet whose page changed on its own, as a
+    /// finished save does, to its top; from `tick()`.
+    pub(super) fn pickers_to_top(&mut self) -> Task<Message> {
+        Task::batch([
+            page_top(&mut self.capture_to),
+            page_top(&mut self.record_to),
+        ])
     }
 
     /// The tallest a sheet may be: the window less a margin.

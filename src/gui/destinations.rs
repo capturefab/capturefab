@@ -14,9 +14,7 @@ use super::style::{self, Palette};
 use super::widgets::{SheetFrame, disclosure, fade, field_error, one_line, sheet_frame};
 use crate::destination::{self, Bucket, Credentials, Destination, Target};
 use crate::volumes::{self, Volume};
-use iced::widget::{
-    button, column, container, keyed_column, pick_list, row, space, text, text_input,
-};
+use iced::widget::{button, column, container, pick_list, row, space, text, text_input};
 use iced::{Alignment, Element, Fill, Length, Theme};
 use serde_json::Value;
 use std::{
@@ -377,6 +375,13 @@ impl Editor {
             .then(|| (self.access_key_id.trim().to_owned(), self.secret.clone()))
     }
 
+    /// Whether a running check is storing the typed secret: it stays typed
+    /// until the check answers, and any edit drops the check. A save waits
+    /// for it, so the keychain is never written twice at once.
+    fn storing(&self) -> bool {
+        self.testing.is_some() && self.secret_to_store().is_some()
+    }
+
     /// The destination as typed, with a valid stand-in for each of
     /// `stand_ins`, so validation reaches the fields after them.
     fn build(&self, stand_ins: &[Field]) -> Destination {
@@ -720,6 +725,8 @@ pub struct Picker {
     advanced_turn: Motion,
     /// The sheet's body has scrolled under its header.
     scrolled: bool,
+    /// The page changed, so its body is due to snap to its top.
+    to_top: bool,
     /// The field to focus once an editor that just opened shows.
     focus: Option<&'static str>,
     /// Remember the choice for the next launch (the capture panel does).
@@ -765,6 +772,7 @@ impl Picker {
             saved_glow: Flashes::new(SAVED_GLOW),
             advanced_turn: Motion::new(0.0, motion::RING, motion::RING_OUT, Kind::Move),
             scrolled: false,
+            to_top: false,
             focus: None,
             remember,
             recording,
@@ -889,6 +897,12 @@ impl Picker {
         self.focus.take()
     }
 
+    /// Whether the page changed since last asked, so the sheet's body
+    /// should snap to its top.
+    pub fn take_to_top(&mut self) -> bool {
+        std::mem::take(&mut self.to_top)
+    }
+
     /// Show `editor` in the manager, scrolled to its top, its first field
     /// to be focused.
     fn open_editor(&mut self, editor: Editor) {
@@ -899,6 +913,7 @@ impl Picker {
         self.editor = Some(editor);
         self.removing = None;
         self.scrolled = false;
+        self.to_top = true;
     }
 
     /// Back to the list, scrolled to its top.
@@ -907,6 +922,7 @@ impl Picker {
         self.advanced_turn.set(0.0);
         self.removing = None;
         self.scrolled = false;
+        self.to_top = true;
     }
 
     /// Where a capture with this output goes, for compact displays.
@@ -1027,7 +1043,7 @@ impl Picker {
                 let Some(editor) = &mut self.editor else {
                     return;
                 };
-                if editor.saving.is_some() {
+                if editor.saving.is_some() || editor.storing() {
                     return;
                 }
                 let destination = match editor.destination() {
@@ -1534,9 +1550,10 @@ impl Picker {
         .size(SHEET_WIDTH, max_height)
         .scrolled(self.scrolled)
         .on_scroll(Message::Scrolled);
-        // Keyed by page: to iced each page is a new sheet, which opens at its
-        // top with nothing focused from the page before.
-        keyed_column([(self.editor.is_some(), page.into())]).into()
+        // To iced both pages are one sheet, whose body would keep its
+        // scroll; the workbench snaps it to the top as the page changes
+        // (see `take_to_top`).
+        page.into()
     }
 
     fn list(&self, p: &'static Palette, now: Instant) -> SheetFrame<'_, Message> {
@@ -1917,6 +1934,7 @@ impl Picker {
         }
         let testing = editor.testing.is_some();
         let saving = editor.saving.is_some();
+        let storing = editor.storing();
         let outcome = if saving {
             status("Saving…".into(), Status::Working, spin, p)
         } else if testing {
@@ -1939,7 +1957,7 @@ impl Picker {
         let save = button(text("Save").size(style::BODY))
             .padding([7, 18])
             .style(style::primary)
-            .on_press_maybe((!saving).then_some(Message::Save));
+            .on_press_maybe((!saving && !storing).then_some(Message::Save));
         let (first, second) = if cfg!(target_os = "windows") {
             (save, cancel)
         } else {
@@ -2261,6 +2279,9 @@ mod tests {
         picker.update(Message::AddBucket, &mut output);
         assert_eq!(picker.take_focus(), Some(BUCKET_FIELD));
         assert_eq!(picker.take_focus(), None, "once");
+        // The editor opens at its top, wherever the list was scrolled.
+        assert!(picker.take_to_top());
+        assert!(!picker.take_to_top(), "once");
         // Saving with nothing typed blames the bucket, not the name that
         // follows it.
         picker.update(Message::Save, &mut output);
@@ -2274,9 +2295,12 @@ mod tests {
         picker.update(Message::Name("archive".into()), &mut output);
         picker.update(Message::Bucket("line-2".into()), &mut output);
         assert_eq!(picker.editor.as_ref().unwrap().name, "archive");
-        // Back to the list, and a folder's editor focuses its name.
+        // Back to the list, at its top, and a folder's editor focuses its
+        // name.
+        picker.update(Message::Scrolled(true), &mut output);
         picker.update(Message::Cancel, &mut output);
         assert!(picker.editor.is_none());
+        assert!(!picker.scrolled && picker.take_to_top());
         picker.scene("folder-editor");
         assert_eq!(picker.take_focus(), Some(NAME_FIELD));
         assert!(picker.manager_open);
@@ -2396,6 +2420,26 @@ mod tests {
             Some(("The keychain is locked".into(), true))
         );
         assert_eq!(editor.secret, "secret", "typed once");
+    }
+
+    #[test]
+    fn a_save_waits_for_a_check_storing_the_secret() {
+        let mut picker = Picker::new(false, false);
+        let mut output = String::new();
+        let mut editor = bucket(|e| e.secret = "secret".into());
+        let (sender, receiver) = channel();
+        editor.testing = Some(receiver);
+        picker.editor = Some(editor);
+        picker.update(Message::Save, &mut output);
+        let editor = picker.editor.as_mut().unwrap();
+        assert!(editor.saving.is_none(), "the check stores it");
+        sender.send((true, Ok("Connected".into()))).unwrap();
+        editor.poll_test();
+        assert!(!editor.storing() && editor.secret_to_store().is_none());
+        // Without a typed secret, a check holds nothing up.
+        let (_sender, receiver) = channel();
+        editor.testing = Some(receiver);
+        assert!(!editor.storing());
     }
 
     #[test]
