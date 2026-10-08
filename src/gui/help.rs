@@ -19,6 +19,8 @@ pub(super) struct SheetState {
     pub(super) scrolled: bool,
     /// The guide's "Connecting cameras" notes are open.
     pub(super) more: bool,
+    /// The notes' chevron: 0 closed, 1 open.
+    pub(super) more_turn: Motion,
 }
 
 impl Default for SheetState {
@@ -27,13 +29,14 @@ impl Default for SheetState {
             shown: Motion::new(0.0, motion::SHEET, motion::SHEET_OUT, Kind::Fade),
             scrolled: false,
             more: false,
+            more_turn: Motion::new(0.0, motion::RING, motion::RING_OUT, Kind::Move),
         }
     }
 }
 
 impl SheetState {
     super::motion::registry! {
-        motions: [shown],
+        motions: [shown, more_turn],
         flashes: [],
     }
 }
@@ -44,7 +47,11 @@ impl Workbench {
     /// `sync_animations`. The scrim fades in with a sheet and out after it;
     /// a sheet opening while the scrim still fades out takes over from there.
     pub(super) fn sync_sheets(&mut self) {
-        self.sheets.shown.show(self.sheet_open(), self.now);
+        let now = self.now;
+        self.sheets.shown.show(self.sheet_open(), now);
+        self.sheets.more_turn.show(self.sheets.more, now);
+        self.capture_to.sync(now);
+        self.record_to.sync(now);
     }
 
     /// Take a screenshot scene word for the sheets: `late` is false
@@ -61,6 +68,7 @@ impl Workbench {
             "help-more" => {
                 self.help_open = true;
                 self.sheets.more = true;
+                self.sheets.more_turn.set(1.0);
                 true
             }
             word => self.capture_to.scene(word),
@@ -79,6 +87,8 @@ impl Workbench {
         if open {
             self.sheets.scrolled = false;
             self.sheets.more = false;
+            // Closed already: no turn while the sheet fades in.
+            self.sheets.more_turn.set(0.0);
         }
     }
 
@@ -200,7 +210,7 @@ impl Workbench {
             disclosure(
                 "Connecting cameras",
                 None,
-                if more { 1.0 } else { 0.0 },
+                self.sheets.more_turn.get(self.now),
                 Message::HelpMore(!more),
                 p,
             ),
@@ -262,6 +272,27 @@ mod tests {
         let _ = bench.handle_message(Message::Help(false));
         let _ = bench.handle_message(Message::Help(true));
         assert!(!bench.sheets.scrolled && !bench.sheets.more);
+    }
+
+    #[test]
+    fn the_notes_chevron_turns_and_settles() {
+        let mut bench = bench();
+        let _ = bench.handle_message(Message::Help(true));
+        bench.sync_animations();
+        let start = bench.now;
+        let _ = bench.handle_message(Message::HelpMore(true));
+        bench.sync_animations();
+        let mid = bench.sheets.more_turn.get(start + motion::RING / 2);
+        assert!(mid > 0.0 && mid < 1.0, "turns: {mid}");
+        bench.now = start + motion::RING;
+        assert_eq!(bench.sheets.more_turn.get(bench.now), 1.0);
+        assert!(!bench.sheets.more_turn.animating(bench.now));
+        // Reopened, the guide shows its notes closed without turning them.
+        let _ = bench.handle_message(Message::Help(false));
+        let _ = bench.handle_message(Message::Help(true));
+        bench.sync_animations();
+        assert_eq!(bench.sheets.more_turn.get(bench.now), 0.0);
+        assert!(!bench.sheets.more_turn.animating(bench.now));
     }
 
     #[test]

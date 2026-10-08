@@ -7,7 +7,7 @@
 //! store never stalls the interface.
 use super::format::{capitalize, grouped, plural};
 use super::icon::{self, Icon, icon};
-use super::motion::Flashes;
+use super::motion::{self, Flashes, Kind, Motion};
 use super::notice::Level;
 use super::sparkline::History;
 use super::style::{self, Palette};
@@ -716,6 +716,8 @@ pub struct Picker {
     notice: Option<(String, bool)>,
     /// Destinations just saved, whose rows glow for a moment.
     saved_glow: Flashes<String>,
+    /// The editor's Advanced chevron: 0 closed, 1 open.
+    advanced_turn: Motion,
     /// The sheet's body has scrolled under its header.
     scrolled: bool,
     /// The field to focus once an editor that just opened shows.
@@ -730,7 +732,7 @@ impl Picker {
     // The picker's own motions and flashes, which the workbench's registry
     // includes.
     super::motion::registry! {
-        motions: [],
+        motions: [advanced_turn],
         flashes: [saved_glow],
     }
 }
@@ -761,6 +763,7 @@ impl Picker {
             manager_open: false,
             notice: None,
             saved_glow: Flashes::new(SAVED_GLOW),
+            advanced_turn: Motion::new(0.0, motion::RING, motion::RING_OUT, Kind::Move),
             scrolled: false,
             focus: None,
             remember,
@@ -874,6 +877,13 @@ impl Picker {
         })
     }
 
+    /// Point the editor's Advanced chevron at the group's state; from
+    /// `Workbench::sync_sheets`.
+    pub fn sync(&mut self, now: Instant) {
+        let open = self.editor.as_ref().is_some_and(|e| e.advanced);
+        self.advanced_turn.show(open, now);
+    }
+
     /// The id of the field to focus, once, after an editor opened.
     pub fn take_focus(&mut self) -> Option<&'static str> {
         self.focus.take()
@@ -883,6 +893,9 @@ impl Picker {
     /// to be focused.
     fn open_editor(&mut self, editor: Editor) {
         self.focus = Some(if editor.s3 { BUCKET_FIELD } else { NAME_FIELD });
+        // A bucket with custom settings opens with Advanced open, unturned.
+        self.advanced_turn
+            .set(if editor.advanced { 1.0 } else { 0.0 });
         self.editor = Some(editor);
         self.removing = None;
         self.scrolled = false;
@@ -891,6 +904,7 @@ impl Picker {
     /// Back to the list, scrolled to its top.
     fn close_editor(&mut self) {
         self.editor = None;
+        self.advanced_turn.set(0.0);
         self.removing = None;
         self.scrolled = false;
     }
@@ -1504,7 +1518,7 @@ impl Picker {
     /// The destination manager, shown as a sheet over the workbench: the
     /// list, or an editor in its place. `max_height` follows the window,
     /// `spin` steps a running check's spinner and `now` fades the glow on a
-    /// row just saved.
+    /// row just saved and turns the Advanced chevron.
     pub fn manager(
         &self,
         dark: bool,
@@ -1515,7 +1529,7 @@ impl Picker {
         let p = Palette::of(dark);
         let page = match &self.editor {
             None => self.list(p, now),
-            Some(editor) => self.form(editor, p, spin),
+            Some(editor) => self.form(editor, p, spin, now),
         }
         .size(SHEET_WIDTH, max_height)
         .scrolled(self.scrolled)
@@ -1661,6 +1675,7 @@ impl Picker {
         editor: &'a Editor,
         p: &'static Palette,
         spin: usize,
+        now: Instant,
     ) -> SheetFrame<'a, Message> {
         let field = |label: &'a str, control: Element<'a, Message>| -> Element<'a, Message> {
             row![
@@ -1843,7 +1858,7 @@ impl Picker {
                 .push(disclosure(
                     "Advanced",
                     (!open).then(|| advanced_summary(editor)),
-                    if open { 1.0 } else { 0.0 },
+                    self.advanced_turn.get(now),
                     Message::Advanced(!open),
                     p,
                 ));
@@ -2412,6 +2427,34 @@ mod tests {
         editor.poll_key(start + KEY_PAUSE + ms(60), |_| unreachable!());
         assert!(editor.stored_secret);
         assert!(editor.key_probe.is_none() && editor.key_changed.is_none());
+    }
+
+    #[test]
+    fn the_advanced_chevron_turns_and_settles() {
+        let mut picker = Picker::new(false, false);
+        let mut output = String::new();
+        let start = Instant::now();
+        picker.update(Message::AddBucket, &mut output);
+        picker.sync(start);
+        assert_eq!(picker.advanced_turn.get(start), 0.0);
+        picker.update(Message::Advanced(true), &mut output);
+        picker.sync(start);
+        let mid = picker.advanced_turn.get(start + motion::RING / 2);
+        assert!(mid > 0.0 && mid < 1.0, "turns: {mid}");
+        assert!(!picker.advanced_turn.animating(start + motion::RING));
+        // Closing the editor rests it at once; nothing shows it.
+        picker.update(Message::Cancel, &mut output);
+        picker.sync(start + motion::RING);
+        assert!(!picker.advanced_turn.animating(start + motion::RING));
+        // A bucket with custom settings opens with the group open, unturned.
+        let custom = bucket(|e| e.prefix = "line-1/".into())
+            .destination()
+            .unwrap();
+        picker.saved = vec![custom.clone()];
+        picker.update(Message::Edit(custom.name), &mut output);
+        picker.sync(start);
+        assert_eq!(picker.advanced_turn.get(start), 1.0);
+        assert!(!picker.advanced_turn.animating(start));
     }
 
     #[test]
