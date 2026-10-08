@@ -57,8 +57,6 @@ pub(super) struct InspectorState {
     forwarded: Option<(String, String)>,
     /// The destination the last capture went to, when one was named.
     saved_to: Option<String>,
-    /// Screenshot scenes' commands, which never finish.
-    held: Vec<mpsc::Sender<anyhow::Result<serde_json::Value>>>,
 }
 
 impl Default for InspectorState {
@@ -77,7 +75,6 @@ impl Default for InspectorState {
             index: FeatureIndex::default(),
             forwarded: None,
             saved_to: None,
-            held: Vec::new(),
         }
     }
 }
@@ -333,36 +330,25 @@ impl Workbench {
             }
             ("inspector-applying", true) => {
                 self.edits.insert(feature.into(), "15000".into());
-                self.scene_hold(&format!("Setting {feature}"), camera, Some(feature));
+                let held = self.scene_hold(&format!("Setting {feature}"));
+                held.camera = camera;
+                held.feature = Some(feature.into());
             }
             ("inspector-accepted", true) => {
                 self.inspect.accepted.hit(feature.into(), self.now);
             }
             ("inspector-switching", true) => {
-                self.scene_hold("Enabling auto mode", camera, None);
+                self.scene_hold("Enabling auto mode").camera = camera;
                 // Where it slides to, for a still.
                 self.inspect.mode_thumb.set(1.0);
             }
-            ("inspector-connecting", true) => self.scene_hold("Connecting camera", None, None),
+            ("inspector-connecting", true) => {
+                self.scene_hold("Connecting camera");
+            }
             ("inspector-context", true) => self.inspect.context.replay(1.0, 0.0, self.now),
             _ => return false,
         }
         true
-    }
-
-    /// A command under `label` that never finishes, for a scene.
-    fn scene_hold(&mut self, label: &str, camera: Option<String>, feature: Option<&str>) {
-        let (sender, receiver) = mpsc::channel();
-        self.inspect.held.push(sender);
-        self.pending.push(Pending {
-            label: label.into(),
-            receiver,
-            target: None,
-            camera,
-            feature: feature.map(str::to_owned),
-            at: self.now,
-            batch: false,
-        });
     }
 
     /// Where the Manual/Auto thumb heads: where a switch on its way to the

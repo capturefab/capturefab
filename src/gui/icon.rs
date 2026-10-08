@@ -38,6 +38,7 @@ pub enum Icon {
     Eject,
     Search,
     Recent,
+    #[allow(dead_code)] // the camera list dropped it; remove unless another area adopts it
     Plug,
     Network,
     Usb,

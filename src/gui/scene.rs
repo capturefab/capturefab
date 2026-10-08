@@ -273,6 +273,13 @@ impl Workbench {
         });
     }
 
+    /// A pending command under `label` that never finishes, for an area's
+    /// scene words; returned so the area can say what it acts on.
+    pub(super) fn scene_hold(&mut self, label: &str) -> &mut Pending {
+        self.hold(label, None);
+        self.pending.last_mut().expect("just held")
+    }
+
     pub(super) fn screenshot_tick(&mut self) -> Task<Message> {
         let Some(mut request) = self.screenshot.take() else {
             return Task::none();

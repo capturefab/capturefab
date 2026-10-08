@@ -653,6 +653,21 @@ pub fn row(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     }
 }
 
+/// `row` with its selected fill drawn in by `amount`, from 0 to 1, so the
+/// highlight can cross-fade from one row to the next.
+pub fn row_mix(amount: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let p = Palette::from(theme);
+        let rest = match status {
+            button::Status::Hovered => p.hover,
+            button::Status::Pressed => p.selected,
+            _ => alpha(p.selected, 0.0),
+        };
+        let fill = mix(rest, p.selected, amount.clamp(0.0, 1.0));
+        button_base((fill.a > 0.0).then_some(fill), p.text, RADIUS)
+    }
+}
+
 /// A label of a `widgets::segmented` control, over its sliding thumb. `lit`
 /// is how much of the thumb sits under it, from 0 to 1, which brings its text
 /// from `secondary` up to `text`.
