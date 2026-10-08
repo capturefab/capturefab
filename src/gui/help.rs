@@ -204,15 +204,7 @@ impl Workbench {
                 column![section(view), section(panels)].spacing(18).width(Fill),
             ]
             .spacing(32),
-            text(format!(
-                "{}, {} and {} act on the workbench when no field has keyboard focus. Press {} or click elsewhere to leave a field.",
-                Action::ToggleStream.key_label(os),
-                Action::FocusCamera.key_label(os),
-                Action::Overview.key_label(os),
-                Action::Overview.key_label(os)
-            ))
-            .size(style::SMALL)
-            .color(p.secondary),
+            text(plain_keys_note(os)).size(style::SMALL).color(p.secondary),
             heading("Control this window from a terminal or agent", p),
             text("Copy the session command to attach your terminal or coding agent. Session commands update this window and share its camera connection.")
                 .size(style::BODY),
@@ -241,6 +233,30 @@ impl Workbench {
             .on_scroll(Message::HelpScrolled)
             .into()
     }
+}
+
+/// The guide's note on plain keys: they act on the workbench only while no
+/// field has keyboard focus. Lists every one the guide shows, in its order.
+fn plain_keys_note(os: Os) -> String {
+    let keys: Vec<String> = Action::SECTIONS
+        .iter()
+        .flat_map(|(_, actions)| actions.iter())
+        .filter(|action| {
+            action
+                .display_binding(os)
+                .is_some_and(|chord| chord.needs_free_keyboard())
+        })
+        .map(|action| action.key_label(os))
+        .collect();
+    let keys = match keys.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        Some((last, _)) => last.clone(),
+        None => String::new(),
+    };
+    format!(
+        "{keys} act on the workbench when no field has keyboard focus. Press {} or click elsewhere to leave a field.",
+        Action::Overview.key_label(os)
+    )
 }
 
 #[cfg(test)]
@@ -323,6 +339,16 @@ mod tests {
         bench.sync_animations();
         assert_eq!(bench.sheets.more_turn.get(bench.now), 0.0);
         assert!(!bench.sheets.more_turn.animating(bench.now));
+    }
+
+    #[test]
+    fn the_guide_names_every_key_a_field_takes() {
+        assert_eq!(
+            plain_keys_note(Os::Mac),
+            "↩, Esc, Space, F, H and R act on the workbench when no field has keyboard focus. Press Esc or click elsewhere to leave a field."
+        );
+        // F1 and F11 work from a field, so they are not named.
+        assert!(plain_keys_note(Os::Windows).starts_with("Enter, Esc, Space, F, H and R act"));
     }
 
     #[test]
