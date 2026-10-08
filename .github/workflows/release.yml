@@ -214,14 +214,34 @@ jobs:
           security create-keychain -p "$password" "$keychain"
           security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$password" "$keychain"
-          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
-          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$MACOS_CERTIFICATE_P12_PASSWORD" -T /usr/bin/codesign
-          rm "$RUNNER_TEMP/certificate.p12"
+          # Accept line-wrapped base64 and a password pasted with a trailing newline.
+          p12="$RUNNER_TEMP/certificate.p12"
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | tr -d '[:space:]' | base64 --decode > "$p12"
+          p12_password=${MACOS_CERTIFICATE_P12_PASSWORD%$'\n'}
+          p12_password=${p12_password%$'\r'}
+          if ! security import "$p12" -k "$keychain" -f pkcs12 -P "$p12_password" -T /usr/bin/codesign; then
+            # A digest of the encrypted file identifies which export the secret holds.
+            echo "::error::MACOS_CERTIFICATE_P12_PASSWORD does not open MACOS_CERTIFICATE_P12_BASE64 ($(wc -c < "$p12" | tr -d ' ') bytes, SHA-256 $(shasum -a 256 < "$p12" | cut -c1-64)). Compare with shasum -a 256 of the exported .p12 and set both secrets from the same export."
+            rm "$p12"
+            exit 1
+          fi
+          rm "$p12"
+          # Exported identities usually omit Apple's intermediate, without which
+          # the identity is untrusted; pin it rather than rely on the runner image.
+          curl --proto '=https' --tlsv1.2 -sSfLo "$RUNNER_TEMP/DeveloperIDG2CA.cer" https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          echo "f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a  $RUNNER_TEMP/DeveloperIDG2CA.cer" | shasum -a 256 -c -
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$keychain"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
-          security list-keychains -d user -s "$keychain"
+          # Keep the existing keychains searchable after the signing keychain.
+          eval "set -- $(security list-keychains -d user | tr '\n' ' ')"
+          security list-keychains -d user -s "$keychain" "$@"
           security default-keychain -d user -s "$keychain"
           identity=$(security find-identity -v -p codesigning "$keychain" | awk '/"Developer ID Application: / && length($2) == 40 {print $2; exit}')
-          if [ -z "$identity" ]; then echo "::error::MACOS_CERTIFICATE_P12_BASE64 holds no valid Developer ID Application identity"; exit 1; fi
+          if [ -z "$identity" ]; then
+            security find-identity -p codesigning "$keychain"
+            echo "::error::MACOS_CERTIFICATE_P12_BASE64 holds no valid Developer ID Application identity"
+            exit 1
+          fi
           echo "MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
           if [ -n "$MACOS_NOTARY_KEY" ]; then
             printf '%s' "$MACOS_NOTARY_KEY" > "$RUNNER_TEMP/notary.p8"
