@@ -70,7 +70,9 @@ pub const LIGHT: Palette = Palette {
     accent_fill: rgb(0x2670E8),
     accent_soft: alpha(rgb(0x2F7BF5), 0.12),
     live: rgb(0x248A3D),
-    warn: rgb(0xC93400),
+    // Amber, a clear step from `danger`'s red; as a mark it reads like the
+    // accent (3:1 on a selected row), and `ink` deepens it for text.
+    warn: rgb(0xC86400),
     danger: rgb(0xD70015),
     scrim: alpha(rgb(0x000000), 0.18),
     shadow: alpha(rgb(0x000000), 0.12),
@@ -1023,6 +1025,38 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Hue in degrees, 0 to 360.
+    fn hue(color: Color) -> f32 {
+        let (r, g, b) = (color.r, color.g, color.b);
+        let max = r.max(g).max(b);
+        let span = max - r.min(g).min(b);
+        let hue = if span == 0.0 {
+            0.0
+        } else if max == r {
+            60.0 * ((g - b) / span)
+        } else if max == g {
+            60.0 * ((b - r) / span + 2.0)
+        } else {
+            60.0 * ((r - g) / span + 4.0)
+        };
+        hue.rem_euclid(360.0)
+    }
+
+    #[test]
+    fn warnings_read_as_amber_not_as_errors() {
+        for p in [&LIGHT, &DARK] {
+            let apart = (hue(p.warn) - hue(p.danger)).rem_euclid(360.0);
+            assert!(
+                (30.0..=60.0).contains(&apart),
+                "warn is {apart:.0}° from danger (dark {})",
+                p.dark
+            );
+            // A stalled camera's dot on its selected row reads like the accent.
+            let r = ratio(p.warn, p.selected);
+            assert!(r >= 3.0, "warn on selected (dark {}): {r:.2}", p.dark);
         }
     }
 

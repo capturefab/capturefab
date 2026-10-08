@@ -1230,7 +1230,7 @@ impl Picker {
                     lines = lines.push(
                         text("Drive not connected. Connect it or choose another destination.")
                             .size(style::CAPTION)
-                            .color(p.warn),
+                            .color(p.ink(p.warn)),
                     );
                 }
                 lines.into()
@@ -1255,7 +1255,7 @@ impl Picker {
                     lines = lines.push(
                         text("Plain http: requests are signed but data is not encrypted.")
                             .size(style::CAPTION)
-                            .color(p.warn),
+                            .color(p.ink(p.warn)),
                     );
                 }
                 lines
@@ -1308,7 +1308,7 @@ impl Picker {
             (w, f) => format!("{w} waiting · {f} failed"),
         };
         let mut head = row![text(summary).size(style::CAPTION).color(if failed > 0 {
-            p.danger
+            p.ink(p.danger)
         } else {
             p.secondary
         })]
@@ -1357,13 +1357,17 @@ impl Picker {
                 .find(|i| i["state"] == "failed")
                 .and_then(|i| i["error"].as_str())
         {
-            lines = lines.push(text(error.to_owned()).size(style::CAPTION).color(p.danger));
+            lines = lines.push(
+                text(error.to_owned())
+                    .size(style::CAPTION)
+                    .color(p.ink(p.danger)),
+            );
         }
         if !status["uploader_running"].as_bool().unwrap_or(true) && waiting > 0 {
             lines = lines.push(
                 text("No uploader is running; keep this window open to upload.")
                     .size(style::CAPTION)
-                    .color(p.warn),
+                    .color(p.ink(p.warn)),
             );
         }
         lines.into()
