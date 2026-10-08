@@ -98,13 +98,31 @@ pub(super) fn feature_group(name: &str) -> &'static str {
     }
 }
 
+/// A feature value as text that parses back to the same value, so it can be
+/// edited and sent as is. Whole floats read as whole numbers, 10000.0 as
+/// "10000"; a fraction or an exponent stays.
 pub(super) fn value_text(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(value) => value.clone(),
-        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::Number(value) => {
+            let text = value.to_string();
+            match text.strip_suffix(".0") {
+                Some("-0") => "0".into(),
+                Some(whole) => whole.into(),
+                None => text,
+            }
+        }
         serde_json::Value::Bool(value) => value.to_string(),
         serde_json::Value::Null => "—".into(),
         _ => value.to_string(),
+    }
+}
+
+/// A GenICam unit as people write it: "us" → "µs".
+pub(super) fn unit_label(unit: &str) -> &str {
+    match unit {
+        "us" | "usec" => "µs",
+        other => other,
     }
 }
 
@@ -137,7 +155,8 @@ pub(super) fn change_text(change: &AutoChange, unit: Option<&str>) -> String {
         change.feature,
         value_text(change.from.as_ref().unwrap_or(&serde_json::Value::Null)),
         value_text(&change.to),
-        unit.map(|u| format!(" {u}")).unwrap_or_default()
+        unit.map(|u| format!(" {}", unit_label(u)))
+            .unwrap_or_default()
     )
 }
 
@@ -242,6 +261,25 @@ pub(super) fn redact_address(value: &str) -> String {
     }
 }
 
+/// A writable feature named `name` of GenICam `kind` holding `value`, for tests.
+#[cfg(test)]
+pub(super) fn sample_feature(name: &str, kind: &str, value: serde_json::Value) -> FeatureInfo {
+    FeatureInfo {
+        name: name.into(),
+        display_name: String::new(),
+        kind: kind.into(),
+        value: Some(value),
+        writable: true,
+        description: String::new(),
+        unit: None,
+        min: None,
+        max: None,
+        inc: None,
+        choices: Vec::new(),
+        error: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,7 +332,7 @@ mod tests {
         };
         assert_eq!(
             change_text(&change, Some("us")),
-            "12:00:01 AutoExposureTimeUpperLimit 5000 → 19800.5 us"
+            "12:00:01 AutoExposureTimeUpperLimit 5000 → 19800.5 µs"
         );
         let change = AutoChange {
             from: None,
@@ -348,6 +386,38 @@ mod tests {
         assert_eq!(grouped(10_000_000), "10,000,000");
         assert_eq!(capitalize("stable"), "Stable");
         assert_eq!(capitalize(""), "");
+    }
+
+    #[test]
+    fn whole_floats_read_as_whole_numbers_and_parse_back() {
+        assert_eq!(value_text(&json!(10000.0)), "10000");
+        assert_eq!(value_text(&json!(30.0)), "30");
+        assert_eq!(value_text(&json!(0.0)), "0");
+        assert_eq!(value_text(&json!(-0.0)), "0");
+        assert_eq!(value_text(&json!(-4.0)), "-4");
+        assert_eq!(value_text(&json!(2.5)), "2.5");
+        assert_eq!(value_text(&json!(15000)), "15000");
+        assert_eq!(value_text(&json!(1e21)), "1e+21");
+        assert_eq!(value_text(&json!("Mono8")), "Mono8");
+        assert_eq!(value_text(&json!(true)), "true");
+        for value in [
+            10000.0,
+            0.1,
+            -0.5,
+            30.0,
+            1e15,
+            1e16,
+            123456.789,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            -1e-7,
+        ] {
+            let text = value_text(&json!(value));
+            assert_eq!(text.parse::<f64>().ok(), Some(value), "{text}");
+        }
+        // The draft a write leaves matches the camera's value once read back.
+        let feature = sample_feature("ExposureTime", "Float", json!(15000.0));
+        assert_eq!(feature_value(&feature), "15000");
     }
 
     #[test]
