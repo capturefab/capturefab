@@ -344,29 +344,6 @@ pub(super) fn code_block<'a>(
     .into()
 }
 
-pub(super) fn segment<'a>(
-    label: &'a str,
-    selected: bool,
-    on: impl Into<Option<Message>>,
-) -> Element<'a, Message> {
-    button(
-        text(label)
-            .size(style::SMALL)
-            .font(if selected {
-                style::SEMIBOLD
-            } else {
-                style::SANS
-            })
-            .width(Fill)
-            .align_x(Alignment::Center),
-    )
-    .width(Fill)
-    .padding([4, 12])
-    .style(style::segment(selected))
-    .on_press_maybe(on.into())
-    .into()
-}
-
 /// What a control sits on, which decides its colors.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[allow(dead_code)] // adopted by the area packages

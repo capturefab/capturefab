@@ -653,32 +653,6 @@ pub fn row(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     }
 }
 
-pub fn segment(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |theme, status| {
-        let p = Palette::from(theme);
-        if selected {
-            let mut style = button_base(
-                Some(if p.dark { rgb(0x4A4A50) } else { p.base }),
-                p.text,
-                RADIUS_SMALL,
-            );
-            style.shadow = Shadow {
-                color: alpha(Color::BLACK, if p.dark { 0.3 } else { 0.1 }),
-                offset: Vector::new(0.0, 1.0),
-                blur_radius: 2.0,
-            };
-            style
-        } else {
-            let text = match status {
-                button::Status::Hovered | button::Status::Pressed => p.text,
-                button::Status::Disabled => p.tertiary,
-                button::Status::Active => p.secondary,
-            };
-            button_base(None, text, RADIUS_SMALL)
-        }
-    }
-}
-
 /// A label of a `widgets::segmented` control, over its sliding thumb. `lit`
 /// is how much of the thumb sits under it, from 0 to 1, which brings its text
 /// from `secondary` up to `text`.
@@ -878,6 +852,26 @@ pub fn pick(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
         }
         .into(),
         border: hairline(Color::TRANSPARENT, RADIUS_SMALL),
+    }
+}
+
+/// A `pick` acknowledging an accepted choice, as `input_flash` does a field.
+pub fn pick_flash(t: f32) -> impl Fn(&Theme, pick_list::Status) -> pick_list::Style {
+    move |theme, status| {
+        let mut style = pick(theme, status);
+        if t <= 0.0 {
+            return style;
+        }
+        let p = Palette::from(theme);
+        if let Background::Color(fill) = style.background {
+            style.background = mix(fill, p.accent, 0.16 * t).into();
+        }
+        style.border = Border {
+            color: alpha(p.accent, 0.8 * t),
+            width: 1.5,
+            radius: RADIUS_SMALL.into(),
+        };
+        style
     }
 }
 

@@ -126,6 +126,81 @@ pub(super) fn unit_label(unit: &str) -> &str {
     }
 }
 
+/// A bound in a range caption: whole numbers from 10,000 up are grouped,
+/// "1,000,000"; the rest read as `number` has them. For captions only;
+/// fields keep plain digits, so they parse.
+pub(super) fn range_number(value: f64) -> String {
+    if value.fract() == 0.0 && (10_000.0..1e15).contains(&value.abs()) {
+        let digits = grouped(value.abs() as u64);
+        if value < 0.0 {
+            format!("-{digits}")
+        } else {
+            digits
+        }
+    } else {
+        number(value)
+    }
+}
+
+/// A feature's range and unit for the caption under its field, such as
+/// "10 – 1,000,000 µs"; empty when it has neither.
+pub(super) fn range_text(feature: &FeatureInfo) -> String {
+    let range = match (feature.min, feature.max) {
+        (Some(min), Some(max)) => format!("{} – {}", range_number(min), range_number(max)),
+        (Some(min), None) => format!("min {}", range_number(min)),
+        (None, Some(max)) => format!("max {}", range_number(max)),
+        _ => String::new(),
+    };
+    match feature.unit.as_deref().map(unit_label) {
+        Some(unit) if range.is_empty() => unit.to_owned(),
+        Some(unit) => format!("{range} {unit}"),
+        None => range,
+    }
+}
+
+/// Features a camera cannot change while it streams: the image's geometry
+/// and format.
+pub(super) fn stream_locked(name: &str) -> bool {
+    matches!(
+        name,
+        "Width"
+            | "Height"
+            | "OffsetX"
+            | "OffsetY"
+            | "PixelFormat"
+            | "BinningHorizontal"
+            | "BinningVertical"
+            | "DecimationHorizontal"
+            | "DecimationVertical"
+            | "VideoMode"
+    )
+}
+
+/// Where a feature sorts within its group: in the order a camera is set up,
+/// then everything else.
+pub(super) fn feature_rank(name: &str) -> usize {
+    const ORDER: [&str; 14] = [
+        "Width",
+        "Height",
+        "OffsetX",
+        "OffsetY",
+        "PixelFormat",
+        "Binning",
+        "Decimation",
+        "AcquisitionStart",
+        "AcquisitionMode",
+        "AcquisitionFrameRate",
+        "ExposureAuto",
+        "ExposureTime",
+        "GainAuto",
+        "Gain",
+    ];
+    ORDER
+        .iter()
+        .position(|prefix| name.starts_with(prefix))
+        .unwrap_or(ORDER.len())
+}
+
 pub(super) fn auto_summary(status: &AutoStatus) -> String {
     let strategy = match status.strategy.as_str() {
         "firmware" => "Camera auto exposure",
@@ -418,6 +493,80 @@ mod tests {
         // The draft a write leaves matches the camera's value once read back.
         let feature = sample_feature("ExposureTime", "Float", json!(15000.0));
         assert_eq!(feature_value(&feature), "15000");
+    }
+
+    #[test]
+    fn ranges_read_with_grouped_digits_and_real_units() {
+        let feature = |min, max, unit: Option<&str>| FeatureInfo {
+            min,
+            max,
+            unit: unit.map(str::to_owned),
+            ..sample_feature("ExposureTime", "Float", json!(1))
+        };
+        assert_eq!(
+            range_text(&feature(Some(10.0), Some(1_000_000.0), Some("us"))),
+            "10 – 1,000,000 µs"
+        );
+        assert_eq!(
+            range_text(&feature(Some(0.0), Some(24.0), Some("dB"))),
+            "0 – 24 dB"
+        );
+        assert_eq!(
+            range_text(&feature(Some(-20_000.0), Some(0.5), None)),
+            "-20,000 – 0.5"
+        );
+        assert_eq!(range_text(&feature(None, Some(9999.0), None)), "max 9999");
+        assert_eq!(range_text(&feature(None, None, Some("Hz"))), "Hz");
+        assert_eq!(range_text(&feature(None, None, None)), "");
+        assert_eq!(range_number(1e20), number(1e20), "too large to group");
+        assert_eq!(unit_label("Hz"), "Hz");
+    }
+
+    #[test]
+    fn features_sort_the_way_a_camera_is_set_up() {
+        let mut names = vec![
+            "Height",
+            "PixelFormat",
+            "Width",
+            "TestPattern",
+            "OffsetX",
+            "WidthMax",
+        ];
+        names.sort_by_key(|name| feature_rank(name));
+        assert_eq!(
+            names,
+            [
+                "Width",
+                "WidthMax",
+                "Height",
+                "OffsetX",
+                "PixelFormat",
+                "TestPattern"
+            ]
+        );
+        let mut names = vec![
+            "Gain",
+            "AcquisitionStart",
+            "ExposureTime",
+            "AcquisitionFrameRate",
+            "GainAuto",
+            "ExposureAuto",
+            "BlackLevel",
+        ];
+        names.sort_by_key(|name| feature_rank(name));
+        assert_eq!(
+            names,
+            [
+                "AcquisitionStart",
+                "AcquisitionFrameRate",
+                "ExposureAuto",
+                "ExposureTime",
+                "GainAuto",
+                "Gain",
+                "BlackLevel"
+            ]
+        );
+        assert!(stream_locked("PixelFormat") && !stream_locked("Gain"));
     }
 
     #[test]
