@@ -377,9 +377,11 @@ pub(super) fn icon_button<'a>(
         .into()
 }
 
-/// Start or Stop for a stream, sending `on`. While `busy`, a spinner at
-/// step `spin` (from `Workbench::spin`) takes the glyph's place and presses
-/// are ignored, with the button keeping its look.
+/// Start or Stop for a stream, sending `on`. Start is the primary action;
+/// Stop is routine, not destructive, so it stays gray with only its glyph in
+/// red. While `busy`, a spinner at step `spin` (from `Workbench::spin`)
+/// takes the glyph's place and presses are ignored, with the button keeping
+/// its look.
 pub(super) fn stream_button<'a>(
     streaming: bool,
     label: &'a str,
@@ -388,14 +390,14 @@ pub(super) fn stream_button<'a>(
     spin: usize,
     p: &'static Palette,
 ) -> button::Button<'a, Message> {
-    let ink = if streaming { p.danger } else { Color::WHITE };
-    let glyph = if busy {
-        icon::spinner(12.0, ink, spin)
-    } else {
-        icon(if streaming { Icon::Stop } else { Icon::Play }, 12.0, ink)
+    let glyph = match (busy, streaming) {
+        (true, true) => icon::spinner(12.0, p.secondary, spin),
+        (true, false) => icon::spinner(12.0, Color::WHITE, spin),
+        (false, true) => icon(Icon::Stop, 12.0, p.danger),
+        (false, false) => icon(Icon::Play, 12.0, Color::WHITE),
     };
     let base = if streaming {
-        style::danger
+        style::stop
     } else {
         style::primary
     };
