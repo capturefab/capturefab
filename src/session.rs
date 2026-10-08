@@ -141,6 +141,11 @@ pub struct CameraSnapshot {
     /// this process's own views; not serialized.
     #[serde(skip)]
     pub stale: bool,
+    /// The time of the worker's newest error line, the one `last_error`
+    /// holds, so a repeat of the same error can be told from the one before.
+    /// Kept for this process's own views; not serialized.
+    #[serde(skip)]
+    pub error_logged: Option<String>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -452,6 +457,12 @@ impl SessionHandle {
                         transport: s.transport.clone(),
                         ring_dropped,
                         stale: false,
+                        error_logged: s
+                            .logs
+                            .iter()
+                            .rev()
+                            .find(|entry| entry.level == "error")
+                            .map(|entry| entry.time.clone()),
                     };
                     if state.active_camera.as_deref() == Some(&id) {
                         state.connected = s.connected.clone();

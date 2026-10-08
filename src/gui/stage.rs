@@ -21,10 +21,25 @@ const REVEAL: Duration = Duration::from_millis(220);
 /// shows, so errors that frames flow straight past never flash up.
 const ERROR_SETTLE: Duration = Duration::from_millis(250);
 /// The scales `zoom_by` keeps to.
-const ZOOM_MIN: f32 = 0.1;
-const ZOOM_MAX: f32 = 8.0;
-/// Room the error badge's text gets on the stage.
+pub(super) const ZOOM_MIN: f32 = 0.1;
+pub(super) const ZOOM_MAX: f32 = 8.0;
+/// The most room an error badge's text gets.
 const ERROR_ROOM: f32 = 420.0;
+/// What an error badge takes besides its text: the mark before it, and
+/// Details and the dismiss after it.
+const ERROR_CHROME: f32 = 102.0;
+/// Below this much room an error badge's text, and its Details, give way
+/// to the mark alone, which tells the error on hover.
+const MARK_ONLY: f32 = 60.0;
+/// What the "Last frame" badge takes, spacing included.
+const LAST_FRAME_ROOM: f32 = 86.0;
+/// What the stall badge takes with its text, spacing included.
+const STALL_ROOM: f32 = 170.0;
+/// The least room an error's text keeps beside the stall badge, which
+/// gives way to it below this.
+const ERROR_BESIDE_STALL: f32 = 120.0;
+/// How far the badges sit in from the stage's edges.
+const BADGE_INSET: f32 = 12.0;
 /// The error a screenshot scene shows.
 const SCENE_ERROR: &str = "Frame timeout: the camera sent no frame within 2000 ms";
 
@@ -54,8 +69,9 @@ pub(super) struct StageState {
     /// The latest error of a command this window sent to each camera. Its
     /// notice already says it, so the camera's badge does not.
     answered: HashMap<String, String>,
-    /// The error each camera's badge was dismissed on, until it changes.
-    dismissed: HashMap<String, String>,
+    /// The errors each camera's badge was dismissed on. A reported one
+    /// shows again when it is logged anew.
+    dismissed: HashMap<String, HashSet<String>>,
     /// What a screenshot scene holds in place.
     scene: StageScene,
 }
@@ -73,22 +89,77 @@ struct Zoom {
 #[derive(Debug)]
 struct CameraError {
     text: String,
+    /// When the worker logged it (see `CameraSnapshot::error_logged`).
+    logged: Option<String>,
     /// When it was first reported.
     at: Instant,
-    /// Frames flowed since, it was answered by a notice, or it was dismissed.
+    /// Frames flowed since, or it was answered by a notice.
     cleared: bool,
     /// Whether its badge shows.
     shown: bool,
 }
 
 impl CameraError {
-    fn new(text: &str, at: Instant) -> Self {
+    fn new(text: &str, logged: Option<&String>, at: Instant) -> Self {
         Self {
             text: text.to_owned(),
+            logged: logged.cloned(),
             at,
             cleared: false,
             shown: false,
         }
+    }
+
+    /// Whether `text`, logged at `logged`, is this occurrence: the same
+    /// text, not logged again since. A repeat is a new error, even of one
+    /// that frames retired or that was dismissed.
+    fn is(&self, text: &str, logged: Option<&String>) -> bool {
+        self.text == text && (logged.is_none() || logged == self.logged.as_ref())
+    }
+}
+
+/// The error a camera's badge shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BadgeError<'a> {
+    pub(super) text: &'a str,
+    /// The camera reported it, so Activity has it in the camera's log;
+    /// otherwise this window failed to decode the camera's frames.
+    pub(super) reported: bool,
+}
+
+/// How a picture's badges share the room over its top left: whether the
+/// stall badge shows, and whole, and the room the error's text gets.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BadgePlan {
+    stall: Option<bool>,
+    error: f32,
+}
+
+impl BadgePlan {
+    /// The badges in `room`: "Last frame" when `stopped`, the stall badge
+    /// when `stalled` and the error when there is `error`. The error also
+    /// keeps clear of `hover` at the end, where a tile's actions show, so
+    /// its Details and dismiss stay in reach. It says more than the stall
+    /// badge, which shows beside it only while the error's text keeps
+    /// `ERROR_BESIDE_STALL`.
+    fn new(room: f32, hover: f32, stopped: bool, stalled: bool, error: bool) -> Self {
+        let room = if stopped {
+            room - LAST_FRAME_ROOM
+        } else {
+            room
+        };
+        let text = |room: f32| (room - hover - ERROR_CHROME).min(ERROR_ROOM);
+        let stall = match (stalled, error) {
+            (false, _) => None,
+            (true, false) => Some(room >= STALL_ROOM),
+            (true, true) => (text(room - STALL_ROOM) >= ERROR_BESIDE_STALL).then_some(true),
+        };
+        let error = text(if stall.is_some() {
+            room - STALL_ROOM
+        } else {
+            room
+        });
+        Self { stall, error }
     }
 }
 
@@ -246,18 +317,26 @@ impl Workbench {
                 ui.errors.remove(id);
                 continue;
             };
-            let error = ui
+            let logged = camera.error_logged.as_ref();
+            if ui
                 .errors
-                .entry(id.clone())
-                .or_insert_with(|| CameraError::new(text, now));
-            if &error.text != text {
-                *error = CameraError::new(text, now);
+                .get(id)
+                .is_none_or(|error| !error.is(text, logged))
+            {
+                ui.errors
+                    .insert(id.clone(), CameraError::new(text, logged, now));
+                if let Some(dismissed) = ui.dismissed.get_mut(id) {
+                    dismissed.remove(text);
+                }
             }
+            let Some(error) = ui.errors.get_mut(id) else {
+                continue;
+            };
             // Frames flowing since, or a notice that already said it, retire it.
             let flowing = self
                 .liveness
                 .get(id)
-                .is_some_and(|live| live.frame_at > error.at);
+                .is_some_and(|live| live.framed_since(error.at));
             if flowing || ui.answered.get(id) == Some(text) {
                 error.cleared = true;
             }
@@ -320,7 +399,7 @@ impl Workbench {
                         .now
                         .checked_sub(Duration::from_secs(1))
                         .unwrap_or(self.born);
-                    let mut error = CameraError::new(SCENE_ERROR, at);
+                    let mut error = CameraError::new(SCENE_ERROR, None, at);
                     error.shown = true;
                     self.stage_ui.errors.insert(id, error);
                 }
@@ -353,14 +432,19 @@ impl Workbench {
             }
             if scene.error && active.as_ref() == Some(&camera.info.id) {
                 camera.last_error = Some(SCENE_ERROR.into());
+                camera.error_logged = None;
             }
         }
     }
 
-    /// Hide camera `id`'s error badge until its error changes.
+    /// Hide camera `id`'s error badge, until the camera logs the error anew.
     pub(super) fn dismiss_stage_error(&mut self, id: &str) {
         if let Some(error) = self.camera_error(id).map(str::to_owned) {
-            self.stage_ui.dismissed.insert(id.to_owned(), error);
+            self.stage_ui
+                .dismissed
+                .entry(id.to_owned())
+                .or_default()
+                .insert(error);
         }
     }
 }
@@ -412,6 +496,11 @@ impl Workbench {
     /// The error camera `id`'s badge shows: one decoding its frames here,
     /// else one it reported (see `tick_stage`), unless dismissed.
     pub(super) fn camera_error(&self, id: &str) -> Option<&str> {
+        self.badge_error(id).map(|error| error.text)
+    }
+
+    /// `camera_error`, and where it comes from.
+    pub(super) fn badge_error(&self, id: &str) -> Option<BadgeError<'_>> {
         let local = if self.overview() {
             self.previews
                 .get(id)
@@ -427,27 +516,61 @@ impl Workbench {
             .get(id)
             .filter(|error| error.shown)
             .map(|error| error.text.as_str());
+        // Each checked on its own, so a dismissed one never hides the other.
+        let dismissed = self.stage_ui.dismissed.get(id);
+        let open = |error: &&str| dismissed.is_none_or(|texts| !texts.contains(*error));
+        let badge = |reported| move |text| BadgeError { text, reported };
         local
-            .or(reported)
-            .filter(|error| self.stage_ui.dismissed.get(id).map(String::as_str) != Some(*error))
+            .filter(open)
+            .map(badge(false))
+            .or_else(|| reported.filter(open).map(badge(true)))
     }
 
-    /// A camera's error over its picture: the first line, with the way to
-    /// the full story in Activity and a dismiss. `room` is what the text
-    /// may take; too little leaves just the mark, explained on hover.
-    pub(super) fn error_badge<'a>(
+    /// The badges over the top left of camera `id`'s picture, laid out in
+    /// `room` as `BadgePlan` says: "Last frame" when `stopped`, how long
+    /// frames have stopped, and its error. Clipped to the room, so nothing
+    /// reaches under a neighbouring tile.
+    pub(super) fn badges(
         &self,
         id: &str,
-        error: &'a str,
+        stopped: bool,
         room: f32,
-    ) -> Element<'a, Message> {
+        hover: f32,
+        padding: f32,
+    ) -> Element<'_, Message> {
+        let stalled = self.stalled(id);
+        let error = self.badge_error(id);
+        let plan = BadgePlan::new(room, hover, stopped, stalled.is_some(), error.is_some());
+        let mut badges = row![].spacing(6).align_y(Alignment::Center);
+        if stopped {
+            badges = badges.push(last_frame());
+        }
+        if let (Some(silent), Some(whole)) = (stalled, plan.stall) {
+            badges = badges.push(stall_badge(silent, whole));
+        }
+        if let Some(error) = error {
+            badges = badges.push(self.error_badge(id, error, plan.error));
+        }
+        container(badges)
+            .padding(padding)
+            .width(Fill)
+            .clip(true)
+            .into()
+    }
+
+    /// A camera's error over its picture: the first line, with a dismiss
+    /// and, for an error the camera reported, the way to the whole story in
+    /// its log in Activity. `room` is what the text may take; too little
+    /// leaves just the mark, explained on hover.
+    fn error_badge<'a>(&self, id: &str, error: BadgeError<'a>, room: f32) -> Element<'a, Message> {
+        let whole = room >= MARK_ONLY;
         let mut message = row![Level::Error.mark(12.0, style::STAGE)]
             .spacing(6)
             .align_y(Alignment::Center);
-        if room >= 60.0 {
+        if whole {
             message = message.push(
                 container(one_line(
-                    error,
+                    error.text,
                     style::SMALL,
                     style::SANS,
                     style::STAGE.text,
@@ -455,36 +578,41 @@ impl Workbench {
                 .max_width(room),
             );
         }
-        let details = button(
-            text("Details")
-                .size(style::SMALL)
-                .font(style::MEDIUM)
-                .color(style::STAGE.text),
-        )
-        .padding([0, 5])
-        .style(style::on_glass(false, 1.0))
-        .on_press(Message::ShowActivity);
+        let mut badge = row![tip(message, error.text)]
+            .spacing(4)
+            .align_y(Alignment::Center);
+        // Only a reported error is in a log, and Activity shows only the
+        // selected camera's, so Details selects the camera first.
+        if whole && error.reported {
+            let details = button(
+                text("Details")
+                    .size(style::SMALL)
+                    .font(style::MEDIUM)
+                    .color(style::STAGE.text),
+            )
+            .padding([0, 5])
+            .style(style::on_glass(false, 1.0))
+            .on_press(Message::CameraActivity(id.to_owned()));
+            let about = if self.snapshot.active_camera.as_deref() == Some(id) {
+                "Show the full error in Activity"
+            } else {
+                "Select the camera and show the full error in Activity"
+            };
+            badge = badge.push(tip(details, about));
+        }
         let close = button(icon(Icon::Close, 10.0, style::STAGE.secondary))
             .padding(3)
             .style(style::on_glass(false, 1.0))
             .on_press(Message::DismissStageError(id.to_owned()));
-        container(
-            row![
-                tip(message, error),
-                tip(details, "Show the full error in Activity"),
-                tip(close, "Dismiss")
-            ]
-            .spacing(4)
-            .align_y(Alignment::Center),
-        )
-        .padding(iced::Padding {
-            top: 1.0,
-            right: 2.0,
-            bottom: 1.0,
-            left: 8.0,
-        })
-        .style(style::badge)
-        .into()
+        container(badge.push(tip(close, "Dismiss")))
+            .padding(iced::Padding {
+                top: 2.0,
+                right: 2.0,
+                bottom: 2.0,
+                left: 8.0,
+            })
+            .style(style::badge)
+            .into()
     }
 
     /// "N lost": amber while losses are recent, neutral once they are not,
@@ -568,19 +696,27 @@ impl Workbench {
     }
 }
 
-/// A frame that should have come by now, on the stage or a tile.
-pub(super) fn stall_badge<'a>(silent: Duration) -> Element<'a, Message> {
+/// A frame that should have come by now, on the stage or a tile: its mark
+/// and how long, or unless `whole`, the mark alone, saying it on hover.
+fn stall_badge<'a>(silent: Duration, whole: bool) -> Element<'a, Message> {
+    let mark = Level::Warning.mark(12.0, style::STAGE);
+    if !whole {
+        return tip(
+            container(mark).padding([4, 6]).style(style::badge),
+            silence(silent),
+        );
+    }
     container(
         row![
-            Level::Warning.mark(12.0, style::STAGE),
+            mark,
             text(silence(silent))
-                .size(style::CAPTION)
-                .font(style::MEDIUM),
+                .size(style::SMALL)
+                .wrapping(text::Wrapping::None),
         ]
         .spacing(5)
         .align_y(Alignment::Center),
     )
-    .padding([3, 8])
+    .padding([2, 8])
     .style(style::badge)
     .into()
 }
@@ -594,8 +730,8 @@ fn ease_scale(from: f32, to: f32, t: f32) -> f32 {
     from * (to / from).powf(t)
 }
 
-/// The capture flash over the picture itself, not the stage around it: a
-/// white edge, over a white wash unless movement is reduced.
+/// The capture flash over the picture itself, not the stage around it, as
+/// `style::capture_flash` draws it over a tile.
 struct Flash {
     native: Size,
     scale: Option<f32>,
@@ -622,16 +758,25 @@ impl canvas::Program<Message> for Flash {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         let white = |a: f32| Color { a, ..Color::WHITE };
         if self.wash {
-            frame.fill_rectangle(picture.position(), picture.size(), white(0.22 * self.level));
+            frame.fill_rectangle(
+                picture.position(),
+                picture.size(),
+                white(style::FLASH_WASH * self.level),
+            );
         }
+        // The edge inside the picture, as a tile's border is.
+        let inset = style::FLASH_WIDTH / 2.0;
         frame.stroke(
             &Path::rectangle(
-                picture.position() + Vector::new(1.0, 1.0),
-                Size::new(picture.width - 2.0, picture.height - 2.0),
+                picture.position() + Vector::new(inset, inset),
+                Size::new(
+                    picture.width - style::FLASH_WIDTH,
+                    picture.height - style::FLASH_WIDTH,
+                ),
             ),
             Stroke::default()
-                .with_width(2.0)
-                .with_color(white(0.9 * self.level)),
+                .with_width(style::FLASH_WIDTH)
+                .with_color(white(style::FLASH_EDGE * self.level)),
         );
         vec![frame.into_geometry()]
     }
@@ -671,23 +816,16 @@ impl Workbench {
                     native: shown.size(),
                     scale,
                     level: flash,
-                    wash: !motion::reduce_motion(),
+                    wash: style::flash_wash(),
                 })
                 .width(Fill)
                 .height(Fill),
             );
         }
-        let mut badges = row![].spacing(6).align_y(Alignment::Center);
-        if !snapshot.streaming {
-            badges = badges.push(last_frame());
-        }
-        if let Some(silent) = self.stalled(id) {
-            badges = badges.push(stall_badge(silent));
-        }
-        if let Some(error) = self.camera_error(id) {
-            badges = badges.push(self.error_badge(id, error, ERROR_ROOM));
-        }
-        layers = layers.push(container(badges).padding(12));
+        // The badges keep clear of the scope cards in the other corner.
+        let stage = self.stage.get();
+        let room = stage.width - 2.0 * BADGE_INSET - self.scope_room(stage);
+        layers = layers.push(self.badges(id, !snapshot.streaming, room, 0.0, BADGE_INSET));
         if let Some(scopes) = self.scopes() {
             layers = layers.push(scopes);
         }
@@ -1059,6 +1197,148 @@ mod tests {
         bench.snapshot.cameras[0].last_error = None;
         bench.tick_stage();
         assert!(bench.stage_ui.errors.is_empty());
+    }
+
+    #[test]
+    fn the_same_error_logged_again_shows_again() {
+        let mut bench = bench();
+        bench.observe_liveness();
+        fn camera(bench: &mut Workbench) -> &mut CameraSnapshot {
+            &mut bench.snapshot.cameras[0]
+        }
+        let stopped = "Acquisition stopped after repeated transport errors";
+        camera(&mut bench).last_error = Some(stopped.into());
+        camera(&mut bench).error_logged = Some("10:00:00".into());
+        bench.tick_stage();
+        bench.now += ERROR_SETTLE;
+        bench.tick_stage();
+        assert_eq!(bench.camera_error("sim:0"), Some(stopped));
+        // Restarted: frames retire it, however long it stays the last error.
+        bench.now += ms(10);
+        bench.frame_seen("sim:0");
+        bench.tick_stage();
+        assert_eq!(bench.camera_error("sim:0"), None);
+        bench.now += ERROR_SETTLE;
+        bench.tick_stage();
+        assert_eq!(bench.camera_error("sim:0"), None, "the same occurrence");
+        // The same failure later on.
+        camera(&mut bench).error_logged = Some("10:10:00".into());
+        bench.tick_stage();
+        bench.now += ERROR_SETTLE;
+        bench.tick_stage();
+        assert_eq!(bench.camera_error("sim:0"), Some(stopped));
+        // Dismissed, it stays so until it is logged once more.
+        bench.dismiss_stage_error("sim:0");
+        bench.now += ERROR_SETTLE;
+        bench.tick_stage();
+        assert_eq!(bench.camera_error("sim:0"), None);
+        camera(&mut bench).error_logged = Some("10:20:00".into());
+        bench.tick_stage();
+        bench.now += ERROR_SETTLE;
+        bench.tick_stage();
+        assert_eq!(bench.camera_error("sim:0"), Some(stopped));
+        // Its line scrolled out of the worker's log: no new occurrence.
+        camera(&mut bench).error_logged = None;
+        bench.tick_stage();
+        assert_eq!(bench.camera_error("sim:0"), Some(stopped));
+    }
+
+    #[test]
+    fn a_stream_starting_is_no_frame_flowing() {
+        let mut bench = bench();
+        bench.snapshot.cameras[0].streaming = false;
+        bench.snapshot.cameras[0].last_error = Some("Link down".into());
+        bench.tick_stage();
+        bench.now += ERROR_SETTLE;
+        bench.tick_stage();
+        assert_eq!(bench.camera_error("sim:0"), Some("Link down"));
+        // Started again: no frame yet, so the error stands.
+        bench.now += ms(100);
+        bench.snapshot.cameras[0].streaming = true;
+        bench.observe_liveness();
+        bench.tick_stage();
+        assert_eq!(bench.camera_error("sim:0"), Some("Link down"));
+        // The first frame is counted.
+        bench.now += ms(100);
+        bench.snapshot.cameras[0].frames += 1;
+        bench.observe_liveness();
+        bench.tick_stage();
+        assert_eq!(bench.camera_error("sim:0"), None);
+    }
+
+    #[test]
+    fn dismissing_one_error_never_hides_another() {
+        let mut bench = bench();
+        bench.display_error = Some("Unsupported pixel format".into());
+        let error = bench.badge_error("sim:0").unwrap();
+        assert_eq!(error.text, "Unsupported pixel format");
+        assert!(!error.reported, "not in any log");
+        bench.dismiss_stage_error("sim:0");
+        assert_eq!(bench.camera_error("sim:0"), None);
+        bench.snapshot.cameras[0].last_error = Some("Link down".into());
+        bench.tick_stage();
+        bench.now += ERROR_SETTLE;
+        bench.tick_stage();
+        let error = bench.badge_error("sim:0").unwrap();
+        assert_eq!((error.text, error.reported), ("Link down", true));
+        // Dismissed too: neither comes back in turn.
+        bench.dismiss_stage_error("sim:0");
+        for _ in 0..3 {
+            bench.now += ERROR_SETTLE;
+            bench.tick_stage();
+            assert_eq!(bench.camera_error("sim:0"), None);
+        }
+    }
+
+    #[test]
+    fn details_select_the_camera_whose_log_tells_the_error() {
+        let mut bench = bench();
+        let mut other = streaming_camera(10, 0, 30.0);
+        other.info.id = "sim:1".into();
+        bench.snapshot.cameras.push(other);
+        bench.image_mode = true;
+        let _ = bench.handle_message(Message::CameraActivity("sim:0".into()));
+        assert!(bench.logs_open && !bench.image_mode);
+        assert!(!bench.pending(Job::Select), "already selected");
+        bench.logs_open = false;
+        let _ = bench.handle_message(Message::CameraActivity("sim:1".into()));
+        assert!(bench.logs_open);
+        assert!(bench.pending_for(Job::Select, "sim:1"));
+    }
+
+    #[test]
+    fn badges_give_the_error_its_room_before_the_stall() {
+        let error = |plan: BadgePlan| plan.error;
+        // A 4-camera tile: the error's text and controls clear the actions,
+        // and the stall gives way to it.
+        let tile = BadgePlan::new(408.0, 88.0, false, true, true);
+        assert_eq!(tile.stall, None);
+        assert_eq!(error(tile), 218.0);
+        assert_eq!(
+            BadgePlan::new(408.0, 88.0, false, true, false).stall,
+            Some(true)
+        );
+        // A wide tile has room for both; a compact stage beside its scope
+        // cards would leave the error too little.
+        let wide = BadgePlan::new(710.0, 88.0, false, true, true);
+        assert_eq!(wide.stall, Some(true));
+        assert_eq!(error(wide), 350.0);
+        let compact = BadgePlan::new(355.0, 0.0, false, true, true);
+        assert_eq!(compact.stall, None);
+        assert_eq!(error(compact), 253.0);
+        // A small one: the stall's mark alone, or the error's.
+        assert_eq!(
+            BadgePlan::new(160.0, 88.0, false, true, false).stall,
+            Some(false)
+        );
+        assert!(error(BadgePlan::new(240.0, 88.0, false, false, true)) < MARK_ONLY);
+        // "Last frame" takes its room; the text never takes more than its cap.
+        let stopped = BadgePlan::new(408.0, 88.0, true, false, true);
+        assert_eq!(error(stopped), 218.0 - LAST_FRAME_ROOM);
+        assert_eq!(
+            error(BadgePlan::new(2000.0, 0.0, false, true, true)),
+            ERROR_ROOM
+        );
     }
 
     #[test]

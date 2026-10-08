@@ -1,6 +1,5 @@
 //! The multi-camera overview: every camera's image as large as the window
 //! allows, captioned over the picture, with actions on hover.
-use super::stage::stall_badge;
 use super::titlebar::fps_spark;
 use super::*;
 use crate::session::CameraSnapshot;
@@ -12,6 +11,28 @@ const GAP: f32 = 8.0;
 const MIN_TILE_HEIGHT: f32 = 140.0;
 /// Tiles narrower than this leave out the frame rate's sparkline.
 const SPARK_WIDTH: f32 = 320.0;
+/// How far a tile's badges sit in from its edges.
+const INSET: f32 = 10.0;
+/// How far a tile's actions sit in from its corner.
+const ACTIONS_INSET: f32 = 8.0;
+/// What a tile's actions take from its right edge on hover: three 24 px
+/// buttons 2 apart, on glass padded by 3, and their inset.
+const ACTIONS: f32 = 3.0 * 24.0 + 2.0 * 2.0 + 2.0 * 3.0 + ACTIONS_INSET;
+
+/// Columns and tile size for `count` images of `aspect` in `area`: as
+/// large as possible (see `layout`), unless that leaves tiles shorter than
+/// `MIN_TILE_HEIGHT`. Then as many columns of that height as fit the width,
+/// widened to fill it, and the grid scrolls.
+fn tiles(count: usize, aspect: f32, area: Size) -> (usize, Size) {
+    let (columns, tile) = layout(count, aspect, area);
+    if tile.height >= MIN_TILE_HEIGHT {
+        return (columns, tile);
+    }
+    let fit = (area.width + GAP) / (MIN_TILE_HEIGHT * aspect + GAP);
+    let columns = (fit as usize).clamp(1, count.max(1));
+    let width = ((area.width - GAP * (columns - 1) as f32) / columns as f32).max(1.0);
+    (columns, Size::new(width, width / aspect))
+}
 
 /// Columns and tile size that show `count` images of `aspect` (width over
 /// height) as large as possible in `area`.
@@ -53,12 +74,9 @@ impl Workbench {
             .map_or(4.0 / 3.0, |(_, width, height, _)| {
                 width as f32 / height.max(1) as f32
             });
-        let (columns, tile) = layout(cameras.len(), aspect, size);
-        let tile = if tile.height < MIN_TILE_HEIGHT {
-            Size::new(MIN_TILE_HEIGHT * aspect, MIN_TILE_HEIGHT)
-        } else {
-            tile
-        };
+        let (columns, tile) = tiles(cameras.len(), aspect, size);
+        let rows = cameras.len().div_ceil(columns).max(1);
+        let height = rows as f32 * tile.height + GAP * (rows - 1) as f32;
         let mut grid = column![].spacing(GAP).align_x(Alignment::Center);
         for chunk in cameras.chunks(columns) {
             let mut line = row![].spacing(GAP);
@@ -67,9 +85,14 @@ impl Workbench {
             }
             grid = grid.push(line);
         }
-        scrollable(container(grid).center_x(size.width).center_y(size.height))
-            .style(style::scroll)
-            .into()
+        // As tall as the rows, so those that do not fit scroll into view.
+        scrollable(
+            container(grid)
+                .center_x(size.width)
+                .center_y(size.height.max(height)),
+        )
+        .style(style::scroll)
+        .into()
     }
 
     /// A camera's picture with its caption, badges and, under the pointer,
@@ -107,7 +130,6 @@ impl Workbench {
         .height(Fill)
         .style(style::bare)
         .on_press(Message::Select(id.clone()));
-        let stalled = self.stalled(id);
         let mut layers = stack![
             picture,
             iced::widget::canvas(Corners {
@@ -123,22 +145,16 @@ impl Workbench {
             .align_bottom(Fill)
             .width(Fill),
         ];
-        let mut badges = row![].spacing(6).align_y(Alignment::Center);
-        // What an error's text may take beside the other badges and the
-        // tile's actions.
-        let mut room = size.width - 150.0;
-        if !camera.streaming && preview.is_some_and(|preview| preview.shown.is_some()) {
-            badges = badges.push(last_frame());
-            room -= 86.0;
-        }
-        if let Some(silent) = stalled {
-            badges = badges.push(stall_badge(silent));
-            room -= 170.0;
-        }
-        if let Some(error) = self.camera_error(id) {
-            badges = badges.push(self.error_badge(id, error, room));
-        }
-        layers = layers.push(container(badges).padding(10));
+        // The badges take the tile's width; the error's controls also keep
+        // clear of the actions, and a gap.
+        let stopped = !camera.streaming && preview.is_some_and(|preview| preview.shown.is_some());
+        layers = layers.push(self.badges(
+            id,
+            stopped,
+            size.width - 2.0 * INSET,
+            ACTIONS - INSET + GAP,
+            INSET,
+        ));
         let shown = self.tile_controls(id);
         if shown > 0.01 {
             let glass = |kind: Icon, hint: String, on: Message| {
@@ -185,23 +201,14 @@ impl Workbench {
                     .style(style::overlay(shown)),
                 )
                 .align_right(Fill)
-                .padding(8),
+                .padding(ACTIONS_INSET),
             );
         }
         let flash = self.flash(id, false);
         if flash > 0.0 {
-            let wash = !motion::reduce_motion();
-            layers = layers.push(container(space().width(Fill).height(Fill)).style(move |_| {
-                container::Style {
-                    background: wash.then(|| fade(Color::WHITE, 0.22 * flash).into()),
-                    border: iced::Border {
-                        color: fade(Color::WHITE, 0.9 * flash),
-                        width: 2.0,
-                        radius: style::RADIUS_MEDIUM.into(),
-                    },
-                    ..container::Style::default()
-                }
-            }));
+            layers = layers.push(
+                container(space().width(Fill).height(Fill)).style(style::capture_flash(flash)),
+            );
         }
         let ring = self.selection_level(id);
         if ring > 0.0 {
@@ -225,16 +232,23 @@ impl Workbench {
     fn caption<'a>(&'a self, camera: &'a CameraSnapshot, width: f32) -> Element<'a, Message> {
         let stage = style::STAGE;
         let state = self.camera_state(camera);
-        let mut name = row![one_line(
+        let twin = twin_identity(&self.snapshot.cameras, &camera.info);
+        let model = one_line(
             camera.info.model.as_str(),
             style::BODY,
             style::SEMIBOLD,
-            stage.text
-        )]
+            stage.text,
+        );
+        // For twins the identity keeps its room first, so the model they
+        // share is what gets cut.
+        let mut name = row![if twin.is_some() {
+            model.yield_room()
+        } else {
+            model
+        }]
         .spacing(7)
         .align_y(Alignment::Center);
-        // The model keeps its room first, so the identity is what gets cut.
-        if let Some(identity) = twin_identity(&self.snapshot.cameras, &camera.info) {
+        if let Some(identity) = twin {
             name = name.push(one_line(
                 identity,
                 style::SMALL,
@@ -373,5 +387,26 @@ mod tests {
         assert_eq!(columns, 2);
         assert_eq!(tile, Size::new(496.0, 496.0));
         assert_eq!(layout(1, 2.0, square).1, Size::new(1000.0, 500.0));
+    }
+
+    #[test]
+    fn tiles_too_short_take_fewer_columns_that_fill_the_width() {
+        let aspect = 4.0 / 3.0;
+        // Three columns would be 128 tall; two fill the width, and scroll.
+        let (columns, tile) = tiles(9, aspect, Size::new(528.0, 597.0));
+        assert_eq!(columns, 2);
+        assert_eq!(tile, Size::new(260.0, 195.0));
+        // Tall enough: as large as possible, as before.
+        let area = Size::new(1000.0, 1000.0);
+        assert_eq!(tiles(4, aspect, area), layout(4, aspect, area));
+        for count in 1..=16 {
+            for width in [100.0, 187.0, 400.0, 528.0, 900.0] {
+                let area = Size::new(width, 300.0);
+                let (columns, tile) = tiles(count, aspect, area);
+                let row = columns as f32 * tile.width + GAP * (columns - 1) as f32;
+                assert!(row <= width + 0.01, "{count} in {width}: {row}");
+                assert!(columns >= 1 && columns <= count);
+            }
+        }
     }
 }

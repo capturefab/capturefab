@@ -14,6 +14,9 @@ use std::collections::VecDeque;
 const WIDTH: f32 = 272.0;
 /// Width of a scope card on a small stage; see `COMPACT_STAGE`.
 const COMPACT_WIDTH: f32 = 236.0;
+/// How far the cards sit in from the stage's edges, and on a small stage.
+const PADDING: f32 = 12.0;
+const COMPACT_PADDING: f32 = 8.0;
 /// A stage narrower or shorter than this gets compact scope cards, so the
 /// picture stays in view.
 const COMPACT_STAGE: Size = Size::new(700.0, 560.0);
@@ -171,6 +174,14 @@ impl FocusMeter {
             .map(|latest| if peak > 0.0 { latest / peak } else { 0.0 })
     }
 
+    /// Chart another measure. Its verdict is judged afresh on the scores
+    /// so far, and a switch is no lock-on.
+    pub fn set_metric(&mut self, metric: Metric) {
+        self.metric = metric;
+        self.sharp =
+            self.history.len() >= SETTLE && self.share().is_some_and(|share| share >= IN_FOCUS);
+    }
+
     /// Whether the latest score is near a peak established over several
     /// frames; a lone first frame is its own peak and says nothing.
     pub fn in_focus(&self) -> bool {
@@ -226,7 +237,25 @@ fn percent(share: f32) -> String {
     }
 }
 
+/// Whether a `stage` this size gets compact scope cards.
+fn compact(stage: Size) -> bool {
+    stage.width < COMPACT_STAGE.width || stage.height < COMPACT_STAGE.height
+}
+
 impl Workbench {
+    /// The width the scope cards take from the right edge of a `stage` this
+    /// size, their padding included; 0 while none shows.
+    pub(super) fn scope_room(&self, stage: Size) -> f32 {
+        let exposure = self.exposure_slide.get(self.now) > 0.01 && self.exposure.is_some();
+        if !exposure && self.focus_slide.get(self.now) <= 0.01 {
+            0.0
+        } else if compact(stage) {
+            COMPACT_WIDTH + COMPACT_PADDING
+        } else {
+            WIDTH + PADDING
+        }
+    }
+
     /// The scope cards stacked in the stage's top right corner, compact on
     /// a small stage.
     pub(super) fn scopes(&self) -> Option<Element<'_, Message>> {
@@ -237,8 +266,7 @@ impl Workbench {
         }
         Some(
             responsive(move |stage| {
-                let compact =
-                    stage.width < COMPACT_STAGE.width || stage.height < COMPACT_STAGE.height;
+                let compact = compact(stage);
                 let mut cards = column![]
                     .spacing(if compact { 6 } else { 8 })
                     .width(if compact { COMPACT_WIDTH } else { WIDTH });
@@ -254,7 +282,7 @@ impl Workbench {
                 container(opaque(cards))
                     .align_right(Fill)
                     .align_top(Fill)
-                    .padding(if compact { 8 } else { 12 })
+                    .padding(if compact { COMPACT_PADDING } else { PADDING })
                     .into()
             })
             .into(),
@@ -1126,5 +1154,46 @@ mod tests {
         assert_eq!(score(1203.4), "1203");
         assert_eq!(score(12_345.0), "12.3k");
         assert_eq!(percent(0.0004), "<0.1%");
+    }
+
+    #[test]
+    fn switching_the_metric_judges_focus_afresh_without_a_lock_on() {
+        let mut meter = FocusMeter::new(true, DEFAULT_REGION, Metric::Tenengrad);
+        let record = |meter: &mut FocusMeter, laplacian| {
+            meter.record(Sharpness {
+                tenengrad: 40.0,
+                laplacian,
+                ..Sharpness::default()
+            })
+        };
+        // Tenengrad steady at its peak; the Laplacian well below its own.
+        record(&mut meter, 100.0);
+        for _ in 0..SETTLE {
+            record(&mut meter, 70.0);
+        }
+        assert!(meter.in_focus());
+        assert_eq!(meter.locks(), 0);
+        meter.set_metric(Metric::Laplacian);
+        assert!(!meter.in_focus(), "70% of the Laplacian's peak");
+        meter.set_metric(Metric::Tenengrad);
+        assert!(meter.in_focus());
+        assert_eq!(meter.locks(), 0, "a switch is no lock-on");
+        record(&mut meter, 70.0);
+        assert_eq!(meter.locks(), 0, "nor is the next frame");
+    }
+
+    #[test]
+    fn scope_cards_take_their_corner_only_while_shown() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        let (large, small) = (Size::new(1200.0, 800.0), Size::new(600.0, 500.0));
+        bench.exposure_slide.set(0.0);
+        bench.focus_slide.set(0.0);
+        assert_eq!(bench.scope_room(large), 0.0);
+        // A histogram with nothing to chart yet shows no card.
+        bench.exposure_slide.set(1.0);
+        assert_eq!(bench.scope_room(large), 0.0);
+        bench.focus_slide.set(1.0);
+        assert_eq!(bench.scope_room(large), WIDTH + PADDING);
+        assert_eq!(bench.scope_room(small), COMPACT_WIDTH + COMPACT_PADDING);
     }
 }

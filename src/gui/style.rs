@@ -344,6 +344,34 @@ pub fn ring(shown: f32) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
+/// The capture flash over a captured picture at full level: a white wash
+/// of this alpha, unless movement is reduced (see `flash_wash`)...
+pub const FLASH_WASH: f32 = 0.22;
+/// ...and a white edge of this alpha and width.
+pub const FLASH_EDGE: f32 = 0.9;
+pub const FLASH_WIDTH: f32 = 2.0;
+
+/// Whether the capture flash washes the picture: not while movement is
+/// reduced, so only its edge flashes.
+pub fn flash_wash() -> bool {
+    !super::motion::reduce_motion()
+}
+
+/// The capture flash over a tile at `level`; the single view draws the same
+/// over its picture.
+pub fn capture_flash(level: f32) -> impl Fn(&Theme) -> container::Style {
+    let wash = flash_wash();
+    move |_theme| container::Style {
+        background: wash.then(|| alpha(Color::WHITE, FLASH_WASH * level).into()),
+        border: Border {
+            color: alpha(Color::WHITE, FLASH_EDGE * level),
+            width: FLASH_WIDTH,
+            radius: RADIUS_MEDIUM.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 /// Dark glass behind controls that float over the image; `shown` fades it.
 /// Opaque while the system asks to reduce transparency.
 pub fn overlay(shown: f32) -> impl Fn(&Theme) -> container::Style {
@@ -789,19 +817,28 @@ pub fn input_flash(t: f32) -> impl Fn(&Theme, text_input::Status) -> text_input:
         if t <= 0.0 {
             return style;
         }
-        let p = Palette::from(theme);
-        if let Background::Color(fill) = style.background {
-            style.background = mix(fill, p.accent, 0.16 * t).into();
-        }
+        let (background, border) = glow(style.background, Palette::from(theme).accent, t);
+        style.background = background;
         if !matches!(status, text_input::Status::Focused { .. }) {
-            style.border = Border {
-                color: alpha(p.accent, 0.8 * t),
-                width: 1.5,
-                radius: RADIUS_SMALL.into(),
-            };
+            style.border = border;
         }
         style
     }
+}
+
+/// The accent glow of an accepted value at `t` over a control's `fill`:
+/// the fill tinted and an accent edge.
+fn glow(fill: Background, accent: Color, t: f32) -> (Background, Border) {
+    let fill = match fill {
+        Background::Color(fill) => mix(fill, accent, 0.16 * t).into(),
+        other => other,
+    };
+    let edge = Border {
+        color: alpha(accent, 0.8 * t),
+        width: 1.5,
+        radius: RADIUS_SMALL.into(),
+    };
+    (fill, edge)
 }
 
 pub fn pick(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
@@ -826,15 +863,7 @@ pub fn pick_flash(t: f32) -> impl Fn(&Theme, pick_list::Status) -> pick_list::St
         if t <= 0.0 {
             return style;
         }
-        let p = Palette::from(theme);
-        if let Background::Color(fill) = style.background {
-            style.background = mix(fill, p.accent, 0.16 * t).into();
-        }
-        style.border = Border {
-            color: alpha(p.accent, 0.8 * t),
-            width: 1.5,
-            radius: RADIUS_SMALL.into(),
-        };
+        (style.background, style.border) = glow(style.background, Palette::from(theme).accent, t);
         style
     }
 }
