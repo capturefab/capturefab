@@ -759,7 +759,7 @@ impl Workbench {
 
     pub(super) fn auto_card(&self, p: &'static Palette) -> Element<'_, Message> {
         let auto = self.snapshot.auto.as_ref();
-        let busy = self.auto_busy();
+        let busy = self.auto_busy_here();
         let os = Os::CURRENT;
         let camera = self.snapshot.active_camera.as_deref().unwrap_or_default();
         let switching =
