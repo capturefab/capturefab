@@ -16,7 +16,8 @@ const ANCHORED: f32 = 280.0;
 const RISE: f32 = 24.0;
 
 impl Workbench {
-    /// A connected camera before its first frame.
+    /// A connected camera before its first frame. On the first connect the
+    /// surface dims from the welcome screen's to the stage's.
     pub(super) fn ready(&self, p: &'static Palette) -> Element<'_, Message> {
         let streaming = self.snapshot.streaming;
         let mut ready = column![
@@ -59,10 +60,20 @@ impl Workbench {
                 .align_y(Alignment::Center),
             );
         }
-        container(center(ready))
+        let t = self.side.stage_in.get(self.now);
+        let surface = style::mix(p.base, p.stage, t);
+        let ready = center(ready).padding(iced::Padding {
+            top: motion::rise(16.0, t),
+            ..iced::Padding::ZERO
+        });
+        container(veil(ready, surface, 0.0, t))
             .width(Fill)
             .height(Fill)
-            .style(style::stage)
+            .style(move |_| container::Style {
+                background: Some(surface.into()),
+                text_color: Some(style::ON_STAGE),
+                ..container::Style::default()
+            })
             .into()
     }
 

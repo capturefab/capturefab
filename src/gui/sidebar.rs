@@ -74,6 +74,11 @@ pub(super) struct SideState {
     hint: (String, Option<String>),
     /// When the address last changed.
     typed_at: Option<Instant>,
+    /// Whether a camera was connected at the last tick.
+    had_camera: bool,
+    /// The stage dimming from the welcome screen's surface to its own as the
+    /// first camera connects.
+    pub(super) stage_in: Motion,
 }
 
 impl Default for SideState {
@@ -88,13 +93,15 @@ impl Default for SideState {
             shakes: Flashes::new(SHAKE),
             hint: (String::new(), None),
             typed_at: None,
+            had_camera: false,
+            stage_in: Motion::new(1.0, motion::IMAGE, motion::IMAGE_OUT, Kind::Fade),
         }
     }
 }
 
 impl SideState {
     super::motion::registry! {
-        motions: [],
+        motions: [stage_in],
         flashes: [arrived, shakes],
     }
 
@@ -183,6 +190,12 @@ impl Workbench {
             side.arrived.hit(ISSUES.to_owned(), now);
         }
         side.had_issues = issues;
+        // The stage dims in as the first camera connects.
+        let connected = self.observed_camera.is_some();
+        if connected && !side.had_camera {
+            side.stage_in.replay(0.0, 1.0, now);
+        }
+        side.had_camera = connected;
     }
 
     /// A command finished, after the shared bookkeeping (`finished`,
@@ -1115,6 +1128,24 @@ mod tests {
         bench.now += ARRIVE;
         bench.tick_side();
         assert_eq!(bench.side.arrival(ISSUES, bench.now), 1.0, "only once");
+    }
+
+    #[test]
+    fn the_stage_dims_in_on_the_first_connect_and_settles() {
+        let mut bench = bench();
+        let start = bench.now;
+        bench.tick_side();
+        assert_eq!(bench.side.stage_in.get(start), 1.0, "at rest");
+        bench.observed_camera = Some("sim:0".into());
+        bench.tick_side();
+        assert_eq!(bench.side.stage_in.get(start), 0.0);
+        assert!(bench.side.stage_in.animating(start + motion::IMAGE / 2));
+        assert_eq!(bench.side.stage_in.get(start + motion::IMAGE), 1.0);
+        // Another camera, or the same one again, does not dim it again.
+        bench.now = start + motion::IMAGE;
+        bench.observed_camera = Some("sim:1".into());
+        bench.tick_side();
+        assert!(!bench.side.stage_in.animating(bench.now));
     }
 
     #[test]
