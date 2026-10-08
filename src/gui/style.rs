@@ -29,11 +29,18 @@ pub struct Palette {
     pub stage: Color,
     pub hairline: Color,
     pub text: Color,
+    /// Text that informs: hints, captions, values. At least 4.5:1 on the base.
     pub secondary: Color,
+    /// Marks that are not text: placeholders, disabled labels, chevrons and
+    /// decorative icons. Below 4.5:1 (light 3.3:1 on the base, 3.0:1 on the
+    /// sidebar), so text that informs uses `secondary`.
     pub tertiary: Color,
+    /// Rings, checks, sliders and icons.
     pub accent: Color,
     /// Accent for text and small marks; darker in light mode for contrast.
     pub accent_text: Color,
+    /// Filled buttons with white labels, deep enough for 4.5:1.
+    pub accent_fill: Color,
     pub accent_soft: Color,
     pub live: Color,
     pub warn: Color,
@@ -56,6 +63,7 @@ pub const LIGHT: Palette = Palette {
     tertiary: rgb(0x8E8E93),
     accent: rgb(0x2F7BF5),
     accent_text: rgb(0x1F6AE0),
+    accent_fill: rgb(0x2670E8),
     accent_soft: alpha(rgb(0x2F7BF5), 0.12),
     live: rgb(0x248A3D),
     warn: rgb(0xC93400),
@@ -78,6 +86,7 @@ pub const DARK: Palette = Palette {
     tertiary: rgb(0x7C7C83),
     accent: rgb(0x4C8DF8),
     accent_text: rgb(0x6AA1FA),
+    accent_fill: rgb(0x2971E6),
     accent_soft: alpha(rgb(0x4C8DF8), 0.18),
     live: rgb(0x32D158),
     warn: rgb(0xFF9F0A),
@@ -86,6 +95,13 @@ pub const DARK: Palette = Palette {
     shadow: alpha(rgb(0x000000), 0.45),
 };
 
+/// Everything drawn on the stage and its glass: tiles, captions, overlays and
+/// the controls floating over the image. The stage is dark in both appearances.
+pub const STAGE: &Palette = &DARK;
+
+/// The strongest tint text sits on: a hovered pill or button.
+const TINT: f32 = 0.22;
+
 impl Palette {
     pub fn of(dark: bool) -> &'static Palette {
         if dark { &DARK } else { &LIGHT }
@@ -93,6 +109,49 @@ impl Palette {
     fn from(theme: &Theme) -> &'static Palette {
         Self::of(theme.extended_palette().is_dark)
     }
+
+    /// `color` for text and icons on a 12–22% tint of itself, like a status
+    /// pill or the danger button: deepened (light) or lightened (dark) just
+    /// enough to read at 4.5:1 over the base and the sidebar.
+    pub fn ink(&self, color: Color) -> Color {
+        let toward = if self.dark {
+            Color::WHITE
+        } else {
+            Color::BLACK
+        };
+        let tint = Color { a: 1.0, ..color };
+        let grounds = [self.base, self.sidebar].map(|surface| luminance(mix(surface, tint, TINT)));
+        let mut amount = 0.0;
+        loop {
+            let ink = Color {
+                a: color.a,
+                ..mix(tint, toward, amount)
+            };
+            let lum = luminance(ink);
+            if amount >= 0.6 || grounds.iter().all(|&ground| contrast(lum, ground) >= 4.5) {
+                return ink;
+            }
+            amount += 0.02;
+        }
+    }
+}
+
+/// WCAG relative luminance of an sRGB color. The renderer blends in sRGB
+/// (iced's `web-colors`), so composites are mixed in the same space.
+fn luminance(color: Color) -> f32 {
+    let channel = |c: f32| {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+}
+
+/// WCAG contrast ratio between two relative luminances.
+fn contrast(a: f32, b: f32) -> f32 {
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
 /// The iced theme for an appearance; widgets left unstyled still match.
@@ -164,9 +223,16 @@ pub const BODY: f32 = 13.0;
 pub const SMALL: f32 = 12.0;
 pub const CAPTION: f32 = 11.0;
 
-/// Controls; sheets, overlays and tiles use `RADIUS_LARGE`.
+/// Corner radii. Fields, plain and glass buttons, segments, tooltips and code.
+pub const RADIUS_SMALL: f32 = 6.0;
+/// Buttons, list rows, menus and segment tracks.
 pub const RADIUS: f32 = 8.0;
+/// Tiles, the selection ring, wells and cards.
+pub const RADIUS_MEDIUM: f32 = 10.0;
+/// Glass overlays floating over the stage.
 pub const RADIUS_LARGE: f32 = 12.0;
+/// Sheets.
+pub const RADIUS_SHEET: f32 = 14.0;
 
 /// Text on the stage and its overlays, which are dark in both appearances.
 pub const ON_STAGE: Color = rgb(0xF5F5F7);
@@ -191,7 +257,8 @@ fn track(p: &Palette) -> Color {
     if p.dark { rgb(0x4A4A50) } else { rgb(0xD2D2D7) }
 }
 
-fn mix(a: Color, b: Color, t: f32) -> Color {
+/// `a` moved toward `b` by `t`, alpha included.
+pub fn mix(a: Color, b: Color, t: f32) -> Color {
     Color {
         r: a.r + (b.r - a.r) * t,
         g: a.g + (b.g - a.g) * t,
@@ -226,7 +293,7 @@ pub fn tile(theme: &Theme) -> container::Style {
     let p = Palette::from(theme);
     container::Style {
         background: Some(p.stage.into()),
-        border: border(10.0),
+        border: border(RADIUS_MEDIUM),
         text_color: Some(ON_STAGE),
         ..container::Style::default()
     }
@@ -238,7 +305,7 @@ pub fn ring(shown: f32) -> impl Fn(&Theme) -> container::Style {
         border: Border {
             color: alpha(Palette::from(theme).accent, shown),
             width: 2.5,
-            radius: 10.0.into(),
+            radius: RADIUS_MEDIUM.into(),
         },
         ..container::Style::default()
     }
@@ -246,10 +313,16 @@ pub fn ring(shown: f32) -> impl Fn(&Theme) -> container::Style {
 
 /// Dark glass behind controls that float over the image; `shown` fades it.
 pub fn overlay(shown: f32) -> impl Fn(&Theme) -> container::Style {
+    glass(shown, false)
+}
+
+/// `overlay`, opaque when `solid`, for Reduce Transparency.
+pub fn glass(shown: f32, solid: bool) -> impl Fn(&Theme) -> container::Style {
+    let (fill, edge) = if solid { (1.0, 0.14) } else { (0.78, 0.08) };
     move |_theme| container::Style {
-        background: Some(alpha(rgb(0x1C1C1E), 0.78 * shown).into()),
+        background: Some(alpha(rgb(0x1C1C1E), fill * shown).into()),
         border: Border {
-            color: alpha(Color::WHITE, 0.08 * shown),
+            color: alpha(Color::WHITE, edge * shown),
             width: 1.0,
             radius: RADIUS_LARGE.into(),
         },
@@ -271,7 +344,7 @@ pub fn caption(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Gradient(fade.into())),
         border: Border {
-            radius: border::Radius::default().bottom(10.0),
+            radius: border::Radius::default().bottom(RADIUS_MEDIUM),
             ..Border::default()
         },
         text_color: Some(ON_STAGE),
@@ -281,11 +354,23 @@ pub fn caption(_theme: &Theme) -> container::Style {
 
 /// A rounded status label tinted with `color`, like "Streaming".
 pub fn pill(color: Color) -> impl Fn(&Theme) -> container::Style {
-    move |_theme| container::Style {
+    move |theme| container::Style {
         background: Some(alpha(color, 0.14).into()),
         border: border(999.0),
-        text_color: Some(color),
+        text_color: Some(Palette::from(theme).ink(color)),
         ..container::Style::default()
+    }
+}
+
+/// A fade from clear to `surface` across a strip at the end of clipped
+/// content, left to right.
+#[allow(dead_code)] // adopted by the area packages
+pub fn edge_fade(surface: Color) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| {
+        let fade = iced::gradient::Linear::new(std::f32::consts::FRAC_PI_2)
+            .add_stop(0.0, alpha(surface, 0.0))
+            .add_stop(1.0, surface);
+        container::Style::default().background(Background::Gradient(fade.into()))
     }
 }
 
@@ -294,7 +379,7 @@ pub fn well(theme: &Theme) -> container::Style {
     let p = Palette::from(theme);
     container::Style {
         background: Some(if p.dark { p.field } else { rgb(0xF7F7F9) }.into()),
-        border: border(10.0),
+        border: border(RADIUS_MEDIUM),
         ..container::Style::default()
     }
 }
@@ -303,7 +388,7 @@ pub fn code(theme: &Theme) -> container::Style {
     let p = Palette::from(theme);
     container::Style {
         background: Some(p.field.into()),
-        border: border(6.0),
+        border: border(RADIUS_SMALL),
         text_color: Some(p.text),
         ..container::Style::default()
     }
@@ -334,7 +419,7 @@ pub fn sheet(theme: &Theme) -> container::Style {
             } else {
                 Color::TRANSPARENT
             },
-            14.0,
+            RADIUS_SHEET,
         ),
         shadow: Shadow {
             color: p.shadow,
@@ -355,7 +440,7 @@ pub fn tooltip(theme: &Theme) -> container::Style {
     let p = Palette::from(theme);
     container::Style {
         background: Some(if p.dark { rgb(0x3A3A3E) } else { rgb(0x2C2C2E) }.into()),
-        border: border(6.0),
+        border: border(RADIUS_SMALL),
         text_color: Some(rgb(0xF5F5F7)),
         shadow: Shadow {
             color: alpha(p.shadow, 0.2),
@@ -377,12 +462,27 @@ pub fn badge(theme: &Theme) -> container::Style {
     }
 }
 
-/// The selected segment of a segmented control.
+/// The groove of a segmented control.
 pub fn segment_track(theme: &Theme) -> container::Style {
     let p = Palette::from(theme);
     container::Style {
         background: Some(if p.dark { p.field } else { rgb(0xEDEDF0) }.into()),
-        border: border(8.0),
+        border: border(RADIUS),
+        ..container::Style::default()
+    }
+}
+
+/// The raised thumb marking a segmented control's selection.
+pub fn segment_thumb(theme: &Theme) -> container::Style {
+    let p = Palette::from(theme);
+    container::Style {
+        background: Some(if p.dark { rgb(0x4A4A50) } else { p.base }.into()),
+        border: border(RADIUS_SMALL),
+        shadow: Shadow {
+            color: alpha(Color::BLACK, if p.dark { 0.3 } else { 0.1 }),
+            offset: Vector::new(0.0, 1.0),
+            blur_radius: 2.0,
+        },
         ..container::Style::default()
     }
 }
@@ -401,10 +501,10 @@ fn button_base(background: Option<Color>, text: Color, radius: f32) -> button::S
 pub fn primary(theme: &Theme, status: button::Status) -> button::Style {
     let p = Palette::from(theme);
     let fill = match status {
-        button::Status::Active => p.accent,
-        button::Status::Hovered => mix(p.accent, Color::BLACK, 0.08),
-        button::Status::Pressed => mix(p.accent, Color::BLACK, 0.16),
-        button::Status::Disabled => alpha(p.accent, 0.35),
+        button::Status::Active => p.accent_fill,
+        button::Status::Hovered => mix(p.accent_fill, Color::BLACK, 0.08),
+        button::Status::Pressed => mix(p.accent_fill, Color::BLACK, 0.16),
+        button::Status::Disabled => alpha(p.accent_fill, 0.35),
     };
     let mut style = button_base(Some(fill), Color::WHITE, RADIUS);
     if status == button::Status::Disabled {
@@ -413,10 +513,15 @@ pub fn primary(theme: &Theme, status: button::Status) -> button::Style {
     style
 }
 
+/// The resting fill of `secondary` buttons.
+fn gray(p: &Palette) -> Color {
+    if p.dark { p.selected } else { rgb(0xECECEF) }
+}
+
 /// A gray, borderless button for secondary actions.
 pub fn secondary(theme: &Theme, status: button::Status) -> button::Style {
     let p = Palette::from(theme);
-    let rest = if p.dark { p.selected } else { rgb(0xECECEF) };
+    let rest = gray(p);
     let fill = match status {
         button::Status::Active | button::Status::Disabled => rest,
         button::Status::Hovered => mix(rest, p.text, 0.06),
@@ -430,14 +535,30 @@ pub fn secondary(theme: &Theme, status: button::Status) -> button::Style {
     button_base(Some(fill), text, RADIUS)
 }
 
+/// Stopping acquisition: a `secondary` button, tinted red only while hovered
+/// or pressed. Routine, not destructive, so the caller adds a `danger` glyph
+/// and keeps the label in the text color.
+#[allow(dead_code)] // adopted by the area packages
+pub fn stop(theme: &Theme, status: button::Status) -> button::Style {
+    let p = Palette::from(theme);
+    let mut style = secondary(theme, status);
+    let tint = match status {
+        button::Status::Hovered => 0.12,
+        button::Status::Pressed => 0.2,
+        _ => return style,
+    };
+    style.background = Some(mix(gray(p), p.danger, tint).into());
+    style
+}
+
 /// Text or an icon with no chrome until hovered.
 pub fn plain(theme: &Theme, status: button::Status) -> button::Style {
     let p = Palette::from(theme);
     match status {
-        button::Status::Active => button_base(None, p.secondary, 6.0),
-        button::Status::Hovered => button_base(Some(p.hover), p.text, 6.0),
-        button::Status::Pressed => button_base(Some(p.selected), p.text, 6.0),
-        button::Status::Disabled => button_base(None, p.tertiary, 6.0),
+        button::Status::Active => button_base(None, p.secondary, RADIUS_SMALL),
+        button::Status::Hovered => button_base(Some(p.hover), p.text, RADIUS_SMALL),
+        button::Status::Pressed => button_base(Some(p.selected), p.text, RADIUS_SMALL),
+        button::Status::Disabled => button_base(None, p.tertiary, RADIUS_SMALL),
     }
 }
 
@@ -445,10 +566,12 @@ pub fn plain(theme: &Theme, status: button::Status) -> button::Style {
 pub fn link(theme: &Theme, status: button::Status) -> button::Style {
     let p = Palette::from(theme);
     match status {
-        button::Status::Active => button_base(None, p.accent_text, 6.0),
-        button::Status::Hovered => button_base(Some(p.accent_soft), p.accent_text, 6.0),
-        button::Status::Pressed => button_base(Some(alpha(p.accent, 0.24)), p.accent_text, 6.0),
-        button::Status::Disabled => button_base(None, p.tertiary, 6.0),
+        button::Status::Active => button_base(None, p.accent_text, RADIUS_SMALL),
+        button::Status::Hovered => button_base(Some(p.accent_soft), p.ink(p.accent), RADIUS_SMALL),
+        button::Status::Pressed => {
+            button_base(Some(alpha(p.accent, 0.24)), p.ink(p.accent), RADIUS_SMALL)
+        }
+        button::Status::Disabled => button_base(None, p.tertiary, RADIUS_SMALL),
     }
 }
 
@@ -461,18 +584,19 @@ pub fn card(theme: &Theme, status: button::Status) -> button::Style {
         _ => (rest, p.hairline),
     };
     button::Style {
-        border: hairline(edge, 10.0),
-        ..button_base(Some(fill), p.text, 10.0)
+        border: hairline(edge, RADIUS_MEDIUM),
+        ..button_base(Some(fill), p.text, RADIUS_MEDIUM)
     }
 }
 
 pub fn danger(theme: &Theme, status: button::Status) -> button::Style {
     let p = Palette::from(theme);
     let soft = alpha(p.danger, 0.12);
+    let ink = p.ink(p.danger);
     match status {
-        button::Status::Active => button_base(Some(soft), p.danger, RADIUS),
-        button::Status::Hovered => button_base(Some(alpha(p.danger, 0.18)), p.danger, RADIUS),
-        button::Status::Pressed => button_base(Some(alpha(p.danger, 0.26)), p.danger, RADIUS),
+        button::Status::Active => button_base(Some(soft), ink, RADIUS),
+        button::Status::Hovered => button_base(Some(alpha(p.danger, 0.18)), ink, RADIUS),
+        button::Status::Pressed => button_base(Some(alpha(p.danger, 0.26)), ink, RADIUS),
         button::Status::Disabled => button_base(Some(soft), p.tertiary, RADIUS),
     }
 }
@@ -498,7 +622,7 @@ pub fn segment(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Sty
             let mut style = button_base(
                 Some(if p.dark { rgb(0x4A4A50) } else { p.base }),
                 p.text,
-                6.0,
+                RADIUS_SMALL,
             );
             style.shadow = Shadow {
                 color: alpha(Color::BLACK, if p.dark { 0.3 } else { 0.1 }),
@@ -512,16 +636,34 @@ pub fn segment(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Sty
                 button::Status::Disabled => p.tertiary,
                 button::Status::Active => p.secondary,
             };
-            button_base(None, text, 6.0)
+            button_base(None, text, RADIUS_SMALL)
         }
+    }
+}
+
+/// A label of a `widgets::segmented` control, over its sliding thumb. `lit`
+/// is how much of the thumb sits under it, from 0 to 1, which brings its text
+/// from `secondary` up to `text`.
+pub fn segment_label(lit: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let p = Palette::from(theme);
+        let text = match status {
+            button::Status::Hovered | button::Status::Pressed => p.text,
+            button::Status::Disabled => mix(p.tertiary, p.text, lit),
+            button::Status::Active => mix(p.secondary, p.text, lit),
+        };
+        button_base(None, text, RADIUS_SMALL)
     }
 }
 
 /// An icon or text button on dark glass; `shown` fades it with its overlay.
 pub fn on_glass(active: bool, shown: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |theme, status| {
-        let p = Palette::from(theme);
-        let rest = if active { p.accent } else { ON_STAGE_SECONDARY };
+    move |_theme, status| {
+        let rest = if active {
+            STAGE.accent
+        } else {
+            ON_STAGE_SECONDARY
+        };
         let (fill, text) = match status {
             button::Status::Active => (None, rest),
             button::Status::Hovered => (Some(alpha(Color::WHITE, 0.12)), ON_STAGE),
@@ -531,7 +673,7 @@ pub fn on_glass(active: bool, shown: f32) -> impl Fn(&Theme, button::Status) -> 
         button_base(
             fill.map(|fill| alpha(fill, fill.a * shown)),
             alpha(text, text.a * shown),
-            6.0,
+            RADIUS_SMALL,
         )
     }
 }
@@ -546,7 +688,7 @@ pub fn glass_segment(
             button_base(
                 Some(alpha(Color::WHITE, 0.2 * shown)),
                 alpha(ON_STAGE, shown),
-                6.0,
+                RADIUS_SMALL,
             )
         } else {
             on_glass(false, shown)(theme, status)
@@ -566,7 +708,7 @@ pub fn toggle(on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
             button::Status::Pressed => alpha(p.accent, 0.28),
             _ => p.accent_soft,
         };
-        button_base(Some(fill), p.accent_text, RADIUS)
+        button_base(Some(fill), p.ink(p.accent), RADIUS)
     }
 }
 
@@ -583,10 +725,10 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
         text_input::Status::Focused { .. } => Border {
             color: alpha(p.accent, 0.8),
             width: 1.5,
-            radius: 6.0.into(),
+            radius: RADIUS_SMALL.into(),
         },
-        text_input::Status::Hovered => hairline(p.hairline, 6.0),
-        _ => hairline(Color::TRANSPARENT, 6.0),
+        text_input::Status::Hovered => hairline(p.hairline, RADIUS_SMALL),
+        _ => hairline(Color::TRANSPARENT, RADIUS_SMALL),
     };
     text_input::Style {
         background: if matches!(status, text_input::Status::Focused { .. }) {
@@ -614,9 +756,44 @@ pub fn input_invalid(theme: &Theme, status: text_input::Status) -> text_input::S
         border: Border {
             color: p.danger,
             width: 1.5,
-            radius: 6.0.into(),
+            radius: RADIUS_SMALL.into(),
         },
         ..input(theme, status)
+    }
+}
+
+/// A field holding an edit that has not been applied yet.
+#[allow(dead_code)] // adopted by the area packages
+pub fn input_dirty(theme: &Theme, status: text_input::Status) -> text_input::Style {
+    let p = Palette::from(theme);
+    let mut style = input(theme, status);
+    if !matches!(status, text_input::Status::Focused { .. }) {
+        style.border = hairline(alpha(p.accent, 0.7), RADIUS_SMALL);
+    }
+    style
+}
+
+/// A field acknowledging an accepted value: an accent glow that fades out as
+/// `t` goes from 1 to 0.
+#[allow(dead_code)] // adopted by the area packages
+pub fn input_flash(t: f32) -> impl Fn(&Theme, text_input::Status) -> text_input::Style {
+    move |theme, status| {
+        let mut style = input(theme, status);
+        if t <= 0.0 {
+            return style;
+        }
+        let p = Palette::from(theme);
+        if let Background::Color(fill) = style.background {
+            style.background = mix(fill, p.accent, 0.16 * t).into();
+        }
+        if !matches!(status, text_input::Status::Focused { .. }) {
+            style.border = Border {
+                color: alpha(p.accent, 0.8 * t),
+                width: 1.5,
+                radius: RADIUS_SMALL.into(),
+            };
+        }
+        style
     }
 }
 
@@ -631,7 +808,7 @@ pub fn pick(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
             _ => p.hover,
         }
         .into(),
-        border: hairline(Color::TRANSPARENT, 6.0),
+        border: hairline(Color::TRANSPARENT, RADIUS_SMALL),
     }
 }
 
@@ -639,7 +816,7 @@ pub fn menu(theme: &Theme) -> menu::Style {
     let p = Palette::from(theme);
     menu::Style {
         background: if p.dark { rgb(0x2E2E32) } else { p.base }.into(),
-        border: hairline(p.hairline, 8.0),
+        border: hairline(p.hairline, RADIUS),
         text_color: p.text,
         selected_text_color: Color::WHITE,
         selected_background: p.accent.into(),
@@ -757,5 +934,84 @@ pub fn scroll(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
             shadow: Shadow::default(),
             icon: p.secondary,
         },
+    }
+}
+
+/// `scroll` for sheets: a faint scroller stays visible at rest whenever the
+/// content overflows, so it is clear there is more below.
+pub fn sheet_scroll(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
+    let mut style = scroll(theme, status);
+    if let scrollable::Status::Active {
+        is_vertical_scrollbar_disabled: false,
+        ..
+    } = status
+    {
+        style.vertical_rail.scroller.background =
+            alpha(Palette::from(theme).secondary, 0.22).into();
+    }
+    style
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `color` laid over `surface` at `amount`, as the renderer blends it.
+    fn tint(color: Color, amount: f32, surface: Color) -> Color {
+        mix(surface, Color { a: 1.0, ..color }, amount)
+    }
+
+    fn ratio(a: Color, b: Color) -> f32 {
+        contrast(luminance(a), luminance(b))
+    }
+
+    #[test]
+    fn contrast_follows_wcag() {
+        assert!((ratio(Color::WHITE, Color::BLACK) - 21.0).abs() < 0.01);
+        assert!((ratio(rgb(0x777777), Color::WHITE) - 4.48).abs() < 0.01);
+    }
+
+    #[test]
+    fn ink_reads_on_tints_of_its_color() {
+        for p in [&LIGHT, &DARK] {
+            for color in [p.live, p.warn, p.danger, p.accent, p.accent_text] {
+                let ink = p.ink(color);
+                for surface in [p.base, p.sidebar] {
+                    for amount in [0.0, 0.12, 0.14, 0.18, 0.22] {
+                        let r = ratio(ink, tint(color, amount, surface));
+                        assert!(r >= 4.5, "{color:?} at {amount} (dark {}): {r:.2}", p.dark);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ink_keeps_colors_that_already_read() {
+        assert_eq!(DARK.ink(DARK.live), DARK.live);
+        assert_eq!(DARK.ink(DARK.warn), DARK.warn);
+        let faded = Color {
+            a: 0.5,
+            ..LIGHT.danger
+        };
+        assert_eq!(LIGHT.ink(faded).a, 0.5);
+    }
+
+    #[test]
+    fn white_reads_on_filled_buttons() {
+        for p in [&LIGHT, &DARK] {
+            let r = ratio(Color::WHITE, p.accent_fill);
+            assert!(r >= 4.5, "dark {}: {r:.2}", p.dark);
+        }
+    }
+
+    #[test]
+    fn secondary_text_reads_on_panels() {
+        for p in [&LIGHT, &DARK] {
+            for surface in [p.base, p.sidebar] {
+                let r = ratio(p.secondary, surface);
+                assert!(r >= 4.5, "dark {}: {r:.2}", p.dark);
+            }
+        }
     }
 }

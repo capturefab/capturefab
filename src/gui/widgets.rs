@@ -1,9 +1,16 @@
 //! Small building blocks shared by the views.
 use super::*;
+use iced::widget::{Row, Stack, column};
 
 pub(super) use super::oneline::one_line;
 
-/// Tooltip in the workbench style.
+/// Room a sheet's pinned header takes: padding around the title row.
+const SHEET_HEADER: f32 = 24.0 + 29.0 + 14.0;
+/// Room a sheet's pinned footer takes: hairline, padding and a button row.
+const SHEET_FOOTER: f32 = 1.0 + 12.0 + 32.0 + 12.0;
+/// Inset of a sheet's content from its edges.
+const SHEET_INSET: f32 = 24.0;
+
 pub(super) fn focus_address() -> Task<Message> {
     Task::batch([
         operation::focus("connect-address"),
@@ -11,20 +18,67 @@ pub(super) fn focus_address() -> Task<Message> {
     ])
 }
 
+/// Tooltip in the workbench style, opening below `content`.
 pub(super) fn tip<'a, M: 'a>(
     content: impl Into<Element<'a, M>>,
     tip: impl ToString,
 ) -> Element<'a, M> {
+    tip_at(content, tip, tooltip::Position::Bottom)
+}
+
+/// Tooltip opening above `content`, for controls along the window's bottom
+/// edge, where one below would land on the control itself.
+#[allow(dead_code)] // adopted by the area packages
+pub(super) fn tip_above<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    tip: impl ToString,
+) -> Element<'a, M> {
+    tip_at(content, tip, tooltip::Position::Top)
+}
+
+/// Tooltip at `position`. Long text wraps at 360 px.
+pub(super) fn tip_at<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    tip: impl ToString,
+    position: tooltip::Position,
+) -> Element<'a, M> {
     tooltip(
         content,
         container(text(tip.to_string()).size(style::SMALL))
+            .max_width(360)
             .padding([5, 9])
             .style(style::tooltip),
-        tooltip::Position::Bottom,
+        position,
     )
     .gap(6)
     .delay(Duration::from_millis(500))
     .into()
+}
+
+/// `content` under a fill of `surface` at `1 - t`, so it seems to fade in as
+/// `t` goes from 0 to 1. Only for content on an opaque `surface` of exactly
+/// that color; `radius` matches its corners. The fill takes no input, and
+/// `content` keeps its widget state (focus, scrolling) through the fade.
+#[allow(dead_code)] // adopted by the area packages
+pub(super) fn veil<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    surface: Color,
+    radius: f32,
+    t: f32,
+) -> Element<'a, M> {
+    let veiled = Stack::new().push(content);
+    if t >= 0.999 {
+        return veiled.into();
+    }
+    veiled
+        .push(
+            container(space().width(Fill).height(Fill)).style(move |_| container::Style {
+                background: Some(fade(surface, 1.0 - t.max(0.0)).into()),
+                border: iced::border::rounded(radius),
+                ..container::Style::default()
+            }),
+        )
+        .into()
 }
 
 pub(super) fn checkbox<'a, M: 'a>(
@@ -79,12 +133,12 @@ pub(super) fn heading<'a, M: 'a>(title: &'a str, p: &'static Palette) -> Element
     .into()
 }
 
-pub(super) fn disclosure<'a>(
+pub(super) fn disclosure<'a, M: Clone + 'a>(
     title: String,
     open: bool,
-    on: Message,
+    on: M,
     p: &'static Palette,
-) -> Element<'a, Message> {
+) -> Element<'a, M> {
     button(
         row![
             icon(
@@ -122,6 +176,25 @@ pub(super) fn field<'a>(
     ]
     .spacing(10)
     .align_y(Alignment::Center)
+    .into()
+}
+
+/// An error caption under the field it concerns. Pair it with
+/// `style::input_invalid` on the field.
+#[allow(dead_code)] // adopted by the area packages
+pub(super) fn field_error<'a, M: 'a>(
+    message: impl text::IntoFragment<'a>,
+    p: &'static Palette,
+) -> Element<'a, M> {
+    let ink = p.ink(p.danger);
+    row![
+        // Centered on the first line, should the message wrap.
+        container(icon(Icon::Warning, 11.0, ink))
+            .height(Length::Fixed(style::CAPTION * 1.3))
+            .align_y(Alignment::Center),
+        text(message).size(style::CAPTION).color(ink),
+    ]
+    .spacing(5)
     .into()
 }
 
@@ -193,6 +266,60 @@ pub(super) fn segment<'a>(
     .into()
 }
 
+/// A segmented control of equal segments, each a label, its message (`None`
+/// disables it) and a hint (empty for none). One thumb marks the selection at
+/// `thumb`, a segment index the caller animates: whole numbers at rest,
+/// fractions while sliding. Labels keep one weight, so nothing reflows, and
+/// brighten as the thumb passes under them.
+#[allow(dead_code)] // adopted by the area packages
+pub(super) fn segmented<'a, M: Clone + 'a>(
+    items: Vec<(&'a str, Option<M>, String)>,
+    thumb: f32,
+) -> Element<'a, M> {
+    let last = items.len().saturating_sub(1) as f32;
+    let thumb = thumb.clamp(0.0, last);
+    // Spacers on either side place the thumb; a zero portion would not be
+    // fluid at all, so it is left out.
+    let before = (thumb * 1000.0).round() as u16;
+    let after = (last * 1000.0).round() as u16 - before;
+    let mut slide = row![];
+    if before > 0 {
+        slide = slide.push(space().width(Length::FillPortion(before)));
+    }
+    slide = slide.push(
+        container(space())
+            .width(Length::FillPortion(1000))
+            .height(Fill)
+            .style(style::segment_thumb),
+    );
+    if after > 0 {
+        slide = slide.push(space().width(Length::FillPortion(after)));
+    }
+    let labels = Row::with_children(items.into_iter().enumerate().map(|(i, (label, on, hint))| {
+        let lit = (1.0 - (thumb - i as f32).abs()).max(0.0);
+        let segment = button(
+            text(label)
+                .size(style::SMALL)
+                .font(style::MEDIUM)
+                .width(Fill)
+                .align_x(Alignment::Center),
+        )
+        .width(Fill)
+        .padding([4, 12])
+        .style(style::segment_label(lit))
+        .on_press_maybe(on);
+        if hint.is_empty() {
+            segment.into()
+        } else {
+            tip(segment, hint)
+        }
+    }));
+    container(Stack::new().push(labels).push_under(slide))
+        .padding(2)
+        .style(style::segment_track)
+        .into()
+}
+
 pub(super) fn icon_button<'a>(
     kind: Icon,
     size: f32,
@@ -260,6 +387,65 @@ pub(super) fn modal<'a>(
         }),
     ]
     .into()
+}
+
+/// The frame every sheet shares: a pinned header with `mark`, `title` and a
+/// close button sending `close`, then `body`, scrolling with a visible
+/// scroller once it overflows, then an optional pinned `footer` for actions
+/// under a hairline. The whole sheet stays within `max_height`, so derive
+/// that from the window height. Goes inside `modal`, which keeps the focus
+/// scope.
+#[allow(dead_code, clippy::too_many_arguments)] // adopted by the area packages
+pub(super) fn sheet_frame<'a, M: Clone + 'a>(
+    title: &'a str,
+    mark: Option<Icon>,
+    close: M,
+    body: Element<'a, M>,
+    footer: Option<Element<'a, M>>,
+    width: f32,
+    max_height: f32,
+    p: &'static Palette,
+) -> Element<'a, M> {
+    let mut head = row![].spacing(10).align_y(Alignment::Center);
+    if let Some(mark) = mark {
+        head = head.push(icon(mark, 24.0, p.accent));
+    }
+    let head = head
+        .push(text(title).size(style::DISPLAY).font(style::BOLD))
+        .push(space::horizontal())
+        .push(tip(
+            button(icon(Icon::Close, 14.0, p.secondary))
+                .padding(6)
+                .style(style::plain)
+                .on_press(close),
+            Action::Overview.hint("Close", Os::CURRENT),
+        ));
+    let room = max_height - SHEET_HEADER - if footer.is_some() { SHEET_FOOTER } else { 0.0 };
+    let body = scrollable(container(body).width(Fill).padding(iced::Padding {
+        top: 0.0,
+        right: SHEET_INSET,
+        bottom: SHEET_INSET,
+        left: SHEET_INSET,
+    }))
+    .width(Fill)
+    .style(style::sheet_scroll);
+    let mut sheet = column![
+        container(head).padding(iced::Padding {
+            top: SHEET_INSET,
+            right: SHEET_INSET,
+            bottom: 14.0,
+            left: SHEET_INSET,
+        }),
+        // Capped explicitly: a shrinking scrollable would otherwise take the
+        // footer's room too.
+        container(body).max_height(room.max(120.0)),
+    ];
+    if let Some(footer) = footer {
+        sheet = sheet
+            .push(rule::horizontal(1).style(style::line))
+            .push(container(footer).width(Fill).padding([12.0, SHEET_INSET]));
+    }
+    container(sheet).width(width).style(style::sheet).into()
 }
 
 /// `history` as a sparkline of `width` × `height`, explained by `about` on
