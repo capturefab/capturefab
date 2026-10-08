@@ -2157,6 +2157,8 @@ impl Workbench {
         } else {
             self.single_view(p)
         };
+        // Always a stack, so the hint coming and going keeps the views' state.
+        let content = stack![content, self.image_hint()];
         let bars = self.bars.get(self.now);
         let mut main = column![content];
         let activity = self.activity_slide.lerp(0.0, 171.0, self.now) * bars;
