@@ -10,6 +10,7 @@ mod keys;
 mod liveness;
 mod motion;
 mod notice;
+mod oneline;
 mod prefs;
 mod preview;
 mod refresh;
