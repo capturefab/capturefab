@@ -913,16 +913,16 @@ impl Workbench {
                     } else {
                         icon(Icon::Copy, 13.0, p.secondary)
                     },
-                    one_line(
-                        if copied {
-                            "Copied".to_owned()
-                        } else {
-                            format!("session {}", self.session)
-                        },
-                        style::CAPTION,
-                        style::MONO,
-                        p.secondary,
-                    ),
+                    if copied {
+                        one_line("Copied", style::CAPTION, style::SANS, p.secondary)
+                    } else {
+                        one_line(
+                            format!("session {}", self.session),
+                            style::CAPTION,
+                            style::MONO,
+                            p.secondary,
+                        )
+                    },
                 ]
                 .spacing(5)
                 .align_y(Alignment::Center),
