@@ -1825,7 +1825,8 @@ impl Picker {
 
     /// Put the manager in a named state for a screenshot; see
     /// `Workbench::scene_sheets`. Whether `word` was one of its own:
-    /// `destinations-list` (two saved destinations, one just saved),
+    /// `destinations-list` (two saved destinations, one just saved; it
+    /// saves them in the session folder, so give the screenshot its own),
     /// `folder-editor`, `bucket-editor` (filled in, its secret stored and
     /// checked) and `testing` (after an editor word: its check never ends).
     pub(super) fn scene(&mut self, word: &str) -> bool {
