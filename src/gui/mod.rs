@@ -291,6 +291,8 @@ struct Pending {
     target: Option<String>,
     /// The camera the command acts on, when known.
     camera: Option<String>,
+    /// The value a write asked for, which its control shows until the reply.
+    value: Option<String>,
     /// When it was sent.
     at: Instant,
     /// One of several sent together, reported as one; see `send_batch`.
@@ -306,6 +308,7 @@ impl Pending {
             receiver: mpsc::channel().1,
             target: None,
             camera: None,
+            value: None,
             at: Instant::now(),
             batch: false,
         }
@@ -1021,6 +1024,10 @@ impl Workbench {
             (None, SessionCommand::Select { camera }) => Some(camera.clone()),
             (None, _) => self.snapshot.active_camera.clone(),
         };
+        let value = match &command {
+            SessionCommand::Set { value, .. } => Some(value.clone()),
+            _ => None,
+        };
         let submitted = match camera {
             Some(camera) => self.handle.submit_to(camera, command),
             None => self.handle.submit(command),
@@ -1031,6 +1038,7 @@ impl Workbench {
                 self.pending.push(Pending {
                     receiver,
                     camera: acts_on,
+                    value,
                     at: self.now,
                     ..Pending::unanswered(job)
                 });
@@ -1180,7 +1188,9 @@ impl Workbench {
                 .filter_map(|warning| warning.as_str().map(str::to_owned))
                 .collect();
         }
-        if let Some(feature) = pending.job.feature() {
+        if let Some(feature) = pending.job.feature()
+            && self.settles_row(pending)
+        {
             self.inspect.write_errors.remove(feature);
         }
         let Some(target) = &pending.target else {
@@ -1217,7 +1227,9 @@ impl Workbench {
         if pending.job == Job::Discover {
             self.side.discovery_issues = vec![full.clone()];
         }
-        if let Some(feature) = pending.job.feature() {
+        if let Some(feature) = pending.job.feature()
+            && self.settles_row(pending)
+        {
             self.inspect
                 .write_errors
                 .insert(feature.to_owned(), full.clone());
