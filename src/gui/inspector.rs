@@ -2,6 +2,7 @@
 use super::*;
 use iced::widget::{Row, column};
 use motion::Flashes;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
 /// The width of every control in the panel's forms and feature rows, so
@@ -24,17 +25,21 @@ const GROUPS: [&str; 5] = ["Image", "Acquisition", "Device", "Transport", "Other
 
 /// State for the settings panel.
 pub(super) struct InspectorState {
-    /// The last write or command that failed on each feature, as the whole
-    /// error; show its first line at the row. Kept by `failed()` and cleared
-    /// by the feature's next success, a new draft, a refresh or another
-    /// camera.
+    /// The last write or command that failed on each of the shown camera's
+    /// features, as the whole error; show its first line at the row. Kept by
+    /// `failed()` and cleared by the feature's next success, a new draft, a
+    /// refresh or another camera; hidden while another try is on its way.
     pub(super) write_errors: HashMap<String, String>,
     /// Feature writes the camera took, glowing on their fields for a moment.
     accepted: Flashes<String>,
-    /// What each feature's field held when its write went out. The reply
-    /// replaces that draft with the value the camera stored, unless it was
-    /// edited in the meantime.
-    sent: HashMap<String, Option<String>>,
+    /// The camera whose last capture failed, and the whole error, shown
+    /// under the capture button until that camera's next capture works.
+    capture_failed: Option<(Option<String>, String)>,
+    /// The stream-lockable features the shown camera could change when it
+    /// was last seen idle, and that camera. The stream locks only these, so
+    /// a source that never lets them change offers no Stop to unlock them.
+    lockable: HashSet<String>,
+    lockable_for: Option<String>,
     /// The tab thumb's place: a tab's index.
     tab_thumb: Motion,
     /// The Manual/Auto thumb's place: 1 for auto. It moves as soon as a
@@ -51,9 +56,12 @@ pub(super) struct InspectorState {
     changes_turn: Motion,
     /// The features grouped and ordered for display.
     index: FeatureIndex,
-    /// The output a forward was started with from here, and a summary of its
-    /// settings.
-    forwarded: Option<(String, String)>,
+    /// The settings each camera's forward was started with from here, as
+    /// sent, until its reply; by camera ID.
+    forward_sent: HashMap<String, String>,
+    /// The output each camera's forward was started with from here, and a
+    /// summary of its settings, while it lasts; by camera ID.
+    forwarded: HashMap<String, (String, String)>,
     /// The destination the last capture went to, when one was named.
     saved_to: Option<String>,
 }
@@ -63,7 +71,9 @@ impl Default for InspectorState {
         Self {
             write_errors: HashMap::new(),
             accepted: Flashes::new(ACCEPTED),
-            sent: HashMap::new(),
+            capture_failed: None,
+            lockable: HashSet::new(),
+            lockable_for: None,
             tab_thumb: Motion::new(0.0, THUMB, THUMB, Kind::Move),
             mode_thumb: Motion::new(0.0, THUMB, THUMB, Kind::Move),
             placed: false,
@@ -72,7 +82,8 @@ impl Default for InspectorState {
             storage_turn: Motion::new(0.0, motion::RING, motion::RING_OUT, Kind::Move),
             changes_turn: Motion::new(0.0, motion::RING, motion::RING_OUT, Kind::Move),
             index: FeatureIndex::default(),
-            forwarded: None,
+            forward_sent: HashMap::new(),
+            forwarded: HashMap::new(),
             saved_to: None,
         }
     }
@@ -221,15 +232,18 @@ impl Workbench {
         }
         inspect.storage_turn.show(self.storage_open, now);
         inspect.changes_turn.show(self.auto_changes_open, now);
-        // Note what each field held as its write went out.
-        for pending in &self.pending {
-            if let Job::Set(feature) = &pending.job
-                && !inspect.sent.contains_key(feature)
-            {
-                inspect
-                    .sent
-                    .insert(feature.clone(), self.edits.get(feature).cloned());
-            }
+        // Note a forward's settings in the update that sent it, before the
+        // form can change.
+        let unnoted = self.pending.iter().find_map(|pending| match &pending.job {
+            Job::Forward { .. } => pending
+                .camera
+                .clone()
+                .filter(|camera| !self.inspect.forward_sent.contains_key(camera)),
+            _ => None,
+        });
+        if let Some(camera) = unnoted {
+            let summary = self.forward_summary();
+            self.inspect.forward_sent.insert(camera, summary);
         }
     }
 
@@ -242,9 +256,77 @@ impl Workbench {
         {
             self.inspect.index = FeatureIndex::new(features);
         }
-        if self.snapshot.forwarding.is_none() {
-            self.inspect.forwarded = None;
+        // A summary goes when its own camera stops forwarding, not when
+        // another camera is shown.
+        let cameras = &self.snapshot.cameras;
+        self.inspect.forwarded.retain(|id, (output, _)| {
+            cameras.iter().any(|camera| {
+                &camera.info.id == id
+                    && (camera.stale || camera.forwarding.as_deref() == Some(output.as_str()))
+            })
+        });
+        let inspect = &mut self.inspect;
+        if inspect.lockable_for != self.snapshot.active_camera {
+            inspect.lockable.clear();
+            inspect.lockable_for = self.snapshot.active_camera.clone();
         }
+        if !self.snapshot.streaming {
+            for feature in features.iter().filter(|f| stream_locked(&f.name)) {
+                if !feature.writable {
+                    inspect.lockable.remove(&feature.name);
+                } else if !inspect.lockable.contains(&feature.name) {
+                    inspect.lockable.insert(feature.name.clone());
+                }
+            }
+        }
+    }
+
+    /// Whether `pending`, a write or command button press that just
+    /// settled, has the last word on its feature's row: it went to the
+    /// camera the panel shows, and no later one for that feature is still on
+    /// its way there. Otherwise its error, value and glow would land on
+    /// another camera's row, or on a newer edit.
+    pub(super) fn settles_row(&self, pending: &Pending) -> bool {
+        pending.camera == self.snapshot.active_camera
+            && !self
+                .pending
+                .iter()
+                .any(|other| other.job == pending.job && other.camera == pending.camera)
+    }
+
+    /// The newest write or command for feature `name` on its way to the
+    /// shown camera. Runs per row on every camera frame: nothing to search
+    /// while nothing is pending.
+    fn asked(&self, name: &str) -> Option<&Pending> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let camera = self.snapshot.active_camera.as_deref();
+        self.pending
+            .iter()
+            .filter(|pending| {
+                pending.job.feature() == Some(name) && pending.camera.as_deref() == camera
+            })
+            .max_by_key(|pending| pending.at)
+    }
+
+    /// The refusal to show at feature `name`'s row: none while `asked`,
+    /// another try, is on its way, as its outcome replaces it.
+    fn refusal(&self, name: &str, asked: Option<&Pending>) -> Option<&String> {
+        if self.inspect.write_errors.is_empty() || asked.is_some() {
+            None
+        } else {
+            self.inspect.write_errors.get(name)
+        }
+    }
+
+    /// Whether the stream locks `feature` now: a geometry or format feature
+    /// of a streaming camera that could change it when idle. Sources that
+    /// never let it change show it as plain read-only instead.
+    fn stream_locks(&self, feature: &FeatureInfo) -> bool {
+        self.snapshot.streaming
+            && stream_locked(&feature.name)
+            && (feature.writable || self.inspect.lockable.contains(&feature.name))
     }
 
     /// A command finished, after the shared bookkeeping (`finished`,
@@ -257,26 +339,56 @@ impl Workbench {
         match (&pending.job, result) {
             (Job::Capture, Ok(value)) => {
                 self.inspect.saved_to = value["destination"].as_str().map(str::to_owned);
+                if self
+                    .inspect
+                    .capture_failed
+                    .as_ref()
+                    .is_some_and(|(camera, _)| *camera == pending.camera)
+                {
+                    self.inspect.capture_failed = None;
+                }
             }
-            (Job::Forward { .. }, Ok(value)) => {
-                self.inspect.forwarded = value["forwarding"]
-                    .as_str()
-                    .map(|output| (output.to_owned(), self.forward_summary()));
+            (Job::Capture, Err(error)) => {
+                // The line under the button tells of the last press, so an
+                // earlier file no longer reads as this one's.
+                if self
+                    .last_saved
+                    .as_ref()
+                    .is_some_and(|saved| saved.camera == pending.camera)
+                {
+                    self.last_saved = None;
+                }
+                self.inspect.capture_failed = Some((pending.camera.clone(), format!("{error:#}")));
+            }
+            (Job::Forward { .. }, _) => {
+                let Some(camera) = &pending.camera else {
+                    return;
+                };
+                let summary = self.inspect.forward_sent.remove(camera);
+                if let (Ok(value), Some(summary)) = (result, summary)
+                    && let Some(output) = value["forwarding"].as_str()
+                {
+                    self.inspect
+                        .forwarded
+                        .insert(camera.clone(), (output.to_owned(), summary));
+                }
             }
             _ => {}
         }
         let Job::Set(feature) = &pending.job else {
             return;
         };
-        let sent = self.inspect.sent.remove(feature);
         let Ok(value) = result else {
             return;
         };
+        if !self.settles_row(pending) {
+            return;
+        }
         // Show what the camera stored, which may be rounded or clamped,
-        // unless the field was edited since.
+        // unless the field was edited since this write went out.
         if let Some(stored) = value.get("value")
             && let Some(draft) = self.edits.get_mut(feature)
-            && sent.is_none_or(|sent| sent.as_ref() == Some(draft))
+            && pending.value.as_ref() == Some(draft)
         {
             *draft = value_text(stored);
         }
@@ -293,8 +405,11 @@ impl Workbench {
     /// (the camera context row lighting up), `inspector-dirty` (an
     /// exposure time typed, not applied), `inspector-applying` (and being
     /// applied), `inspector-accepted` (just taken by the camera),
-    /// `inspector-switching` (auto mode on its way) and `inspector-connecting`
-    /// (with `welcome`: a camera connecting).
+    /// `inspector-switching` (auto mode on its way), `inspector-connecting`
+    /// (with `welcome`: a camera connecting), `inspector-deletes` (deleting
+    /// the oldest files at capacity, storage closed),
+    /// `inspector-capture-failed` (a capture refused) and
+    /// `inspector-capturing` (a capture on its way).
     pub(super) fn scene_inspector(&mut self, word: &str, late: bool) -> bool {
         let camera = self.snapshot.active_camera.clone();
         let feature = "ExposureTime";
@@ -317,9 +432,12 @@ impl Workbench {
                 | "inspector-accepted"
                 | "inspector-switching"
                 | "inspector-connecting"
-                | "inspector-context",
+                | "inspector-context"
+                | "inspector-capture-failed"
+                | "inspector-capturing",
                 false,
             ) => return false,
+            ("inspector-deletes", _) => self.quota_action = "delete-oldest",
             ("inspector-dirty", true) => {
                 self.edits.insert(feature.into(), "15000".into());
             }
@@ -340,6 +458,16 @@ impl Workbench {
                 self.scene_hold(Job::Connect).target = Some("sim:0".into());
             }
             ("inspector-context", true) => self.inspect.context.replay(1.0, 0.0, self.now),
+            ("inspector-capture-failed", true) => self.settle(
+                &Pending {
+                    camera,
+                    ..Pending::unanswered(Job::Capture)
+                },
+                &Err(anyhow::anyhow!(
+                    "save capture.png: capture output already exists: capture.png; choose a new file name"
+                )),
+            ),
+            ("inspector-capturing", true) => self.scene_hold(Job::Capture).camera = camera,
             _ => return false,
         }
         true
@@ -424,9 +552,30 @@ fn schedule_text(count: u32, interval: f64) -> String {
     )
 }
 
+/// What the storage section says, open or closed, of an at-capacity policy
+/// that deletes files.
+fn capacity_warning(action: &str) -> Option<&'static str> {
+    (action == "delete-oldest").then_some(
+        "At capacity, removes the oldest Capturefab managed files in the output location.",
+    )
+}
+
 /// A quiet line saying why the action above it cannot run.
 fn reason<'a>(why: &'a str, p: &'static Palette) -> Element<'a, Message> {
     text(why).size(style::SMALL).color(p.secondary).into()
+}
+
+/// A failure's line, as `field_error` lays it out, in secondary ink while
+/// another try is on its way.
+fn quiet_error<'a>(message: String, p: &'static Palette) -> Element<'a, Message> {
+    row![
+        container(icon(Level::Error.icon(), 11.0, p.secondary))
+            .height(style::line_height(style::CAPTION))
+            .align_y(Alignment::Center),
+        text(message).size(style::CAPTION).color(p.secondary),
+    ]
+    .spacing(5)
+    .into()
 }
 
 /// An accent text action.
@@ -545,7 +694,8 @@ impl Workbench {
         }
         let camera = self.snapshot.connected.as_ref()?;
         let glow = self.inspect.context.get(self.now);
-        // The same state dot as the camera's row in the camera list.
+        // The same state dot as the camera's row in the camera list, and
+        // like it, ahead of the name.
         let state = self
             .snapshot
             .cameras
@@ -553,10 +703,9 @@ impl Workbench {
             .find(|state| state.info.id == camera.id)
             .map_or(CameraState::Idle, |state| self.camera_state(state));
         let line = row![
-            icon(Icon::transport(camera.transport), 13.0, p.secondary),
+            container(status_dot(state, 6.0, p)).center_x(13),
             one_line(camera.model.as_str(), style::SMALL, style::MEDIUM, p.text),
             one_line(identity(camera), style::SMALL, style::SANS, p.secondary).width(Fill),
-            status_dot(state, 6.0, p),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
@@ -641,7 +790,7 @@ impl Workbench {
                 }
                 shown = true;
                 matched += 1;
-                locked |= snapshot.streaming && stream_locked(&feature.name);
+                locked |= self.stream_locks(feature);
                 rows = rows.push(self.feature(feature, &index.labels[i], &index.tips[i], p));
             }
             if shown {
@@ -898,15 +1047,15 @@ impl Workbench {
             .auto
             .as_ref()
             .is_some_and(|auto| auto.managed.iter().any(|m| m == name));
-        let locked = streaming && stream_locked(name);
+        let locked = self.stream_locks(feature);
         let writable = (feature.writable || managed) && !locked;
         let kind = feature.kind.as_str();
         let command = kind.eq_ignore_ascii_case("command");
-        let refused = if self.inspect.write_errors.is_empty() {
-            None
-        } else {
-            self.inspect.write_errors.get(name)
-        };
+        // A write or command for this row on its way to the shown camera:
+        // its control shows what it asked for, and an earlier refusal waits
+        // for its outcome.
+        let asked = self.asked(name);
+        let refused = self.refusal(name, asked);
         let current = feature_value(feature);
         // The caption's left side, and whether this row holds a text field,
         // which keeps its caption line so nothing moves as an edit begins.
@@ -927,11 +1076,26 @@ impl Workbench {
                 "AcquisitionStop" => ("Stop stream", streaming),
                 _ => ("Execute", true),
             };
-            button(text(action).size(style::SMALL))
+            let running = asked.is_some_and(|pending| matches!(pending.job, Job::Execute(_)));
+            let mut label = row![].spacing(6).align_y(Alignment::Center);
+            if running {
+                label = label.push(icon::spinner(11.0, p.secondary, self.spin()));
+            }
+            button(label.push(text(action).size(style::SMALL)))
                 .padding([4, 10])
-                .style(style::secondary)
+                .style(move |theme, status| {
+                    style::secondary(
+                        theme,
+                        if running {
+                            button::Status::Active
+                        } else {
+                            status
+                        },
+                    )
+                })
                 .on_press_maybe(
-                    (feature.writable && enabled).then(|| Message::Execute(feature.name.clone())),
+                    (feature.writable && enabled && !running)
+                        .then(|| Message::Execute(feature.name.clone())),
                 )
                 .into()
         } else if !writable {
@@ -954,11 +1118,15 @@ impl Workbench {
                 })
                 .into()
         } else if kind.eq_ignore_ascii_case("boolean") || kind.eq_ignore_ascii_case("bool") {
-            let checked = feature
-                .value
-                .as_ref()
-                .and_then(|v| v.as_bool())
-                .unwrap_or(current == "true" || current == "1");
+            // What a write on its way asked for, else what the camera has.
+            let checked = match asked.and_then(|pending| pending.value.as_deref()) {
+                Some(value) => value == "true" || value == "1",
+                None => feature
+                    .value
+                    .as_ref()
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(current == "true" || current == "1"),
+            };
             iced::widget::checkbox(checked)
                 .on_toggle(move |value| Message::Set(feature.name.clone(), value.to_string()))
                 .size(16)
@@ -966,9 +1134,13 @@ impl Workbench {
                 .into()
         } else if !feature.choices.is_empty() {
             let glow = self.inspect.accepted.level(name, self.now);
+            // What a write on its way asked for, else what the camera has.
+            let shown = asked
+                .and_then(|pending| pending.value.as_deref())
+                .unwrap_or(&current);
             pick_list(
                 &feature.choices[..],
-                feature.choices.iter().find(|c| **c == current).cloned(),
+                feature.choices.iter().find(|c| *c == shown).cloned(),
                 move |value| Message::Set(feature.name.clone(), value),
             )
             .placeholder(current.clone())
@@ -981,11 +1153,7 @@ impl Workbench {
         } else {
             let draft = self.edits.get(name).unwrap_or(&current);
             let dirty = *draft != current;
-            let applying = !self.pending.is_empty()
-                && self
-                    .pending
-                    .iter()
-                    .any(|pending| matches!(&pending.job, Job::Set(feature) if feature == name));
+            let applying = asked.is_some_and(|pending| matches!(pending.job, Job::Set(_)));
             let edit = if refused.is_some() {
                 Edit::Refused
             } else if dirty {
@@ -1007,7 +1175,9 @@ impl Workbench {
                     Action::FocusCamera.hint("Apply", Os::CURRENT),
                 )
             } else {
-                Element::from(space())
+                // One caption line, as tall as Apply, so a field with no
+                // range keeps its line too.
+                Element::from(space().height(style::line_height(style::CAPTION)))
             });
             text_input(&current, draft)
                 .on_input(move |value| Message::Draft(feature.name.clone(), value))
@@ -1044,13 +1214,15 @@ impl Workbench {
         let head = row![container(label).width(Fill), control,]
             .spacing(10)
             .align_y(Alignment::Center);
-        let caption: Option<Element<'_, Message>> = if let Some(error) = refused {
-            Some(field_error(
-                error.lines().next().unwrap_or_default().to_owned(),
-                p,
-            ))
-        } else if !notes.is_empty() || trailing.is_some() {
-            let line = Row::with_children(notes).spacing(8).wrap();
+        // A refusal takes the notes' place; Apply stays beside it.
+        let caption: Option<Element<'_, Message>> = if refused.is_some()
+            || !notes.is_empty()
+            || trailing.is_some()
+        {
+            let line: Element<'_, Message> = match refused {
+                Some(error) => field_error(error.lines().next().unwrap_or_default().to_owned(), p),
+                None => Row::with_children(notes).spacing(8).wrap().into(),
+            };
             let mut caption = row![container(line).width(Fill)].align_y(Alignment::Start);
             if let Some(trailing) = trailing {
                 caption = caption.push(trailing);
@@ -1153,7 +1325,8 @@ impl Workbench {
             Action::Capture.hint("Capture and save", os),
         )]
         .spacing(8);
-        if !capturing && let Some(status) = self.capture_status(connected, p) {
+        // Kept while the next capture saves, so nothing below it moves.
+        if let Some(status) = self.capture_status(connected, capturing, p) {
             action = action.push(status);
         }
         let mut save = column![
@@ -1220,18 +1393,41 @@ impl Workbench {
         .into()
     }
 
-    /// Under the capture button: why it cannot capture, or else the last
-    /// file this camera saved, with a button that copies its path.
-    fn capture_status(&self, connected: bool, p: &'static Palette) -> Option<Element<'_, Message>> {
+    /// Under the capture button: why it cannot capture, or else how this
+    /// camera's last capture went: why it failed, or the file it saved, with
+    /// a button that copies its path. Quiet while the next one saves.
+    fn capture_status(
+        &self,
+        connected: bool,
+        capturing: bool,
+        p: &'static Palette,
+    ) -> Option<Element<'_, Message>> {
         if !connected {
             return Some(reason("Connect a camera to capture.", p));
         }
         if self.output.trim().is_empty() {
             return Some(reason("Enter a file name to save to.", p));
         }
-        let saved = self.last_saved.as_ref().filter(|saved| {
-            saved.camera.is_none() || saved.camera == self.snapshot.active_camera
-        })?;
+        let here =
+            |camera: &Option<String>| camera.is_none() || *camera == self.snapshot.active_camera;
+        if let Some((_, error)) = self
+            .inspect
+            .capture_failed
+            .as_ref()
+            .filter(|(camera, _)| here(camera))
+        {
+            let first = error.lines().next().unwrap_or_default().to_owned();
+            let line = if capturing {
+                quiet_error(first, p)
+            } else {
+                field_error(first, p)
+            };
+            return Some(tip(container(line).width(Fill), error.clone()));
+        }
+        let saved = self
+            .last_saved
+            .as_ref()
+            .filter(|saved| here(&saved.camera))?;
         let path = std::path::Path::new(&saved.path);
         let name = |path: &std::path::Path| {
             path.file_name()
@@ -1258,7 +1454,15 @@ impl Workbench {
         let copied = self.just_copied(&copy);
         Some(
             row![
-                icon(Icon::Check, 12.0, p.ink(p.live)),
+                icon(
+                    Icon::Check,
+                    12.0,
+                    if capturing {
+                        p.secondary
+                    } else {
+                        p.ink(p.live)
+                    }
+                ),
                 tip(
                     one_line(summary, style::SMALL, style::SANS, p.secondary).width(Fill),
                     copy.clone(),
@@ -1429,9 +1633,10 @@ impl Workbench {
         .spacing(6);
         // Only settings sent from here are known; the CLI may have started it.
         if let Some((_, summary)) = self
-            .inspect
-            .forwarded
+            .snapshot
+            .active_camera
             .as_ref()
+            .and_then(|camera| self.inspect.forwarded.get(camera))
             .filter(|(output, _)| output == destination)
         {
             card = card.push(text(summary.as_str()).size(style::SMALL).color(p.secondary));
@@ -1510,13 +1715,11 @@ impl Workbench {
                     p,
                 ));
             }
-            if self.quota_action == "delete-oldest" {
-                content = content.push(
-                    text("At capacity, removes the oldest Capturefab managed files in the output location.")
-                        .size(style::SMALL)
-                        .color(p.ink(p.warn)),
-                );
-            }
+        }
+        // Said open or closed: the setting deletes files and is kept
+        // across launches.
+        if let Some(warning) = capacity_warning(self.quota_action) {
+            content = content.push(text(warning).size(style::SMALL).color(p.ink(p.warn)));
         }
         content.into()
     }
@@ -1639,19 +1842,31 @@ mod tests {
                 .any(|flashes| flashes.animating(now))
     }
 
-    fn sent(
-        bench: &mut Workbench,
-        feature: &str,
-    ) -> mpsc::Sender<anyhow::Result<serde_json::Value>> {
+    type Reply = mpsc::Sender<anyhow::Result<serde_json::Value>>;
+
+    /// A command doing `job` on its way to `camera`.
+    fn asked_of(bench: &mut Workbench, camera: &str, job: Job, value: Option<&str>) -> Reply {
         let (sender, receiver) = mpsc::channel();
         bench.pending.push(Pending {
             receiver,
-            camera: Some("sim:0".into()),
+            camera: Some(camera.into()),
+            value: value.map(str::to_owned),
             at: bench.now,
-            ..Pending::unanswered(Job::Set(feature.into()))
+            ..Pending::unanswered(job)
         });
         bench.sync_animations();
         sender
+    }
+
+    /// A write of `feature` on its way to sim:0 with what its field holds,
+    /// as `Message::Commit` sends it.
+    fn sent(bench: &mut Workbench, feature: &str) -> Reply {
+        let draft = bench.edits.get(feature).cloned();
+        asked_of(bench, "sim:0", Job::Set(feature.into()), draft.as_deref())
+    }
+
+    fn draft(bench: &Workbench) -> Option<&str> {
+        bench.edits.get("ExposureTime").map(String::as_str)
     }
 
     #[test]
@@ -1707,11 +1922,7 @@ mod tests {
             .send(Ok(json!({"name": "ExposureTime", "value": 15000.0})))
             .unwrap();
         bench.poll();
-        assert_eq!(
-            bench.edits.get("ExposureTime").map(String::as_str),
-            Some("15000"),
-            "what the camera stored"
-        );
+        assert_eq!(draft(&bench), Some("15000"), "what the camera stored");
         let start = bench.now;
         assert_eq!(bench.inspect.accepted.level("ExposureTime", start), 1.0);
         assert_eq!(bench.inspect.accepted.level("Gain", start), 0.0);
@@ -1731,11 +1942,232 @@ mod tests {
             .send(Ok(json!({"name": "ExposureTime", "value": 15000.0})))
             .unwrap();
         bench.poll();
+        assert_eq!(draft(&bench), Some("150001"));
         assert_eq!(
-            bench.edits.get("ExposureTime").map(String::as_str),
-            Some("150001")
+            bench.inspect.accepted.level("ExposureTime", bench.now),
+            1.0,
+            "the camera still took the write"
         );
-        assert!(bench.inspect.sent.is_empty());
+    }
+
+    #[test]
+    fn only_the_newest_write_of_a_field_settles_it() {
+        // Both replies in one poll, then one at a time.
+        for together in [true, false] {
+            let mut bench = bench();
+            bench.edits.insert("ExposureTime".into(), "15000".into());
+            let first = sent(&mut bench, "ExposureTime");
+            bench.now += Duration::from_millis(1);
+            bench.edits.insert("ExposureTime".into(), "16000".into());
+            let second = sent(&mut bench, "ExposureTime");
+            bench.edits.insert("ExposureTime".into(), "17".into());
+            first.send(Ok(json!({"value": 15000.0}))).unwrap();
+            if !together {
+                bench.poll();
+                assert_eq!(draft(&bench), Some("17"));
+                assert!(bench.inspect.accepted.is_empty(), "the newer one glows");
+            }
+            second.send(Ok(json!({"value": 16000.0}))).unwrap();
+            bench.poll();
+            assert_eq!(draft(&bench), Some("17"), "typed, not applied");
+        }
+        // With nothing typed since, the newest reply's stored value shows.
+        let mut bench = bench();
+        bench.edits.insert("ExposureTime".into(), "15000".into());
+        let first = sent(&mut bench, "ExposureTime");
+        bench.edits.insert("ExposureTime".into(), "16000.4".into());
+        let second = sent(&mut bench, "ExposureTime");
+        first.send(Ok(json!({"value": 15000.0}))).unwrap();
+        second.send(Ok(json!({"value": 16000.0}))).unwrap();
+        bench.poll();
+        assert_eq!(draft(&bench), Some("16000"));
+    }
+
+    #[test]
+    fn writes_settle_only_the_rows_of_their_own_camera() {
+        let mut bench = bench();
+        bench.edits.insert("ExposureTime".into(), "5".into());
+        let refused = sent(&mut bench, "ExposureTime");
+        let taken = asked_of(&mut bench, "sim:0", Job::Set("Gain".into()), Some("3"));
+        assert!(bench.asked("ExposureTime").is_some());
+        // Another camera takes the panel, as `tick()` does it.
+        bench.snapshot.active_camera = Some("sim:1".into());
+        bench.edits.clear();
+        bench.inspect.write_errors.clear();
+        assert!(bench.asked("ExposureTime").is_none(), "not applying here");
+        bench
+            .inspect
+            .write_errors
+            .insert("Gain".into(), "its own".into());
+        bench.edits.insert("Gain".into(), "3".into());
+        refused.send(Err(anyhow::anyhow!("too short"))).unwrap();
+        taken.send(Ok(json!({"value": 3.5}))).unwrap();
+        bench.poll();
+        assert!(!bench.inspect.write_errors.contains_key("ExposureTime"));
+        assert_eq!(
+            bench.inspect.write_errors.get("Gain").map(String::as_str),
+            Some("its own"),
+            "kept"
+        );
+        assert_eq!(bench.edits.get("Gain").map(String::as_str), Some("3"));
+        assert!(bench.inspect.accepted.is_empty(), "no glow");
+    }
+
+    #[test]
+    fn a_retry_holds_back_the_old_refusal_until_its_outcome() {
+        let mut bench = bench();
+        bench.edits.insert("ExposureTime".into(), "5".into());
+        let reply = sent(&mut bench, "ExposureTime");
+        reply.send(Err(anyhow::anyhow!("auto owns it"))).unwrap();
+        bench.poll();
+        let shown = |bench: &Workbench| {
+            bench
+                .refusal("ExposureTime", bench.asked("ExposureTime"))
+                .cloned()
+        };
+        assert_eq!(shown(&bench).as_deref(), Some("auto owns it"));
+        // The same value again: the row shows it applying, not the old error.
+        let retry = sent(&mut bench, "ExposureTime");
+        assert_eq!(shown(&bench), None);
+        retry.send(Err(anyhow::anyhow!("still auto"))).unwrap();
+        bench.poll();
+        assert_eq!(shown(&bench).as_deref(), Some("still auto"));
+        let retry = sent(&mut bench, "ExposureTime");
+        retry.send(Ok(json!({"value": 5.0}))).unwrap();
+        bench.poll();
+        assert_eq!(shown(&bench), None);
+        assert!(bench.inspect.write_errors.is_empty());
+    }
+
+    #[test]
+    fn controls_show_what_a_write_on_its_way_asked_for() {
+        let mut bench = bench();
+        let _pick = asked_of(
+            &mut bench,
+            "sim:0",
+            Job::Set("TriggerMode".into()),
+            Some("On"),
+        );
+        let _run = asked_of(
+            &mut bench,
+            "sim:0",
+            Job::Execute("UserSetLoad".into()),
+            None,
+        );
+        let _elsewhere = asked_of(&mut bench, "sim:1", Job::Set("Gain".into()), Some("2"));
+        let asked = bench.asked("TriggerMode").expect("on its way");
+        assert_eq!(asked.value.as_deref(), Some("On"));
+        assert!(matches!(
+            bench.asked("UserSetLoad").map(|p| &p.job),
+            Some(Job::Execute(_))
+        ));
+        assert!(bench.asked("Gain").is_none(), "another camera's");
+        bench.pending.clear();
+        assert!(bench.asked("TriggerMode").is_none());
+    }
+
+    #[test]
+    fn a_failed_capture_replaces_the_last_saved_line() {
+        let mut bench = bench();
+        let capture = || Pending {
+            camera: Some("sim:0".into()),
+            ..Pending::unanswered(Job::Capture)
+        };
+        bench.settle(
+            &capture(),
+            &Ok(json!({"files": ["capture.png"], "count": 1})),
+        );
+        assert!(bench.last_saved.is_some());
+        assert!(bench.just_saved(Some("sim:0")));
+        bench.settle(
+            &capture(),
+            &Err(anyhow::anyhow!(
+                "capture output already exists: capture.png"
+            )),
+        );
+        assert!(bench.last_saved.is_none(), "not this press's file");
+        assert!(!bench.just_saved(None), "no Saved on the buttons");
+        assert_eq!(
+            bench.inspect.capture_failed,
+            Some((
+                Some("sim:0".into()),
+                "capture output already exists: capture.png".into()
+            ))
+        );
+        // Another camera's success leaves it; this camera's clears it.
+        bench.settle(
+            &Pending {
+                camera: Some("sim:1".into()),
+                ..Pending::unanswered(Job::Capture)
+            },
+            &Ok(json!({"files": ["b.png"], "count": 1})),
+        );
+        assert!(bench.inspect.capture_failed.is_some());
+        bench.settle(&capture(), &Ok(json!({"files": ["c.png"], "count": 1})));
+        assert!(bench.inspect.capture_failed.is_none());
+    }
+
+    #[test]
+    fn the_stream_locks_only_what_it_keeps_from_changing() {
+        let mut bench = bench();
+        // Width can change while idle; Height, as on an RTSP source, never.
+        bench.snapshot.features[4].writable = false;
+        bench.tick_inspector();
+        bench.snapshot.streaming = true;
+        let width = bench.snapshot.features[1].clone();
+        let height = bench.snapshot.features[4].clone();
+        assert!(bench.stream_locks(&width));
+        assert!(!bench.stream_locks(&height), "plain read-only");
+        // Read again mid-stream, the camera reports Width locked.
+        bench.snapshot.features[1].writable = false;
+        bench.tick_inspector();
+        assert!(bench.stream_locks(&bench.snapshot.features[1].clone()));
+        assert!(!bench.stream_locks(&bench.snapshot.features[3].clone()));
+        // Another camera, never seen idle, goes by what it reports.
+        bench.snapshot.active_camera = Some("sim:1".into());
+        bench.tick_inspector();
+        assert!(!bench.stream_locks(&bench.snapshot.features[1].clone()));
+    }
+
+    #[test]
+    fn a_forward_keeps_the_settings_it_was_sent_with() {
+        let mut bench = bench();
+        let mut other = liveness::streaming_camera(10, 0, 30.0);
+        other.info.id = "sim:1".into();
+        bench.snapshot.cameras = vec![liveness::streaming_camera(10, 0, 30.0), other];
+        let reply = asked_of(&mut bench, "sim:0", Job::Forward { recording: false }, None);
+        bench.forward_codec = "h265";
+        reply
+            .send(Ok(json!({"forwarding": "rtsp://localhost:8554/cam"})))
+            .unwrap();
+        bench.poll();
+        bench.snapshot.cameras[0].forwarding = Some("rtsp://localhost:8554/cam".into());
+        let summary = |bench: &Workbench| {
+            bench
+                .inspect
+                .forwarded
+                .get("sim:0")
+                .map(|(_, summary)| summary.clone())
+        };
+        assert_eq!(summary(&bench).as_deref(), Some("H.264 · 30 fps · 4M"));
+        assert!(bench.inspect.forward_sent.is_empty());
+        // Showing another camera and back keeps it.
+        bench.snapshot.active_camera = Some("sim:1".into());
+        bench.snapshot.forwarding = None;
+        bench.tick_inspector();
+        bench.snapshot.active_camera = Some("sim:0".into());
+        bench.tick_inspector();
+        assert!(summary(&bench).is_some());
+        // Its own stop ends it.
+        bench.snapshot.cameras[0].forwarding = None;
+        bench.tick_inspector();
+        assert!(summary(&bench).is_none());
+    }
+
+    #[test]
+    fn a_policy_that_deletes_files_is_said_even_closed() {
+        assert!(capacity_warning("delete-oldest").is_some());
+        assert!(capacity_warning("stop").is_none());
     }
 
     #[test]
@@ -1747,10 +2179,7 @@ mod tests {
             .send(Err(anyhow::anyhow!("5 is below the minimum of 10")))
             .unwrap();
         bench.poll();
-        assert_eq!(
-            bench.edits.get("ExposureTime").map(String::as_str),
-            Some("5")
-        );
+        assert_eq!(draft(&bench), Some("5"));
         assert!(bench.inspect.write_errors.contains_key("ExposureTime"));
         assert!(bench.inspect.accepted.is_empty(), "no glow");
     }
