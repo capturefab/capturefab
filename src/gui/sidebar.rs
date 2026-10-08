@@ -671,7 +671,7 @@ impl Workbench {
             button(line)
                 .width(Fill)
                 .padding([7.0, INSET])
-                .style(style::row_mix(self.selection_level(id)))
+                .style(style::row(self.selection_level(id)))
                 .on_press_maybe((!connecting).then(|| Message::CameraRow(camera.id.clone()))),
             hint,
         );
@@ -705,7 +705,7 @@ impl Workbench {
         button(line)
             .width(Fill)
             .padding([7.0, INSET])
-            .style(style::row(false))
+            .style(style::row(0.0))
             .into()
     }
 
@@ -766,7 +766,7 @@ impl Workbench {
                 button(line)
                     .width(Fill)
                     .padding([7.0, INSET])
-                    .style(style::row(false))
+                    .style(style::row(0.0))
                     .on_press_maybe(
                         (!connecting).then(|| Message::CameraRow(entry.target.clone())),
                     ),
@@ -1138,15 +1138,7 @@ mod tests {
             let theme = style::theme(dark);
             let p = Palette::of(dark);
             let fill = |amount: f32, status: Status| {
-                style::row_mix(amount)(&theme, status)
-                    .background
-                    .map(|background| match background {
-                        iced::Background::Color(color) => color,
-                        _ => unreachable!(),
-                    })
-            };
-            let row = |selected: bool, status: Status| {
-                style::row(selected)(&theme, status)
+                style::row(amount)(&theme, status)
                     .background
                     .map(|background| match background {
                         iced::Background::Color(color) => color,
@@ -1154,9 +1146,11 @@ mod tests {
                     })
             };
             for status in [Status::Active, Status::Hovered, Status::Pressed] {
-                assert_eq!(fill(1.0, status), row(true, status));
-                assert_eq!(fill(0.0, status), row(false, status));
+                assert_eq!(fill(1.0, status), Some(p.selected), "selected");
             }
+            assert_eq!(fill(0.0, Status::Active), None, "no fill at rest");
+            assert_eq!(fill(0.0, Status::Hovered), Some(p.hover));
+            assert_eq!(fill(0.0, Status::Pressed), Some(p.selected));
             let half = fill(0.5, Status::Active).expect("a fill");
             assert_eq!(
                 (half.r, half.g, half.b),

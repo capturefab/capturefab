@@ -635,23 +635,9 @@ pub fn danger(theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-/// A sidebar list row; `selected` keeps the highlight.
-pub fn row(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |theme, status| {
-        let p = Palette::from(theme);
-        let fill = match (selected, status) {
-            (true, _) => Some(p.selected),
-            (false, button::Status::Hovered) => Some(p.hover),
-            (false, button::Status::Pressed) => Some(p.selected),
-            _ => None,
-        };
-        button_base(fill, p.text, RADIUS)
-    }
-}
-
-/// `row` with its selected fill drawn in by `amount`, from 0 to 1, so the
-/// highlight can cross-fade from one row to the next.
-pub fn row_mix(amount: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
+/// A sidebar list row, with the selected fill drawn in by `selected`, from
+/// 0 to 1, so the highlight can cross-fade from one row to the next.
+pub fn row(selected: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
         let p = Palette::from(theme);
         let rest = match status {
@@ -659,7 +645,7 @@ pub fn row_mix(amount: f32) -> impl Fn(&Theme, button::Status) -> button::Style 
             button::Status::Pressed => p.selected,
             _ => alpha(p.selected, 0.0),
         };
-        let fill = mix(rest, p.selected, amount.clamp(0.0, 1.0));
+        let fill = mix(rest, p.selected, selected.clamp(0.0, 1.0));
         button_base((fill.a > 0.0).then_some(fill), p.text, RADIUS)
     }
 }

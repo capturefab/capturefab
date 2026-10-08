@@ -4,10 +4,11 @@ use super::*;
 use iced::widget::column;
 use sidebar::{ADDRESSES, DISCOVERING, DISCOVERS, ISSUES, place, recent_place};
 
-/// Height of a welcome card: its padding and two lines of text.
-const CARD: f32 = 10.0 + 13.0 * 1.3 + 2.0 + 11.0 * 1.3 + 10.0;
-/// Height of the discovery callout.
-const CALLOUT: f32 = 4.0 + 12.0 * 1.3 + 4.0;
+/// Height of a welcome card: its padding and its title and detail lines.
+const CARD: f32 =
+    10.0 + style::line_height(style::BODY) + 2.0 + style::line_height(style::CAPTION) + 10.0;
+/// Height of the discovery callout: its padding and one line.
+const CALLOUT: f32 = 4.0 + style::line_height(style::SMALL) + 4.0;
 /// Height of the welcome screen's content with one card and nothing else,
 /// which sits centered; more grows downward from there, so nothing above
 /// the cards ever moves as discovery changes them.

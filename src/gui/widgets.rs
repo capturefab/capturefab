@@ -4,9 +4,9 @@ use iced::widget::{Row, Stack, column};
 
 pub(super) use super::oneline::one_line;
 
-/// Room a sheet's pinned header takes: padding around the title row, and
-/// the hairline under it.
-const SHEET_HEADER: f32 = 24.0 + 29.0 + 13.0 + 1.0;
+/// Room a sheet's pinned header takes: padding around the title row, as
+/// tall as its title's line, and the hairline under it.
+const SHEET_HEADER: f32 = SHEET_INSET + style::line_height(style::DISPLAY) + 13.0 + 1.0;
 /// Room a sheet's pinned footer takes: hairline, padding and a button row.
 const SHEET_FOOTER: f32 = 1.0 + 12.0 + 32.0 + 12.0;
 /// Inset of a sheet's content from its edges.
@@ -338,9 +338,14 @@ pub(super) fn code_block<'a>(
     };
     container(
         row![
-            // Filling the room left by the button, so a long command ends in
-            // "…" rather than pushing the button out.
-            one_line(command.clone(), style::SMALL, style::MONO, p.text).width(Fill),
+            // Filling the room the button leaves and wrapping in it, so a
+            // long command stays readable without pushing the button out.
+            text(command.clone())
+                .size(style::SMALL)
+                .font(style::MONO)
+                .color(p.text)
+                .width(Fill)
+                .wrapping(text::Wrapping::WordOrGlyph),
             tip(
                 button(icon(glyph, 13.0, color))
                     .padding(4)

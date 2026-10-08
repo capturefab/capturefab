@@ -35,7 +35,7 @@ pub(super) const SLIDE_OUT: Duration = Duration::from_millis(160);
 pub(super) const SHUTTER: Duration = Duration::from_millis(320);
 pub(super) const WELCOME: Duration = Duration::from_millis(400);
 pub(super) const NOTICE_IN: Duration = Duration::from_millis(160);
-pub(super) const NOTICE_OUT: Duration = Duration::from_millis(200);
+pub(super) const NOTICE_OUT: Duration = Duration::from_millis(120);
 /// How long a done or warning notice stays before it fades.
 pub(super) const NOTICE_LIFE: Duration = Duration::from_secs(5);
 /// How long a copy button reads as copied.
