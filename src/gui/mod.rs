@@ -152,7 +152,18 @@ pub fn run_capture(
         );
         app.width = window_size.width;
         if let Some(path) = &screenshot {
-            let count = demo_cameras.clamp(1, 16);
+            let scene = std::env::var("CAPTUREFAB_SCREENSHOT_SCENE").unwrap_or_default();
+            let scene: Vec<&str> = scene.split(',').map(str::trim).collect();
+            let welcome = scene.contains(&"welcome");
+            let count = if welcome {
+                0
+            } else {
+                demo_cameras.clamp(1, 16)
+            };
+            app.apply_scene(&scene);
+            if welcome {
+                app.discover();
+            }
             app.screenshot = Some(ScreenshotRequest {
                 path: path.clone(),
                 cameras: count,
@@ -1811,6 +1822,45 @@ impl Workbench {
             _ => {}
         }
         Task::none()
+    }
+
+    /// Put the workbench in a named state for a screenshot. Set through
+    /// CAPTUREFAB_SCREENSHOT_SCENE as comma-separated words, e.g. `help,light`.
+    fn apply_scene(&mut self, scene: &[&str]) {
+        for word in scene {
+            match *word {
+                "help" => self.help_open = true,
+                "capture" => self.tab = Tab::Capture,
+                "forward" => self.tab = Tab::Forward,
+                "features" => self.tab = Tab::Features,
+                "destinations" => self.capture_to.manager_open = true,
+                "logs" => self.logs_open = true,
+                "image" => self.image_mode = true,
+                "focus" => self.focus.open = true,
+                "exposure" => self.exposure_open = true,
+                "noscopes" => {
+                    self.exposure_open = false;
+                    self.focus.open = false;
+                }
+                "noinspector" => self.inspector_open = false,
+                "inspector" => self.inspector_open = true,
+                "nosidebar" => self.sidebar_open = false,
+                "sidebar" => self.sidebar_open = true,
+                "light" => self.appearance = Appearance::Light,
+                "dark" => self.appearance = Appearance::Dark,
+                "notice" => {
+                    self.notice = Some(("Saved capture-0001.png".into(), false, self.now));
+                }
+                "error" => {
+                    self.notice = Some((
+                        "Capture failed: the camera stopped responding".into(),
+                        true,
+                        self.now,
+                    ));
+                }
+                _ => {}
+            }
+        }
     }
 
     fn screenshot_tick(&mut self) -> Task<Message> {
