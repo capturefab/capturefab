@@ -2,10 +2,10 @@
 //! recordings on this computer, in a folder on an external or network drive,
 //! or in an S3-compatible bucket.
 //!
-//! Disk scans, bucket checks, keychain lookups and queue status run on
-//! background threads, so a slow network share, service or credential store
-//! never stalls the interface.
-use super::format::{grouped, plural};
+//! Disk scans, bucket checks, keychain lookups and writes, and queue status
+//! run on background threads, so a slow network share, service or credential
+//! store never stalls the interface.
+use super::format::{capitalize, grouped, plural};
 use super::icon::{self, Icon, icon};
 use super::motion::Flashes;
 use super::notice::Level;
@@ -198,15 +198,6 @@ impl Field {
     }
 }
 
-/// `message` starting with a capital, for showing on its own.
-fn sentence(message: &str) -> String {
-    let mut chars = message.chars();
-    chars
-        .next()
-        .map(|first| first.to_uppercase().chain(chars).collect())
-        .unwrap_or_default()
-}
-
 /// The add/edit form.
 struct Editor {
     /// The name being edited, when changing an existing destination.
@@ -240,7 +231,12 @@ struct Editor {
     /// The last check's outcome or a refusal no field explains; true for
     /// a problem.
     message: Option<(String, bool)>,
-    testing: Option<Receiver<Result<String, String>>>,
+    /// A running check: whether it stored the typed secret first, and its
+    /// outcome.
+    testing: Option<Receiver<(bool, Result<String, String>)>>,
+    /// A running save of this destination: its folder being made or its
+    /// typed secret stored, answering whether a secret was.
+    saving: Option<(Destination, Receiver<anyhow::Result<bool>>)>,
 }
 
 impl Editor {
@@ -269,6 +265,7 @@ impl Editor {
             invalid: Vec::new(),
             message: None,
             testing: None,
+            saving: None,
         }
     }
     /// A new bucket, named after the bucket until a name is typed.
@@ -364,6 +361,22 @@ impl Editor {
         }
     }
 
+    /// The typed secret is now in the keychain under the current access key
+    /// ID, so any lookup in flight or due for it is moot.
+    fn secret_stored(&mut self) {
+        self.secret.clear();
+        self.stored_secret = true;
+        self.key_probe = None;
+        self.key_changed = None;
+    }
+
+    /// The access key ID and typed secret to store in the keychain before
+    /// the bucket is saved or checked, if one was typed.
+    fn secret_to_store(&self) -> Option<(String, String)> {
+        (self.s3 && self.source == Source::Keychain && !self.secret.is_empty())
+            .then(|| (self.access_key_id.trim().to_owned(), self.secret.clone()))
+    }
+
     /// The destination as typed, with a valid stand-in for each of
     /// `stand_ins`, so validation reaches the fields after them.
     fn build(&self, stand_ins: &[Field]) -> Destination {
@@ -448,7 +461,7 @@ impl Editor {
             Vec::new()
         };
         if problems.is_empty() {
-            self.message = Some((sentence(&message), true));
+            self.message = Some((capitalize(&message), true));
         } else {
             self.advanced |= problems.iter().any(|(field, _)| *field == Field::Prefix);
             self.invalid = problems;
@@ -456,13 +469,32 @@ impl Editor {
         }
     }
 
+    /// Refuse the name: another saved destination has it, which saving
+    /// would replace.
+    fn refuse_name(&mut self, why: String) {
+        // It no longer follows the bucket, so the fix sticks.
+        self.name_touched = true;
+        self.invalid = vec![(Field::Name, why)];
+        self.message = None;
+    }
+
+    /// Why the name can't be saved, if another destination in `saved` has
+    /// it. Keeping the name of the destination being edited is fine.
+    fn name_taken(&self, saved: &[Destination]) -> Option<String> {
+        let name = self.name.trim();
+        (self.original.as_deref() != Some(name) && saved.iter().any(|d| d.name == name))
+            .then(|| format!("a destination named {name} already exists; choose another name"))
+    }
+
     /// `field` was edited: its refusal no longer applies, nor does the last
-    /// check's outcome.
+    /// check's outcome, or a check or save still running on the old values.
     fn edited(&mut self, field: Option<Field>) {
         if let Some(field) = field {
             self.invalid.retain(|(f, _)| *f != field);
         }
         self.message = None;
+        self.testing = None;
+        self.saving = None;
     }
 
     /// Why `field` was refused, if it was.
@@ -472,20 +504,31 @@ impl Editor {
             .find(|(f, _)| *f == field)
             .map(|(_, message)| message.as_str())
     }
-    /// Save the destination (and a typed secret, into the OS credential
-    /// store); returns the saved name.
-    fn save(&mut self) -> anyhow::Result<String> {
-        let destination = self.destination()?;
-        if let Target::Folder { path } = &destination.target {
-            volumes::ensure_present(path)?;
-            std::fs::create_dir_all(path)
-                .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", path.display()))?;
+    /// The slow part of saving `destination`, to run off the UI thread:
+    /// making its folder and storing a typed secret in the OS credential
+    /// store. Answers whether a secret was stored.
+    fn prepare(
+        &self,
+        destination: &Destination,
+    ) -> impl FnOnce() -> anyhow::Result<bool> + Send + 'static {
+        let folder = match &destination.target {
+            Target::Folder { path } => Some(path.clone()),
+            Target::S3(_) => None,
+        };
+        let secret = self.secret_to_store();
+        move || {
+            if let Some(path) = folder {
+                volumes::ensure_present(&path)?;
+                std::fs::create_dir_all(&path)
+                    .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", path.display()))?;
+            }
+            store_secret(secret)
         }
-        #[cfg(feature = "s3")]
-        if self.s3 && self.source == Source::Keychain && !self.secret.is_empty() {
-            crate::s3::store_secret(self.access_key_id.trim(), &self.secret)?;
-            self.secret.clear();
-        }
+    }
+
+    /// Record `destination` in the saved list in place of the one edited;
+    /// returns its name. Quick: it writes the local settings only.
+    fn commit(&mut self, destination: Destination) -> anyhow::Result<String> {
         if let Some(original) = &self.original
             && original != &destination.name
         {
@@ -495,6 +538,74 @@ impl Editor {
         self.original = Some(destination.name.clone());
         Ok(destination.name)
     }
+
+    /// Save the destination at once; returns the saved name.
+    fn save(&mut self) -> anyhow::Result<String> {
+        let destination = self.destination()?;
+        if self.prepare(&destination)()? {
+            self.secret_stored();
+        }
+        self.commit(destination)
+    }
+
+    /// Take a running check's outcome, if it came.
+    fn poll_test(&mut self) {
+        let answer = match self.testing.as_ref().map(Receiver::try_recv) {
+            None | Some(Err(TryRecvError::Empty)) => return,
+            Some(Ok(answer)) => answer,
+            Some(Err(TryRecvError::Disconnected)) => {
+                (false, Err("the check stopped without an answer".into()))
+            }
+        };
+        let (stored, outcome) = answer;
+        self.testing = None;
+        if stored {
+            self.secret_stored();
+        }
+        self.message = Some(match outcome {
+            Ok(text) => (text, false),
+            Err(text) => (capitalize(&text), true),
+        });
+    }
+
+    /// Finish a save whose slow part answered: record the destination, or
+    /// show why it was refused. The saved name, once saved.
+    fn poll_save(&mut self) -> Option<String> {
+        let prepared = match self.saving.as_ref()?.1.try_recv() {
+            Ok(prepared) => prepared,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => {
+                Err(anyhow::anyhow!("saving stopped without an answer"))
+            }
+        };
+        let (destination, _) = self.saving.take()?;
+        let saved = prepared.and_then(|stored| {
+            if stored {
+                self.secret_stored();
+            }
+            self.commit(destination)
+        });
+        match saved {
+            Ok(name) => Some(name),
+            Err(error) => {
+                self.refuse(error);
+                None
+            }
+        }
+    }
+}
+
+/// Store a typed secret under its access key ID in the OS credential store;
+/// whether one was. It can wait on a keychain prompt, so off the UI thread.
+fn store_secret(secret: Option<(String, String)>) -> anyhow::Result<bool> {
+    #[cfg(feature = "s3")]
+    if let Some((id, secret)) = secret {
+        crate::s3::store_secret(&id, &secret)?;
+        return Ok(true);
+    }
+    #[cfg(not(feature = "s3"))]
+    let _ = secret;
+    Ok(false)
 }
 
 /// Check a destination: write a probe file to a folder, or reach a bucket.
@@ -657,8 +768,12 @@ impl Picker {
         }
     }
 
-    /// Reload the saved list now and then, and collect background results.
-    pub fn tick(&mut self) {
+    /// Reload the saved list now and then, and collect background results;
+    /// a finished save chooses its destination, as for `update`.
+    pub fn tick(&mut self, output: &mut String) {
+        if let Some(name) = self.editor.as_mut().and_then(Editor::poll_save) {
+            self.saved_as(name, output);
+        }
         if self
             .loaded
             .is_none_or(|t| t.elapsed() > Duration::from_secs(3))
@@ -733,21 +848,8 @@ impl Picker {
             self.uploads_at = Some(Instant::now());
             self.uploads_task = Some(background(|| crate::upload::status().ok()));
         }
-        if let Some(editor) = &mut self.editor
-            && let Some(task) = &editor.testing
-        {
-            let outcome = match task.try_recv() {
-                Ok(Ok(text)) => Some((text, false)),
-                Ok(Err(text)) => Some((sentence(&text), true)),
-                Err(TryRecvError::Disconnected) => {
-                    Some(("The check stopped without an answer".into(), true))
-                }
-                Err(TryRecvError::Empty) => None,
-            };
-            if outcome.is_some() {
-                editor.message = outcome;
-                editor.testing = None;
-            }
+        if let Some(editor) = &mut self.editor {
+            editor.poll_test();
         }
         #[cfg(feature = "s3")]
         if let Some(editor) = &mut self.editor {
@@ -761,11 +863,14 @@ impl Picker {
         self.editor.is_some() || self.removing.is_some()
     }
 
-    /// Whether a background check or keychain lookup is running or due, so
-    /// the app keeps polling.
+    /// Whether a background check, save or keychain lookup is running or
+    /// due, so the app keeps polling.
     pub fn busy(&self) -> bool {
         self.editor.as_ref().is_some_and(|e| {
-            e.testing.is_some() || e.key_probe.is_some() || e.key_changed.is_some()
+            e.testing.is_some()
+                || e.saving.is_some()
+                || e.key_probe.is_some()
+                || e.key_changed.is_some()
         })
     }
 
@@ -818,6 +923,16 @@ impl Picker {
     fn selected_destination(&self) -> Option<&Destination> {
         let name = self.selected.as_ref()?;
         self.saved.iter().find(|d| &d.name == name)
+    }
+
+    /// The editor saved `name`: back to the list, due to reload, with its
+    /// row glowing, and chosen.
+    fn saved_as(&mut self, name: String, output: &mut String) {
+        self.notice = Some((format!("Saved {name}"), false));
+        self.saved_glow.hit(name.clone(), Instant::now());
+        self.close_editor();
+        self.loaded = None;
+        self.select(Some(name), output);
     }
 
     pub fn update(&mut self, message: Message, output: &mut String) {
@@ -874,7 +989,7 @@ impl Picker {
                     Err(e) => (format!("{e:#}"), true),
                 });
                 self.loaded = None;
-                self.tick();
+                self.tick(output);
             }
             Message::ConfirmRemove(name) => self.removing = name,
             Message::AddFolder => {
@@ -892,47 +1007,52 @@ impl Picker {
             }
             Message::AddBucket => self.open_editor(Editor::new_bucket()),
             Message::Cancel => self.close_editor(),
+            // The folder and keychain may be slow to answer, so saving
+            // finishes in `tick`.
             Message::Save => {
                 let Some(editor) = &mut self.editor else {
                     return;
                 };
-                match editor.save() {
-                    Ok(name) => {
-                        self.notice = Some((format!("Saved {name}"), false));
-                        self.saved_glow.hit(name.clone(), Instant::now());
-                        self.close_editor();
-                        self.loaded = None;
-                        self.tick();
-                        self.select(Some(name), output);
-                    }
-                    Err(error) => editor.refuse(error),
+                if editor.saving.is_some() {
+                    return;
                 }
+                let destination = match editor.destination() {
+                    Ok(destination) => destination,
+                    Err(error) => return editor.refuse(error),
+                };
+                if let Some(why) = editor.name_taken(&self.saved) {
+                    return editor.refuse_name(why);
+                }
+                if editor.secret_to_store().is_some() {
+                    // Its answer would be about the keychain before the store.
+                    editor.key_probe = None;
+                }
+                editor.message = None;
+                let prepare = editor.prepare(&destination);
+                editor.saving = Some((destination, background(prepare)));
             }
             Message::Test => {
                 let Some(editor) = &mut self.editor else {
                     return;
                 };
+                if editor.saving.is_some() {
+                    return;
+                }
                 let destination = match editor.destination() {
                     Ok(destination) => destination,
                     Err(error) => return editor.refuse(error),
                 };
                 // Testing a bucket needs the key, so store a typed secret first.
-                #[cfg(feature = "s3")]
-                if editor.s3 && editor.source == Source::Keychain && !editor.secret.is_empty() {
-                    match crate::s3::store_secret(editor.access_key_id.trim(), &editor.secret) {
-                        Ok(()) => {
-                            editor.secret.clear();
-                            editor.stored_secret = true;
-                        }
-                        Err(e) => {
-                            editor.message = Some((sentence(&format!("{e:#}")), true));
-                            return;
-                        }
-                    }
+                let secret = editor.secret_to_store();
+                if secret.is_some() {
+                    editor.key_probe = None;
                 }
                 editor.message = None;
                 editor.invalid.clear();
-                editor.testing = Some(background(move || test(destination)));
+                editor.testing = Some(background(move || match store_secret(secret) {
+                    Ok(stored) => (stored, test(destination)),
+                    Err(e) => (false, Err(format!("{e:#}"))),
+                }));
             }
             message => {
                 let Some(editor) = &mut self.editor else {
@@ -1049,20 +1169,22 @@ impl Picker {
             },
             folder,
         );
-        match editor.save() {
-            Ok(name) => {
-                self.loaded = None;
-                self.tick();
-                self.select(Some(name.clone()), output);
-                self.notice = Some((format!("Saving to {name}"), false));
-            }
-            Err(error) => {
-                // Show the form so the name or folder can be adjusted.
-                editor.refuse(error);
-                self.open_editor(editor);
-                self.manager_open = true;
-            }
+        match editor.name_taken(&self.saved) {
+            Some(why) => editor.refuse_name(why),
+            None => match editor.save() {
+                Ok(name) => {
+                    self.loaded = None;
+                    self.tick(output);
+                    self.select(Some(name.clone()), output);
+                    self.notice = Some((format!("Saving to {name}"), false));
+                    return;
+                }
+                Err(error) => editor.refuse(error),
+            },
         }
+        // Show the form so the name or folder can be adjusted.
+        self.open_editor(editor);
+        self.manager_open = true;
     }
 
     /// The "Save to" row, the output field and the drive shortcuts. `output`
@@ -1555,7 +1677,7 @@ impl Picker {
         // A field with why it was refused under its control, if it was.
         let checked = |kind: Field, row: Element<'a, Message>| -> Element<'a, Message> {
             match editor.refusal(kind) {
-                Some(message) => column![row, field("", field_error(sentence(message), p))]
+                Some(message) => column![row, field("", field_error(capitalize(message), p))]
                     .spacing(4)
                     .into(),
                 None => row,
@@ -1779,7 +1901,10 @@ impl Picker {
             ));
         }
         let testing = editor.testing.is_some();
-        let outcome = if testing {
+        let saving = editor.saving.is_some();
+        let outcome = if saving {
+            status("Saving…".into(), Status::Working, spin, p)
+        } else if testing {
             let doing = if editor.s3 {
                 "Checking the bucket…"
             } else {
@@ -1799,7 +1924,7 @@ impl Picker {
         let save = button(text("Save").size(style::BODY))
             .padding([7, 18])
             .style(style::primary)
-            .on_press(Message::Save);
+            .on_press_maybe((!saving).then_some(Message::Save));
         let (first, second) = if cfg!(target_os = "windows") {
             (save, cancel)
         } else {
@@ -1810,7 +1935,7 @@ impl Picker {
                 button(text("Test").size(style::BODY))
                     .padding([7, 14])
                     .style(style::secondary)
-                    .on_press_maybe((!testing).then_some(Message::Test)),
+                    .on_press_maybe((!testing && !saving).then_some(Message::Test)),
                 if editor.s3 {
                     "Check that the bucket can be reached with these credentials"
                 } else {
@@ -2187,6 +2312,109 @@ mod tests {
     }
 
     #[test]
+    fn a_new_destination_never_replaces_a_saved_one() {
+        let mut picker = Picker::new(false, false);
+        let mut output = String::new();
+        picker.saved = vec![
+            bucket(|_| {}).destination().unwrap(),
+            bucket(|e| e.name = "archive".into()).destination().unwrap(),
+        ];
+        picker.update(Message::AddBucket, &mut output);
+        picker.update(Message::Bucket("line-1".into()), &mut output);
+        picker.update(Message::AccessKey("AKIA".into()), &mut output);
+        picker.update(Message::Save, &mut output);
+        let editor = picker.editor.as_ref().unwrap();
+        assert_eq!(
+            editor.refusal(Field::Name),
+            Some("a destination named line-1 already exists; choose another name")
+        );
+        assert!(editor.saving.is_none(), "nothing saved");
+        // The name stops following the bucket, so it can be fixed.
+        picker.update(Message::Bucket("line-2".into()), &mut output);
+        assert_eq!(picker.editor.as_ref().unwrap().name, "line-1");
+        // An edited destination keeps its own name, but can't take another's.
+        let mut editor = Editor::edit(&picker.saved[0]);
+        assert_eq!(editor.name_taken(&picker.saved), None);
+        editor.name = "archive".into();
+        assert!(editor.name_taken(&picker.saved).is_some());
+    }
+
+    #[test]
+    fn a_check_or_save_on_values_since_edited_is_dropped() {
+        let pending = || {
+            let (sender, receiver) = channel::<(bool, Result<String, String>)>();
+            std::mem::forget(sender);
+            receiver
+        };
+        let mut editor = bucket(|_| {});
+        editor.testing = Some(pending());
+        editor.edited(Some(Field::Bucket));
+        assert!(editor.testing.is_none());
+        let (_sender, receiver) = channel();
+        editor.saving = Some((editor.destination().unwrap(), receiver));
+        editor.edited(None);
+        assert!(editor.saving.is_none());
+    }
+
+    #[test]
+    fn saving_runs_off_the_ui_thread_and_keeps_a_refused_secret() {
+        let mut picker = Picker::new(false, false);
+        let mut output = String::new();
+        let mut editor = bucket(|e| e.secret = "secret".into());
+        let (sender, receiver) = channel();
+        editor.saving = Some((editor.destination().unwrap(), receiver));
+        picker.editor = Some(editor);
+        assert!(picker.busy(), "polls for the answer");
+        // Neither saves nor checks twice while it runs.
+        picker.update(Message::Save, &mut output);
+        picker.update(Message::Test, &mut output);
+        let editor = picker.editor.as_mut().unwrap();
+        assert!(editor.saving.is_some() && editor.testing.is_none());
+        assert_eq!(editor.poll_save(), None, "no answer yet");
+        sender
+            .send(Err(anyhow::anyhow!("the keychain is locked")))
+            .unwrap();
+        assert_eq!(editor.poll_save(), None);
+        assert!(editor.saving.is_none());
+        assert_eq!(
+            editor.message,
+            Some(("The keychain is locked".into(), true))
+        );
+        assert_eq!(editor.secret, "secret", "typed once");
+    }
+
+    #[test]
+    fn a_check_that_stored_the_secret_says_so() {
+        let mut editor = bucket(|e| e.secret = "secret".into());
+        let (sender, receiver) = channel();
+        editor.testing = Some(receiver);
+        editor.poll_test();
+        assert!(editor.testing.is_some(), "still checking");
+        sender.send((true, Err("access denied".into()))).unwrap();
+        editor.poll_test();
+        assert!(editor.testing.is_none());
+        assert!(editor.stored_secret && editor.secret.is_empty());
+        assert_eq!(editor.message, Some(("Access denied".into(), true)));
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_stored_secret_outlasts_an_older_lookup() {
+        let start = Instant::now();
+        let mut editor = bucket(|e| e.secret = "secret".into());
+        editor.key_edited(start);
+        editor.poll_key(start + KEY_PAUSE, |_| {
+            let (sender, receiver) = channel();
+            let _ = sender.send(false);
+            receiver
+        });
+        editor.secret_stored();
+        editor.poll_key(start + KEY_PAUSE + ms(60), |_| unreachable!());
+        assert!(editor.stored_secret);
+        assert!(editor.key_probe.is_none() && editor.key_changed.is_none());
+    }
+
+    #[test]
     fn the_picker_polls_while_a_lookup_is_due() {
         let mut picker = Picker::new(false, false);
         assert!(!picker.busy());
@@ -2222,6 +2450,5 @@ mod tests {
             advanced_summary(&bucket(|e| e.path_style = true)),
             "capturefab/ · path-style"
         );
-        assert_eq!(sentence("cannot reach"), "Cannot reach");
     }
 }

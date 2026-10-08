@@ -1281,8 +1281,8 @@ impl Workbench {
         self.sample_throughput();
         self.observe_liveness();
         self.update_frames();
-        self.capture_to.tick();
-        self.record_to.tick();
+        self.capture_to.tick(&mut self.output);
+        self.record_to.tick(&mut self.forward_output);
         self.tick_chrome();
         self.tick_side();
         self.tick_stage();
