@@ -2028,6 +2028,7 @@ impl Workbench {
             Action::SearchFeatures => {
                 self.tab = Tab::Features;
                 return Task::batch([
+                    operation::snap_to(inspector::SCROLL, operation::RelativeOffset::START),
                     operation::focus("feature-search"),
                     operation::select_all("feature-search"),
                 ]);

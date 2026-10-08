@@ -147,16 +147,28 @@ pub(super) fn disclosure<'a, M: Clone + 'a>(
     on: M,
     p: &'static Palette,
 ) -> Element<'a, M> {
-    let mut header = row![
+    // The font's chevrons at rest, like every other; drawn only mid-turn.
+    let chevron = if turn <= 0.0 || turn >= 1.0 {
         icon(
-            if turn >= 0.5 {
+            if turn >= 1.0 {
                 Icon::ChevronDown
             } else {
                 Icon::ChevronRight
             },
             11.0,
             p.secondary,
-        ),
+        )
+    } else {
+        iced::widget::canvas(Chevron {
+            turn,
+            color: p.secondary,
+        })
+        .width(11)
+        .height(11)
+        .into()
+    };
+    let mut header = row![
+        chevron,
         text(title)
             .size(style::BODY)
             .font(style::MEDIUM)
@@ -172,11 +184,76 @@ pub(super) fn disclosure<'a, M: Clone + 'a>(
             p.secondary,
         ));
     }
+    // Flush with the content's edge; the hover fill still has room on the right.
     button(header)
-        .padding([3, 4])
+        .width(Fill)
+        .padding(iced::Padding {
+            top: 3.0,
+            right: 6.0,
+            bottom: 3.0,
+            left: 0.0,
+        })
         .style(style::plain)
         .on_press(on)
         .into()
+}
+
+/// A disclosure's chevron, turned from pointing right at 0 to down at 1:
+/// the font's caret, drawn so it can turn.
+struct Chevron {
+    turn: f32,
+    color: Color,
+}
+
+/// The drawn chevron, kept until its turn or color changes.
+#[derive(Default)]
+struct Turned {
+    cache: iced::widget::canvas::Cache,
+    key: Cell<Option<(u32, Color)>>,
+}
+
+impl<M> iced::widget::canvas::Program<M> for Chevron {
+    type State = Turned;
+
+    fn draw(
+        &self,
+        state: &Turned,
+        renderer: &iced::Renderer,
+        _theme: &Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<iced::widget::canvas::Geometry> {
+        use iced::widget::canvas::{LineCap, LineJoin, Path, Stroke};
+        let key = Some((self.turn.to_bits(), self.color));
+        if state.key.replace(key) != key {
+            state.cache.clear();
+        }
+        let geometry = state.cache.draw(renderer, bounds.size(), |frame| {
+            // Phosphor's caret: 5/16 of the size wide and 5/8 tall about the
+            // center, stroked at 1/16.
+            let side = bounds.width.min(bounds.height);
+            let (half_w, half_h) = (side * 5.0 / 32.0, side * 5.0 / 16.0);
+            let (sin, cos) = (self.turn * std::f32::consts::FRAC_PI_2).sin_cos();
+            let center = frame.center();
+            let at = |x: f32, y: f32| {
+                iced::Point::new(center.x + x * cos - y * sin, center.y + x * sin + y * cos)
+            };
+            let caret = Path::new(|path| {
+                path.move_to(at(-half_w, -half_h));
+                path.line_to(at(half_w, 0.0));
+                path.line_to(at(-half_w, half_h));
+            });
+            frame.stroke(
+                &caret,
+                Stroke::default()
+                    .with_color(self.color)
+                    .with_width(side / 16.0)
+                    .with_line_cap(LineCap::Round)
+                    .with_line_join(LineJoin::Round),
+            );
+        });
+        vec![geometry]
+    }
 }
 
 /// A label on the left and its control on the right.
@@ -266,29 +343,6 @@ pub(super) fn code_block<'a>(
     })
     .width(Fill)
     .style(style::code)
-    .into()
-}
-
-pub(super) fn segment<'a>(
-    label: &'a str,
-    selected: bool,
-    on: impl Into<Option<Message>>,
-) -> Element<'a, Message> {
-    button(
-        text(label)
-            .size(style::SMALL)
-            .font(if selected {
-                style::SEMIBOLD
-            } else {
-                style::SANS
-            })
-            .width(Fill)
-            .align_x(Alignment::Center),
-    )
-    .width(Fill)
-    .padding([4, 12])
-    .style(style::segment(selected))
-    .on_press_maybe(on.into())
     .into()
 }
 
