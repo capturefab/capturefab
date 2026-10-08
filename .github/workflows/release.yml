@@ -113,7 +113,10 @@ jobs:
           - { os: linux, arch: aarch64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, container: 'quay.io/pypa/manylinux_2_28_aarch64:latest', python: /opt/python/cp312-cp312/bin/python3 }
           - { os: macos, arch: aarch64, target: aarch64-apple-darwin, runner: macos-15, macos: '11.0' }
           - { os: macos, arch: x86_64, target: x86_64-apple-darwin, runner: macos-15-intel, macos: '10.15' }
-          - { os: windows, arch: x86_64, target: x86_64-pc-windows-msvc, runner: windows-2025 }
+          # FFmpeg builds with MinGW: GCC on x64, LLVM on ARM64 (MSYS2 has no
+          # ARM64 GCC).
+          - { os: windows, arch: x86_64, target: x86_64-pc-windows-msvc, runner: windows-2025, msystem: UCRT64 }
+          - { os: windows, arch: aarch64, target: aarch64-pc-windows-msvc, runner: windows-11-arm, msystem: CLANGARM64 }
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
     timeout-minutes: 150
@@ -143,7 +146,7 @@ jobs:
         if: runner.os == 'macOS' && matrix.arch == 'x86_64'
         run: brew install nasm
       - name: Install NASM for libjpeg-turbo SIMD
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.arch == 'x86_64'
         shell: pwsh
         run: |
           choco install nasm --no-progress -y
@@ -154,13 +157,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The Windows ARM64 image does not ship rustup.
+      - name: Install rustup
+        if: runner.os == 'Windows' && matrix.arch == 'aarch64'
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSfLo "$RUNNER_TEMP/rustup-init.exe" https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe
+          "$RUNNER_TEMP/rustup-init.exe" -y --profile minimal --default-toolchain none
+          echo "$USERPROFILE/.cargo/bin" >> "$GITHUB_PATH"
       - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
       - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         if: runner.os == 'Windows'
         with:
-          msystem: UCRT64
+          msystem: ${{ matrix.msystem }}
           install: curl diffutils make perl tar xz
-          pacboy: cmake:p gcc:p nasm:p ninja:p pkgconf:p
+          pacboy: cmake:p ninja:p pkgconf:p ${{ matrix.arch == 'aarch64' && 'clang:p' || 'gcc:p nasm:p' }}
       - id: ffmpeg
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -175,8 +185,13 @@ jobs:
         env:
           TARGET_OS: mingw32
           TARGET_ARCH: ${{ matrix.arch }}
-          CC: gcc
-          CXX: g++
+          CC: ${{ matrix.arch == 'aarch64' && 'clang' || 'gcc' }}
+          CXX: ${{ matrix.arch == 'aarch64' && 'clang++' || 'g++' }}
+          # Empty selects the script's default (ar, ranlib, strip, objdump).
+          AR: ${{ matrix.arch == 'aarch64' && 'llvm-ar' || '' }}
+          RANLIB: ${{ matrix.arch == 'aarch64' && 'llvm-ranlib' || '' }}
+          STRIP: ${{ matrix.arch == 'aarch64' && 'llvm-strip' || '' }}
+          OBJDUMP: ${{ matrix.arch == 'aarch64' && 'llvm-objdump' || '' }}
         run: BUILD_DIR="$(cygpath -u "$RUNNER_TEMP")/ffmpeg-build" scripts/build-ffmpeg.sh target/ffmpeg-bundle
       - if: steps.ffmpeg.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
