@@ -8,6 +8,7 @@ mod icon;
 mod inspector;
 mod keys;
 mod motion;
+mod oneline;
 mod prefs;
 mod preview;
 mod refresh;

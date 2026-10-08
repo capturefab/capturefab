@@ -1,6 +1,8 @@
 //! Small building blocks shared by the views.
 use super::*;
 
+pub(super) use super::oneline::one_line;
+
 /// Tooltip in the workbench style.
 pub(super) fn focus_address() -> Task<Message> {
     Task::batch([
@@ -143,13 +145,9 @@ pub(super) fn unit<'a>(
 pub(super) fn code_block<'a>(command: String, p: &'static Palette) -> Element<'a, Message> {
     container(
         row![
-            clipped(
-                text(command.clone())
-                    .size(style::SMALL)
-                    .font(style::MONO)
-                    .color(p.text)
-            ),
-            space::horizontal(),
+            // Filling the room left by the button, so a long command ends in
+            // "…" rather than pushing the button out.
+            one_line(command.clone(), style::SMALL, style::MONO, p.text).width(Fill),
             tip(
                 button(icon(Icon::Copy, 13.0, p.secondary))
                     .padding(4)
