@@ -122,7 +122,7 @@ impl Workbench {
     fn capture_button(&self, p: &'static Palette) -> Element<'_, Message> {
         let os = Os::CURRENT;
         let connected = self.snapshot.connected.is_some();
-        let capturing = self.pending("Saving capture");
+        let capturing = self.pending(Job::Capture);
         // One capture runs at a time, from any camera; saved is per camera.
         let saved = !capturing && self.just_saved(self.snapshot.active_camera.as_deref());
         let (glyph, label): (Element<'_, Message>, _) = if capturing {
@@ -170,8 +170,28 @@ impl Workbench {
         )
     }
 
+    /// Whether `pending` shows its progress where it was asked for, on
+    /// screen now, so the toolbar need not say it again: the control or pill
+    /// that shows a command on its way is where to look for it.
+    fn shown_in_place(&self, pending: &Pending) -> bool {
+        match pending.job {
+            // The Capture button beside the status reads "Saving…".
+            Job::Capture => true,
+            // The overview's pill reads "Starting…" or "Stopping…".
+            Job::Start | Job::Stop if pending.batch => self.overview(),
+            // The single camera's pill does, for the camera shown; a tile's
+            // own button shows nothing.
+            Job::Start | Job::Stop => {
+                !self.overview() && pending.camera == self.snapshot.active_camera
+            }
+            // The camera list's spinners.
+            Job::Discover | Job::Connect => self.sidebar_shown(),
+            _ => false,
+        }
+    }
+
     /// The toolbar's status: the notice, else the newest command on its
-    /// way, else the camera's link.
+    /// way that shows nowhere else, else the camera's link.
     fn status(&self, width: f32, p: &'static Palette) -> Element<'_, Message> {
         let snapshot = &self.snapshot;
         if let Some(notice) = &self.notice
@@ -179,12 +199,17 @@ impl Workbench {
         {
             return self.notice_line(notice, width, p);
         }
-        if let Some(pending) = self.pending.iter().max_by_key(|pending| pending.at) {
+        if let Some(pending) = self
+            .pending
+            .iter()
+            .filter(|pending| !self.shown_in_place(pending))
+            .max_by_key(|pending| pending.at)
+        {
             // The newest command, most likely the one just asked for.
             return row![
                 dot(fade(p.accent, self.pulse()), 6.0),
                 one_line(
-                    format!("{}…", pending.label),
+                    format!("{}…", pending.label()),
                     style::SMALL,
                     style::SANS,
                     p.secondary
@@ -198,7 +223,7 @@ impl Workbench {
             return space().into();
         };
         let mut parts = row![
-            text(format!("{} · {}", camera.transport, camera.serial))
+            text(format!("{} · {}", camera.transport, identity(camera)))
                 .size(style::SMALL)
                 .color(p.secondary)
                 .wrapping(text::Wrapping::None)
@@ -246,10 +271,12 @@ impl Workbench {
         p: &'static Palette,
     ) -> Element<'a, Message> {
         let alpha = self.notice_alpha();
-        let (glyph, tint, ink) = match notice.level {
-            Level::Done => (Icon::Check, p.live, p.secondary),
-            Level::Warning => (Icon::WarningTriangle, p.warn, p.secondary),
-            Level::Error => (Icon::Warning, p.danger, p.ink(p.danger)),
+        let level = notice.level;
+        // Errors read in their color; other outcomes are told by the glyph.
+        let ink = if level == Level::Error {
+            level.color(p)
+        } else {
+            p.secondary
         };
         let details = notice.level != Level::Done && !self.logs_open;
         let dismiss = notice.level == Level::Error;
@@ -261,7 +288,7 @@ impl Workbench {
             room -= NOTICE_DISMISS;
         }
         let mut line = row![
-            icon(glyph, 13.0, fade(tint, alpha)),
+            icon(level.icon(), 13.0, fade(level.color(p), alpha)),
             space().width(6),
             tip_above(
                 container(one_line(
@@ -304,19 +331,12 @@ impl Workbench {
                     .color(p.secondary),
             );
         }
-        let (warn, danger) = (p.ink(p.warn), p.ink(p.danger));
         for entry in &self.snapshot.logs {
             // Errors and warnings read by shape as well as color, as notices do.
-            let (mark, ink): (Element<'_, Message>, _) =
-                if entry.level.eq_ignore_ascii_case("error") {
-                    (icon(Icon::Warning, 11.0, p.danger), danger)
-                } else if entry.level.eq_ignore_ascii_case("warn")
-                    || entry.level.eq_ignore_ascii_case("warning")
-                {
-                    (icon(Icon::WarningTriangle, 11.0, p.warn), warn)
-                } else {
-                    (space().into(), p.text)
-                };
+            let (mark, ink): (Element<'_, Message>, _) = match Level::from_log(&entry.level) {
+                Some(level) => (level.mark(11.0, p), level.color(p)),
+                None => (space().into(), p.text),
+            };
             lines = lines.push(
                 row![
                     // Failed commands are logged without a time.
@@ -380,17 +400,44 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn progress_shows_once_where_it_was_asked_for() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        let mut other = liveness::streaming_camera(0, 0, 0.0);
+        other.info.id = "sim:1".into();
+        bench.snapshot.cameras = vec![liveness::streaming_camera(0, 0, 0.0), other];
+        bench.snapshot.active_camera = Some("sim:0".into());
+        let start = |camera: &str, batch: bool| Pending {
+            camera: Some(camera.into()),
+            batch,
+            ..Pending::unanswered(Job::Start)
+        };
+        bench.focus_camera = true;
+        assert!(
+            bench.shown_in_place(&start("sim:0", false)),
+            "the pill says it"
+        );
+        assert!(!bench.shown_in_place(&start("sim:1", false)));
+        bench.focus_camera = false;
+        assert!(
+            !bench.shown_in_place(&start("sim:1", false)),
+            "a tile's button shows nothing"
+        );
+        assert!(
+            bench.shown_in_place(&start("sim:1", true)),
+            "the overview pill"
+        );
+        let discovery = Pending::unanswered(Job::Discover);
+        bench.sidebar_open = true;
+        assert!(bench.shown_in_place(&discovery), "the camera list spins");
+        bench.sidebar_open = false;
+        assert!(!bench.shown_in_place(&discovery));
+        assert!(!bench.shown_in_place(&Pending::unanswered(Job::Set("Gain".into()))));
+    }
+
+    #[test]
     fn the_welcome_callout_speaks_for_discovery_once() {
         let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
-        let discovery = Pending {
-            label: "Discovering cameras".into(),
-            receiver: mpsc::channel().1,
-            target: None,
-            camera: None,
-            feature: None,
-            at: bench.now,
-            batch: false,
-        };
+        let discovery = Pending::unanswered(Job::Discover);
         let result = Ok(json!({"devices": [{}], "warnings": ["USB access denied"]}));
         bench.settle(&discovery, &result);
         let notice = bench.notice.clone().expect("a warning notice");

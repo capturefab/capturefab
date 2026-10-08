@@ -117,12 +117,12 @@ impl Workbench {
                 "light" => self.appearance = Appearance::Light,
                 "dark" => self.appearance = Appearance::Dark,
                 "notice" => self.scene_notice(command_notice(
-                    "Saving capture",
+                    &Job::Capture,
                     &Ok(json!({"files": ["capture-0001.png"], "count": 1})),
                 )),
                 // Settled, so the discovery's issues are kept as well.
                 "warning" => self.scene_settle(
-                    unanswered("Discovering cameras"),
+                    Pending::unanswered(Job::Discover),
                     Ok(json!({
                         "devices": [{"id": "sim:0"}],
                         "warnings": [
@@ -132,14 +132,14 @@ impl Workbench {
                     })),
                 ),
                 "error" => self.scene_notice(command_notice(
-                    "Saving capture",
+                    &Job::Capture,
                     &Err(anyhow::anyhow!("the camera stopped responding")),
                 )),
                 "notice-long" => self.scene_notice(command_notice(
-                    "Connecting camera",
+                    &Job::Connect,
                     &Err(anyhow::anyhow!(LONG_ERROR)),
                 )),
-                "searching" => self.hold("Discovering cameras", None),
+                "searching" => self.hold(Job::Discover, None),
                 "stalled" => self.scene.stalled = true,
                 "auto" => self.scene.auto = true,
                 "forwarding" => {
@@ -153,7 +153,7 @@ impl Workbench {
                     self.scene_settle(
                         Pending {
                             target: Some(target.into()),
-                            ..unanswered("Connecting camera")
+                            ..Pending::unanswered(Job::Connect)
                         },
                         Err(anyhow::anyhow!(
                             "no GigE Vision camera answered at 192.168.10.50 within 5 s"
@@ -205,7 +205,7 @@ impl Workbench {
                 "saved" => {
                     let result = json!({"files": ["capture-0001.png"], "count": 1});
                     self.last_saved = Saved::from_result(camera.clone(), &result, self.now);
-                    self.scene_notice(command_notice("Saving capture", &Ok(result)));
+                    self.scene_notice(command_notice(&Job::Capture, &Ok(result)));
                 }
                 // Copy buttons confirm in place, with no notice.
                 "copied" => self.note_copied(self.session_command()),
@@ -217,9 +217,9 @@ impl Workbench {
                     if word == "starting" {
                         self.scene.stopped = true;
                         self.scene.patch(&mut self.snapshot);
-                        self.hold("Starting stream", camera.clone());
+                        self.hold(Job::Start, camera.clone());
                     } else {
-                        self.hold("Stopping stream", camera.clone());
+                        self.hold(Job::Stop, camera.clone());
                     }
                 }
                 "write-error" => {
@@ -228,8 +228,7 @@ impl Workbench {
                     self.scene_settle(
                         Pending {
                             camera: camera.clone(),
-                            feature: Some(feature.into()),
-                            ..unanswered("Setting ExposureTime")
+                            ..Pending::unanswered(Job::Set(feature.into()))
                         },
                         Err(anyhow::anyhow!("5 is below the minimum of 10")),
                     );
@@ -264,21 +263,21 @@ impl Workbench {
     }
 
     /// A pending command that never finishes.
-    fn hold(&mut self, label: &str, camera: Option<String>) {
+    fn hold(&mut self, job: Job, camera: Option<String>) {
         let (sender, receiver) = mpsc::channel();
         self.scene.held.push(sender);
         self.pending.push(Pending {
             camera,
             at: self.now,
             receiver,
-            ..unanswered(label)
+            ..Pending::unanswered(job)
         });
     }
 
-    /// A pending command under `label` that never finishes, for an area's
+    /// A pending command doing `job` that never finishes, for an area's
     /// scene words; returned so the area can say what it acts on.
-    pub(super) fn scene_hold(&mut self, label: &str) -> &mut Pending {
-        self.hold(label, None);
+    pub(super) fn scene_hold(&mut self, job: Job) -> &mut Pending {
+        self.hold(job, None);
         self.pending.last_mut().expect("just held")
     }
 
@@ -327,11 +326,11 @@ impl Workbench {
                     .map(|camera| camera.info.id.clone())
                     .collect::<Vec<_>>()
                 {
-                    self.send_to(&id, "Starting demo stream", SessionCommand::Start);
+                    self.send_to(&id, Job::Start, SessionCommand::Start);
                     if self.scene.auto {
                         self.send_to(
                             &id,
-                            "Enabling auto mode",
+                            Job::AutoOn,
                             SessionCommand::Auto {
                                 balance: Some(self.balance),
                             },
@@ -363,19 +362,6 @@ impl Workbench {
         }
         self.screenshot = Some(request);
         task
-    }
-}
-
-/// A command under `label` whose answer never comes, to fill in for a scene.
-fn unanswered(label: &str) -> Pending {
-    Pending {
-        label: label.into(),
-        receiver: mpsc::channel().1,
-        target: None,
-        camera: None,
-        feature: None,
-        at: Instant::now(),
-        batch: false,
     }
 }
 
@@ -443,7 +429,7 @@ mod tests {
         bench.apply_scene(&["write-error"]);
         bench.observe_liveness();
         bench.stage_scene();
-        assert!(bench.pending_for("Starting stream", "sim:0"));
+        assert_eq!(bench.stream_pending("sim:0"), Some(false));
         assert!(!bench.snapshot.cameras[0].streaming && !bench.snapshot.streaming);
         assert!(bench.inspect.write_errors.contains_key("ExposureTime"));
         assert_eq!(
@@ -468,14 +454,8 @@ mod tests {
         );
         bench.stage_scene();
         bench.poll();
-        assert!(bench.pending("Discovering cameras"));
-        assert!(bench.pending("Stopping stream"));
+        assert!(bench.pending(Job::Discover));
         assert_eq!(bench.pending.len(), bench.scene.held.len());
-        assert!(
-            bench
-                .pending
-                .iter()
-                .any(|p| p.label == "Stopping stream" && p.camera.as_deref() == Some("sim:0"))
-        );
+        assert!(bench.pending_for(Job::Stop, "sim:0"));
     }
 }

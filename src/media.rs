@@ -154,6 +154,11 @@ fn validate_source(url: &str) -> Result<()> {
     }
     Ok(())
 }
+/// Whether `output` is a local file a forward records to (a path or a
+/// `file:` URL) rather than a URL it streams to.
+pub fn is_recording(output: &str) -> bool {
+    matches!(scheme(output).as_deref(), None | Some("file"))
+}
 pub fn is_source(url: &str) -> bool {
     scheme(url).is_some_and(|s| {
         matches!(
@@ -1840,7 +1845,7 @@ fn output_args(output: &str) -> Result<Vec<String>> {
     Ok(args)
 }
 fn recording_output(output: &str) -> Result<Option<(PathBuf, &'static str)>> {
-    if !matches!(scheme(output).as_deref(), None | Some("file")) {
+    if !is_recording(output) {
         return Ok(None);
     }
     let path = if scheme(output).as_deref() == Some("file") {

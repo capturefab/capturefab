@@ -29,19 +29,6 @@ pub(super) fn layout(count: usize, aspect: f32, area: Size) -> (usize, Size) {
         .unwrap_or((1, area))
 }
 
-/// Whether each camera shares its model with another, so its caption needs
-/// the serial number to tell them apart.
-fn twins(cameras: &[CameraSnapshot]) -> Vec<bool> {
-    let mut models: HashMap<&str, usize> = HashMap::new();
-    for camera in cameras {
-        *models.entry(camera.info.model.as_str()).or_default() += 1;
-    }
-    cameras
-        .iter()
-        .map(|camera| models[camera.info.model.as_str()] > 1)
-        .collect()
-}
-
 impl Workbench {
     pub(super) fn overview_view(&self, p: &'static Palette) -> Element<'_, Message> {
         let grid = responsive(move |size| self.grid(size));
@@ -72,12 +59,11 @@ impl Workbench {
         } else {
             tile
         };
-        let twins = twins(cameras);
         let mut grid = column![].spacing(GAP).align_x(Alignment::Center);
-        for (chunk, twins) in cameras.chunks(columns).zip(twins.chunks(columns)) {
+        for chunk in cameras.chunks(columns) {
             let mut line = row![].spacing(GAP);
-            for (camera, &twin) in chunk.iter().zip(twins) {
-                line = line.push(self.tile(camera, tile, twin));
+            for camera in chunk {
+                line = line.push(self.tile(camera, tile));
             }
             grid = grid.push(line);
         }
@@ -87,13 +73,8 @@ impl Workbench {
     }
 
     /// A camera's picture with its caption, badges and, under the pointer,
-    /// its actions. `twin` adds the serial number to the caption.
-    fn tile<'a>(
-        &'a self,
-        camera: &'a CameraSnapshot,
-        size: Size,
-        twin: bool,
-    ) -> Element<'a, Message> {
+    /// its actions.
+    fn tile<'a>(&'a self, camera: &'a CameraSnapshot, size: Size) -> Element<'a, Message> {
         let id = &camera.info.id;
         let surface = Palette::of(self.dark()).stage;
         let preview = self.previews.get(id);
@@ -135,7 +116,7 @@ impl Workbench {
             .width(Fill)
             .height(Fill),
             container(
-                container(self.caption(camera, twin, stalled.is_some(), size.width))
+                container(self.caption(camera, size.width))
                     .padding([10, 12])
                     .style(style::caption)
             )
@@ -191,8 +172,9 @@ impl Workbench {
                             glass(
                                 Icon::CornersOut,
                                 format!(
-                                    "Open · S/N {} · worker PID {}",
-                                    camera.info.serial, camera.worker_pid
+                                    "Open · {} · worker PID {}",
+                                    identity(&camera.info),
+                                    camera.worker_pid
                                 ),
                                 Message::FocusTile(id.clone()),
                             ),
@@ -238,15 +220,11 @@ impl Workbench {
     }
 
     /// The line over the bottom of a tile's picture: whether frames come,
-    /// which camera it is, what else it does, and its frame rate.
-    fn caption<'a>(
-        &'a self,
-        camera: &'a CameraSnapshot,
-        twin: bool,
-        stalled: bool,
-        width: f32,
-    ) -> Element<'a, Message> {
+    /// which camera it is (with what tells it apart from another of its
+    /// model), what else it does, and its frame rate.
+    fn caption<'a>(&'a self, camera: &'a CameraSnapshot, width: f32) -> Element<'a, Message> {
         let stage = style::STAGE;
+        let state = self.camera_state(camera);
         let mut name = row![one_line(
             camera.info.model.as_str(),
             style::BODY,
@@ -255,40 +233,32 @@ impl Workbench {
         )]
         .spacing(7)
         .align_y(Alignment::Center);
-        // The model keeps its room first, so the serial is what gets cut.
-        if twin {
+        // The model keeps its room first, so the identity is what gets cut.
+        if let Some(identity) = twin_identity(&self.snapshot.cameras, &camera.info) {
             name = name.push(one_line(
-                format!("S/N {}", camera.info.serial),
+                identity,
                 style::SMALL,
                 style::SANS,
                 stage.secondary,
             ));
         }
         let mut caption = row![
-            dot(
-                if !camera.streaming {
-                    stage.secondary
-                } else if stalled {
-                    stage.warn
-                } else {
-                    stage.live
-                },
-                7.0
-            ),
+            // The same state dot as the camera's row in the camera list.
+            status_dot(state, 7.0, stage),
             // Fluid, so the marks and figures after it are laid out first.
             container(name).width(Fill),
         ]
         .spacing(7)
         .align_y(Alignment::Center);
-        if let Some(output) = &camera.forwarding {
-            caption = caption.push(if output.contains("://") {
-                chip(
-                    icon(Icon::Broadcast, 12.0, stage.accent_text),
-                    format!("Forwarding to {}", redact_address(output)),
-                )
-            } else {
-                chip(dot(stage.danger, 7.0), format!("Recording to {output}"))
-            });
+        if let Some(output) = camera.forwarding.as_deref().map(Output::of) {
+            caption = caption.push(chip(
+                if output.recording() {
+                    dot(stage.danger, 7.0)
+                } else {
+                    icon(Icon::Broadcast, 12.0, stage.accent_text)
+                },
+                output.about(),
+            ));
         }
         if let Some(auto) = &camera.auto {
             caption = caption.push(chip(
@@ -304,9 +274,10 @@ impl Workbench {
             caption = caption.push(self.loss_label(camera, lost, 1.0));
         }
         if camera.streaming && width >= SPARK_WIDTH {
+            // In the dot's color: amber once frames stop, as on the pill.
             caption = caption.push(fps_spark(
                 self.throughput.get(&camera.info.id),
-                stage.live,
+                state.color(stage),
                 stage.warn,
                 (52.0, 14.0),
             ));
@@ -388,7 +359,6 @@ impl canvas::Program<Message> for Corners {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use liveness::streaming_camera;
 
     #[test]
     fn grid_layout_makes_tiles_as_large_as_possible() {
@@ -402,17 +372,5 @@ mod tests {
         assert_eq!(columns, 2);
         assert_eq!(tile, Size::new(496.0, 496.0));
         assert_eq!(layout(1, 2.0, square).1, Size::new(1000.0, 500.0));
-    }
-
-    #[test]
-    fn only_cameras_sharing_a_model_show_their_serial() {
-        let mut cameras = vec![
-            streaming_camera(0, 0, 30.0),
-            streaming_camera(0, 0, 30.0),
-            streaming_camera(0, 0, 30.0),
-        ];
-        cameras[2].info.model = "Line scan".into();
-        assert_eq!(twins(&cameras), [true, true, false]);
-        assert_eq!(twins(&cameras[1..]), [false, false]);
     }
 }

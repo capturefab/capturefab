@@ -2,7 +2,7 @@
 //! connected, and a connected camera before its first frame.
 use super::*;
 use iced::widget::column;
-use sidebar::{ADDRESSES, DISCOVERING, DISCOVERS, ISSUES, first_line, place, recent_place};
+use sidebar::{ADDRESSES, DISCOVERING, DISCOVERS, ISSUES, place, recent_place};
 
 /// Height of a welcome card: its padding and two lines of text.
 const CARD: f32 = 10.0 + 13.0 * 1.3 + 2.0 + 11.0 * 1.3 + 10.0;
@@ -44,7 +44,8 @@ impl Workbench {
                         self.snapshot
                             .active_camera
                             .as_deref()
-                            .is_some_and(|id| self.pending_for("Starting stream", id)),
+                            .and_then(|id| self.stream_pending(id))
+                            .is_some(),
                         self.spin(),
                         p,
                     )
@@ -52,9 +53,7 @@ impl Workbench {
                     button(text("Capture one frame").size(style::BODY))
                         .padding([7, 12])
                         .style(style::on_glass(false, 1.0))
-                        .on_press_maybe(
-                            (!self.pending("Saving capture")).then_some(Message::Capture)
-                        ),
+                        .on_press_maybe((!self.pending(Job::Capture)).then_some(Message::Capture)),
                 ]
                 .spacing(10)
                 .align_y(Alignment::Center),
@@ -104,7 +103,7 @@ impl Workbench {
     /// `ANCHORED` it is.
     pub(super) fn welcome_content(&self, p: &'static Palette) -> (Element<'_, Message>, f32) {
         let now = self.now;
-        let discovering = self.pending("Discovering cameras");
+        let discovering = self.pending(Job::Discover);
         let spin = self.spin();
         let found: Vec<_> = self
             .snapshot
@@ -159,12 +158,12 @@ impl Workbench {
         // callout grows into it and only what follows moves.
         let mut issues: Element<'_, Message> = space().height(0).into();
         if let Some(issue) = self.side.discovery_issues.first() {
-            let ink = p.ink(p.warn);
+            let ink = Level::Warning.color(p);
             // As wide as the cards, in the warning tint of a status pill.
             let callout = tip(
                 container(
                     row![
-                        icon(Icon::WarningTriangle, 12.0, ink),
+                        Level::Warning.mark(12.0, p),
                         one_line(first_line(issue), style::SMALL, style::SANS, ink).width(Fill),
                         button(text("Details").size(style::SMALL))
                             .style(style::link)
@@ -360,11 +359,10 @@ impl Workbench {
                 p.secondary,
             )
         } else if let Some((error, _)) = failure {
-            let ink = p.ink(p.danger);
             (
-                icon(Icon::Warning, 20.0, ink),
+                Level::Error.mark(20.0, p),
                 first_line(error).to_owned(),
-                ink,
+                Level::Error.color(p),
             )
         } else {
             (icon(kind, 20.0, p.accent), detail, p.secondary)

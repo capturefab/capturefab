@@ -5,7 +5,7 @@ use crate::{scheduling::CaptureJob, session::LogEntry};
 use std::collections::HashSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-/// The chrome package's own state: the title bar and the toolbar.
+/// State for the title bar and the toolbar.
 pub(super) struct ChromeState {
     /// The status pill going live, from Ready (0) to streaming (1): its tint,
     /// and the width of its live section.
@@ -45,9 +45,9 @@ impl ChromeState {
     }
 }
 
-/// The chrome package's hooks into the shared update cycle.
+/// The title bar's and toolbar's hooks into the shared update cycle.
 impl Workbench {
-    /// Point the chrome package's motions at what they show; from
+    /// Point the title bar's motions at what they show; from
     /// `sync_animations`.
     pub(super) fn sync_chrome(&mut self) {
         let now = self.now;
@@ -81,24 +81,15 @@ impl Workbench {
         self.chrome.hint.show(hint, now);
     }
 
-    /// The chrome package's bookkeeping on the slow tick, after the snapshot
-    /// refresh; from `tick()`.
+    /// The title bar's and toolbar's bookkeeping on the slow tick, after the
+    /// snapshot refresh; from `tick()`.
     pub(super) fn tick_chrome(&mut self) {
         self.patch_chrome_scene();
         let open = self.logs_open && !self.image_mode;
         self.chrome.unseen = unseen(&self.snapshot.logs, &mut self.chrome.seen, open);
     }
 
-    /// A command finished, after the shared bookkeeping (`finished`,
-    /// `failed`) and before its notice; from `settle()`.
-    pub(super) fn result_chrome(
-        &mut self,
-        _pending: &Pending,
-        _result: &anyhow::Result<serde_json::Value>,
-    ) {
-    }
-
-    /// Take a screenshot scene word the chrome package owns: `late` is false
+    /// Take a screenshot scene word for the title bar or toolbar: `late` is false
     /// while the scene is set up and true once its cameras stream. Returns
     /// whether the word was taken; see `apply_scene`. Words: `scheduled` (the
     /// selected camera has an active capture job), `log-sample` (the
@@ -282,6 +273,16 @@ impl Phase {
         }
     }
 
+    /// The camera state whose dot color the pill takes once live, so it
+    /// agrees with the camera's dot elsewhere.
+    fn state(self) -> CameraState {
+        match self {
+            Phase::Streaming => CameraState::Live,
+            Phase::Waiting(_) => CameraState::Stalled,
+            Phase::Ready | Phase::Starting | Phase::Stopping => CameraState::Idle,
+        }
+    }
+
     /// Whether the pill shows its live section, tinted as live.
     fn live(self) -> bool {
         matches!(self, Phase::Streaming | Phase::Waiting(_))
@@ -352,13 +353,7 @@ const SEEN_MAX: usize = 512;
 fn unseen(logs: &[LogEntry], seen: &mut HashSet<u64>, open: bool) -> Option<Level> {
     let mut worst = None;
     for entry in logs {
-        let level = if entry.level.eq_ignore_ascii_case("error") {
-            Level::Error
-        } else if entry.level.eq_ignore_ascii_case("warn")
-            || entry.level.eq_ignore_ascii_case("warning")
-        {
-            Level::Warning
-        } else {
+        let Some(level) = Level::from_log(&entry.level) else {
             continue;
         };
         let key = alert_key(entry);
@@ -433,16 +428,13 @@ impl Workbench {
         let snapshot = &self.snapshot;
         snapshot.connected.as_ref()?;
         let id = snapshot.active_camera.as_deref();
-        let pending = |label: &str| id.is_some_and(|id| self.pending_for(label, id));
-        Some(if pending("Starting stream") {
-            Phase::Starting
-        } else if pending("Stopping stream") {
-            Phase::Stopping
-        } else if snapshot.streaming {
-            id.and_then(|id| self.stalled(id))
-                .map_or(Phase::Streaming, Phase::Waiting)
-        } else {
-            Phase::Ready
+        Some(match id.and_then(|id| self.stream_pending(id)) {
+            Some(false) => Phase::Starting,
+            Some(true) => Phase::Stopping,
+            None if snapshot.streaming => id
+                .and_then(|id| self.stalled(id))
+                .map_or(Phase::Streaming, Phase::Waiting),
+            None => Phase::Ready,
         })
     }
 
@@ -459,9 +451,11 @@ impl Workbench {
             .iter()
             .filter_map(|camera| Some((&camera.info, self.stalled(&camera.info.id)?)))
             .collect();
-        let phase = if self.pending("Starting streams") {
+        // Start all and Stop all; a single camera's tile shows its own.
+        let batch = |job: Job| self.pending.iter().any(|p| p.batch && p.job == job);
+        let phase = if batch(Job::Start) {
             Phase::Starting
-        } else if self.pending("Stopping streams") {
+        } else if batch(Job::Stop) {
             Phase::Stopping
         } else if let Some(longest) = waiting.iter().map(|(_, silent)| *silent).max() {
             Phase::Waiting(longest)
@@ -485,17 +479,11 @@ impl Workbench {
         (tint, width)
     }
 
-    /// The serial of the camera shown, when another connected camera is the
-    /// same model, so the title alone would not tell them apart.
-    fn twin_serial(&self) -> Option<String> {
+    /// What tells the camera shown apart, when another connected camera is
+    /// the same model, so the title alone would not; see `twin_identity`.
+    fn twin_identity(&self) -> Option<String> {
         let camera = self.snapshot.connected.as_ref()?;
-        let same = self
-            .snapshot
-            .cameras
-            .iter()
-            .filter(|other| other.info.model == camera.model)
-            .count();
-        (same > 1).then(|| format!("S/N {}", camera.serial))
+        twin_identity(&self.snapshot.cameras, camera)
     }
 
     /// The single-camera title bar: the camera's model, its live status,
@@ -515,11 +503,7 @@ impl Workbench {
         let mut status = row![].spacing(6).align_y(Alignment::Center);
         if let Some(phase) = phase {
             let (tint, reveal) = self.live_level();
-            let on = if let Phase::Waiting(_) = phase {
-                p.warn
-            } else {
-                p.live
-            };
+            let on = phase.state().color(p);
             // Drawn while it folds away too.
             let live = reveal > 0.001;
             let history = snapshot
@@ -617,8 +601,8 @@ impl Workbench {
         // The sidebar toggle, the title and the gaps around it.
         let mut room = self.main_width() - padding - actions - 26.0 - 30.0;
         room -= rough(title, style::TITLE);
-        if let Some(serial) = self.twin_serial() {
-            room -= 10.0 + rough(&serial, style::BODY);
+        if let Some(identity) = self.twin_identity() {
+            room -= 10.0 + rough(&identity, style::BODY);
         }
         let pill = rough(label, style::SMALL) + 32.0 + 6.0 + LIVE;
         let tag = rough("Forwarding", style::SMALL) + 44.0;
@@ -669,7 +653,7 @@ impl Workbench {
         let streaming = snapshot.cameras.iter().filter(|c| c.streaming).count();
         let (phase, waiting) = self.overview_phase();
         let (tint, reveal) = self.live_level();
-        let on = if waiting.is_empty() { p.live } else { p.warn };
+        let on = phase.state().color(p);
         let pill = status_pill(
             phase.label(),
             (reveal > 0.001).then(|| match phase {
@@ -690,9 +674,9 @@ impl Workbench {
                     .iter()
                     .map(|(camera, silent)| {
                         format!(
-                            "{} · S/N {}: {}",
+                            "{} · {}: {}",
                             camera.model,
-                            camera.serial,
+                            identity(camera),
                             silence(*silent).to_lowercase()
                         )
                     })
@@ -787,9 +771,9 @@ impl Workbench {
                     .font(style::BOLD)
                     .wrapping(text::Wrapping::None),
             ));
-            if let Some(serial) = (!self.overview()).then(|| self.twin_serial()).flatten() {
+            if let Some(identity) = (!self.overview()).then(|| self.twin_identity()).flatten() {
                 left = left.push(clipped(
-                    text(serial)
+                    text(identity)
                         .size(style::BODY)
                         .color(p.secondary)
                         .wrapping(text::Wrapping::None),
@@ -880,27 +864,18 @@ impl Workbench {
 /// What the camera shown records to (a local file, in red) or forwards to
 /// (a URL, with its credentials hidden); opens the Forward tab.
 fn output_tag<'a>(target: &str, labelled: bool, p: &'static Palette) -> Element<'a, Message> {
-    let (mark, label, color, about): (Element<'a, Message>, _, _, _) = if target.contains("://") {
-        (
-            icon(Icon::Broadcast, 12.0, p.accent_text),
-            "Forwarding",
-            p.accent_text,
-            format!("Forwarding to {}", redact_address(target)),
-        )
+    let output = Output::of(target);
+    let (mark, color): (Element<'a, Message>, _) = if output.recording() {
+        (dot(p.danger, 6.0), p.danger)
     } else {
-        (
-            dot(p.danger, 6.0),
-            "Recording",
-            p.danger,
-            format!("Recording to {target}"),
-        )
+        (icon(Icon::Broadcast, 12.0, p.accent_text), p.accent_text)
     };
     tag(
         mark,
-        labelled.then(|| label.to_owned()),
+        labelled.then(|| output.title().to_owned()),
         color,
         Message::ShowTab(Tab::Forward),
-        format!("{about}\nClick for Forward settings"),
+        format!("{}\nClick for Forward settings", output.about()),
     )
 }
 
@@ -955,10 +930,15 @@ mod tests {
         assert_eq!(bench.single_phase(), Some(Phase::Ready));
         bench.snapshot.streaming = true;
         assert_eq!(bench.single_phase(), Some(Phase::Streaming));
-        bench.send_to("sim:0", "Stopping stream", SessionCommand::Stop);
+        bench.send_to("sim:0", Job::Stop, SessionCommand::Stop);
         assert_eq!(bench.single_phase(), Some(Phase::Stopping));
         assert_eq!(Phase::Stopping.pending(), Some(true));
         assert!(!Phase::Stopping.live(), "folds as soon as Stop is pressed");
+        // Start all and Stop all reach the camera shown too.
+        bench.pending.clear();
+        bench.snapshot.streaming = false;
+        bench.send_batch(vec!["sim:0".into()], Job::Start, || SessionCommand::Start);
+        assert_eq!(bench.single_phase(), Some(Phase::Starting));
         bench.snapshot.connected = None;
         assert_eq!(bench.single_phase(), None);
         assert_eq!(silence(Duration::from_millis(6400)), "No new frame for 6 s");
@@ -1066,15 +1046,23 @@ mod tests {
     }
 
     #[test]
-    fn twins_show_their_serials() {
+    fn twins_say_which_one_is_shown() {
         let mut bench = bench();
-        assert_eq!(bench.twin_serial(), None);
+        assert_eq!(bench.twin_identity(), None);
         let mut twin = streaming_camera(10, 0, 30.0);
         twin.info.id = "sim:1".into();
         twin.info.serial = "SIM1".into();
         bench.snapshot.cameras.push(twin);
         let serial = bench.snapshot.connected.as_ref().unwrap().serial.clone();
-        assert_eq!(bench.twin_serial(), Some(format!("S/N {serial}")));
+        assert_eq!(bench.twin_identity(), Some(format!("S/N {serial}")));
+        // Stream inputs go by their address, never their hash serial.
+        for camera in &mut bench.snapshot.cameras {
+            camera.info.model = "RTSP input".into();
+            camera.info.address = Some(format!("rtsp://{}.local/live", camera.info.id));
+        }
+        bench.snapshot.connected = Some(bench.snapshot.cameras[0].info.clone());
+        let id = &bench.snapshot.cameras[0].info.id;
+        assert_eq!(bench.twin_identity(), Some(format!("{id}.local/live")));
     }
 
     #[test]

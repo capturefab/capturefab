@@ -8,9 +8,8 @@ const SHEET_MARGIN: f32 = 40.0;
 /// The least height a sheet gets, however short the window.
 const SHEET_MIN: f32 = 320.0;
 
-/// The sheets package's own state: the quick guide and the destination sheets
-/// (whose pickers keep their own, see `Picker`). Add fields here, register
-/// their motions below and point them in `sync_sheets`.
+/// State for the sheets: the quick guide and the destination sheets (whose
+/// pickers keep their own, see `Picker`).
 pub(super) struct SheetState {
     /// The scrim of a sheet: 1 shown, 0 gone. It rises with the sheet and
     /// fades out after the sheet closes, so the window never flashes back
@@ -39,29 +38,16 @@ impl SheetState {
     }
 }
 
-/// The sheets package's hooks into the shared update cycle.
+/// The sheets' hooks into the shared update cycle.
 impl Workbench {
-    /// Point the sheets package's motions at what they show; from
+    /// Point the sheets' motions at what they show; from
     /// `sync_animations`. The scrim fades in with a sheet and out after it;
     /// a sheet opening while the scrim still fades out takes over from there.
     pub(super) fn sync_sheets(&mut self) {
         self.sheets.shown.show(self.sheet_open(), self.now);
     }
 
-    /// The sheets package's bookkeeping on the slow tick, after the snapshot
-    /// refresh; from `tick()`.
-    pub(super) fn tick_sheets(&mut self) {}
-
-    /// A command finished, after the shared bookkeeping (`finished`,
-    /// `failed`) and before its notice; from `settle()`.
-    pub(super) fn result_sheets(
-        &mut self,
-        _pending: &Pending,
-        _result: &anyhow::Result<serde_json::Value>,
-    ) {
-    }
-
-    /// Take a screenshot scene word the sheets package owns: `late` is false
+    /// Take a screenshot scene word for the sheets: `late` is false
     /// while the scene is set up and true once its cameras stream. Returns
     /// whether the word was taken; see `apply_scene`. Words: `help-more`
     /// (the guide with its connection notes open), and the destination

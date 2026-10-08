@@ -48,9 +48,7 @@ pub(super) const ADDRESSES: &str =
 /// What the address field takes, in the room under it.
 const ADDRESS_HINT: &str = "IP, stream URL, onvif: or video file";
 
-/// The sidebar-welcome package's own state: the camera list and the welcome
-/// screen. Add fields here, register their motions below and point them in
-/// `sync_side`.
+/// State for the camera list and the welcome screen.
 pub(super) struct SideState {
     /// The last discovery's problems, each in full: its warnings, or the
     /// error it failed with. Replaced whenever a discovery finishes.
@@ -146,9 +144,9 @@ fn shake_offset(level: f32) -> f32 {
     SHAKE_BY * left * left * ((1.0 - left) * 3.0 * std::f32::consts::TAU).sin()
 }
 
-/// The sidebar-welcome package's hooks into the shared update cycle.
+/// The camera list's and welcome screen's hooks into the shared update cycle.
 impl Workbench {
-    /// Point the sidebar-welcome package's motions at what they show; from
+    /// Point the camera list's and welcome screen's motions at what they show; from
     /// `sync_animations`. Also reads a changed address, here rather than in
     /// the view, since recognizing a file checks the disk.
     pub(super) fn sync_side(&mut self) {
@@ -159,8 +157,8 @@ impl Workbench {
         }
     }
 
-    /// The sidebar-welcome package's bookkeeping on the slow tick, after the
-    /// snapshot refresh; from `tick()`.
+    /// The camera list's and welcome screen's bookkeeping on the slow tick,
+    /// after the snapshot refresh; from `tick()`.
     pub(super) fn tick_side(&mut self) {
         let now = self.now;
         // Newly found cameras arrive one after another, in list order.
@@ -206,7 +204,7 @@ impl Workbench {
         pending: &Pending,
         result: &anyhow::Result<serde_json::Value>,
     ) {
-        if pending.label == "Discovering cameras" {
+        if pending.job == Job::Discover {
             self.side.searched = true;
         }
         if let (Err(_), Some(target)) = (result, &pending.target)
@@ -217,7 +215,7 @@ impl Workbench {
         }
     }
 
-    /// Take a screenshot scene word the sidebar-welcome package owns: `late` is
+    /// Take a screenshot scene word for the camera list or welcome screen: `late` is
     /// false while the scene is set up and true once its cameras stream.
     /// Returns whether the word was taken; see `apply_scene`. Words, for
     /// `welcome` scenes:
@@ -237,7 +235,7 @@ impl Workbench {
                     "sim:0",
                     "rtsp://operator:secret@192.168.1.20:8554/line-1?token=abc",
                 ] {
-                    self.scene_hold("Connecting camera").target = Some(target.into());
+                    self.scene_hold(Job::Connect).target = Some(target.into());
                 }
             }
             "side-card-failed" => self.side.connect_failed(
@@ -272,22 +270,6 @@ impl Workbench {
     }
 }
 
-/// `address` without its scheme, credentials, query or fragment: the host,
-/// any port, and the path. Safe to show, as `redact_address` is.
-pub(super) fn short_address(address: &str) -> String {
-    let rest = address.strip_prefix("onvif:").unwrap_or(address);
-    let rest = rest
-        .strip_prefix("//")
-        .or_else(|| rest.split_once("://").map(|(_, rest)| rest))
-        .unwrap_or(rest);
-    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
-    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    format!("{host}{}", path.trim_end_matches('/'))
-}
-
 /// Just the host (and port) of `address`, as `short_address` gives it.
 fn host(address: &str) -> String {
     let short = short_address(address);
@@ -297,13 +279,10 @@ fn host(address: &str) -> String {
     }
 }
 
-/// Where a camera is, identifier first: its address or serial, then its
-/// transport. Two cameras of one model differ here.
+/// Where a camera is, identifier first: its address or serial (see
+/// `identity`), then its transport. Two cameras of one model differ here.
 pub(super) fn place(camera: &CameraInfo) -> String {
-    match &camera.address {
-        Some(address) => format!("{} · {}", short_address(address), camera.transport),
-        None => format!("S/N {} · {}", camera.serial, camera.transport),
-    }
+    format!("{} · {}", identity(camera), camera.transport)
 }
 
 /// A recent camera's detail, identifier first like `place`. Recents keep it
@@ -316,11 +295,6 @@ pub(super) fn recent_place(recent: &Recent) -> String {
         Some((transport, place)) => format!("{place} · {transport}"),
         None => recent.detail.clone(),
     }
-}
-
-/// The first line of an error, for a one-line slot; the tooltip has it all.
-pub(super) fn first_line(error: &str) -> &str {
-    error.lines().next().unwrap_or(error)
 }
 
 /// What connecting to `input` will try, following `Camera::open`'s order;
@@ -369,20 +343,6 @@ fn read_address(input: &str, devices: &[CameraInfo]) -> Option<String> {
         .iter()
         .find(|device| device.id == input || device.serial == input)
         .map(|device| format!("Will try {} · S/N {}", device.model, device.serial))
-}
-
-/// A hollow status dot: a camera that is not connected.
-fn ring<'a>(color: Color, size: f32) -> Element<'a, Message> {
-    container(space().width(size).height(size))
-        .style(move |_| container::Style {
-            border: iced::Border {
-                color,
-                width: 1.5,
-                radius: (size / 2.0).into(),
-            },
-            ..container::Style::default()
-        })
-        .into()
 }
 
 /// `glyph` centered in the leading slot.
@@ -435,27 +395,19 @@ fn camera_status(
     p: &'static Palette,
 ) -> Option<(Element<'static, Message>, String)> {
     if let Some(silent) = stalled {
-        return Some((
-            icon(Icon::WarningTriangle, 12.0, p.ink(p.warn)),
-            silence(silent),
-        ));
+        return Some((Level::Warning.mark(12.0, p), silence(silent)));
     }
     // An old error says little while frames flow.
     if let Some(error) = camera.last_error.as_ref().filter(|_| !camera.streaming) {
-        return Some((
-            icon(Icon::Warning, 12.0, p.ink(p.danger)),
-            format!("Last error: {error}"),
-        ));
+        return Some((Level::Error.mark(12.0, p), format!("Last error: {error}")));
     }
-    let target = camera.forwarding.as_ref()?;
-    Some(if target.contains("://") {
-        (
-            icon(Icon::Broadcast, 13.0, p.secondary),
-            format!("Forwarding to {}", redact_address(target)),
-        )
+    let output = Output::of(camera.forwarding.as_ref()?);
+    let mark = if output.recording() {
+        dot(p.danger, 7.0)
     } else {
-        (dot(p.danger, 7.0), format!("Recording to {target}"))
-    })
+        icon(Icon::Broadcast, 13.0, p.secondary)
+    };
+    Some((mark, output.about()))
 }
 
 impl Workbench {
@@ -466,7 +418,7 @@ impl Workbench {
         let running = self
             .pending
             .iter()
-            .filter(|pending| pending.label == "Discovering cameras")
+            .filter(|pending| pending.job == Job::Discover)
             .map(|pending| self.now.saturating_duration_since(pending.at))
             .max();
         !self.side.searched || running.is_some_and(|running| running >= SEARCH_SHOWN)
@@ -488,7 +440,7 @@ impl Workbench {
                 devices.push(&camera.info);
             }
         }
-        let discovering = self.pending("Discovering cameras");
+        let discovering = self.pending(Job::Discover);
         let spin = self.spin();
         let brand = row![
             icon(Icon::Mark, 16.0, p.accent),
@@ -516,7 +468,7 @@ impl Workbench {
         }
         if !self.side.discovery_issues.is_empty() {
             header = header.push(tip(
-                icon(Icon::WarningTriangle, 12.0, p.ink(p.warn)),
+                Level::Warning.mark(12.0, p),
                 self.side.discovery_issues.join("\n"),
             ));
         }
@@ -644,13 +596,15 @@ impl Workbench {
         let stalled = state
             .filter(|state| state.streaming)
             .and_then(|_| self.stalled(id));
-        let glyph: Element<'a, Message> = match state {
-            _ if connecting => icon::spinner(12.0, p.secondary, spin),
-            Some(state) if state.streaming && stalled.is_some() => dot(p.warn, 8.0),
-            Some(state) if state.streaming => dot(p.live, 8.0),
-            Some(_) => dot(p.accent, 8.0),
-            None if failure.is_some() => ring(p.danger, 8.0),
-            None => ring(p.tertiary, 8.0),
+        let dot_state = match state {
+            Some(state) => self.camera_state(state),
+            None if failure.is_some() => CameraState::Failed,
+            None => CameraState::Offline,
+        };
+        let glyph: Element<'a, Message> = if connecting {
+            icon::spinner(12.0, p.secondary, spin)
+        } else {
+            status_dot(dot_state, 8.0, p)
         };
         let (detail, ink) = if connecting {
             ("Connecting…".to_owned(), p.secondary)
@@ -661,18 +615,7 @@ impl Workbench {
         };
         let status = state.and_then(|state| camera_status(state, stalled, p));
         let mut hint = match state {
-            Some(state) => format!(
-                "{} {} · {}",
-                camera.vendor,
-                camera.model,
-                if stalled.is_some() {
-                    "waiting for frames"
-                } else if state.streaming {
-                    "streaming"
-                } else {
-                    "connected"
-                }
-            ),
+            Some(_) => format!("{} {} · {}", camera.vendor, camera.model, dot_state.about()),
             None => format!("Connect to {} {}", camera.vendor, camera.model),
         };
         if let Some((_, about)) = &status {
@@ -785,7 +728,7 @@ impl Workbench {
             )
         } else if let Some((error, _)) = failure {
             (
-                ring(p.danger, 8.0),
+                status_dot(CameraState::Failed, 8.0, p),
                 first_line(error).to_owned(),
                 p.ink(p.danger),
             )
@@ -872,10 +815,10 @@ impl Workbench {
             });
         // One line, whatever it says, so the field above never moves.
         let hint: Element<'_, Message> = if let Some((error, _)) = failure {
-            let ink = p.ink(p.danger);
+            let ink = Level::Error.color(p);
             tip_above(
                 row![
-                    icon(Icon::Warning, 11.0, ink),
+                    Level::Error.mark(11.0, p),
                     one_line(first_line(error), style::CAPTION, style::SANS, ink).width(Fill),
                 ]
                 .spacing(5)
@@ -1157,13 +1100,9 @@ mod tests {
         let start = bench.now;
         bench.address = "192.168.10.50".into();
         let pending = |target: &str| Pending {
-            label: "Connecting camera".into(),
-            receiver: mpsc::channel().1,
             target: Some(target.into()),
-            camera: None,
-            feature: None,
             at: start,
-            batch: false,
+            ..Pending::unanswered(Job::Connect)
         };
         let failed: anyhow::Result<serde_json::Value> = Err(anyhow::anyhow!("no answer"));
         bench.settle(&pending("sim:4"), &failed);
@@ -1233,13 +1172,8 @@ mod tests {
         let start = bench.now;
         assert!(bench.searching_shown(), "until the first search finishes");
         let discovery = || Pending {
-            label: "Discovering cameras".into(),
-            receiver: mpsc::channel().1,
-            target: None,
-            camera: None,
-            feature: None,
             at: start,
-            batch: false,
+            ..Pending::unanswered(Job::Discover)
         };
         bench.settle(&discovery(), &Ok(json!({"devices": [], "warnings": []})));
         assert!(!bench.searching_shown());

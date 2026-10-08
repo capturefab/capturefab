@@ -4,7 +4,7 @@
 use super::*;
 use serde_json::Value;
 
-/// How much a notice matters.
+/// How much a notice, a log line or another status matters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Level {
     /// It worked. Fades after `NOTICE_LIFE`.
@@ -14,6 +14,45 @@ pub(super) enum Level {
     /// It failed. Stays until the next command, a newer error or a
     /// dismissal; later good news does not replace it.
     Error,
+}
+
+impl Level {
+    /// The problem an activity log line reports, by its level: "error",
+    /// "warn" or "warning", in any case. `None` for news.
+    pub(super) fn from_log(level: &str) -> Option<Level> {
+        if level.eq_ignore_ascii_case("error") {
+            Some(Level::Error)
+        } else if level.eq_ignore_ascii_case("warn") || level.eq_ignore_ascii_case("warning") {
+            Some(Level::Warning)
+        } else {
+            None
+        }
+    }
+
+    /// Its glyph, so it reads by shape as well as color: a check, a
+    /// triangle for warnings, a circled mark for errors.
+    pub(super) fn icon(self) -> Icon {
+        match self {
+            Level::Done => Icon::Check,
+            Level::Warning => Icon::WarningTriangle,
+            Level::Error => Icon::Warning,
+        }
+    }
+
+    /// Its glyph's color in `p`: `live` for done; for problems `warn` or
+    /// `danger` through `ink`, which their text can share.
+    pub(super) fn color(self, p: &Palette) -> Color {
+        match self {
+            Level::Done => p.live,
+            Level::Warning => p.ink(p.warn),
+            Level::Error => p.ink(p.danger),
+        }
+    }
+
+    /// Its glyph at `size`, in its color.
+    pub(super) fn mark<'a, M: 'a>(self, size: f32, p: &Palette) -> Element<'a, M> {
+        icon(self.icon(), size, self.color(p))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -62,8 +101,8 @@ impl Saved {
 /// The `copied` key for the whole activity log.
 pub(super) const COPIED_LOG: &str = "\0activity log";
 
-/// Commands sent to several cameras at once under one label, reported in
-/// one notice when the last finishes.
+/// Commands sent to several cameras at once doing one job, reported in one
+/// notice when the last finishes.
 #[derive(Debug, Default)]
 pub(super) struct Batch {
     total: usize,
@@ -127,57 +166,55 @@ impl Workbench {
         }
     }
 
-    /// Send `command` to each of `cameras` under `label`, as one batch with
+    /// Send `command` to each of `cameras` to do `job`, as one batch with
     /// one notice; see `batch_result`.
     pub(super) fn send_batch(
         &mut self,
         cameras: Vec<String>,
-        label: &str,
+        job: Job,
         command: impl Fn() -> SessionCommand,
     ) {
         for camera in cameras {
             let sent = self
-                .submit(Some(&camera), label.to_owned(), command())
+                .submit(Some(&camera), job.clone(), command())
                 .map(|pending| pending.batch = true)
                 .is_some();
             if sent {
-                let batch = self.batches.entry(label.to_owned()).or_default();
+                let batch = self.batches.entry(job.clone()).or_default();
                 batch.total += 1;
                 batch.left += 1;
             }
         }
     }
 
-    /// One command of the batch under `label` finished. Once the last has,
+    /// One command of the batch doing `job` finished. Once the last has,
     /// the batch's notice: the usual outcome when all worked, otherwise an
     /// error counting the failures, listed in full as its detail.
     pub(super) fn batch_result(
         &mut self,
-        label: &str,
+        job: &Job,
         result: &Result<Value>,
     ) -> Option<(String, Option<String>, Level)> {
-        let Some(batch) = self.batches.get_mut(label) else {
-            return command_notice(label, result);
+        let Some(batch) = self.batches.get_mut(job) else {
+            return command_notice(job, result);
         };
         batch.left = batch.left.saturating_sub(1);
         if let Err(error) = result {
             let full = format!("{error:#}");
-            batch
-                .failures
-                .push(full.lines().next().unwrap_or_default().to_owned());
+            batch.failures.push(first_line(&full).to_owned());
         }
         if batch.left > 0 {
             return None;
         }
-        let batch = self.batches.remove(label)?;
+        let batch = self.batches.remove(job)?;
         let Some(first) = batch.failures.first() else {
-            return command_notice(label, result);
+            return command_notice(job, result);
         };
         let failed = batch.failures.len();
-        let text = match label {
-            "Starting streams" => format!("Could not start {failed} of {} streams", batch.total),
-            "Stopping streams" => format!("Could not stop {failed} of {} streams", batch.total),
-            _ => format!("{} on {failed} of {} cameras", failure(label), batch.total),
+        let text = match job {
+            Job::Start => format!("Could not start {failed} of {} streams", batch.total),
+            Job::Stop => format!("Could not stop {failed} of {} streams", batch.total),
+            _ => format!("{} on {failed} of {} cameras", failure(job), batch.total),
         };
         Some((
             format!("{text}: {first}"),
@@ -247,16 +284,15 @@ impl Workbench {
 /// story as detail, and how much it matters. `None` when nothing is worth
 /// saying because the result is already on screen.
 pub(super) fn command_notice(
-    label: &str,
+    job: &Job,
     result: &Result<Value>,
 ) -> Option<(String, Option<String>, Level)> {
     match result {
-        Ok(value) => outcome(label, value),
+        Ok(value) => outcome(job, value),
         Err(error) => {
             let full = format!("{error:#}");
-            let first = full.lines().next().unwrap_or_default();
             Some((
-                format!("{}: {first}", failure(label)),
+                format!("{}: {}", failure(job), first_line(&full)),
                 Some(full.clone()),
                 Level::Error,
             ))
@@ -264,97 +300,88 @@ pub(super) fn command_notice(
     }
 }
 
-fn outcome(label: &str, value: &Value) -> Option<(String, Option<String>, Level)> {
+fn outcome(job: &Job, value: &Value) -> Option<(String, Option<String>, Level)> {
     let done = |text: String| Some((text, None, Level::Done));
-    match label {
-        "Saving capture" => Some(saved(value)),
-        "Discovering cameras" => Some(discovered(value)),
-        "Connecting camera" | "Connecting demo camera" => {
-            done(match value["connected"]["model"].as_str() {
-                Some(model) => format!("Connected to {model}"),
-                None => "Connected".into(),
-            })
-        }
-        "Disconnecting" => done("Disconnected".into()),
+    match job {
+        Job::Capture => Some(saved(value)),
+        Job::Discover => Some(discovered(value)),
+        Job::Connect => done(match value["connected"]["model"].as_str() {
+            Some(model) => format!("Connected to {model}"),
+            None => "Connected".into(),
+        }),
+        Job::Disconnect => done("Disconnected".into()),
         // The selection, the job list and the status pill already show the
         // result.
-        "Selecting camera"
-        | "Refreshing capture jobs"
-        | "Starting stream"
-        | "Starting demo stream"
-        | "Starting streams"
-        | "Stopping stream"
-        | "Stopping streams" => None,
-        "Enabling auto mode" => done("Auto mode on".into()),
-        "Switching to manual" => done("Auto mode off".into()),
-        "Updating auto balance" => done("Auto balance updated".into()),
-        "Refreshing features" => done(match value["features"].as_array() {
-            Some(features) => format!("Read {}", count(features.len(), "feature", "features")),
+        Job::Select | Job::RefreshJobs | Job::Start | Job::Stop => None,
+        Job::AutoOn => done("Auto mode on".into()),
+        Job::AutoOff => done("Auto mode off".into()),
+        Job::Balance => done("Auto balance updated".into()),
+        Job::RefreshFeatures => done(match value["features"].as_array() {
+            Some(features) => format!(
+                "Read {}",
+                plural(features.len() as u64, "feature", "features")
+            ),
             None => "Features read".into(),
         }),
-        "Scheduling capture" => done(match value["job"]["id"].as_u64() {
+        Job::Schedule => done(match value["job"]["id"].as_u64() {
             Some(id) => format!("Capture job {id} scheduled"),
             None => "Capture scheduled".into(),
         }),
-        "Cancelling capture job" => done(match value["cancelled"].as_u64() {
+        Job::Cancel => done(match value["cancelled"].as_u64() {
             Some(id) => format!("Capture job {id} cancelled"),
             None => "Capture job cancelled".into(),
         }),
-        "Starting forwarding" => done(match value["forwarding"].as_str() {
-            Some(output) => format!("Forwarding to {}", redact_address(output)),
+        Job::Forward { recording } => done(match value["forwarding"].as_str() {
+            Some(output) => Output::of(output).about(),
+            None if *recording => "Recording started".into(),
             None => "Forwarding started".into(),
         }),
-        "Stopping forwarding" => done("Forwarding stopped".into()),
-        _ => {
-            if let (Some(name), Some(set)) = (value["name"].as_str(), value.get("value")) {
-                let mut text = format!("{} set to {}", words(name), value_text(set));
-                // The camera left auto mode to take a manual value.
-                if value.get("auto").is_some_and(Value::is_null) {
-                    text.push_str(" · auto mode off");
-                }
-                done(text)
-            } else if let Some(feature) = value["executed"].as_str() {
-                done(format!("{} executed", words(feature)))
-            } else if value["streaming"].is_boolean() {
-                // AcquisitionStart and Stop: the status pill shows it.
-                None
-            } else {
-                done(format!("{label} · done"))
+        Job::StopForward { recording: true } => done("Recording stopped".into()),
+        Job::StopForward { recording: false } => done("Forwarding stopped".into()),
+        Job::Set(feature) => {
+            let name = value["name"].as_str().unwrap_or(feature);
+            let mut text = match value.get("value") {
+                Some(set) => format!("{} set to {}", words(name), value_text(set)),
+                None => format!("{} set", words(name)),
+            };
+            // The camera left auto mode to take a manual value.
+            if value.get("auto").is_some_and(Value::is_null) {
+                text.push_str(" · auto mode off");
             }
+            done(text)
         }
+        // AcquisitionStart and Stop report the stream: the status pill shows it.
+        Job::Execute(_) if value["streaming"].is_boolean() => None,
+        Job::Execute(feature) => done(format!(
+            "{} executed",
+            words(value["executed"].as_str().unwrap_or(feature))
+        )),
     }
 }
 
-/// "Capture failed", "Could not connect": what did not happen, for a label.
-fn failure(label: &str) -> String {
-    let text = match label {
-        "Saving capture" => "Capture failed",
-        "Discovering cameras" => "Discovery failed",
-        "Connecting camera" | "Connecting demo camera" => "Could not connect",
-        "Disconnecting" => "Could not disconnect",
-        "Selecting camera" => "Could not select the camera",
-        "Starting stream" | "Starting streams" | "Starting demo stream" => {
-            "Could not start the stream"
-        }
-        "Stopping stream" | "Stopping streams" => "Could not stop the stream",
-        "Enabling auto mode" => "Could not turn on auto mode",
-        "Switching to manual" => "Could not switch to manual",
-        "Updating auto balance" => "Could not update the auto balance",
-        "Refreshing features" => "Could not read the features",
-        "Scheduling capture" => "Could not schedule the capture",
-        "Refreshing capture jobs" => "Could not read the capture jobs",
-        "Cancelling capture job" => "Could not cancel the capture job",
-        "Starting forwarding" => "Could not start forwarding",
-        "Stopping forwarding" => "Could not stop forwarding",
-        _ => {
-            return if let Some(feature) = label.strip_prefix("Setting ") {
-                format!("Could not set {}", words(feature))
-            } else if let Some(feature) = label.strip_prefix("Executing ") {
-                format!("Could not execute {}", words(feature))
-            } else {
-                format!("{label} failed")
-            };
-        }
+/// "Capture failed", "Could not connect": what did not happen.
+fn failure(job: &Job) -> String {
+    let text = match job {
+        Job::Capture => "Capture failed",
+        Job::Discover => "Discovery failed",
+        Job::Connect => "Could not connect",
+        Job::Disconnect => "Could not disconnect",
+        Job::Select => "Could not select the camera",
+        Job::Start => "Could not start the stream",
+        Job::Stop => "Could not stop the stream",
+        Job::AutoOn => "Could not turn on auto mode",
+        Job::AutoOff => "Could not switch to manual",
+        Job::Balance => "Could not update the auto balance",
+        Job::RefreshFeatures => "Could not read the features",
+        Job::Schedule => "Could not schedule the capture",
+        Job::RefreshJobs => "Could not read the capture jobs",
+        Job::Cancel => "Could not cancel the capture job",
+        Job::Forward { recording: true } => "Could not start recording",
+        Job::Forward { recording: false } => "Could not start forwarding",
+        Job::StopForward { recording: true } => "Could not stop recording",
+        Job::StopForward { recording: false } => "Could not stop forwarding",
+        Job::Set(feature) => return format!("Could not set {}", words(feature)),
+        Job::Execute(feature) => return format!("Could not execute {}", words(feature)),
     };
     text.into()
 }
@@ -373,9 +400,9 @@ fn saved(value: &Value) -> (String, Option<String>, Level) {
     };
     let (mut text, detail) = match files.as_slice() {
         [] => {
-            let frames = value["count"].as_u64().unwrap_or(1) as usize;
+            let frames = value["count"].as_u64().unwrap_or(1);
             (
-                format!("Captured {}", count(frames, "frame", "frames")),
+                format!("Captured {}", plural(frames, "frame", "frames")),
                 None,
             )
         }
@@ -416,7 +443,7 @@ fn saved(value: &Value) -> (String, Option<String>, Level) {
             });
             let why = format!(
                 "{} not queued for upload to {destination}; Activity has the reason.",
-                count(stuck as usize, "file was", "files were")
+                plural(stuck, "file was", "files were")
             );
             let detail = Some(match detail {
                 Some(saved) => format!("{saved}\n{why}"),
@@ -432,7 +459,7 @@ fn saved(value: &Value) -> (String, Option<String>, Level) {
 fn discovered(value: &Value) -> (String, Option<String>, Level) {
     let found = match value["devices"].as_array().map_or(0, Vec::len) {
         0 => "No cameras found".to_owned(),
-        found => format!("Found {}", count(found, "camera", "cameras")),
+        found => format!("Found {}", plural(found as u64, "camera", "cameras")),
     };
     let warnings: Vec<&str> = value["warnings"]
         .as_array()
@@ -442,19 +469,13 @@ fn discovered(value: &Value) -> (String, Option<String>, Level) {
         (found, None, Level::Done)
     } else {
         (
-            format!("{found} · {}", count(warnings.len(), "warning", "warnings")),
+            format!(
+                "{found} · {}",
+                plural(warnings.len() as u64, "warning", "warnings")
+            ),
             Some(warnings.join("\n")),
             Level::Warning,
         )
-    }
-}
-
-/// "1 camera", "12 cameras".
-fn count(n: usize, one: &str, many: &str) -> String {
-    if n == 1 {
-        format!("1 {one}")
-    } else {
-        format!("{} {many}", grouped(n as u64))
     }
 }
 
@@ -463,14 +484,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn notice(label: &str, value: Value) -> (String, Option<String>, Level) {
-        command_notice(label, &Ok(value)).expect("a notice")
+    fn notice(job: Job, value: Value) -> (String, Option<String>, Level) {
+        command_notice(&job, &Ok(value)).expect("a notice")
     }
 
     #[test]
     fn discovery_warnings_remain_visible_after_success() {
         let (text, detail, level) = notice(
-            "Discovering cameras",
+            Job::Discover,
             json!({
                 "devices": [{"id": "sim:0"}],
                 "warnings": ["Native discovery timed out", "USB access denied"]
@@ -482,137 +503,136 @@ mod tests {
         assert!(detail.contains("Native discovery timed out"));
         assert!(detail.contains("USB access denied"));
         assert_eq!(
-            notice(
-                "Discovering cameras",
-                json!({"devices": [], "warnings": []})
-            ),
+            notice(Job::Discover, json!({"devices": [], "warnings": []})),
             ("No cameras found".into(), None, Level::Done)
         );
         assert_eq!(
-            notice(
-                "Discovering cameras",
-                json!({"devices": [{}, {}], "warnings": []})
-            )
-            .0,
+            notice(Job::Discover, json!({"devices": [{}, {}], "warnings": []})).0,
             "Found 2 cameras"
         );
     }
 
     #[test]
     fn notices_state_the_outcome() {
+        let recording = Job::Forward { recording: true };
         let cases = [
             (
-                "Saving capture",
+                Job::Capture,
                 json!({"files": ["shots/capture-0001.png"], "count": 1}),
                 "Saved capture-0001.png",
             ),
             (
-                "Saving capture",
+                Job::Capture,
                 json!({"files": ["shots/a-1.png", "shots/a-2.png"], "count": 2}),
                 "Saved 2 files to shots",
             ),
             (
-                "Saving capture",
+                Job::Capture,
                 json!({"files": ["c.png"], "destination": "lab", "queued_uploads": 1}),
                 "Saved c.png · uploading to lab",
             ),
             (
-                "Saving capture",
+                Job::Capture,
                 json!({"files": ["c.png"], "destination": "nas"}),
                 "Saved c.png",
             ),
             (
-                "Connecting camera",
+                Job::Connect,
                 json!({"connected": {"model": "Pattern camera"}}),
                 "Connected to Pattern camera",
             ),
             (
-                "Setting ExposureTime",
+                Job::Set("ExposureTime".into()),
                 json!({"name": "ExposureTime", "value": 15000}),
                 "Exposure Time set to 15000",
             ),
             (
-                "Setting Gain",
+                Job::Set("Gain".into()),
                 json!({"name": "Gain", "value": 2.5, "auto": null}),
                 "Gain set to 2.5 · auto mode off",
             ),
             (
-                "Executing TriggerSoftware",
+                Job::Execute("TriggerSoftware".into()),
                 json!({"executed": "TriggerSoftware"}),
                 "Trigger Software executed",
             ),
             (
-                "Refreshing features",
+                Job::RefreshFeatures,
                 json!({"features": [{}, {}, {}]}),
                 "Read 3 features",
             ),
             (
-                "Starting forwarding",
+                Job::Forward { recording: false },
                 json!({"forwarding": "rtsp://user:secret@host/live"}),
                 "Forwarding to rtsp://[redacted]@host/live",
             ),
             (
-                "Scheduling capture",
+                recording.clone(),
+                json!({"forwarding": "recordings/line-1.mkv"}),
+                "Recording to recordings/line-1.mkv",
+            ),
+            (
+                Job::StopForward { recording: true },
+                json!({"forwarding": null}),
+                "Recording stopped",
+            ),
+            (
+                Job::Schedule,
                 json!({"job": {"id": 4}}),
                 "Capture job 4 scheduled",
             ),
-            ("Enabling auto mode", json!({"auto": {}}), "Auto mode on"),
-            ("Something new", json!({}), "Something new · done"),
+            (Job::AutoOn, json!({"auto": {}}), "Auto mode on"),
         ];
-        for (label, value, expected) in cases {
-            let (text, _, level) = notice(label, value);
-            assert_eq!(text, expected, "{label}");
-            assert_eq!(level, Level::Done, "{label}");
+        for (job, value, expected) in cases {
+            let (text, _, level) = notice(job.clone(), value);
+            assert_eq!(text, expected, "{job:?}");
+            assert_eq!(level, Level::Done, "{job:?}");
         }
-        let (_, detail, _) = notice(
-            "Saving capture",
-            json!({"files": ["shots/capture-0001.png"]}),
-        );
+        let (_, detail, _) = notice(Job::Capture, json!({"files": ["shots/capture-0001.png"]}));
         assert_eq!(detail.as_deref(), Some("shots/capture-0001.png"));
-        assert!(command_notice("Selecting camera", &Ok(json!({}))).is_none());
+        assert!(command_notice(&Job::Select, &Ok(json!({}))).is_none());
         // The status pill shows these.
-        for (label, streaming) in [
-            ("Starting stream", true),
-            ("Stopping stream", false),
-            ("Starting streams", true),
-            ("Executing AcquisitionStart", true),
+        for (job, streaming) in [
+            (Job::Start, true),
+            (Job::Stop, false),
+            (Job::Execute("AcquisitionStart".into()), true),
         ] {
             let result = Ok(json!({ "streaming": streaming }));
-            assert!(command_notice(label, &result).is_none(), "{label}");
+            assert!(command_notice(&job, &result).is_none(), "{job:?}");
         }
     }
 
     #[test]
     fn failures_say_what_did_not_happen_on_one_line() {
         let error = anyhow::anyhow!("frame timeout\nwhile waiting").context("save capture.png");
-        let (text, detail, level) = command_notice("Saving capture", &Err(error)).unwrap();
+        let (text, detail, level) = command_notice(&Job::Capture, &Err(error)).unwrap();
         assert_eq!(level, Level::Error);
         assert_eq!(text, "Capture failed: save capture.png: frame timeout");
         assert_eq!(
             detail.as_deref(),
             Some("save capture.png: frame timeout\nwhile waiting")
         );
-        let failed = |label: &str| {
-            command_notice(label, &Err(anyhow::anyhow!("busy")))
+        let failed = |job: Job| {
+            command_notice(&job, &Err(anyhow::anyhow!("busy")))
                 .unwrap()
                 .0
         };
-        assert_eq!(failed("Connecting camera"), "Could not connect: busy");
+        assert_eq!(failed(Job::Connect), "Could not connect: busy");
         assert_eq!(
-            failed("Setting ExposureTime"),
+            failed(Job::Set("ExposureTime".into())),
             "Could not set Exposure Time: busy"
         );
+        assert_eq!(failed(Job::Start), "Could not start the stream: busy");
         assert_eq!(
-            failed("Starting stream"),
-            "Could not start the stream: busy"
+            failed(Job::Forward { recording: true }),
+            "Could not start recording: busy"
         );
-        assert_eq!(failed("Doing something"), "Doing something failed: busy");
     }
 
     #[test]
     fn uploads_that_could_not_be_queued_are_a_warning() {
         let (text, detail, level) = notice(
-            "Saving capture",
+            Job::Capture,
             json!({"files": ["shots/c.png"], "destination": "lab", "queued_uploads": 0}),
         );
         assert_eq!(level, Level::Warning);
@@ -621,7 +641,7 @@ mod tests {
         assert!(detail.starts_with("shots/c.png\n"));
         assert!(detail.contains("1 file was not queued for upload to lab"));
         let (text, _, level) = notice(
-            "Saving capture",
+            Job::Capture,
             json!({
                 "files": ["shots/a.png", "shots/b.png", "shots/c.png"],
                 "destination": "lab",
@@ -634,18 +654,6 @@ mod tests {
 
     fn bench() -> Workbench {
         Workbench::new(SessionHandle::new(), "test".into(), true, None)
-    }
-
-    fn sent(label: &str) -> Pending {
-        Pending {
-            label: label.into(),
-            receiver: mpsc::channel().1,
-            target: None,
-            camera: None,
-            feature: None,
-            at: Instant::now(),
-            batch: false,
-        }
     }
 
     fn text(bench: &Workbench) -> Option<&str> {
@@ -718,7 +726,7 @@ mod tests {
         let mut bench = bench();
         let batch = |bench: &mut Workbench, total: usize| {
             bench.batches.insert(
-                "Starting streams".into(),
+                Job::Start,
                 Batch {
                     total,
                     left: total,
@@ -727,7 +735,7 @@ mod tests {
             );
             Pending {
                 batch: true,
-                ..sent("Starting streams")
+                ..Pending::unanswered(Job::Start)
             }
         };
         let pending = batch(&mut bench, 3);
@@ -753,7 +761,7 @@ mod tests {
     #[test]
     fn failures_are_kept_where_they_were_asked_for() {
         let mut bench = bench();
-        let discover = sent("Discovering cameras");
+        let discover = Pending::unanswered(Job::Discover);
         bench.settle(&discover, &Err(anyhow::anyhow!("network unreachable")));
         assert_eq!(bench.side.discovery_issues, ["network unreachable"]);
         bench.settle(
@@ -764,10 +772,7 @@ mod tests {
         bench.settle(&discover, &Ok(json!({"devices": []})));
         assert!(bench.side.discovery_issues.is_empty());
 
-        let set = Pending {
-            feature: Some("Gain".into()),
-            ..sent("Setting Gain")
-        };
+        let set = Pending::unanswered(Job::Set("Gain".into()));
         bench.settle(&set, &Err(anyhow::anyhow!("out of range")));
         assert_eq!(bench.inspect.write_errors["Gain"], "out of range");
         let _ = bench.handle_message(Message::Draft("Gain".into(), "2".into()));
@@ -780,7 +785,7 @@ mod tests {
             bench.now += Duration::from_millis(1);
             let connect = Pending {
                 target: Some(format!("10.0.0.{n}")),
-                ..sent("Connecting camera")
+                ..Pending::unanswered(Job::Connect)
             };
             bench.settle(&connect, &Err(anyhow::anyhow!("no answer")));
         }
@@ -792,6 +797,34 @@ mod tests {
         assert!(
             !bench.side.connect_failures.contains_key("10.0.0.11"),
             "edited"
+        );
+    }
+
+    #[test]
+    fn levels_read_from_logs_and_mark_by_shape() {
+        assert_eq!(Level::from_log("error"), Some(Level::Error));
+        assert_eq!(Level::from_log("WARN"), Some(Level::Warning));
+        assert_eq!(Level::from_log("Warning"), Some(Level::Warning));
+        assert_eq!(Level::from_log("info"), None);
+        assert_eq!(Level::Warning.icon(), Icon::WarningTriangle);
+        assert_eq!(Level::Error.icon(), Icon::Warning);
+        for p in [&style::LIGHT, &style::DARK] {
+            assert_eq!(Level::Error.color(p), p.ink(p.danger), "as its text");
+            assert_eq!(Level::Warning.color(p), p.ink(p.warn));
+        }
+    }
+
+    #[test]
+    fn labels_say_what_is_on_its_way() {
+        let batch = Pending {
+            batch: true,
+            ..Pending::unanswered(Job::Start)
+        };
+        assert_eq!(batch.label(), "Starting streams");
+        assert_eq!(Pending::unanswered(Job::Start).label(), "Starting stream");
+        assert_eq!(
+            Pending::unanswered(Job::Set("ExposureTime".into())).label(),
+            "Setting Exposure Time"
         );
     }
 

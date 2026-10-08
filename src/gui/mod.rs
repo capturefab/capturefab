@@ -47,7 +47,7 @@ use iced::{
 };
 use icon::{Icon, icon};
 use keys::{Action, Chord, Os};
-use liveness::Liveness;
+use liveness::{CameraState, Liveness};
 use motion::{Kind, Motion};
 use notice::{Batch, Level, Notice, Saved, command_notice};
 use prefs::{Prefs, Recent};
@@ -185,7 +185,7 @@ pub fn run_capture(
             });
             for index in 0..count {
                 app.send(
-                    "Connecting demo camera",
+                    Job::Connect,
                     SessionCommand::Connect {
                         camera: format!("sim:{index}"),
                         timeout_ms: 2000,
@@ -283,18 +283,114 @@ fn screen_refresh() -> Task<Message> {
 
 /// A command on its way to the session, filled in once where it is sent.
 struct Pending {
-    label: String,
+    /// What it does: views, notices and batches go by this, never by its
+    /// `label`.
+    job: Job,
     receiver: Receiver<anyhow::Result<serde_json::Value>>,
     /// The address or ID a connect asked for.
     target: Option<String>,
     /// The camera the command acts on, when known.
     camera: Option<String>,
-    /// The feature a write or command button acts on.
-    feature: Option<String>,
     /// When it was sent.
     at: Instant,
     /// One of several sent together, reported as one; see `send_batch`.
     batch: bool,
+}
+
+impl Pending {
+    /// A command doing `job` whose answer never comes, for scenes and tests;
+    /// they, like `submit`, fill in the rest with struct update syntax.
+    fn unanswered(job: Job) -> Self {
+        Pending {
+            job,
+            receiver: mpsc::channel().1,
+            target: None,
+            camera: None,
+            at: Instant::now(),
+            batch: false,
+        }
+    }
+
+    /// What the toolbar says while it is on its way, before its "…". For
+    /// display only.
+    fn label(&self) -> String {
+        let label = match &self.job {
+            Job::Discover => "Looking for cameras",
+            Job::Connect => "Connecting camera",
+            Job::Disconnect => "Disconnecting",
+            Job::Select => "Selecting camera",
+            Job::Start if self.batch => "Starting streams",
+            Job::Start => "Starting stream",
+            Job::Stop if self.batch => "Stopping streams",
+            Job::Stop => "Stopping stream",
+            Job::Capture => "Saving capture",
+            Job::AutoOn => "Enabling auto mode",
+            Job::AutoOff => "Switching to manual",
+            Job::Balance => "Updating auto balance",
+            Job::RefreshFeatures => "Refreshing features",
+            Job::Schedule => "Scheduling capture",
+            Job::RefreshJobs => "Refreshing capture jobs",
+            Job::Cancel => "Cancelling capture job",
+            Job::Forward { recording: true } => "Starting recording",
+            Job::Forward { recording: false } => "Starting forwarding",
+            Job::StopForward { recording: true } => "Stopping recording",
+            Job::StopForward { recording: false } => "Stopping forwarding",
+            Job::Set(feature) => return format!("Setting {}", words(feature)),
+            Job::Execute(feature) => return format!("Executing {}", words(feature)),
+        };
+        label.into()
+    }
+}
+
+/// What a command sent to the session does. Matches on it are exhaustive,
+/// so a new kind of command cannot slip past the views and notices that
+/// tell commands apart.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Job {
+    Discover,
+    Connect,
+    Disconnect,
+    Select,
+    /// Start a camera's stream; with `Pending::batch`, part of Start all.
+    Start,
+    /// Stop a camera's stream; with `Pending::batch`, part of Stop all.
+    Stop,
+    Capture,
+    AutoOn,
+    AutoOff,
+    /// A new balance for auto mode.
+    Balance,
+    RefreshFeatures,
+    Schedule,
+    RefreshJobs,
+    /// Cancel a capture job.
+    Cancel,
+    /// Start forwarding, or recording to a file (see `Output`).
+    Forward {
+        recording: bool,
+    },
+    StopForward {
+        recording: bool,
+    },
+    /// Write a feature, by name.
+    Set(String),
+    /// Run a command feature, by name.
+    Execute(String),
+}
+
+impl Job {
+    /// The feature a write or command button acts on.
+    fn feature(&self) -> Option<&str> {
+        match self {
+            Job::Set(feature) | Job::Execute(feature) => Some(feature),
+            _ => None,
+        }
+    }
+
+    /// Whether it switches auto mode or tunes it.
+    fn is_auto(&self) -> bool {
+        matches!(self, Job::AutoOn | Job::AutoOff | Job::Balance)
+    }
 }
 
 /// GPU slot of the single-camera view; camera tiles use their camera IDs.
@@ -464,20 +560,8 @@ enum Message {
     FocusTile(String),
     CaptureCamera(String),
     DismissNotice,
-    // Each area adds its messages under its own heading, and handles them
-    // under the same heading in `handle_message`, so areas never edit the
-    // same lines.
-
-    // Chrome: titlebar.rs, toolbar.rs
-
-    // Camera list and welcome: sidebar.rs, welcome.rs
-
-    // Stage: stage.rs, grid.rs, scopes.rs
     /// Hide a camera's error badge, by camera ID, until its error changes.
     DismissStageError(String),
-    // Inspector: inspector.rs
-
-    // Sheets: help.rs, destinations.rs
     /// The guide's body scrolled away from its top, or back.
     HelpScrolled(bool),
     /// Open or close the guide's notes on connecting cameras.
@@ -553,9 +637,9 @@ struct Workbench {
     /// Whether each streaming camera's frames keep coming, by camera id.
     liveness: HashMap<String, Liveness>,
     pending: Vec<Pending>,
-    /// Commands sent to several cameras at once, by label, until the last
-    /// one finishes.
-    batches: HashMap<String, Batch>,
+    /// Commands sent to several cameras at once, by what they do, until
+    /// the last one finishes.
+    batches: HashMap<Job, Batch>,
     notice: Option<Notice>,
     notice_shown: Motion,
     /// The last value put on the clipboard, and when.
@@ -603,7 +687,7 @@ struct Workbench {
     ring: Motion,
     /// The camera selected before the current one, while `ring` draws in.
     ring_from: Option<String>,
-    // Each area's own state, in its own file. Add fields there, not here.
+    // Each part of the window keeps its own state in its own file.
     chrome: titlebar::ChromeState,
     side: sidebar::SideState,
     stage_ui: stage::StageState,
@@ -908,23 +992,22 @@ impl Workbench {
 
     /// Send `command` to the selected camera, or to the session for
     /// discovery, connecting and selection.
-    fn send(&mut self, label: impl Into<String>, command: SessionCommand) {
-        self.submit(None, label.into(), command);
+    fn send(&mut self, job: Job, command: SessionCommand) {
+        self.submit(None, job, command);
     }
 
-    fn send_to(&mut self, camera: &str, label: impl Into<String>, command: SessionCommand) {
-        self.submit(Some(camera), label.into(), command);
+    fn send_to(&mut self, camera: &str, job: Job, command: SessionCommand) {
+        self.submit(Some(camera), job, command);
     }
 
-    /// Submit `command` and track it as pending under `label`, noting the
-    /// camera and feature it acts on; returns the entry, so a send site can
-    /// add what only it knows. The session routes commands without a camera
-    /// the same way: to the selected camera, except discovery, connecting
-    /// and selection.
+    /// Submit `command` and track it as pending, doing `job`, noting the
+    /// camera it acts on; returns the entry, so a send site can add what only
+    /// it knows. The session routes commands without a camera the same way:
+    /// to the selected camera, except discovery, connecting and selection.
     fn submit(
         &mut self,
         camera: Option<&str>,
-        label: String,
+        job: Job,
         command: SessionCommand,
     ) -> Option<&mut Pending> {
         let acts_on = match (camera, &command) {
@@ -938,12 +1021,6 @@ impl Workbench {
             (None, SessionCommand::Select { camera }) => Some(camera.clone()),
             (None, _) => self.snapshot.active_camera.clone(),
         };
-        let feature = match &command {
-            SessionCommand::Set { feature, .. } | SessionCommand::Execute { feature } => {
-                Some(feature.clone())
-            }
-            _ => None,
-        };
         let submitted = match camera {
             Some(camera) => self.handle.submit_to(camera, command),
             None => self.handle.submit(command),
@@ -952,18 +1029,15 @@ impl Workbench {
             Ok(receiver) => {
                 self.give_way();
                 self.pending.push(Pending {
-                    label,
                     receiver,
-                    target: None,
                     camera: acts_on,
-                    feature,
                     at: self.now,
-                    batch: false,
+                    ..Pending::unanswered(job)
                 });
                 self.pending.last_mut()
             }
             Err(error) => {
-                if let Some((text, detail, level)) = command_notice(&label, &Err(error)) {
+                if let Some((text, detail, level)) = command_notice(&job, &Err(error)) {
                     self.set_notice(text, detail, level);
                 }
                 None
@@ -971,15 +1045,39 @@ impl Workbench {
         }
     }
 
-    fn pending(&self, label: &str) -> bool {
-        self.pending.iter().any(|p| p.label == label)
+    /// Whether a command doing `job` is on its way, to any camera.
+    fn pending(&self, job: Job) -> bool {
+        self.pending.iter().any(|p| p.job == job)
     }
 
-    /// Whether a command under `label` is on its way to `camera`.
-    fn pending_for(&self, label: &str, camera: &str) -> bool {
+    /// Whether a command doing `job` is on its way to `camera`.
+    fn pending_for(&self, job: Job, camera: &str) -> bool {
         self.pending
             .iter()
-            .any(|p| p.label == label && p.camera.as_deref() == Some(camera))
+            .any(|p| p.job == job && p.camera.as_deref() == Some(camera))
+    }
+
+    /// While a start or stop is on its way to `camera`, alone or as part of
+    /// Start all or Stop all, whether it is a stop. The controls that start
+    /// and stop a camera and `toggle_stream` all go by this, so a control
+    /// that looks ready never ignores a press.
+    fn stream_pending(&self, camera: &str) -> Option<bool> {
+        self.pending
+            .iter()
+            .filter(|p| {
+                p.camera.as_deref() == Some(camera) && matches!(p.job, Job::Start | Job::Stop)
+            })
+            .max_by_key(|p| p.at)
+            .map(|p| p.job == Job::Stop)
+    }
+
+    /// While a forward or recording starts or stops, whether it stops.
+    fn forward_pending(&self) -> Option<bool> {
+        self.pending.iter().find_map(|p| match p.job {
+            Job::Forward { .. } => Some(false),
+            Job::StopForward { .. } => Some(true),
+            _ => None,
+        })
     }
 
     /// `command` in a code block whose copy button confirms in place.
@@ -988,13 +1086,9 @@ impl Workbench {
         code_block(command, copied, p)
     }
 
+    /// Whether auto mode is being switched or tuned on any camera.
     fn auto_busy(&self) -> bool {
-        self.pending.iter().any(|p| {
-            matches!(
-                p.label.as_str(),
-                "Enabling auto mode" | "Switching to manual" | "Updating auto balance"
-            )
-        })
+        self.pending.iter().any(|p| p.job.is_auto())
     }
 
     fn title(&self) -> String {
@@ -1057,15 +1151,13 @@ impl Workbench {
             Ok(value) => self.finished(pending, value),
             Err(error) => self.failed(pending, error),
         }
-        self.result_chrome(pending, result);
         self.result_side(pending, result);
         self.result_stage(pending, result);
         self.result_inspector(pending, result);
-        self.result_sheets(pending, result);
         let notice = if pending.batch {
-            self.batch_result(&pending.label, result)
+            self.batch_result(&pending.job, result)
         } else {
-            command_notice(&pending.label, result)
+            command_notice(&pending.job, result)
         };
         if let Some((text, detail, level)) = notice {
             self.set_notice(text, detail, level);
@@ -1074,13 +1166,13 @@ impl Workbench {
 
     /// Shared bookkeeping for a command that worked, before its notice.
     fn finished(&mut self, pending: &Pending, result: &serde_json::Value) {
-        if pending.label == "Saving capture" {
+        if pending.job == Job::Capture {
             self.shutter.replay(1.0, 0.0, self.now);
             if let Some(saved) = Saved::from_result(pending.camera.clone(), result, self.now) {
                 self.last_saved = Some(saved);
             }
         }
-        if pending.label == "Discovering cameras" {
+        if pending.job == Job::Discover {
             self.side.discovery_issues = result["warnings"]
                 .as_array()
                 .into_iter()
@@ -1088,7 +1180,7 @@ impl Workbench {
                 .filter_map(|warning| warning.as_str().map(str::to_owned))
                 .collect();
         }
-        if let Some(feature) = &pending.feature {
+        if let Some(feature) = pending.job.feature() {
             self.inspect.write_errors.remove(feature);
         }
         let Some(target) = &pending.target else {
@@ -1122,13 +1214,13 @@ impl Workbench {
     /// failure kept where the control that sent it can show it.
     fn failed(&mut self, pending: &Pending, error: &anyhow::Error) {
         let full = format!("{error:#}");
-        if pending.label == "Discovering cameras" {
+        if pending.job == Job::Discover {
             self.side.discovery_issues = vec![full.clone()];
         }
-        if let Some(feature) = &pending.feature {
+        if let Some(feature) = pending.job.feature() {
             self.inspect
                 .write_errors
-                .insert(feature.clone(), full.clone());
+                .insert(feature.to_owned(), full.clone());
         }
         if let Some(target) = &pending.target {
             self.side.connect_failed(target, full, self.now);
@@ -1192,7 +1284,6 @@ impl Workbench {
         self.tick_side();
         self.tick_stage();
         self.tick_inspector();
-        self.tick_sheets();
         self.save_prefs();
         self.screenshot_tick()
     }
@@ -1340,7 +1431,7 @@ impl Workbench {
 
     fn discover(&mut self) {
         self.send(
-            "Discovering cameras",
+            Job::Discover,
             SessionCommand::Discover {
                 timeout_ms: 700,
                 simulated: self.include_simulator,
@@ -1354,7 +1445,7 @@ impl Workbench {
         self.side.connect_failures.remove(&camera);
         if let Some(pending) = self.submit(
             None,
-            "Connecting camera".into(),
+            Job::Connect,
             SessionCommand::Connect {
                 camera: camera.clone(),
                 timeout_ms: 5000,
@@ -1370,31 +1461,28 @@ impl Workbench {
             .any(|pending| pending.target.as_deref() == Some(id))
     }
 
+    /// Start or stop the selected camera, unless a start or stop is already
+    /// on its way to it; another camera's does not hold it up.
     fn toggle_stream(&mut self) {
-        if self.pending("Starting stream") || self.pending("Stopping stream") {
+        let Some(camera) = self.snapshot.active_camera.clone() else {
+            return;
+        };
+        if self.stream_pending(&camera).is_some() {
             return;
         }
-        let streaming = self.snapshot.streaming;
-        self.send(
-            if streaming {
-                "Stopping stream"
-            } else {
-                "Starting stream"
-            },
-            if streaming {
-                SessionCommand::Stop
-            } else {
-                SessionCommand::Start
-            },
-        );
+        if self.snapshot.streaming {
+            self.send_to(&camera, Job::Stop, SessionCommand::Stop);
+        } else {
+            self.send_to(&camera, Job::Start, SessionCommand::Start);
+        }
     }
 
     fn capture(&mut self) {
-        if self.pending("Saving capture") {
+        if self.pending(Job::Capture) {
             return;
         }
         self.send(
-            "Saving capture",
+            Job::Capture,
             SessionCommand::Capture {
                 output: self.output.clone(),
                 count: self.count,
@@ -1411,13 +1499,10 @@ impl Workbench {
             return;
         }
         if self.snapshot.auto.is_some() {
-            self.send(
-                "Switching to manual",
-                SessionCommand::Manual { revert: false },
-            );
+            self.send(Job::AutoOff, SessionCommand::Manual { revert: false });
         } else {
             self.send(
-                "Enabling auto mode",
+                Job::AutoOn,
                 SessionCommand::Auto {
                     balance: Some(self.balance),
                 },
@@ -1438,7 +1523,7 @@ impl Workbench {
             .unwrap_or(0);
         let next = (current as isize + step).rem_euclid(count as isize) as usize;
         let camera = self.snapshot.cameras[next].info.id.clone();
-        self.send("Selecting camera", SessionCommand::Select { camera });
+        self.send(Job::Select, SessionCommand::Select { camera });
     }
 
     fn toggle_exposure(&mut self) {
@@ -1627,11 +1712,11 @@ impl Workbench {
                 if !self.snapshot.cameras.iter().any(|c| c.info.id == id) {
                     self.connect(id);
                 } else if self.snapshot.active_camera.as_ref() != Some(&id) {
-                    self.send("Selecting camera", SessionCommand::Select { camera: id });
+                    self.send(Job::Select, SessionCommand::Select { camera: id });
                 }
             }
             Message::Disconnect(id) => {
-                self.send_to(&id, "Disconnecting", SessionCommand::Disconnect)
+                self.send_to(&id, Job::Disconnect, SessionCommand::Disconnect)
             }
             Message::Address(value) => {
                 // Editing the address retires its failure.
@@ -1647,22 +1732,14 @@ impl Workbench {
             Message::ToggleStream => self.toggle_stream(),
             Message::Capture => self.capture(),
             Message::Focus(focus) => self.focus_camera = focus,
-            Message::Select(camera) => {
-                self.send("Selecting camera", SessionCommand::Select { camera })
+            Message::Select(camera) => self.send(Job::Select, SessionCommand::Select { camera }),
+            Message::StreamCamera(id, start) => {
+                if start {
+                    self.send_to(&id, Job::Start, SessionCommand::Start);
+                } else {
+                    self.send_to(&id, Job::Stop, SessionCommand::Stop);
+                }
             }
-            Message::StreamCamera(id, start) => self.send_to(
-                &id,
-                if start {
-                    "Starting stream"
-                } else {
-                    "Stopping stream"
-                },
-                if start {
-                    SessionCommand::Start
-                } else {
-                    SessionCommand::Stop
-                },
-            ),
             Message::AllStreams(start) => {
                 let cameras = self
                     .snapshot
@@ -1672,9 +1749,9 @@ impl Workbench {
                     .map(|camera| camera.info.id.clone())
                     .collect();
                 if start {
-                    self.send_batch(cameras, "Starting streams", || SessionCommand::Start);
+                    self.send_batch(cameras, Job::Start, || SessionCommand::Start);
                 } else {
-                    self.send_batch(cameras, "Stopping streams", || SessionCommand::Stop);
+                    self.send_batch(cameras, Job::Stop, || SessionCommand::Stop);
                 }
             }
             Message::AllAuto(auto) => {
@@ -1687,11 +1764,9 @@ impl Workbench {
                     .collect();
                 let balance = Some(self.balance);
                 if auto {
-                    self.send_batch(cameras, "Enabling auto mode", || SessionCommand::Auto {
-                        balance,
-                    });
+                    self.send_batch(cameras, Job::AutoOn, || SessionCommand::Auto { balance });
                 } else {
-                    self.send_batch(cameras, "Switching to manual", || SessionCommand::Manual {
+                    self.send_batch(cameras, Job::AutoOff, || SessionCommand::Manual {
                         revert: false,
                     });
                 }
@@ -1747,7 +1822,7 @@ impl Workbench {
                 self.edits.clear();
                 self.edit_sources.clear();
                 self.inspect.write_errors.clear();
-                self.send("Refreshing features", SessionCommand::Features);
+                self.send(Job::RefreshFeatures, SessionCommand::Features);
             }
             Message::Auto(on) => {
                 if !self.auto_busy() && on != self.snapshot.auto.is_some() {
@@ -1767,7 +1842,7 @@ impl Workbench {
                     .is_some_and(|status| status.balance != self.balance)
                 {
                     self.send(
-                        "Updating auto balance",
+                        Job::Balance,
                         SessionCommand::Auto {
                             balance: Some(self.balance),
                         },
@@ -1787,12 +1862,12 @@ impl Workbench {
                     .or_else(|| self.edit_sources.get(&feature).cloned())
                     .unwrap_or_default();
                 self.send(
-                    format!("Setting {feature}"),
+                    Job::Set(feature.clone()),
                     SessionCommand::Set { feature, value },
                 );
             }
             Message::Set(feature, value) => self.send(
-                format!("Setting {feature}"),
+                Job::Set(feature.clone()),
                 SessionCommand::Set { feature, value },
             ),
             Message::Execute(feature) => {
@@ -1803,9 +1878,7 @@ impl Workbench {
                         feature: feature.clone(),
                     },
                 };
-                if let Some(pending) = self.submit(None, format!("Executing {feature}"), command) {
-                    pending.feature = Some(feature);
-                }
+                self.send(Job::Execute(feature), command);
             }
             Message::Num(key, value) => {
                 if self.set_num(key, &value) {
@@ -1828,7 +1901,7 @@ impl Workbench {
             }
             Message::ScheduleEnabled(value) => self.schedule_enabled = value,
             Message::Schedule => self.send(
-                "Scheduling capture",
+                Job::Schedule,
                 SessionCommand::Schedule {
                     output: self.output.clone(),
                     count: self.count,
@@ -1844,17 +1917,18 @@ impl Workbench {
             Message::ToggleStorage => self.storage_open = !self.storage_open,
             Message::OnFull(choice) => self.quota_action = choice.value,
             Message::RetentionEnabled(value) => self.retention_enabled = value,
-            Message::RefreshJobs => self.send("Refreshing capture jobs", SessionCommand::Jobs),
-            Message::CancelJob(id) => {
-                self.send("Cancelling capture job", SessionCommand::CancelJob { id })
-            }
+            Message::RefreshJobs => self.send(Job::RefreshJobs, SessionCommand::Jobs),
+            Message::CancelJob(id) => self.send(Job::Cancel, SessionCommand::CancelJob { id }),
             Message::Codec(codec) => self.forward_codec = codec.value,
             Message::Encoder(value) => self.forward_encoder = value,
             Message::Bitrate(value) => self.forward_bitrate = value,
             Message::StartForward => {
-                if !self.pending("Starting forwarding") {
+                let output = Output::of(self.forward_output.trim());
+                if self.forward_pending() != Some(false) {
                     self.send(
-                        "Starting forwarding",
+                        Job::Forward {
+                            recording: output.recording(),
+                        },
                         SessionCommand::Forward {
                             output: self.forward_output.trim().into(),
                             codec: self.forward_codec.into(),
@@ -1869,7 +1943,14 @@ impl Workbench {
                     );
                 }
             }
-            Message::StopForward => self.send("Stopping forwarding", SessionCommand::StopForward),
+            Message::StopForward => {
+                let recording = self
+                    .snapshot
+                    .forwarding
+                    .as_deref()
+                    .is_some_and(|output| Output::of(output).recording());
+                self.send(Job::StopForward { recording }, SessionCommand::StopForward);
+            }
             Message::CapturePicker(message) => return self.picker(false, message),
             Message::RecordPicker(message) => return self.picker(true, message),
             Message::ToggleSidebar => {
@@ -1916,14 +1997,14 @@ impl Workbench {
             Message::FocusTile(camera) => {
                 self.focus_camera = true;
                 if self.snapshot.active_camera.as_ref() != Some(&camera) {
-                    self.send("Selecting camera", SessionCommand::Select { camera });
+                    self.send(Job::Select, SessionCommand::Select { camera });
                 }
             }
             Message::CaptureCamera(id) => {
-                if !self.pending("Saving capture") {
+                if !self.pending(Job::Capture) {
                     self.send_to(
                         &id,
-                        "Saving capture",
+                        Job::Capture,
                         SessionCommand::Capture {
                             output: self.output.clone(),
                             count: self.count,
@@ -1946,15 +2027,7 @@ impl Workbench {
                 }
             }
             Message::DismissNotice => self.dismiss_notice(),
-            // Chrome: titlebar.rs, toolbar.rs
-
-            // Camera list and welcome: sidebar.rs, welcome.rs
-
-            // Stage: stage.rs, grid.rs, scopes.rs
             Message::DismissStageError(id) => self.dismiss_stage_error(&id),
-            // Inspector: inspector.rs
-
-            // Sheets: help.rs, destinations.rs
             Message::HelpScrolled(scrolled) => self.sheets.scrolled = scrolled,
             Message::HelpMore(open) => self.sheets.more = open,
         }
@@ -2202,6 +2275,42 @@ mod tests {
         bench.width = 960.0;
         let _ = bench.handle_message(Message::ShowTab(Tab::Capture));
         assert!(bench.inspector_peek, "floats in a narrow window");
+    }
+
+    #[test]
+    fn a_start_on_its_way_holds_up_only_its_own_camera() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        let mut other = liveness::streaming_camera(0, 0, 0.0);
+        other.info.id = "sim:1".into();
+        other.streaming = false;
+        bench.snapshot.cameras = vec![liveness::streaming_camera(0, 0, 0.0), other];
+        bench.pending.push(Pending {
+            camera: Some("sim:0".into()),
+            ..Pending::unanswered(Job::Start)
+        });
+        bench.snapshot.active_camera = Some("sim:1".into());
+        assert_eq!(
+            bench.stream_pending("sim:1"),
+            None,
+            "its controls look ready"
+        );
+        bench.toggle_stream();
+        assert!(
+            bench.pending_for(Job::Start, "sim:1"),
+            "and do what they say"
+        );
+        let sent = bench.pending.len();
+        bench.toggle_stream();
+        assert_eq!(bench.pending.len(), sent, "its own start holds it up");
+        // A Stop all on its way counts as the camera's own.
+        bench.pending.clear();
+        bench.pending.push(Pending {
+            camera: Some("sim:1".into()),
+            batch: true,
+            ..Pending::unanswered(Job::Stop)
+        });
+        assert_eq!(bench.stream_pending("sim:1"), Some(true));
+        assert_eq!(bench.stream_pending("sim:0"), None);
     }
 
     #[test]

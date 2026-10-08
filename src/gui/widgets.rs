@@ -119,6 +119,25 @@ pub(super) fn dot<'a, M: 'a>(color: Color, size: f32) -> Element<'a, M> {
         .into()
 }
 
+/// A camera's status dot in `p`: filled while it is connected, a ring
+/// while it is not; see `CameraState`.
+pub(super) fn status_dot<'a, M: 'a>(state: CameraState, size: f32, p: &Palette) -> Element<'a, M> {
+    let color = state.color(p);
+    if !state.hollow() {
+        return dot(color, size);
+    }
+    container(space().width(size).height(size))
+        .style(move |_| container::Style {
+            border: iced::Border {
+                color,
+                width: 1.5,
+                radius: (size / 2.0).into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
 /// A section title: a small label above its group.
 pub(super) fn heading<'a, M: 'a>(title: &'a str, p: &'static Palette) -> Element<'a, M> {
     container(
@@ -275,13 +294,14 @@ pub(super) fn field_error<'a, M: 'a>(
     message: impl text::IntoFragment<'a>,
     p: &'static Palette,
 ) -> Element<'a, M> {
-    let ink = p.ink(p.danger);
     row![
         // Centered on the first line, should the message wrap.
-        container(icon(Icon::Warning, 11.0, ink))
-            .height(Length::Fixed(style::CAPTION * 1.3))
+        container(Level::Error.mark(11.0, p))
+            .height(Length::Fixed(style::line_height(style::CAPTION)))
             .align_y(Alignment::Center),
-        text(message).size(style::CAPTION).color(ink),
+        text(message)
+            .size(style::CAPTION)
+            .color(Level::Error.color(p)),
     ]
     .spacing(5)
     .into()

@@ -25,6 +25,53 @@ pub(super) fn camera_loss(camera: &CameraSnapshot) -> u64 {
     )
 }
 
+/// What a camera's status dot says. The camera list, the tiles, the
+/// inspector and the title pill all take it from here, so one camera reads
+/// the same everywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CameraState {
+    /// Not connected.
+    Offline,
+    /// Not connected: the last connect to it failed.
+    Failed,
+    /// Connected, not streaming.
+    Idle,
+    /// Streaming, with frames coming.
+    Live,
+    /// Streaming, but no new frame for longer than its pace allows.
+    Stalled,
+}
+
+impl CameraState {
+    /// The dot's color in `p`: gray or red rings for cameras not connected;
+    /// accent while idle, `live` while frames come, `warn` once they stop.
+    pub(super) fn color(self, p: &Palette) -> Color {
+        match self {
+            CameraState::Offline => p.tertiary,
+            CameraState::Failed => p.danger,
+            CameraState::Idle => p.accent,
+            CameraState::Live => p.live,
+            CameraState::Stalled => p.warn,
+        }
+    }
+
+    /// Whether the dot is a ring: the camera is not connected.
+    pub(super) fn hollow(self) -> bool {
+        matches!(self, CameraState::Offline | CameraState::Failed)
+    }
+
+    /// The state in a few words, for tooltips: "waiting for frames".
+    pub(super) fn about(self) -> &'static str {
+        match self {
+            CameraState::Offline => "not connected",
+            CameraState::Failed => "could not connect",
+            CameraState::Idle => "connected",
+            CameraState::Live => "streaming",
+            CameraState::Stalled => "waiting for frames",
+        }
+    }
+}
+
 /// What a camera's features say about how often frames should come.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Pace {
@@ -231,6 +278,17 @@ impl Workbench {
         (silent > live.limit()).then_some(silent)
     }
 
+    /// The state of a connected camera, as its status dot shows it.
+    pub(super) fn camera_state(&self, camera: &CameraSnapshot) -> CameraState {
+        if !camera.streaming {
+            CameraState::Idle
+        } else if self.stalled(&camera.info.id).is_some() {
+            CameraState::Stalled
+        } else {
+            CameraState::Live
+        }
+    }
+
     /// Whether a streaming camera lost frames within `LOSS_RECENT`, counting
     /// only losses since its stream started (see `camera_loss`).
     pub(super) fn recent_loss(&self, id: &str) -> bool {
@@ -398,6 +456,34 @@ mod tests {
         triggered.features = vec![feature("TriggerMode", json!("On"))];
         report(&mut bench, start, ms(20_000), triggered);
         assert_eq!(bench.stalled(id), None, "waits for triggers");
+    }
+
+    #[test]
+    fn every_view_reads_a_camera_state_the_same() {
+        let mut bench = bench();
+        let start = bench.now;
+        let mut idle = streaming_camera(0, 0, 0.0);
+        idle.streaming = false;
+        assert_eq!(bench.camera_state(&idle), CameraState::Idle);
+        for step in 0..=4u64 {
+            report(
+                &mut bench,
+                start,
+                ms(step * 250),
+                streaming_camera(step * 8, 0, 30.0),
+            );
+        }
+        let camera = bench.snapshot.cameras[0].clone();
+        assert_eq!(bench.camera_state(&camera), CameraState::Live);
+        report(&mut bench, start, ms(4000), camera.clone());
+        assert_eq!(bench.camera_state(&camera), CameraState::Stalled);
+        for p in [&style::LIGHT, &style::DARK, style::STAGE] {
+            assert_eq!(CameraState::Idle.color(p), p.accent);
+            assert_eq!(CameraState::Live.color(p), p.live);
+            assert_eq!(CameraState::Stalled.color(p), p.warn);
+            assert_eq!(CameraState::Failed.color(p), p.danger);
+        }
+        assert!(CameraState::Offline.hollow() && !CameraState::Idle.hollow());
     }
 
     #[test]

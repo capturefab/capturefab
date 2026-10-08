@@ -22,8 +22,7 @@ pub(super) const SCROLL: &str = "inspector";
 /// The feature groups, in the order they show.
 const GROUPS: [&str; 5] = ["Image", "Acquisition", "Device", "Transport", "Other"];
 
-/// The inspector package's own state. Add fields here, register their motions
-/// below and point them in `sync_inspector`.
+/// State for the settings panel.
 pub(super) struct InspectorState {
     /// The last write or command that failed on each feature, as the whole
     /// error; show its first line at the row. Kept by `failed()` and cleared
@@ -186,9 +185,9 @@ enum Edit {
     Rest(f32),
 }
 
-/// The inspector package's hooks into the shared update cycle.
+/// The settings panel's hooks into the shared update cycle.
 impl Workbench {
-    /// Point the inspector package's motions at what they show; from
+    /// Point the settings panel's motions at what they show; from
     /// `sync_animations`.
     pub(super) fn sync_inspector(&mut self) {
         let now = self.now;
@@ -224,8 +223,7 @@ impl Workbench {
         inspect.changes_turn.show(self.auto_changes_open, now);
         // Note what each field held as its write went out.
         for pending in &self.pending {
-            if let Some(feature) = &pending.feature
-                && pending.label.starts_with("Setting ")
+            if let Job::Set(feature) = &pending.job
                 && !inspect.sent.contains_key(feature)
             {
                 inspect
@@ -235,7 +233,7 @@ impl Workbench {
         }
     }
 
-    /// The inspector package's bookkeeping on the slow tick, after the snapshot
+    /// The settings panel's bookkeeping on the slow tick, after the snapshot
     /// refresh; from `tick()`.
     pub(super) fn tick_inspector(&mut self) {
         let features = &self.snapshot.features;
@@ -256,23 +254,20 @@ impl Workbench {
         pending: &Pending,
         result: &anyhow::Result<serde_json::Value>,
     ) {
-        match (pending.label.as_str(), result) {
-            ("Saving capture", Ok(value)) => {
+        match (&pending.job, result) {
+            (Job::Capture, Ok(value)) => {
                 self.inspect.saved_to = value["destination"].as_str().map(str::to_owned);
             }
-            ("Starting forwarding", Ok(value)) => {
+            (Job::Forward { .. }, Ok(value)) => {
                 self.inspect.forwarded = value["forwarding"]
                     .as_str()
                     .map(|output| (output.to_owned(), self.forward_summary()));
             }
             _ => {}
         }
-        let Some(feature) = &pending.feature else {
+        let Job::Set(feature) = &pending.job else {
             return;
         };
-        if !pending.label.starts_with("Setting ") {
-            return;
-        }
         let sent = self.inspect.sent.remove(feature);
         let Ok(value) = result else {
             return;
@@ -288,7 +283,7 @@ impl Workbench {
         self.inspect.accepted.hit(feature.clone(), self.now);
     }
 
-    /// Take a screenshot scene word the inspector package owns: `late` is false
+    /// Take a screenshot scene word for the settings panel: `late` is false
     /// while the scene is set up and true once its cameras stream. Returns
     /// whether the word was taken; see `apply_scene`. Words:
     /// `inspector-search` and `inspector-nomatch` (a search with and without
@@ -330,21 +325,19 @@ impl Workbench {
             }
             ("inspector-applying", true) => {
                 self.edits.insert(feature.into(), "15000".into());
-                let held = self.scene_hold(&format!("Setting {feature}"));
-                held.camera = camera;
-                held.feature = Some(feature.into());
+                self.scene_hold(Job::Set(feature.into())).camera = camera;
             }
             ("inspector-accepted", true) => {
                 self.inspect.accepted.hit(feature.into(), self.now);
             }
             ("inspector-switching", true) => {
-                self.scene_hold("Enabling auto mode").camera = camera;
+                self.scene_hold(Job::AutoOn).camera = camera;
                 // Where it slides to, for a still.
                 self.inspect.mode_thumb.set(1.0);
             }
             ("inspector-connecting", true) => {
                 // The welcome card it came from shows it connecting too.
-                self.scene_hold("Connecting camera").target = Some("sim:0".into());
+                self.scene_hold(Job::Connect).target = Some("sim:0".into());
             }
             ("inspector-context", true) => self.inspect.context.replay(1.0, 0.0, self.now),
             _ => return false,
@@ -356,9 +349,9 @@ impl Workbench {
     /// selected camera goes, else where the camera is.
     fn mode_target(&self) -> f32 {
         let camera = self.snapshot.active_camera.as_deref().unwrap_or_default();
-        if self.pending_for("Enabling auto mode", camera) {
+        if self.pending_for(Job::AutoOn, camera) {
             1.0
-        } else if self.pending_for("Switching to manual", camera) {
+        } else if self.pending_for(Job::AutoOff, camera) {
             0.0
         } else if self.snapshot.auto.is_some() {
             1.0
@@ -424,9 +417,8 @@ fn form_row<'a>(
 /// What a schedule will do: "10 frames, one every 2.5 seconds".
 fn schedule_text(count: u32, interval: f64) -> String {
     format!(
-        "{} {}, one every {} {}",
-        grouped(count.into()),
-        if count == 1 { "frame" } else { "frames" },
+        "{}, one every {} {}",
+        plural(count.into(), "frame", "frames"),
         number(interval),
         if interval == 1.0 { "second" } else { "seconds" }
     )
@@ -553,25 +545,18 @@ impl Workbench {
         }
         let camera = self.snapshot.connected.as_ref()?;
         let glow = self.inspect.context.get(self.now);
-        // The same state dot as the camera's row in the sidebar.
-        let state = if !self.snapshot.streaming {
-            p.accent
-        } else if self.stalled(&camera.id).is_some() {
-            p.warn
-        } else {
-            p.live
-        };
+        // The same state dot as the camera's row in the camera list.
+        let state = self
+            .snapshot
+            .cameras
+            .iter()
+            .find(|state| state.info.id == camera.id)
+            .map_or(CameraState::Idle, |state| self.camera_state(state));
         let line = row![
             icon(Icon::transport(camera.transport), 13.0, p.secondary),
             one_line(camera.model.as_str(), style::SMALL, style::MEDIUM, p.text),
-            one_line(
-                format!("S/N {}", camera.serial),
-                style::SMALL,
-                style::SANS,
-                p.secondary
-            )
-            .width(Fill),
-            dot(state, 6.0),
+            one_line(identity(camera), style::SMALL, style::SANS, p.secondary).width(Fill),
+            status_dot(state, 6.0, p),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
@@ -599,7 +584,7 @@ impl Workbench {
     /// The Features tab with no camera: what will show here, and what can
     /// be set up meanwhile.
     fn no_camera(&self, p: &'static Palette) -> Element<'_, Message> {
-        let connecting = self.pending("Connecting camera");
+        let connecting = self.pending(Job::Connect);
         let content = if connecting {
             column![
                 icon::spinner(22.0, p.secondary, self.spin()),
@@ -664,12 +649,16 @@ impl Workbench {
                 groups = groups.push(column![section(group, banner, p), rows].spacing(10));
             }
         }
-        let refreshing = self.pending("Refreshing features");
+        let refreshing = self.pending(Job::RefreshFeatures);
         let total = index.listed;
-        let count = match (query.is_empty(), total) {
-            (true, 1) => "1 feature".to_owned(),
-            (true, _) => format!("{total} features"),
-            (false, _) => format!("{matched} of {total} features"),
+        let count = if query.is_empty() {
+            plural(total as u64, "feature", "features")
+        } else {
+            format!(
+                "{} of {} features",
+                grouped(matched as u64),
+                grouped(total as u64)
+            )
         };
         let count = row![
             text(count).size(style::SMALL).color(p.secondary),
@@ -749,7 +738,7 @@ impl Workbench {
     /// Said once per group that holds features the stream locks.
     fn locked_banner(&self, p: &'static Palette) -> Element<'_, Message> {
         let camera = self.snapshot.active_camera.as_deref().unwrap_or_default();
-        let stopping = self.pending_for("Stopping stream", camera);
+        let stopping = self.stream_pending(camera) == Some(true);
         row![
             icon(Icon::Lock, 11.0, p.secondary),
             text("Locked while streaming")
@@ -773,8 +762,8 @@ impl Workbench {
         let busy = self.auto_busy();
         let os = Os::CURRENT;
         let camera = self.snapshot.active_camera.as_deref().unwrap_or_default();
-        let switching = self.pending_for("Enabling auto mode", camera)
-            || self.pending_for("Switching to manual", camera);
+        let switching =
+            self.pending_for(Job::AutoOn, camera) || self.pending_for(Job::AutoOff, camera);
         let mut head = row![
             text("Exposure").size(style::BODY).font(style::SEMIBOLD),
             space::horizontal(),
@@ -993,10 +982,10 @@ impl Workbench {
             let draft = self.edits.get(name).unwrap_or(&current);
             let dirty = *draft != current;
             let applying = !self.pending.is_empty()
-                && self.pending.iter().any(|pending| {
-                    pending.feature.as_deref() == Some(name)
-                        && pending.label.starts_with("Setting ")
-                });
+                && self
+                    .pending
+                    .iter()
+                    .any(|pending| matches!(&pending.job, Job::Set(feature) if feature == name));
             let edit = if refused.is_some() {
                 Edit::Refused
             } else if dirty {
@@ -1080,9 +1069,9 @@ impl Workbench {
     /// while that is on its way.
     fn stream_toggle(&self, p: &'static Palette) -> Element<'_, Message> {
         let camera = self.snapshot.active_camera.as_deref().unwrap_or_default();
-        let starting = self.pending_for("Starting stream", camera);
-        let stopping = self.pending_for("Stopping stream", camera);
-        let busy = starting || stopping;
+        let pending = self.stream_pending(camera);
+        let (starting, stopping) = (pending == Some(false), pending == Some(true));
+        let busy = pending.is_some();
         let streaming = self.snapshot.streaming;
         let glyph = if busy {
             icon::spinner(11.0, p.secondary, self.spin())
@@ -1142,7 +1131,7 @@ impl Workbench {
 
     pub(super) fn capture_settings(&self, p: &'static Palette) -> Element<'_, Message> {
         let connected = self.snapshot.connected.is_some();
-        let capturing = self.pending("Saving capture");
+        let capturing = self.pending(Job::Capture);
         let saved = self.just_saved(self.snapshot.active_camera.as_deref());
         let os = Os::CURRENT;
         let (glyph, label) = if capturing {
@@ -1315,7 +1304,7 @@ impl Workbench {
 
     fn forward_form(&self, p: &'static Palette) -> Element<'_, Message> {
         let connected = self.snapshot.connected.is_some();
-        let starting = self.pending("Starting forwarding");
+        let starting = self.forward_pending() == Some(false);
         let glyph = if starting {
             icon::spinner(15.0, Color::WHITE, self.spin())
         } else {
@@ -1410,9 +1399,9 @@ impl Workbench {
         destination: &'a str,
         p: &'static Palette,
     ) -> Element<'a, Message> {
-        let stopping = self.pending("Stopping forwarding");
-        // A path rather than a URL is a recording on this computer.
-        let recording = !destination.contains("://");
+        let stopping = self.forward_pending() == Some(true);
+        // A file rather than a URL is a recording on this computer.
+        let recording = Output::of(destination).recording();
         let (mark, title, stop) = if recording {
             (dot(p.danger, 8.0), "Recording", "Stop recording")
         } else {
@@ -1534,7 +1523,7 @@ impl Workbench {
 
     pub(super) fn jobs(&self, p: &'static Palette) -> Element<'_, Message> {
         let snapshot = &self.snapshot;
-        let refresh = if self.pending("Refreshing capture jobs") {
+        let refresh = if self.pending(Job::RefreshJobs) {
             container(text("Refreshing…").size(style::SMALL).color(p.secondary))
                 .padding([3, 8])
                 .into()
@@ -1656,13 +1645,10 @@ mod tests {
     ) -> mpsc::Sender<anyhow::Result<serde_json::Value>> {
         let (sender, receiver) = mpsc::channel();
         bench.pending.push(Pending {
-            label: format!("Setting {feature}"),
             receiver,
-            target: None,
             camera: Some("sim:0".into()),
-            feature: Some(feature.into()),
             at: bench.now,
-            batch: false,
+            ..Pending::unanswered(Job::Set(feature.into()))
         });
         bench.sync_animations();
         sender
@@ -1792,13 +1778,10 @@ mod tests {
         bench.sync_animations();
         let (sender, receiver) = mpsc::channel();
         bench.pending.push(Pending {
-            label: "Enabling auto mode".into(),
             receiver,
-            target: None,
             camera: Some("sim:0".into()),
-            feature: None,
             at: bench.now,
-            batch: false,
+            ..Pending::unanswered(Job::AutoOn)
         });
         bench.sync_animations();
         assert_eq!(bench.inspect.mode_thumb.target(), 1.0, "optimistic");

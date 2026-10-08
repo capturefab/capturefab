@@ -28,9 +28,7 @@ const ERROR_ROOM: f32 = 420.0;
 /// The error a screenshot scene shows.
 const SCENE_ERROR: &str = "Frame timeout: the camera sent no frame within 2000 ms";
 
-/// The stage package's own state: the single-camera stage, the overview grid
-/// and the scopes. Its motions are registered below and pointed in
-/// `sync_stage`.
+/// State for the single-camera stage, the overview grid and the scopes.
 pub(super) struct StageState {
     zoom: Zoom,
     /// The focus region locking on, replayed from 1 to 0 each time.
@@ -134,9 +132,9 @@ impl StageState {
     }
 }
 
-/// The stage package's hooks into the shared update cycle.
+/// The stage's hooks into the shared update cycle.
 impl Workbench {
-    /// Point the stage package's motions at what they show; from
+    /// Point the stage's motions at what they show; from
     /// `sync_animations`, after every message.
     pub(super) fn sync_stage(&mut self) {
         let now = self.now;
@@ -225,7 +223,7 @@ impl Workbench {
         }
     }
 
-    /// The stage package's bookkeeping on the slow tick, after the snapshot
+    /// The stage's bookkeeping on the slow tick, after the snapshot
     /// refresh: which cameras are new, and which errors their badges show.
     pub(super) fn tick_stage(&mut self) {
         let now = self.now;
@@ -281,7 +279,7 @@ impl Workbench {
         }
     }
 
-    /// Take a screenshot scene word the stage package owns: `late` is false
+    /// Take a screenshot scene word for the stage: `late` is false
     /// while the scene is set up and true once its cameras stream. Words:
     /// `stage-controls` (the stage controls stay up), `stage-zoom` (zoomed
     /// to 150%), `stage-lost` (every camera lost frames, the first and every
@@ -443,7 +441,7 @@ impl Workbench {
         error: &'a str,
         room: f32,
     ) -> Element<'a, Message> {
-        let mut message = row![icon(Icon::Warning, 12.0, style::STAGE.danger)]
+        let mut message = row![Level::Error.mark(12.0, style::STAGE)]
             .spacing(6)
             .align_y(Alignment::Center);
         if room >= 60.0 {
@@ -512,12 +510,10 @@ impl Workbench {
     }
 
     fn loss_about(&self, camera: &CameraSnapshot, lost: u64) -> String {
-        let frames = if lost == 1 {
-            "1 frame".to_owned()
-        } else {
-            format!("{} frames", grouped(lost))
-        };
-        let mut about = format!("{frames} lost since the camera connected");
+        let mut about = format!(
+            "{} lost since the camera connected",
+            plural(lost, "frame", "frames")
+        );
         if let Some(at) = self
             .liveness
             .get(&camera.info.id)
@@ -576,7 +572,7 @@ impl Workbench {
 pub(super) fn stall_badge<'a>(silent: Duration) -> Element<'a, Message> {
     container(
         row![
-            icon(Icon::WarningTriangle, 12.0, style::STAGE.warn),
+            Level::Warning.mark(12.0, style::STAGE),
             text(silence(silent))
                 .size(style::CAPTION)
                 .font(style::MEDIUM),
@@ -1070,13 +1066,9 @@ mod tests {
         let mut bench = bench();
         let start = bench.now;
         let pending = Pending {
-            label: "Setting Gain".into(),
-            receiver: mpsc::channel().1,
-            target: None,
             camera: Some("sim:0".into()),
-            feature: Some("Gain".into()),
             at: start,
-            batch: false,
+            ..Pending::unanswered(Job::Set("Gain".into()))
         };
         bench.result_stage(
             &pending,

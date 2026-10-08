@@ -336,6 +336,103 @@ pub(super) fn redact_address(value: &str) -> String {
     }
 }
 
+/// `address` without its scheme, credentials, query or fragment: the host,
+/// any port, and the path. Safe to show, as `redact_address` is.
+pub(super) fn short_address(address: &str) -> String {
+    let rest = address.strip_prefix("onvif:").unwrap_or(address);
+    let rest = rest
+        .strip_prefix("//")
+        .or_else(|| rest.split_once("://").map(|(_, rest)| rest))
+        .unwrap_or(rest);
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{host}{}", path.trim_end_matches('/'))
+}
+
+/// What tells a camera from others of its model, the same everywhere it
+/// shows: its short address when it has one (stream and ONVIF inputs have
+/// only a hash for a serial), else its serial, as "S/N SIM0".
+pub(super) fn identity(camera: &CameraInfo) -> String {
+    match &camera.address {
+        Some(address) => short_address(address),
+        None => format!("S/N {}", camera.serial),
+    }
+}
+
+/// `identity(camera)` when another of the connected `cameras` is the same
+/// model, so its model alone would not tell them apart.
+pub(super) fn twin_identity(
+    cameras: &[crate::session::CameraSnapshot],
+    camera: &CameraInfo,
+) -> Option<String> {
+    let same = cameras
+        .iter()
+        .filter(|other| other.info.model == camera.model)
+        .count();
+    (same > 1).then(|| identity(camera))
+}
+
+/// What a camera's output is: a file it records to, or a URL it forwards
+/// to, told apart by the rule the forwarder itself uses. Safe to show: a
+/// URL's credentials are hidden.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Output {
+    Recording(String),
+    Forwarding(String),
+}
+
+impl Output {
+    pub(super) fn of(target: &str) -> Self {
+        if crate::media::is_recording(target) {
+            Output::Recording(target.to_owned())
+        } else {
+            Output::Forwarding(redact_address(target))
+        }
+    }
+
+    pub(super) fn recording(&self) -> bool {
+        matches!(self, Output::Recording(_))
+    }
+
+    /// "Recording" or "Forwarding".
+    pub(super) fn title(&self) -> &'static str {
+        match self {
+            Output::Recording(_) => "Recording",
+            Output::Forwarding(_) => "Forwarding",
+        }
+    }
+
+    /// The file or URL.
+    pub(super) fn target(&self) -> &str {
+        match self {
+            Output::Recording(target) | Output::Forwarding(target) => target,
+        }
+    }
+
+    /// "Recording to clip.mkv", "Forwarding to rtsp://[redacted]@cam/live".
+    pub(super) fn about(&self) -> String {
+        format!("{} to {}", self.title(), self.target())
+    }
+}
+
+/// A count and its noun: "1 camera", "1,204 features".
+pub(super) fn plural(n: u64, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{} {many}", grouped(n))
+    }
+}
+
+/// The first line of an error, for a one-line slot; a tooltip or the
+/// activity log has it all.
+pub(super) fn first_line(error: &str) -> &str {
+    error.lines().next().unwrap_or(error)
+}
+
 /// A short span of time: "4 s", "3 min", "2 h".
 pub(super) fn span(duration: Duration) -> String {
     match duration.as_secs() {
@@ -594,6 +691,72 @@ mod tests {
             ]
         );
         assert!(stream_locked("PixelFormat") && !stream_locked("Gain"));
+    }
+
+    fn camera(model: &str, serial: &str, address: Option<&str>) -> CameraInfo {
+        CameraInfo {
+            id: serial.to_lowercase(),
+            transport: crate::types::Transport::Media,
+            vendor: String::new(),
+            model: model.into(),
+            serial: serial.into(),
+            address: address.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn cameras_go_by_address_or_serial_and_twins_say_which() {
+        let rtsp = |serial: &str, host: &str| {
+            camera(
+                "RTSP input",
+                serial,
+                Some(&format!("rtsp://[redacted]@{host}:554/live")),
+            )
+        };
+        let snapshot = |info: CameraInfo| crate::session::CameraSnapshot {
+            info,
+            ..super::super::liveness::streaming_camera(0, 0, 0.0)
+        };
+        let streams = [
+            rtsp("3fa9c0d2e4b1a7f0", "cam1"),
+            rtsp("9c4f2e7a1b03d8e6", "cam2"),
+        ];
+        let sim = camera("Pattern camera", "SIM0", None);
+        assert_eq!(identity(&streams[0]), "cam1:554/live", "never the hash");
+        assert_eq!(identity(&sim), "S/N SIM0");
+        let cameras: Vec<_> = streams
+            .iter()
+            .chain([&sim])
+            .cloned()
+            .map(snapshot)
+            .collect();
+        assert_eq!(
+            twin_identity(&cameras, &streams[1]).as_deref(),
+            Some("cam2:554/live")
+        );
+        assert_eq!(twin_identity(&cameras, &sim), None, "its model is its own");
+        assert_eq!(twin_identity(&cameras[2..], &sim), None);
+    }
+
+    #[test]
+    fn outputs_are_recordings_by_the_forwarder_rule() {
+        let url = Output::of("rtsp://user:secret@host/live");
+        assert!(!url.recording());
+        assert_eq!(url.about(), "Forwarding to rtsp://[redacted]@host/live");
+        assert_eq!(Output::of("clip.mkv"), Output::Recording("clip.mkv".into()));
+        let file = Output::of("file:///tmp/clip.mkv");
+        assert!(file.recording(), "a file URL is a recording");
+        assert_eq!(file.title(), "Recording");
+        assert!(!Output::of("srt://10.0.0.5:9000").recording());
+    }
+
+    #[test]
+    fn counts_name_their_noun() {
+        assert_eq!(plural(1, "feature", "features"), "1 feature");
+        assert_eq!(plural(0, "feature", "features"), "0 features");
+        assert_eq!(plural(1204, "feature", "features"), "1,204 features");
+        assert_eq!(first_line("no answer\nwithin 5 s"), "no answer");
+        assert_eq!(first_line(""), "");
     }
 
     #[test]

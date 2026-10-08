@@ -249,6 +249,13 @@ pub const BODY: f32 = 13.0;
 pub const SMALL: f32 = 12.0;
 pub const CAPTION: f32 = 11.0;
 
+/// The height of one line of text at `size`: iced's default line height,
+/// `LineHeight::Relative(1.3)`. For layout heights that hold text, so they
+/// follow the type scale.
+pub const fn line_height(size: f32) -> f32 {
+    size * 1.3
+}
+
 /// Corner radii. Fields, plain and glass buttons, segments, tooltips and code.
 pub const RADIUS_SMALL: f32 = 6.0;
 /// Buttons, list rows, menus and segment tracks.

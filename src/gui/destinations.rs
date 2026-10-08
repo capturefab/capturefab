@@ -5,8 +5,10 @@
 //! Disk scans, bucket checks, keychain lookups and queue status run on
 //! background threads, so a slow network share, service or credential store
 //! never stalls the interface.
+use super::format::{grouped, plural};
 use super::icon::{self, Icon, icon};
 use super::motion::Flashes;
+use super::notice::Level;
 use super::sparkline::History;
 use super::style::{self, Palette};
 use super::widgets::{SheetFrame, disclosure, fade, field_error, one_line, sheet_frame};
@@ -1304,8 +1306,12 @@ impl Picker {
         let (waiting, failed) = (mine("pending") + mine("uploading"), mine("failed"));
         let summary = match (waiting, failed) {
             (0, 0) => format!("All uploaded · {} sent in total", status["uploaded"]),
-            (w, 0) => format!("Uploading {w} file{}", if w == 1 { "" } else { "s" }),
-            (w, f) => format!("{w} waiting · {f} failed"),
+            (w, 0) => format!("Uploading {}", plural(w as u64, "file", "files")),
+            (w, f) => format!(
+                "{} waiting · {} failed",
+                grouped(w as u64),
+                grouped(f as u64)
+            ),
         };
         let mut head = row![text(summary).size(style::CAPTION).color(if failed > 0 {
             p.ink(p.danger)
@@ -1930,19 +1936,19 @@ fn status<'a>(
     p: &'static Palette,
 ) -> Element<'a, Message> {
     let ink = if status == Status::Failed {
-        p.ink(p.danger)
+        Level::Error.color(p)
     } else {
         p.secondary
     };
     let glyph = match status {
         Status::Working => icon::spinner(13.0, p.secondary, spin),
-        Status::Done => icon(Icon::Check, 13.0, p.live),
-        Status::Failed => icon(Icon::Warning, 13.0, ink),
+        Status::Done => Level::Done.mark(13.0, p),
+        Status::Failed => Level::Error.mark(13.0, p),
     };
     row![
         // On the first line, should the text wrap.
         container(glyph)
-            .height(Length::Fixed(style::SMALL * 1.3))
+            .height(Length::Fixed(style::line_height(style::SMALL)))
             .align_y(Alignment::Center),
         text(message).size(style::SMALL).color(ink),
     ]
