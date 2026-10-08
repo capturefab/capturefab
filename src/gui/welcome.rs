@@ -102,7 +102,7 @@ impl Workbench {
 
     /// The welcome screen's column, and roughly how much taller than
     /// `ANCHORED` it is.
-    fn welcome_content(&self, p: &'static Palette) -> (Element<'_, Message>, f32) {
+    pub(super) fn welcome_content(&self, p: &'static Palette) -> (Element<'_, Message>, f32) {
         let now = self.now;
         let discovering = self.pending("Discovering cameras");
         let spin = self.spin();

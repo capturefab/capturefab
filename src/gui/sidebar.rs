@@ -561,12 +561,15 @@ impl Workbench {
             list = list.push(self.camera_row(camera, spin, p));
         }
         // A connect to something not listed yet shows where it will land.
+        let mut provisional: Vec<&str> = Vec::new();
         for target in self.pending.iter().filter_map(|p| p.target.as_deref()) {
             let listed = devices
                 .iter()
                 .any(|device| device.id == target || device.address.as_deref() == Some(target))
-                || recent.iter().any(|recent| recent.target == target);
+                || recent.iter().any(|recent| recent.target == target)
+                || provisional.contains(&target);
             if !listed {
+                provisional.push(target);
                 list = list.push(self.provisional_row(target, spin, p));
             }
         }
@@ -1245,6 +1248,33 @@ mod tests {
         assert!(!bench.searching_shown(), "a quick search keeps the slot");
         bench.now = start + SEARCH_SHOWN;
         assert!(bench.searching_shown());
+    }
+
+    #[test]
+    fn every_row_and_card_state_builds() {
+        let mut bench = bench();
+        let mut connected = super::super::liveness::streaming_camera(10, 0, 30.0);
+        connected.forwarding = Some("rtsp://user:pw@10.0.0.9/out".into());
+        bench.snapshot.cameras = vec![connected];
+        bench.snapshot.active_camera = Some("sim:0".into());
+        bench.snapshot.devices = vec![device("sim:1", "SIM1"), device("sim:2", "SIM2")];
+        bench.side.discovery_issues = vec!["USB access denied".into()];
+        bench
+            .side
+            .connect_failed("sim:2", "no answer\nmore".into(), bench.now);
+        bench.apply_scene(&["side-recent", "side-connecting"]);
+        bench.address = "192.168.10.50".into();
+        bench
+            .side
+            .connect_failed("192.168.10.50", "no answer".into(), bench.now);
+        bench.tick_side();
+        bench.sync_side();
+        for p in [&style::LIGHT, &style::DARK] {
+            let _ = bench.sidebar(p);
+            let _ = bench.ready(p);
+            let (_, extra) = bench.welcome_content(p);
+            assert!(extra > 0.0, "the callout and recents add height");
+        }
     }
 
     #[test]
