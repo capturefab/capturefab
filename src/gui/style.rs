@@ -395,18 +395,6 @@ pub fn pill(color: Color) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
-/// A fade from clear to `surface` across a strip at the end of clipped
-/// content, left to right.
-#[allow(dead_code)] // adopted by the area packages
-pub fn edge_fade(surface: Color) -> impl Fn(&Theme) -> container::Style {
-    move |_theme| {
-        let fade = iced::gradient::Linear::new(std::f32::consts::FRAC_PI_2)
-            .add_stop(0.0, alpha(surface, 0.0))
-            .add_stop(1.0, surface);
-        container::Style::default().background(Background::Gradient(fade.into()))
-    }
-}
-
 /// The fill of a `well`.
 fn well_fill(p: &Palette) -> Color {
     if p.dark { p.field } else { rgb(0xF7F7F9) }
@@ -576,7 +564,6 @@ pub fn secondary(theme: &Theme, status: button::Status) -> button::Style {
 /// Stopping acquisition: a `secondary` button, tinted red only while hovered
 /// or pressed. Routine, not destructive, so the caller adds a `danger` glyph
 /// and keeps the label in the text color.
-#[allow(dead_code)] // adopted by the area packages
 pub fn stop(theme: &Theme, status: button::Status) -> button::Style {
     let p = Palette::from(theme);
     let mut style = secondary(theme, status);
@@ -723,37 +710,6 @@ pub fn glass_segment(
     }
 }
 
-/// The groove of a segmented control on dark glass; `shown` fades it.
-pub fn glass_track(shown: f32) -> container::Style {
-    container::Style {
-        background: Some(alpha(Color::WHITE, 0.06 * shown).into()),
-        border: border(RADIUS),
-        ..container::Style::default()
-    }
-}
-
-/// The thumb of a segmented control on dark glass; `shown` fades it.
-pub fn glass_thumb(shown: f32) -> container::Style {
-    container::Style {
-        background: Some(alpha(Color::WHITE, 0.2 * shown).into()),
-        border: border(RADIUS_SMALL),
-        ..container::Style::default()
-    }
-}
-
-/// A label of a segmented control on dark glass: `lit` as for
-/// `segment_label`, `shown` fading it with its overlay.
-pub fn glass_label(lit: f32, shown: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |_theme, status| {
-        let text = match status {
-            button::Status::Hovered | button::Status::Pressed => STAGE.text,
-            button::Status::Disabled => alpha(STAGE.text, 0.35),
-            button::Status::Active => mix(STAGE.secondary, STAGE.text, lit),
-        };
-        button_base(None, alpha(text, text.a * shown), RADIUS_SMALL)
-    }
-}
-
 /// A secondary button that stays tinted in accent while `on`, like Auto.
 pub fn toggle(on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
@@ -821,7 +777,6 @@ pub fn input_invalid(theme: &Theme, status: text_input::Status) -> text_input::S
 }
 
 /// A field holding an edit that has not been applied yet.
-#[allow(dead_code)] // adopted by the area packages
 pub fn input_dirty(theme: &Theme, status: text_input::Status) -> text_input::Style {
     let p = Palette::from(theme);
     let mut style = input(theme, status);
@@ -833,7 +788,6 @@ pub fn input_dirty(theme: &Theme, status: text_input::Status) -> text_input::Sty
 
 /// A field acknowledging an accepted value: an accent glow that fades out as
 /// `t` goes from 1 to 0.
-#[allow(dead_code)] // adopted by the area packages
 pub fn input_flash(t: f32) -> impl Fn(&Theme, text_input::Status) -> text_input::Style {
     move |theme, status| {
         let mut style = input(theme, status);

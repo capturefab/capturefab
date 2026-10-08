@@ -418,14 +418,12 @@ enum Message {
     ResetFocusPeak,
     ToggleActivity,
     /// Open the activity log; never closes it.
-    #[allow(dead_code)] // adopted by the chrome and sidebar-welcome packages
     ShowActivity,
     CopyLog,
     CopySessionCommand,
     Copy(String),
     Tab(Tab),
     /// Show the inspector on `Tab`, from anywhere.
-    #[allow(dead_code)] // adopted by the chrome and inspector packages
     ShowTab(Tab),
     Search(String),
     RefreshFeatures,
@@ -465,7 +463,6 @@ enum Message {
     HoverTile(Option<String>),
     FocusTile(String),
     CaptureCamera(String),
-    #[allow(dead_code)] // adopted by the chrome package's dismiss button
     DismissNotice,
     // Each area adds its messages under its own heading, and handles them
     // under the same heading in `handle_message`, so areas never edit the
@@ -589,7 +586,6 @@ struct Workbench {
     /// Window width at the last resize.
     width: f32,
     /// Window height at the last resize.
-    #[allow(dead_code)] // adopted by the sheets package
     height: f32,
     window: Option<[f32; 2]>,
     fullscreen: bool,

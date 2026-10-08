@@ -42,7 +42,6 @@ impl OneLine<'_> {
     }
 
     /// Sets the text against the right edge of a wider room, for figures.
-    #[allow(dead_code)] // adopted by the area packages
     pub(super) fn align_right(mut self) -> Self {
         self.align_x = text::Alignment::Right;
         self

@@ -38,8 +38,6 @@ pub enum Icon {
     Eject,
     Search,
     Recent,
-    #[allow(dead_code)] // the camera list dropped it; remove unless another area adopts it
-    Plug,
     Network,
     Usb,
     Video,
@@ -57,14 +55,10 @@ pub enum Icon {
     CornersIn,
     Scan,
     Reset,
-    #[allow(dead_code)] // adopted by the inspector package
     Lock,
-    #[allow(dead_code)] // adopted by the sheets package
     CloudArrowUp,
-    #[allow(dead_code)] // adopted by the sheets package
     FolderPlus,
     /// Drives: local, external or network storage.
-    #[allow(dead_code)] // adopted by the sheets package
     HardDrives,
     /// The app mark: a rounded lens body.
     Mark,
@@ -96,7 +90,6 @@ impl Icon {
             Icon::Eject => (REGULAR, '\u{e212}'),
             Icon::Search => (REGULAR, '\u{e30c}'),
             Icon::Recent => (REGULAR, '\u{e1a0}'),
-            Icon::Plug => (REGULAR, '\u{e946}'),
             Icon::Network => (REGULAR, '\u{edde}'),
             Icon::Usb => (REGULAR, '\u{e956}'),
             Icon::Video => (REGULAR, '\u{e4da}'),
@@ -202,7 +195,6 @@ const SPOKES: usize = 8;
 /// A macOS-style activity indicator: eight spokes fading behind the one lit
 /// at `phase`. The caller steps `phase` from a tick it already runs; this
 /// draws a still frame and requests no redraws itself.
-#[allow(dead_code)] // adopted by the area packages
 pub fn spinner<'a, Message: 'a>(size: f32, color: Color, phase: usize) -> Element<'a, Message> {
     canvas::Canvas::new(Spinner {
         color,

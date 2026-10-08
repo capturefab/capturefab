@@ -31,7 +31,6 @@ pub(super) fn tip<'a, M: 'a>(
 
 /// Tooltip opening above `content`, for controls along the window's bottom
 /// edge, where one below would land on the control itself.
-#[allow(dead_code)] // adopted by the area packages
 pub(super) fn tip_above<'a, M: 'a>(
     content: impl Into<Element<'a, M>>,
     tip: impl ToString,
@@ -62,7 +61,6 @@ pub(super) fn tip_at<'a, M: 'a>(
 /// `t` goes from 0 to 1. Only for content on an opaque `surface` of exactly
 /// that color; `radius` matches its corners. The fill takes no input, and
 /// `content` keeps its widget state (focus, scrolling) through the fade.
-#[allow(dead_code)] // adopted by the area packages
 pub(super) fn veil<'a, M: 'a>(
     content: impl Into<Element<'a, M>>,
     surface: Color,
@@ -273,7 +271,6 @@ pub(super) fn field<'a>(
 
 /// An error caption under the field it concerns. Pair it with
 /// `style::input_invalid` on the field.
-#[allow(dead_code)] // adopted by the area packages
 pub(super) fn field_error<'a, M: 'a>(
     message: impl text::IntoFragment<'a>,
     p: &'static Palette,
@@ -346,26 +343,14 @@ pub(super) fn code_block<'a>(
     .into()
 }
 
-/// What a control sits on, which decides its colors.
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[allow(dead_code)] // adopted by the area packages
-pub(super) enum Surface {
-    /// A light or dark panel: the sidebar, the inspector, a sheet.
-    Panel,
-    /// The stage's dark glass, faded with it by the value, from 0 to 1.
-    Glass(f32),
-}
-
 /// A segmented control of equal segments, each a label, its message (`None`
-/// disables it) and a hint (empty for none), on `surface`. One thumb marks
+/// disables it) and a hint (empty for none), on a panel. One thumb marks
 /// the selection at `thumb`, a segment index the caller animates: whole
 /// numbers at rest, fractions while sliding. Labels keep one weight, so
 /// nothing reflows, and brighten as the thumb passes under them.
-#[allow(dead_code)] // adopted by the area packages
 pub(super) fn segmented<'a, M: Clone + 'a>(
     items: Vec<(&'a str, Option<M>, String)>,
     thumb: f32,
-    surface: Surface,
 ) -> Element<'a, M> {
     let last = items.len().saturating_sub(1) as f32;
     let thumb = thumb.clamp(0.0, last);
@@ -381,10 +366,7 @@ pub(super) fn segmented<'a, M: Clone + 'a>(
         container(space())
             .width(Length::FillPortion(1000))
             .height(Fill)
-            .style(move |theme| match surface {
-                Surface::Panel => style::segment_thumb(theme),
-                Surface::Glass(shown) => style::glass_thumb(shown),
-            }),
+            .style(style::segment_thumb),
     );
     if after > 0 {
         slide = slide.push(space().width(Length::FillPortion(after)));
@@ -400,10 +382,7 @@ pub(super) fn segmented<'a, M: Clone + 'a>(
         )
         .width(Fill)
         .padding([4, 12])
-        .style(move |theme, status| match surface {
-            Surface::Panel => style::segment_label(lit)(theme, status),
-            Surface::Glass(shown) => style::glass_label(lit, shown)(theme, status),
-        })
+        .style(style::segment_label(lit))
         .on_press_maybe(on);
         if hint.is_empty() {
             segment.into()
@@ -413,10 +392,7 @@ pub(super) fn segmented<'a, M: Clone + 'a>(
     }));
     container(Stack::new().push(labels).push_under(slide))
         .padding(2)
-        .style(move |theme| match surface {
-            Surface::Panel => style::segment_track(theme),
-            Surface::Glass(shown) => style::glass_track(shown),
-        })
+        .style(style::segment_track)
         .into()
 }
 
@@ -523,7 +499,6 @@ pub(super) struct SheetFrame<'a, M> {
 
 /// A sheet titled `title` around `body`, whose close button sends `close`;
 /// 560 × 640 unless sized.
-#[allow(dead_code)] // adopted by the sheets package
 pub(super) fn sheet_frame<'a, M: Clone + 'a>(
     title: impl text::IntoFragment<'a>,
     close: M,
@@ -545,7 +520,6 @@ pub(super) fn sheet_frame<'a, M: Clone + 'a>(
     }
 }
 
-#[allow(dead_code)] // adopted by the sheets package
 impl<'a, M: Clone + 'a> SheetFrame<'a, M> {
     /// An accent glyph before the title.
     pub(super) fn mark(mut self, mark: Icon) -> Self {

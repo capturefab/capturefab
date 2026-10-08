@@ -35,7 +35,6 @@ impl Notice {
 
 /// The last capture that saved files.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // `path` and `count` are adopted by the inspector package
 pub(super) struct Saved {
     /// The camera it came from, when known at the send site.
     pub(super) camera: Option<String>,
@@ -114,7 +113,6 @@ impl Workbench {
     }
 
     /// Fade the notice out; `age_notice` drops it once it has gone.
-    #[allow(dead_code)] // adopted by the chrome package's dismiss button
     pub(super) fn dismiss_notice(&mut self) {
         self.notice_shown.go(0.0, self.now);
     }
@@ -213,7 +211,6 @@ impl Workbench {
 
     /// Whether `value` was copied within the last `COPIED`. The slow tick
     /// redraws when that ends, so no per-frame redraws are needed.
-    #[allow(dead_code)] // adopted by the sheets, chrome and sidebar packages
     pub(super) fn just_copied(&self, value: &str) -> bool {
         self.copied.as_ref().is_some_and(|(copied, at)| {
             copied == value && self.now.saturating_duration_since(*at) <= motion::COPIED
@@ -238,7 +235,6 @@ impl Workbench {
 
     /// Whether a capture from `camera` (any camera for `None`) saved files
     /// within the last `SAVED`.
-    #[allow(dead_code)] // adopted by the inspector and stage packages
     pub(super) fn just_saved(&self, camera: Option<&str>) -> bool {
         self.last_saved.as_ref().is_some_and(|saved| {
             self.now.saturating_duration_since(saved.at) <= motion::SAVED

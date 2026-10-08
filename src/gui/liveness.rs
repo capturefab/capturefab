@@ -216,7 +216,6 @@ impl Workbench {
     /// passes its limit (see `Liveness::limit`). `None` while that cannot be
     /// told: its worker is busy with a command from here or from another
     /// client, so its counters are old, or it waits for triggers.
-    #[allow(dead_code)] // adopted by the chrome, stage and sidebar packages
     pub(super) fn stalled(&self, id: &str) -> Option<Duration> {
         let live = self.liveness.get(id)?;
         if live.busy
@@ -234,7 +233,6 @@ impl Workbench {
 
     /// Whether a streaming camera lost frames within `LOSS_RECENT`, counting
     /// only losses since its stream started (see `camera_loss`).
-    #[allow(dead_code)] // adopted by the stage and sidebar packages
     pub(super) fn recent_loss(&self, id: &str) -> bool {
         self.liveness
             .get(id)

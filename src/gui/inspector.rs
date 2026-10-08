@@ -490,7 +490,6 @@ impl Workbench {
                 ),
             ],
             self.inspect.tab_thumb.get(self.now),
-            Surface::Panel,
         );
         let mut panel = column![
             self.titlebar(
@@ -815,7 +814,6 @@ impl Workbench {
                 ),
             ],
             self.inspect.mode_thumb.get(self.now),
-            Surface::Panel,
         );
         let mut card = column![head, modes].spacing(10);
         match auto {

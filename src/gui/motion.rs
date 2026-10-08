@@ -42,8 +42,6 @@ pub(super) const NOTICE_LIFE: Duration = Duration::from_secs(5);
 pub(super) const COPIED: Duration = Duration::from_millis(1500);
 /// How long a capture control reads as saved.
 pub(super) const SAVED: Duration = Duration::from_millis(1600);
-/// How long `Flashes` remembers a hit, which bounds what `held` can answer.
-pub(super) const FLASH_KEEP: Duration = Duration::from_secs(3);
 /// How often the system's accessibility display settings are read again.
 const ACCESSIBILITY_POLL: Duration = Duration::from_secs(2);
 /// Below this window width the inspector floats over the stage instead of docking.
@@ -201,7 +199,6 @@ pub(super) struct Flashes<K> {
     duration: Duration,
 }
 
-#[allow(dead_code)] // adopted by the area packages
 impl<K: Eq + Hash> Flashes<K> {
     pub(super) fn new(duration: Duration) -> Self {
         Self {
@@ -230,19 +227,7 @@ impl<K: Eq + Hash> Flashes<K> {
         })
     }
 
-    /// Whether `key` was hit within `within`, at most `FLASH_KEEP` ago.
-    pub(super) fn held<Q>(&self, key: &Q, now: Instant, within: Duration) -> bool
-    where
-        K: Borrow<Q>,
-        Q: Eq + Hash + ?Sized,
-    {
-        !self.at.is_empty()
-            && self
-                .at
-                .get(key)
-                .is_some_and(|at| now.saturating_duration_since(*at) < within)
-    }
-
+    #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.at.is_empty()
     }
@@ -254,12 +239,13 @@ impl<K: Eq + Hash> Flashes<K> {
             .any(|at| now.saturating_duration_since(*at) < self.duration)
     }
 
-    /// Forget hits older than the duration and `FLASH_KEEP`.
+    /// Forget hits that have faded. Hits set in the future, for a staggered
+    /// start, stay until they have played.
     pub(super) fn prune(&mut self, now: Instant) {
         if self.at.is_empty() {
             return;
         }
-        let keep = self.duration.max(FLASH_KEEP);
+        let keep = self.duration;
         self.at
             .retain(|_, at| now.saturating_duration_since(*at) < keep);
     }
@@ -419,7 +405,6 @@ impl Workbench {
     /// on the newly selected camera as it fades from the one before, in step
     /// with the overview's ring. For the tile ring, sidebar rows and the
     /// inspector, so all three move together.
-    #[allow(dead_code)] // adopted by the stage, sidebar-welcome and inspector packages
     pub(super) fn selection_level(&self, id: &str) -> f32 {
         let t = self.ring.get(self.now);
         if self.snapshot.active_camera.as_deref() == Some(id) {
@@ -576,11 +561,13 @@ mod tests {
             "as registered"
         );
         assert_eq!(flashes.level("Gain", start + ms(400)), 0.0);
-        assert!(flashes.held("Gain", start + ms(1500), ms(2000)));
-        assert!(!flashes.held("Gain", start + ms(2500), ms(2000)));
-        flashes.prune(start + ms(1000));
-        assert!(!flashes.is_empty(), "kept for held()");
-        flashes.prune(start + FLASH_KEEP);
+        flashes.prune(start + ms(399));
+        assert!(!flashes.is_empty(), "kept while fading");
+        flashes.hit("Gain".to_string(), start + ms(1000));
+        flashes.prune(start + ms(500));
+        assert!(!flashes.is_empty(), "a staggered hit waits for its start");
+        assert_eq!(flashes.level("Gain", start + ms(500)), 1.0);
+        flashes.prune(start + ms(1400));
         assert!(flashes.is_empty());
     }
 
