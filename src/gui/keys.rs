@@ -273,7 +273,7 @@ impl Action {
     ];
 
     /// Help sheet layout: section title and its actions in reading order.
-    pub const SECTIONS: [(&'static str, &'static [Action]); 4] = [
+    pub const SECTIONS: [(&'static str, &'static [Action]); 5] = [
         (
             "Cameras",
             &[
@@ -297,20 +297,25 @@ impl Action {
         (
             "View",
             &[
-                Action::FeaturesTab,
-                Action::CaptureTab,
-                Action::ForwardTab,
                 Action::ZoomIn,
                 Action::ZoomOut,
                 Action::ZoomFit,
                 Action::ZoomActual,
-                Action::ToggleSidebar,
-                Action::ToggleInspector,
                 Action::ImageMode,
+                Action::Fullscreen,
                 Action::ToggleExposure,
                 Action::ToggleFocusRegion,
+            ],
+        ),
+        (
+            "Panels",
+            &[
+                Action::FeaturesTab,
+                Action::CaptureTab,
+                Action::ForwardTab,
+                Action::ToggleSidebar,
+                Action::ToggleInspector,
                 Action::ToggleActivity,
-                Action::Fullscreen,
             ],
         ),
         (
@@ -323,15 +328,17 @@ impl Action {
         ),
     ];
 
+    /// The action's name in the help sheet, under its section's title.
+    /// Toggles are named by what they show.
     pub fn label(self) -> &'static str {
         match self {
             Action::Discover => "Discover cameras",
             Action::ConnectAddress => "Connect to an address or stream",
             Action::NextCamera => "Select next camera",
             Action::PreviousCamera => "Select previous camera",
-            Action::FocusCamera => "Focus selected camera",
+            Action::FocusCamera => "Open selected camera",
             Action::Overview => "Back to all cameras",
-            Action::ToggleStream => "Start / stop streaming",
+            Action::ToggleStream => "Start or stop streaming",
             Action::Capture => "Capture and save",
             Action::ToggleAuto => "Switch between auto and manual",
             Action::SearchFeatures => "Search camera features",
@@ -342,15 +349,15 @@ impl Action {
             Action::ZoomOut => "Zoom out",
             Action::ZoomFit => "Zoom to fit",
             Action::ZoomActual => "Actual pixels (1:1)",
-            Action::ToggleActivity => "Show / hide activity",
-            Action::ToggleSidebar => "Show / hide camera list",
-            Action::ToggleInspector => "Show / hide camera settings",
+            Action::ToggleActivity => "Activity log",
+            Action::ToggleSidebar => "Camera list",
+            Action::ToggleInspector => "Camera settings",
             Action::ImageMode => "Image only",
-            Action::ToggleExposure => "Show / hide exposure histogram",
-            Action::ToggleFocusRegion => "Show / hide focus region and scores",
-            Action::CopySessionCommand => "Copy session CLI command",
-            Action::Fullscreen => "Enter / exit full screen",
-            Action::Help => "Keyboard shortcuts and help",
+            Action::ToggleExposure => "Exposure histogram",
+            Action::ToggleFocusRegion => "Focus region and scores",
+            Action::CopySessionCommand => "Copy session command",
+            Action::Fullscreen => "Full screen",
+            Action::Help => "This guide",
             Action::CloseWindow => "Close window",
         }
     }
@@ -423,6 +430,23 @@ impl Action {
                 (keyboard_free || !binding.needs_free_keyboard()) && binding.matches(pressed)
             })
         })
+    }
+
+    /// The one binding a list of shortcuts shows: the primary, except that
+    /// zooming in reads ⌘+ on macOS, as Apple's menus have it.
+    pub fn display_binding(self, os: Os) -> Option<Chord> {
+        let bindings = self.bindings(os);
+        let plus = (self == Action::ZoomIn && os == Os::Mac)
+            .then(|| bindings.iter().find(|chord| chord.key == Key::Char('+')))
+            .flatten();
+        plus.or(bindings.first()).copied()
+    }
+
+    /// `display_binding`'s label, e.g. "⌘?"; empty with no binding.
+    pub fn key_label(self, os: Os) -> String {
+        self.display_binding(os)
+            .map(|chord| chord.label(os))
+            .unwrap_or_default()
     }
 
     /// All bindings, e.g. "⌘? / F1".
@@ -532,6 +556,24 @@ mod tests {
         assert_eq!(Action::Fullscreen.shortcut(Os::Mac), "⌃⌘F");
         assert_eq!(Action::ToggleAuto.shortcut(Os::Mac), "⇧⌘A");
         assert_eq!(Action::Help.shortcut(Os::Mac), "⌘? / F1");
+    }
+
+    #[test]
+    fn the_help_sheet_shows_one_working_key_per_action() {
+        assert_eq!(Action::ZoomIn.key_label(Os::Mac), "⌘+");
+        assert_eq!(Action::ZoomIn.key_label(Os::Windows), "Ctrl+=");
+        assert_eq!(Action::Help.key_label(Os::Mac), "⌘?");
+        assert_eq!(Action::Help.key_label(Os::Windows), "F1");
+        assert_eq!(Action::Discover.key_label(Os::Windows), "Ctrl+R");
+        assert_eq!(Action::CloseWindow.key_label(Os::Windows), "");
+        for os in PLATFORMS {
+            for action in Action::ALL {
+                if let Some(chord) = action.display_binding(os) {
+                    assert_eq!(Action::find(&chord, true, os), Some(action), "{action:?}");
+                }
+                assert!(!action.key_label(os).contains(" / "), "{action:?}");
+            }
+        }
     }
 
     #[test]

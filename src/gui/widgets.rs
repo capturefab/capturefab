@@ -11,6 +11,8 @@ const SHEET_HEADER: f32 = 24.0 + 29.0 + 13.0 + 1.0;
 const SHEET_FOOTER: f32 = 1.0 + 12.0 + 32.0 + 12.0;
 /// Inset of a sheet's content from its edges.
 const SHEET_INSET: f32 = 24.0;
+/// How far a sheet rises into place as it opens.
+const SHEET_RISE: f32 = 12.0;
 
 pub(super) fn focus_address() -> Task<Message> {
     Task::batch([
@@ -425,10 +427,12 @@ pub(super) fn modal<'a>(
     on_blur: Option<Message>,
     shown: f32,
 ) -> Element<'a, Message> {
+    // Centering splits the padding above and below, so the sheet travels
+    // half of it.
     let sheet = container(opaque(content))
         .id("sheet")
         .padding(iced::Padding {
-            top: motion::rise(24.0, shown),
+            top: motion::rise(2.0 * SHEET_RISE, shown),
             ..iced::Padding::ZERO
         });
     let scrim = mouse_area(center(sheet).style(move |theme| style::scrim(theme, shown)));
