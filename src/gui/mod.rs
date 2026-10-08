@@ -476,7 +476,8 @@ enum Message {
     // Camera list and welcome: sidebar.rs, welcome.rs
 
     // Stage: stage.rs, grid.rs, scopes.rs
-
+    /// Hide a camera's error badge, by camera ID, until its error changes.
+    DismissStageError(String),
     // Inspector: inspector.rs
 
     // Sheets: help.rs, destinations.rs
@@ -1952,7 +1953,7 @@ impl Workbench {
             // Camera list and welcome: sidebar.rs, welcome.rs
 
             // Stage: stage.rs, grid.rs, scopes.rs
-
+            Message::DismissStageError(id) => self.dismiss_stage_error(&id),
             // Inspector: inspector.rs
 
             // Sheets: help.rs, destinations.rs

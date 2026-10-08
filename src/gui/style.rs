@@ -325,9 +325,9 @@ pub fn tile(theme: &Theme) -> container::Style {
 
 /// The accent ring drawn over the selected tile; `shown` fades it.
 pub fn ring(shown: f32) -> impl Fn(&Theme) -> container::Style {
-    move |theme| container::Style {
+    move |_theme| container::Style {
         border: Border {
-            color: alpha(Palette::from(theme).accent, shown),
+            color: alpha(STAGE.accent, shown),
             width: 2.5,
             radius: RADIUS_MEDIUM.into(),
         },
