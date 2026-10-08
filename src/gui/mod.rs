@@ -1004,12 +1004,31 @@ impl Workbench {
     /// camera it acts on; returns the entry, so a send site can add what only
     /// it knows. The session routes commands without a camera the same way:
     /// to the selected camera, except discovery, connecting and selection.
+    /// When the session refuses it, says why in the notice.
     fn submit(
         &mut self,
         camera: Option<&str>,
         job: Job,
         command: SessionCommand,
     ) -> Option<&mut Pending> {
+        let error = match self.try_submit(camera, job.clone(), command) {
+            // Reborrowed, as the borrow checker cannot yet return `pending`.
+            Ok(_) => return self.pending.last_mut(),
+            Err(error) => error,
+        };
+        if let Some((text, detail, level)) = command_notice(&job, &Err(error)) {
+            self.set_notice(text, detail, level);
+        }
+        None
+    }
+
+    /// `submit`, leaving a refusal for the caller to report.
+    fn try_submit(
+        &mut self,
+        camera: Option<&str>,
+        job: Job,
+        command: SessionCommand,
+    ) -> Result<&mut Pending> {
         let acts_on = match (camera, &command) {
             (Some(camera), _) => Some(camera.to_owned()),
             (
@@ -1021,28 +1040,18 @@ impl Workbench {
             (None, SessionCommand::Select { camera }) => Some(camera.clone()),
             (None, _) => self.snapshot.active_camera.clone(),
         };
-        let submitted = match camera {
+        let receiver = match camera {
             Some(camera) => self.handle.submit_to(camera, command),
             None => self.handle.submit(command),
-        };
-        match submitted {
-            Ok(receiver) => {
-                self.give_way();
-                self.pending.push(Pending {
-                    receiver,
-                    camera: acts_on,
-                    at: self.now,
-                    ..Pending::unanswered(job)
-                });
-                self.pending.last_mut()
-            }
-            Err(error) => {
-                if let Some((text, detail, level)) = command_notice(&job, &Err(error)) {
-                    self.set_notice(text, detail, level);
-                }
-                None
-            }
-        }
+        }?;
+        self.give_way();
+        self.pending.push(Pending {
+            receiver,
+            camera: acts_on,
+            at: self.now,
+            ..Pending::unanswered(job)
+        });
+        Ok(self.pending.last_mut().expect("just pushed"))
     }
 
     /// Whether a command doing `job` is on its way, to any camera.
@@ -1582,6 +1591,11 @@ impl Workbench {
     fn copy_session_command(&mut self, announce: bool) -> Task<Message> {
         let command = self.session_command();
         if announce {
+            // With the camera list hidden, its session control cannot
+            // confirm in place, so the toolbar must, even over an error.
+            if !self.sidebar_shown() {
+                self.give_way();
+            }
             self.set_notice("Session command copied", None, Level::Done);
         }
         self.note_copied(command.clone());
