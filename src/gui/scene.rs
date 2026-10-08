@@ -235,7 +235,9 @@ impl Workbench {
                     );
                 }
                 word => {
-                    self.area_scene(word, true);
+                    if !self.area_scene(word, true) {
+                        eprintln!("screenshot scene: no area takes {word:?}");
+                    }
                 }
             }
         }

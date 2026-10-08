@@ -297,11 +297,6 @@ impl Phase {
     }
 }
 
-/// "No new frame for 6 s".
-fn silence(silent: Duration) -> String {
-    format!("No new frame for {} s", silent.as_secs().max(1))
-}
-
 /// The overview's Auto label for `on` of `total` cameras in auto mode, and
 /// whether it reads as on: all of them.
 fn auto_all(on: usize, total: usize) -> (String, bool) {
@@ -864,8 +859,8 @@ impl Workbench {
             container(
                 text(format!(
                     "Press {} or {} to show the panels",
-                    Action::ImageMode.shortcut(os),
-                    Action::Overview.shortcut(os)
+                    Action::ImageMode.key_label(os),
+                    Action::Overview.key_label(os)
                 ))
                 .size(style::SMALL)
                 .color(fade(style::ON_STAGE, shown)),

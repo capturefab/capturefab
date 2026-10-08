@@ -437,7 +437,7 @@ fn camera_status(
     if let Some(silent) = stalled {
         return Some((
             icon(Icon::WarningTriangle, 12.0, p.ink(p.warn)),
-            format!("No new frames for {} s", silent.as_secs()),
+            silence(silent),
         ));
     }
     // An old error says little while frames flow.

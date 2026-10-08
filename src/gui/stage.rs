@@ -577,7 +577,7 @@ pub(super) fn stall_badge<'a>(silent: Duration) -> Element<'a, Message> {
     container(
         row![
             icon(Icon::WarningTriangle, 12.0, style::STAGE.warn),
-            text(format!("No new frame for {}", span(silent)))
+            text(silence(silent))
                 .size(style::CAPTION)
                 .font(style::MEDIUM),
         ]
@@ -587,15 +587,6 @@ pub(super) fn stall_badge<'a>(silent: Duration) -> Element<'a, Message> {
     .padding([3, 8])
     .style(style::badge)
     .into()
-}
-
-/// A short span of time: "4 s", "3 min", "2 h".
-pub(super) fn span(duration: Duration) -> String {
-    match duration.as_secs() {
-        seconds @ 0..60 => format!("{seconds} s"),
-        seconds @ 60..3600 => format!("{} min", seconds / 60),
-        seconds => format!("{} h", seconds / 3600),
-    }
 }
 
 /// `from` to `to` at `t`, evenly in ratio, so each step of the way zooms by
@@ -1115,12 +1106,5 @@ mod tests {
         bench.now = start + motion::SHUTTER;
         assert_eq!(bench.flash("sim:1", false), 0.0);
         assert!(!bench.animating());
-    }
-
-    #[test]
-    fn spans_read_in_the_largest_whole_unit() {
-        assert_eq!(span(ms(6400)), "6 s");
-        assert_eq!(span(Duration::from_secs(130)), "2 min");
-        assert_eq!(span(Duration::from_secs(7300)), "2 h");
     }
 }

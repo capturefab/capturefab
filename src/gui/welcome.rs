@@ -322,7 +322,7 @@ impl Workbench {
                 .style(style::link)
                 .padding([2, 6])
                 .on_press(Message::Help(true)),
-            text(Action::Help.shortcut(os))
+            text(Action::Help.key_label(os))
                 .size(style::CAPTION)
                 .color(p.secondary),
         ]

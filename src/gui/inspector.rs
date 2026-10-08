@@ -343,7 +343,8 @@ impl Workbench {
                 self.inspect.mode_thumb.set(1.0);
             }
             ("inspector-connecting", true) => {
-                self.scene_hold("Connecting camera");
+                // The welcome card it came from shows it connecting too.
+                self.scene_hold("Connecting camera").target = Some("sim:0".into());
             }
             ("inspector-context", true) => self.inspect.context.replay(1.0, 0.0, self.now),
             _ => return false,
@@ -552,6 +553,14 @@ impl Workbench {
         }
         let camera = self.snapshot.connected.as_ref()?;
         let glow = self.inspect.context.get(self.now);
+        // The same state dot as the camera's row in the sidebar.
+        let state = if !self.snapshot.streaming {
+            p.accent
+        } else if self.stalled(&camera.id).is_some() {
+            p.warn
+        } else {
+            p.live
+        };
         let line = row![
             icon(Icon::transport(camera.transport), 13.0, p.secondary),
             one_line(camera.model.as_str(), style::SMALL, style::MEDIUM, p.text),
@@ -562,14 +571,7 @@ impl Workbench {
                 p.secondary
             )
             .width(Fill),
-            dot(
-                if self.snapshot.streaming {
-                    p.live
-                } else {
-                    p.tertiary
-                },
-                6.0
-            ),
+            dot(state, 6.0),
         ]
         .spacing(6)
         .align_y(Alignment::Center);

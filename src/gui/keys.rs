@@ -353,7 +353,7 @@ impl Action {
             Action::ToggleSidebar => "Camera list",
             Action::ToggleInspector => "Camera settings",
             Action::ImageMode => "Image only",
-            Action::ToggleExposure => "Exposure histogram",
+            Action::ToggleExposure => "Histogram",
             Action::ToggleFocusRegion => "Focus region and scores",
             Action::CopySessionCommand => "Copy session command",
             Action::Fullscreen => "Full screen",
@@ -449,18 +449,10 @@ impl Action {
             .unwrap_or_default()
     }
 
-    /// All bindings, e.g. "⌘? / F1".
-    pub fn shortcut(self, os: Os) -> String {
-        self.bindings(os)
-            .iter()
-            .map(|chord| chord.label(os))
-            .collect::<Vec<_>>()
-            .join(" / ")
-    }
-
-    /// Tooltip text in the workbench's "description · shortcut" style.
+    /// Tooltip text in the workbench's "description · shortcut" style, with
+    /// the shortcut the guide lists.
     pub fn hint(self, text: &str, os: Os) -> String {
-        match self.bindings(os).first() {
+        match self.display_binding(os) {
             Some(chord) => format!("{text} · {}", chord.label(os)),
             None => text.to_owned(),
         }
@@ -543,19 +535,19 @@ mod tests {
 
     #[test]
     fn shortcut_labels_follow_the_platform() {
-        assert_eq!(Action::Capture.shortcut(Os::Windows), "Ctrl+S");
-        assert_eq!(Action::Discover.shortcut(Os::Windows), "Ctrl+R / F5");
-        assert_eq!(Action::Fullscreen.shortcut(Os::Windows), "F11");
-        assert_eq!(Action::ToggleAuto.shortcut(Os::Nix), "Ctrl+Shift+A");
+        assert_eq!(Action::Capture.key_label(Os::Windows), "Ctrl+S");
+        assert_eq!(Action::Fullscreen.key_label(Os::Windows), "F11");
+        assert_eq!(Action::ToggleAuto.key_label(Os::Nix), "Ctrl+Shift+A");
         assert_eq!(
             Action::ToggleStream.hint("Start or stop acquisition", Os::Windows),
             "Start or stop acquisition · Space"
         );
-        assert_eq!(Action::Discover.shortcut(Os::Mac), "⌘R");
-        assert_eq!(Action::ZoomActual.shortcut(Os::Mac), "⌥⌘0");
-        assert_eq!(Action::Fullscreen.shortcut(Os::Mac), "⌃⌘F");
-        assert_eq!(Action::ToggleAuto.shortcut(Os::Mac), "⇧⌘A");
-        assert_eq!(Action::Help.shortcut(Os::Mac), "⌘? / F1");
+        assert_eq!(Action::Discover.key_label(Os::Mac), "⌘R");
+        assert_eq!(Action::ZoomActual.key_label(Os::Mac), "⌥⌘0");
+        assert_eq!(Action::Fullscreen.key_label(Os::Mac), "⌃⌘F");
+        assert_eq!(Action::ToggleAuto.key_label(Os::Mac), "⇧⌘A");
+        // Tooltips name the key the guide lists.
+        assert_eq!(Action::ZoomIn.hint("Zoom in", Os::Mac), "Zoom in · ⌘+");
     }
 
     #[test]

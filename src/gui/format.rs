@@ -336,6 +336,23 @@ pub(super) fn redact_address(value: &str) -> String {
     }
 }
 
+/// A short span of time: "4 s", "3 min", "2 h".
+pub(super) fn span(duration: Duration) -> String {
+    match duration.as_secs() {
+        seconds @ 0..60 => format!("{seconds} s"),
+        seconds @ 60..3600 => format!("{} min", seconds / 60),
+        seconds => format!("{} h", seconds / 3600),
+    }
+}
+
+/// What a stalled camera's badge, row and pill say: "No new frame for 6 s".
+pub(super) fn silence(silent: Duration) -> String {
+    format!(
+        "No new frame for {}",
+        span(silent.max(Duration::from_secs(1)))
+    )
+}
+
 /// A writable feature named `name` of GenICam `kind` holding `value`, for tests.
 #[cfg(test)]
 pub(super) fn sample_feature(name: &str, kind: &str, value: serde_json::Value) -> FeatureInfo {
@@ -359,6 +376,16 @@ pub(super) fn sample_feature(name: &str, kind: &str, value: serde_json::Value) -
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn spans_read_in_the_largest_whole_unit() {
+        let ms = Duration::from_millis;
+        assert_eq!(span(ms(6400)), "6 s");
+        assert_eq!(span(Duration::from_secs(130)), "2 min");
+        assert_eq!(span(Duration::from_secs(7300)), "2 h");
+        assert_eq!(silence(ms(6400)), "No new frame for 6 s");
+        assert_eq!(silence(ms(300)), "No new frame for 1 s");
+    }
 
     #[test]
     fn trends_name_their_span_range_and_marks() {

@@ -258,7 +258,7 @@ impl Workbench {
         // The model keeps its room first, so the serial is what gets cut.
         if twin {
             name = name.push(one_line(
-                camera.info.serial.as_str(),
+                format!("S/N {}", camera.info.serial),
                 style::SMALL,
                 style::SANS,
                 stage.secondary,

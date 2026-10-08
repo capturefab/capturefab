@@ -276,12 +276,15 @@ fn outcome(label: &str, value: &Value) -> Option<(String, Option<String>, Level)
             })
         }
         "Disconnecting" => done("Disconnected".into()),
-        // The selection and job list already show the result.
-        "Selecting camera" | "Refreshing capture jobs" => None,
-        "Starting stream" | "Starting demo stream" => done("Stream started".into()),
-        "Starting streams" => done("Streams started".into()),
-        "Stopping stream" => done("Stream stopped".into()),
-        "Stopping streams" => done("Streams stopped".into()),
+        // The selection, the job list and the status pill already show the
+        // result.
+        "Selecting camera"
+        | "Refreshing capture jobs"
+        | "Starting stream"
+        | "Starting demo stream"
+        | "Starting streams"
+        | "Stopping stream"
+        | "Stopping streams" => None,
         "Enabling auto mode" => done("Auto mode on".into()),
         "Switching to manual" => done("Auto mode off".into()),
         "Updating auto balance" => done("Auto balance updated".into()),
@@ -312,15 +315,9 @@ fn outcome(label: &str, value: &Value) -> Option<(String, Option<String>, Level)
                 done(text)
             } else if let Some(feature) = value["executed"].as_str() {
                 done(format!("{} executed", words(feature)))
-            } else if let Some(streaming) = value["streaming"].as_bool() {
-                done(
-                    if streaming {
-                        "Stream started"
-                    } else {
-                        "Stream stopped"
-                    }
-                    .into(),
-                )
+            } else if value["streaming"].is_boolean() {
+                // AcquisitionStart and Stop: the status pill shows it.
+                None
             } else {
                 done(format!("{label} · done"))
             }
@@ -530,16 +527,6 @@ mod tests {
                 "Connected to Pattern camera",
             ),
             (
-                "Starting stream",
-                json!({"streaming": true}),
-                "Stream started",
-            ),
-            (
-                "Stopping stream",
-                json!({"streaming": false}),
-                "Stream stopped",
-            ),
-            (
                 "Setting ExposureTime",
                 json!({"name": "ExposureTime", "value": 15000}),
                 "Exposure Time set to 15000",
@@ -548,11 +535,6 @@ mod tests {
                 "Setting Gain",
                 json!({"name": "Gain", "value": 2.5, "auto": null}),
                 "Gain set to 2.5 · auto mode off",
-            ),
-            (
-                "Executing AcquisitionStart",
-                json!({"streaming": true}),
-                "Stream started",
             ),
             (
                 "Executing TriggerSoftware",
@@ -588,6 +570,16 @@ mod tests {
         );
         assert_eq!(detail.as_deref(), Some("shots/capture-0001.png"));
         assert!(command_notice("Selecting camera", &Ok(json!({}))).is_none());
+        // The status pill shows these.
+        for (label, streaming) in [
+            ("Starting stream", true),
+            ("Stopping stream", false),
+            ("Starting streams", true),
+            ("Executing AcquisitionStart", true),
+        ] {
+            let result = Ok(json!({ "streaming": streaming }));
+            assert!(command_notice(label, &result).is_none(), "{label}");
+        }
     }
 
     #[test]
@@ -754,7 +746,8 @@ mod tests {
         let pending = batch(&mut bench, 2);
         bench.settle(&pending, &Ok(json!({"streaming": true})));
         bench.settle(&pending, &Ok(json!({"streaming": true})));
-        assert_eq!(text(&bench), Some("Streams started"));
+        assert!(bench.notice.is_none(), "the pill says it");
+        assert!(bench.batches.is_empty());
     }
 
     #[test]

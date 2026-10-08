@@ -174,7 +174,9 @@ impl Workbench {
     /// way, else the camera's link.
     fn status(&self, width: f32, p: &'static Palette) -> Element<'_, Message> {
         let snapshot = &self.snapshot;
-        if let Some(notice) = &self.notice {
+        if let Some(notice) = &self.notice
+            && !self.welcome_says(notice)
+        {
             return self.notice_line(notice, width, p);
         }
         if let Some(pending) = self.pending.iter().max_by_key(|pending| pending.at) {
@@ -221,6 +223,17 @@ impl Workbench {
             ));
         }
         parts.into()
+    }
+
+    /// Whether the welcome screen's discovery callout already shows what
+    /// `notice` says, so the toolbar need not say it again.
+    fn welcome_says(&self, notice: &Notice) -> bool {
+        let issues = &self.side.discovery_issues;
+        self.shown.is_none()
+            && self.snapshot.connected.is_none()
+            && !self.overview()
+            && !issues.is_empty()
+            && notice.detail.as_deref() == Some(issues.join("\n").as_str())
     }
 
     /// A notice on one line: its glyph and text, with a way to the whole
@@ -358,5 +371,37 @@ impl Workbench {
             .padding([10.0, GUTTER]),
         ]
         .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn the_welcome_callout_speaks_for_discovery_once() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        let discovery = Pending {
+            label: "Discovering cameras".into(),
+            receiver: mpsc::channel().1,
+            target: None,
+            camera: None,
+            feature: None,
+            at: bench.now,
+            batch: false,
+        };
+        let result = Ok(json!({"devices": [{}], "warnings": ["USB access denied"]}));
+        bench.settle(&discovery, &result);
+        let notice = bench.notice.clone().expect("a warning notice");
+        assert!(bench.welcome_says(&notice), "the callout shows it");
+        let other = Notice {
+            text: "Capture failed: busy".into(),
+            detail: Some("busy".into()),
+            ..notice.clone()
+        };
+        assert!(!bench.welcome_says(&other), "not what the callout says");
+        bench.snapshot.connected = Some(liveness::streaming_camera(0, 0, 0.0).info);
+        assert!(!bench.welcome_says(&notice), "no callout once connected");
     }
 }
