@@ -50,6 +50,7 @@ use keys::{Action, Chord, Os};
 use liveness::{CameraState, Liveness};
 use motion::{Kind, Motion};
 use notice::{Batch, Level, Notice, Saved, command_notice};
+pub(crate) use prefs::migrate as migrate_prefs;
 use prefs::{Prefs, Recent};
 use preview::Shown;
 use scene::{Scene, ScreenshotRequest};

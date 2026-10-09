@@ -553,6 +553,8 @@ pub fn run(cli: Cli) -> Result<()> {
             let _ = wgpu;
             let client = Client::new(&cli)?;
             let handle = client.local.as_ref().unwrap().clone();
+            #[cfg(feature = "gui")]
+            crate::gui::migrate_prefs();
             let _server = ipc::Server::start(handle.clone(), name)?;
             #[cfg(feature = "s3")]
             crate::upload::start();
