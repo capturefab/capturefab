@@ -10,6 +10,7 @@ use std::{
 };
 
 const RECENT_LIMIT: usize = 6;
+const FILE: &str = "gui.prefs.json";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -111,7 +112,25 @@ impl Prefs {
 }
 
 fn path() -> PathBuf {
-    crate::ipc::session_dir().join("gui.json")
+    crate::ipc::session_dir().join(FILE)
+}
+
+pub fn migrate() {
+    migrate_in(&crate::ipc::session_dir());
+}
+
+fn migrate_in(dir: &Path) {
+    let old = dir.join("gui.json");
+    let is_prefs = fs::read(&old)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|value| value.is_object() && value.get("token").is_none());
+    if is_prefs {
+        let new = dir.join(FILE);
+        if new.exists() || fs::rename(&old, &new).is_err() {
+            let _ = fs::remove_file(&old);
+        }
+    }
 }
 
 pub fn load() -> Prefs {
@@ -121,7 +140,7 @@ pub fn load() -> Prefs {
 pub fn save(prefs: &Prefs) -> Result<()> {
     let dir = crate::ipc::session_dir();
     crate::ipc::ensure_private_dir(&dir)?;
-    save_to(&dir.join("gui.json"), prefs)
+    save_to(&dir.join(FILE), prefs)
 }
 
 fn load_from(path: &Path) -> Prefs {
@@ -165,7 +184,7 @@ mod tests {
     fn round_trips_and_falls_back_to_defaults() {
         let dir = std::env::temp_dir().join(format!("capturefab-prefs-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("gui.json");
+        let file = dir.join(FILE);
         assert_eq!(load_from(&file), Prefs::default());
         let mut prefs = Prefs {
             appearance: Appearance::Dark,
@@ -187,6 +206,27 @@ mod tests {
         );
         fs::write(&file, b"not json").unwrap();
         assert_eq!(load_from(&file), Prefs::default());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn migration_frees_the_default_session_descriptor() {
+        let dir = std::env::temp_dir().join(format!("capturefab-migrate-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("gui.json");
+        let descriptor =
+            br#"{"version":1,"name":"gui","pid":1,"address":"127.0.0.1:1","token":"t"}"#;
+        fs::write(&old, descriptor).unwrap();
+        migrate_in(&dir);
+        assert_eq!(fs::read(&old).unwrap(), descriptor);
+        fs::write(&old, br#"{"count":7}"#).unwrap();
+        migrate_in(&dir);
+        assert!(!old.exists());
+        assert_eq!(load_from(&dir.join(FILE)).count, 7);
+        fs::write(&old, br#"{"count":9}"#).unwrap();
+        migrate_in(&dir);
+        assert!(!old.exists());
+        assert_eq!(load_from(&dir.join(FILE)).count, 7);
         fs::remove_dir_all(&dir).unwrap();
     }
 

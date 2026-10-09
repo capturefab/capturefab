@@ -524,3 +524,42 @@ fn discovery_reports_native_backend_failure_without_hiding_other_cameras() {
         "{status}"
     );
 }
+#[test]
+fn stale_session_descriptor_is_replaced_but_live_one_is_kept() {
+    let dir = std::env::temp_dir().join(format!(
+        "capturefab-stale-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let serve = || {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+            .env("CAPTUREFAB_SESSION_DIR", &dir)
+            .args(["--json", "serve", "--name", "stale"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        (child, line)
+    };
+    let (mut first, ready) = serve();
+    assert!(ready.contains("\"ready\":true"), "{ready}");
+    first.kill().unwrap();
+    first.wait().unwrap();
+    assert!(dir.join("stale.json").exists());
+    let (second, ready) = serve();
+    assert!(ready.contains("\"ready\":true"), "{ready}");
+    let _fixture = Fixture {
+        child: second,
+        dir: dir.clone(),
+    };
+    let (mut third, refused) = serve();
+    assert!(refused.contains("already exists"), "{refused}");
+    third.wait().unwrap();
+}

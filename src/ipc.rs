@@ -212,6 +212,11 @@ impl Server {
             address: listener.local_addr()?,
             token: token.clone(),
         };
+        if read_descriptor(name).is_ok_and(|d| {
+            TcpStream::connect_timeout(&d.address, Duration::from_millis(100)).is_err()
+        }) {
+            let _ = fs::remove_file(&path);
+        }
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
