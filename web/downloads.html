@@ -31,20 +31,27 @@
     <main id="main">
       <section class="page-head" aria-labelledby="downloads-title">
         <h1 id="downloads-title">All downloads</h1>
-        <p class="lead">Every published build with its SHA-256 checksum. Desktop builds include the app and the CLI; headless builds are the CLI alone, for servers and devices without a display. Latest release: none published yet.</p>
+        <p class="lead">Every published build with its SHA-256 checksum. Desktop builds include the app and the CLI; headless builds are the CLI alone, for servers and devices without a display. Latest release: v0.1.1.</p>
       </section>
-      <section class="section" aria-labelledby="none-title">
-        <div class="section-heading"><h2 id="none-title">No published binaries yet.</h2><p>No release has been published, so the <a href="releases.json">release manifest</a> is empty and the <a href="feed.xml">Atom release feed</a> has no entries. Until then, build from source.</p></div>
-        <div class="source-build">
-          <div><h3>Build it yourself</h3><p>Builds need a stable Rust toolchain, a C compiler and CMake, plus NASM on x86, because the JPEG encoder compiles libjpeg-turbo from source. Industrial cameras work without FFmpeg; webcams, streams and recording need a bundled or <code>CAPTUREFAB_FFMPEG</code>-supplied binary. The <a href="https://github.com/capturefab/capturefab#build-test-and-release">build guide</a> covers both.</p></div>
-          <div class="code-wrap"><pre><code>git clone https://github.com/capturefab/capturefab
-cd capturefab
-# desktop app and CLI
-cargo build --release
-# headless CLI
-cargo build --release --no-default-features --features usb,jpeg
-target/release/capturefab --camera sim:0 capture -o first.png</code></pre></div>
-        </div>
+      <section class="section" id="v0.1.1" aria-labelledby="v0.1.1-title">
+        <div class="section-heading"><p class="eyebrow">2026-10-09 / latest</p><h2 id="v0.1.1-title">capturefab 0.1.1</h2></div>
+        <p class="section-intro"><a href="https://github.com/capturefab/capturefab/releases/tag/v0.1.1">Release notes</a> · <a href="https://github.com/capturefab/capturefab/releases/download/v0.1.1/SHA256SUMS">SHA256SUMS</a> · <a href="https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-source.tar.gz">Corresponding source</a> · <a href="https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-sbom.cdx.json">SBOM</a></p>
+        <div class="table-scroll"><table class="release-assets"><caption>capturefab 0.1.1 release assets</caption><thead><tr><th scope="col">System</th><th scope="col">Processor</th><th scope="col">Build</th><th scope="col">File</th><th scope="col">SHA-256</th><th scope="col">Notes</th></tr></thead><tbody>
+          <tr><td>Linux</td><td>x64</td><td>desktop</td><td><a href="https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-linux-x86_64-desktop.tar.gz">capturefab-0.1.1-linux-x86_64-desktop.tar.gz</a><br>26.0 MiB</td><td><code class="checksum">24d2235f640d6bc16ad80eb51d9e77f3bdead60e5194a27e208d9e0ae35932c3</code></td><td>Smoke-tested on its own platform · Unsigned</td></tr>
+          <tr><td>Linux</td><td>x64</td><td>headless</td><td><a href="https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-linux-x86_64-headless.tar.gz">capturefab-0.1.1-linux-x86_64-headless.tar.gz</a><br>18.1 MiB</td><td><code class="checksum">5d4f2e7932114241d4a63c0996d895740602d0d85b5972830773b8053faad099</code></td><td>Smoke-tested on its own platform · Unsigned</td></tr>
+          <tr><td>Linux</td><td>ARM64</td><td>desktop</td><td><a href="https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-linux-aarch64-desktop.tar.gz">capturefab-0.1.1-linux-aarch64-desktop.tar.gz</a><br>25.3 MiB</td><td><code class="checksum">6b3eda5d4f7c3c216f734099a50c14737ead920ac036d22c3f64378ac493fbf5</code></td><td>Smoke-tested on its own platform · Unsigned</td></tr>
+          <tr><td>Linux</td><td>ARM64</td><td>headless</td><td><a href="https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-linux-aarch64-headless.tar.gz">capturefab-0.1.1-linux-aarch64-headless.tar.gz</a><br>17.8 MiB</td><td><code class="checksum">e1f9d854a659e1c0b4ed191987daeffbe006a2f74e0aed65dcc2204505693720</code></td><td>Smoke-tested on its own platform · Unsigned</td></tr>
+          <tr><td>Linux</td><td>ARMv7</td><td>desktop</td><td class="unavailable">Not published</td><td>—</td><td>Not built for this release</td></tr>
+          <tr><td>Linux</td><td>ARMv7</td><td>headless</td><td class="unavailable">Not published</td><td>—</td><td>Not built for this release</td></tr>
+          <tr><td>macOS</td><td>x64</td><td>desktop</td><td><a href="https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-macos-x86_64-desktop.zip">capturefab-0.1.1-macos-x86_64-desktop.zip</a><br>43.1 MiB</td><td><code class="checksum">86542ff1465d51bf2e26eada1a40a1bf037a8c8bf08f4f67e2c7de2f22c623d8</code></td><td>Smoke-tested on its own platform · Apple notarized</td></tr>
+          <tr><td>macOS</td><td>x64</td><td>headless</td><td><a href="https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-macos-x86_64-headless.zip">capturefab-0.1.1-macos-x86_64-headless.zip</a><br>16.3 MiB</td><td><code class="checksum">e29c8be7a9120e3e4d8dd53ee1b01ab89f5049f1e0f6d22ef09494a13909921a</code></td><td>Smoke-tested on its own platform · Apple notarized</td></tr>
+          <tr><td>macOS</td><td>ARM64</td><td>desktop</td><td><a href="https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-macos-aarch64-desktop.zip">capturefab-0.1.1-macos-aarch64-desktop.zip</a><br>40.5 MiB</td><td><code class="checksum">ec105cab2dba9a064b3b87024a3085fb63bbf8ff5eac39b79758e7d686c286b8</code></td><td>Smoke-tested on its own platform · Apple notarized</td></tr>
+          <tr><td>macOS</td><td>ARM64</td><td>headless</td><td><a href="https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-macos-aarch64-headless.zip">capturefab-0.1.1-macos-aarch64-headless.zip</a><br>15.4 MiB</td><td><code class="checksum">123952c3be7cdc5c36ee79f3f2856291786a3373caa0c2dc6ffe632bead89c4b</code></td><td>Smoke-tested on its own platform · Apple notarized</td></tr>
+          <tr><td>Windows</td><td>x64</td><td>desktop</td><td><a href="https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-windows-x86_64-desktop.zip">capturefab-0.1.1-windows-x86_64-desktop.zip</a><br>25.4 MiB</td><td><code class="checksum">c164e2f9d8b2c2af81b775b9210d056ca95904b3fb74bfd28c1e49c4928d3f50</code></td><td>Smoke-tested on its own platform · Unsigned</td></tr>
+          <tr><td>Windows</td><td>x64</td><td>headless</td><td><a href="https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-windows-x86_64-headless.zip">capturefab-0.1.1-windows-x86_64-headless.zip</a><br>18.9 MiB</td><td><code class="checksum">427e42bdf18e15b9321c40dc22a211c084c70df7d2d3b6d5e4df812c84b0dba6</code></td><td>Smoke-tested on its own platform · Unsigned</td></tr>
+          <tr><td>Windows</td><td>ARM64</td><td>desktop</td><td><a href="https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-windows-aarch64-desktop.zip">capturefab-0.1.1-windows-aarch64-desktop.zip</a><br>20.8 MiB</td><td><code class="checksum">68e9d074f6c53a37d9d8a765c8aa685b22de5a20edcf36db815ea054dff212b2</code></td><td>Smoke-tested on its own platform · Unsigned</td></tr>
+          <tr><td>Windows</td><td>ARM64</td><td>headless</td><td><a href="https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-windows-aarch64-headless.zip">capturefab-0.1.1-windows-aarch64-headless.zip</a><br>14.7 MiB</td><td><code class="checksum">5c22deee1ffbed2b044739e8b1b4c1410ba3d29d67288b731f7c6291ea899e1f</code></td><td>Smoke-tested on its own platform · Unsigned</td></tr>
+        </tbody></table></div>
       </section>
     </main>
     <footer class="site-footer">

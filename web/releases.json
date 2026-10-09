@@ -1,5 +1,188 @@
 {
   "schema_version": 1,
-  "latest": null,
-  "releases": []
+  "latest": "0.1.1",
+  "releases": [
+    {
+      "version": "0.1.1",
+      "date": "2026-10-09",
+      "url": "https://github.com/capturefab/capturefab/releases/tag/v0.1.1",
+      "checksums_url": "https://github.com/capturefab/capturefab/releases/download/v0.1.1/SHA256SUMS",
+      "source_url": "https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-source.tar.gz",
+      "sbom_url": "https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-sbom.cdx.json",
+      "assets": [
+        {
+          "name": "capturefab-0.1.1-linux-x86_64-desktop.tar.gz",
+          "os": "linux",
+          "arch": "x86_64",
+          "variant": "desktop",
+          "available": true,
+          "sha256": "24d2235f640d6bc16ad80eb51d9e77f3bdead60e5194a27e208d9e0ae35932c3",
+          "size": 27285974,
+          "target": "x86_64-unknown-linux-gnu",
+          "platform_signature": "unsigned",
+          "validation": "native-smoke-passed",
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-linux-x86_64-desktop.tar.gz"
+        },
+        {
+          "name": "capturefab-0.1.1-linux-x86_64-headless.tar.gz",
+          "os": "linux",
+          "arch": "x86_64",
+          "variant": "headless",
+          "available": true,
+          "sha256": "5d4f2e7932114241d4a63c0996d895740602d0d85b5972830773b8053faad099",
+          "size": 18957042,
+          "target": "x86_64-unknown-linux-gnu",
+          "platform_signature": "unsigned",
+          "validation": "native-smoke-passed",
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-linux-x86_64-headless.tar.gz"
+        },
+        {
+          "name": "capturefab-0.1.1-linux-aarch64-desktop.tar.gz",
+          "os": "linux",
+          "arch": "aarch64",
+          "variant": "desktop",
+          "available": true,
+          "sha256": "6b3eda5d4f7c3c216f734099a50c14737ead920ac036d22c3f64378ac493fbf5",
+          "size": 26558235,
+          "target": "aarch64-unknown-linux-gnu",
+          "platform_signature": "unsigned",
+          "validation": "native-smoke-passed",
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-linux-aarch64-desktop.tar.gz"
+        },
+        {
+          "name": "capturefab-0.1.1-linux-aarch64-headless.tar.gz",
+          "os": "linux",
+          "arch": "aarch64",
+          "variant": "headless",
+          "available": true,
+          "sha256": "e1f9d854a659e1c0b4ed191987daeffbe006a2f74e0aed65dcc2204505693720",
+          "size": 18643770,
+          "target": "aarch64-unknown-linux-gnu",
+          "platform_signature": "unsigned",
+          "validation": "native-smoke-passed",
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-linux-aarch64-headless.tar.gz"
+        },
+        {
+          "os": "linux",
+          "arch": "armv7",
+          "variant": "desktop",
+          "name": "capturefab-0.1.1-linux-armv7-desktop",
+          "available": false,
+          "reason": "Not built for this release"
+        },
+        {
+          "os": "linux",
+          "arch": "armv7",
+          "variant": "headless",
+          "name": "capturefab-0.1.1-linux-armv7-headless",
+          "available": false,
+          "reason": "Not built for this release"
+        },
+        {
+          "name": "capturefab-0.1.1-macos-x86_64-desktop.zip",
+          "os": "macos",
+          "arch": "x86_64",
+          "variant": "desktop",
+          "available": true,
+          "sha256": "86542ff1465d51bf2e26eada1a40a1bf037a8c8bf08f4f67e2c7de2f22c623d8",
+          "size": 45154521,
+          "target": "x86_64-apple-darwin",
+          "platform_signature": "apple-notarized",
+          "validation": "native-smoke-passed",
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-macos-x86_64-desktop.zip"
+        },
+        {
+          "name": "capturefab-0.1.1-macos-x86_64-headless.zip",
+          "os": "macos",
+          "arch": "x86_64",
+          "variant": "headless",
+          "available": true,
+          "sha256": "e29c8be7a9120e3e4d8dd53ee1b01ab89f5049f1e0f6d22ef09494a13909921a",
+          "size": 17112077,
+          "target": "x86_64-apple-darwin",
+          "platform_signature": "apple-notarized",
+          "validation": "native-smoke-passed",
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-macos-x86_64-headless.zip"
+        },
+        {
+          "name": "capturefab-0.1.1-macos-aarch64-desktop.zip",
+          "os": "macos",
+          "arch": "aarch64",
+          "variant": "desktop",
+          "available": true,
+          "sha256": "ec105cab2dba9a064b3b87024a3085fb63bbf8ff5eac39b79758e7d686c286b8",
+          "size": 42459125,
+          "target": "aarch64-apple-darwin",
+          "platform_signature": "apple-notarized",
+          "validation": "native-smoke-passed",
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-macos-aarch64-desktop.zip"
+        },
+        {
+          "name": "capturefab-0.1.1-macos-aarch64-headless.zip",
+          "os": "macos",
+          "arch": "aarch64",
+          "variant": "headless",
+          "available": true,
+          "sha256": "123952c3be7cdc5c36ee79f3f2856291786a3373caa0c2dc6ffe632bead89c4b",
+          "size": 16152790,
+          "target": "aarch64-apple-darwin",
+          "platform_signature": "apple-notarized",
+          "validation": "native-smoke-passed",
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-macos-aarch64-headless.zip"
+        },
+        {
+          "name": "capturefab-0.1.1-windows-x86_64-desktop.zip",
+          "os": "windows",
+          "arch": "x86_64",
+          "variant": "desktop",
+          "available": true,
+          "sha256": "c164e2f9d8b2c2af81b775b9210d056ca95904b3fb74bfd28c1e49c4928d3f50",
+          "size": 26651095,
+          "target": "x86_64-pc-windows-msvc",
+          "platform_signature": "unsigned",
+          "validation": "native-smoke-passed",
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-windows-x86_64-desktop.zip"
+        },
+        {
+          "name": "capturefab-0.1.1-windows-x86_64-headless.zip",
+          "os": "windows",
+          "arch": "x86_64",
+          "variant": "headless",
+          "available": true,
+          "sha256": "427e42bdf18e15b9321c40dc22a211c084c70df7d2d3b6d5e4df812c84b0dba6",
+          "size": 19832181,
+          "target": "x86_64-pc-windows-msvc",
+          "platform_signature": "unsigned",
+          "validation": "native-smoke-passed",
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-windows-x86_64-headless.zip"
+        },
+        {
+          "name": "capturefab-0.1.1-windows-aarch64-desktop.zip",
+          "os": "windows",
+          "arch": "aarch64",
+          "variant": "desktop",
+          "available": true,
+          "sha256": "68e9d074f6c53a37d9d8a765c8aa685b22de5a20edcf36db815ea054dff212b2",
+          "size": 21764516,
+          "target": "aarch64-pc-windows-msvc",
+          "platform_signature": "unsigned",
+          "validation": "native-smoke-passed",
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-windows-aarch64-desktop.zip"
+        },
+        {
+          "name": "capturefab-0.1.1-windows-aarch64-headless.zip",
+          "os": "windows",
+          "arch": "aarch64",
+          "variant": "headless",
+          "available": true,
+          "sha256": "5c22deee1ffbed2b044739e8b1b4c1410ba3d29d67288b731f7c6291ea899e1f",
+          "size": 15391237,
+          "target": "aarch64-pc-windows-msvc",
+          "platform_signature": "unsigned",
+          "validation": "native-smoke-passed",
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.1.1/capturefab-0.1.1-windows-aarch64-headless.zip"
+        }
+      ]
+    }
+  ]
 }

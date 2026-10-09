@@ -5,6 +5,14 @@
   <subtitle>Published Capturefab builds with SHA-256 checksums.</subtitle>
   <link rel="self" type="application/atom+xml" href="https://capturefab.com/feed.xml"/>
   <link rel="alternate" type="text/html" href="https://capturefab.com/downloads.html"/>
-  <updated>2026-10-04T00:00:00Z</updated>
+  <updated>2026-10-09T00:00:00Z</updated>
   <author><name>Capturefab contributors</name></author>
+  <entry>
+    <id>https://github.com/capturefab/capturefab/releases/tag/v0.1.1</id>
+    <title>capturefab 0.1.1</title>
+    <updated>2026-10-09T00:00:00Z</updated>
+    <link rel="alternate" type="text/html" href="https://github.com/capturefab/capturefab/releases/tag/v0.1.1"/>
+    <link rel="related" type="text/html" href="https://capturefab.com/downloads.html#v0.1.1"/>
+    <summary>Published downloads: Linux x64 desktop, Linux x64 headless, Linux ARM64 desktop, Linux ARM64 headless, macOS x64 desktop, macOS x64 headless, macOS ARM64 desktop, macOS ARM64 headless, Windows x64 desktop, Windows x64 headless, Windows ARM64 desktop, Windows ARM64 headless.</summary>
+  </entry>
 </feed>
