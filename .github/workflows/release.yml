@@ -230,7 +230,8 @@ jobs:
           # the identity is untrusted; pin it rather than rely on the runner image.
           curl --proto '=https' --tlsv1.2 -sSfLo "$RUNNER_TEMP/DeveloperIDG2CA.cer" https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
           echo "f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a  $RUNNER_TEMP/DeveloperIDG2CA.cer" | shasum -a 256 -c -
-          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$keychain"
+          # Images that already carry it report a duplicate; the validity check below decides.
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$keychain" || true
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
           # Keep the existing keychains searchable after the signing keychain.
           eval "set -- $(security list-keychains -d user | tr '\n' ' ')"
@@ -244,7 +245,25 @@ jobs:
           fi
           echo "MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
           if [ -n "$MACOS_NOTARY_KEY" ]; then
-            printf '%s' "$MACOS_NOTARY_KEY" > "$RUNNER_TEMP/notary.p8"
+            # Accept the .p8 as saved, with CRLF endings, base64-encoded, or as
+            # its bare body, and fail clearly when it is not an EC private key.
+            key=$(printf '%s' "$MACOS_NOTARY_KEY" | tr -d '\r')
+            case $key in
+              *'-----BEGIN PRIVATE KEY-----'*) ;;
+              *)
+                body=$(printf '%s' "$key" | tr -d '[:space:]')
+                decoded=$(printf '%s' "$body" | base64 --decode 2>/dev/null || true)
+                case $decoded in
+                  *'-----BEGIN PRIVATE KEY-----'*) key=$decoded ;;
+                  *) key=$(printf -- '-----BEGIN PRIVATE KEY-----\n%s\n-----END PRIVATE KEY-----\n' "$(printf '%s' "$body" | fold -w 64)") ;;
+                esac ;;
+            esac
+            printf '%s\n' "$key" > "$RUNNER_TEMP/notary.p8"
+            if ! openssl pkey -in "$RUNNER_TEMP/notary.p8" -noout 2>/dev/null; then
+              rm "$RUNNER_TEMP/notary.p8"
+              echo "::error::MACOS_NOTARY_KEY is not an App Store Connect API private key; set it from the AuthKey_KEYID.p8 file: gh secret set MACOS_NOTARY_KEY < AuthKey_KEYID.p8"
+              exit 1
+            fi
             xcrun notarytool store-credentials capturefab-notary --key "$RUNNER_TEMP/notary.p8" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER"
             rm "$RUNNER_TEMP/notary.p8"
             echo "MACOS_NOTARY_PROFILE=capturefab-notary" >> "$GITHUB_ENV"
