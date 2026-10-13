@@ -9,6 +9,7 @@ network streams as well as industrial cameras. Run `capturefab doctor --json` an
 | --- | --- | --- |
 | GenICam GigE Vision | Discovered ID, unique serial, or IPv4 address | Camera XML features: read, write, execute; available controls depend on the camera |
 | GenICam USB3 Vision | Discovered `usb:` ID or unique serial | Register-backed camera XML features; USB3 Vision transport requires the `usb` build feature |
+| Document scanner | SANE `scanner:sane:DEVICE` on Linux, WIA `scanner:wia:ID` on Windows, ImageCaptureCore `scanner:ica:UUID` on macOS | On-demand page capture with resolution, mode and source settings; installed scanner driver and `scanner` build feature required; physical scanner compatibility has not been validated |
 | Built-in laptop camera or USB webcam/UVC capture device | AVFoundation on macOS, V4L2 on Linux, DirectShow on Windows | Capture; configure native size/frame rate and advertised `VideoMode` choices before acquisition; host device exposure/focus controls are not currently exposed |
 | Driver-backed Linux CSI camera | A usable `v4l2:/dev/videoN` endpoint | Same host capture path; platform driver and pipeline setup are required |
 | ONVIF camera | `onvif:http://HOST/onvif/device_service` or authenticated locator | Discovery and Media1 profile/RTSP URI resolution; ONVIF PTZ and imaging configuration are not implemented |
@@ -21,6 +22,17 @@ capture device uses the host camera path even when its cable uses USB 3. Built-i
 camera availability depends on operating system permissions and drivers. This
 does not require Aravis, libusb, a separately installed FFmpeg, or a camera vendor
 SDK in a release containing the matching embedded FFmpeg.
+
+## Document scans
+
+Run `capturefab scanners --json` for scanner IDs, or `discover --json` for all sources. Linux requires SANE's `scanimage` and suitable backends; Windows requires Windows PowerShell, the WIA service and a WIA driver; macOS uses a bundled ImageCaptureCore helper. Set a longer transport deadline for physical scanning:
+
+```sh
+capturefab --camera 'scanner:sane:DEVICE' --timeout-ms 60000 capture \
+  --set ScanResolution=300 --set ScanMode=Gray -o document.png
+```
+
+Connecting and `start` do not initiate physical scanning. Each capture requests one page; `-n` saves successive pages as separate images, including feeder pages with `ScanSource=Feeder`. The default source preserves the driver's source choice. Exact supported modes, DPI and paper-source names depend on the driver. SANE's explicit source names are `Flatbed` and `Automatic Document Feeder`; drivers using other source names can use `ScanSource=Default`. Capture timeouts terminate the helper. The GUI has scanner controls, a separate 60-second default timeout and the existing preview. Samples normalize to 8-bit RGB/grayscale with a 128 MiB page bound. Scans share the existing destinations and storage ledger; scanner video forwarding, camera auto exposure, PDF assembly and OCR are not included.
 
 ## Built-in cameras and capture devices
 

@@ -9,6 +9,7 @@ pub enum Transport {
     Usb3,
     Simulator,
     Media,
+    Scanner,
 }
 
 impl std::fmt::Display for Transport {
@@ -18,6 +19,7 @@ impl std::fmt::Display for Transport {
             Self::Usb3 => "USB3",
             Self::Simulator => "Simulator",
             Self::Media => "Media",
+            Self::Scanner => "Scanner",
         })
     }
 }
@@ -72,6 +74,12 @@ pub trait Backend: RegisterIo {
     fn xml(&mut self) -> Result<String>;
     /// Configure receiving before the owner executes AcquisitionStart.
     fn start(&mut self, payload_size: usize) -> Result<()>;
+    /// Request one frame from an on-demand source. Streaming transports need
+    /// no explicit trigger; scanners begin one page only when capture asks.
+    /// Repeated requests while an acquisition is pending must be idempotent.
+    fn request_frame(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn next_frame(&mut self, timeout: Duration) -> Result<Frame>;
     fn stop(&mut self) -> Result<()>;
     fn stats(&self) -> Option<TransportStats> {

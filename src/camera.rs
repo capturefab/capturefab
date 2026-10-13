@@ -8,13 +8,14 @@ use std::{net::Ipv4Addr, time::Duration};
 pub fn discover(timeout: Duration, simulated: bool) -> Result<(Vec<CameraInfo>, Vec<String>)> {
     let mut devices = Vec::new();
     let mut warnings = Vec::new();
-    let (gige, onvif, native) = std::thread::scope(|s| {
+    let (gige, onvif, native, scanners) = std::thread::scope(|s| {
         let g = s.spawn(|| crate::transport::gige::discover(timeout));
         let o = s.spawn(|| crate::onvif::camera_infos(timeout));
         let n = s.spawn(|| crate::media::native_devices_with_timeout(timeout));
-        (g.join(), o.join(), n.join())
+        let d = s.spawn(|| crate::scanner::discover(timeout));
+        (g.join(), o.join(), n.join(), d.join())
     });
-    for (label, result) in [("GigE", gige), ("ONVIF", onvif)] {
+    for (label, result) in [("GigE", gige), ("ONVIF", onvif), ("Scanner", scanners)] {
         match result {
             Ok(Ok(v)) => devices.extend(v),
             Ok(Err(e)) => warnings.push(format!("{label} discovery: {e:#}")),
@@ -69,6 +70,13 @@ impl Camera {
         }
         let info = if selector.starts_with("sim:") {
             crate::transport::simulator::info_named(selector)
+        } else if crate::scanner::is_source(selector) {
+            known
+                .iter()
+                .find(|d| d.id == selector && d.transport == Transport::Scanner)
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| crate::scanner::info(selector))?
         } else if crate::media::is_source(selector) {
             crate::media::info(selector)?
         } else if let Ok(ip) = selector.trim_start_matches("gige:").parse::<Ipv4Addr>() {
@@ -86,6 +94,7 @@ impl Camera {
         };
         let backend: Box<dyn Backend> = match info.transport {
             Transport::Simulator => Box::new(crate::transport::simulator::Simulator::default()),
+            Transport::Scanner => crate::scanner::open(&info)?,
             Transport::Media => {
                 if crate::onvif::is_source(&info.id) {
                     let (info, backend) = crate::onvif::connect(&info.id, timeout)?;
@@ -179,6 +188,13 @@ impl Camera {
     pub fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
         ensure!(self.streaming, "camera is not streaming");
         self.backend.next_frame(timeout)
+    }
+    pub fn request_frame(&mut self) -> Result<()> {
+        ensure!(self.streaming, "camera is not streaming");
+        self.backend.request_frame()
+    }
+    pub fn is_scanner(&self) -> bool {
+        self.info.transport == Transport::Scanner
     }
     pub fn stop(&mut self) -> Result<()> {
         if !self.streaming {

@@ -289,6 +289,10 @@ fn process(
             destination,
         } => {
             ensure!(
+                !camera_mut(camera)?.is_scanner(),
+                "scanner forwarding is unsupported; use capture for document scans"
+            );
+            ensure!(
                 forwarder.is_none(),
                 "forwarding is already active; stop-forward first"
             );
@@ -344,6 +348,7 @@ fn process(
                 .iter()
                 .any(|d| d.id == selector || d.serial == selector)
                 && !selector.starts_with("sim:")
+                && !crate::scanner::is_source(&selector)
                 && !crate::media::is_source(&selector)
                 && !crate::onvif::is_source(&selector)
                 && selector
@@ -529,6 +534,10 @@ fn process(
         }
         SessionCommand::Auto { balance } => {
             let c = camera_mut(camera)?;
+            ensure!(
+                !c.is_scanner(),
+                "scanner auto exposure is unsupported; configure scan settings with set"
+            );
             let explicit = match auto.as_mut() {
                 Some(controller) => {
                     if let Some(balance) = balance {
@@ -618,6 +627,13 @@ fn process(
                 "stdout supports one frame only"
             );
             let c = camera_mut(camera)?;
+            ensure!(
+                !c.is_scanner()
+                    || !jobs
+                        .iter()
+                        .any(|job| job.info.active() && job.deadline.is_some()),
+                "scanner is busy with a scheduled scan; wait for it to finish or cancel the capture job first"
+            );
             let was_streaming = c.is_streaming();
             c.start()?;
             let result = (|| -> Result<Value> {
@@ -645,6 +661,15 @@ fn process(
                     }
                 }
                 for index in 0..count {
+                    if c.is_scanner() && output != "-" {
+                        preflight_scanner_output(&output_path(
+                            &resolved.output,
+                            count,
+                            index,
+                            &format,
+                        ))?;
+                    }
+                    c.request_frame()?;
                     let frame = next_frame(h, c, auto, Instant::now() + duration)?
                         .context("frame timeout")?;
                     if index == 0 {
@@ -684,8 +709,15 @@ fn process(
                 }
                 Ok(value)
             })();
-            let stopped = if !was_streaming { c.stop() } else { Ok(()) };
-            refresh(h, camera, false);
+            // A scanner's pending helper must be cancelled on a failed scan,
+            // even if the caller had already armed acquisition with start.
+            let scanner = c.is_scanner();
+            let stopped = if !was_streaming || scanner {
+                c.stop()
+            } else {
+                Ok(())
+            };
+            refresh(h, camera, scanner);
             let value = result?;
             stopped?;
             h.log("info", format!("Captured {count} frame(s)"));
@@ -752,6 +784,16 @@ fn tick_jobs(
                     c.start()?;
                     *started = true;
                 }
+                if c.is_scanner() {
+                    *started = true;
+                    preflight_scanner_output(&output_path(
+                        &job.info.output,
+                        job.info.count,
+                        job.info.captured,
+                        &job.format,
+                    ))?;
+                }
+                c.request_frame()?;
                 Ok(stopped)
             })();
             let stopped = match result {
@@ -789,7 +831,8 @@ fn tick_jobs(
     }
     trim_jobs(jobs);
     sync_jobs(h, jobs);
-    refresh(h, camera, false);
+    let scanner = camera.as_ref().is_some_and(Camera::is_scanner);
+    refresh(h, camera, scanner);
 }
 fn capture_jobs(h: &WorkerHandle, frame: &Frame, jobs: &mut [Scheduled], settled: bool) {
     let now = crate::scheduling::now_ms();
@@ -848,6 +891,40 @@ fn capture_jobs(h: &WorkerHandle, frame: &Frame, jobs: &mut [Scheduled], settled
     sync_jobs(h, jobs);
 }
 
+fn fail_scanner_jobs(h: &WorkerHandle, jobs: &mut [Scheduled], error: &anyhow::Error) {
+    let error = format!("{error:#}");
+    for job in jobs
+        .iter_mut()
+        .filter(|job| job.info.active() && job.deadline.is_some())
+    {
+        job.info.status = "failed".into();
+        job.info.error = Some(error.clone());
+        job.deadline = None;
+        job.warm = None;
+        h.log(
+            "error",
+            format!("Capture job {} failed: {error}", job.info.id),
+        );
+    }
+    sync_jobs(h, jobs);
+}
+
+fn preflight_scanner_output(path: &std::path::Path) -> Result<()> {
+    // A feeder consumes paper irreversibly. Reject known output conflicts
+    // before asking for a page; storage still creates the file atomically to
+    // protect against a file appearing after this check.
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => anyhow::bail!(
+            "capture output already exists: {}; choose a new file name",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect capture output {}", path.display()))
+        }
+    }
+}
+
 pub fn output_path(output: &str, count: u32, index: u32, format: &str) -> PathBuf {
     if output.contains("{frame}") {
         PathBuf::from(output.replace("{frame}", &format!("{:06}", index + 1)))
@@ -859,7 +936,7 @@ pub fn output_path(output: &str, count: u32, index: u32, format: &str) -> PathBu
 }
 
 fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
-    let mut camera = None;
+    let mut camera: Option<Camera> = None;
     let mut forwarder: Option<(Forwarder, f64)> = None;
     let mut auto: Option<AutoController> = None;
     let mut jobs: Vec<Scheduled> = Vec::new();
@@ -869,7 +946,11 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
     let mut rate_count = 0;
     let mut consecutive_errors = 0u32;
     while !h.cancelled() {
-        let envelope = if camera.as_ref().is_some_and(Camera::is_streaming) {
+        let receiving = camera.as_ref().is_some_and(|c| {
+            c.is_streaming()
+                && (!c.is_scanner() || jobs.iter().any(|j| j.info.active() && j.deadline.is_some()))
+        });
+        let envelope = if receiving {
             rx.try_recv().ok()
         } else {
             rx.recv_timeout(Duration::from_millis(100)).ok()
@@ -906,7 +987,11 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
         {
             publish_auto(&h, controller);
         }
-        if let Some(c) = camera.as_mut().filter(|c| c.is_streaming()) {
+        let scheduled_scan = jobs.iter().any(|j| j.info.active() && j.deadline.is_some());
+        if let Some(c) = camera
+            .as_mut()
+            .filter(|c| c.is_streaming() && (!c.is_scanner() || scheduled_scan))
+        {
             match c.next_frame(Duration::from_millis(100)) {
                 Ok(frame) => {
                     if let Some(controller) = auto.as_mut() {
@@ -931,6 +1016,16 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
                     if !timed_out(&e) {
                         consecutive_errors += 1;
                         h.counters.dropped.fetch_add(1, Ordering::Relaxed);
+                        if c.is_scanner() {
+                            // Scanner errors are terminal for the requested
+                            // page: the backend has already discarded its
+                            // helper, so another poll cannot produce it.
+                            fail_scanner_jobs(&h, &mut jobs, &e);
+                            let _ = c.stop();
+                            scheduled_stream = false;
+                            refresh(&h, &mut camera, true);
+                            continue;
+                        }
                         if consecutive_errors == 1 {
                             h.log("warn", format!("{e:#}"));
                         }
@@ -1155,6 +1250,348 @@ mod tests {
         fn stop(&mut self) -> Result<()> {
             self.0.lock().unwrap().stop()
         }
+    }
+
+    struct DemandScanner {
+        simulator: crate::transport::simulator::Simulator,
+        requests: Arc<AtomicU64>,
+        stops: Arc<AtomicU64>,
+        ready: Option<Instant>,
+        latency: Duration,
+    }
+    impl crate::types::RegisterIo for DemandScanner {
+        fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
+            self.simulator.read_memory(address, length)
+        }
+        fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
+            self.simulator.write_memory(address, data)
+        }
+    }
+    impl crate::types::Backend for DemandScanner {
+        fn xml(&mut self) -> Result<String> {
+            self.simulator.xml()
+        }
+        fn start(&mut self, payload: usize) -> Result<()> {
+            self.simulator.start(payload)
+        }
+        fn request_frame(&mut self) -> Result<()> {
+            if self.ready.is_none() {
+                self.requests.fetch_add(1, Ordering::Relaxed);
+                self.ready = Some(Instant::now() + self.latency);
+            }
+            Ok(())
+        }
+        fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
+            let Some(ready) = self.ready else {
+                anyhow::bail!("frame timeout; no scan requested");
+            };
+            let wait = ready.saturating_duration_since(Instant::now());
+            if wait > timeout {
+                std::thread::sleep(timeout);
+                anyhow::bail!("frame timeout");
+            }
+            std::thread::sleep(wait);
+            let frame = self.simulator.next_frame(timeout)?;
+            self.ready = None;
+            Ok(frame)
+        }
+        fn stop(&mut self) -> Result<()> {
+            self.stops.fetch_add(1, Ordering::Relaxed);
+            self.ready = None;
+            self.simulator.stop()
+        }
+    }
+    fn scanner(latency: Duration) -> (Option<Camera>, Arc<AtomicU64>, Arc<AtomicU64>) {
+        let requests = Arc::new(AtomicU64::new(0));
+        let stops = Arc::new(AtomicU64::new(0));
+        let mut info = crate::transport::simulator::info();
+        info.transport = crate::types::Transport::Scanner;
+        (
+            Some(
+                Camera::from_backend(
+                    info,
+                    Box::new(DemandScanner {
+                        simulator: Default::default(),
+                        requests: requests.clone(),
+                        stops: stops.clone(),
+                        ready: None,
+                        latency,
+                    }),
+                )
+                .unwrap(),
+            ),
+            requests,
+            stops,
+        )
+    }
+    fn scanner_command(
+        h: &WorkerHandle,
+        camera: &mut Option<Camera>,
+        command: SessionCommand,
+    ) -> Result<Value> {
+        process(
+            h,
+            camera,
+            &mut None,
+            &mut None,
+            &mut Vec::new(),
+            &mut 1,
+            &mut false,
+            command,
+        )
+    }
+    fn scanner_capture(timeout_ms: u64) -> SessionCommand {
+        SessionCommand::Capture {
+            output: "-".into(),
+            count: 1,
+            timeout_ms,
+            format: "raw".into(),
+            storage: Default::default(),
+            destination: None,
+        }
+    }
+
+    #[test]
+    fn scanner_capture_requests_one_page_across_timeout_polls() {
+        let h = WorkerHandle::new();
+        let (mut camera, requests, stops) = scanner(Duration::from_millis(220));
+        camera.as_mut().unwrap().start().unwrap();
+        assert!(
+            camera
+                .as_mut()
+                .unwrap()
+                .next_frame(Duration::from_millis(1))
+                .is_err()
+        );
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            0,
+            "start only arms the scanner"
+        );
+        let result = scanner_command(&h, &mut camera, scanner_capture(1000)).unwrap();
+        assert_eq!(result["count"], 1);
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert_eq!(stops.load(Ordering::Relaxed), 1);
+        assert!(!camera.as_ref().unwrap().is_streaming());
+        assert_eq!(h.snapshot().frames, 1);
+        h.shutdown();
+    }
+
+    #[test]
+    fn scanner_capture_timeout_cancels_an_already_armed_scan() {
+        let h = WorkerHandle::new();
+        let (mut camera, requests, stops) = scanner(Duration::from_secs(1));
+        camera.as_mut().unwrap().start().unwrap();
+        let error = scanner_command(&h, &mut camera, scanner_capture(1)).unwrap_err();
+        assert!(error.to_string().contains("timeout"));
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert_eq!(stops.load(Ordering::Relaxed), 1);
+        assert!(!camera.as_ref().unwrap().is_streaming());
+        assert_eq!(h.snapshot().frames, 0);
+        h.shutdown();
+    }
+
+    #[test]
+    fn existing_scanner_output_fails_without_consuming_a_page() {
+        let h = WorkerHandle::new();
+        let (mut camera, requests, _) = scanner(Duration::ZERO);
+        let dir = std::env::temp_dir().join(format!(
+            "capturefab-scanner-output-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("document.png");
+        std::fs::write(&path, b"existing document").unwrap();
+        let mut command = scanner_capture(1000);
+        if let SessionCommand::Capture { output, .. } = &mut command {
+            *output = path.to_string_lossy().into_owned();
+        }
+        let error = scanner_command(&h, &mut camera, command.clone()).unwrap_err();
+        assert!(error.to_string().contains("output already exists"));
+        assert_eq!(requests.load(Ordering::Relaxed), 0);
+        assert_eq!(h.snapshot().frames, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing document");
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(dir.join("missing-document.png"), &path).unwrap();
+            let error = scanner_command(&h, &mut camera, command).unwrap_err();
+            assert!(error.to_string().contains("output already exists"));
+            assert_eq!(requests.load(Ordering::Relaxed), 0);
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        h.shutdown();
+    }
+
+    #[test]
+    fn scheduled_scanner_requests_once_and_cancels_on_deadline() {
+        let h = WorkerHandle::new();
+        let (mut camera, requests, stops) = scanner(Duration::from_secs(1));
+        let now = crate::scheduling::now_ms();
+        let mut jobs = vec![Scheduled {
+            info: crate::scheduling::CaptureJob {
+                id: 1,
+                status: "pending".into(),
+                output: "scan.png".into(),
+                destination: None,
+                count: 1,
+                captured: 0,
+                first_at_ms: now,
+                interval_ms: 0,
+                next_at_ms: now,
+                last_file: None,
+                error: None,
+            },
+            resolved: crate::destination::resolve(None, "scan.png").unwrap(),
+            timeout_ms: 1000,
+            format: "png".into(),
+            storage: Default::default(),
+            deadline: None,
+            warm: None,
+        }];
+        let mut started = false;
+        tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, false);
+        tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, false);
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert_eq!(jobs[0].info.status, "running");
+        jobs[0].deadline = Some(Instant::now() - Duration::from_millis(1));
+        tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, false);
+        assert_eq!(jobs[0].info.status, "failed");
+        assert_eq!(stops.load(Ordering::Relaxed), 1);
+        assert!(!camera.as_ref().unwrap().is_streaming());
+        h.shutdown();
+    }
+
+    #[test]
+    fn explicit_capture_does_not_consume_a_scheduled_scan() {
+        let h = WorkerHandle::new();
+        let (mut camera, requests, stops) = scanner(Duration::from_millis(220));
+        let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
+        let (mut next_job, mut started) = (1, false);
+        process(
+            &h,
+            &mut camera,
+            &mut forwarder,
+            &mut auto,
+            &mut jobs,
+            &mut next_job,
+            &mut started,
+            SessionCommand::Schedule {
+                output: "scan.png".into(),
+                count: 1,
+                timeout_ms: 1000,
+                format: "png".into(),
+                first_at_ms: crate::scheduling::now_ms(),
+                interval_ms: 0,
+                storage: Default::default(),
+                destination: None,
+            },
+        )
+        .unwrap();
+        tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, false);
+        let deadline = jobs[0].deadline;
+        let error = process(
+            &h,
+            &mut camera,
+            &mut forwarder,
+            &mut auto,
+            &mut jobs,
+            &mut next_job,
+            &mut started,
+            scanner_capture(1000),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("busy with a scheduled scan"));
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert_eq!(stops.load(Ordering::Relaxed), 0);
+        assert!(camera.as_ref().unwrap().is_streaming());
+        assert_eq!(jobs[0].info.status, "running");
+        assert_eq!(jobs[0].deadline, deadline);
+        assert_eq!(jobs[0].info.captured, 0);
+        assert_eq!(h.snapshot().frames, 0);
+        // The scheduled page is still pending; rejecting the direct capture
+        // must neither consume it nor ask the scanner for a replacement page.
+        let page = camera
+            .as_mut()
+            .unwrap()
+            .next_frame(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(page.id, 1);
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        h.shutdown();
+    }
+
+    #[test]
+    fn scheduled_scanner_failure_preserves_diagnostics_and_future_jobs() {
+        let h = WorkerHandle::new();
+        let (mut camera, requests, _) = scanner(Duration::from_secs(1));
+        let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
+        let (mut next_job, mut started) = (1, false);
+        let now = crate::scheduling::now_ms();
+        for first_at_ms in [now, now, now + 60_000] {
+            process(
+                &h,
+                &mut camera,
+                &mut forwarder,
+                &mut auto,
+                &mut jobs,
+                &mut next_job,
+                &mut started,
+                SessionCommand::Schedule {
+                    output: "scan.png".into(),
+                    count: 2,
+                    timeout_ms: 1000,
+                    format: "png".into(),
+                    first_at_ms,
+                    interval_ms: 60_000,
+                    storage: Default::default(),
+                    destination: None,
+                },
+            )
+            .unwrap();
+        }
+        tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, false);
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            1,
+            "due jobs share one scan"
+        );
+        assert_eq!(jobs[0].info.status, "running");
+        assert_eq!(jobs[1].info.status, "running");
+        assert_eq!(jobs[2].info.status, "pending");
+        // A driver rejects the requested page before its deadline. Keep the
+        // real failure in every waiting job instead of later timing out.
+        let error = anyhow::anyhow!("unsupported scanner source: document feeder unavailable")
+            .context("scanner acquisition failed");
+        fail_scanner_jobs(&h, &mut jobs, &error);
+        for job in &jobs[..2] {
+            assert_eq!(job.info.status, "failed");
+            assert_eq!(
+                job.info.error.as_deref(),
+                Some(
+                    "scanner acquisition failed: unsupported scanner source: document feeder unavailable"
+                )
+            );
+            assert!(job.deadline.is_none());
+            assert_eq!(job.info.captured, 0);
+        }
+        assert_eq!(jobs[2].info.status, "pending");
+        assert!(jobs[2].info.error.is_none());
+        assert!(jobs[2].deadline.is_none());
+        assert_eq!(h.snapshot().jobs[0].error, jobs[0].info.error);
+        tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, false);
+        assert!(!camera.as_ref().unwrap().is_streaming());
+        h.shutdown();
     }
 
     #[test]

@@ -8,9 +8,12 @@ license = "MIT"
 repository = "https://github.com/capturefab/capturefab"
 
 [features]
-default = ["gui", "usb", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "s3"]
+default = ["gui", "usb", "scanner", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "s3"]
 gui = ["dep:iced", "dep:bytemuck", "dep:rfd", "dep:objc2", "dep:objc2-app-kit"]
 usb = ["dep:nusb"]
+# Document scanners: SANE scanimage, Windows WIA and macOS ImageCaptureCore.
+# Drivers run in disposable helper processes, never in the UI.
+scanner = []
 # libjpeg-turbo, built from source with its NEON/SSE2/AVX2 SIMD (x86 needs NASM).
 jpeg = ["dep:turbojpeg"]
 # NVIDIA nvJPEG/CUDA, loaded at runtime in an isolated helper process; no SDK at build time.
@@ -66,7 +69,7 @@ objc2-app-kit = { version = "0.3", optional = true, default-features = false, fe
 # SHA-NI at runtime without this; the asm crate does not assemble under MSVC.
 # Drive types and labels for the capture destination's volume list.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
 
 [target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }

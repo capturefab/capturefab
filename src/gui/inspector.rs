@@ -128,6 +128,7 @@ impl FeatureIndex {
     }
 
     fn new(features: &[FeatureInfo]) -> Self {
+        let scanner = features.iter().any(|f| f.name == "ScanResolution");
         // One Stream row starts and stops, so AcquisitionStop goes.
         let folded = features.iter().any(|f| f.name == "AcquisitionStart");
         let mut groups = Vec::new();
@@ -150,7 +151,11 @@ impl FeatureIndex {
             .iter()
             .map(|f| {
                 if folded && f.name == "AcquisitionStart" {
-                    "Stream".into()
+                    if scanner {
+                        "Scan".into()
+                    } else {
+                        "Stream".into()
+                    }
                 } else if f.display_name.is_empty() || f.display_name == f.name {
                     words(&f.name)
                 } else {
@@ -845,13 +850,16 @@ impl Workbench {
         } else {
             groups.into()
         };
-        column![
-            self.auto_card(p),
-            column![self.search_field(p), count].spacing(6),
-            list,
-        ]
-        .spacing(SECTION_GAP)
-        .into()
+        let mut content = column![].spacing(SECTION_GAP);
+        if self.scanner_selected() {
+            content = content.push(text("Each capture scans one page. Choose a source and resolution supported by your scanner.").size(style::SMALL).color(p.secondary));
+        } else {
+            content = content.push(self.auto_card(p));
+        }
+        content
+            .push(column![self.search_field(p), count].spacing(6))
+            .push(list)
+            .into()
     }
 
     /// The feature search, with a button that clears it once it holds text.
@@ -1073,7 +1081,14 @@ impl Workbench {
         };
         let mut trailing = None;
         let read_only = !writable && !command && !locked;
-        let control: Element<'_, Message> = if command && name == "AcquisitionStart" {
+        let scan = command && name == "AcquisitionStart" && self.scanner_selected();
+        let control: Element<'_, Message> = if scan {
+            button(text("Scan & save").size(style::SMALL))
+                .padding([4, 10])
+                .style(style::secondary)
+                .on_press_maybe((!self.pending(Job::Capture)).then_some(Message::Capture))
+                .into()
+        } else if command && name == "AcquisitionStart" {
             self.stream_toggle(p)
         } else if let Some(error) = feature.error.as_ref().filter(|_| !command) {
             notes.push(note(error.clone(), p.ink(p.warn)));
@@ -1309,15 +1324,30 @@ impl Workbench {
 
     pub(super) fn capture_settings(&self, p: &'static Palette) -> Element<'_, Message> {
         let connected = self.snapshot.connected.is_some();
+        let scanner = self.scanner_selected();
         let capturing = self.pending(Job::Capture);
         let saved = self.just_saved(self.snapshot.active_camera.as_deref());
         let os = Os::CURRENT;
         let (glyph, label) = if capturing {
-            (icon::spinner(14.0, Color::WHITE, self.spin()), "Saving…")
+            (
+                icon::spinner(14.0, Color::WHITE, self.spin()),
+                if scanner { "Scanning…" } else { "Saving…" },
+            )
         } else if saved {
             (icon(Icon::Check, 14.0, Color::WHITE), "Saved")
         } else {
-            (icon(Icon::Camera, 14.0, Color::WHITE), "Capture & save")
+            (
+                icon(
+                    if scanner { Icon::Scan } else { Icon::Camera },
+                    14.0,
+                    Color::WHITE,
+                ),
+                if scanner {
+                    "Scan & save"
+                } else {
+                    "Capture & save"
+                },
+            )
         };
         let ready = connected && !self.output.trim().is_empty();
         let mut action = column![tip(
@@ -1336,11 +1366,24 @@ impl Workbench {
             action = action.push(status);
         }
         let mut save = column![
-            section("Save frames", None, p),
+            section(
+                if scanner {
+                    "Save document scans"
+                } else {
+                    "Save frames"
+                },
+                None,
+                p
+            ),
             self.capture_to
                 .view(&self.output, "Output path", self.dark())
                 .map(Message::CapturePicker),
-            form_row("Frames", self.num(Num::Count), "", p),
+            form_row(
+                if scanner { "Pages" } else { "Frames" },
+                self.num(Num::Count),
+                "",
+                p
+            ),
             form_row(
                 "Format",
                 pick_list(&FORMATS[..], find(&FORMATS, self.format), Message::Format)
@@ -1492,6 +1535,17 @@ impl Workbench {
     }
 
     pub(super) fn forward_settings(&self, p: &'static Palette) -> Element<'_, Message> {
+        if self.scanner_selected() {
+            return column![
+                section("Document scanner", None, p),
+                text("Use Capture to scan and save pages.")
+                    .size(style::BODY)
+                    .color(p.secondary),
+                link("Open Capture", Some(Message::Tab(Tab::Capture))),
+            ]
+            .spacing(ROW_GAP)
+            .into();
+        }
         let first = match &self.snapshot.forwarding {
             Some(destination) => self.forward_card(destination, p),
             None => self.forward_form(p),

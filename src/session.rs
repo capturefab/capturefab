@@ -232,7 +232,7 @@ struct Process {
     snapshot: SessionSnapshot,
 }
 impl Process {
-    fn spawn() -> Result<Self> {
+    fn spawn(scanner: bool) -> Result<Self> {
         let dir = crate::ipc::session_dir();
         crate::ipc::ensure_private_dir(&dir)?;
         let mut random = [0u8; 16];
@@ -247,7 +247,13 @@ impl Process {
             .map(|s| s.parse::<usize>())
             .transpose()
             .context("CAPTUREFAB_FRAME_BYTES must be a number")?
-            .unwrap_or(DEFAULT_CAPACITY);
+            // A letter/A4 page at 600 dpi in RGB needs about 100 MiB. Scanner
+            // pages retain their full resolution in the shared preview ring.
+            .unwrap_or(if scanner {
+                128 * 1024 * 1024
+            } else {
+                DEFAULT_CAPACITY
+            });
         let ring = SharedRing::create(&path, capacity)?;
         let executable = std::env::var_os("CAPTUREFAB_EXECUTABLE")
             .map(std::path::PathBuf::from)
@@ -709,7 +715,12 @@ impl SessionHandle {
                     self.workers().len() < maximum,
                     "camera limit reached ({maximum}); disconnect a camera or increase CAPTUREFAB_MAX_CAMERAS"
                 );
-                let mut p = Process::spawn()?;
+                let scanner = crate::scanner::is_source(&camera)
+                    || self.snapshot().devices.iter().any(|device| {
+                        device.transport == crate::types::Transport::Scanner
+                            && (device.id == camera || device.serial == camera)
+                    });
+                let mut p = Process::spawn(scanner)?;
                 let result = p.call(SessionCommand::Connect { camera, timeout_ms })?;
                 let info = p
                     .snapshot

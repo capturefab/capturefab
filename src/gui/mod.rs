@@ -595,6 +595,7 @@ struct Workbench {
     count: u32,
     format: &'static str,
     timeout_ms: u64,
+    scan_timeout_ms: u64,
     forward_output: String,
     forward_codec: &'static str,
     forward_encoder: String,
@@ -730,6 +731,7 @@ impl Workbench {
             count: prefs.count,
             format: pick(&FORMATS, &prefs.format, &defaults.format),
             timeout_ms: prefs.timeout_ms,
+            scan_timeout_ms: prefs.scan_timeout_ms,
             forward_codec: pick(&CODECS, &prefs.forward_codec, &defaults.forward_codec),
             forward_encoder: prefs.forward_encoder,
             forward_fps: prefs.forward_fps,
@@ -866,6 +868,7 @@ impl Workbench {
             format: self.format.into(),
             count: self.count,
             timeout_ms: self.timeout_ms,
+            scan_timeout_ms: self.scan_timeout_ms,
             schedule_delay_seconds: self.schedule_delay_seconds,
             schedule_interval_seconds: self.schedule_interval_seconds,
             forward_output: self.forward_output.clone(),
@@ -1521,6 +1524,27 @@ impl Workbench {
         }
     }
 
+    fn scanner_selected(&self) -> bool {
+        self.snapshot
+            .connected
+            .as_ref()
+            .is_some_and(|camera| camera.transport == crate::types::Transport::Scanner)
+    }
+
+    fn capture_timeout(&self, target: Option<&str>) -> u64 {
+        let scanner = match target {
+            Some(id) => self.snapshot.cameras.iter().any(|camera| {
+                camera.info.id == id && camera.info.transport == crate::types::Transport::Scanner
+            }),
+            None => self.scanner_selected(),
+        };
+        if scanner {
+            self.scan_timeout_ms
+        } else {
+            self.timeout_ms
+        }
+    }
+
     fn capture(&mut self) {
         if self.pending(Job::Capture) {
             return;
@@ -1530,7 +1554,7 @@ impl Workbench {
             SessionCommand::Capture {
                 output: self.output.clone(),
                 count: self.count,
-                timeout_ms: self.timeout_ms,
+                timeout_ms: self.capture_timeout(None),
                 format: self.format.into(),
                 storage: self.storage_policy(),
                 destination: self.capture_to.selected.clone(),
@@ -1638,7 +1662,7 @@ impl Workbench {
     fn num_text(&self, key: Num) -> String {
         match key {
             Num::Count => self.count.to_string(),
-            Num::Timeout => self.timeout_ms.to_string(),
+            Num::Timeout => self.capture_timeout(None).to_string(),
             Num::Delay => self.schedule_delay_seconds.to_string(),
             Num::Interval => number(self.schedule_interval_seconds),
             Num::Fps => number(self.forward_fps),
@@ -1666,7 +1690,13 @@ impl Workbench {
                     self.output = "capture.png".into();
                 }
             }
-            (Num::Timeout, Some(v), _) => self.timeout_ms = v,
+            (Num::Timeout, Some(v), _) => {
+                if self.scanner_selected() {
+                    self.scan_timeout_ms = v;
+                } else {
+                    self.timeout_ms = v;
+                }
+            }
             (Num::Delay, Some(v), _) => self.schedule_delay_seconds = v,
             (Num::QuotaFiles, Some(v), _) => self.quota_files = v as u32,
             (Num::RetentionDays, Some(v), _) => self.retention_days = v,
@@ -1967,7 +1997,7 @@ impl Workbench {
                 SessionCommand::Schedule {
                     output: self.output.clone(),
                     count: self.count,
-                    timeout_ms: self.timeout_ms,
+                    timeout_ms: self.capture_timeout(None),
                     format: self.format.into(),
                     first_at_ms: epoch_ms()
                         .saturating_add(self.schedule_delay_seconds.saturating_mul(1000)),
@@ -2070,7 +2100,7 @@ impl Workbench {
                         SessionCommand::Capture {
                             output: self.output.clone(),
                             count: self.count,
-                            timeout_ms: self.timeout_ms,
+                            timeout_ms: self.capture_timeout(Some(&id)),
                             format: self.format.into(),
                             storage: self.storage_policy(),
                             destination: self.capture_to.selected.clone(),
@@ -2312,6 +2342,26 @@ fn num_valid(key: Num, text: &str) -> bool {
 mod tests {
     use super::*;
     use iced::futures::{FutureExt, StreamExt};
+
+    #[test]
+    fn scanner_timeout_is_separate_from_camera_timeout() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), false, None);
+        bench.timeout_ms = 5000;
+        bench.scan_timeout_ms = 60_000;
+        let mut info = crate::transport::simulator::info();
+        bench.snapshot.connected = Some(info.clone());
+        assert_eq!(bench.num_text(Num::Timeout), "5000");
+        info.transport = crate::types::Transport::Scanner;
+        info.id = "scanner:ica:test".into();
+        bench.snapshot.connected = Some(info);
+        assert_eq!(bench.num_text(Num::Timeout), "60000");
+        assert!(bench.set_num(Num::Timeout, "45000"));
+        assert_eq!(bench.capture_timeout(None), 45_000);
+        assert_eq!(bench.timeout_ms, 5000);
+        bench.snapshot.connected = None;
+        assert_eq!(bench.capture_timeout(None), 5000);
+        assert_eq!(bench.prefs().scan_timeout_ms, 45_000);
+    }
 
     #[test]
     fn frame_watcher_stays_quiet_without_new_frames() {

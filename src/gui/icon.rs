@@ -118,6 +118,7 @@ impl Icon {
             Transport::Usb3 => Icon::Usb,
             Transport::Simulator => Icon::Cube,
             Transport::Media => Icon::Video,
+            Transport::Scanner => Icon::Scan,
         }
     }
 }

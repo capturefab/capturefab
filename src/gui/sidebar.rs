@@ -399,6 +399,9 @@ fn read_address(input: &str, devices: &[CameraInfo], file: Option<bool>) -> Opti
     if input.starts_with("sim:") {
         return Some("Will try a simulated camera".into());
     }
+    if crate::scanner::is_source(input) {
+        return Some("Will try a document scanner".into());
+    }
     if crate::media::is_url_source(input) {
         return Some(match input.split_once(':') {
             Some((scheme, rest)) if rest.starts_with("//") => {

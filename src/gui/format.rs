@@ -78,6 +78,7 @@ pub(super) fn feature_group(name: &str) -> &'static str {
         "Analog",
         "Digital",
         "Auto",
+        "Scan",
     ]
     .iter()
     .any(|p| name.starts_with(p))

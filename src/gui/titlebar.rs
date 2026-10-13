@@ -658,7 +658,28 @@ impl Workbench {
                 Action::Overview.hint("Back to all cameras", os),
             ));
         }
-        if let Some(phase) = phase {
+        if self.scanner_selected() {
+            let scanning = self.pending(Job::Capture);
+            actions = actions.push(tip(
+                button(
+                    row![
+                        icon(Icon::Scan, 14.0, p.text),
+                        text(if scanning {
+                            "Scanning…"
+                        } else {
+                            "Scan & save"
+                        })
+                        .size(style::BODY)
+                    ]
+                    .spacing(7)
+                    .align_y(Alignment::Center),
+                )
+                .padding([5, 12])
+                .style(style::secondary)
+                .on_press_maybe((!scanning).then_some(Message::Capture)),
+                Action::Capture.hint("Scan a page and save using the Capture settings", os),
+            ));
+        } else if let Some(phase) = phase {
             let stopping = phase.pending();
             // While a start or stop is on its way, the button keeps the
             // label it was pressed with.

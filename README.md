@@ -56,6 +56,26 @@ capturefab --session bench start
 capturefab --session bench stop
 ```
 
+## Document scanners
+
+Document scanners use the existing capture commands, GUI, schedules, destinations and storage quotas. The `scanner` build feature is enabled by default. Linux uses an installed SANE `scanimage` executable and scanner backends (including network scanners exposed by those backends); Windows uses Windows Image Acquisition (WIA) through Windows PowerShell; macOS uses a bundled native ImageCaptureCore helper. Install a compatible scanner driver on the host. Physical scanner compatibility has not been validated.
+
+```sh
+capturefab scanners --json
+# Use the full scanner ID returned by scanners or discover:
+capturefab --camera 'scanner:sane:DEVICE' --timeout-ms 60000 capture -o document.png
+capturefab --camera 'scanner:wia:ID' --timeout-ms 60000 capture -o document.png
+capturefab --camera 'scanner:ica:UUID' --timeout-ms 60000 capture -o document.png
+capturefab --camera 'scanner:sane:DEVICE' --timeout-ms 60000 capture \
+  --set ScanResolution=300 --set ScanMode=Gray --set ScanSource=Feeder -n 5 -o pages
+```
+
+In the GUI, discover and connect a scanner, choose **Scan resolution**, **Scan mode** and **Scan source** in Features, then **Scan & save** in Capture. Scanner captures have a separate GUI timeout, initially 60 seconds; use `--timeout-ms 60000` for CLI scans. `ScanResolution` accepts 75–600 dpi (default 150), `ScanMode` is `Color`, `Gray` or `Lineart` (default `Color`), and `ScanSource` is `Default`, `Flatbed` or `Feeder` (default `Default`, keeping the driver's paper source). Drivers can support a subset of these settings; rejected settings fail without silently switching modes. SANE's explicit source names are `Flatbed` and `Automatic Document Feeder`; use `Default` for drivers with other source names. `CAPTUREFAB_SCANIMAGE` can point to a specific executable.
+
+Connecting or starting acquisition does not scan. Each capture requests one page; `-n` requests successive pages, including feeder pages. Multiple pages save as separate image files in a directory or `{frame}` template. Scans appear in the existing preview. Samples normalize to 8-bit RGB/grayscale with a 128 MiB page limit, using the existing PNG, JPEG, PGM, PPM and raw formats. PDF assembly and OCR are not included. Scanner forwarding and camera auto exposure return unsupported errors. Timeout, stop or disconnect terminates acquisition. Inspect `doctor --json` for the compiled feature and runtime availability.
+
+Scanner IDs and previously discovered scanner serials receive a 128 MiB frame ring per slot (cameras default to 16 MiB). Use full scanner IDs when opening scanners directly, or set `CAPTUREFAB_FRAME_BYTES` when connecting by an undiscovered serial. Each worker keeps three slots, and the existing 256 MiB maximum override remains available.
+
 ## Auto exposure and frame rate
 
 ```sh
@@ -154,7 +174,7 @@ Supported image conversion includes Mono8, unpacked Mono10/12/16, RGB/BGR8 and B
 
 ```sh
 cargo build --release                              # Rust desktop; bundles FFmpeg when supplied
-cargo build --release --no-default-features --features usb,jpeg,nvjpeg,vaapi,videotoolbox # headless
+cargo build --release --no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox # headless
 cargo test
 cargo clippy --all-features --all-targets -- -D warnings
 ```

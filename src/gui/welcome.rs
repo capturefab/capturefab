@@ -21,10 +21,19 @@ impl Workbench {
     /// surface dims from the welcome screen's to the stage's.
     pub(super) fn ready(&self, p: &'static Palette) -> Element<'_, Message> {
         let streaming = self.snapshot.streaming;
+        let scanner = self.scanner_selected();
         let mut ready = column![
-            icon(Icon::Camera, 40.0, style::ON_STAGE_SECONDARY),
+            icon(
+                if scanner { Icon::Scan } else { Icon::Camera },
+                40.0,
+                style::ON_STAGE_SECONDARY
+            ),
             space().height(6),
-            text(if streaming {
+            text(if scanner && self.pending(Job::Capture) {
+                "Scanning document…"
+            } else if scanner {
+                "Ready to scan a document"
+            } else if streaming {
                 "Waiting for the first frame…"
             } else {
                 "Ready for your first frame"
@@ -35,9 +44,10 @@ impl Workbench {
         ]
         .spacing(6)
         .align_x(Alignment::Center);
-        if !streaming {
-            ready = ready.push(space().height(8)).push(
-                row![
+        if !streaming || scanner {
+            let mut actions = row![].spacing(10).align_y(Alignment::Center);
+            if !scanner {
+                actions = actions.push(
                     stream_button(
                         false,
                         "Start stream",
@@ -51,13 +61,22 @@ impl Workbench {
                         p,
                     )
                     .padding([7, 16]),
-                    button(text("Capture one frame").size(style::BODY))
-                        .padding([7, 12])
-                        .style(style::on_glass(false, 1.0))
-                        .on_press_maybe((!self.pending(Job::Capture)).then_some(Message::Capture)),
-                ]
-                .spacing(10)
-                .align_y(Alignment::Center),
+                );
+            }
+            ready = ready.push(space().height(8)).push(
+                actions.push(
+                    button(
+                        text(if scanner {
+                            "Scan & save"
+                        } else {
+                            "Capture one frame"
+                        })
+                        .size(style::BODY),
+                    )
+                    .padding([7, 12])
+                    .style(style::on_glass(false, 1.0))
+                    .on_press_maybe((!self.pending(Job::Capture)).then_some(Message::Capture)),
+                ),
             );
         }
         let t = self.side.stage_in.get(self.now);

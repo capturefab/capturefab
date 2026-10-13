@@ -18,6 +18,7 @@ pub mod nvjpeg;
 pub mod onvif;
 #[cfg(feature = "s3")]
 pub mod s3;
+pub mod scanner;
 pub mod scheduling;
 pub mod session;
 pub mod shared_memory;

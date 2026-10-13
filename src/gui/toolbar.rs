@@ -122,22 +122,28 @@ impl Workbench {
     fn capture_button(&self, p: &'static Palette) -> Element<'_, Message> {
         let os = Os::CURRENT;
         let connected = self.snapshot.connected.is_some();
+        let scanner = self.scanner_selected();
         let capturing = self.pending(Job::Capture);
         // One capture runs at a time, from any camera; saved is per camera.
         let saved = !capturing && self.just_saved(self.snapshot.active_camera.as_deref());
         let (glyph, label): (Element<'_, Message>, _) = if capturing {
-            (icon::spinner(14.0, p.secondary, self.spin()), "Saving…")
+            (
+                icon::spinner(14.0, p.secondary, self.spin()),
+                if scanner { "Scanning…" } else { "Saving…" },
+            )
         } else if saved {
             (icon(Icon::Check, 14.0, p.live), "Saved")
         } else {
             (
                 icon(
-                    Icon::Camera,
+                    if scanner { Icon::Scan } else { Icon::Camera },
                     14.0,
                     if connected { p.text } else { p.tertiary },
                 ),
                 if self.overview() {
                     "Capture selected"
+                } else if scanner {
+                    "Scan"
                 } else {
                     "Capture"
                 },

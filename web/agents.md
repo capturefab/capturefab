@@ -80,6 +80,20 @@ Native locators accept `?size=WIDTHxHEIGHT&fps=RATE`. Inspect `features` for adv
 
 Media inputs and forwarding use bundled FFmpeg in release builds. Inspect `capturefab ffmpeg --json` to see the actual build's protocols and encoders. SRT support depends on the bundled FFmpeg configuration.
 
+## Scan documents
+
+`capturefab scanners --json` lists platform document scanners; `discover` includes them with `transport: "scanner"`. Use the returned full `scanner:sane:DEVICE` (Linux), `scanner:wia:ID` (Windows), or `scanner:ica:UUID` (macOS) ID. Linux requires SANE `scanimage` and an appropriate backend; Windows requires a WIA driver and Windows PowerShell; macOS uses a bundled ImageCaptureCore helper and compatible driver. `doctor` reports the compiled `scanner` feature and runtime availability. Physical scanner compatibility has not been verified.
+
+```sh
+capturefab scanners --json
+capturefab --camera 'scanner:sane:DEVICE' --timeout-ms 60000 capture \
+  --set ScanResolution=300 --set ScanMode=Gray --set ScanSource=Feeder -n 5 -o pages --json
+```
+
+Scanner controls are `ScanResolution` (75–600 dpi, default 150), `ScanMode` (`Color`, `Gray`, `Lineart`, default `Color`) and `ScanSource` (`Default`, `Flatbed`, `Feeder`, default `Default`). Drivers may reject unsupported choices. SANE source strings vary between drivers; `Default` leaves that option unset. `CAPTUREFAB_SCANIMAGE` overrides the executable path. Connecting or `start` never scans; capture requests one page per count, including feeder pages. Use `--timeout-ms 60000` for physical scanning; RPC respects the requested per-page deadline. A timeout cancels the helper. The GUI keeps a separate scanner timeout, initially 60 seconds.
+
+Scans use existing image formats, schedules, destinations and quotas. Multi-page captures save separate files; samples normalize to 8-bit RGB/grayscale with a 128 MiB page bound. PDF/OCR conversion, forwarding and camera auto exposure are not provided for scanner sources. Use full scanner IDs or discover before connecting by serial so the preview ring has its 128 MiB scanner capacity.
+
 ## Forward to an existing recorder
 
 ```sh
