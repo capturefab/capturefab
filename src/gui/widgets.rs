@@ -334,7 +334,7 @@ pub(super) fn code_block<'a>(
     p: &'static Palette,
 ) -> Element<'a, Message> {
     let (glyph, color, hint) = if copied {
-        (Icon::Check, p.live, "Copied")
+        (Icon::Check, p.ink(p.live), "Copied")
     } else {
         (Icon::Copy, p.secondary, "Copy")
     };
@@ -437,9 +437,9 @@ pub(super) fn icon_button<'a>(
 }
 
 /// Start or Stop for a stream, sending `on`. Start is the primary action;
-/// Stop is routine, not destructive, so it stays gray with only its glyph in
-/// red. While `busy`, a spinner at step `spin` (from `Workbench::spin`)
-/// takes the glyph's place and presses are ignored, with the button keeping
+/// Stop is routine, so its glyph and label use the neutral text color.
+/// While `busy`, a spinner at step `spin` (from `Workbench::spin`) takes the
+/// glyph's place and presses are ignored, with the button keeping
 /// its look.
 pub(super) fn stream_button<'a>(
     streaming: bool,
@@ -452,7 +452,7 @@ pub(super) fn stream_button<'a>(
     let glyph = match (busy, streaming) {
         (true, true) => icon::spinner(12.0, p.secondary, spin),
         (true, false) => icon::spinner(12.0, Color::WHITE, spin),
-        (false, true) => icon(Icon::Stop, 12.0, p.danger),
+        (false, true) => icon(Icon::Stop, 12.0, p.text),
         (false, false) => icon(Icon::Play, 12.0, Color::WHITE),
     };
     let base = if streaming {

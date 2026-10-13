@@ -302,7 +302,11 @@ impl Workbench {
         let stage = style::STAGE;
         let clip = |label: &'static str, share: f32| {
             let over = share > CLIP_WARN;
-            let color = ink(if over { stage.warn } else { stage.secondary });
+            let color = ink(if over {
+                stage.ink(stage.warn)
+            } else {
+                stage.secondary
+            });
             row![
                 dot(color, 5.0),
                 text(format!("{label} {}", percent(share)))
@@ -405,10 +409,14 @@ impl Workbench {
         ]
         .spacing(2)
         .align_y(Alignment::Center);
-        let lit = ink(if sharp { stage.live } else { stage.text });
+        let lit = ink(if sharp {
+            stage.ink(stage.live)
+        } else {
+            stage.text
+        });
         let verdict: Element<'_, Message> = if sharp {
             row![
-                icon(Icon::Check, 11.0, ink(stage.live)),
+                icon(Icon::Check, 11.0, ink(stage.ink(stage.live))),
                 text("In focus")
                     .size(style::CAPTION)
                     .color(ink(stage.secondary)),
@@ -485,9 +493,9 @@ impl Workbench {
                 scale: self.view_scale(),
                 label,
                 color: if self.focus.in_focus() {
-                    style::STAGE.live
+                    style::STAGE.ink(style::STAGE.live)
                 } else {
-                    style::STAGE.accent
+                    style::STAGE.accent_text
                 },
                 shown: t,
                 lock: self.stage_ui.lock.get(self.now),
@@ -937,10 +945,18 @@ impl canvas::Program<Message> for RegionEditor {
                 frame.fill_rectangle(Point::new(x, y), Size::new(w, h), shade);
             }
         }
+        let boundary = Path::rectangle(r.position(), r.size());
+        // A dark casing keeps the light boundary visible on bright frames.
         frame.stroke(
-            &Path::rectangle(r.position(), r.size()),
+            &boundary,
             Stroke::default()
-                .with_color(a(Color::WHITE, 0.6))
+                .with_color(a(Color::BLACK, 0.85))
+                .with_width(3.0),
+        );
+        frame.stroke(
+            &boundary,
+            Stroke::default()
+                .with_color(a(Color::WHITE, 0.9))
                 .with_width(1.0),
         );
         // Locking on: 0 at either end, 1 at the height of it.
@@ -971,6 +987,14 @@ impl canvas::Program<Message> for RegionEditor {
                 path.line_to(Point::new(x, y + sy * arm));
             }
         });
+        // The same casing preserves the blue/green focus state over any image.
+        frame.stroke(
+            &corners,
+            Stroke::default()
+                .with_color(a(Color::BLACK, 0.85))
+                .with_width(5.0 + swell)
+                .with_line_cap(LineCap::Round),
+        );
         frame.stroke(
             &corners,
             Stroke::default()

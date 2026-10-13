@@ -78,7 +78,7 @@ impl Workbench {
                 Icon::Activity,
                 16.0,
                 if self.logs_open {
-                    p.accent
+                    p.accent_text
                 } else {
                     p.secondary
                 },
@@ -154,7 +154,7 @@ impl Workbench {
                 if scanner { "Scanning…" } else { "Saving…" },
             )
         } else if saved {
-            (icon(Icon::Check, 14.0, p.live), "Saved")
+            (icon(Icon::Check, 14.0, p.ink(p.live)), "Saved")
         } else {
             (
                 icon(
@@ -300,11 +300,11 @@ impl Workbench {
     ) -> Element<'a, Message> {
         let alpha = self.notice_alpha();
         let level = notice.level;
-        // Errors read in their color; other outcomes are told by the glyph.
-        let ink = if level == Level::Error {
-            level.color(p)
-        } else {
+        // Problems use the same semantic ink as Activity and their glyphs.
+        let ink = if level == Level::Done {
             p.secondary
+        } else {
+            level.color(p)
         };
         let details = notice.level != Level::Done && !self.logs_open;
         let dismiss = notice.level == Level::Error;

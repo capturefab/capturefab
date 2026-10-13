@@ -124,6 +124,7 @@
     const render = async () => {
       const current = ++request;
       const query = input.value.trim();
+      status.removeAttribute('data-state');
       if (options.onQuery) options.onQuery(query);
       if (!query && !options.suggestions) {
         container.replaceChildren();
@@ -145,6 +146,7 @@
       input.removeAttribute('aria-activedescendant');
       if (!data.documents.length) {
         status.textContent = 'Search is unavailable here. Open the documentation and use your browser’s Find (Ctrl/Cmd F).';
+        status.dataset.state = 'warning';
         const fallback = element('a', 'search-result', 'Open the documentation');
         fallback.href = 'docs.html';
         container.append(fallback);

@@ -188,6 +188,43 @@ def check_search_index(root, errors):
         errors.append("search-index.json is stale; run scripts/docs-search.py")
 
 
+def check_theme_contrast(root, errors):
+    """Check real theme tokens used by small text, buttons and control outlines."""
+    css = (root / "style.css").read_text(encoding="utf-8")
+    palettes = re.findall(r":root\{([^{}]*)\}", css)
+    if len(palettes) != 2:
+        errors.append("style.css: expected one light palette and one dark palette")
+        return
+
+    def luminance(color):
+        channels = [int(color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+        return sum(c * weight for c, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+
+    for mode, palette in zip(("light", "dark"), palettes):
+        tokens = dict(re.findall(r"--([\w-]+):(#[0-9a-fA-F]{6})(?=;|$)", palette))
+        # Tokens inherited from light mode still apply in dark mode.
+        if mode == "light":
+            inherited = tokens.copy()
+        else:
+            tokens = inherited | tokens
+        surfaces = ("bg", "panel", "field", "accent-soft")
+        pairs = [(text, surface, 4.5) for text in ("text", "muted", "faint", "code-text", "accent-text") for surface in surfaces]
+        pairs += [("on-accent", background, 4.5) for background in ("accent", "accent-hover")]
+        pairs += [("success", "bg", 4.5), ("warning", "warning-soft", 4.5), ("warning", "bg", 4.5)]
+        pairs += [("canvas-text", "canvas", 4.5), ("canvas-muted", "canvas", 4.5)]
+        pairs += [("control-line", surface, 3) for surface in ("bg", "panel", "field")]
+        pairs += [("accent", surface, 3) for surface in surfaces]
+        for foreground, background, minimum in pairs:
+            if foreground not in tokens or background not in tokens:
+                errors.append(f"style.css: {mode} palette is missing {foreground} or {background}")
+                continue
+            low, high = sorted((luminance(tokens[foreground]), luminance(tokens[background])))
+            ratio = (high + 0.05) / (low + 0.05)
+            if ratio < minimum:
+                errors.append(f"style.css: {mode} {foreground} on {background} is {ratio:.2f}:1; expected {minimum}:1")
+
+
 def validate(root=ROOT):
     errors = []
     check_pages(root, errors)
@@ -202,6 +239,7 @@ def validate(root=ROOT):
     check_feed(root, versions, errors)
     check_generated(root, errors)
     check_search_index(root, errors)
+    check_theme_contrast(root, errors)
     return errors, versions
 
 
@@ -209,7 +247,7 @@ def main():
     errors, versions = validate()
     if errors:
         sys.exit("\n".join(errors))
-    print(f"Static site validated; current documentation search, {len(versions)} releases, downloads page and Atom feed, no remote runtime dependencies.")
+    print(f"Static site validated; light/dark color contrast, current documentation search, {len(versions)} releases, downloads page and Atom feed, no remote runtime dependencies.")
 
 
 if __name__ == "__main__":

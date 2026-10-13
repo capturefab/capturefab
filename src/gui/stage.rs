@@ -648,7 +648,7 @@ impl Workbench {
         shown: f32,
     ) -> Element<'a, Message> {
         let color = if self.recent_loss(&camera.info.id) {
-            style::STAGE.warn
+            style::STAGE.ink(style::STAGE.warn)
         } else {
             style::STAGE.secondary
         };

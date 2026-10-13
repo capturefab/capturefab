@@ -341,9 +341,9 @@ fn auto_all(on: usize, total: usize) -> (String, bool) {
 /// still at work.
 fn auto_color(state: &str, p: &Palette) -> Color {
     match state {
-        "stable" => p.live,
-        "limited" => p.warn,
-        _ => p.accent,
+        "stable" => p.ink(p.live),
+        "limited" => p.ink(p.warn),
+        _ => p.ink(p.accent),
     }
 }
 
@@ -1039,7 +1039,7 @@ impl Workbench {
 /// (a URL, with its credentials hidden); opens the Forward tab.
 fn output_tag<'a>(output: Output, labelled: bool, p: &'static Palette) -> Element<'a, Message> {
     let (mark, color): (Element<'a, Message>, _) = if output.recording() {
-        (dot(p.danger, 6.0), p.danger)
+        (dot(p.ink(p.danger), 6.0), p.danger)
     } else {
         (icon(Icon::Broadcast, 12.0, p.accent_text), p.accent_text)
     };

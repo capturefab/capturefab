@@ -422,7 +422,8 @@ impl Workbench {
     /// (with `welcome`: a camera connecting), `inspector-deletes` (deleting
     /// the oldest files at capacity, storage closed),
     /// `inspector-capture-failed` (a capture refused) and
-    /// `inspector-capturing` (a capture on its way).
+    /// `inspector-capturing` (a capture on its way), `inspector-nocapture`
+    /// (no output name) and `inspector-noforward` (no forwarding destination).
     pub(super) fn scene_inspector(&mut self, word: &str, late: bool) -> bool {
         let camera = self.snapshot.active_camera.clone();
         let feature = "ExposureTime";
@@ -431,6 +432,7 @@ impl Workbench {
             ("inspector-nomatch", _) => self.search = "white balance".into(),
             ("inspector-storage", _) => self.storage_open = true,
             ("inspector-noforward", _) => self.forward_output.clear(),
+            ("inspector-nocapture", _) => self.output.clear(),
             ("inspector-widest", _) => {
                 self.format = "pgm";
                 self.forward_codec = "h265";
@@ -1270,7 +1272,7 @@ impl Workbench {
         let glyph = if busy {
             icon::spinner(11.0, p.secondary, self.spin())
         } else if streaming {
-            icon(Icon::Stop, 11.0, p.ink(p.danger))
+            icon(Icon::Stop, 11.0, p.text)
         } else {
             icon(Icon::Play, 11.0, p.accent_text)
         };
@@ -1330,19 +1332,27 @@ impl Workbench {
         let capturing = self.pending(Job::Capture);
         let saved = self.just_saved(self.snapshot.active_camera.as_deref());
         let os = Os::CURRENT;
+        let ready = connected && !self.output.trim().is_empty();
+        // Busy actions keep their blue fill; unavailable actions use a
+        // neutral fill and need the same readable ink as their labels.
+        let action_ink = if ready || capturing {
+            Color::WHITE
+        } else {
+            p.secondary
+        };
         let (glyph, label) = if capturing {
             (
-                icon::spinner(14.0, Color::WHITE, self.spin()),
+                icon::spinner(14.0, action_ink, self.spin()),
                 if scanner { "Scanning…" } else { "Saving…" },
             )
         } else if saved {
-            (icon(Icon::Check, 14.0, Color::WHITE), "Saved")
+            (icon(Icon::Check, 14.0, action_ink), "Saved")
         } else {
             (
                 icon(
                     if scanner { Icon::Scan } else { Icon::Camera },
                     14.0,
-                    Color::WHITE,
+                    action_ink,
                 ),
                 if scanner {
                     "Scan & save"
@@ -1351,7 +1361,6 @@ impl Workbench {
                 },
             )
         };
-        let ready = connected && !self.output.trim().is_empty();
         let mut action = column![tip(
             wide_button(
                 glyph,
@@ -1571,12 +1580,17 @@ impl Workbench {
     fn forward_form(&self, p: &'static Palette) -> Element<'_, Message> {
         let connected = self.snapshot.connected.is_some();
         let starting = self.forward_pending() == Some(false);
-        let glyph = if starting {
-            icon::spinner(15.0, Color::WHITE, self.spin())
-        } else {
-            icon(Icon::Broadcast, 15.0, Color::WHITE)
-        };
         let ready = connected && !self.forward_output.trim().is_empty();
+        let action_ink = if ready || starting {
+            Color::WHITE
+        } else {
+            p.secondary
+        };
+        let glyph = if starting {
+            icon::spinner(15.0, action_ink, self.spin())
+        } else {
+            icon(Icon::Broadcast, 15.0, action_ink)
+        };
         let mut action = column![wide_button(
             glyph,
             if starting {
@@ -1671,7 +1685,7 @@ impl Workbench {
         // A file rather than a URL is a recording on this computer.
         let recording = Output::of(destination).recording();
         let (mark, title, stop) = if recording {
-            (dot(p.danger, 8.0), "Recording", "Stop recording")
+            (dot(p.ink(p.danger), 8.0), "Recording", "Stop recording")
         } else {
             (
                 icon(Icon::Broadcast, 14.0, p.accent_text),
@@ -1708,7 +1722,7 @@ impl Workbench {
         let glyph = if stopping {
             icon::spinner(12.0, p.secondary, self.spin())
         } else {
-            icon(Icon::Stop, 12.0, p.ink(p.danger))
+            icon(Icon::Stop, 12.0, p.text)
         };
         card = card.push(space().height(2)).push(wide_button(
             glyph,
@@ -1826,6 +1840,7 @@ impl Workbench {
                         .size(style::CAPTION)
                         .color(match status {
                             "failed" => p.ink(p.danger),
+                            "complete" => p.ink(p.live),
                             "running" | "pending" => p.accent_text,
                             _ => p.secondary,
                         }),

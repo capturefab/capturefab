@@ -212,6 +212,17 @@ impl Workbench {
         }
         let ring = self.selection_level(id);
         if ring > 0.0 {
+            // The dark inner edge keeps selection blue distinct on blue frames.
+            layers = layers.push(container(space().width(Fill).height(Fill)).style(move |_| {
+                container::Style {
+                    border: iced::Border {
+                        color: fade(Color::BLACK, 0.9 * ring),
+                        width: 5.0,
+                        radius: style::RADIUS_MEDIUM.into(),
+                    },
+                    ..container::Style::default()
+                }
+            }));
             layers =
                 layers.push(container(space().width(Fill).height(Fill)).style(style::ring(ring)));
         }
@@ -267,7 +278,7 @@ impl Workbench {
         if let Some(output) = camera.forwarding.as_deref().map(Output::of) {
             caption = caption.push(chip(
                 if output.recording() {
-                    dot(stage.danger, 7.0)
+                    dot(stage.ink(stage.danger), 7.0)
                 } else {
                     icon(Icon::Broadcast, 12.0, stage.accent_text)
                 },

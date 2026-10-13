@@ -498,7 +498,7 @@ fn camera_status(
     }
     let output = Output::of(camera.forwarding.as_ref()?);
     let mark = if output.recording() {
-        dot(p.danger, 7.0)
+        dot(p.ink(p.danger), 7.0)
     } else {
         icon(Icon::Broadcast, 13.0, p.secondary)
     };
@@ -971,7 +971,7 @@ impl Workbench {
             button(
                 row![
                     if copied {
-                        icon(Icon::Check, 13.0, p.live)
+                        icon(Icon::Check, 13.0, p.ink(p.live))
                     } else {
                         icon(Icon::Copy, 13.0, p.secondary)
                     },

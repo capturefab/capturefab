@@ -42,6 +42,7 @@
   const renderSelection = () => {
     clearDownload();
     if (!manifest) return;
+    document.querySelector('.download-result').removeAttribute('data-state');
     if (!release || !assets.some(isPublished)) {
       text('download-label', 'No published binaries yet');
       text('download-description', 'Use the source checkout and build guide, or follow the release feed for new downloads.');
@@ -156,6 +157,7 @@
       text('download-label', 'Open the release manifest');
       text('download-description', 'Automatic selection is unavailable. The manifest contains published download URLs and checksums.');
       clearDownload();
+      document.querySelector('.download-result').dataset.state = 'warning';
       tableNotice('Open all downloads or releases.json to inspect the available builds.');
     });
   if (hasDownloadPanel) detectPlatform();
@@ -166,8 +168,8 @@
     if (!ok) throw new Error('copy unavailable');
   };
   document.querySelectorAll('.copy-button').forEach((button) => button.addEventListener('click', async () => {
-    try { await copy(button.parentElement.querySelector('code').textContent); button.textContent = 'Copied'; }
-    catch (_) { button.textContent = 'Select text'; }
-    window.setTimeout(() => { button.textContent = 'Copy'; }, 1800);
+    try { await copy(button.parentElement.querySelector('code').textContent); button.textContent = 'Copied'; button.dataset.state = 'success'; }
+    catch (_) { button.textContent = 'Select text'; button.dataset.state = 'warning'; }
+    window.setTimeout(() => { button.textContent = 'Copy'; button.removeAttribute('data-state'); }, 1800);
   }));
 })();

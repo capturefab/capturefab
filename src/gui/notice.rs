@@ -39,11 +39,10 @@ impl Level {
         }
     }
 
-    /// Its glyph's color in `p`: `live` for done; for problems `warn` or
-    /// `danger` through `ink`, which their text can share.
+    /// Its semantic ink in `p`, shared by small glyphs and status text.
     pub(super) fn color(self, p: &Palette) -> Color {
         match self {
-            Level::Done => p.live,
+            Level::Done => p.ink(p.live),
             Level::Warning => p.ink(p.warn),
             Level::Error => p.ink(p.danger),
         }

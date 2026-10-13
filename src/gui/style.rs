@@ -1,5 +1,5 @@
-//! The workbench's look: a quiet, Things-like palette of white space, hairlines
-//! and one blue accent, with matching light and dark variants.
+//! Shared light and dark colors: blue for interaction and selection, green for
+//! success/live acquisition, amber for attention, and red for errors or removal.
 use iced::widget::{
     button, checkbox, container, overlay::menu, pick_list, progress_bar, rule, scrollable, slider,
     text_input,
@@ -19,6 +19,8 @@ const fn alpha(color: Color, a: f32) -> Color {
 /// styles from the theme, so both always agree.
 pub struct Palette {
     pub dark: bool,
+    /// Stage controls need to read over composited glass on any camera image.
+    on_image: bool,
     /// Main content and inspector.
     pub base: Color,
     pub sidebar: Color,
@@ -28,14 +30,16 @@ pub struct Palette {
     pub field: Color,
     pub stage: Color,
     pub hairline: Color,
+    /// Functional outlines and inactive tracks; at least 3:1 against fields
+    /// and panels. Hairlines remain quieter for decorative separators.
+    pub control_border: Color,
     pub text: Color,
     /// Text that informs: hints, captions, values. At least 4.5:1 on every
     /// panel surface, including hovered and selected rows, fields, wells,
     /// segment tracks and gray buttons.
     pub secondary: Color,
-    /// Marks that are not text: placeholders, disabled labels, chevrons and
-    /// decorative icons. Below 4.5:1 (light 3.3:1 on the base, 3.0:1 on the
-    /// sidebar), so text that informs uses `secondary`.
+    /// Decorative marks. Text that informs, including placeholders and
+    /// unavailable action labels, uses `secondary`.
     pub tertiary: Color,
     /// Rings, checks, sliders and icons.
     pub accent: Color,
@@ -55,20 +59,22 @@ pub struct Palette {
 
 pub const LIGHT: Palette = Palette {
     dark: false,
+    on_image: false,
     base: rgb(0xFFFFFF),
     sidebar: rgb(0xF5F5F7),
     hover: rgb(0xEDEDF0),
-    selected: rgb(0xE3E4E9),
+    selected: rgb(0xE3EDFC),
     field: rgb(0xF1F1F4),
     stage: rgb(0x1A1A1C),
     hairline: rgb(0xE5E5E9),
+    control_border: rgb(0x87878E),
     text: rgb(0x1D1D1F),
-    secondary: rgb(0x636368),
+    secondary: rgb(0x5E5E65),
     tertiary: rgb(0x8E8E93),
-    accent: rgb(0x2F7BF5),
-    accent_text: rgb(0x1F6AE0),
-    accent_fill: rgb(0x2670E8),
-    accent_soft: alpha(rgb(0x2F7BF5), 0.12),
+    accent: rgb(0x246CD6),
+    accent_text: rgb(0x1D5FBC),
+    accent_fill: rgb(0x246BDC),
+    accent_soft: alpha(rgb(0x246CD6), 0.12),
     live: rgb(0x248A3D),
     // Amber, a clear step from `danger`'s red; as a mark it reads like the
     // accent (3:1 on a selected row), and `ink` deepens it for text.
@@ -80,18 +86,20 @@ pub const LIGHT: Palette = Palette {
 
 pub const DARK: Palette = Palette {
     dark: true,
+    on_image: false,
     base: rgb(0x1E1E20),
     sidebar: rgb(0x29292C),
     hover: rgb(0x323236),
-    selected: rgb(0x3B3B40),
+    selected: rgb(0x243B5B),
     field: rgb(0x2C2C30),
     stage: rgb(0x111113),
     hairline: rgb(0x343438),
+    control_border: rgb(0x85858F),
     text: rgb(0xEDEDF0),
-    secondary: rgb(0xA6A6AD),
+    secondary: rgb(0xB9B9C2),
     tertiary: rgb(0x7C7C83),
     accent: rgb(0x4C8DF8),
-    accent_text: rgb(0x6AA1FA),
+    accent_text: rgb(0x95BFFF),
     accent_fill: rgb(0x2971E6),
     accent_soft: alpha(rgb(0x4C8DF8), 0.18),
     live: rgb(0x32D158),
@@ -108,13 +116,15 @@ pub const DARK: Palette = Palette {
 /// `tertiary` is for marks only, and glyphs that show an active state use
 /// `accent_text`, not `accent`.
 pub const STAGE: &Palette = &Palette {
+    on_image: true,
     text: ON_STAGE,
     secondary: ON_STAGE_SECONDARY,
+    accent_text: rgb(0xA8CAFF),
     ..DARK
 };
 
-/// The strongest tint text sits on: a hovered pill or button.
-const TINT: f32 = 0.22;
+/// The strongest tint text sits on: a pressed button or selected text.
+const TINT: f32 = 0.30;
 
 impl Palette {
     pub fn of(dark: bool) -> &'static Palette {
@@ -126,8 +136,8 @@ impl Palette {
 
     /// `color` for text and icons: deepened (light) or lightened (dark) just
     /// enough to read at 4.5:1 on any panel surface (`grounds`), and on a
-    /// 12–22% tint of itself over the base or the sidebar, like a status pill
-    /// or the danger button.
+    /// tint of itself up to 30% over a panel, including pressed buttons and
+    /// selected text. Hue stays consistent as contrast increases.
     pub fn ink(&self, color: Color) -> Color {
         let toward = if self.dark {
             Color::WHITE
@@ -135,7 +145,8 @@ impl Palette {
             Color::BLACK
         };
         let tint = Color { a: 1.0, ..color };
-        let tinted = [self.base, self.sidebar].map(|surface| luminance(mix(surface, tint, TINT)));
+        let tinted = [self.base, self.sidebar, self.field, well_fill(self)]
+            .map(|surface| luminance(mix(surface, tint, TINT)));
         let mut amount = 0.0;
         let plain = self.grounds().map(luminance);
         loop {
@@ -144,7 +155,7 @@ impl Palette {
                 ..mix(tint, toward, amount)
             };
             let lum = luminance(ink);
-            if amount >= 0.6
+            if amount >= 1.0
                 || tinted
                     .iter()
                     .chain(&plain)
@@ -152,13 +163,31 @@ impl Palette {
             {
                 return ink;
             }
-            amount += 0.02;
+            amount = (amount + 0.02).min(1.0);
         }
     }
 
-    /// The panel surfaces text sits on plainly: base, sidebar, field and well.
-    fn grounds(&self) -> [Color; 4] {
-        [self.base, self.sidebar, self.field, well_fill(self)]
+    /// Every control surface, including selected/hovered rows and the
+    /// brightest image behind stage glass.
+    fn grounds(&self) -> [Color; 11] {
+        [
+            self.base,
+            self.sidebar,
+            self.field,
+            well_fill(self),
+            self.hover,
+            self.selected,
+            gray(self),
+            segment_fill(self),
+            thumb_fill(self),
+            mix(gray(self), self.text, 0.12),
+            if self.on_image {
+                // Bright white image, then glass, then a pressed glass button.
+                mix(mix(Color::WHITE, rgb(0x1C1C1E), 0.84), Color::WHITE, 0.2)
+            } else {
+                self.base
+            },
+        ]
     }
 }
 
@@ -185,7 +214,7 @@ pub fn theme(dark: bool) -> Theme {
     static THEMES: OnceLock<[Theme; 2]> = OnceLock::new();
     let themes = THEMES.get_or_init(|| {
         [&LIGHT, &DARK].map(|p| {
-            Theme::custom(
+            Theme::custom_with_fn(
                 if p.dark {
                     "Capturefab Dark"
                 } else {
@@ -194,10 +223,29 @@ pub fn theme(dark: bool) -> Theme {
                 iced::theme::Palette {
                     background: p.base,
                     text: p.text,
-                    primary: p.accent,
+                    primary: p.accent_fill,
                     success: p.live,
                     warning: p.warn,
                     danger: p.danger,
+                },
+                |palette| {
+                    let mut extended = iced::theme::palette::Extended::generate(palette);
+                    // The default generator brightens hover blue while keeping
+                    // the resting label, which loses contrast. Reuse our actual
+                    // filled-button colors for widgets without an explicit style.
+                    extended.primary.base = iced::theme::palette::Pair {
+                        color: p.accent_fill,
+                        text: Color::WHITE,
+                    };
+                    extended.primary.strong = iced::theme::palette::Pair {
+                        color: mix(p.accent_fill, Color::BLACK, 0.08),
+                        text: Color::WHITE,
+                    };
+                    extended.primary.weak = iced::theme::palette::Pair {
+                        color: mix(p.base, p.accent, p.accent_soft.a),
+                        text: p.ink(p.accent),
+                    };
+                    extended
                 },
             )
         })
@@ -269,7 +317,7 @@ pub const RADIUS_SHEET: f32 = 14.0;
 
 /// Text on the stage and its overlays, which are dark in both appearances.
 pub const ON_STAGE: Color = rgb(0xF5F5F7);
-pub const ON_STAGE_SECONDARY: Color = alpha(rgb(0xF5F5F7), 0.68);
+pub const ON_STAGE_SECONDARY: Color = rgb(0xC2C2C9);
 
 fn border(radius: f32) -> Border {
     Border {
@@ -287,7 +335,7 @@ fn hairline(color: Color, radius: f32) -> Border {
 }
 
 fn track(p: &Palette) -> Color {
-    if p.dark { rgb(0x4A4A50) } else { rgb(0xD2D2D7) }
+    p.control_border
 }
 
 /// `a` moved toward `b` by `t`, alpha included.
@@ -380,7 +428,7 @@ pub fn overlay(shown: f32) -> impl Fn(&Theme) -> container::Style {
 
 /// `overlay` with its transparency chosen: opaque when `solid`.
 pub fn glass(shown: f32, solid: bool) -> impl Fn(&Theme) -> container::Style {
-    let (fill, edge) = if solid { (1.0, 0.14) } else { (0.78, 0.08) };
+    let (fill, edge) = if solid { (1.0, 0.14) } else { (0.84, 0.08) };
     move |_theme| container::Style {
         background: Some(alpha(rgb(0x1C1C1E), fill * shown).into()),
         border: Border {
@@ -400,11 +448,11 @@ pub fn glass(shown: f32, solid: bool) -> impl Fn(&Theme) -> container::Style {
 
 /// How dark the shade under a tile's caption is, from its bottom edge (0)
 /// to its top (1): held deep across the text row, then fading out.
-const CAPTION_SHADE: [(f32, f32); 3] = [(0.0, 0.7), (0.55, 0.55), (1.0, 0.0)];
+const CAPTION_SHADE: [(f32, f32); 3] = [(0.0, 0.88), (0.75, 0.82), (1.0, 0.0)];
 
 /// The darkening under a tile's caption, so its text reads on any image:
-/// `STAGE.text` at 4.5:1 even over white. Secondary text there needs a
-/// `badge` behind it over bright pictures.
+/// Primary and secondary labels read throughout the caption's text rows,
+/// even over a white image; only the top quarter fades out.
 pub fn caption(_theme: &Theme) -> container::Style {
     let fade = CAPTION_SHADE
         .iter()
@@ -518,7 +566,7 @@ pub fn tooltip(theme: &Theme) -> container::Style {
 pub fn badge(theme: &Theme) -> container::Style {
     let _ = theme;
     container::Style {
-        background: Some(alpha(rgb(0x000000), 0.55).into()),
+        background: Some(alpha(rgb(0x000000), 0.82).into()),
         border: border(5.0),
         text_color: Some(Color::WHITE),
         ..container::Style::default()
@@ -529,7 +577,7 @@ pub fn badge(theme: &Theme) -> container::Style {
 pub fn segment_track(theme: &Theme) -> container::Style {
     let p = Palette::from(theme);
     container::Style {
-        background: Some(if p.dark { p.field } else { rgb(0xEDEDF0) }.into()),
+        background: Some(segment_fill(p).into()),
         border: border(RADIUS),
         ..container::Style::default()
     }
@@ -539,7 +587,7 @@ pub fn segment_track(theme: &Theme) -> container::Style {
 pub fn segment_thumb(theme: &Theme) -> container::Style {
     let p = Palette::from(theme);
     container::Style {
-        background: Some(if p.dark { rgb(0x4A4A50) } else { p.base }.into()),
+        background: Some(thumb_fill(p).into()),
         border: border(RADIUS_SMALL),
         shadow: Shadow {
             color: alpha(Color::BLACK, if p.dark { 0.3 } else { 0.1 }),
@@ -548,6 +596,14 @@ pub fn segment_thumb(theme: &Theme) -> container::Style {
         },
         ..container::Style::default()
     }
+}
+
+fn segment_fill(p: &Palette) -> Color {
+    if p.dark { p.field } else { rgb(0xEDEDF0) }
+}
+
+fn thumb_fill(p: &Palette) -> Color {
+    if p.dark { rgb(0x4A4A50) } else { p.base }
 }
 
 // Buttons
@@ -567,18 +623,18 @@ pub fn primary(theme: &Theme, status: button::Status) -> button::Style {
         button::Status::Active => p.accent_fill,
         button::Status::Hovered => mix(p.accent_fill, Color::BLACK, 0.08),
         button::Status::Pressed => mix(p.accent_fill, Color::BLACK, 0.16),
-        button::Status::Disabled => alpha(p.accent_fill, 0.35),
+        button::Status::Disabled => p.field,
     };
     let mut style = button_base(Some(fill), Color::WHITE, RADIUS);
     if status == button::Status::Disabled {
-        style.text_color = alpha(Color::WHITE, 0.8);
+        style.text_color = p.secondary;
     }
     style
 }
 
 /// The resting fill of `secondary` buttons.
 fn gray(p: &Palette) -> Color {
-    if p.dark { p.selected } else { rgb(0xECECEF) }
+    if p.dark { rgb(0x3B3B40) } else { rgb(0xECECEF) }
 }
 
 /// A gray, borderless button for secondary actions.
@@ -591,26 +647,16 @@ pub fn secondary(theme: &Theme, status: button::Status) -> button::Style {
         button::Status::Pressed => mix(rest, p.text, 0.12),
     };
     let text = if status == button::Status::Disabled {
-        p.tertiary
+        p.secondary
     } else {
         p.text
     };
     button_base(Some(fill), text, RADIUS)
 }
 
-/// Stopping acquisition: a `secondary` button, tinted red only while hovered
-/// or pressed. Routine, not destructive, so the caller adds a `danger` glyph
-/// and keeps the label in the text color.
+/// Stopping acquisition is a routine action. Red belongs to removal/errors.
 pub fn stop(theme: &Theme, status: button::Status) -> button::Style {
-    let p = Palette::from(theme);
-    let mut style = secondary(theme, status);
-    let tint = match status {
-        button::Status::Hovered => 0.12,
-        button::Status::Pressed => 0.2,
-        _ => return style,
-    };
-    style.background = Some(mix(gray(p), p.danger, tint).into());
-    style
+    secondary(theme, status)
 }
 
 /// Text or an icon with no chrome until hovered.
@@ -620,7 +666,7 @@ pub fn plain(theme: &Theme, status: button::Status) -> button::Style {
         button::Status::Active => button_base(None, p.secondary, RADIUS_SMALL),
         button::Status::Hovered => button_base(Some(p.hover), p.text, RADIUS_SMALL),
         button::Status::Pressed => button_base(Some(p.selected), p.text, RADIUS_SMALL),
-        button::Status::Disabled => button_base(None, p.tertiary, RADIUS_SMALL),
+        button::Status::Disabled => button_base(None, p.secondary, RADIUS_SMALL),
     }
 }
 
@@ -633,7 +679,7 @@ pub fn link(theme: &Theme, status: button::Status) -> button::Style {
         button::Status::Pressed => {
             button_base(Some(alpha(p.accent, 0.24)), p.ink(p.accent), RADIUS_SMALL)
         }
-        button::Status::Disabled => button_base(None, p.tertiary, RADIUS_SMALL),
+        button::Status::Disabled => button_base(None, p.secondary, RADIUS_SMALL),
     }
 }
 
@@ -659,7 +705,7 @@ pub fn danger(theme: &Theme, status: button::Status) -> button::Style {
         button::Status::Active => button_base(Some(soft), ink, RADIUS),
         button::Status::Hovered => button_base(Some(alpha(p.danger, 0.18)), ink, RADIUS),
         button::Status::Pressed => button_base(Some(alpha(p.danger, 0.26)), ink, RADIUS),
-        button::Status::Disabled => button_base(Some(soft), p.tertiary, RADIUS),
+        button::Status::Disabled => button_base(Some(p.field), p.secondary, RADIUS),
     }
 }
 
@@ -686,7 +732,7 @@ pub fn segment_label(lit: f32) -> impl Fn(&Theme, button::Status) -> button::Sty
         let p = Palette::from(theme);
         let text = match status {
             button::Status::Hovered | button::Status::Pressed => p.text,
-            button::Status::Disabled => mix(p.tertiary, p.text, lit),
+            button::Status::Disabled => mix(p.secondary, p.text, lit),
             button::Status::Active => mix(p.secondary, p.text, lit),
         };
         button_base(None, text, RADIUS_SMALL)
@@ -760,12 +806,13 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
     let p = Palette::from(theme);
     let border = match status {
         text_input::Status::Focused { .. } => Border {
-            color: alpha(p.accent, 0.8),
+            color: p.accent,
             width: 1.5,
             radius: RADIUS_SMALL.into(),
         },
-        text_input::Status::Hovered => hairline(p.hairline, RADIUS_SMALL),
-        _ => hairline(Color::TRANSPARENT, RADIUS_SMALL),
+        text_input::Status::Hovered => hairline(p.secondary, RADIUS_SMALL),
+        text_input::Status::Disabled => hairline(p.hairline, RADIUS_SMALL),
+        _ => hairline(p.control_border, RADIUS_SMALL),
     };
     text_input::Style {
         background: if matches!(status, text_input::Status::Focused { .. }) {
@@ -776,7 +823,7 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
         .into(),
         border,
         icon: p.secondary,
-        placeholder: p.tertiary,
+        placeholder: p.secondary,
         value: if status == text_input::Status::Disabled {
             p.secondary
         } else {
@@ -804,12 +851,12 @@ pub fn input_dirty(theme: &Theme, status: text_input::Status) -> text_input::Sty
     let p = Palette::from(theme);
     let mut style = input(theme, status);
     if !matches!(status, text_input::Status::Focused { .. }) {
-        style.border = hairline(alpha(p.accent, 0.7), RADIUS_SMALL);
+        style.border = hairline(p.accent, RADIUS_SMALL);
     }
     style
 }
 
-/// A field acknowledging an accepted value: an accent glow that fades out as
+/// A field acknowledging an accepted value: a success glow that fades out as
 /// `t` goes from 1 to 0.
 pub fn input_flash(t: f32) -> impl Fn(&Theme, text_input::Status) -> text_input::Style {
     move |theme, status| {
@@ -817,7 +864,7 @@ pub fn input_flash(t: f32) -> impl Fn(&Theme, text_input::Status) -> text_input:
         if t <= 0.0 {
             return style;
         }
-        let (background, border) = glow(style.background, Palette::from(theme).accent, t);
+        let (background, border) = glow(style.background, Palette::from(theme), t);
         style.background = background;
         if !matches!(status, text_input::Status::Focused { .. }) {
             style.border = border;
@@ -826,15 +873,16 @@ pub fn input_flash(t: f32) -> impl Fn(&Theme, text_input::Status) -> text_input:
     }
 }
 
-/// The accent glow of an accepted value at `t` over a control's `fill`:
-/// the fill tinted and an accent edge.
-fn glow(fill: Background, accent: Color, t: f32) -> (Background, Border) {
+/// The green acknowledgement of an accepted value. The functional outline
+/// remains visible as the success color fades back to its neutral border.
+fn glow(fill: Background, p: &Palette, t: f32) -> (Background, Border) {
+    let t = t.clamp(0.0, 1.0);
     let fill = match fill {
-        Background::Color(fill) => mix(fill, accent, 0.16 * t).into(),
+        Background::Color(fill) => mix(fill, p.live, 0.12 * t).into(),
         other => other,
     };
     let edge = Border {
-        color: alpha(accent, 0.8 * t),
+        color: mix(p.control_border, p.live, t),
         width: 1.5,
         radius: RADIUS_SMALL.into(),
     };
@@ -845,14 +893,14 @@ pub fn pick(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
     let p = Palette::from(theme);
     pick_list::Style {
         text_color: p.text,
-        placeholder_color: p.tertiary,
+        placeholder_color: p.secondary,
         handle_color: p.secondary,
         background: match status {
             pick_list::Status::Active => p.field,
             _ => p.hover,
         }
         .into(),
-        border: hairline(Color::TRANSPARENT, RADIUS_SMALL),
+        border: hairline(p.control_border, RADIUS_SMALL),
     }
 }
 
@@ -863,7 +911,7 @@ pub fn pick_flash(t: f32) -> impl Fn(&Theme, pick_list::Status) -> pick_list::St
         if t <= 0.0 {
             return style;
         }
-        (style.background, style.border) = glow(style.background, Palette::from(theme).accent, t);
+        (style.background, style.border) = glow(style.background, Palette::from(theme), t);
         style
     }
 }
@@ -875,7 +923,7 @@ pub fn menu(theme: &Theme) -> menu::Style {
         border: hairline(p.hairline, RADIUS),
         text_color: p.text,
         selected_text_color: Color::WHITE,
-        selected_background: p.accent.into(),
+        selected_background: p.accent_fill.into(),
         shadow: Shadow {
             color: p.shadow,
             offset: Vector::new(0.0, 6.0),
@@ -891,7 +939,7 @@ pub fn check(theme: &Theme, status: checkbox::Status) -> checkbox::Style {
         checkbox::Status::Hovered { is_checked } => (is_checked, true, false),
         checkbox::Status::Disabled { is_checked } => (is_checked, false, true),
     };
-    let fill = if disabled { p.tertiary } else { p.accent };
+    let fill = if disabled { p.tertiary } else { p.accent_fill };
     checkbox::Style {
         background: if checked { fill } else { p.base }.into(),
         icon_color: Color::WHITE,
@@ -901,7 +949,7 @@ pub fn check(theme: &Theme, status: checkbox::Status) -> checkbox::Style {
             } else if hovered {
                 p.secondary
             } else {
-                p.tertiary
+                p.control_border
             },
             width: 1.5,
             radius: 4.5.into(),
@@ -928,11 +976,7 @@ pub fn slide(theme: &Theme, status: slider::Status) -> slider::Style {
             },
             background: Color::WHITE.into(),
             border_width: 1.0,
-            border_color: if p.dark {
-                Color::TRANSPARENT
-            } else {
-                rgb(0xD2D2D7)
-            },
+            border_color: p.accent_fill,
         },
     }
 }
@@ -1009,6 +1053,9 @@ pub fn sheet_scroll(theme: &Theme, status: scrollable::Status) -> scrollable::St
 }
 
 #[cfg(test)]
+mod contrast_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1029,11 +1076,11 @@ mod tests {
 
     #[test]
     fn ink_reads_on_tints_of_its_color() {
-        for p in [&LIGHT, &DARK] {
+        for p in [&LIGHT, &DARK, STAGE] {
             for color in [p.live, p.warn, p.danger, p.accent, p.accent_text] {
                 let ink = p.ink(color);
                 for surface in [p.base, p.sidebar] {
-                    for amount in [0.12, 0.14, 0.18, 0.22] {
+                    for amount in [0.12, 0.14, 0.18, 0.22, 0.26, 0.30] {
                         let r = ratio(ink, tint(color, amount, surface));
                         assert!(r >= 4.5, "{color:?} at {amount} (dark {}): {r:.2}", p.dark);
                     }
@@ -1084,8 +1131,7 @@ mod tests {
 
     #[test]
     fn ink_keeps_colors_that_already_read() {
-        assert_eq!(DARK.ink(DARK.live), DARK.live);
-        assert_eq!(DARK.ink(DARK.warn), DARK.warn);
+        assert_eq!(LIGHT.ink(LIGHT.text), LIGHT.text);
         let faded = Color {
             a: 0.5,
             ..LIGHT.danger
@@ -1129,7 +1175,10 @@ mod tests {
     #[test]
     fn stage_text_reads_on_glass_over_bright_pictures() {
         for picture in [Color::WHITE, rgb(0xC0C0C0), rgb(0x808080)] {
-            let glass = over(alpha(rgb(0x1C1C1E), 0.78), picture);
+            let Some(Background::Color(fill)) = glass(1.0, false)(&theme(true)).background else {
+                panic!("glass needs a solid color backing");
+            };
+            let glass = over(fill, picture);
             for text in [STAGE.text, STAGE.secondary] {
                 let r = ratio(over(text, glass), glass);
                 assert!(r >= 4.5, "{text:?} over {picture:?}: {r:.2}");
