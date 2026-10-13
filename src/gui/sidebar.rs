@@ -727,6 +727,12 @@ impl Workbench {
             Some(_) => format!("{} {} · {}", camera.vendor, camera.model, dot_state.about()),
             None => format!("Connect to {} {}", camera.vendor, camera.model),
         };
+        let profile = state.map_or(&camera.profile, |state| &state.info.profile);
+        hint.push_str(&format!(
+            "\n{}\nDetected from {}",
+            profile.kind.summary(),
+            profile.source
+        ));
         // The dot says it stalled; for how long is here.
         if let Some(silent) = stalled {
             hint = format!("{hint}\n{}", silence(silent));
@@ -1068,6 +1074,7 @@ mod tests {
             model: "Pattern camera".into(),
             serial: serial.into(),
             address: None,
+            profile: Default::default(),
         }
     }
 

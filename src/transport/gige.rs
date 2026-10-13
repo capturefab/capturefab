@@ -162,6 +162,7 @@ fn discovery_info(payload: &[u8], source: Ipv4Addr) -> Result<CameraInfo> {
         model: fixed_text(&payload[0x68..0x88]),
         serial,
         address: Some(address.to_string()),
+        profile: Default::default(),
     })
 }
 

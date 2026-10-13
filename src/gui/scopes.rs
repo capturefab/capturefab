@@ -253,6 +253,9 @@ impl Workbench {
     /// The width the scope cards take from the right edge of a `stage` this
     /// size, their padding included; 0 while none shows.
     pub(super) fn scope_room(&self, stage: Size) -> f32 {
+        if !self.intensity_image() || self.camera_kind() == CameraKind::LineScan {
+            return 0.0;
+        }
         let exposure = self.exposure_slide.get(self.now) > 0.01 && self.exposure.is_some();
         if !exposure && self.focus_slide.get(self.now) <= 0.01 {
             0.0
@@ -266,6 +269,9 @@ impl Workbench {
     /// The scope cards stacked in the stage's top right corner, compact on
     /// a small stage.
     pub(super) fn scopes(&self) -> Option<Element<'_, Message>> {
+        if !self.intensity_image() || self.camera_kind() == CameraKind::LineScan {
+            return None;
+        }
         let exposure = self.exposure_slide.get(self.now);
         let focus = self.focus_slide.get(self.now);
         if exposure <= 0.01 && focus <= 0.01 {
@@ -478,6 +484,9 @@ impl Workbench {
     /// The draggable focus region over the image, when shown. It reads the
     /// picture's own scale, so it stays on the picture while a zoom eases.
     pub(super) fn focus_overlay(&self, shown: &Shown) -> Option<Element<'_, Message>> {
+        if !self.intensity_image() || self.camera_kind() == CameraKind::LineScan {
+            return None;
+        }
         let t = self.focus_slide.get(self.now);
         if t <= 0.01 {
             return None;

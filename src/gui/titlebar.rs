@@ -687,7 +687,10 @@ impl Workbench {
             // While a start or stop is on its way, the button keeps the
             // label it was pressed with.
             let streaming = stopping.unwrap_or(snapshot.streaming);
-            actions = actions.push(self.auto_button(p)).push(tip(
+            if self.camera_kind().supports_auto() || snapshot.auto.is_some() {
+                actions = actions.push(self.auto_button(p));
+            }
+            actions = actions.push(tip(
                 stream_button(
                     streaming,
                     if streaming { "Stop" } else { "Start" },
@@ -871,7 +874,12 @@ impl Workbench {
             )
         };
         let auto_on = snapshot.cameras.iter().filter(|c| c.auto.is_some()).count();
-        let (auto_label, all_on) = auto_all(auto_on, total);
+        let auto_total = snapshot
+            .cameras
+            .iter()
+            .filter(|c| c.info.profile.kind.supports_auto() || c.auto.is_some())
+            .count();
+        let (auto_label, all_on) = auto_all(auto_on, auto_total);
         let auto_busy = self.auto_busy();
         let mut auto = row![].spacing(6).align_y(Alignment::Center);
         if auto_busy {
@@ -893,7 +901,9 @@ impl Workbench {
                         };
                         style::toggle(all_on)(theme, status)
                     })
-                    .on_press_maybe((!auto_busy).then_some(Message::AllAuto(!all_on))),
+                    .on_press_maybe(
+                        (!auto_busy && auto_total > 0).then_some(Message::AllAuto(!all_on))
+                    ),
                 if self.pending(Job::AutoOn) || self.pending(Job::AutoOff) {
                     "Switching auto mode…"
                 } else if auto_busy {
@@ -901,7 +911,7 @@ impl Workbench {
                 } else if all_on {
                     "Switch every camera to manual"
                 } else {
-                    "Tune exposure, gain and frame rate on every camera"
+                    "Tune exposure, gain and frame rate on image cameras"
                 },
             ),
             tip(

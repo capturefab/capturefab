@@ -60,6 +60,7 @@ pub fn info(selector: &str) -> Result<CameraInfo> {
         model: "Document scanner".into(),
         serial: device.into(),
         address: Some(selector.into()),
+        profile: Default::default(),
     })
 }
 

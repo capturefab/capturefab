@@ -23,6 +23,55 @@ camera availability depends on operating system permissions and drivers. This
 does not require Aravis, libusb, a separately installed FFmpeg, or a camera vendor
 SDK in a release containing the matching embedded FFmpeg.
 
+## Camera types and stream limits
+
+Camera purpose and transport are separate. Area scan, line scan, depth, microscope, thermal and document scanner profiles adapt the interface using controls the source advertises:
+
+| Profile | Useful controls when advertised | Display behavior |
+| --- | --- | --- |
+| Area scan | Image region, exposure, gain, frame timing | Complete image frames |
+| Line scan | Line width, block height in lines, line rate, triggers, encoders | Recent received rows; gaps mark skipped blocks |
+| Depth | Component selection, output mode, depth range, coordinate units/scale/offset | Scalar range colors with automatic raw sample bounds |
+| Microscope | Focus, objective/magnification, illumination, stage | Image preview with focus region and sharpness tools |
+| Thermal | Temperature output, range, emissivity, radiometric calibration | Scalar heatmap with automatic raw sample bounds |
+| Document scanner | Resolution, mode, paper source | Page acquisition on demand |
+
+Other control names remain accessible through the full feature list. Controls do not imply writable access: use `features`, choices in feature metadata and live bounds. Native host cameras expose their existing size/frame-rate/video-mode controls; identifying a microscope or thermal source does not add host-driver focus or radiometric controls.
+
+Every camera identity includes `profile: {kind, source, evidence, capabilities}` in discovery, info and session status JSON. `kind` is `unknown`, `area_scan`, `line_scan`, `depth`, `microscope`, `thermal` or `document_scanner`; `source` is `unknown`, `transport`, `identity`, `features` or `device_metadata`. `evidence` explains the classification and `capabilities` lists advertised control families. A discovery profile may be provisional until connection reads GenICam features. Detection uses this priority:
+
+1. A document scanner transport.
+2. An explicit device class in `DeviceType`, `CameraType` or `SensorType`.
+3. Explicit `DeviceScanType=Linescan` geometry.
+4. Specialty feature families: depth/Scan3d output, radiometric temperature output, microscope focus with objective/magnification, or line-rate controls.
+5. Remaining declared scan geometry, model identity, then conventional image dimensions and frame timing.
+
+Absent evidence leaves the type unknown. Vendor branding, high bit depth, or `Height=1` alone do not identify depth, thermal or line scan cameras. Capabilities come from features independently of classification, and feature metadata remains the authority for current availability and settings.
+
+The transport pipeline delivers one raster per acquired frame or line block. Depth cameras must expose a compatible single-component image stream, for example a scalar range plane; component controls only configure the device's advertised output. Recognizing depth metadata does not decode multipart payloads, GenDC containers, XYZ point-cloud payloads or proprietary vendor SDK protocols. Those paths remain unsupported. Configure a compatible single-component stream when the device offers one. No physical camera compatibility is implied by a detected profile.
+
+The automatic GUI previews are display transformations. **Sensor pixels** returns to the ordinary sensor preview. Line history contains recently received display rows, can downsample large blocks, and marks skipped blocks because live consumers prefer the newest frame; it is not a complete encoder-aligned reconstruction. Saving captures each acquired block rather than the stitched history. Depth/thermal legends show raw sample bounds and automatically remap colors per image. They do not apply the device's measurement calibration. Coordinate previews honor an advertised Scan3dInvalidDataFlag/Value for the C coordinate; otherwise only nonfinite samples are marked invalid.
+
+For quantitative depth or temperature data, capture `--format raw` and retain the selected component's calibration features, units, scale and offset. Raw files preserve acquired bytes and precision but do not embed that metadata; also retain frame dimensions and pixel format. PNG, JPEG, PGM, PPM and forwarded video are 8-bit visualizations without measurement calibration. Forwarding does not carry the GUI color map, including when a higher-bit-depth sensor format is passed to the encoder. Generic auto exposure is supported for image cameras with suitable controls, including microscopes; line scan, depth, thermal and document scanner sources return unsupported and need their specific timing or measurement controls.
+
+## Typed simulators
+
+`sim:line[:name]`, `sim:depth[:name]`, `sim:microscope[:name]` and `sim:thermal[:name]` exercise the specialized interface and automation without hardware. `sim:0` and arbitrary other simulator names retain the area-scan pattern camera.
+
+```sh
+capturefab --camera sim:line capture --set Height=1 \
+  --set AcquisitionLineRate=2000 --set ExposureTime=100 -o line.png
+capturefab --camera sim:depth get ComponentSelector Scan3dOutputMode \
+  Scan3dCoordinateScale Scan3dCoordinateOffset Scan3dCoordinateUnit --json
+capturefab --camera sim:depth capture --format raw -o range.raw
+capturefab --camera sim:microscope capture --set FocusPosition=50 \
+  --set Magnification=4 --set IlluminationIntensity=70 -o micrograph.png
+capturefab --camera sim:thermal get TemperatureLinearResolution TemperatureUnit --json
+capturefab --camera sim:thermal capture --format raw -o temperature.raw
+```
+
+The line simulator accepts single lines or blocks and schedules them using line rate and exposure. The depth simulator supplies `Coord3D_C16` samples with a millimeter scale. The microscope's focus, magnification and illumination change its image. The thermal simulator supplies `Mono16` samples at 0.01 Kelvin per raw value. These are synthetic sources, not hardware compatibility tests.
+
 ## Document scans
 
 Run `capturefab scanners --json` for scanner IDs, or `discover --json` for all sources. Linux requires SANE's `scanimage` and suitable backends; Windows requires Windows PowerShell, the WIA service and a WIA driver; macOS uses a bundled ImageCaptureCore helper. Set a longer transport deadline for physical scanning:

@@ -46,6 +46,7 @@ fn camera_info(d: &DeviceInfo) -> CameraInfo {
         model: d.product_string().unwrap_or("USB3 Vision camera").into(),
         serial,
         address: Some(location),
+        profile: Default::default(),
     }
 }
 pub fn discover() -> Result<Vec<CameraInfo>> {

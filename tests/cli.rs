@@ -912,6 +912,214 @@ fn auto_mode_session_contract() {
 }
 
 #[test]
+fn camera_types_propagate_through_workers_and_preserve_native_capture() {
+    let dir = std::env::temp_dir().join(format!(
+        "capturefab-camera-types-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+        .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .args(["--json", "serve", "--name", "types-ci"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&line).unwrap()["result"]["ready"],
+        true,
+        "{line}"
+    );
+    let fixture = Fixture {
+        child,
+        dir: dir.clone(),
+    };
+    let mut worker_pids = Vec::new();
+    for (selector, kind, source, control, height, bytes_per_pixel) in [
+        (
+            "sim:0",
+            "area_scan",
+            "device_metadata",
+            "ExposureTime",
+            64,
+            1,
+        ),
+        (
+            "sim:line",
+            "line_scan",
+            "device_metadata",
+            "AcquisitionLineRate",
+            16,
+            1,
+        ),
+        (
+            "sim:depth",
+            "depth",
+            "features",
+            "Scan3dCoordinateScale",
+            64,
+            2,
+        ),
+        (
+            "sim:microscope",
+            "microscope",
+            "features",
+            "FocusPosition",
+            64,
+            1,
+        ),
+        (
+            "sim:thermal",
+            "thermal",
+            "features",
+            "TemperatureLinearResolution",
+            64,
+            2,
+        ),
+    ] {
+        let connected = json(
+            &dir,
+            &["--json", "--session", "types-ci", "connect", selector],
+        );
+        assert_eq!(
+            connected["connected"]["profile"]["kind"], kind,
+            "{selector}"
+        );
+        assert_eq!(
+            connected["connected"]["profile"]["source"], source,
+            "{selector}"
+        );
+        assert!(
+            !connected["connected"]["profile"]["evidence"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let pid = connected["worker_pid"].as_u64().unwrap();
+        assert_ne!(pid, u64::from(fixture.child.id()));
+        assert!(!worker_pids.contains(&pid));
+        worker_pids.push(pid);
+
+        let info = json(
+            &dir,
+            &[
+                "--json",
+                "--session",
+                "types-ci",
+                "--camera",
+                selector,
+                "info",
+            ],
+        );
+        assert_eq!(info["camera"]["profile"]["kind"], kind);
+        assert!(
+            info["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|feature| feature["name"] == control)
+        );
+        if kind == "line_scan" {
+            assert!(
+                !info["features"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|feature| feature["name"] == "AcquisitionFrameRate")
+            );
+        }
+        let dimensions = format!("Height={height}");
+        let output = dir.join(format!("{kind}.raw"));
+        json(
+            &dir,
+            &[
+                "--json",
+                "--session",
+                "types-ci",
+                "--camera",
+                selector,
+                "capture",
+                "-o",
+                output.to_str().unwrap(),
+                "-f",
+                "raw",
+                "--set",
+                "Width=64",
+                "--set",
+                &dimensions,
+            ],
+        );
+        let raw = std::fs::read(&output).unwrap();
+        assert_eq!(raw.len(), 64 * height * bytes_per_pixel, "{selector}");
+        if bytes_per_pixel == 2 {
+            let samples: Vec<_> = raw
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect();
+            assert!(
+                samples.iter().any(|sample| *sample > 255),
+                "{selector}: scalar samples were reduced to a preview"
+            );
+            assert!(samples.windows(2).any(|pair| pair[0] != pair[1]));
+        }
+
+        if ["line_scan", "depth", "thermal"].contains(&kind) {
+            let automatic = cmd(
+                &dir,
+                &[
+                    "--json",
+                    "--session",
+                    "types-ci",
+                    "--camera",
+                    selector,
+                    "auto",
+                ],
+            );
+            assert_eq!(
+                automatic.status.code(),
+                Some(5),
+                "{selector}: {}",
+                String::from_utf8_lossy(&automatic.stdout)
+            );
+            let error: Value = serde_json::from_slice(&automatic.stdout).unwrap();
+            assert_eq!(error["error"]["code"], "unsupported");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("automatic image tuning")
+            );
+        }
+        let status = json(
+            &dir,
+            &[
+                "--json",
+                "--session",
+                "types-ci",
+                "--camera",
+                selector,
+                "status",
+            ],
+        );
+        assert_eq!(
+            status["connected"]["profile"]["kind"], kind,
+            "profile lost after capture"
+        );
+    }
+    let all = json(&dir, &["--json", "--session", "types-ci", "status"]);
+    assert_eq!(all["cameras"].as_array().unwrap().len(), 5);
+}
+
+#[test]
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn discovery_reports_native_backend_failure_without_hiding_other_cameras() {
     let dir = std::env::temp_dir().join(format!(

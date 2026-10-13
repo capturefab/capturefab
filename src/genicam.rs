@@ -476,6 +476,66 @@ impl NodeMap {
             })
             .collect()
     }
+    /// Classification needs feature names and only a few identifying values.
+    /// Avoid a second full live feature/bounds/access walk during connection.
+    pub(crate) fn profile_features(&self, io: &mut dyn RegisterIo) -> Vec<FeatureInfo> {
+        const IDENTITY: [&str; 7] = [
+            "DeviceType",
+            "CameraType",
+            "SensorType",
+            "DeviceScanType",
+            "PixelFormat",
+            "ComponentSelector",
+            "Scan3dOutputMode",
+        ];
+        let exposed = self.exposed_features();
+        self.nodes
+            .iter()
+            .filter(|(name, node)| {
+                IDENTITY.contains(&name.as_str())
+                    || (exposed.as_ref().is_none_or(|names| names.contains(*name))
+                        && node.prop("Visibility") != Some("Invisible")
+                        && matches!(
+                            node.kind.as_str(),
+                            "Integer"
+                                | "Float"
+                                | "Boolean"
+                                | "Enumeration"
+                                | "String"
+                                | "Command"
+                                | "IntReg"
+                                | "MaskedIntReg"
+                                | "FloatReg"
+                                | "StringReg"
+                                | "IntSwissKnife"
+                                | "SwissKnife"
+                                | "IntConverter"
+                                | "Converter"
+                        ))
+            })
+            .map(|(name, node)| {
+                let value = if IDENTITY.contains(&name.as_str()) {
+                    self.get(io, name).ok()
+                } else {
+                    None
+                };
+                FeatureInfo {
+                    name: name.clone(),
+                    display_name: node.prop("DisplayName").unwrap_or(name).into(),
+                    kind: node.kind.clone(),
+                    value,
+                    writable: false,
+                    description: String::new(),
+                    unit: node.prop("Unit").map(str::to_string),
+                    min: None,
+                    max: None,
+                    inc: None,
+                    choices: Vec::new(),
+                    error: None,
+                }
+            })
+            .collect()
+    }
     fn exposed_features(&self) -> Option<BTreeSet<String>> {
         if !self
             .nodes

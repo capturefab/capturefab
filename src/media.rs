@@ -341,6 +341,7 @@ pub fn info(url: &str) -> Result<CameraInfo> {
         ),
         serial: format!("{hash:016x}"),
         address: Some(safe_url),
+        profile: Default::default(),
     })
 }
 struct Executable {

@@ -55,10 +55,31 @@ capturefab --camera 192.168.1.10 capture -n 10 -o frames --json
 
 Selectors can be a discovered camera ID, unique serial, or GigE IPv4 address. GenICam feature names, access modes, increments, selectors, and bounds depend on the device. Inspect `features` and read back important settings. Capture outputs never silently overwrite existing files. Use `--format raw` when preserving an unsupported pixel format matters.
 
-Use the built-in pattern camera to exercise automation without hardware:
+## Camera profiles and specialized acquisition
+
+Camera identity JSON now includes `profile: {kind, source, evidence, capabilities}`. Read it in `discover` result `devices[]`, `info` result `camera`, and `status` result `connected` or `cameras[].info`. Discovery may have only identity hints; connection refines the profile from readable features. Kinds are `unknown`, `area_scan`, `line_scan`, `depth`, `microscope`, `thermal` and `document_scanner`. Sources are `unknown`, `transport`, `identity`, `features` and `device_metadata`. `evidence` is a string array explaining the classification; `capabilities` is an array of advertised control families. `schema.camera_profiles` describes the enum values and fields. Profiles add metadata to identities; the JSON envelope and capture formats are unchanged.
+
+Detection prioritizes scanner transport, explicit `DeviceType`/`CameraType`/`SensorType` class, explicit `DeviceScanType=Linescan`, specialty feature families, remaining declared scan geometry, model identity, then conventional frame dimensions/timing. `Height=1`, high bit depth and a vendor name alone are not type evidence. A profile does not guarantee a feature exists or is writable: inspect the live feature list, selector values, choices and bounds before setting it.
+
+The GUI puts line geometry/timing and triggers/encoders first for line scan; components, depth range and calibration first for depth; optics, illumination and stage first for microscopes; temperature/radiometric controls first for thermal; and scan controls first for document scanners. Microscope image previews keep the focus region and sharpness tools. Line previews show recent received display rows and gaps for skipped blocks; they can downsample large blocks and are not complete encoder-aligned reconstructions. Scalar depth/thermal previews automatically color the raw sample range and show its bounds. **Sensor pixels** returns to the ordinary preview. Display transformations do not change acquired or raw captured bytes, and captures save individual line blocks rather than their preview history.
+
+For depth and temperature measurements use `--format raw` and separately retain the selected component, unit, scale, offset and calibration features. Raw capture preserves sample bytes and precision; it does not embed dimensions, pixel format or calibration metadata, so retain those separately. PNG, JPEG, PGM, PPM and forwarded video are 8-bit visualizations; forwarding lacks measurement calibration and the GUI color map. A raw-value preview legend is not a calibrated distance or temperature.
+
+Existing transports acquire single rasters. Depth sources need a compatible single-component stream; multipart, GenDC, point-cloud payloads and vendor SDK-only access remain unsupported. Type detection does not establish physical camera compatibility. Generic auto exposure is unsupported for line scan, depth, thermal and document scanner sources; configure their timing or measurement controls directly. Image cameras, including microscopes with suitable advertised controls, retain auto exposure support.
+
+Use the built-in typed cameras to exercise automation without hardware. Selectors `sim:line[:name]`, `sim:depth[:name]`, `sim:microscope[:name]` and `sim:thermal[:name]` accept optional names. `sim:0` and arbitrary other names retain the area-scan pattern camera:
 
 ```sh
 capturefab --camera sim:0 capture -o pattern.png --json
+capturefab --camera sim:line capture --set Height=64 \
+  --set AcquisitionLineRate=2000 --set ExposureTime=100 -o line-block.png --json
+capturefab --camera sim:depth get PixelFormat Scan3dCoordinateScale \
+  Scan3dCoordinateOffset Scan3dCoordinateUnit --json
+capturefab --camera sim:depth capture --format raw -o depth.raw --json
+capturefab --camera sim:microscope capture --set FocusPosition=50 \
+  --set Magnification=4 --set IlluminationIntensity=70 -o micrograph.png --json
+capturefab --camera sim:thermal get TemperatureLinearResolution TemperatureUnit --json
+capturefab --camera sim:thermal capture --format raw -o thermal.raw --json
 ```
 
 ## Let Capturefab tune exposure and frame rate

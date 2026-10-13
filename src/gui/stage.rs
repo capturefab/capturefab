@@ -920,6 +920,7 @@ impl Workbench {
         .wrapping(text::Wrapping::None);
         let camera = self.active_camera();
         let mut details = vec![];
+        let kind = self.camera_kind();
         // With the title bar hidden, say whose picture this is.
         if self.image_mode {
             if let Some(connected) = &snapshot.connected {
@@ -930,10 +931,22 @@ impl Workbench {
             }
         }
         if let Some((_, width, height, format, _)) = self.frame_meta {
-            details.push(format!("{width} × {height}"));
+            details.push(if kind == CameraKind::LineScan {
+                format!("{width} px × {height} lines/block")
+            } else {
+                format!("{width} × {height}")
+            });
             details.push(pixel_name(format));
         }
-        details.push(format!("{} frames", grouped(snapshot.frames)));
+        details.push(format!(
+            "{} {}",
+            grouped(snapshot.frames),
+            if kind == CameraKind::LineScan {
+                "blocks"
+            } else {
+                "frames"
+            }
+        ));
         let mut summary = row![
             one_line(
                 details.join("  ·  "),
@@ -956,6 +969,7 @@ impl Workbench {
                 )
                 .push(self.loss_label(camera, lost, shown));
         }
+        let intensity = self.intensity_image() && kind != CameraKind::LineScan;
         let bar = row![
             row![
                 tip_above(
@@ -988,7 +1002,7 @@ impl Workbench {
                 glass(
                     Icon::Chart,
                     self.exposure_open,
-                    Some(Message::ToggleExposure)
+                    intensity.then_some(Message::ToggleExposure)
                 ),
                 Action::ToggleExposure.hint("Histogram", os)
             ),
@@ -996,7 +1010,7 @@ impl Workbench {
                 glass(
                     Icon::Scan,
                     self.focus.open,
-                    Some(Message::ToggleFocusRegion)
+                    intensity.then_some(Message::ToggleFocusRegion)
                 ),
                 Action::ToggleFocusRegion.hint("Focus region", os)
             ),
@@ -1023,7 +1037,34 @@ impl Workbench {
         ]
         .spacing(6)
         .align_y(Alignment::Center);
-        container(bar)
+        let mut content = column![bar].spacing(4);
+        if matches!(
+            kind,
+            CameraKind::LineScan | CameraKind::Depth | CameraKind::Thermal
+        ) {
+            let state = snapshot
+                .active_camera
+                .as_ref()
+                .and_then(|id| self.camera_views.get(id));
+            let label = state.map_or("Sensor pixels", |state| state.label(kind));
+            let mut view = row![tip_above(
+                segment(label, state.is_some_and(|state| !state.sensor), Message::ToggleCameraView),
+                "Switch between the camera-specific display and sensor pixels. Captures keep their original geometry."
+            )].spacing(8).align_y(Alignment::Center);
+            if let Some(legend) = state.and_then(|state| state.legend.as_ref()) {
+                view = view.push(
+                    one_line(
+                        legend,
+                        style::CAPTION,
+                        style::SANS,
+                        fade(stage.secondary, shown),
+                    )
+                    .width(Fill),
+                );
+            }
+            content = content.push(view);
+        }
+        container(content)
             .max_width(if self.image_mode { 760 } else { 640 })
             .width(Fill)
             .padding([6, 8])

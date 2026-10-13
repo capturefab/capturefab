@@ -1,6 +1,7 @@
 //! The native workbench. Camera I/O lives on the session worker, never the UI thread.
 mod brand;
 mod camera_history;
+mod camera_view;
 mod destinations;
 mod format;
 mod gpu;
@@ -32,6 +33,7 @@ mod widgets;
 
 use crate::{
     auto::{AutoChange, AutoStatus},
+    camera_profile::CameraKind,
     frame,
     genicam::FeatureInfo,
     session::{SessionCommand, SessionHandle, SessionSnapshot},
@@ -170,8 +172,11 @@ pub fn run_capture(
             let scene = std::env::var("CAPTUREFAB_SCREENSHOT_SCENE").unwrap_or_default();
             let scene: Vec<&str> = scene.split(',').map(str::trim).collect();
             let welcome = scene.contains(&"welcome");
+            let existing = handle.snapshot().cameras.len() as u32;
             let count = if welcome {
                 0
+            } else if existing > 0 {
+                existing
             } else {
                 demo_cameras.clamp(1, 16)
             };
@@ -189,7 +194,7 @@ pub fn run_capture(
                 save: None,
                 outcome: app_outcome.clone(),
             });
-            for index in 0..count {
+            for index in 0..if existing == 0 { count } else { 0 } {
                 app.send(
                     Job::Connect,
                     SessionCommand::Connect {
@@ -586,6 +591,7 @@ enum Message {
     ToggleSidebar,
     ToggleInspector,
     ToggleImage,
+    ToggleCameraView,
     Resized(Size),
     WindowMode(window::Mode, Option<Size>),
     ZoomWindow,
@@ -677,6 +683,7 @@ struct Workbench {
     frame_id: Option<u64>,
     display_error: Option<String>,
     previews: HashMap<String, CameraPreview>,
+    camera_views: HashMap<String, camera_view::CameraView>,
     /// Each streaming camera's recent frame rate, by camera id.
     throughput: HashMap<String, sparkline::History>,
     /// Whether each streaming camera's frames keep coming, by camera id.
@@ -825,6 +832,7 @@ impl Workbench {
             frame_id: None,
             display_error: None,
             previews: HashMap::new(),
+            camera_views: HashMap::new(),
             throughput: HashMap::new(),
             liveness: HashMap::new(),
             pending: Vec::new(),
@@ -1368,6 +1376,10 @@ impl Workbench {
             .map(|camera| camera.id.clone());
         if camera_id != self.observed_camera {
             if let Some(previous) = &self.observed_camera {
+                self.camera_views
+                    .entry(previous.clone())
+                    .or_default()
+                    .focus_open = Some(self.focus.open);
                 self.camera_drafts.insert(
                     previous.clone(),
                     (self.edits.clone(), self.edit_sources.clone()),
@@ -1388,6 +1400,14 @@ impl Workbench {
             self.display_error = None;
             self.exposure = None;
             self.focus.reset();
+            let kind = self.camera_kind();
+            if let Some(id) = &self.observed_camera {
+                let state = self.camera_views.entry(id.clone()).or_default();
+                self.focus.open = state
+                    .focus_open
+                    .unwrap_or(kind == CameraKind::Microscope || self.focus.open);
+                state.focus_open = Some(self.focus.open);
+            }
             self.gpu.retire(MAIN_VIEW);
         }
         // Keep untouched editors in sync with CLI/agent changes without destroying drafts.
@@ -1453,13 +1473,19 @@ impl Workbench {
     }
 
     fn update_frames(&mut self) {
+        self.camera_views.retain(|id, _| {
+            self.snapshot
+                .cameras
+                .iter()
+                .any(|camera| &camera.info.id == id)
+        });
         if self.overview() {
             self.update_previews();
             if self.frame_id.take().is_some() {
                 self.gpu.retire(MAIN_VIEW);
             }
         } else {
-            self.update_frame();
+            self.update_frame(true);
             for key in self.previews.drain().map(|(key, _)| key) {
                 self.gpu.retire(&key);
             }
@@ -1492,10 +1518,16 @@ impl Workbench {
                 self.now,
             );
             let meta = (frame.id, frame.width, frame.height, frame.pixel_format);
-            let shown =
-                preview::present(gpu, &mut preview.shown, &camera.info.id, frame, |frame| {
-                    frame::preview_rgba(frame, 640, 480)
-                });
+            let state = self.camera_views.entry(camera.info.id.clone()).or_default();
+            let shown = camera_view::present(
+                gpu,
+                &mut preview.shown,
+                state,
+                (camera.info.profile.kind, &camera.features),
+                &camera.info.id,
+                frame,
+                (640, 480),
+            );
             match shown {
                 Ok(()) => {
                     preview.meta = Some(meta);
@@ -1506,7 +1538,7 @@ impl Workbench {
         }
     }
 
-    fn update_frame(&mut self) {
+    fn update_frame(&mut self, arrival: bool) {
         let Some(frame) = self.handle.latest_frame() else {
             return;
         };
@@ -1514,7 +1546,7 @@ impl Workbench {
             return;
         }
         self.frame_id = Some(frame.id);
-        if let Some(id) = &self.observed_camera {
+        if arrival && let Some(id) = &self.observed_camera {
             liveness::seen(&mut self.liveness, self.scene.frozen.as_ref(), id, self.now);
         }
         let meta = (
@@ -1534,11 +1566,18 @@ impl Workbench {
             self.focus.reset();
         }
         self.measure(&frame);
-        let shown = preview::present(&self.gpu, &mut self.shown, MAIN_VIEW, frame, |frame| {
-            // Decode straight into RGBA bytes: one pass, one allocation.
-            let pixels = frame::convert(frame, |[r, g, b]| [r, g, b, 255])?;
-            Ok((frame.width, frame.height, pixels.into_flattened()))
-        });
+        let kind = self.camera_kind();
+        let id = self.snapshot.active_camera.clone().unwrap_or_default();
+        let state = self.camera_views.entry(id).or_default();
+        let shown = camera_view::present(
+            &self.gpu,
+            &mut self.shown,
+            state,
+            (kind, &self.snapshot.features),
+            MAIN_VIEW,
+            frame,
+            (u32::MAX, u32::MAX),
+        );
         match shown {
             Ok(()) => {
                 self.frame_meta = Some(meta);
@@ -1551,6 +1590,11 @@ impl Workbench {
     /// Update the open scopes from `frame`. A frame they cannot measure
     /// still shows; presenting it reports any real decoding problem.
     fn measure(&mut self, frame: &crate::types::Frame) {
+        if !self.intensity_image() || self.camera_kind() == CameraKind::LineScan {
+            self.exposure = None;
+            self.focus.reset();
+            return;
+        }
         if self.exposure_open {
             self.exposure = frame::exposure(frame).ok();
         }
@@ -1631,6 +1675,17 @@ impl Workbench {
             .connected
             .as_ref()
             .is_some_and(|camera| camera.transport == crate::types::Transport::Scanner)
+    }
+
+    fn camera_kind(&self) -> CameraKind {
+        self.snapshot
+            .connected
+            .as_ref()
+            .map_or(CameraKind::Unknown, |camera| camera.profile.kind)
+    }
+
+    fn intensity_image(&self) -> bool {
+        !matches!(self.camera_kind(), CameraKind::Depth | CameraKind::Thermal)
     }
 
     fn capture_timeout(&self, target: Option<&str>) -> u64 {
@@ -1734,7 +1789,7 @@ impl Workbench {
         }
         if self.snapshot.auto.is_some() {
             self.send(Job::AutoOff, SessionCommand::Manual { revert: false });
-        } else {
+        } else if self.camera_kind().supports_auto() {
             self.send(
                 Job::AutoOn,
                 SessionCommand::Auto {
@@ -1761,6 +1816,9 @@ impl Workbench {
     }
 
     fn toggle_exposure(&mut self) {
+        if !self.intensity_image() || self.camera_kind() == CameraKind::LineScan {
+            return;
+        }
         self.exposure_open = !self.exposure_open;
         if self.exposure_open
             && let Some(frame) = self.handle.latest_frame()
@@ -1770,6 +1828,9 @@ impl Workbench {
     }
 
     fn toggle_focus_region(&mut self) {
+        if !self.intensity_image() || self.camera_kind() == CameraKind::LineScan {
+            return;
+        }
         self.focus.open = !self.focus.open;
         self.focus.reset();
         if self.focus.open
@@ -2043,7 +2104,10 @@ impl Workbench {
                     .snapshot
                     .cameras
                     .iter()
-                    .filter(|camera| camera.auto.is_none() == auto)
+                    .filter(|camera| {
+                        camera.auto.is_none() == auto
+                            && (!auto || camera.info.profile.kind.supports_auto())
+                    })
                     .map(|camera| camera.info.id.clone())
                     .collect();
                 let balance = Some(self.balance);
@@ -2061,6 +2125,13 @@ impl Workbench {
                 self.zoom = 1.0;
             }
             Message::Zoom(factor) => self.zoom_by(factor),
+            Message::ToggleCameraView => {
+                if let Some(id) = &self.snapshot.active_camera {
+                    self.camera_views.entry(id.clone()).or_default().toggle();
+                    self.frame_id = None;
+                    self.update_frame(false);
+                }
+            }
             Message::ToggleExposure => self.toggle_exposure(),
             Message::ToggleFocusRegion => self.toggle_focus_region(),
             Message::FocusRegion(region) => {

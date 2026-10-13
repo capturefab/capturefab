@@ -32,6 +32,8 @@ pub struct CameraInfo {
     pub model: String,
     pub serial: String,
     pub address: Option<String>,
+    #[serde(default)]
+    pub profile: crate::camera_profile::CameraProfile,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

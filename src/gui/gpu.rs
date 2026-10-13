@@ -193,10 +193,10 @@ impl Layout {
             ..gray(wgpu::TextureFormat::R8Uint, 1, 0)
         };
         match pixel_format {
-            MONO8 => Some(gray(wgpu::TextureFormat::R8Uint, 1, 0)),
+            MONO8 | 0x0108_00b1 | 0x0108_00c6 => Some(gray(wgpu::TextureFormat::R8Uint, 1, 0)),
             0x0110_0003 => wide(2),
             0x0110_0005 => wide(4),
-            0x0110_0007 => wide(8),
+            0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => wide(8),
             RGB8 => Some(packed(1)),
             0x0218_0015 => Some(packed(2)),
             0x0108_0008..=0x0108_000b => Some(Self {

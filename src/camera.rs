@@ -42,6 +42,7 @@ pub fn discover(timeout: Duration, simulated: bool) -> Result<(Vec<CameraInfo>, 
                             model: d["name"].as_str().unwrap_or("Host camera").into(),
                             serial: id.into(),
                             address: Some(id.into()),
+                            profile: Default::default(),
                         });
                     }
                 }
@@ -52,6 +53,9 @@ pub fn discover(timeout: Duration, simulated: bool) -> Result<(Vec<CameraInfo>, 
     }
     devices.sort_by(|a, b| a.id.cmp(&b.id));
     devices.dedup_by(|a, b| a.id == b.id);
+    for info in &mut devices {
+        info.profile = crate::camera_profile::detect(info, &[]);
+    }
     Ok((devices, warnings))
 }
 
@@ -61,6 +65,7 @@ pub struct Camera {
     nodes: NodeMap,
     streaming: bool,
     xml: String,
+    profile_metadata: Vec<FeatureInfo>,
 }
 /// Reject malformed known source forms without checking availability or build capabilities.
 /// Bare camera IDs and serials are resolved against discovery results on open.
@@ -137,7 +142,9 @@ impl Camera {
             matches[0].clone()
         };
         let backend: Box<dyn Backend> = match info.transport {
-            Transport::Simulator => Box::new(crate::transport::simulator::Simulator::default()),
+            Transport::Simulator => Box::new(crate::transport::simulator::Simulator::for_selector(
+                &info.id,
+            )),
             Transport::Scanner => crate::scanner::open(&info)?,
             Transport::Media => {
                 if crate::onvif::is_source(&info.id) {
@@ -164,19 +171,48 @@ impl Camera {
         };
         Self::from_backend(info, backend)
     }
-    pub fn from_backend(info: CameraInfo, mut backend: Box<dyn Backend>) -> Result<Self> {
+    pub fn from_backend(mut info: CameraInfo, mut backend: Box<dyn Backend>) -> Result<Self> {
         let xml = backend.xml().context("load camera GenICam XML")?;
         let nodes = NodeMap::parse(&xml).context("parse camera GenICam XML")?;
+        let mut profile_metadata = nodes.profile_features(backend.as_mut());
+        info.profile = crate::camera_profile::detect(&info, &profile_metadata);
+        // Devices may keep their identifying nodes outside Root or Invisible.
+        // Preserve those declarations when normal feature snapshots omit them.
+        profile_metadata.retain(|feature| {
+            matches!(
+                feature.name.as_str(),
+                "DeviceType"
+                    | "CameraType"
+                    | "SensorType"
+                    | "DeviceScanType"
+                    | "PixelFormat"
+                    | "ComponentSelector"
+                    | "Scan3dOutputMode"
+            )
+        });
         Ok(Self {
             info,
             backend,
             nodes,
             streaming: false,
             xml,
+            profile_metadata,
         })
     }
     pub fn features(&mut self) -> Vec<FeatureInfo> {
-        self.nodes.features(self.backend.as_mut())
+        let mut features = self.nodes.features(self.backend.as_mut());
+        let visible_count = features.len();
+        for declaration in &self.profile_metadata {
+            if !features
+                .iter()
+                .any(|feature| feature.name == declaration.name)
+            {
+                features.push(declaration.clone());
+            }
+        }
+        self.info.profile = crate::camera_profile::detect(&self.info, &features);
+        features.truncate(visible_count);
+        features
     }
     pub fn get(&mut self, name: &str) -> Result<serde_json::Value> {
         self.nodes.get(self.backend.as_mut(), name)
@@ -282,6 +318,80 @@ impl Drop for Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::camera_profile::{CameraCapability, CameraKind, DetectionSource};
+
+    #[test]
+    fn typed_simulator_serial_preserves_its_backend() {
+        let info = crate::transport::simulator::info_named("sim:depth:alias");
+        let mut camera = Camera::open(
+            &info.serial,
+            std::slice::from_ref(&info),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(camera.info.id, "sim:depth:alias");
+        assert_eq!(camera.info.profile.kind, CameraKind::Depth);
+        assert_eq!(camera.get("PixelFormat").unwrap(), "Coord3D_C16");
+    }
+
+    #[test]
+    fn hidden_type_metadata_survives_refresh_without_extra_feature_polling() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct MetadataBackend(Arc<AtomicUsize>);
+        impl crate::types::RegisterIo for MetadataBackend {
+            fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                if address == 0 {
+                    let mut value = b"Linescan".to_vec();
+                    value.resize(length, 0);
+                    Ok(value)
+                } else {
+                    Ok(vec![0; length])
+                }
+            }
+            fn write_memory(&mut self, _: u64, _: &[u8]) -> Result<()> {
+                Ok(())
+            }
+        }
+        impl Backend for MetadataBackend {
+            fn xml(&mut self) -> Result<String> {
+                Ok(r#"<RegisterDescription>
+                    <Category Name="Root"><pFeature>ExposureTime</pFeature><pFeature>Width</pFeature><pFeature>Height</pFeature><pFeature>AcquisitionFrameRate</pFeature></Category>
+                    <StringReg Name="DeviceScanType"><Address>0</Address><Length>32</Length><AccessMode>RO</AccessMode><Visibility>Invisible</Visibility></StringReg>
+                    <FloatReg Name="ExposureTime"><Address>64</Address><Length>8</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></FloatReg>
+                    <Integer Name="Width"><Value>640</Value></Integer>
+                    <Integer Name="Height"><Value>1</Value></Integer>
+                    <Float Name="AcquisitionFrameRate"><Value>30</Value></Float>
+                    </RegisterDescription>"#.into())
+            }
+            fn start(&mut self, _: usize) -> Result<()> {
+                Ok(())
+            }
+            fn next_frame(&mut self, _: Duration) -> Result<Frame> {
+                anyhow::bail!("no frames")
+            }
+            fn stop(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let reads = Arc::new(AtomicUsize::new(0));
+        let info = crate::transport::simulator::info();
+        let mut camera =
+            Camera::from_backend(info, Box::new(MetadataBackend(reads.clone()))).unwrap();
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            1,
+            "opening must not poll unrelated exposure registers"
+        );
+        assert_eq!(camera.info.profile.kind, CameraKind::LineScan);
+        assert!(camera.info.profile.supports(CameraCapability::Exposure));
+        assert!(!camera.features().iter().any(|f| f.name == "DeviceScanType"));
+        assert_eq!(camera.info.profile.kind, CameraKind::LineScan);
+        assert_eq!(camera.info.profile.source, DetectionSource::DeviceMetadata);
+    }
 
     #[test]
     fn malformed_selectors_fail_before_opening_a_backend() {
@@ -364,6 +474,7 @@ mod tests {
             model: "Network camera".into(),
             serial: "network-serial".into(),
             address: Some("https://camera/service".into()),
+            profile: Default::default(),
         };
         let error = Camera::open(
             &info.serial,

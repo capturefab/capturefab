@@ -2,6 +2,7 @@
 pub mod accel;
 pub mod auto;
 pub mod camera;
+pub mod camera_profile;
 pub mod cli;
 pub mod compatibility;
 pub mod destination;

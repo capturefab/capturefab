@@ -11,6 +11,11 @@ pub fn pixel_format_name(format: u32) -> &'static str {
         0x0110_0003 => "Mono10",
         0x0110_0005 => "Mono12",
         0x0110_0007 => "Mono16",
+        0x0108_00b1 => "Coord3D_C8",
+        0x0110_00b8 => "Coord3D_C16",
+        0x0120_00bf => "Coord3D_C32f",
+        0x0108_00c6 => "Confidence8",
+        0x0110_00c7 => "Confidence16",
         0x0108_0008 => "BayerGR8",
         0x0108_0009 => "BayerRG8",
         0x0108_000a => "BayerGB8",
@@ -30,7 +35,7 @@ pub fn rgb(frame: &Frame) -> Result<Vec<u8>> {
     // elements from the generic converter do not; only Bayer is shared.
     let mut out = vec![0; pixels * 3];
     match frame.pixel_format {
-        MONO8 => {
+        MONO8 | 0x0108_00b1 | 0x0108_00c6 => {
             ensure!(frame.data.len() >= pixels, "truncated Mono8 frame");
             let data = &frame.data[..pixels];
             gray(&mut out, |i| data[i]);
@@ -46,7 +51,7 @@ pub fn rgb(frame: &Frame) -> Result<Vec<u8>> {
                 *dst = [p[2], p[1], p[0]];
             }
         }
-        0x0110_0003 | 0x0110_0005 | 0x0110_0007 => {
+        0x0110_0003 | 0x0110_0005 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => {
             ensure!(
                 frame.data.len() >= pixels * 2,
                 "truncated unpacked monochrome frame"
@@ -150,7 +155,7 @@ fn convert_to<'a, P: Copy + Default + Send + 'a>(
     let pixels = checked_pixels(frame)?;
     // Streaming formats map source to output in order.
     match frame.pixel_format {
-        MONO8 => {
+        MONO8 | 0x0108_00b1 | 0x0108_00c6 => {
             ensure!(frame.data.len() >= pixels, "truncated Mono8 frame");
             out.stream(frame.data[..pixels].iter().map(|&v| pixel([v, v, v])));
         }
@@ -164,7 +169,7 @@ fn convert_to<'a, P: Copy + Default + Send + 'a>(
             let source = frame.data[..pixels * 3].as_chunks::<3>().0;
             out.stream(source.iter().map(|p| pixel([p[2], p[1], p[0]])));
         }
-        0x0110_0003 | 0x0110_0005 | 0x0110_0007 => {
+        0x0110_0003 | 0x0110_0005 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => {
             ensure!(
                 frame.data.len() >= pixels * 2,
                 "truncated unpacked monochrome frame"
@@ -291,9 +296,11 @@ fn bayer_bounded(frame: &Frame, pattern: [usize; 4], x: usize, y: usize) -> [u8;
 fn validated_bytes_per_pixel(frame: &Frame) -> Result<usize> {
     let pixels = checked_pixels(frame)?;
     let (bytes, name) = match frame.pixel_format {
-        MONO8 => (1, "Mono8"),
+        MONO8 | 0x0108_00b1 | 0x0108_00c6 => (1, "8-bit scalar"),
         RGB8 | 0x0218_0015 => (3, "RGB"),
-        0x0110_0003 | 0x0110_0005 | 0x0110_0007 => (2, "unpacked monochrome"),
+        0x0110_0003 | 0x0110_0005 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => {
+            (2, "unpacked monochrome")
+        }
         0x0108_0008..=0x0108_000b => (1, "Bayer8"),
         v => {
             bail!("unsupported PFNC format 0x{v:08x}; capture with --format raw to preserve bytes")
@@ -306,8 +313,17 @@ fn validated_bytes_per_pixel(frame: &Frame) -> Result<usize> {
 pub fn convertible(pixel_format: u32) -> bool {
     matches!(
         pixel_format,
-        MONO8 | RGB8 | 0x0218_0015 | 0x0110_0003 | 0x0110_0005 | 0x0110_0007 | 0x0108_0008
-            ..=0x0108_000b
+        MONO8
+            | 0x0108_00b1
+            | 0x0108_00c6
+            | RGB8
+            | 0x0218_0015
+            | 0x0110_0003
+            | 0x0110_0005
+            | 0x0110_0007
+            | 0x0110_00b8
+            | 0x0110_00c7
+            | 0x0108_0008..=0x0108_000b
     )
 }
 /// One pixel exactly as `convert` would produce it; for sparse sampling when
@@ -317,10 +333,10 @@ fn pixel_at(frame: &Frame, x: usize, y: usize) -> [u8; 3] {
     let i = y * frame.width as usize + x;
     let data = &frame.data;
     match frame.pixel_format {
-        MONO8 => [data[i]; 3],
+        MONO8 | 0x0108_00b1 | 0x0108_00c6 => [data[i]; 3],
         RGB8 => [data[3 * i], data[3 * i + 1], data[3 * i + 2]],
         0x0218_0015 => [data[3 * i + 2], data[3 * i + 1], data[3 * i]],
-        0x0110_0003 | 0x0110_0005 | 0x0110_0007 => {
+        0x0110_0003 | 0x0110_0005 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => {
             let shift = match frame.pixel_format {
                 0x0110_0003 => 2,
                 0x0110_0005 => 4,
@@ -361,7 +377,14 @@ pub fn exposure(frame: &Frame) -> Result<Exposure> {
     let (w, pixels) = (frame.width as usize, checked_pixels(frame)?);
     let mono = matches!(
         frame.pixel_format,
-        MONO8 | 0x0110_0003 | 0x0110_0005 | 0x0110_0007
+        MONO8
+            | 0x0108_00b1
+            | 0x0108_00c6
+            | 0x0110_0003
+            | 0x0110_0005
+            | 0x0110_0007
+            | 0x0110_00b8
+            | 0x0110_00c7
     );
     let (mut luma_bins, mut channels) = ([0; 64], [[0; 64]; 3]);
     let (mut sum, mut samples, mut shadows, mut highlights) = (0u64, 0u32, 0u32, 0u32);
@@ -501,8 +524,8 @@ pub fn preview_rgba(frame: &Frame, max_width: u32, max_height: u32) -> Result<(u
 fn decimate(frame: &Frame, factor: usize) -> Option<Frame> {
     let (unit, bytes): (usize, usize) = match frame.pixel_format {
         0x0108_0008..=0x0108_000b => (2, 1),
-        MONO8 => (1, 1),
-        0x0110_0003 | 0x0110_0005 | 0x0110_0007 => (1, 2),
+        MONO8 | 0x0108_00b1 | 0x0108_00c6 => (1, 1),
+        0x0110_0003 | 0x0110_0005 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => (1, 2),
         RGB8 | 0x0218_0015 => (1, 3),
         _ => return None,
     };
@@ -566,7 +589,14 @@ pub fn encode(frame: &Frame, format: &str) -> Result<Vec<u8>> {
             ensure!(
                 matches!(
                     frame.pixel_format,
-                    MONO8 | 0x0110_0003 | 0x0110_0005 | 0x0110_0007
+                    MONO8
+                        | 0x0108_00b1
+                        | 0x0108_00c6
+                        | 0x0110_0003
+                        | 0x0110_0005
+                        | 0x0110_0007
+                        | 0x0110_00b8
+                        | 0x0110_00c7
                 ),
                 "PGM requires a monochrome image; use PNG or PPM"
             );
@@ -590,6 +620,23 @@ pub fn save(frame: &Frame, path: &Path, format: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn coordinate_and_confidence_formats_convert_but_raw_preserves_precision() {
+        for format in [0x0110_00b8, 0x0110_00c7] {
+            let source = f(format, vec![0x34, 0x12, 0xff, 0xff]);
+            assert_eq!(rgb(&source).unwrap(), vec![0x12, 0x12, 0x12, 255, 255, 255]);
+            assert_eq!(encode(&source, "raw").unwrap(), source.data);
+            assert!(convertible(format));
+            assert!(exposure(&source).unwrap().channels.is_none());
+            assert_eq!(preview_rgba(&source, 1, 1).unwrap().0, 1);
+        }
+        for format in [0x0108_00b1, 0x0108_00c6] {
+            assert_eq!(
+                rgb(&f(format, vec![20, 40])).unwrap(),
+                vec![20, 20, 20, 40, 40, 40]
+            );
+        }
+    }
     fn f(fmt: u32, data: Vec<u8>) -> Frame {
         Frame {
             id: 1,

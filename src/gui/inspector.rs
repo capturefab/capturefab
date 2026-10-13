@@ -1,5 +1,6 @@
 //! The settings panel: features, auto exposure, capture, forwarding and storage.
 use super::*;
+use crate::camera_profile::{CameraCapability, CameraKind, CameraProfile};
 use iced::widget::{Row, column};
 use motion::Flashes;
 use std::collections::HashSet;
@@ -20,8 +21,470 @@ const ACCEPTED: Duration = Duration::from_millis(450);
 const CONTEXT: Duration = Duration::from_millis(280);
 /// The panel's scrollable, for jumping back to its top.
 pub(super) const SCROLL: &str = "inspector";
-/// The feature groups, in the order they show.
-const GROUPS: [&str; 5] = ["Image", "Acquisition", "Device", "Transport", "Other"];
+/// The feature groups retain every advertised control, including vendor
+/// extensions. Specialized controls come first for their camera type.
+fn feature_groups(kind: CameraKind) -> &'static [&'static str] {
+    match kind {
+        CameraKind::LineScan => &[
+            "Line geometry",
+            "Line timing",
+            "Trigger and encoder",
+            "Image",
+            "Acquisition",
+            "Device",
+            "Transport",
+            "Other",
+        ],
+        CameraKind::Depth => &[
+            "Components",
+            "Depth",
+            "Calibration",
+            "Image",
+            "Acquisition",
+            "Device",
+            "Transport",
+            "Other",
+        ],
+        CameraKind::Microscope => &[
+            "Optics",
+            "Illumination",
+            "Stage",
+            "Image",
+            "Acquisition",
+            "Device",
+            "Transport",
+            "Other",
+        ],
+        CameraKind::Thermal => &[
+            "Temperature",
+            "Image",
+            "Acquisition",
+            "Device",
+            "Transport",
+            "Other",
+        ],
+        CameraKind::DocumentScanner => &[
+            "Scan",
+            "Image",
+            "Acquisition",
+            "Device",
+            "Transport",
+            "Other",
+        ],
+        CameraKind::AreaScan | CameraKind::Unknown => {
+            &["Image", "Acquisition", "Device", "Transport", "Other"]
+        }
+    }
+}
+
+/// Classify only features the camera supplies. Unknown names stay accessible
+/// in the ordinary feature groups and through search.
+fn adaptive_feature_group(name: &str, kind: CameraKind) -> &'static str {
+    let starts = |prefixes: &[&str]| prefixes.iter().any(|prefix| name.starts_with(prefix));
+    match kind {
+        CameraKind::LineScan if starts(&["Trigger", "Encoder", "ShaftEncoder", "LineTrigger"]) => {
+            "Trigger and encoder"
+        }
+        CameraKind::LineScan
+            if starts(&[
+                "AcquisitionLineRate",
+                "ResultingLineRate",
+                "LineRate",
+                "LinePeriod",
+                "LinePitch",
+            ]) =>
+        {
+            "Line timing"
+        }
+        CameraKind::LineScan
+            if starts(&[
+                "Width",
+                "Height",
+                "Offset",
+                "Binning",
+                "Decimation",
+                "SensorWidth",
+                "SensorHeight",
+                "LineWidth",
+                "LineHeight",
+                "BlockHeight",
+                "AcquisitionFrameHeight",
+            ]) =>
+        {
+            "Line geometry"
+        }
+        CameraKind::Depth if starts(&["Component"]) => "Components",
+        CameraKind::Depth
+            if starts(&[
+                "Scan3dCoordinate",
+                "Scan3dDistanceUnit",
+                "Scan3dAxis",
+                "Scan3dTransform",
+                "Scan3dInvalid",
+                "CoordinateScale",
+                "CoordinateOffset",
+                "DepthScale",
+                "DepthUnit",
+                "DistanceUnit",
+                "FocalLength",
+                "Baseline",
+                "SpatialCalibration",
+            ]) =>
+        {
+            "Calibration"
+        }
+        CameraKind::Depth
+            if starts(&[
+                "Scan3d",
+                "Depth",
+                "Distance",
+                "Confidence",
+                "Range",
+                "Disparity",
+                "PointCloud",
+                "Intensity",
+                "DepthQuality",
+            ]) =>
+        {
+            "Depth"
+        }
+        CameraKind::Microscope
+            if starts(&[
+                "Focus",
+                "AutoFocus",
+                "Autofocus",
+                "Magnification",
+                "Objective",
+                "OpticalZoom",
+                "Zoom",
+                "Lens",
+            ]) =>
+        {
+            "Optics"
+        }
+        CameraKind::Microscope
+            if starts(&[
+                "Illumination",
+                "LightSource",
+                "LightIntensity",
+                "Lamp",
+                "LED",
+                "Led",
+            ]) =>
+        {
+            "Illumination"
+        }
+        CameraKind::Microscope if starts(&["Stage", "ZPosition", "ZOffset"]) => "Stage",
+        CameraKind::Thermal
+            if starts(&[
+                "Temperature",
+                "Thermal",
+                "Emissivity",
+                "Reflected",
+                "ObjectTemperature",
+                "Atmospheric",
+                "ExternalOptics",
+                "IR",
+                "Infrared",
+                "Radiometric",
+                "Blackbody",
+                "Transmission",
+            ]) =>
+        {
+            "Temperature"
+        }
+        CameraKind::DocumentScanner
+            if starts(&["Scan", "Page", "Document"])
+                || matches!(name, "AcquisitionStart" | "AcquisitionStop") =>
+        {
+            "Scan"
+        }
+        _ => feature_group(name),
+    }
+}
+
+/// Put selectors before their dependent controls, then the settings needed
+/// to start acquiring a useful image. Remaining controls keep camera order.
+fn adaptive_feature_rank(name: &str, kind: CameraKind) -> usize {
+    let order: &[&str] = match kind {
+        CameraKind::LineScan => &[
+            "Width",
+            "LineWidth",
+            "Height",
+            "BlockHeight",
+            "AcquisitionFrameHeight",
+            "Offset",
+            "Binning",
+            "Decimation",
+            "AcquisitionLineRateEnable",
+            "AcquisitionLineRate",
+            "LineRate",
+            "LinePeriod",
+            "LinePitch",
+            "ResultingLineRate",
+            "EncoderSelector",
+            "EncoderSourceA",
+            "EncoderSourceB",
+            "EncoderMode",
+            "EncoderDivider",
+            "TriggerSelector",
+            "TriggerMode",
+            "TriggerSource",
+            "TriggerActivation",
+            "TriggerDelay",
+            "TriggerSoftware",
+        ],
+        CameraKind::Depth => &[
+            "ComponentSelector",
+            "ComponentEnable",
+            "Scan3dOutputMode",
+            "DepthMode",
+            "DepthMin",
+            "DepthMax",
+            "DistanceMin",
+            "DistanceMax",
+            "RangeMin",
+            "RangeMax",
+            "ConfidenceThreshold",
+            "Confidence",
+            "Scan3dCoordinateSelector",
+            "Scan3dDistanceUnit",
+            "Scan3dCoordinateUnit",
+            "DepthUnit",
+            "DistanceUnit",
+            "Scan3dCoordinateScale",
+            "Scan3dCoordinateOffset",
+            "Scan3dInvalidDataFlag",
+            "Scan3dInvalidDataValue",
+        ],
+        CameraKind::Microscope => &[
+            "ObjectiveSelector",
+            "Objective",
+            "Magnification",
+            "OpticalZoom",
+            "Zoom",
+            "FocusMode",
+            "FocusAuto",
+            "AutoFocus",
+            "Autofocus",
+            "FocusPosition",
+            "Focus",
+            "IlluminationMode",
+            "IlluminationEnable",
+            "IlluminationIntensity",
+            "Illumination",
+            "LightSource",
+            "Lamp",
+            "StageX",
+            "StageY",
+            "StageZ",
+            "Stage",
+        ],
+        CameraKind::Thermal => &[
+            "TemperatureSelector",
+            "TemperatureLinearMode",
+            "TemperatureUnit",
+            "TemperatureRange",
+            "TemperatureMin",
+            "TemperatureMax",
+            "Emissivity",
+            "ReflectedTemperature",
+            "AtmosphericTemperature",
+            "AtmosphericTransmission",
+        ],
+        CameraKind::DocumentScanner => &[
+            "ScanSource",
+            "ScanResolution",
+            "ScanMode",
+            "Page",
+            "Document",
+            "AcquisitionStart",
+        ],
+        CameraKind::AreaScan | CameraKind::Unknown => return feature_rank(name),
+    };
+    order
+        .iter()
+        .position(|prefix| name.starts_with(prefix))
+        .unwrap_or(order.len() + feature_rank(name))
+}
+
+fn adaptive_feature_label(feature: &FeatureInfo, kind: CameraKind) -> String {
+    let label = match (kind, feature.name.as_str()) {
+        (CameraKind::LineScan, "Width") => Some("Line width"),
+        (CameraKind::LineScan, "Height" | "BlockHeight" | "AcquisitionFrameHeight") => {
+            Some("Block height (lines)")
+        }
+        (CameraKind::LineScan, "AcquisitionLineRate" | "AcquisitionLineRateAbs" | "LineRate") => {
+            Some("Line rate")
+        }
+        (CameraKind::LineScan, "AcquisitionLineRateEnable") => Some("Set line rate"),
+        (CameraKind::LineScan, "AcquisitionFrameRate" | "AcquisitionFrameRateAbs") => {
+            Some("Block rate")
+        }
+        (CameraKind::Depth, "ComponentSelector") => Some("Component"),
+        (CameraKind::Depth, "ComponentEnable") => Some("Include component"),
+        (CameraKind::Depth, "Scan3dOutputMode") => Some("Depth output"),
+        (CameraKind::Depth, "Scan3dCoordinateSelector") => Some("Coordinate"),
+        (
+            CameraKind::Depth,
+            "Scan3dDistanceUnit" | "Scan3dCoordinateUnit" | "DepthUnit" | "DistanceUnit",
+        ) => Some("Distance unit"),
+        (CameraKind::Depth, "Scan3dCoordinateScale") => Some("Coordinate scale"),
+        (CameraKind::Depth, "Scan3dCoordinateOffset") => Some("Coordinate offset"),
+        (CameraKind::Depth, "Scan3dInvalidDataFlag") => Some("Mark invalid data"),
+        (CameraKind::Depth, "Scan3dInvalidDataValue") => Some("Invalid sample value"),
+        (CameraKind::Depth, "ConfidenceThreshold") => Some("Minimum confidence"),
+        (CameraKind::Microscope, "FocusPosition") => Some("Focus position"),
+        (CameraKind::Microscope, "ObjectiveSelector") => Some("Objective"),
+        (CameraKind::Microscope, "IlluminationIntensity") => Some("Illumination intensity"),
+        (CameraKind::Thermal, "TemperatureLinearMode") => Some("Linear temperature output"),
+        (CameraKind::Thermal, "TemperatureRange") => Some("Measurement range"),
+        (CameraKind::DocumentScanner, "ScanResolution") => Some("Resolution"),
+        (CameraKind::DocumentScanner, "ScanSource") => Some("Page source"),
+        _ => None,
+    };
+    label.map(str::to_owned).unwrap_or_else(|| {
+        if feature.display_name.is_empty() || feature.display_name == feature.name {
+            words(&feature.name)
+        } else {
+            feature.display_name.clone()
+        }
+    })
+}
+
+fn adaptive_feature_help(name: &str, kind: CameraKind) -> Option<&'static str> {
+    match (kind, name) {
+        (CameraKind::LineScan, "Height" | "BlockHeight" | "AcquisitionFrameHeight") => Some(
+            "Number of acquired lines assembled into each image block. This is not the sensor's height.",
+        ),
+        (CameraKind::LineScan, "Width") => Some("Pixels acquired across each sensor line."),
+        (CameraKind::LineScan, "AcquisitionLineRate" | "AcquisitionLineRateAbs" | "LineRate") => {
+            Some(
+                "Lines acquired per second. Match this to object motion or use an encoder trigger.",
+            )
+        }
+        (CameraKind::LineScan, "AcquisitionFrameRate" | "AcquisitionFrameRateAbs") => Some(
+            "Image blocks acquired per second; each block contains the configured number of lines.",
+        ),
+        (CameraKind::Depth, "ComponentSelector") => Some(
+            "Select Range, Intensity or Confidence to inspect that component's live settings. Available choices depend on the camera.",
+        ),
+        (CameraKind::Depth, "Scan3dCoordinateScale" | "Scan3dCoordinateOffset") => Some(
+            "Use the selected coordinate's scale, offset and distance unit when interpreting raw depth samples.",
+        ),
+        (CameraKind::Depth, "ConfidenceThreshold") => Some(
+            "Reject uncertain depth measurements. A higher threshold may leave more invalid pixels.",
+        ),
+        (CameraKind::Microscope, "Magnification" | "ObjectiveSelector") => Some(
+            "Choose the optics before adjusting focus and illumination. Magnification alone does not calibrate image measurements.",
+        ),
+        (CameraKind::Thermal, "Emissivity") => Some(
+            "Set the target material's emissivity for temperature measurements; reflected temperature may also affect the result.",
+        ),
+        _ => None,
+    }
+}
+
+fn group_guidance(group: &str, kind: CameraKind) -> Option<&'static str> {
+    match (kind, group) {
+        (CameraKind::LineScan, "Line geometry") => {
+            Some("Each block combines consecutive lines into an image.")
+        }
+        (CameraKind::LineScan, "Trigger and encoder") => Some(
+            "Select the trigger or encoder first; its dependent controls update from the camera.",
+        ),
+        (CameraKind::Depth, "Components") => {
+            Some("Select a component to edit its settings. Enable one component for preview.")
+        }
+        (CameraKind::Depth, "Calibration") => {
+            Some("Units, scale and offset describe the selected depth coordinate.")
+        }
+        (CameraKind::Microscope, "Optics") => {
+            Some("Choose an objective and magnification, then bring the specimen into focus.")
+        }
+        (CameraKind::Thermal, "Temperature") => {
+            Some("Choose a measurement range and set emissivity for your target material.")
+        }
+        _ => None,
+    }
+}
+
+/// Software exposure automation assumes ordinary image brightness and a
+/// frame-rate budget. Specialized acquisition has its own timing or units.
+fn offers_auto(profile: &CameraProfile) -> bool {
+    matches!(
+        profile.kind,
+        CameraKind::AreaScan | CameraKind::Unknown | CameraKind::Microscope
+    ) && [
+        CameraCapability::Exposure,
+        CameraCapability::Gain,
+        CameraCapability::FrameRate,
+    ]
+    .into_iter()
+    .any(|capability| profile.supports(capability))
+}
+
+fn camera_guidance(kind: CameraKind) -> &'static str {
+    match kind {
+        CameraKind::AreaScan => "Set the image size, exposure and frame rate for each full image.",
+        CameraKind::LineScan => {
+            "Match line rate to motion, or synchronize with an encoder. Block height sets how many lines form each image."
+        }
+        CameraKind::Depth => {
+            "Enable one component for preview and set its output mode. Check its distance unit, coordinate scale and confidence before interpreting measurements."
+        }
+        CameraKind::Microscope => {
+            "Choose the objective and magnification, then adjust focus and illumination for the specimen."
+        }
+        CameraKind::Thermal => {
+            "Configure temperature output, measurement range and emissivity before taking measurements."
+        }
+        CameraKind::DocumentScanner => {
+            "Each capture scans one page. Choose a source and resolution supported by your scanner."
+        }
+        CameraKind::Unknown => {
+            "Use the controls advertised by this camera. Its acquisition type is not identified yet."
+        }
+    }
+}
+
+fn capture_title(kind: CameraKind) -> &'static str {
+    match kind {
+        CameraKind::LineScan => "Save line blocks",
+        CameraKind::Depth => "Save depth frames",
+        CameraKind::Microscope => "Save micrographs",
+        CameraKind::Thermal => "Save thermal frames",
+        CameraKind::DocumentScanner => "Save document scans",
+        CameraKind::AreaScan | CameraKind::Unknown => "Save frames",
+    }
+}
+
+fn capture_guidance(kind: CameraKind) -> Option<&'static str> {
+    match kind {
+        CameraKind::LineScan => {
+            Some("Each saved block contains the configured number of consecutive lines.")
+        }
+        CameraKind::Depth => Some(
+            "Use Raw pixels to preserve depth samples. Image formats produce 8-bit images. Keep the component's unit, scale and offset with your measurements.",
+        ),
+        CameraKind::Thermal => Some(
+            "Use Raw pixels to preserve temperature samples. Image formats produce 8-bit images. Keep the camera's temperature unit and calibration with your measurements.",
+        ),
+        _ => None,
+    }
+}
+
+fn forward_guidance(kind: CameraKind) -> Option<&'static str> {
+    match kind {
+        CameraKind::LineScan => Some(
+            "Forwarding encodes image blocks at the chosen video frame rate. Match acquisition line timing separately in Features.",
+        ),
+        CameraKind::Depth | CameraKind::Thermal => Some(
+            "Forwarding encodes an 8-bit image without measurement calibration or the preview color map. Use Capture with Raw pixels for quantitative data.",
+        ),
+        _ => None,
+    }
+}
 
 /// State for the settings panel.
 pub(super) struct InspectorState {
@@ -97,13 +560,14 @@ impl InspectorState {
 }
 
 /// The features as the panel lists them: grouped, in setup order, with
-/// their labels and search text. Built again only when the names change, so
+/// their labels and search text. Built again when the type or text changes, so
 /// the view, which runs on every camera frame, does no per-row sorting,
 /// grouping or lowercasing.
 #[derive(Default)]
 struct FeatureIndex {
-    /// The names it was built from, hashed.
+    /// The type and display metadata it was built from, hashed.
     key: u64,
+    kind: CameraKind,
     /// How many features it was built from.
     len: usize,
     /// Each group with its features' indices, in display order.
@@ -119,29 +583,34 @@ struct FeatureIndex {
 }
 
 impl FeatureIndex {
-    fn key(features: &[FeatureInfo]) -> u64 {
+    fn key(features: &[FeatureInfo], kind: CameraKind) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        kind.hash(&mut hasher);
         for feature in features {
             feature.name.hash(&mut hasher);
+            feature.display_name.hash(&mut hasher);
+            feature.description.hash(&mut hasher);
         }
         hasher.finish()
     }
 
-    fn new(features: &[FeatureInfo]) -> Self {
-        let scanner = features.iter().any(|f| f.name == "ScanResolution");
+    fn new(features: &[FeatureInfo], kind: CameraKind) -> Self {
+        let scanner = kind == CameraKind::DocumentScanner
+            || features.iter().any(|f| f.name == "ScanResolution");
         // One Stream row starts and stops, so AcquisitionStop goes.
         let folded = features.iter().any(|f| f.name == "AcquisitionStart");
         let mut groups = Vec::new();
         let mut listed = 0;
-        for group in GROUPS {
+        for &group in feature_groups(kind) {
             let mut members: Vec<usize> = (0..features.len())
                 .filter(|&i| {
                     let name = features[i].name.as_str();
-                    feature_group(name) == group && !(folded && name == "AcquisitionStop")
+                    adaptive_feature_group(name, kind) == group
+                        && !(folded && name == "AcquisitionStop")
                 })
                 .collect();
             // Stable, so ties keep the camera's order.
-            members.sort_by_key(|&i| feature_rank(&features[i].name));
+            members.sort_by_key(|&i| adaptive_feature_rank(&features[i].name, kind));
             listed += members.len();
             if !members.is_empty() {
                 groups.push((group, members));
@@ -156,30 +625,36 @@ impl FeatureIndex {
                     } else {
                         "Stream".into()
                     }
-                } else if f.display_name.is_empty() || f.display_name == f.name {
-                    words(&f.name)
                 } else {
-                    f.display_name.clone()
+                    adaptive_feature_label(f, kind)
                 }
             })
             .collect();
         let tips = features
             .iter()
             .map(|f| {
-                if f.description.is_empty() {
+                let mut tip = if f.description.is_empty() {
                     f.name.clone()
                 } else {
                     format!("{}\n{}", f.name, f.description)
+                };
+                if let Some(help) = adaptive_feature_help(&f.name, kind) {
+                    tip.push('\n');
+                    tip.push_str(help);
                 }
+                tip
             })
             .collect();
         let words = features
             .iter()
             .zip(&labels)
-            .map(|(f, label)| format!("{}\n{label}\n{}", f.name, f.description).to_lowercase())
+            .map(|(f, label)| {
+                format!("{}\n{}\n{label}\n{}", f.name, f.display_name, f.description).to_lowercase()
+            })
             .collect();
         Self {
-            key: Self::key(features),
+            key: Self::key(features, kind),
+            kind,
             len: features.len(),
             groups,
             labels,
@@ -207,9 +682,11 @@ impl Workbench {
     /// `sync_animations`.
     pub(super) fn sync_inspector(&mut self) {
         let now = self.now;
-        // The tick checks the names; a new length cannot wait for it.
-        if self.inspect.index.len != self.snapshot.features.len() {
-            self.inspect.index = FeatureIndex::new(&self.snapshot.features);
+        // The tick checks metadata; a new type or length cannot wait for it.
+        let kind = self.camera_kind();
+        if self.inspect.index.len != self.snapshot.features.len() || self.inspect.index.kind != kind
+        {
+            self.inspect.index = FeatureIndex::new(&self.snapshot.features, kind);
         }
         let tab = self.tab as usize as f32;
         let mode = self.mode_target();
@@ -256,10 +733,11 @@ impl Workbench {
     /// refresh; from `tick()`.
     pub(super) fn tick_inspector(&mut self) {
         let features = &self.snapshot.features;
+        let kind = self.camera_kind();
         if self.inspect.index.len != features.len()
-            || self.inspect.index.key != FeatureIndex::key(features)
+            || self.inspect.index.key != FeatureIndex::key(features, kind)
         {
-            self.inspect.index = FeatureIndex::new(features);
+            self.inspect.index = FeatureIndex::new(features, kind);
         }
         // A summary goes when its own camera stops forwarding, not when
         // another camera is shown.
@@ -565,16 +1043,21 @@ fn form_row<'a>(
 }
 
 /// What a schedule will do: "10 frames, one every 2.5 seconds".
-fn schedule_text(count: u32, interval: f64) -> String {
+fn schedule_text_for(kind: CameraKind, count: u32, interval: f64) -> String {
+    let (singular, multiple) = match kind {
+        CameraKind::LineScan => ("block", "blocks"),
+        CameraKind::DocumentScanner => ("page", "pages"),
+        _ => ("frame", "frames"),
+    };
     if interval == 0.0 {
         return format!(
             "{}, captured consecutively",
-            plural(count.into(), "frame", "frames")
+            plural(count.into(), singular, multiple)
         );
     }
     format!(
         "{}, one every {} {}",
-        plural(count.into(), "frame", "frames"),
+        plural(count.into(), singular, multiple),
         number(interval),
         if interval == 1.0 { "second" } else { "seconds" }
     )
@@ -802,6 +1285,7 @@ impl Workbench {
     pub(super) fn features(&self, p: &'static Palette) -> Element<'_, Message> {
         let snapshot = &self.snapshot;
         let index = &self.inspect.index;
+        let kind = self.camera_kind();
         let query = self.search.trim().to_lowercase();
         let mut groups = column![].spacing(SECTION_GAP);
         let mut matched = 0;
@@ -823,7 +1307,11 @@ impl Workbench {
             }
             if shown {
                 let banner = locked.then(|| self.locked_banner(p));
-                groups = groups.push(column![section(group, banner, p), rows].spacing(10));
+                let mut content = column![section(group, banner, p)].spacing(10);
+                if let Some(guidance) = group_guidance(group, kind) {
+                    content = content.push(reason(guidance, p));
+                }
+                groups = groups.push(content.push(rows));
             }
         }
         let refreshing = self.pending(Job::RefreshFeatures);
@@ -866,14 +1354,61 @@ impl Workbench {
             groups.into()
         };
         let mut content = column![].spacing(SECTION_GAP);
-        if self.scanner_selected() {
-            content = content.push(text("Each capture scans one page. Choose a source and resolution supported by your scanner.").size(style::SMALL).color(p.secondary));
-        } else {
+        if let Some(profile) = snapshot.connected.as_ref().map(|camera| &camera.profile) {
+            content = content.push(self.camera_type_card(profile, p));
+        }
+        if snapshot.auto.is_some()
+            || snapshot
+                .connected
+                .as_ref()
+                .is_some_and(|camera| offers_auto(&camera.profile))
+        {
             content = content.push(self.auto_card(p));
         }
         content
             .push(column![self.search_field(p), count].spacing(6))
             .push(list)
+            .into()
+    }
+
+    /// Camera type and the acquisition model it implies. Detection evidence
+    /// is available on the title without taking room from everyday controls.
+    fn camera_type_card<'a>(
+        &'a self,
+        profile: &'a CameraProfile,
+        p: &'static Palette,
+    ) -> Element<'a, Message> {
+        let about = if profile.evidence.is_empty() {
+            if profile.kind == CameraKind::Unknown {
+                "This camera has not advertised a recognized acquisition type.".into()
+            } else {
+                "Camera type detected automatically.".into()
+            }
+        } else {
+            format!(
+                "Camera type detected automatically.\n{}",
+                profile.evidence.join("\n")
+            )
+        };
+        let head = row![
+            tip(
+                text("Camera type").size(style::SMALL).color(p.secondary),
+                about
+            ),
+            space::horizontal(),
+            text(if profile.kind == CameraKind::Unknown {
+                "Unidentified".into()
+            } else {
+                profile.kind.to_string()
+            })
+            .size(style::BODY)
+            .font(style::SEMIBOLD),
+        ]
+        .align_y(Alignment::Center);
+        container(column![head, reason(camera_guidance(profile.kind), p)].spacing(8))
+            .padding(14)
+            .width(Fill)
+            .style(style::well)
             .into()
     }
 
@@ -1360,6 +1895,7 @@ impl Workbench {
     pub(super) fn capture_settings(&self, p: &'static Palette) -> Element<'_, Message> {
         let connected = self.snapshot.connected.is_some();
         let scanner = self.scanner_selected();
+        let kind = self.camera_kind();
         let capturing = self.pending(Job::Capture);
         let saved = self.just_saved(self.snapshot.active_camera.as_deref());
         let os = Os::CURRENT;
@@ -1408,16 +1944,12 @@ impl Workbench {
         if let Some(status) = self.capture_status(connected, capturing, p) {
             action = action.push(status);
         }
+        let mut head = column![section(capture_title(kind), None, p)].spacing(8);
+        if let Some(guidance) = capture_guidance(kind) {
+            head = head.push(reason(guidance, p));
+        }
         let mut save = column![
-            section(
-                if scanner {
-                    "Save document scans"
-                } else {
-                    "Save frames"
-                },
-                None,
-                p
-            ),
+            head,
             self.capture_to
                 .view(
                     &self.output,
@@ -1432,7 +1964,11 @@ impl Workbench {
                 )
                 .map(Message::CapturePicker),
             form_row(
-                if scanner { "Pages" } else { "Frames" },
+                match kind {
+                    CameraKind::DocumentScanner => "Pages",
+                    CameraKind::LineScan => "Blocks",
+                    _ => "Frames",
+                },
                 self.num(Num::Count),
                 "",
                 p
@@ -1461,11 +1997,24 @@ impl Workbench {
             let problem = self.validate_input(&self.capture_command(true)).err();
             save = save
                 .push(form_row("Start after", self.num(Num::Delay), "s", p))
-                .push(form_row("Frame interval", self.num(Num::Interval), "s", p))
+                .push(form_row(
+                    match kind {
+                        CameraKind::DocumentScanner => "Page interval",
+                        CameraKind::LineScan => "Block interval",
+                        _ => "Frame interval",
+                    },
+                    self.num(Num::Interval),
+                    "s",
+                    p,
+                ))
                 .push(
-                    text(schedule_text(self.count, self.schedule_interval_seconds))
-                        .size(style::SMALL)
-                        .color(p.secondary),
+                    text(schedule_text_for(
+                        kind,
+                        self.count,
+                        self.schedule_interval_seconds,
+                    ))
+                    .size(style::SMALL)
+                    .color(p.secondary),
                 )
                 .push(
                     button(
@@ -1607,9 +2156,15 @@ impl Workbench {
             Some(destination) => self.forward_card(destination, p),
             None => self.forward_form(p),
         };
-        column![
-            first,
+        let mut content = column![].spacing(SECTION_GAP);
+        if let Some(guidance) = forward_guidance(self.camera_kind()) {
+            content = content.push(reason(guidance, p));
+        }
+        content.push(first)
+            .push(
             self.storage_settings(p),
+            )
+            .push(
             column![
                 section("Encoder availability", None, p),
                 text("Auto picks an available hardware or software encoder. To list what this computer has, run:")
@@ -1618,8 +2173,7 @@ impl Workbench {
                 self.copyable("capturefab doctor".into(), p),
             ]
             .spacing(ROW_GAP),
-        ]
-        .spacing(SECTION_GAP)
+            )
         .into()
     }
 
@@ -2055,6 +2609,232 @@ mod tests {
         assert_eq!(bench.inspect.index.len, bench.snapshot.features.len());
     }
 
+    fn members<'a>(index: &FeatureIndex, features: &'a [FeatureInfo], group: &str) -> Vec<&'a str> {
+        index
+            .groups
+            .iter()
+            .find(|(name, _)| *name == group)
+            .map(|(_, members)| members.iter().map(|&i| features[i].name.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    fn features_named(names: &[&str]) -> Vec<FeatureInfo> {
+        names
+            .iter()
+            .map(|name| sample_feature(name, "Integer", json!(1)))
+            .collect()
+    }
+
+    #[test]
+    fn line_scan_separates_block_geometry_line_timing_and_motion_sync() {
+        let mut features = features_named(&[
+            "TriggerSource",
+            "Height",
+            "AcquisitionLineRate",
+            "EncoderSourceA",
+            "Width",
+            "TriggerSelector",
+            "VendorAdvancedSetting",
+            "AcquisitionFrameRate",
+        ]);
+        features[1].display_name = "Vendor frame rows".into();
+        let index = FeatureIndex::new(&features, CameraKind::LineScan);
+        assert_eq!(
+            members(&index, &features, "Line geometry"),
+            ["Width", "Height"]
+        );
+        assert_eq!(
+            members(&index, &features, "Line timing"),
+            ["AcquisitionLineRate"]
+        );
+        assert_eq!(
+            members(&index, &features, "Trigger and encoder"),
+            ["EncoderSourceA", "TriggerSelector", "TriggerSource"]
+        );
+        assert_eq!(index.labels[1], "Block height (lines)");
+        assert_eq!(index.labels[2], "Line rate");
+        assert_eq!(index.labels[4], "Line width");
+        assert_eq!(index.labels[7], "Block rate");
+        assert!(index.tips[1].contains("not the sensor's height"));
+        assert!(index.words[1].contains("block height"));
+        assert!(index.words[1].contains("vendor frame rows"));
+        assert_eq!(
+            members(&index, &features, "Other"),
+            ["VendorAdvancedSetting"]
+        );
+        assert_eq!(index.listed, features.len());
+    }
+
+    #[test]
+    fn depth_components_and_coordinate_selectors_precede_dependent_controls() {
+        let features = features_named(&[
+            "Scan3dCoordinateScale",
+            "ConfidenceThreshold",
+            "ComponentEnable",
+            "Scan3dDistanceUnit",
+            "Scan3dCoordinateSelector",
+            "ComponentSelector",
+            "DepthMax",
+            "DepthMin",
+            "PixelFormat",
+        ]);
+        let index = FeatureIndex::new(&features, CameraKind::Depth);
+        assert_eq!(
+            members(&index, &features, "Components"),
+            ["ComponentSelector", "ComponentEnable"]
+        );
+        assert_eq!(
+            members(&index, &features, "Depth"),
+            ["DepthMin", "DepthMax", "ConfidenceThreshold"]
+        );
+        assert_eq!(
+            members(&index, &features, "Calibration"),
+            [
+                "Scan3dCoordinateSelector",
+                "Scan3dDistanceUnit",
+                "Scan3dCoordinateScale"
+            ]
+        );
+        assert_eq!(index.labels[1], "Minimum confidence");
+        assert_eq!(index.labels[3], "Distance unit");
+        assert_eq!(index.labels[5], "Component");
+        assert!(index.tips[5].contains("live settings"));
+        assert_eq!(members(&index, &features, "Image"), ["PixelFormat"]);
+    }
+
+    #[test]
+    fn microscope_and_thermal_controls_follow_their_measurement_workflows() {
+        let features = features_named(&[
+            "FocusPosition",
+            "IlluminationIntensity",
+            "Magnification",
+            "ObjectiveSelector",
+            "StageZ",
+            "ExposureTime",
+            "DeviceTemperature",
+        ]);
+        let index = FeatureIndex::new(&features, CameraKind::Microscope);
+        assert_eq!(
+            members(&index, &features, "Optics"),
+            ["ObjectiveSelector", "Magnification", "FocusPosition"]
+        );
+        assert_eq!(
+            members(&index, &features, "Illumination"),
+            ["IlluminationIntensity"]
+        );
+        assert_eq!(members(&index, &features, "Stage"), ["StageZ"]);
+        assert_eq!(members(&index, &features, "Acquisition"), ["ExposureTime"]);
+        assert_eq!(members(&index, &features, "Device"), ["DeviceTemperature"]);
+
+        let features = features_named(&[
+            "Emissivity",
+            "DeviceTemperature",
+            "TemperatureRange",
+            "TemperatureLinearMode",
+        ]);
+        let index = FeatureIndex::new(&features, CameraKind::Thermal);
+        assert_eq!(
+            members(&index, &features, "Temperature"),
+            ["TemperatureLinearMode", "TemperatureRange", "Emissivity"]
+        );
+        assert_eq!(members(&index, &features, "Device"), ["DeviceTemperature"]);
+        assert_eq!(index.labels[2], "Measurement range");
+        assert!(index.tips[0].contains("target material"));
+    }
+
+    #[test]
+    fn scanner_and_unknown_cameras_keep_available_controls_and_vendor_labels() {
+        let mut features = features_named(&[
+            "ScanResolution",
+            "ScanSource",
+            "AcquisitionStop",
+            "AcquisitionStart",
+        ]);
+        let index = FeatureIndex::new(&features, CameraKind::DocumentScanner);
+        assert_eq!(
+            members(&index, &features, "Scan"),
+            ["ScanSource", "ScanResolution", "AcquisitionStart"]
+        );
+        assert_eq!(index.labels[3], "Scan");
+        assert_eq!(index.listed, 3);
+
+        features = features_named(&["Width", "Height", "VendorSpecialControl"]);
+        features[2].display_name = "Vendor precision mode".into();
+        features[2].description = "A vendor-specific extension".into();
+        let index = FeatureIndex::new(&features, CameraKind::Unknown);
+        assert_eq!(members(&index, &features, "Image"), ["Width", "Height"]);
+        assert_eq!(
+            members(&index, &features, "Other"),
+            ["VendorSpecialControl"]
+        );
+        assert_eq!(index.labels[2], "Vendor precision mode");
+        assert!(index.words[2].contains("vendor-specific extension"));
+        assert_eq!(
+            index.listed,
+            features.len(),
+            "no unsupported controls are invented"
+        );
+    }
+
+    #[test]
+    fn the_index_refreshes_on_camera_type_and_selector_text_changes() {
+        let mut bench = bench();
+        bench.snapshot.connected = Some(liveness::streaming_camera(10, 0, 30.0).info);
+        bench.tick_inspector();
+        let key = bench.inspect.index.key;
+        bench.snapshot.connected.as_mut().unwrap().profile.kind = CameraKind::LineScan;
+        bench.sync_inspector();
+        assert_ne!(bench.inspect.index.key, key);
+        assert_eq!(bench.inspect.index.labels[4], "Block height (lines)");
+        let key = bench.inspect.index.key;
+        bench.snapshot.features[0].display_name = "Component gain".into();
+        bench.snapshot.features[0].description = "Gain for selected component".into();
+        bench.tick_inspector();
+        assert_ne!(bench.inspect.index.key, key);
+        assert_eq!(bench.inspect.index.labels[0], "Component gain");
+        assert!(bench.inspect.index.words[0].contains("selected component"));
+    }
+
+    #[test]
+    fn specialized_guidance_and_automation_respect_measurement_types() {
+        let mut profile = CameraProfile::default();
+        assert!(!offers_auto(&profile), "no controls were advertised");
+        profile.capabilities = vec![CameraCapability::Exposure];
+        for kind in [
+            CameraKind::AreaScan,
+            CameraKind::Unknown,
+            CameraKind::Microscope,
+        ] {
+            profile.kind = kind;
+            assert!(offers_auto(&profile));
+        }
+        for kind in [
+            CameraKind::LineScan,
+            CameraKind::Depth,
+            CameraKind::Thermal,
+            CameraKind::DocumentScanner,
+        ] {
+            profile.kind = kind;
+            assert!(!offers_auto(&profile));
+        }
+        assert!(camera_guidance(CameraKind::LineScan).contains("Block height"));
+        assert!(camera_guidance(CameraKind::Depth).contains("one component"));
+        assert!(camera_guidance(CameraKind::Microscope).contains("focus"));
+        assert!(camera_guidance(CameraKind::Thermal).contains("emissivity"));
+        assert!(camera_guidance(CameraKind::DocumentScanner).contains("one page"));
+        assert!(
+            capture_guidance(CameraKind::Depth)
+                .unwrap()
+                .contains("Raw pixels")
+        );
+        assert!(
+            forward_guidance(CameraKind::Thermal)
+                .unwrap()
+                .contains("8-bit")
+        );
+        assert_eq!(capture_title(CameraKind::LineScan), "Save line blocks");
+    }
+
     #[test]
     fn an_accepted_write_shows_the_stored_value_and_glows_once() {
         let mut bench = bench();
@@ -2467,9 +3247,26 @@ mod tests {
 
     #[test]
     fn schedules_read_in_the_right_number() {
-        assert_eq!(schedule_text(1, 60.0), "1 frame, one every 60 seconds");
-        assert_eq!(schedule_text(1200, 1.0), "1,200 frames, one every 1 second");
-        assert_eq!(schedule_text(10, 2.5), "10 frames, one every 2.5 seconds");
+        assert_eq!(
+            schedule_text_for(CameraKind::Unknown, 1, 60.0),
+            "1 frame, one every 60 seconds"
+        );
+        assert_eq!(
+            schedule_text_for(CameraKind::AreaScan, 1200, 1.0),
+            "1,200 frames, one every 1 second"
+        );
+        assert_eq!(
+            schedule_text_for(CameraKind::Microscope, 10, 2.5),
+            "10 frames, one every 2.5 seconds"
+        );
+        assert_eq!(
+            schedule_text_for(CameraKind::LineScan, 3, 0.0),
+            "3 blocks, captured consecutively"
+        );
+        assert_eq!(
+            schedule_text_for(CameraKind::DocumentScanner, 1, 2.0),
+            "1 page, one every 2 seconds"
+        );
     }
 
     #[test]

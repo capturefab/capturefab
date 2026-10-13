@@ -1559,6 +1559,7 @@ mod tests {
                 model: "Test".into(),
                 serial: "serial-a".into(),
                 address: Some("192.0.2.1".into()),
+                profile: Default::default(),
             });
         let set = handle
             .command_turn(Some("camera-a"), &width_command())

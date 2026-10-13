@@ -369,6 +369,11 @@ pub struct AutoController {
 impl AutoController {
     pub fn enter(camera: &mut Camera, balance: f64) -> Result<Self> {
         let balance = validate_balance(balance)?;
+        ensure!(
+            camera.info.profile.kind.supports_auto(),
+            "automatic image tuning is unsupported for {}; use the camera's acquisition and measurement controls",
+            camera.info.profile.kind
+        );
         let hash = camera
             .info
             .serial
@@ -2165,6 +2170,7 @@ mod tests {
                 model: "ace 2".into(),
                 serial: "12345678".into(),
                 address: None,
+                profile: Default::default(),
             };
             Camera::from_backend(info, Box::new(self.clone())).unwrap()
         }

@@ -721,6 +721,7 @@ mod tests {
             model: model.into(),
             serial: serial.into(),
             address: address.map(str::to_owned),
+            profile: Default::default(),
         }
     }
 

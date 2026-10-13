@@ -942,6 +942,7 @@ pub fn connect(
         model: profile.name.clone(),
         serial: format!("{hash:016x}"),
         address: Some(safe_endpoint),
+        profile: Default::default(),
     };
     Ok((info, backend))
 }
@@ -963,6 +964,7 @@ pub fn camera_infos(timeout: Duration) -> Result<Vec<crate::types::CameraInfo>> 
                 model: name,
                 serial: device.uuid,
                 address: Some(endpoint),
+                profile: Default::default(),
             }
         })
         .collect())
