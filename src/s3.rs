@@ -74,6 +74,19 @@ pub fn has_secret(access_key_id: &str) -> bool {
         .is_ok()
 }
 
+/// Read a key for an in-memory undo transaction. Missing keys differ from a
+/// locked or unavailable credential store: a save must never mistake an
+/// unreadable existing key for an empty slot and then overwrite it.
+pub(crate) fn read_secret(access_key_id: &str) -> Result<Option<String>> {
+    match keyring::Entry::new(KEYCHAIN_SERVICE, access_key_id)
+        .and_then(|entry| entry.get_password())
+    {
+        Ok(secret) => Ok(Some(secret)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => bail!("cannot read the secret key from the OS credential store: {e}"),
+    }
+}
+
 /// The `[profile]` section of an AWS shared credentials file.
 fn profile_keys(text: &str, profile: &str) -> Option<Keys> {
     let mut section = String::new();
@@ -338,6 +351,26 @@ fn error_text(body: &str) -> String {
 impl Client {
     pub fn new(bucket: &Bucket) -> Result<Self> {
         let keys = keys(&bucket.credentials)?;
+        Self::with_keys(bucket, keys)
+    }
+
+    /// Check a typed credential without changing the shared credential store.
+    pub(crate) fn with_secret(bucket: &Bucket, secret: String) -> Result<Self> {
+        let Credentials::Keychain { access_key_id } = &bucket.credentials else {
+            bail!("a typed secret requires an access key ID");
+        };
+        ensure!(!secret.is_empty(), "the secret access key is empty");
+        Self::with_keys(
+            bucket,
+            Keys {
+                id: access_key_id.clone(),
+                secret,
+                token: None,
+            },
+        )
+    }
+
+    fn with_keys(bucket: &Bucket, keys: Keys) -> Result<Self> {
         let service = bucket.service_url();
         let (scheme, authority) = service
             .split_once("://")

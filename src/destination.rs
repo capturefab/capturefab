@@ -282,6 +282,13 @@ fn write(file: &File) -> Result<()> {
 
 /// Serialize read-modify-write updates across processes.
 fn locked<T>(update: impl FnOnce(&mut File) -> Result<T>) -> Result<T> {
+    locked_with_rollback(update, |_| Ok(()))
+}
+
+fn locked_with_rollback<T>(
+    update: impl FnOnce(&mut File) -> Result<T>,
+    rollback: impl FnOnce(&T) -> Result<()>,
+) -> Result<T> {
     use fs2::FileExt;
     let dir = crate::ipc::session_dir();
     crate::ipc::ensure_private_dir(&dir)?;
@@ -294,8 +301,91 @@ fn locked<T>(update: impl FnOnce(&mut File) -> Result<T>) -> Result<T> {
     let mut file = read()?;
     file.version = 1;
     let result = update(&mut file)?;
-    write(&file)?;
+    if let Err(error) = write(&file) {
+        rollback(&result)
+            .context("restore credentials after the destination could not be saved")?;
+        return Err(error);
+    }
     Ok(result)
+}
+
+/// Replace exactly the destination the caller observed. Renames are one
+/// transaction, and a concurrent editor cannot silently lose its changes.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub(crate) fn replace(before: Option<&Destination>, after: Option<&Destination>) -> Result<()> {
+    replace_with(before, after, || Ok(()), |_| Ok(()))
+}
+
+/// Apply an accompanying credential change under the destination lock.
+/// Restore it if writing the settings fails, so a failed save has no hidden
+/// credential side effect.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub(crate) fn replace_with<T>(
+    before: Option<&Destination>,
+    after: Option<&Destination>,
+    prepare: impl FnOnce() -> Result<T>,
+    rollback: impl FnOnce(&T) -> Result<()>,
+) -> Result<T> {
+    replace_with_selection(before, after, None, prepare, rollback)
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub(crate) fn replace_with_selection<T>(
+    before: Option<&Destination>,
+    after: Option<&Destination>,
+    selection: Option<(Option<&str>, bool)>,
+    prepare: impl FnOnce() -> Result<T>,
+    rollback: impl FnOnce(&T) -> Result<()>,
+) -> Result<T> {
+    if let Some(after) = after {
+        after.validate()?;
+    }
+    locked_with_rollback(
+        |file| {
+            replace_in_file(file, before, after)?;
+            if let Some((selected, remember)) = selection {
+                if let Some(name) = selected {
+                    ensure!(
+                        file.destinations.iter().any(|d| d.name == name),
+                        "destination {name} no longer exists; cannot restore its selection"
+                    );
+                }
+                if remember {
+                    file.preferred = selected.map(str::to_owned);
+                }
+            }
+            prepare()
+        },
+        rollback,
+    )
+}
+
+fn replace_in_file(
+    file: &mut File,
+    before: Option<&Destination>,
+    after: Option<&Destination>,
+) -> Result<()> {
+    for name in before.into_iter().chain(after).map(|d| &d.name) {
+        let expected = before.filter(|d| &d.name == name);
+        let current = file.destinations.iter().find(|d| &d.name == name);
+        ensure!(
+            current == expected,
+            "destination {name} changed outside this edit; reload it before trying again"
+        );
+    }
+    let old_name = before.map(|d| &d.name);
+    if before.is_some() {
+        file.destinations.retain(|d| Some(&d.name) != old_name);
+    }
+    if let Some(after) = after {
+        ensure!(file.destinations.len() < 256, "too many destinations");
+        file.destinations.push(after.clone());
+        file.destinations.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    if file.preferred.as_ref() == old_name && old_name.is_some() {
+        file.preferred = after.map(|d| d.name.clone());
+    }
+    Ok(())
 }
 
 /// Add a destination, or replace the one with the same name.
@@ -457,6 +547,156 @@ mod tests {
             },
             keep_local: false,
         }
+    }
+
+    fn folder(name: &str) -> Destination {
+        Destination {
+            name: name.into(),
+            target: Target::Folder {
+                path: std::env::temp_dir().join(name),
+            },
+        }
+    }
+
+    #[test]
+    fn undo_destination_edits_preserve_unrelated_data_and_check_the_expected_version() {
+        let (original, renamed, other) = (folder("original"), folder("renamed"), folder("other"));
+        let mut file = File {
+            version: 1,
+            destinations: vec![original.clone(), other.clone()],
+            preferred: Some(original.name.clone()),
+        };
+        replace_in_file(&mut file, Some(&original), Some(&renamed)).unwrap();
+        assert_eq!(file.destinations, vec![other.clone(), renamed.clone()]);
+        assert_eq!(file.preferred.as_deref(), Some("renamed"));
+        // Undo is the reverse compare-and-swap, with the other destination left intact.
+        replace_in_file(&mut file, Some(&renamed), Some(&original)).unwrap();
+        assert_eq!(file.destinations, vec![original.clone(), other.clone()]);
+        assert_eq!(file.preferred.as_deref(), Some("original"));
+        let mut modified = original.clone();
+        modified.target = Target::Folder {
+            path: std::env::temp_dir().join("changed-elsewhere"),
+        };
+        file.destinations[0] = modified.clone();
+        assert!(replace_in_file(&mut file, Some(&original), Some(&renamed)).is_err());
+        assert_eq!(file.destinations, vec![modified, other]);
+    }
+
+    #[test]
+    fn add_remove_and_rename_undo_refuse_to_overwrite_concurrent_destinations() {
+        let (original, occupied) = (folder("original"), folder("occupied"));
+        let mut file = File {
+            version: 1,
+            destinations: vec![original.clone(), occupied.clone()],
+            preferred: Some(original.name.clone()),
+        };
+        let mut renamed = original.clone();
+        renamed.name = occupied.name.clone();
+        assert!(replace_in_file(&mut file, Some(&original), Some(&renamed)).is_err());
+        assert_eq!(
+            file.destinations,
+            vec![original.clone(), occupied.clone()],
+            "rename checks both names before touching either"
+        );
+        assert!(replace_in_file(&mut file, None, Some(&original)).is_err());
+        replace_in_file(&mut file, Some(&original), None).unwrap();
+        assert!(file.preferred.is_none());
+        replace_in_file(&mut file, None, Some(&original)).unwrap();
+        let mut concurrent = original.clone();
+        concurrent.target = occupied.target.clone();
+        replace_in_file(&mut file, Some(&original), Some(&concurrent)).unwrap();
+        assert!(
+            replace_in_file(&mut file, Some(&original), None).is_err(),
+            "undo of an add cannot remove another editor's update"
+        );
+        assert!(file.destinations.contains(&concurrent));
+    }
+
+    #[test]
+    fn persisted_undo_is_atomic_and_rolls_back_a_credential_when_writing_fails() {
+        // Run the disk checks in a child with its own session directory. Tests
+        // must never alter the launching user's destinations or process-wide
+        // environment while other tests run.
+        if std::env::var_os("CAPTUREFAB_DESTINATION_UNDO_TEST").is_none() {
+            let dir = std::env::temp_dir().join(format!(
+                "capturefab-destination-undo-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            crate::ipc::ensure_private_dir(&dir).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "destination::tests::persisted_undo_is_atomic_and_rolls_back_a_credential_when_writing_fails", "--nocapture"])
+                .env("CAPTUREFAB_SESSION_DIR", &dir).env("CAPTUREFAB_DESTINATION_UNDO_TEST", "1")
+                .output().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (before, after, unrelated) = (folder("before"), folder("after"), folder("unrelated"));
+        save(before.clone()).unwrap();
+        save(unrelated.clone()).unwrap();
+        set_preferred(Some(&before.name)).unwrap();
+        replace(Some(&before), Some(&after)).unwrap();
+        assert_eq!(get("after").unwrap(), after);
+        assert!(get("before").is_err());
+        assert_eq!(preferred().as_deref(), Some("after"));
+        replace(Some(&after), Some(&before)).unwrap();
+        assert_eq!(get("unrelated").unwrap(), unrelated);
+        assert_eq!(preferred().as_deref(), Some("before"));
+        let secret = std::cell::Cell::new("old");
+        let temp =
+            crate::ipc::session_dir().join(format!("destinations.json.{}.tmp", std::process::id()));
+        let result = replace_with(
+            Some(&before),
+            Some(&after),
+            || {
+                secret.set("new");
+                fs::create_dir(&temp)?; // Make opening the atomic-write sibling fail.
+                Ok(())
+            },
+            |_| {
+                secret.set("old");
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            secret.get(),
+            "old",
+            "restore accompanying credential on persistence failure"
+        );
+        assert_eq!(
+            get("before").unwrap(),
+            before,
+            "original settings stay readable"
+        );
+        assert!(get("after").is_err());
+        fs::remove_dir(&temp).unwrap();
+        let touched = std::cell::Cell::new(false);
+        assert!(
+            replace_with(
+                Some(&after),
+                None,
+                || {
+                    touched.set(true);
+                    Ok(())
+                },
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        assert!(
+            !touched.get(),
+            "conflict validation happens before touching credentials"
+        );
     }
 
     #[test]

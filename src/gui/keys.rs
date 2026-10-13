@@ -212,6 +212,8 @@ fn physical_char(physical: key::Physical) -> Option<char> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
+    Undo,
+    Redo,
     Discover,
     ConnectAddress,
     NextCamera,
@@ -242,7 +244,9 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 27] = [
+    pub const ALL: [Action; 29] = [
+        Action::Undo,
+        Action::Redo,
         Action::Discover,
         Action::ConnectAddress,
         Action::NextCamera,
@@ -273,7 +277,8 @@ impl Action {
     ];
 
     /// Help sheet layout: section title and its actions in reading order.
-    pub const SECTIONS: [(&'static str, &'static [Action]); 5] = [
+    pub const SECTIONS: [(&'static str, &'static [Action]); 6] = [
+        ("Editing", &[Action::Undo, Action::Redo]),
         (
             "Cameras",
             &[
@@ -332,6 +337,8 @@ impl Action {
     /// Toggles are named by what they show.
     pub fn label(self) -> &'static str {
         match self {
+            Action::Undo => "Undo",
+            Action::Redo => "Redo",
             Action::Discover => "Discover cameras",
             Action::ConnectAddress => "Connect to an address or stream",
             Action::NextCamera => "Select next camera",
@@ -363,7 +370,8 @@ impl Action {
     }
 
     /// Key bindings for `os`, primary first. Command chords use ⌘ on macOS and Ctrl elsewhere,
-    /// avoiding keys that the OS menu or text fields already own (⌘H, ⌘Q, Ctrl+W, Ctrl+Tab).
+    /// reserving text-editing keys for their usual meaning and avoiding keys that
+    /// the OS menu already owns (⌘H, ⌘Q, Ctrl+W, Ctrl+Tab).
     pub fn bindings(self, os: Os) -> Vec<Chord> {
         let mac = os == Os::Mac;
         let with = |mods, key| Chord { mods, key };
@@ -378,6 +386,9 @@ impl Action {
             ..Mods::COMMAND
         };
         match self {
+            Action::Undo => vec![cmd('z')],
+            Action::Redo if mac => vec![with(cmd_shift, Key::Char('z'))],
+            Action::Redo => vec![with(cmd_shift, Key::Char('z')), cmd('y')],
             Action::Discover if mac => vec![cmd('r')],
             Action::Discover => vec![cmd('r'), bare(Key::F5)],
             Action::ConnectAddress => vec![cmd('l')],
@@ -491,6 +502,9 @@ mod tests {
                 reserved.extend(['h', 'k', 'u', 'w']);
             }
             for action in Action::ALL {
+                if matches!(action, Action::Undo | Action::Redo) {
+                    continue;
+                }
                 for chord in action.bindings(os) {
                     for c in &reserved {
                         let plain = Chord {
@@ -535,6 +549,10 @@ mod tests {
 
     #[test]
     fn shortcut_labels_follow_the_platform() {
+        assert_eq!(Action::Undo.key_label(Os::Mac), "⌘Z");
+        assert_eq!(Action::Redo.key_label(Os::Mac), "⇧⌘Z");
+        assert_eq!(Action::Undo.key_label(Os::Windows), "Ctrl+Z");
+        assert_eq!(Action::Redo.key_label(Os::Windows), "Ctrl+Shift+Z");
         assert_eq!(Action::Capture.key_label(Os::Windows), "Ctrl+S");
         assert_eq!(Action::Fullscreen.key_label(Os::Windows), "F11");
         assert_eq!(Action::ToggleAuto.key_label(Os::Nix), "Ctrl+Shift+A");
@@ -588,6 +606,25 @@ mod tests {
             Action::find(&press(Mods::COMMAND, Key::Char('s')), false, os),
             Some(Action::Capture)
         );
+    }
+
+    #[test]
+    fn undo_and_redo_work_while_a_field_has_focus() {
+        for os in PLATFORMS {
+            for action in [Action::Undo, Action::Redo] {
+                for chord in action.bindings(os) {
+                    assert_eq!(Action::find(&chord, false, os), Some(action));
+                }
+            }
+            let ctrl_y = Chord {
+                mods: Mods::COMMAND,
+                key: Key::Char('y'),
+            };
+            assert_eq!(
+                Action::find(&ctrl_y, false, os),
+                (os != Os::Mac).then_some(Action::Redo)
+            );
+        }
     }
 
     #[test]

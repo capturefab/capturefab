@@ -76,6 +76,22 @@ Connecting or starting acquisition does not scan. Each capture requests one page
 
 Scanner IDs and previously discovered scanner serials receive a 128 MiB frame ring per slot (cameras default to 16 MiB). Use full scanner IDs when opening scanners directly, or set `CAPTUREFAB_FRAME_BYTES` when connecting by an undiscovered serial. Each worker keeps three slots, and the existing 256 MiB maximum override remains available.
 
+## Undo and redo
+
+The desktop provides Undo and Redo throughout its editors and settings: **⌘Z / ⇧⌘Z** on macOS, **Ctrl+Z / Ctrl+Shift+Z** elsewhere, with **Ctrl+Y** also available for redo. The guide lists these bindings. Continuous edits are grouped into one change, and a new change clears redo.
+
+Camera workers also keep history for reversible feature writes, auto/manual changes and streaming changes, shared by GUI, CLI and RPC clients. Each connected camera has its own history; `--camera` addresses that camera without changing the visible selection.
+
+```sh
+capturefab --session bench --camera sim:0 history
+capturefab --session bench --camera sim:0 undo --json
+capturefab --session bench --camera sim:0 redo --json
+```
+
+`status.history` and `cameras[].history` report the next undo/redo labels, or `null` when unavailable. History is bounded and lasts for the camera connection. Replay checks camera state and reports conflicts or failures without discarding the entry. Captures, uploads, recordings, schedules, connection changes, arbitrary camera commands and raw memory writes have external effects that camera history cannot reverse; stopping a stream while it has schedules or forwarding is also excluded.
+
+Scanner settings are reversible. Scanner acquisition, including Start and Stop, may move or consume physical pages and cannot be undone or replayed.
+
 ## Auto exposure and frame rate
 
 ```sh

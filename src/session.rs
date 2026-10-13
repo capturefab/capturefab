@@ -8,11 +8,11 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, ChildStdout, Stdio},
     sync::{
-        Arc, Mutex, OnceLock, PoisonError, RwLock,
+        Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver},
     },
@@ -46,6 +46,17 @@ pub enum SessionCommand {
     },
     Start,
     Stop,
+    /// Revert the last successful reversible change on the addressed camera.
+    Undo,
+    /// Reapply the last reverted change on the addressed camera.
+    Redo,
+    /// Replay a specific acknowledged checkpoint, used by the GUI's shared
+    /// timeline. Tokens are tied to a worker lifetime and cannot target a
+    /// replacement connection accidentally.
+    ReplayCameraChange {
+        token: String,
+        undo: bool,
+    },
     Auto {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         balance: Option<f64>,
@@ -115,6 +126,24 @@ pub struct LogEntry {
     pub level: String,
     pub message: String,
 }
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CameraHistoryStatus {
+    pub undo: Option<String>,
+    pub redo: Option<String>,
+    #[serde(default)]
+    pub entries: Vec<CameraHistoryEntry>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CameraHistoryEntry {
+    pub token: String,
+    pub label: String,
+    pub applied: bool,
+    pub created_at_ms: u64,
+    #[serde(default)]
+    pub last_changed_at_us: u64,
+    pub feature: Option<String>,
+    pub kind: String,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraSnapshot {
     pub info: CameraInfo,
@@ -133,6 +162,8 @@ pub struct CameraSnapshot {
     pub auto: Option<crate::auto::AutoStatus>,
     #[serde(default)]
     pub transport: Option<crate::types::TransportStats>,
+    #[serde(default)]
+    pub history: CameraHistoryStatus,
     /// Frames the shared ring replaced before this process read them, which
     /// `dropped` includes. Kept for this process's own views; not serialized.
     #[serde(skip)]
@@ -170,6 +201,8 @@ pub struct SessionSnapshot {
     pub auto: Option<crate::auto::AutoStatus>,
     #[serde(default)]
     pub transport: Option<crate::types::TransportStats>,
+    #[serde(default)]
+    pub history: CameraHistoryStatus,
 }
 type Reply = Receiver<Result<Value>>;
 /// Newest-frame cache fed by a worker's shared ring. It has its own lock so
@@ -341,6 +374,7 @@ struct Coordinator {
     quitting: AtomicBool,
     pending: AtomicUsize,
     connecting: Mutex<()>,
+    command_order: Mutex<BTreeMap<CommandTarget, Weak<CommandOrder>>>,
     poller: OnceLock<std::thread::Thread>,
     discovery_logs: Mutex<Vec<LogEntry>>,
 }
@@ -368,6 +402,65 @@ impl Drop for PendingSlot {
         self.0.pending.fetch_sub(1, Ordering::AcqRel);
     }
 }
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum CommandTarget {
+    Camera(String),
+    Discovery,
+}
+#[derive(Default)]
+struct CommandOrder {
+    state: Mutex<CommandOrderState>,
+    ready: Condvar,
+}
+#[derive(Default)]
+struct CommandOrderState {
+    next: u64,
+    pending: VecDeque<u64>,
+}
+/// Reserved before spawning so thread scheduling cannot reorder commands.
+/// Dropping an unstarted task removes its ticket without releasing a later
+/// command while an earlier command is still running.
+struct CommandTurn {
+    order: Arc<CommandOrder>,
+    ticket: u64,
+}
+impl CommandOrder {
+    fn reserve(self: &Arc<Self>) -> CommandTurn {
+        let mut state = locked(&self.state);
+        let ticket = state.next;
+        state.next = state.next.wrapping_add(1);
+        state.pending.push_back(ticket);
+        CommandTurn {
+            order: self.clone(),
+            ticket,
+        }
+    }
+}
+impl CommandTurn {
+    fn wait(&self) {
+        let mut state = locked(&self.order.state);
+        while state.pending.front() != Some(&self.ticket) {
+            state = self
+                .order
+                .ready
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+impl Drop for CommandTurn {
+    fn drop(&mut self) {
+        let mut state = locked(&self.order.state);
+        if let Some(position) = state
+            .pending
+            .iter()
+            .position(|ticket| *ticket == self.ticket)
+        {
+            state.pending.remove(position);
+        }
+        self.order.ready.notify_all();
+    }
+}
 const MAX_PENDING: usize = 32;
 const STATUS_POLL: Duration = Duration::from_millis(250);
 #[derive(Clone)]
@@ -389,6 +482,7 @@ impl SessionHandle {
                 quitting: AtomicBool::new(false),
                 pending: AtomicUsize::new(0),
                 connecting: Mutex::new(()),
+                command_order: Mutex::new(BTreeMap::new()),
                 poller: OnceLock::new(),
                 discovery_logs: Mutex::new(Vec::new()),
             }),
@@ -461,6 +555,7 @@ impl SessionHandle {
                         jobs: s.jobs.clone(),
                         auto: s.auto.clone(),
                         transport: s.transport.clone(),
+                        history: s.history.clone(),
                         ring_dropped,
                         stale: false,
                         error_logged: s
@@ -481,6 +576,7 @@ impl SessionHandle {
                         state.jobs = s.jobs.clone();
                         state.auto = s.auto.clone();
                         state.transport = s.transport.clone();
+                        state.history = s.history.clone();
                         state.last_error = s.last_error.clone();
                         state.logs = s.logs.clone();
                     }
@@ -500,6 +596,7 @@ impl SessionHandle {
             state.forwarding = None;
             state.auto = None;
             state.transport = None;
+            state.history = CameraHistoryStatus::default();
         }
         // Active worker snapshots replace their own logs. Keep discovery
         // diagnostics independently so connecting a camera cannot erase them.
@@ -528,6 +625,7 @@ impl SessionHandle {
                     .clone()
             })
             .context("no camera connected; use connect")?;
+        let id = self.camera_id(&id);
         let workers = self.inner.workers.read().unwrap_or_else(|e| e.into_inner());
         if let Some(w) = workers.get(&id) {
             return Ok(w.clone());
@@ -586,6 +684,51 @@ impl SessionHandle {
     pub fn submit_to(&self, camera: &str, c: SessionCommand) -> Result<Reply> {
         self.submit_target(Some(camera.to_owned()), c)
     }
+    /// Resolve aliases from cached identities, without waiting for a busy
+    /// worker's command pipe. All names for one camera share an ordering gate.
+    fn camera_id(&self, selector: &str) -> String {
+        let state = self
+            .inner
+            .state
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let identities = || {
+            state
+                .cameras
+                .iter()
+                .map(|camera| &camera.info)
+                .chain(state.connected.iter())
+                .chain(state.devices.iter())
+        };
+        if identities().any(|info| info.id == selector) {
+            return selector.to_owned();
+        }
+        identities()
+            .find(|info| info.serial == selector || info.address.as_deref() == Some(selector))
+            .map_or_else(|| selector.to_owned(), |info| info.id.clone())
+    }
+    fn command_turn(&self, target: Option<&str>, command: &SessionCommand) -> Option<CommandTurn> {
+        let target = match command {
+            SessionCommand::Discover { .. } => CommandTarget::Discovery,
+            SessionCommand::Connect { camera, .. } | SessionCommand::Select { camera } => {
+                CommandTarget::Camera(self.camera_id(camera))
+            }
+            _ => CommandTarget::Camera(self.camera_id(target?)),
+        };
+        let mut orders = locked(&self.inner.command_order);
+        // Idle gates have no state to retain. At most the bounded pending
+        // commands keep gates alive, including across disconnect/reconnect.
+        orders.retain(|_, order| order.strong_count() > 0);
+        let order = orders
+            .get(&target)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let order = Arc::new(CommandOrder::default());
+                orders.insert(target, Arc::downgrade(&order));
+                order
+            });
+        Some(order.reserve())
+    }
     fn submit_target(&self, target: Option<String>, command: SessionCommand) -> Result<Reply> {
         ensure!(
             !self.inner.quitting.load(Ordering::Relaxed),
@@ -610,13 +753,23 @@ impl SessionHandle {
                     .clone()
             }
         });
+        let target = target.map(|camera| self.camera_id(&camera));
+        let turn = self.command_turn(target.as_deref(), &command);
         let h = self.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("capturefab-command".into())
             .spawn(move || {
                 let _slot = slot;
-                let result = h.process(target.as_deref(), command);
+                let _turn = turn;
+                if let Some(turn) = &_turn {
+                    turn.wait();
+                }
+                let result = if h.inner.quitting.load(Ordering::Acquire) {
+                    Err(anyhow::anyhow!("session is shutting down"))
+                } else {
+                    h.process(target.as_deref(), command)
+                };
                 if let Err(e) = &result {
                     let mut s = h.inner.state.write().unwrap_or_else(|e| e.into_inner());
                     s.last_error = Some(format!("{e:#}"));
@@ -914,6 +1067,192 @@ pub fn run_worker(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn width_command() -> SessionCommand {
+        SessionCommand::Set {
+            feature: "Width".into(),
+            value: "128".into(),
+        }
+    }
+
+    #[test]
+    fn camera_command_turns_follow_submission_order_with_independent_targets() {
+        let handle = SessionHandle::new();
+        let first = handle
+            .command_turn(Some("camera-a"), &width_command())
+            .unwrap();
+        let second = handle
+            .command_turn(Some("camera-a"), &width_command())
+            .unwrap();
+        let third = handle
+            .command_turn(Some("camera-a"), &width_command())
+            .unwrap();
+        let other = handle
+            .command_turn(Some("camera-b"), &width_command())
+            .unwrap();
+        first.wait();
+        let (events, received) = mpsc::channel();
+        let (started, running) = mpsc::channel();
+        let spawn =
+            |turn: CommandTurn, number, events: mpsc::Sender<_>, started: mpsc::Sender<_>| {
+                std::thread::spawn(move || {
+                    started.send(number).unwrap();
+                    turn.wait();
+                    events.send(number).unwrap();
+                })
+            };
+        // Start later submissions first to exercise the ordering gate rather
+        // than relying on the scheduler to happen to start threads in order.
+        let third_thread = spawn(third, 3, events.clone(), started.clone());
+        assert_eq!(running.recv_timeout(Duration::from_secs(2)).unwrap(), 3);
+        let second_thread = spawn(second, 2, events.clone(), started.clone());
+        assert_eq!(running.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+        let other_thread = spawn(other, 4, events, started);
+        assert_eq!(running.recv_timeout(Duration::from_secs(2)).unwrap(), 4);
+        assert_eq!(received.recv_timeout(Duration::from_secs(2)).unwrap(), 4);
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(first);
+        assert_eq!(received.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+        assert_eq!(received.recv_timeout(Duration::from_secs(2)).unwrap(), 3);
+        for thread in [third_thread, second_thread, other_thread] {
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn canceled_or_panicking_command_turns_do_not_deadlock_or_bypass_earlier_commands() {
+        let order = Arc::new(CommandOrder::default());
+        let first = order.reserve();
+        let canceled = order.reserve();
+        let last = order.reserve();
+        first.wait();
+        // Builder::spawn drops its closure on failure. This exercises that
+        // exact ownership path without depending on OS thread exhaustion.
+        let unstarted_task = move || {
+            canceled.wait();
+        };
+        drop(unstarted_task);
+        assert_eq!(locked(&order.state).pending.len(), 2);
+        let (started, running) = mpsc::channel();
+        let (completed, received) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            last.wait();
+            completed.send(()).unwrap();
+        });
+        running.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        // A running task unwinding also releases the head reservation.
+        assert!(
+            std::panic::catch_unwind(move || {
+                let _first = first;
+                panic!("simulated command failure");
+            })
+            .is_err()
+        );
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        thread.join().unwrap();
+        assert!(locked(&order.state).pending.is_empty());
+        order.reserve().wait();
+    }
+
+    #[test]
+    fn submission_threads_obey_the_target_gate_and_allow_other_targets_to_finish() {
+        let handle = SessionHandle::new();
+        let running = handle
+            .command_turn(Some("camera-a"), &width_command())
+            .unwrap();
+        running.wait();
+        // Disconnected-camera errors are enough to exercise the real
+        // submission thread without launching a subprocess in a unit test.
+        let blocked = handle.submit_to("camera-a", width_command()).unwrap();
+        let independent = handle.submit_to("camera-b", width_command()).unwrap();
+        assert!(
+            independent
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_err()
+        );
+        assert!(matches!(
+            blocked.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(running);
+        assert!(
+            blocked
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn camera_aliases_and_lifecycle_commands_share_a_gate_but_discovery_is_separate() {
+        let handle = SessionHandle::new();
+        handle
+            .inner
+            .state
+            .write()
+            .unwrap()
+            .devices
+            .push(CameraInfo {
+                id: "camera-a".into(),
+                transport: crate::types::Transport::GigE,
+                vendor: "Test".into(),
+                model: "Test".into(),
+                serial: "serial-a".into(),
+                address: Some("192.0.2.1".into()),
+            });
+        let set = handle
+            .command_turn(Some("camera-a"), &width_command())
+            .unwrap();
+        let alias = handle
+            .command_turn(Some("serial-a"), &width_command())
+            .unwrap();
+        let disconnect = handle
+            .command_turn(Some("192.0.2.1"), &SessionCommand::Disconnect)
+            .unwrap();
+        let connect = handle
+            .command_turn(
+                None,
+                &SessionCommand::Connect {
+                    camera: "serial-a".into(),
+                    timeout_ms: 1000,
+                },
+            )
+            .unwrap();
+        let select = handle
+            .command_turn(
+                None,
+                &SessionCommand::Select {
+                    camera: "camera-a".into(),
+                },
+            )
+            .unwrap();
+        for turn in [&alias, &disconnect, &connect, &select] {
+            assert!(Arc::ptr_eq(&set.order, &turn.order));
+        }
+        let discover = SessionCommand::Discover {
+            timeout_ms: 1000,
+            simulated: true,
+        };
+        let first_discovery = handle.command_turn(None, &discover).unwrap();
+        let second_discovery = handle.command_turn(None, &discover).unwrap();
+        assert!(Arc::ptr_eq(&first_discovery.order, &second_discovery.order));
+        assert!(!Arc::ptr_eq(&set.order, &first_discovery.order));
+        assert!(handle.command_turn(None, &SessionCommand::Status).is_none());
+        let addressed_status = handle
+            .command_turn(Some("serial-a"), &SessionCommand::Status)
+            .unwrap();
+        assert!(Arc::ptr_eq(&set.order, &addressed_status.order));
+    }
+
     #[test]
     fn frame_feed_reuses_unshared_frames_and_never_mutates_shared_ones() {
         let path = std::env::temp_dir().join(format!(

@@ -52,6 +52,27 @@ impl Workbench {
             ));
         }
         let unseen = self.chrome.unseen.filter(|_| !self.logs_open);
+        let history_button = |undo: bool| {
+            let action = if undo { Action::Undo } else { Action::Redo };
+            let label = self.history_label(undo);
+            let about = label.map_or_else(
+                || action.label().to_owned(),
+                |label| format!("{} {label}", action.label()),
+            );
+            tip_above(
+                button(text(action.label()).size(style::SMALL))
+                    .padding([4, 6])
+                    .style(style::plain)
+                    .on_press_maybe(
+                        (label.is_some() && !self.history_busy()).then_some(if undo {
+                            Message::Undo
+                        } else {
+                            Message::Redo
+                        }),
+                    ),
+                action.hint(&about, os),
+            )
+        };
         let mut activity = stack![tip_above(
             icon_button(
                 Icon::Activity,
@@ -93,6 +114,7 @@ impl Workbench {
                 row![
                     container(left).width(Fill).clip(true),
                     container(self.status(width, p)).max_width(width).clip(true),
+                    row![history_button(true), history_button(false)].spacing(2),
                     activity,
                 ]
                 .spacing(10)
@@ -110,7 +132,7 @@ impl Workbench {
     /// must keep for the capture controls when they show.
     fn status_width(&self, capture: bool) -> f32 {
         // Padding, gaps and the Activity button.
-        let mut room = self.main_width() - 2.0 * (GUTTER - 6.0) - 2.0 * 10.0 - 28.0;
+        let mut room = self.main_width() - 2.0 * (GUTTER - 6.0) - 3.0 * 10.0 - 128.0;
         if capture {
             room -= CAPTURE_ROOM;
         }

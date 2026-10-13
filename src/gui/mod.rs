@@ -1,13 +1,17 @@
 //! The native workbench. Camera I/O lives on the session worker, never the UI thread.
+mod camera_history;
 mod destinations;
 mod format;
 mod gpu;
 mod grid;
 mod help;
+mod history;
 mod icon;
 mod inspector;
+mod keyboard_history;
 mod keys;
 mod liveness;
+mod local_history;
 mod motion;
 mod notice;
 mod oneline;
@@ -298,6 +302,10 @@ struct Pending {
     at: Instant,
     /// One of several sent together, reported as one; see `send_batch`.
     batch: bool,
+    /// A replay of an acknowledged history checkpoint. Its reply commits the
+    /// shared timeline rather than recording another edit.
+    history_replay: Option<bool>,
+    history_token: Option<String>,
 }
 
 impl Pending {
@@ -312,6 +320,8 @@ impl Pending {
             value: None,
             at: Instant::now(),
             batch: false,
+            history_replay: None,
+            history_token: None,
         }
     }
 
@@ -474,6 +484,14 @@ enum Num {
 
 #[derive(Debug, Clone)]
 enum Message {
+    Undo,
+    Redo,
+    FullscreenResult {
+        before: bool,
+        actual: bool,
+        expected: bool,
+        replay: Option<bool>,
+    },
     Tick,
     /// A redraw paced by the display, at the given time.
     Frame(Instant),
@@ -514,6 +532,7 @@ enum Message {
     ToggleFocusRegion,
     /// The focus region, normalized to the frame.
     FocusRegion(iced::Rectangle),
+    FocusRegionStart,
     FocusMetric(scopes::Metric),
     ResetFocusPeak,
     ToggleActivity,
@@ -575,7 +594,16 @@ enum Message {
     HelpMore(bool),
 }
 
+type FeatureDrafts = (HashMap<String, String>, HashMap<String, String>);
+
 struct Workbench {
+    history: history::History<local_history::Edit>,
+    history_replay: Option<bool>,
+    history_deferred: Vec<(String, Option<String>, local_history::Edit, Instant)>,
+    history_deferred_apply: Option<Box<local_history::LocalChange>>,
+    camera_drafts: HashMap<String, FeatureDrafts>,
+    known_camera_history: HashMap<String, (bool, u64)>,
+    camera_history_state: camera_history::State,
     handle: SessionHandle,
     session: String,
     snapshot: SessionSnapshot,
@@ -716,6 +744,13 @@ impl Workbench {
         motion::refresh_accessibility();
         let shown = |open: bool| if open { 1.0 } else { 0.0 };
         Self {
+            history: Default::default(),
+            history_replay: None,
+            history_deferred: Vec::new(),
+            history_deferred_apply: None,
+            camera_drafts: HashMap::new(),
+            known_camera_history: HashMap::new(),
+            camera_history_state: Default::default(),
             handle,
             session,
             snapshot: SessionSnapshot::default(),
@@ -1186,6 +1221,9 @@ impl Workbench {
     /// Everything that follows a finished command: the shared bookkeeping,
     /// each area's, then its notice.
     fn settle(&mut self, pending: &Pending, result: &Result<serde_json::Value>) {
+        if self.camera_history_result(pending, result) {
+            return;
+        }
         match result {
             Ok(value) => self.finished(pending, value),
             Err(error) => self.failed(pending, error),
@@ -1200,6 +1238,15 @@ impl Workbench {
         };
         if let Some((text, detail, level)) = notice {
             self.set_notice(text, detail, level);
+        }
+        if let Ok(value) = result
+            && let Some(reason) = value["history_unavailable"].as_str()
+        {
+            self.set_notice(
+                "Change completed · undo unavailable",
+                Some(reason.to_owned()),
+                Level::Warning,
+            );
         }
     }
 
@@ -1282,6 +1329,7 @@ impl Workbench {
         let selected = self.snapshot.active_camera.clone();
         self.snapshot = self.handle.snapshot();
         self.scene.patch(&mut self.snapshot);
+        self.sync_camera_history();
         if self.snapshot.active_camera != selected {
             self.ring_from = selected;
             self.ring.replay(0.0, 1.0, self.now);
@@ -1292,9 +1340,20 @@ impl Workbench {
             .as_ref()
             .map(|camera| camera.id.clone());
         if camera_id != self.observed_camera {
+            if let Some(previous) = &self.observed_camera {
+                self.camera_drafts.insert(
+                    previous.clone(),
+                    (self.edits.clone(), self.edit_sources.clone()),
+                );
+            }
             self.observed_camera = camera_id;
-            self.edits.clear();
-            self.edit_sources.clear();
+            let (edits, sources) = self
+                .observed_camera
+                .as_ref()
+                .and_then(|id| self.camera_drafts.remove(id))
+                .unwrap_or_default();
+            self.edits = edits;
+            self.edit_sources = sources;
             self.inspect.write_errors.clear();
             self.frame_id = None;
             self.shown = None;
@@ -1324,8 +1383,15 @@ impl Workbench {
         self.sample_throughput();
         self.observe_liveness();
         self.update_frames();
+        let destination_before = local_history::LocalState::capture(self);
         self.capture_to.tick(&mut self.output);
         self.record_to.tick(&mut self.forward_output);
+        self.record_local_change(
+            "Choose output folder".into(),
+            None,
+            destination_before,
+            false,
+        );
         let pages = self.pickers_to_top();
         self.tick_chrome();
         self.tick_side();
@@ -1711,7 +1777,22 @@ impl Workbench {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         self.now = Instant::now();
+        // Apply ready completions before capturing this gesture. A destination
+        // replay must never overwrite input before its history entry exists.
+        self.poll_destination_history();
+        let gesture = local_history::gesture(&message);
+        if local_history::group_barrier(&message) {
+            self.break_history_group();
+        }
+        let before = gesture
+            .as_ref()
+            .map(|_| local_history::LocalState::capture(self));
+        let reset = matches!(message, Message::ResetFocusPeak);
         let task = self.handle_message(message);
+        if let (Some((label, key)), Some(before)) = (gesture, before) {
+            self.record_local_change(label, key, before, reset);
+        }
+        self.poll_destination_history();
         self.sync_animations();
         self.frame_gap
             .store(self.frame_gap().as_nanos() as u64, Ordering::Relaxed);
@@ -1720,6 +1801,24 @@ impl Workbench {
 
     fn handle_message(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::Undo => return self.replay_history(true),
+            Message::Redo => return self.replay_history(false),
+            Message::FullscreenResult {
+                before,
+                actual,
+                expected,
+                replay,
+            } => {
+                self.fullscreen = actual;
+                if replay.is_some() {
+                    self.history_replayed(actual == expected);
+                    if actual != expected {
+                        self.set_notice("Could not restore window mode", None, Level::Error);
+                    }
+                } else if before != actual {
+                    self.record_window_change(before, actual);
+                }
+            }
             Message::Tick => return self.tick(),
             Message::Frame(at) => self.refresh.redraw(at),
             Message::Displaced => {
@@ -1865,6 +1964,7 @@ impl Workbench {
                 self.focus.reset();
                 self.remeasure();
             }
+            Message::FocusRegionStart => self.break_history_group(),
             Message::FocusMetric(metric) => self.focus.set_metric(metric),
             Message::ResetFocusPeak => {
                 self.focus.reset();
@@ -2137,6 +2237,8 @@ impl Workbench {
         };
         let connected = self.snapshot.connected.is_some();
         match action {
+            Action::Undo => return self.replay_history(true),
+            Action::Redo => return self.replay_history(false),
             Action::Overview if self.help_open => self.help_open = false,
             Action::Overview if self.capture_to.editing() => {
                 return self.picker(false, destinations::Message::Cancel);
@@ -2157,18 +2259,7 @@ impl Workbench {
             Action::Help => self.show_help(!self.help_open),
             Action::CopySessionCommand => return self.copy_session_command(true),
             Action::Fullscreen => {
-                return window::latest().and_then(|id| {
-                    window::mode(id).then(move |mode| {
-                        window::set_mode(
-                            id,
-                            if mode == window::Mode::Fullscreen {
-                                window::Mode::Windowed
-                            } else {
-                                window::Mode::Fullscreen
-                            },
-                        )
-                    })
-                });
+                return self.fullscreen_task(None, None);
             }
             Action::CloseWindow => return window::latest().and_then(window::close),
             Action::ToggleSidebar => return self.handle_message(Message::ToggleSidebar),
@@ -2274,7 +2365,7 @@ impl Workbench {
         let body: Element<'_, Message> = layers
             .push(shader(self.gpu.probe()).width(1).height(1))
             .into();
-        self.sheets(body, p)
+        keyboard_history::guard(self.sheets(body, p))
     }
 
     /// The title bar row at the top of a pane; on macOS it is also the

@@ -18,6 +18,8 @@ use std::{
 };
 
 use crate::session::{LogEntry, SessionCommand, SessionSnapshot};
+mod history;
+use history::process;
 type Reply = Receiver<Result<Value>>;
 struct Envelope {
     command: SessionCommand,
@@ -50,6 +52,7 @@ pub struct WorkerHandle {
     quitting: Arc<AtomicBool>,
     thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     ring: Option<Arc<Mutex<crate::shared_memory::SharedRing>>>,
+    history: Arc<Mutex<history::Journal>>,
 }
 impl Default for WorkerHandle {
     fn default() -> Self {
@@ -73,6 +76,7 @@ impl WorkerHandle {
             quitting: Arc::new(AtomicBool::new(false)),
             thread: Arc::new(Mutex::new(None)),
             ring,
+            history: Arc::default(),
         };
         let worker_handle = handle.clone();
         let thread = std::thread::Builder::new()
@@ -265,7 +269,7 @@ fn stop_forward(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn process(
+fn process_plain(
     h: &WorkerHandle,
     camera: &mut Option<Camera>,
     forwarder: &mut Option<(Forwarder, f64)>,
@@ -277,6 +281,9 @@ fn process(
 ) -> Result<Value> {
     match command {
         SessionCommand::Status => Ok(serde_json::to_value(h.snapshot())?),
+        SessionCommand::Undo | SessionCommand::Redo | SessionCommand::ReplayCameraChange { .. } => {
+            anyhow::bail!("history commands must be handled by the camera journal")
+        }
         SessionCommand::Select { .. } => anyhow::bail!("selection belongs to the coordinator"),
         SessionCommand::Forward {
             output,
@@ -1388,6 +1395,41 @@ mod tests {
         assert_eq!(stops.load(Ordering::Relaxed), 1);
         assert!(!camera.as_ref().unwrap().is_streaming());
         assert_eq!(h.snapshot().frames, 0);
+        h.shutdown();
+    }
+
+    #[test]
+    fn scanner_acquisition_has_no_replayable_checkpoint_or_redo_page() {
+        let h = WorkerHandle::new();
+        let (mut camera, requests, stops) = scanner(Duration::ZERO);
+        let started = scanner_command(&h, &mut camera, SessionCommand::Start).unwrap();
+        assert!(started.get("camera_change").is_none());
+        assert!(
+            started["history_unavailable"]
+                .as_str()
+                .unwrap()
+                .contains("document")
+        );
+        let stopped = scanner_command(&h, &mut camera, SessionCommand::Stop).unwrap();
+        assert!(stopped.get("camera_change").is_none());
+        assert!(scanner_command(&h, &mut camera, SessionCommand::Undo).is_err());
+        assert!(scanner_command(&h, &mut camera, SessionCommand::Redo).is_err());
+        // Scanner settings remain ordinary reversible configuration edits.
+        scanner_command(
+            &h,
+            &mut camera,
+            SessionCommand::Set {
+                feature: "Width".into(),
+                value: "128".into(),
+            },
+        )
+        .unwrap();
+        scanner_command(&h, &mut camera, SessionCommand::Undo).unwrap();
+        assert_eq!(camera.as_mut().unwrap().get("Width").unwrap(), 640);
+        scanner_command(&h, &mut camera, SessionCommand::Redo).unwrap();
+        assert_eq!(camera.as_mut().unwrap().get("Width").unwrap(), 128);
+        assert_eq!(requests.load(Ordering::Relaxed), 0);
+        assert_eq!(stops.load(Ordering::Relaxed), 1);
         h.shutdown();
     }
 

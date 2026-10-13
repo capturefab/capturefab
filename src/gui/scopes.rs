@@ -89,6 +89,7 @@ impl Metric {
 
 /// The focus region, its scores over recent frames and the best seen since
 /// the region last changed.
+#[derive(Clone, PartialEq)]
 pub struct FocusMeter {
     pub open: bool,
     /// Normalized to the frame: 0–1 on both axes.
@@ -103,6 +104,12 @@ pub struct FocusMeter {
 }
 
 impl FocusMeter {
+    pub(super) fn restore_calibration(&mut self, previous: &Self) {
+        self.history = previous.history.clone();
+        self.peak = previous.peak;
+        self.sharp = previous.sharp;
+        self.locks = previous.locks;
+    }
     pub fn new(open: bool, region: [f32; 4], metric: Metric) -> Self {
         Self {
             open,
@@ -861,7 +868,7 @@ impl canvas::Program<Message> for RegionEditor {
                 };
                 drag.held = Some((grip, Self::normalized(image, point), self.region));
                 drag.moved = false;
-                Some(canvas::Action::capture())
+                Some(canvas::Action::publish(Message::FocusRegionStart).and_capture())
             }
             canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 let (grip, from, start) = drag.held?;

@@ -36,6 +36,235 @@ fn json(dir: &PathBuf, args: &[&str]) -> Value {
     assert_eq!(v["ok"], true);
     v["result"].clone()
 }
+
+#[test]
+fn undo_redo_camera_session_contract() {
+    let dir = std::env::temp_dir().join(format!(
+        "capturefab-history-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+        .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .args(["--json", "serve", "--name", "history-ci"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&line).unwrap()["result"]["ready"],
+        true
+    );
+    let _fixture = Fixture {
+        child,
+        dir: dir.clone(),
+    };
+    let session = |args: &[&str]| {
+        json(
+            &dir,
+            &[&["--json", "--session", "history-ci"], args].concat(),
+        )
+    };
+    let camera = |id: &str, args: &[&str]| session(&[&["--camera", id], args].concat());
+    let rpc = |id: &str, request: Value| {
+        let mut process = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+            .env("CAPTUREFAB_SESSION_DIR", &dir)
+            .args(["--json", "--session", "history-ci", "--camera", id, "rpc"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        serde_json::to_writer(process.stdin.take().unwrap(), &request).unwrap();
+        let out = process.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["result"].clone()
+    };
+    session(&["connect", "sim:0"]);
+    session(&["connect", "sim:1"]);
+    let original = camera("sim:0", &["get", "Width"])["features"][0]["value"].clone();
+    assert!(camera("sim:0", &["history"])["history"]["undo"].is_null());
+    let write = camera("sim:0", &["set", "Width=128"]);
+    assert_eq!(write["features"][0]["camera_change"]["camera"], "sim:0");
+    assert!(
+        write["features"][0]["camera_change"]["last_changed_at_us"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    camera("sim:1", &["set", "Width=256"]);
+    let status = session(&["status"]);
+    assert_eq!(status["active_camera"], "sim:1");
+    for id in ["sim:0", "sim:1"] {
+        assert_eq!(camera(id, &["history"])["history"]["undo"], "Set Width");
+        let reported = status["cameras"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|camera| camera["info"]["id"] == id)
+            .unwrap();
+        assert_eq!(reported["history"]["undo"], "Set Width");
+        if id == "sim:0" {
+            assert_eq!(
+                reported["history"]["entries"][0]["last_changed_at_us"],
+                write["features"][0]["camera_change"]["last_changed_at_us"]
+            );
+        }
+    }
+    let plain = cmd(
+        &dir,
+        &["--session", "history-ci", "--camera", "sim:0", "history"],
+    );
+    assert!(plain.status.success());
+    assert!(String::from_utf8_lossy(&plain.stdout).contains("Undo: Set Width"));
+    assert_eq!(camera("sim:0", &["undo"])["undone"], "Set Width");
+    assert_eq!(
+        camera("sim:0", &["get", "Width"])["features"][0]["value"],
+        original
+    );
+    assert_eq!(
+        camera("sim:1", &["get", "Width"])["features"][0]["value"],
+        256
+    );
+    assert_eq!(session(&["status"])["active_camera"], "sim:1");
+    let invalid = cmd(
+        &dir,
+        &[
+            "--json",
+            "--session",
+            "history-ci",
+            "--camera",
+            "sim:0",
+            "set",
+            "Width=0",
+        ],
+    );
+    assert!(!invalid.status.success());
+    assert_eq!(
+        camera("sim:0", &["history"])["history"]["redo"],
+        "Set Width"
+    );
+    assert_eq!(
+        rpc("sim:0", serde_json::json!({"op":"redo"}))["redone"],
+        "Set Width"
+    );
+    // Raw writes bypass history; replay must detect and retain the conflicting entry.
+    camera("sim:0", &["memory", "write", "0x100", "c0000000"]);
+    let conflict = cmd(
+        &dir,
+        &[
+            "--json",
+            "--session",
+            "history-ci",
+            "--camera",
+            "sim:0",
+            "undo",
+        ],
+    );
+    assert!(!conflict.status.success());
+    assert!(
+        serde_json::from_slice::<Value>(&conflict.stdout).unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("changed outside this history")
+    );
+    assert_eq!(
+        camera("sim:0", &["history"])["history"]["undo"],
+        "Set Width"
+    );
+    assert_eq!(
+        camera("sim:0", &["get", "Width"])["features"][0]["value"],
+        192
+    );
+    camera("sim:0", &["memory", "write", "0x100", "80000000"]);
+    rpc("sim:0", serde_json::json!({"op":"undo"}));
+    camera("sim:0", &["set", "Width=160"]);
+    assert!(camera("sim:0", &["history"])["history"]["redo"].is_null());
+    let no_redo = cmd(
+        &dir,
+        &[
+            "--json",
+            "--session",
+            "history-ci",
+            "--camera",
+            "sim:0",
+            "redo",
+        ],
+    );
+    assert!(!no_redo.status.success());
+    camera("sim:0", &["start"]);
+    assert_eq!(camera("sim:0", &["undo"])["undone"], "Start stream");
+    assert_eq!(camera("sim:0", &["status"])["streaming"], false);
+    camera("sim:0", &["redo"]);
+    assert_eq!(camera("sim:0", &["status"])["streaming"], true);
+    camera("sim:0", &["disconnect"]);
+    session(&["connect", "sim:0"]);
+    assert!(camera("sim:0", &["history"])["history"]["undo"].is_null());
+    assert_eq!(
+        camera("sim:1", &["history"])["history"]["undo"],
+        "Set Width"
+    );
+    #[cfg(all(
+        feature = "scanner",
+        any(target_os = "linux", target_os = "windows", target_os = "macos")
+    ))]
+    {
+        // Scanner settings are local registers; opening and editing an invented
+        // device ID never starts a driver helper or moves a real scanner.
+        let scanner = match std::env::consts::OS {
+            "linux" => "scanner:sane:HISTORY-TEST",
+            "windows" => "scanner:wia:HISTORY-TEST",
+            "macos" => "scanner:ica:HISTORY-TEST",
+            _ => unreachable!(),
+        };
+        session(&["connect", scanner]);
+        camera(scanner, &["set", "ScanResolution=300"]);
+        assert_eq!(camera(scanner, &["undo"])["undone"], "Set ScanResolution");
+        assert_eq!(
+            camera(scanner, &["get", "ScanResolution"])["features"][0]["value"],
+            150
+        );
+        camera(scanner, &["redo"]);
+        assert_eq!(
+            camera(scanner, &["get", "ScanResolution"])["features"][0]["value"],
+            300
+        );
+        for (setting, field, original) in [
+            ("ScanMode=Gray", "ScanMode", "Color"),
+            ("ScanSource=Feeder", "ScanSource", "Default"),
+        ] {
+            camera(scanner, &["set", setting]);
+            camera(scanner, &["undo"]);
+            assert_eq!(
+                camera(scanner, &["get", field])["features"][0]["value"],
+                original
+            );
+        }
+        assert_eq!(camera(scanner, &["status"])["frames"], 0);
+    }
+    for action in ["undo", "redo", "history"] {
+        let direct = cmd(&dir, &["--json", "--camera", "sim:0", action]);
+        assert!(!direct.status.success());
+        assert!(
+            serde_json::from_slice::<Value>(&direct.stdout).unwrap()["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("needs --session")
+        );
+    }
+}
+
 #[test]
 fn parallel_camera_workers_and_public_cli() {
     let dir = std::env::temp_dir().join(format!(
@@ -384,7 +613,7 @@ fn auto_mode_session_contract() {
     );
     assert_eq!(session(&["auto"])["auto"]["balance"], 0.25);
     assert_eq!(session(&["status"])["cameras"][0]["auto"]["balance"], 0.25);
-    assert_eq!(session(&["manual"]), serde_json::json!({"auto": null}));
+    assert!(session(&["manual"])["auto"].is_null());
     assert!(session(&["status"])["auto"].is_null());
     let saved = dir.join("session.png");
     session(&[

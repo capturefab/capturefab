@@ -40,6 +40,8 @@ const NAME_FIELD: &str = "destination-name";
 const BUCKET_FIELD: &str = "destination-bucket";
 /// Width of the destination sheets.
 const SHEET_WIDTH: f32 = 560.0;
+static SECRET_WRITES: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+static NEXT_SECRET_WRITE: AtomicU64 = AtomicU64::new(1);
 
 /// Run `work` on a thread; poll the receiver for its result.
 fn background<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Receiver<T> {
@@ -178,6 +180,138 @@ enum Field {
     Profile,
 }
 
+/// Editable values only. Runtime tasks and credential-store observations are
+/// refreshed when a draft is restored, rather than replayed from stale state.
+#[derive(Clone, PartialEq, Eq)]
+struct Draft {
+    name: String,
+    name_touched: bool,
+    folder: String,
+    provider: usize,
+    endpoint: String,
+    region: String,
+    bucket: String,
+    prefix: String,
+    path_style: bool,
+    source: Source,
+    access_key_id: String,
+    secret: String,
+    profile: String,
+    keep_local: bool,
+}
+
+struct DraftChange {
+    before: Draft,
+    after: Draft,
+    label: &'static str,
+}
+
+#[derive(Default)]
+struct DraftHistory {
+    undo: Vec<DraftChange>,
+    redo: Vec<DraftChange>,
+    last: Option<(&'static str, Instant)>,
+}
+
+impl DraftHistory {
+    fn record(&mut self, before: Draft, after: Draft, label: &'static str, coalesce: bool) {
+        if before == after {
+            return;
+        }
+        let now = Instant::now();
+        let mut canceled = false;
+        if coalesce
+            && self.last.is_some_and(|(last, at)| {
+                last == label && now.duration_since(at) < Duration::from_millis(600)
+            })
+            && let Some(previous) = self.undo.last_mut()
+        {
+            canceled = previous.before == after;
+            previous.after = after;
+            if canceled {
+                self.undo.pop();
+            }
+        } else {
+            if self.undo.len() == 200 {
+                self.undo.remove(0);
+            }
+            self.undo.push(DraftChange {
+                before,
+                after,
+                label,
+            });
+        }
+        self.redo.clear();
+        self.last = (coalesce && !canceled).then_some((label, now));
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SecretChange {
+    access_key_id: String,
+    before: Option<String>,
+    after: String,
+}
+
+impl fmt::Debug for SecretChange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretChange")
+            .field("access_key_id", &self.access_key_id)
+            .field("previously_stored", &self.before.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Selection {
+    selected: Option<String>,
+    output: String,
+}
+
+/// A successful saved-destination edit, including its selection side effects.
+/// Secret values stay in memory and are deliberately omitted from Debug.
+#[derive(Clone)]
+pub struct Change {
+    before: Option<Destination>,
+    after: Option<Destination>,
+    secret: Option<SecretChange>,
+    before_selection: Selection,
+    after_selection: Selection,
+    label: String,
+    created_at: Instant,
+}
+
+impl fmt::Debug for Change {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DestinationChange")
+            .field("before", &self.before)
+            .field("after", &self.after)
+            .field("credentials_changed", &self.secret.is_some())
+            .field("label", &self.label)
+            .finish()
+    }
+}
+
+impl Change {
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+    pub fn created_at(&self) -> Instant {
+        self.created_at
+    }
+}
+
+struct SaveContext {
+    before: Option<Destination>,
+    selection: Selection,
+    created_at: Instant,
+}
+
+struct Replay {
+    task: Receiver<anyhow::Result<()>>,
+    selection: Selection,
+}
+
 impl Field {
     /// The field a message from `Destination::validate` is about, by its
     /// opening words, as `cli::error_code` classifies errors.
@@ -232,12 +366,13 @@ struct Editor {
     /// The last check's outcome or a refusal no field explains; true for
     /// a problem.
     message: Option<(String, bool)>,
-    /// A running check: whether it stored the typed secret first, and its
-    /// outcome.
-    testing: Option<Receiver<(bool, Result<String, String>)>>,
+    /// A running check. Typed credentials are used transiently and never
+    /// change the saved key until Save succeeds.
+    testing: Option<Receiver<Result<String, String>>>,
     /// A running save of this destination: its folder being made or its
     /// typed secret stored, answering whether a secret was.
-    saving: Option<(Destination, Receiver<anyhow::Result<bool>>)>,
+    saving: Option<(Destination, Receiver<anyhow::Result<Option<SecretChange>>>)>,
+    history: DraftHistory,
 }
 
 impl Editor {
@@ -267,6 +402,7 @@ impl Editor {
             message: None,
             testing: None,
             saving: None,
+            history: DraftHistory::default(),
         }
     }
     /// A new bucket, named after the bucket until a name is typed.
@@ -311,6 +447,47 @@ impl Editor {
             }
         }
         editor
+    }
+
+    fn draft(&self) -> Draft {
+        Draft {
+            name: self.name.clone(),
+            name_touched: self.name_touched,
+            folder: self.folder.clone(),
+            provider: self.provider,
+            endpoint: self.endpoint.clone(),
+            region: self.region.clone(),
+            bucket: self.bucket.clone(),
+            prefix: self.prefix.clone(),
+            path_style: self.path_style,
+            source: self.source,
+            access_key_id: self.access_key_id.clone(),
+            secret: self.secret.clone(),
+            profile: self.profile.clone(),
+            keep_local: self.keep_local,
+        }
+    }
+
+    fn restore_draft(&mut self, draft: Draft) {
+        self.name = draft.name;
+        self.name_touched = draft.name_touched;
+        self.folder = draft.folder;
+        self.provider = draft.provider;
+        self.endpoint = draft.endpoint;
+        self.region = draft.region;
+        self.bucket = draft.bucket;
+        self.prefix = draft.prefix;
+        self.path_style = draft.path_style;
+        self.source = draft.source;
+        self.access_key_id = draft.access_key_id;
+        self.secret = draft.secret;
+        self.profile = draft.profile;
+        self.keep_local = draft.keep_local;
+        self.invalid.clear();
+        self.edited(None);
+        self.key_probe = None;
+        self.key_edited(Instant::now());
+        self.advanced |= self.custom_advanced();
     }
 
     /// Whether the Advanced fields differ from what a new bucket of this
@@ -369,19 +546,19 @@ impl Editor {
         self.stored_secret = true;
         self.key_probe = None;
         self.key_changed = None;
+        self.history = DraftHistory::default();
     }
 
     /// The access key ID and typed secret to store in the keychain before
-    /// the bucket is saved or checked, if one was typed.
+    /// the bucket is saved, if one was typed.
     fn secret_to_store(&self) -> Option<(String, String)> {
         (self.s3 && self.source == Source::Keychain && !self.secret.is_empty())
             .then(|| (self.access_key_id.trim().to_owned(), self.secret.clone()))
     }
 
-    /// Whether a running check is storing the typed secret: it stays typed
-    /// until the check answers, and any edit drops the check. A save waits
-    /// for it, so the keychain is never written twice at once.
-    fn storing(&self) -> bool {
+    /// A save waits for the check using its typed key, so its result remains
+    /// visible before the form closes. The check never changes the keychain.
+    fn checking_secret(&self) -> bool {
         self.testing.is_some() && self.secret_to_store().is_some()
     }
 
@@ -495,14 +672,14 @@ impl Editor {
     }
 
     /// `field` was edited: its refusal no longer applies, nor does the last
-    /// check's outcome, or a check or save still running on the old values.
+    /// check's outcome, or a check still running on the old values. A save
+    /// retains its receiver until its worker's commit is acknowledged.
     fn edited(&mut self, field: Option<Field>) {
         if let Some(field) = field {
             self.invalid.retain(|(f, _)| *f != field);
         }
         self.message = None;
         self.testing = None;
-        self.saving = None;
     }
 
     /// Why `field` was refused, if it was.
@@ -518,11 +695,14 @@ impl Editor {
     fn prepare(
         &self,
         destination: &Destination,
-    ) -> impl FnOnce() -> anyhow::Result<bool> + Send + 'static {
+        before: Option<Destination>,
+        remember: bool,
+    ) -> impl FnOnce() -> anyhow::Result<Option<SecretChange>> + Send + 'static {
         let folder = match &destination.target {
             Target::Folder { path } => Some(path.clone()),
             Target::S3(_) => None,
         };
+        let destination = destination.clone();
         let secret = SecretWrite::queue(self.secret_to_store());
         move || {
             if let Some(path) = folder {
@@ -530,30 +710,32 @@ impl Editor {
                 std::fs::create_dir_all(&path)
                     .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", path.display()))?;
             }
-            store_secret(secret)
+            destination::replace_with_selection(
+                before.as_ref(),
+                Some(&destination),
+                Some((Some(&destination.name), remember)),
+                || store_secret(secret),
+                |change| match change {
+                    Some(change) => restore_secret(change, true),
+                    None => Ok(()),
+                },
+            )
         }
-    }
-
-    /// Record `destination` in the saved list in place of the one edited;
-    /// returns its name. Quick: it writes the local settings only.
-    fn commit(&mut self, destination: Destination) -> anyhow::Result<String> {
-        if let Some(original) = &self.original
-            && original != &destination.name
-        {
-            destination::remove(original)?;
-        }
-        destination::save(destination.clone())?;
-        self.original = Some(destination.name.clone());
-        Ok(destination.name)
     }
 
     /// Save the destination at once; returns the saved name.
-    fn save(&mut self) -> anyhow::Result<String> {
+    fn save(&mut self, remember: bool) -> anyhow::Result<String> {
         let destination = self.destination()?;
-        if self.prepare(&destination)()? {
+        let before = self
+            .original
+            .as_ref()
+            .map(|name| destination::get(name))
+            .transpose()?;
+        if self.prepare(&destination, before, remember)()?.is_some() {
             self.secret_stored();
         }
-        self.commit(destination)
+        self.original = Some(destination.name.clone());
+        Ok(destination.name)
     }
 
     /// Take a running check's outcome, if it came.
@@ -562,15 +744,11 @@ impl Editor {
             None | Some(Err(TryRecvError::Empty)) => return,
             Some(Ok(answer)) => answer,
             Some(Err(TryRecvError::Disconnected)) => {
-                (false, Err("the check stopped without an answer".into()))
+                Err("the check stopped without an answer".into())
             }
         };
-        let (stored, outcome) = answer;
         self.testing = None;
-        if stored {
-            self.secret_stored();
-        }
-        self.message = Some(match outcome {
+        self.message = Some(match answer {
             Ok(text) => (text, false),
             Err(text) => (capitalize(&text), true),
         });
@@ -578,7 +756,7 @@ impl Editor {
 
     /// Finish a save whose slow part answered: record the destination, or
     /// show why it was refused. The saved name, once saved.
-    fn poll_save(&mut self) -> Option<String> {
+    fn poll_save(&mut self) -> Option<(String, Option<SecretChange>)> {
         let prepared = match self.saving.as_ref()?.1.try_recv() {
             Ok(prepared) => prepared,
             Err(TryRecvError::Empty) => return None,
@@ -587,14 +765,14 @@ impl Editor {
             }
         };
         let (destination, _) = self.saving.take()?;
-        let saved = prepared.and_then(|stored| {
-            if stored {
-                self.secret_stored();
+        match prepared {
+            Ok(secret) => {
+                if secret.is_some() {
+                    self.secret_stored();
+                }
+                self.original = Some(destination.name.clone());
+                Some((destination.name, secret))
             }
-            self.commit(destination)
-        });
-        match saved {
-            Ok(name) => Some(name),
             Err(error) => {
                 self.refuse(error);
                 None
@@ -613,11 +791,10 @@ struct SecretWrite {
 
 impl SecretWrite {
     fn queue(secret: Option<(String, String)>) -> Option<Self> {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
         secret.map(|(access_key_id, secret)| Self {
             access_key_id,
             secret,
-            ticket: NEXT.fetch_add(1, Ordering::Relaxed),
+            ticket: NEXT_SECRET_WRITE.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -625,46 +802,97 @@ impl SecretWrite {
     /// later already wrote this key: an editor drops a store it no longer
     /// wants, but its thread may still be waiting on a keychain prompt, and
     /// must not land over the newer secret.
-    fn store_in_order(
+    fn store_in_order<T>(
         self,
         written: &Mutex<BTreeMap<String, u64>>,
-        store: impl FnOnce(&str, &str) -> anyhow::Result<()>,
-    ) -> anyhow::Result<()> {
+        store: impl FnOnce(&str, &str) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
         let mut written = written.lock().unwrap_or_else(PoisonError::into_inner);
         if written
             .get(&self.access_key_id)
             .is_some_and(|&ticket| ticket > self.ticket)
         {
-            return Ok(());
+            return Err(anyhow::anyhow!(
+                "The credential write was superseded; save again"
+            ));
         }
-        store(&self.access_key_id, &self.secret)?;
+        let result = store(&self.access_key_id, &self.secret)?;
         written.insert(self.access_key_id, self.ticket);
-        Ok(())
+        Ok(result)
     }
 }
 
 /// Store a typed secret under its access key ID in the OS credential store;
 /// whether one was. It can wait on a keychain prompt, so off the UI thread.
-fn store_secret(write: Option<SecretWrite>) -> anyhow::Result<bool> {
-    static WRITTEN: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+fn store_secret(write: Option<SecretWrite>) -> anyhow::Result<Option<SecretChange>> {
     // Without S3 support there is no bucket to store a secret for.
     let Some(write) = write.filter(|_| cfg!(feature = "s3")) else {
-        return Ok(false);
+        return Ok(None);
     };
-    write.store_in_order(&WRITTEN, keychain_store)?;
-    Ok(true)
+    write
+        .store_in_order(&SECRET_WRITES, |access_key_id, secret| {
+            let before = keychain_read(access_key_id)?;
+            keychain_store(access_key_id, secret)?;
+            Ok(SecretChange {
+                access_key_id: access_key_id.into(),
+                before,
+                after: secret.into(),
+            })
+        })
+        .map(Some)
+}
+
+fn restore_secret(change: &SecretChange, undo: bool) -> anyhow::Result<()> {
+    let mut written = SECRET_WRITES.lock().unwrap_or_else(PoisonError::into_inner);
+    restore_secret_using(change, undo, keychain_read, |id, secret| match secret {
+        Some(secret) => keychain_store(id, secret),
+        None => keychain_delete(id),
+    })?;
+    written.insert(
+        change.access_key_id.clone(),
+        NEXT_SECRET_WRITE.fetch_add(1, Ordering::Relaxed),
+    );
+    Ok(())
+}
+
+fn restore_secret_using(
+    change: &SecretChange,
+    undo: bool,
+    read: impl FnOnce(&str) -> anyhow::Result<Option<String>>,
+    write: impl FnOnce(&str, Option<&str>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let (expected, desired) = if undo {
+        (Some(change.after.as_str()), change.before.as_deref())
+    } else {
+        (change.before.as_deref(), Some(change.after.as_str()))
+    };
+    anyhow::ensure!(
+        read(&change.access_key_id)?.as_deref() == expected,
+        "the stored credential changed outside this edit; undo cannot overwrite it"
+    );
+    write(&change.access_key_id, desired)
 }
 
 #[cfg(feature = "s3")]
 use crate::s3::store_secret as keychain_store;
+#[cfg(feature = "s3")]
+use crate::s3::{delete_secret as keychain_delete, read_secret as keychain_read};
 
 #[cfg(not(feature = "s3"))]
 fn keychain_store(_access_key_id: &str, _secret: &str) -> anyhow::Result<()> {
     Ok(())
 }
+#[cfg(not(feature = "s3"))]
+fn keychain_read(_access_key_id: &str) -> anyhow::Result<Option<String>> {
+    Ok(None)
+}
+#[cfg(not(feature = "s3"))]
+fn keychain_delete(_access_key_id: &str) -> anyhow::Result<()> {
+    Ok(())
+}
 
 /// Check a destination: write a probe file to a folder, or reach a bucket.
-fn test(destination: Destination) -> Result<String, String> {
+fn test(destination: Destination, secret: Option<String>) -> Result<String, String> {
     match &destination.target {
         Target::Folder { path } => {
             volumes::ensure_present(path).map_err(|e| e.to_string())?;
@@ -686,14 +914,18 @@ fn test(destination: Destination) -> Result<String, String> {
         Target::S3(bucket) => {
             #[cfg(feature = "s3")]
             {
-                crate::s3::Client::new(bucket)
+                let client = match secret {
+                    Some(secret) => crate::s3::Client::with_secret(bucket, secret),
+                    None => crate::s3::Client::new(bucket),
+                };
+                client
                     .and_then(|client| client.check())
                     .map(|()| format!("Connected to {}", bucket.bucket))
                     .map_err(|e| format!("{e:#}"))
             }
             #[cfg(not(feature = "s3"))]
             {
-                let _ = bucket;
+                let _ = (bucket, secret);
                 Err("S3 support is not included in this build".into())
             }
         }
@@ -702,6 +934,8 @@ fn test(destination: Destination) -> Result<String, String> {
 
 #[derive(Clone, Debug)]
 pub enum Message {
+    Undo,
+    Redo,
     Select(Choice),
     Output(String),
     BrowseOutput,
@@ -783,6 +1017,9 @@ pub struct Picker {
     remember: bool,
     /// Files are recordings, not stills; changes a few labels.
     recording: bool,
+    changes: Vec<Change>,
+    saving_context: Option<SaveContext>,
+    replay: Option<Replay>,
 }
 
 impl Picker {
@@ -826,14 +1063,31 @@ impl Picker {
             focus: None,
             remember,
             recording,
+            changes: Vec::new(),
+            saving_context: None,
+            replay: None,
         }
     }
 
     /// Reload the saved list now and then, and collect background results;
     /// a finished save chooses its destination, as for `update`.
     pub fn tick(&mut self, output: &mut String) {
-        if let Some(name) = self.editor.as_mut().and_then(Editor::poll_save) {
+        if let Some((name, secret)) = self.editor.as_mut().and_then(Editor::poll_save) {
+            let context = self.saving_context.take();
+            let after = self.editor.as_ref().and_then(|e| e.destination().ok());
             self.saved_as(name, output);
+            if let Some(context) = context {
+                self.record_change(
+                    context.before,
+                    after,
+                    secret,
+                    context.selection,
+                    output,
+                    context.created_at,
+                );
+            }
+        } else if self.editor.as_ref().is_none_or(|e| e.saving.is_none()) {
+            self.saving_context = None;
         }
         if self
             .loaded
@@ -924,15 +1178,227 @@ impl Picker {
         self.editor.is_some() || self.removing.is_some()
     }
 
+    pub fn editor_open(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.mutation_busy()
+            && self
+                .editor
+                .as_ref()
+                .is_some_and(|e| !e.history.undo.is_empty())
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.mutation_busy()
+            && self
+                .editor
+                .as_ref()
+                .is_some_and(|e| !e.history.redo.is_empty())
+    }
+
+    pub fn undo_label(&self) -> Option<&str> {
+        self.can_undo()
+            .then(|| {
+                self.editor
+                    .as_ref()?
+                    .history
+                    .undo
+                    .last()
+                    .map(|change| change.label)
+            })
+            .flatten()
+    }
+
+    pub fn redo_label(&self) -> Option<&str> {
+        self.can_redo()
+            .then(|| {
+                self.editor
+                    .as_ref()?
+                    .history
+                    .redo
+                    .last()
+                    .map(|change| change.label)
+            })
+            .flatten()
+    }
+
+    pub fn undo(&mut self) -> bool {
+        if !self.can_undo() {
+            return false;
+        }
+        let editor = self.editor.as_mut().unwrap();
+        let change = editor.history.undo.pop().unwrap();
+        editor.restore_draft(change.before.clone());
+        editor.history.redo.push(change);
+        editor.history.last = None;
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        if !self.can_redo() {
+            return false;
+        }
+        let editor = self.editor.as_mut().unwrap();
+        let change = editor.history.redo.pop().unwrap();
+        editor.restore_draft(change.after.clone());
+        editor.history.undo.push(change);
+        editor.history.last = None;
+        true
+    }
+
+    pub fn mutation_busy(&self) -> bool {
+        self.replay.is_some() || self.editor.as_ref().is_some_and(|e| e.saving.is_some())
+    }
+
+    pub fn take_changes(&mut self) -> Vec<Change> {
+        std::mem::take(&mut self.changes)
+    }
+
+    fn selection(&self, output: &str) -> Selection {
+        Selection {
+            selected: self.selected.clone(),
+            output: output.into(),
+        }
+    }
+
+    /// Restore the exact output supplied by the app's history. Selection
+    /// restoration must not strip directories as a fresh user selection does.
+    pub fn restore_selection(
+        &mut self,
+        selected: Option<String>,
+        _output: &mut String,
+    ) -> Result<(), String> {
+        if let Some(name) = &selected {
+            let current = destination::list().map_err(|e| format!("{e:#}"))?;
+            if !current.iter().any(|d| &d.name == name) {
+                return Err(format!("Destination {name} no longer exists"));
+            }
+            self.saved = current;
+        }
+        if self.remember {
+            destination::set_preferred(selected.as_deref()).map_err(|e| format!("{e:#}"))?;
+        }
+        self.selected = selected;
+        self.folder = None;
+        Ok(())
+    }
+
+    fn record_change(
+        &mut self,
+        before: Option<Destination>,
+        after: Option<Destination>,
+        secret: Option<SecretChange>,
+        before_selection: Selection,
+        output: &str,
+        created_at: Instant,
+    ) {
+        let label = match (&before, &after) {
+            (None, Some(destination)) => format!("Add destination {}", destination.name),
+            (Some(destination), None) => format!("Remove destination {}", destination.name),
+            (_, Some(destination)) => format!("Edit destination {}", destination.name),
+            _ => return,
+        };
+        self.changes.push(Change {
+            before,
+            after,
+            secret,
+            before_selection,
+            after_selection: self.selection(output),
+            label,
+            created_at,
+        });
+    }
+
+    /// Credential access runs in a worker. Return true for immediate success,
+    /// false when the app should await `take_replay_result` before moving its
+    /// history cursor.
+    pub fn replay(
+        &mut self,
+        change: &Change,
+        undo: bool,
+        output: &mut String,
+    ) -> Result<bool, String> {
+        if self.mutation_busy() {
+            return Err("A destination change is still running".into());
+        }
+        let (before, after, selection) = if undo {
+            (&change.after, &change.before, &change.before_selection)
+        } else {
+            (&change.before, &change.after, &change.after_selection)
+        };
+        if let Some(secret) = &change.secret {
+            let (before, after, secret, selection) = (
+                before.clone(),
+                after.clone(),
+                secret.clone(),
+                selection.clone(),
+            );
+            self.replay = Some(Replay {
+                selection: selection.clone(),
+                task: background({
+                    let remember = self.remember;
+                    move || {
+                        destination::replace_with_selection(
+                            before.as_ref(),
+                            after.as_ref(),
+                            Some((selection.selected.as_deref(), remember)),
+                            || restore_secret(&secret, undo),
+                            |_| restore_secret(&secret, !undo),
+                        )
+                    }
+                }),
+            });
+            return Ok(false);
+        }
+        destination::replace_with_selection(
+            before.as_ref(),
+            after.as_ref(),
+            Some((selection.selected.as_deref(), self.remember)),
+            || Ok(()),
+            |_| Ok(()),
+        )
+        .map_err(|e| format!("{e:#}"))?;
+        self.finish_replay(selection.clone(), output);
+        Ok(true)
+    }
+
+    fn finish_replay(&mut self, selection: Selection, output: &mut String) {
+        self.saved = destination::list().unwrap_or_default();
+        self.loaded = Some(Instant::now());
+        self.selected = selection.selected;
+        *output = selection.output;
+        self.folder = None;
+        self.notice = None;
+    }
+
+    pub fn take_replay_result(&mut self, output: &mut String) -> Option<Result<(), String>> {
+        let result = match self.replay.as_ref()?.task.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => Err(anyhow::anyhow!(
+                "Destination restore stopped without an answer"
+            )),
+        };
+        let replay = self.replay.take().unwrap();
+        Some(
+            result
+                .map(|()| self.finish_replay(replay.selection, output))
+                .map_err(|e| format!("{e:#}")),
+        )
+    }
+
     /// Whether a background check, save or keychain lookup is running or
     /// due, so the app keeps polling.
     pub fn busy(&self) -> bool {
-        self.editor.as_ref().is_some_and(|e| {
-            e.testing.is_some()
-                || e.saving.is_some()
-                || e.key_probe.is_some()
-                || e.key_changed.is_some()
-        })
+        self.replay.is_some()
+            || self.editor.as_ref().is_some_and(|e| {
+                e.testing.is_some()
+                    || e.saving.is_some()
+                    || e.key_probe.is_some()
+                    || e.key_changed.is_some()
+            })
     }
 
     /// Point the editor's Advanced chevron at the group's state; from
@@ -985,7 +1451,7 @@ impl Picker {
 
     fn select(&mut self, name: Option<String>, output: &mut String) {
         if self.selected != name {
-            if self.remember {
+            if self.remember && self.replay.is_none() {
                 let _ = destination::set_preferred(name.as_deref());
             }
             self.selected = name;
@@ -1016,7 +1482,26 @@ impl Picker {
     }
 
     pub fn update(&mut self, message: Message, output: &mut String) {
+        // Saving now commits in its worker. Keep its form and receiver alive
+        // until the result arrives, so a close or edit cannot hide a commit.
+        let local_during_replay = self.replay.is_some()
+            && matches!(
+                message,
+                Message::Output(_) | Message::Select(_) | Message::BrowseOutput
+            );
+        if self.mutation_busy()
+            && !local_during_replay
+            && !matches!(message, Message::Scrolled(_) | Message::Advanced(_))
+        {
+            return;
+        }
         match message {
+            Message::Undo => {
+                self.undo();
+            }
+            Message::Redo => {
+                self.redo();
+            }
             Message::Select(choice) => self.select(choice.name, output),
             Message::Output(value) => {
                 *output = value;
@@ -1063,13 +1548,33 @@ impl Picker {
                 }
             }
             Message::Remove(name) => {
+                let created_at = Instant::now();
                 self.removing = None;
-                self.notice = Some(match destination::remove(&name) {
-                    Ok(_) => (format!("Removed {name}; its files are untouched"), false),
-                    Err(e) => (format!("{e:#}"), true),
-                });
-                self.loaded = None;
-                self.tick(output);
+                let before_selection = self.selection(output);
+                let before = self.saved.iter().find(|d| d.name == name).cloned();
+                let result = match &before {
+                    Some(before) => destination::replace(Some(before), None),
+                    None => Err(anyhow::anyhow!(
+                        "Destination {name} is no longer in the list"
+                    )),
+                };
+                match result {
+                    Ok(()) => {
+                        self.loaded = None;
+                        self.tick(output);
+                        self.record_change(
+                            before,
+                            None,
+                            None,
+                            before_selection,
+                            output,
+                            created_at,
+                        );
+                        self.notice =
+                            Some((format!("Removed {name}; its files are untouched"), false));
+                    }
+                    Err(error) => self.notice = Some((format!("{error:#}"), true)),
+                }
             }
             Message::ConfirmRemove(name) => self.removing = name,
             Message::AddFolder => {
@@ -1090,10 +1595,11 @@ impl Picker {
             // The folder and keychain may be slow to answer, so saving
             // finishes in `tick`.
             Message::Save => {
+                let selection = self.selection(output);
                 let Some(editor) = &mut self.editor else {
                     return;
                 };
-                if editor.saving.is_some() || editor.storing() {
+                if editor.saving.is_some() || editor.checking_secret() {
                     return;
                 }
                 let destination = match editor.destination() {
@@ -1103,13 +1609,28 @@ impl Picker {
                 if let Some(why) = editor.name_taken(&self.saved) {
                     return editor.refuse_name(why);
                 }
+                let before = editor
+                    .original
+                    .as_ref()
+                    .and_then(|original| self.saved.iter().find(|d| &d.name == original))
+                    .cloned();
+                if editor.original.is_some() && before.is_none() {
+                    return editor.refuse(anyhow::anyhow!(
+                        "This destination was removed; reopen the editor"
+                    ));
+                }
                 if editor.secret_to_store().is_some() {
                     // Its answer would be about the keychain before the store.
                     editor.key_probe = None;
                 }
                 editor.message = None;
-                let prepare = editor.prepare(&destination);
+                let prepare = editor.prepare(&destination, before.clone(), self.remember);
                 editor.saving = Some((destination, background(prepare)));
+                self.saving_context = Some(SaveContext {
+                    before,
+                    selection,
+                    created_at: Instant::now(),
+                });
             }
             Message::Test => {
                 let Some(editor) = &mut self.editor else {
@@ -1122,21 +1643,34 @@ impl Picker {
                     Ok(destination) => destination,
                     Err(error) => return editor.refuse(error),
                 };
-                // Testing a bucket needs the key, so store a typed secret first.
-                let secret = SecretWrite::queue(editor.secret_to_store());
-                if secret.is_some() {
-                    editor.key_probe = None;
-                }
+                // A check uses the typed key transiently. Testing or canceling
+                // a draft must never overwrite a saved destination's key.
+                let secret = editor.secret_to_store().map(|(_, secret)| secret);
                 editor.message = None;
                 editor.invalid.clear();
-                editor.testing = Some(background(move || match store_secret(secret) {
-                    Ok(stored) => (stored, test(destination)),
-                    Err(e) => (false, Err(format!("{e:#}"))),
-                }));
+                editor.testing = Some(background(move || test(destination, secret)));
             }
             message => {
                 let Some(editor) = &mut self.editor else {
                     return;
+                };
+                let before = editor.draft();
+                let (label, coalesce) = match &message {
+                    Message::Name(_) => ("Destination name", true),
+                    Message::Folder(_) => ("Destination folder", true),
+                    Message::BrowseFolder => ("Destination folder", false),
+                    Message::Provider(_) => ("Bucket provider", false),
+                    Message::Endpoint(_) => ("Bucket endpoint", true),
+                    Message::Region(_) => ("Bucket region", true),
+                    Message::Bucket(_) => ("Bucket name", true),
+                    Message::Prefix(_) => ("Bucket key prefix", true),
+                    Message::Source(_) => ("Credential source", false),
+                    Message::AccessKey(_) => ("Access key ID", true),
+                    Message::Secret(_) => ("Secret key", true),
+                    Message::Profile(_) => ("AWS profile", true),
+                    Message::PathStyle(_) => ("Bucket addressing", false),
+                    Message::KeepLocal(_) => ("Keep local copy", false),
+                    _ => ("Destination", false),
                 };
                 let field = match message {
                     Message::Name(value) => {
@@ -1220,12 +1754,15 @@ impl Picker {
                     _ => return,
                 };
                 editor.edited(field);
+                let after = editor.draft();
+                editor.history.record(before, after, label, coalesce);
             }
         }
     }
 
     /// Save to `Capturefab/` on a drive, reusing a destination already there.
     fn use_volume(&mut self, volume: &Volume, output: &mut String) {
+        let created_at = Instant::now();
         let folder = volume.path.join("Capturefab");
         if let Some(existing) = self
             .saved
@@ -1249,13 +1786,16 @@ impl Picker {
             },
             folder,
         );
+        let before_selection = self.selection(output);
         match editor.name_taken(&self.saved) {
             Some(why) => editor.refuse_name(why),
-            None => match editor.save() {
+            None => match editor.save(self.remember) {
                 Ok(name) => {
+                    let after = editor.destination().ok();
                     self.loaded = None;
                     self.tick(output);
                     self.select(Some(name.clone()), output);
+                    self.record_change(None, after, None, before_selection, output, created_at);
                     self.notice = Some((format!("Saving to {name}"), false));
                     return;
                 }
@@ -1328,6 +1868,11 @@ impl Picker {
                     .push(
                         row![
                             text_input(local_example, output)
+                                .id(if self.recording {
+                                    "record-output"
+                                } else {
+                                    "capture-output"
+                                })
                                 .on_input(Message::Output)
                                 .size(style::BODY)
                                 .padding([6, 10])
@@ -1357,6 +1902,11 @@ impl Picker {
                     ))
                     .push(
                         text_input(named_example, output)
+                            .id(if self.recording {
+                                "record-output"
+                            } else {
+                                "capture-output"
+                            })
                             .on_input(Message::Output)
                             .size(style::BODY)
                             .padding([6, 10])
@@ -1591,10 +2141,12 @@ impl Picker {
         max_height: f32,
         spin: usize,
         now: Instant,
+        undo_label: Option<&str>,
+        redo_label: Option<&str>,
     ) -> Element<'_, Message> {
         let p = Palette::of(dark);
         let page = match &self.editor {
-            None => self.list(p, now),
+            None => self.list(p, now, undo_label, redo_label),
             Some(editor) => self.form(editor, p, spin, now),
         }
         .size(SHEET_WIDTH, max_height)
@@ -1606,8 +2158,15 @@ impl Picker {
         page.into()
     }
 
-    fn list(&self, p: &'static Palette, now: Instant) -> SheetFrame<'_, Message> {
+    fn list(
+        &self,
+        p: &'static Palette,
+        now: Instant,
+        undo_label: Option<&str>,
+        redo_label: Option<&str>,
+    ) -> SheetFrame<'_, Message> {
         let mut body = column![
+            history_controls(undo_label, redo_label, p),
             text(
                 "Save captures and recordings to a folder or drive, or upload them to an S3 bucket."
             )
@@ -1794,7 +2353,8 @@ impl Picker {
                 ),
             ),
         );
-        let mut form = column![].spacing(10);
+        let mut form =
+            column![history_controls(self.undo_label(), self.redo_label(), p)].spacing(10);
         if editor.s3 {
             form = form.push(field(
                 "Service",
@@ -1984,7 +2544,7 @@ impl Picker {
         }
         let testing = editor.testing.is_some();
         let saving = editor.saving.is_some();
-        let storing = editor.storing();
+        let checking_secret = editor.checking_secret();
         let outcome = if saving {
             status("Saving…".into(), Status::Working, spin, p)
         } else if testing {
@@ -2003,11 +2563,11 @@ impl Picker {
         let cancel = button(text("Cancel").size(style::BODY))
             .padding([7, 14])
             .style(style::plain)
-            .on_press(Message::Cancel);
+            .on_press_maybe((!saving).then_some(Message::Cancel));
         let save = button(text("Save").size(style::BODY))
             .padding([7, 18])
             .style(style::primary)
-            .on_press_maybe((!saving && !storing).then_some(Message::Save));
+            .on_press_maybe((!saving && !checking_secret).then_some(Message::Save));
         let (first, second) = if cfg!(target_os = "windows") {
             (save, cancel)
         } else {
@@ -2112,11 +2672,11 @@ impl Picker {
 /// Width of the editor's label column.
 const LABEL: f32 = 110.0;
 
-/// Where Test and Save keep a typed secret key.
+/// Where Save keeps a typed secret key; Test never changes a saved key.
 const KEYCHAIN_NOTE: &str = if cfg!(target_os = "macos") {
-    "Test and Save store it in your macOS keychain, not in settings."
+    "Save keeps this key in your macOS keychain. Test uses it for this check only."
 } else {
-    "Test and Save store it in the OS credential store, not in settings."
+    "Save keeps this key in the OS credential store. Test uses it for this check only."
 };
 
 fn label<'a>(value: &'a str, p: &'static Palette) -> Element<'a, Message> {
@@ -2133,6 +2693,34 @@ enum Status {
     Working,
     Done,
     Failed,
+}
+
+fn history_controls<'a>(
+    undo_label: Option<&str>,
+    redo_label: Option<&str>,
+    _p: &'static Palette,
+) -> Element<'a, Message> {
+    use super::keys::{Action, Os};
+    let control = |action: Action, label: Option<&str>, on: Message, word: &str| {
+        let description = label
+            .map(|label| format!("{word} {label}"))
+            .unwrap_or_else(|| format!("Nothing to {}", word.to_lowercase()));
+        super::tip(
+            button(
+                text(format!("{word} · {}", action.key_label(Os::CURRENT))).size(style::CAPTION),
+            )
+            .padding([5, 10])
+            .style(style::secondary)
+            .on_press_maybe(label.map(|_| on)),
+            action.hint(&description, Os::CURRENT),
+        )
+    };
+    row![
+        control(Action::Undo, undo_label, Message::Undo, "Undo"),
+        control(Action::Redo, redo_label, Message::Redo, "Redo")
+    ]
+    .spacing(8)
+    .into()
 }
 
 /// An outcome in the toolbar's manner: a glyph, then the text. `spin` steps
@@ -2237,6 +2825,234 @@ mod tests {
     }
 
     #[test]
+    fn draft_undo_groups_typing_and_restores_fields_changed_by_presets() {
+        let mut picker = Picker::new(false, false);
+        let mut output = "capture.png".to_string();
+        picker.update(Message::AddBucket, &mut output);
+        picker.update(Message::Endpoint("https://example.com".into()), &mut output);
+        picker.update(Message::Endpoint(String::new()), &mut output);
+        assert!(
+            !picker.can_undo(),
+            "typing back to the starting value has no effect to undo"
+        );
+        picker.update(Message::Bucket("cam".into()), &mut output);
+        picker.update(Message::Bucket("camera".into()), &mut output);
+        assert_eq!(picker.editor.as_ref().unwrap().history.undo.len(), 1);
+        assert_eq!(picker.undo_label(), Some("Bucket name"));
+        assert!(picker.undo());
+        let editor = picker.editor.as_ref().unwrap();
+        assert!(
+            editor.bucket.is_empty() && editor.name.is_empty(),
+            "automatic name changes restore with the bucket"
+        );
+        assert!(picker.redo());
+        assert_eq!(picker.editor.as_ref().unwrap().name, "camera");
+        picker.update(Message::Provider(Provider(1)), &mut output);
+        assert!(picker.editor.as_ref().unwrap().path_style);
+        assert!(picker.undo());
+        let editor = picker.editor.as_ref().unwrap();
+        assert_eq!(
+            (
+                editor.provider,
+                editor.region.as_str(),
+                editor.endpoint.as_str(),
+                editor.path_style
+            ),
+            (0, "us-east-1", "", false)
+        );
+        assert!(picker.redo());
+        assert_eq!(picker.editor.as_ref().unwrap().region, "auto");
+        assert_eq!(output, "capture.png");
+    }
+
+    #[test]
+    fn draft_history_branches_and_keeps_secret_values_private() {
+        let mut picker = Picker::new(false, false);
+        let mut output = String::new();
+        picker.update(Message::AddBucket, &mut output);
+        picker.update(Message::Secret("private-first".into()), &mut output);
+        picker.update(Message::Source(Source::Environment), &mut output);
+        assert!(picker.undo());
+        assert_eq!(picker.editor.as_ref().unwrap().source, Source::Keychain);
+        assert!(picker.undo());
+        assert!(picker.editor.as_ref().unwrap().secret.is_empty());
+        assert!(picker.redo());
+        assert_eq!(picker.editor.as_ref().unwrap().secret, "private-first");
+        picker.update(Message::Secret("private-second".into()), &mut output);
+        assert!(!picker.can_redo(), "editing branches the history");
+        picker.editor.as_mut().unwrap().secret_stored();
+        assert!(!picker.can_undo(), "storing clears sensitive draft history");
+        let before_selection = picker.selection(&output);
+        picker.record_change(
+            None,
+            Some(bucket(|_| {}).destination().unwrap()),
+            Some(SecretChange {
+                access_key_id: "AKIA".into(),
+                before: Some("private-first".into()),
+                after: "private-second".into(),
+            }),
+            before_selection,
+            &output,
+            Instant::now(),
+        );
+        let text = format!("{:?}", picker.take_changes());
+        assert!(!text.contains("private-first") && !text.contains("private-second"));
+        picker.update(Message::Cancel, &mut output);
+        assert!(!picker.can_undo() && !picker.can_redo());
+    }
+
+    #[test]
+    fn pending_save_blocks_edits_and_only_success_creates_global_history() {
+        let mut picker = Picker::new(false, false);
+        let mut output = "/tmp/capture.png".to_string();
+        let mut editor = bucket(|e| e.source = Source::Environment);
+        let (sender, receiver) = channel();
+        editor.saving = Some((editor.destination().unwrap(), receiver));
+        picker.editor = Some(editor);
+        picker.saving_context = Some(SaveContext {
+            before: None,
+            selection: picker.selection(&output),
+            created_at: Instant::now(),
+        });
+        picker.manager_open = true;
+        picker.update(Message::Name("different".into()), &mut output);
+        picker.update(Message::CloseManager, &mut output);
+        assert!(picker.manager_open && picker.mutation_busy());
+        assert_eq!(picker.editor.as_ref().unwrap().name, "line-1");
+        picker.tick(&mut output);
+        assert!(picker.take_changes().is_empty());
+        sender.send(Ok(None)).unwrap();
+        picker.tick(&mut output);
+        let changes = picker.take_changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].label(), "Add destination line-1");
+        assert_eq!(changes[0].before_selection.output, "/tmp/capture.png");
+        assert_eq!(changes[0].after_selection.output, "capture.png");
+        assert!(!picker.mutation_busy());
+        assert!(picker.take_changes().is_empty(), "delivered once");
+    }
+
+    #[test]
+    fn failed_replay_retains_selection_and_success_restores_the_exact_output() {
+        let mut picker = Picker::new(false, false);
+        let mut output = "current.png".to_string();
+        let desired = Selection {
+            selected: None,
+            output: "/tmp/previous.png".into(),
+        };
+        let (sender, receiver) = channel();
+        picker.replay = Some(Replay {
+            task: receiver,
+            selection: desired.clone(),
+        });
+        assert!(picker.mutation_busy());
+        assert!(picker.take_replay_result(&mut output).is_none());
+        picker.update(Message::Output("newer.png".into()), &mut output);
+        assert_eq!(
+            output, "newer.png",
+            "new local typing stays available for the app's deferred history"
+        );
+        sender
+            .send(Err(anyhow::anyhow!("credential changed")))
+            .unwrap();
+        assert!(picker.take_replay_result(&mut output).unwrap().is_err());
+        assert_eq!(output, "newer.png");
+        assert!(!picker.mutation_busy());
+        let (sender, receiver) = channel();
+        picker.replay = Some(Replay {
+            task: receiver,
+            selection: desired,
+        });
+        sender.send(Ok(())).unwrap();
+        assert!(picker.take_replay_result(&mut output).unwrap().is_ok());
+        assert_eq!(output, "/tmp/previous.png");
+        assert!(
+            picker.take_changes().is_empty(),
+            "replay creates no new edits"
+        );
+    }
+
+    #[test]
+    fn asynchronous_destination_restore_reapplies_newer_output_through_the_global_timeline() {
+        assert_newer_output_survives_destination_replay(false);
+    }
+
+    #[test]
+    fn destination_replay_ready_before_input_preserves_the_current_output_gesture() {
+        assert_newer_output_survives_destination_replay(true);
+    }
+
+    fn assert_newer_output_survives_destination_replay(ready_before_input: bool) {
+        use super::super::{Message as AppMessage, Workbench};
+        let mut app = Workbench::new(
+            crate::session::SessionHandle::new(),
+            "destination-history-test".into(),
+            true,
+            None,
+        );
+        // Use the worker acknowledgment boundary instead of accessing the
+        // user's OS credential store or destination settings in this test.
+        app.capture_to = Picker::new(false, false);
+        app.output = "saved.png".into();
+        let before = Selection {
+            selected: None,
+            output: "/tmp/before.png".into(),
+        };
+        app.capture_to.record_change(
+            None,
+            Some(bucket(|_| {}).destination().unwrap()),
+            Some(SecretChange {
+                access_key_id: "test-key".into(),
+                before: None,
+                after: "test-secret".into(),
+            }),
+            before.clone(),
+            &app.output,
+            Instant::now(),
+        );
+        app.poll_destination_history();
+        let (sender, receiver) = channel();
+        app.capture_to.replay = Some(Replay {
+            task: receiver,
+            selection: before,
+        });
+        app.history_replay = Some(true);
+        if ready_before_input {
+            sender.send(Ok(())).unwrap();
+        }
+        let _ = app.update(AppMessage::CapturePicker(Message::Output(
+            "newer.png".into(),
+        )));
+        assert_eq!(app.output, "newer.png");
+        if !ready_before_input {
+            sender.send(Ok(())).unwrap();
+        }
+        app.poll_destination_history();
+        assert!(app.history_replay.is_none());
+        assert_eq!(
+            app.output, "newer.png",
+            "the completed destination restore cannot erase newer typing"
+        );
+        assert_eq!(app.history_label(true), Some("Edit capture output"));
+        assert!(
+            app.history_label(false).is_none(),
+            "new typing branches the redo timeline"
+        );
+        let _ = app.update(AppMessage::Undo);
+        assert_eq!(
+            app.output,
+            if ready_before_input {
+                "/tmp/before.png"
+            } else {
+                "saved.png"
+            },
+            "undo restores the value shown when the newer edit began"
+        );
+        let _ = app.update(AppMessage::Redo);
+        assert_eq!(app.output, "newer.png");
+    }
+
+    #[test]
     fn a_superseded_secret_store_never_lands_over_a_newer_one() {
         let queue =
             |id: &str, secret: &str| SecretWrite::queue(Some((id.into(), secret.into()))).unwrap();
@@ -2252,7 +3068,7 @@ mod tests {
         // The newer store's thread runs first; the older one then finds it
         // superseded, while an unrelated key still stores.
         newer.store_in_order(&written, store).unwrap();
-        older.store_in_order(&written, store).unwrap();
+        assert!(older.store_in_order(&written, store).is_err());
         other.store_in_order(&written, store).unwrap();
         assert_eq!(*stored.borrow(), ["AKIA=new", "AKIB=b"]);
         // In order, both store and the newer one is last.
@@ -2260,6 +3076,44 @@ mod tests {
         first.store_in_order(&written, store).unwrap();
         second.store_in_order(&written, store).unwrap();
         assert_eq!(stored.borrow()[2..], ["AKIC=1", "AKIC=2"]);
+    }
+
+    #[test]
+    fn credential_undo_redo_restore_old_values_without_overwriting_external_changes() {
+        let change = SecretChange {
+            access_key_id: "AKIA".into(),
+            before: Some("old".into()),
+            after: "new".into(),
+        };
+        let current = std::cell::RefCell::new(Some("new".to_string()));
+        let read = |_: &str| Ok(current.borrow().clone());
+        let write = |_: &str, value: Option<&str>| {
+            *current.borrow_mut() = value.map(str::to_owned);
+            Ok(())
+        };
+        restore_secret_using(&change, true, read, write).unwrap();
+        assert_eq!(current.borrow().as_deref(), Some("old"));
+        restore_secret_using(&change, false, read, write).unwrap();
+        assert_eq!(current.borrow().as_deref(), Some("new"));
+        *current.borrow_mut() = Some("external".into());
+        assert!(restore_secret_using(&change, true, read, write).is_err());
+        assert_eq!(current.borrow().as_deref(), Some("external"));
+        assert!(
+            restore_secret_using(&change, true, |_| Err(anyhow::anyhow!("locked")), write).is_err()
+        );
+        assert_eq!(current.borrow().as_deref(), Some("external"));
+        let new_key = SecretChange {
+            before: None,
+            ..change
+        };
+        *current.borrow_mut() = Some("new".into());
+        restore_secret_using(&new_key, true, read, write).unwrap();
+        assert!(
+            current.borrow().is_none(),
+            "undoing a new key removes only that key"
+        );
+        restore_secret_using(&new_key, false, read, write).unwrap();
+        assert_eq!(current.borrow().as_deref(), Some("new"));
     }
 
     /// A bucket that validates, changed by `change`.
@@ -2455,9 +3309,9 @@ mod tests {
     }
 
     #[test]
-    fn a_check_or_save_on_values_since_edited_is_dropped() {
+    fn editing_drops_a_stale_check_but_keeps_the_save_acknowledgment() {
         let pending = || {
-            let (sender, receiver) = channel::<(bool, Result<String, String>)>();
+            let (sender, receiver) = channel::<Result<String, String>>();
             std::mem::forget(sender);
             receiver
         };
@@ -2468,7 +3322,10 @@ mod tests {
         let (_sender, receiver) = channel();
         editor.saving = Some((editor.destination().unwrap(), receiver));
         editor.edited(None);
-        assert!(editor.saving.is_none());
+        assert!(
+            editor.saving.is_some(),
+            "a committing worker must retain its acknowledgment receiver"
+        );
     }
 
     #[test]
@@ -2499,7 +3356,7 @@ mod tests {
     }
 
     #[test]
-    fn a_save_waits_for_a_check_storing_the_secret() {
+    fn a_save_waits_for_the_check_using_its_typed_credentials() {
         let mut picker = Picker::new(false, false);
         let mut output = String::new();
         let mut editor = bucket(|e| e.secret = "secret".into());
@@ -2508,27 +3365,35 @@ mod tests {
         picker.editor = Some(editor);
         picker.update(Message::Save, &mut output);
         let editor = picker.editor.as_mut().unwrap();
-        assert!(editor.saving.is_none(), "the check stores it");
-        sender.send((true, Ok("Connected".into()))).unwrap();
+        assert!(
+            editor.saving.is_none(),
+            "finish the check before closing its form"
+        );
+        sender.send(Ok("Connected".into())).unwrap();
         editor.poll_test();
-        assert!(!editor.storing() && editor.secret_to_store().is_none());
+        assert!(!editor.checking_secret() && editor.secret_to_store().is_some());
+        assert_eq!(
+            editor.secret, "secret",
+            "checking never stores or clears the key"
+        );
         // Without a typed secret, a check holds nothing up.
+        editor.secret.clear();
         let (_sender, receiver) = channel();
         editor.testing = Some(receiver);
-        assert!(!editor.storing());
+        assert!(!editor.checking_secret());
     }
 
     #[test]
-    fn a_check_that_stored_the_secret_says_so() {
+    fn a_check_keeps_the_typed_secret_without_claiming_it_is_stored() {
         let mut editor = bucket(|e| e.secret = "secret".into());
         let (sender, receiver) = channel();
         editor.testing = Some(receiver);
         editor.poll_test();
         assert!(editor.testing.is_some(), "still checking");
-        sender.send((true, Err("access denied".into()))).unwrap();
+        sender.send(Err("access denied".into())).unwrap();
         editor.poll_test();
         assert!(editor.testing.is_none());
-        assert!(editor.stored_secret && editor.secret.is_empty());
+        assert!(!editor.stored_secret && editor.secret == "secret");
         assert_eq!(editor.message, Some(("Access denied".into(), true)));
     }
 

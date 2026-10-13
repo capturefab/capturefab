@@ -120,6 +120,19 @@ impl Workbench {
         recording: bool,
         message: destinations::Message,
     ) -> Task<Message> {
+        if matches!(
+            message,
+            destinations::Message::Undo | destinations::Message::Redo
+        ) {
+            let editor = if recording {
+                self.record_to.editor_open()
+            } else {
+                self.capture_to.editor_open()
+            };
+            if !editor {
+                return self.replay_history(matches!(message, destinations::Message::Undo));
+            }
+        }
         let (picker, output) = if recording {
             (&mut self.record_to, &mut self.forward_output)
         } else {
@@ -162,7 +175,18 @@ impl Workbench {
             modal(
                 body,
                 self.capture_to
-                    .manager(p.dark, height, spin, now)
+                    .manager(
+                        p.dark,
+                        height,
+                        spin,
+                        now,
+                        (!self.history_busy())
+                            .then(|| self.history_label(true))
+                            .flatten(),
+                        (!self.history_busy())
+                            .then(|| self.history_label(false))
+                            .flatten(),
+                    )
                     .map(Message::CapturePicker),
                 (!self.capture_to.editing())
                     .then_some(Message::CapturePicker(destinations::Message::CloseManager)),
@@ -172,7 +196,18 @@ impl Workbench {
             modal(
                 body,
                 self.record_to
-                    .manager(p.dark, height, spin, now)
+                    .manager(
+                        p.dark,
+                        height,
+                        spin,
+                        now,
+                        (!self.history_busy())
+                            .then(|| self.history_label(true))
+                            .flatten(),
+                        (!self.history_busy())
+                            .then(|| self.history_label(false))
+                            .flatten(),
+                    )
                     .map(Message::RecordPicker),
                 (!self.record_to.editing())
                     .then_some(Message::RecordPicker(destinations::Message::CloseManager)),
@@ -211,19 +246,22 @@ impl Workbench {
             }
             list
         };
-        let [cameras, acquisition, view, panels, window] = Action::SECTIONS;
+        let [editing, cameras, acquisition, view, panels, window] = Action::SECTIONS;
         let more = self.sheets.more;
         let mut body = column![
             text("Discover a camera, connect, then start a stream. The simulator is available without camera hardware.")
                 .size(style::BODY)
                 .color(p.secondary),
             row![
-                column![section(cameras), section(acquisition), section(window)]
+                column![section(editing), section(cameras), section(acquisition), section(window)]
                     .spacing(18)
                     .width(Fill),
                 column![section(view), section(panels)].spacing(18).width(Fill),
             ]
             .spacing(32),
+            text("Undo and Redo work in text fields and restore reversible settings changes. Captures and uploads stay saved.")
+                .size(style::SMALL)
+                .color(p.secondary),
             text(plain_keys_note(os)).size(style::SMALL).color(p.secondary),
             heading("Control this window from a terminal or agent", p),
             text("Copy the session command to attach your terminal or coding agent. Session commands update this window and share its camera connection.")

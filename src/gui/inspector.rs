@@ -1203,6 +1203,7 @@ impl Workbench {
                 Element::from(space().height(style::line_height(style::CAPTION)))
             });
             text_input(&current, draft)
+                .id(format!("feature:{}", feature.name))
                 .on_input(move |value| Message::Draft(feature.name.clone(), value))
                 .on_submit(Message::Commit(feature.name.clone()))
                 .size(style::SMALL)
@@ -1309,6 +1310,7 @@ impl Workbench {
             .unwrap_or_else(|| self.num_text(key));
         let valid = !self.drafts.contains_key(&key) || num_valid(key, &value);
         text_input("", &value)
+            .id(format!("number:{key:?}"))
             .on_input(move |value| Message::Num(key, value))
             .size(style::BODY)
             .padding([5, 8])
@@ -1619,6 +1621,7 @@ impl Workbench {
                 "Encoder",
                 tip(
                     text_input("auto", &self.forward_encoder)
+                        .id("forward-encoder")
                         .on_input(Message::Encoder)
                         .size(style::BODY)
                         .padding([5, 8])
@@ -1633,6 +1636,7 @@ impl Workbench {
             form_row(
                 "Bitrate",
                 text_input("4M", &self.forward_bitrate)
+                    .id("forward-bitrate")
                     .on_input(Message::Bitrate)
                     .size(style::BODY)
                     .padding([5, 8])

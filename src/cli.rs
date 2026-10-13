@@ -250,6 +250,12 @@ pub enum Command {
         #[arg(required = true)]
         assignments: Vec<String>,
     },
+    /// Undo the latest reversible camera change in an existing session
+    Undo,
+    /// Redo the latest undone camera change in an existing session
+    Redo,
+    /// Show the next undo and redo labels for the selected or addressed camera
+    History,
     /// Execute a GenICam command such as TriggerSoftware
     Execute { feature: String },
     /// Connect a camera in an existing persistent session
@@ -690,6 +696,9 @@ pub fn run(cli: Cli) -> Result<()> {
                 | Command::Stop
                 | Command::Auto { .. }
                 | Command::Manual { .. }
+                | Command::Undo
+                | Command::Redo
+                | Command::History
                 | Command::StopForward
                 | Command::Status
                 | Command::Rpc
@@ -851,6 +860,16 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Stop => client.call(SessionCommand::Stop)?,
         Command::Auto { balance } => client.call(SessionCommand::Auto { balance: *balance })?,
         Command::Manual { revert } => client.call(SessionCommand::Manual { revert: *revert })?,
+        Command::Undo => client.call(SessionCommand::Undo)?,
+        Command::Redo => client.call(SessionCommand::Redo)?,
+        Command::History => {
+            let status = client.call(SessionCommand::Status)?;
+            ensure!(
+                status["connected"].is_object(),
+                "no camera connected; use connect"
+            );
+            json!({"camera":status["connected"]["id"],"history":status["history"]})
+        }
         Command::Status => client.call(SessionCommand::Status)?,
         Command::Capture {
             output: destination,
@@ -1023,7 +1042,30 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
         return write_json(&json!({"version":ipc::VERSION,"ok":true,"result":value}));
     }
     let mut out = io::stdout().lock();
-    if let Some(devices) = value["devices"].as_array() {
+    if matches!(&cli.command, Some(Command::Undo | Command::Redo)) {
+        let (verb, key) = if matches!(&cli.command, Some(Command::Undo)) {
+            ("Undid", "undone")
+        } else {
+            ("Redid", "redone")
+        };
+        writeln!(out, "{verb} {}", value[key].as_str().unwrap_or("change"))?;
+    } else if matches!(&cli.command, Some(Command::History)) {
+        writeln!(out, "Camera {}", value["camera"].as_str().unwrap_or(""))?;
+        writeln!(
+            out,
+            "Undo: {}",
+            value["history"]["undo"]
+                .as_str()
+                .unwrap_or("Nothing to undo")
+        )?;
+        writeln!(
+            out,
+            "Redo: {}",
+            value["history"]["redo"]
+                .as_str()
+                .unwrap_or("Nothing to redo")
+        )?;
+    } else if let Some(devices) = value["devices"].as_array() {
         if devices.is_empty() {
             writeln!(
                 out,
@@ -1119,8 +1161,22 @@ fn schema() -> Value {
     contract["storage"] = json!({"default":crate::storage::StoragePolicy::default(),"scope":"All Capturefab-owned capture and recording files across output directories in this user's session directory. Reservations count toward quota. Existing/unowned/modified files are never deleted.","recording_file_cap_default":crate::media::default_recording_cap(),"on_full":["stop","delete-oldest"],"status":"capturefab storage --json","error":"storage_full; exit 6"});
     contract["scheduling"] = json!({"cli":"capture --at RFC3339 | --delay 30s; --interval 10s -n 100","lifetime":"Schedules run while the GUI, serve session or direct CLI process remains running; jobs are not persisted across exit.","interval":"First time plus captured count times interval; no unbounded backlog. Each job has a per-frame transport timeout.","states":["pending","running","complete","cancelled","failed"]});
     contract["auto"] = json!({"cli":"--session NAME auto [--balance B] | manual [--revert]; capture|forward|serve --auto [--balance B]","default":"manual; connecting never enables auto mode and it ends on disconnect","balance":"0 favors image quality, 1 favors frame rate; quality, balanced and frame-rate mean 0, 0.5 and 1; omitted keeps the current value, initially 0.5","status":"status.auto and cameras[].auto; null in manual mode","strategies":["firmware","software","video-mode","none"],"states":["waiting","converging","stable","limited"],"settled":["stable","limited"],"manual":"Setting a feature in auto.managed switches that camera to manual first and the set result adds \"auto\":null; manual turns ExposureAuto, GainAuto and BalanceWhiteAuto off so values hold","persistence":"Camera settings written by auto mode remain after manual, like set; manual --revert, disconnect and session exit restore their previous values (best effort)","capture":"--set applies before --auto; capture saves once exposure settles or after min(timeout_ms/2, 3 s) and result.auto reports the state; with --session auto mode stays on afterwards"});
+    contract["history"] = json!({
+        "cli":"--session NAME [--camera ID] history | undo | redo",
+        "scope":"Reversible camera changes are recorded by the camera worker, including changes made through the GUI, CLI and RPC; each connected camera has its own history.",
+        "status":"status.history and cameras[].history contain undo and redo labels, or null when unavailable; history returns the selected or addressed camera's labels.",
+        "lifetime":"History is bounded and lasts while the camera remains connected; a new change clears its redo history.",
+        "checkpoints":"Successful reversible commands also return camera_change:{token,camera,label,last_changed_at_us}. replay_camera_change targets that token with undo:true or undo:false for desktop history; expired tokens and conflicting camera state fail.",
+        "conflicts":"Replay checks current camera state before changing it. A conflicting or failed replay reports an error and retains the history entry.",
+        "effects":"Captures, uploads, recordings, schedules, connection changes, arbitrary commands and raw memory writes cannot be reversed by camera history. Stopping a stream with schedules or forwarding is also excluded. Scanner settings are reversible; scanner acquisition, including Start and Stop, may move or consume physical pages and cannot be undone or replayed."
+    });
     let commands = contract["rpc"]["commands"].as_array_mut().unwrap();
     commands.extend([json!({"op":"select","camera":"sim:0"}),json!({"op":"jobs"}),json!({"op":"cancel_job","id":1}),json!({"op":"schedule","output":"timelapse","count":10,"timeout_ms":2000,"format":"png","first_at_ms":crate::scheduling::now_ms()+60000,"interval_ms":10000,"storage":crate::storage::StoragePolicy::default()}),json!({"op":"forward","output":"rtsp://localhost:8554/camera","codec":"h264","encoder":"auto","fps":30,"bitrate":"4M","storage":crate::storage::StoragePolicy::default(),"max_file_bytes":crate::media::default_recording_cap()}),json!({"op":"stop_forward"}),json!({"op":"auto","balance":0.5}),json!({"op":"manual"})]);
+    commands.extend([
+        json!({"op":"undo"}),
+        json!({"op":"redo"}),
+        json!({"op":"replay_camera_change","token":"TOKEN_FROM_CAMERA_CHANGE","undo":true}),
+    ]);
     contract
 }
 
@@ -1425,6 +1481,21 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(["capturefab"].iter().chain(args)).is_err());
         }
+        for action in ["undo", "redo", "history"] {
+            assert!(Cli::try_parse_from(["capturefab", "--session", "bench", action]).is_ok());
+            assert!(
+                Cli::try_parse_from([
+                    "capturefab",
+                    "--session",
+                    "bench",
+                    "--camera",
+                    "sim:1",
+                    action,
+                    "--json"
+                ])
+                .is_ok()
+            );
+        }
     }
     #[test]
     fn balance_values() {
@@ -1455,7 +1526,7 @@ mod tests {
             serde_json::from_value::<SessionCommand>(command.clone()).unwrap();
         }
         assert!(
-            ["auto", "manual"]
+            ["auto", "manual", "undo", "redo", "replay_camera_change"]
                 .iter()
                 .all(|op| commands.iter().any(|c| c["op"] == *op))
         );

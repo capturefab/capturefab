@@ -297,6 +297,7 @@ impl Aimd {
     }
 }
 
+#[derive(Clone)]
 struct Bandwidth {
     aimd: Aimd,
     feature: &'static str,
@@ -306,7 +307,7 @@ struct Bandwidth {
     frames: u64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Supervisor {
     read: Option<(Instant, f64, f64)>,
     decided: Option<Instant>,
@@ -318,12 +319,13 @@ struct Supervisor {
     lowered: bool,
 }
 
+#[derive(Clone)]
 struct WhiteBalance {
     selector: Option<Value>,
     ratios: Vec<(Option<String>, Value)>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct AutoController {
     status: AutoStatus,
     published: AutoStatus,

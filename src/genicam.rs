@@ -174,8 +174,83 @@ impl NodeMap {
     pub fn has(&self, name: &str) -> bool {
         self.nodes.contains_key(name)
     }
+    /// Selectors that address a feature's value, including selectors hidden
+    /// behind register address expressions. Undo must read and write the
+    /// same selected bank even when the inspector has since selected another.
+    pub fn selectors(&self, name: &str) -> Vec<String> {
+        let mut dependencies = BTreeSet::new();
+        let mut pending = vec![name.to_owned()];
+        let mut selectors = BTreeSet::new();
+        while let Some(name) = pending.pop() {
+            if !dependencies.insert(name.clone()) {
+                continue;
+            }
+            let Some(node) = self.nodes.get(&name) else {
+                continue;
+            };
+            for property in &node.props {
+                if property.tag.starts_with('p') && self.nodes.contains_key(&property.text) {
+                    pending.push(property.text.clone());
+                    if property.tag == "pIndex" || property.text.ends_with("Selector") {
+                        selectors.insert(property.text.clone());
+                    }
+                }
+            }
+        }
+        for (selector, node) in &self.nodes {
+            if node.props.iter().any(|property| {
+                property.tag == "pSelected" && dependencies.contains(&property.text)
+            }) {
+                selectors.insert(selector.clone());
+            }
+        }
+        selectors.remove(name);
+        selectors.into_iter().collect()
+    }
     pub fn is_writable(&self, io: &mut dyn RegisterIo, name: &str) -> bool {
         self.writable(io, name, 0).is_ok()
+    }
+    /// A configuration value may be temporarily locked by another setting.
+    /// Include its readable value in checkpoints even while it is locked;
+    /// omit genuinely read-only measurements and command nodes.
+    pub(crate) fn is_configuration_value(&self, io: &mut dyn RegisterIo, name: &str) -> bool {
+        fn writable(
+            map: &NodeMap,
+            io: &mut dyn RegisterIo,
+            name: &str,
+            depth: usize,
+        ) -> Result<bool> {
+            let node = map.node(name, depth)?;
+            if ["AccessMode", "ImposedAccessMode"]
+                .into_iter()
+                .any(|key| node.prop(key) == Some("RO"))
+                || !matches!(
+                    node.kind.as_str(),
+                    "Integer"
+                        | "Float"
+                        | "String"
+                        | "Boolean"
+                        | "Enumeration"
+                        | "Converter"
+                        | "IntConverter"
+                        | "IntReg"
+                        | "MaskedIntReg"
+                        | "FloatReg"
+                        | "StringReg"
+                )
+            {
+                return Ok(false);
+            }
+            if let Some(link) = map.resolve_value_link(io, node, depth)? {
+                return writable(map, io, link, depth + 1);
+            }
+            Ok(node.host_value()
+                || matches!(
+                    node.kind.as_str(),
+                    "IntReg" | "MaskedIntReg" | "FloatReg" | "StringReg"
+                ))
+        }
+        writable(self, io, name, 0).unwrap_or(false)
     }
     pub fn choices(&self, io: &mut dyn RegisterIo, name: &str) -> Result<Vec<String>> {
         let node = self.node(name, 0)?;

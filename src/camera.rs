@@ -137,6 +137,13 @@ impl Camera {
     pub fn get(&mut self, name: &str) -> Result<serde_json::Value> {
         self.nodes.get(self.backend.as_mut(), name)
     }
+    pub(crate) fn selectors(&self, name: &str) -> Vec<String> {
+        self.nodes.selectors(name)
+    }
+    pub(crate) fn is_configuration_value(&mut self, name: &str) -> bool {
+        self.nodes
+            .is_configuration_value(self.backend.as_mut(), name)
+    }
     pub fn set(&mut self, name: &str, value: &str) -> Result<()> {
         self.nodes.set(self.backend.as_mut(), name, value)
     }

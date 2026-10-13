@@ -25,6 +25,10 @@ capturefab --session gui capture -n 10 -o frames --json
 
 Use the session name returned by `sessions`; it may differ from `gui`. `connect` adds a camera to a persistent session. Use `select` or `--camera` to choose a particular connected camera when multiple cameras are present. Use `rpc` with `schema` for the complete versioned local session interface.
 
+Reversible camera changes from GUI, CLI and RPC clients share each camera worker's bounded history. Use `capturefab --session NAME [--camera ID] history --json` to inspect the next undo/redo labels, and `undo` or `redo` to apply them. RPC accepts `{"op":"undo"}` and `{"op":"redo"}`; `status.history` and `cameras[].history` hold the labels. Replay detects conflicting state and retains the entry on failure. History lasts for the camera connection; a new change clears redo. Captures, uploads, recordings, schedules, connection changes, arbitrary commands and raw memory writes cannot be reversed by this camera history. Stopping a stream with schedules or forwarding is also excluded. Inspect the labels before undoing someone else's changes.
+
+Scanner settings are reversible. Scanner acquisition, including Start and Stop, may move or consume physical pages and cannot be undone or replayed.
+
 A foreground headless session can also be used:
 
 ```sh
