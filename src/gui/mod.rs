@@ -1070,6 +1070,13 @@ impl Workbench {
             Ok(_) => return self.pending.last_mut(),
             Err(error) => error,
         };
+        if let Job::Set(feature) = &job
+            && camera.is_none_or(|id| self.snapshot.active_camera.as_deref() == Some(id))
+        {
+            self.inspect
+                .write_errors
+                .insert(feature.clone(), format!("{error:#}"));
+        }
         if let Some((text, detail, level)) = command_notice(&job, &Err(error)) {
             self.set_notice(text, detail, level);
         }
@@ -1083,6 +1090,17 @@ impl Workbench {
         job: Job,
         command: SessionCommand,
     ) -> Result<&mut Pending> {
+        self.validate_input(&command)?;
+        if let SessionCommand::Set { feature, value } = &command
+            && camera.is_none_or(|id| self.snapshot.active_camera.as_deref() == Some(id))
+            && let Some(info) = self
+                .snapshot
+                .features
+                .iter()
+                .find(|info| info.name == *feature)
+        {
+            info.validate_input(value)?;
+        }
         let acts_on = match (camera, &command) {
             (Some(camera), _) => Some(camera.to_owned()),
             (
@@ -1562,9 +1580,16 @@ impl Workbench {
     }
 
     fn connect(&mut self, camera: String) {
-        self.edits.clear();
-        self.edit_sources.clear();
         self.side.connect_failures.remove(&camera);
+        let command = SessionCommand::Connect {
+            camera: camera.clone(),
+            timeout_ms: 5000,
+        };
+        if let Err(error) = command.validate() {
+            self.side
+                .connect_failed(&camera, format!("{error:#}"), self.now);
+            return;
+        }
         if let Some(pending) = self.submit(
             None,
             Job::Connect,
@@ -1574,6 +1599,8 @@ impl Workbench {
             },
         ) {
             pending.target = Some(camera);
+            self.edits.clear();
+            self.edit_sources.clear();
         }
     }
 
@@ -1624,8 +1651,23 @@ impl Workbench {
         if self.pending(Job::Capture) {
             return;
         }
-        self.send(
-            Job::Capture,
+        self.send(Job::Capture, self.capture_command(false));
+    }
+
+    fn capture_command(&self, scheduled: bool) -> SessionCommand {
+        if scheduled {
+            SessionCommand::Schedule {
+                output: self.output.clone(),
+                count: self.count,
+                timeout_ms: self.capture_timeout(None),
+                format: self.format.into(),
+                first_at_ms: epoch_ms()
+                    .saturating_add(self.schedule_delay_seconds.saturating_mul(1000)),
+                interval_ms: (self.schedule_interval_seconds * 1000.0).round() as u64,
+                storage: self.storage_policy(),
+                destination: self.capture_to.selected.clone(),
+            }
+        } else {
             SessionCommand::Capture {
                 output: self.output.clone(),
                 count: self.count,
@@ -1633,8 +1675,57 @@ impl Workbench {
                 format: self.format.into(),
                 storage: self.storage_policy(),
                 destination: self.capture_to.selected.clone(),
-            },
-        );
+            }
+        }
+    }
+
+    fn forward_command(&self) -> SessionCommand {
+        SessionCommand::Forward {
+            output: self.forward_output.clone(),
+            codec: self.forward_codec.into(),
+            encoder: self.forward_encoder.trim().into(),
+            fps: self.forward_fps,
+            bitrate: self.forward_bitrate.trim().into(),
+            storage: self.storage_policy(),
+            max_file_bytes: (self.forward_file_mib * 1024.0 * 1024.0).round() as u64,
+            destination: self.record_to.selected.clone(),
+        }
+    }
+
+    /// Validate the visible draft, including shortcuts and per-camera actions.
+    /// A stale accepted number must never replace invalid text on submission.
+    fn validate_input(&self, command: &SessionCommand) -> Result<()> {
+        let mut keys = Vec::new();
+        match command {
+            SessionCommand::Capture { .. } | SessionCommand::Schedule { .. } => {
+                keys.extend([Num::Count, Num::Timeout, Num::QuotaGib, Num::QuotaFiles]);
+                if matches!(command, SessionCommand::Schedule { .. }) {
+                    keys.extend([Num::Delay, Num::Interval]);
+                }
+                if self.retention_enabled {
+                    keys.push(Num::RetentionDays);
+                }
+            }
+            SessionCommand::Forward { output, .. } => {
+                keys.push(Num::Fps);
+                if Output::of(output).recording() {
+                    keys.extend([Num::FileMib, Num::QuotaGib, Num::QuotaFiles]);
+                    if self.retention_enabled {
+                        keys.push(Num::RetentionDays);
+                    }
+                }
+            }
+            _ => {}
+        }
+        for key in keys {
+            let value = self
+                .drafts
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| self.num_text(key));
+            anyhow::ensure!(num_valid(key, &value), "{}", num_requirement(key));
+        }
+        command.validate()
     }
 
     fn toggle_auto(&mut self) {
@@ -1739,10 +1830,10 @@ impl Workbench {
             Num::Count => self.count.to_string(),
             Num::Timeout => self.capture_timeout(None).to_string(),
             Num::Delay => self.schedule_delay_seconds.to_string(),
-            Num::Interval => number(self.schedule_interval_seconds),
-            Num::Fps => number(self.forward_fps),
-            Num::FileMib => number(self.forward_file_mib),
-            Num::QuotaGib => number(self.quota_gib),
+            Num::Interval => self.schedule_interval_seconds.to_string(),
+            Num::Fps => self.forward_fps.to_string(),
+            Num::FileMib => self.forward_file_mib.to_string(),
+            Num::QuotaGib => self.quota_gib.to_string(),
             Num::QuotaFiles => self.quota_files.to_string(),
             Num::RetentionDays => self.retention_days.to_string(),
         }
@@ -1913,7 +2004,11 @@ impl Workbench {
                 self.address = value;
             }
             Message::ConnectAddress => {
-                let address = self.address.trim().to_owned();
+                let address = if std::path::Path::new(&self.address).is_file() {
+                    self.address.clone()
+                } else {
+                    self.address.trim().to_owned()
+                };
                 if !address.is_empty() {
                     self.connect(address);
                 }
@@ -2101,20 +2196,7 @@ impl Workbench {
                 }
             }
             Message::ScheduleEnabled(value) => self.schedule_enabled = value,
-            Message::Schedule => self.send(
-                Job::Schedule,
-                SessionCommand::Schedule {
-                    output: self.output.clone(),
-                    count: self.count,
-                    timeout_ms: self.capture_timeout(None),
-                    format: self.format.into(),
-                    first_at_ms: epoch_ms()
-                        .saturating_add(self.schedule_delay_seconds.saturating_mul(1000)),
-                    interval_ms: (self.schedule_interval_seconds * 1000.0).round() as u64,
-                    storage: self.storage_policy(),
-                    destination: self.capture_to.selected.clone(),
-                },
-            ),
+            Message::Schedule => self.send(Job::Schedule, self.capture_command(true)),
             Message::ToggleStorage => self.storage_open = !self.storage_open,
             Message::OnFull(choice) => self.quota_action = choice.value,
             Message::RetentionEnabled(value) => self.retention_enabled = value,
@@ -2124,23 +2206,13 @@ impl Workbench {
             Message::Encoder(value) => self.forward_encoder = value,
             Message::Bitrate(value) => self.forward_bitrate = value,
             Message::StartForward => {
-                let output = Output::of(self.forward_output.trim());
+                let output = Output::of(&self.forward_output);
                 if self.forward_pending() != Some(false) {
                     self.send(
                         Job::Forward {
                             recording: output.recording(),
                         },
-                        SessionCommand::Forward {
-                            output: self.forward_output.trim().into(),
-                            codec: self.forward_codec.into(),
-                            encoder: self.forward_encoder.trim().into(),
-                            fps: self.forward_fps,
-                            bitrate: self.forward_bitrate.trim().into(),
-                            storage: self.storage_policy(),
-                            max_file_bytes: (self.forward_file_mib * 1024.0 * 1024.0).round()
-                                as u64,
-                            destination: self.record_to.selected.clone(),
-                        },
+                        self.forward_command(),
                     );
                 }
             }
@@ -2427,14 +2499,37 @@ fn num_valid(key: Num, text: &str) -> bool {
     }
     match key {
         Num::Count => within(text, 1u64, 100_000),
-        Num::Timeout => within(text, 100u64, 60_000),
-        Num::Delay => within(text, 0u64, 31_536_000),
-        Num::Interval => within(text, 0.1f64, 86_400.0),
-        Num::Fps => within(text, 1.0f64, 240.0),
+        Num::Timeout => within(text, 1u64, 60_000),
+        Num::Delay => within(text, 0u64, 315_576_000),
+        Num::Interval => {
+            let value = text.trim();
+            (value.contains('0')
+                && value.bytes().all(|b| matches!(b, b'0' | b'.'))
+                && value.bytes().filter(|b| *b == b'.').count() <= 1)
+                || (within(text, 0.001f64, 315_576_000.0)
+                    && crate::scheduling::parse_duration(&format!("{}s", text.trim())).is_ok())
+        }
+        Num::Fps => within(text, 0.1f64, 240.0),
         Num::FileMib => within(text, 1.0f64, 65_536.0),
         Num::QuotaGib => within(text, 0.01f64, 102_400.0),
-        Num::QuotaFiles => within(text, 1u64, 1_000_000),
+        Num::QuotaFiles => within(text, 1u64, 100_000),
         Num::RetentionDays => within(text, 1u64, 3650),
+    }
+}
+
+fn num_requirement(key: Num) -> &'static str {
+    match key {
+        Num::Count => "Enter a whole frame or page count from 1 to 100,000.",
+        Num::Timeout => "Enter a whole timeout from 1 to 60,000 ms.",
+        Num::Delay => "Enter a whole delay from 0 to 315,576,000 seconds (10 years).",
+        Num::Interval => {
+            "Enter an interval from 0.001 to 315,576,000 seconds in whole milliseconds, or 0 for consecutive captures."
+        }
+        Num::Fps => "Enter a frame rate from 0.1 to 240 fps.",
+        Num::FileMib => "Enter a maximum file size from 1 to 65,536 MiB.",
+        Num::QuotaGib => "Enter a disk budget from 0.01 to 102,400 GiB.",
+        Num::QuotaFiles => "Enter a whole file limit from 1 to 100,000.",
+        Num::RetentionDays => "Enter a whole retention age from 1 to 3,650 days.",
     }
 }
 
@@ -2538,9 +2633,92 @@ mod tests {
         assert!(num_valid(Num::Count, "12"));
         assert!(!num_valid(Num::Count, "0"));
         assert!(!num_valid(Num::Count, "1.5"));
-        assert!(!num_valid(Num::Timeout, "50"));
+        assert!(num_valid(Num::Timeout, "50"));
+        assert!(!num_valid(Num::Timeout, "0"));
         assert!(num_valid(Num::Interval, " 0.5 "));
-        assert!(!num_valid(Num::Interval, "0.05"));
+        assert!(num_valid(Num::Interval, "0.05"));
+        assert!(num_valid(Num::Interval, "0.0"));
+        assert!(!num_valid(Num::Interval, "0.0005"));
+        assert!(!num_valid(Num::Interval, "0.0015"));
+        assert!(!num_valid(Num::Interval, "1e-999"));
+        assert!(!num_valid(Num::Interval, "-1e-999"));
         assert!(!num_valid(Num::QuotaFiles, "many"));
+        assert!(!num_valid(Num::QuotaFiles, "100001"));
+        for key in [Num::Fps, Num::QuotaGib, Num::FileMib, Num::Interval] {
+            assert!(!num_valid(key, "NaN"));
+            assert!(!num_valid(key, "inf"));
+        }
+    }
+
+    #[test]
+    fn invalid_visible_drafts_block_buttons_shortcuts_and_tile_captures() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        bench.drafts.insert(Num::Count, "invalid".into());
+        assert_eq!(bench.count, 1, "an old valid value is still stored");
+        assert!(bench.validate_input(&bench.capture_command(false)).is_err());
+        bench.capture();
+        let _ = bench.handle_message(Message::CaptureCamera("sim:0".into()));
+        let _ = bench.handle_message(Message::Schedule);
+        assert!(
+            bench.pending.is_empty(),
+            "invalid drafts never reach the session"
+        );
+        assert!(
+            bench.notice.is_some(),
+            "shortcuts explain the refused submission"
+        );
+        assert!(
+            bench.validate_input(&bench.forward_command()).is_ok(),
+            "capture drafts do not block forwarding"
+        );
+
+        bench.drafts.remove(&Num::Count);
+        bench.drafts.insert(Num::Interval, "NaN".into());
+        assert!(bench.validate_input(&bench.capture_command(false)).is_ok());
+        assert!(bench.validate_input(&bench.capture_command(true)).is_err());
+        bench.drafts.insert(Num::Fps, "0".into());
+        let _ = bench.handle_message(Message::StartForward);
+        assert!(bench.pending.is_empty());
+
+        bench.drafts.clear();
+        bench.quota_files = 100001;
+        assert!(
+            bench.validate_input(&bench.capture_command(false)).is_err(),
+            "invalid persisted values also need correction"
+        );
+    }
+
+    #[test]
+    fn unused_retention_and_recording_fields_do_not_block_streams() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        bench.drafts.insert(Num::RetentionDays, "invalid".into());
+        assert!(bench.validate_input(&bench.capture_command(false)).is_ok());
+        bench.retention_enabled = true;
+        assert!(bench.validate_input(&bench.capture_command(false)).is_err());
+        bench.drafts.insert(Num::FileMib, "invalid".into());
+        assert!(bench.validate_input(&bench.forward_command()).is_ok());
+        bench.forward_output = "recording.mkv".into();
+        assert!(bench.validate_input(&bench.forward_command()).is_err());
+    }
+
+    #[test]
+    fn editable_numeric_text_preserves_the_value_sent() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        for key in [Num::Fps, Num::FileMib, Num::QuotaGib] {
+            assert!(bench.set_num(key, "1.23456789"));
+            assert_eq!(bench.num_text(key), "1.23456789");
+        }
+    }
+
+    #[test]
+    fn recording_paths_preserve_meaningful_whitespace() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        bench.forward_output = " recordings / recording.mkv".into();
+        let command = bench.forward_command();
+        let SessionCommand::Forward { output, .. } = &command else {
+            panic!("expected forwarding command");
+        };
+        assert_eq!(output, " recordings / recording.mkv");
+        assert!(bench.validate_input(&command).is_ok());
     }
 }

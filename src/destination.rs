@@ -31,6 +31,7 @@ pub enum Target {
 /// An S3-compatible bucket: AWS S3, Cloudflare R2, Backblaze B2, MinIO, Wasabi
 /// and others that implement the S3 API with Signature Version 4.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Bucket {
     /// Service URL, for example `https://ACCOUNT.r2.cloudflarestorage.com`;
     /// empty for AWS S3, whose endpoint follows from the region.
@@ -53,8 +54,8 @@ pub struct Bucket {
 
 /// Where an S3 destination's keys come from. Only the access key ID is stored
 /// here; secrets stay in the OS credential store or the standard AWS sources.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "source", rename_all = "snake_case")]
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Credentials {
     /// The OS credential store (macOS Keychain, Windows Credential Manager,
     /// Secret Service on Linux), under this access key ID.
@@ -64,6 +65,27 @@ pub enum Credentials {
     /// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and optionally
     /// `AWS_SESSION_TOKEN` in the environment of the uploading process.
     Environment,
+}
+
+impl<'de> Deserialize<'de> for Credentials {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        // Empty struct variants enforce unknown-field checks, which serde
+        // skips for internally tagged unit variants.
+        #[derive(Deserialize)]
+        #[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+        enum Input {
+            Keychain { access_key_id: String },
+            Profile { name: String },
+            Environment {},
+        }
+        Ok(match Input::deserialize(deserializer)? {
+            Input::Keychain { access_key_id } => Self::Keychain { access_key_id },
+            Input::Profile { name } => Self::Profile { name },
+            Input::Environment {} => Self::Environment,
+        })
+    }
 }
 
 impl Bucket {
@@ -78,19 +100,42 @@ impl Bucket {
     /// The service is reached without TLS, so object data travels unencrypted
     /// (requests are still signed; the secret key is never sent).
     pub fn insecure(&self) -> bool {
-        self.endpoint.starts_with("http://")
+        self.endpoint
+            .split_once("://")
+            .is_some_and(|(protocol, _)| protocol.eq_ignore_ascii_case("http"))
     }
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         ensure!(
             self.endpoint.is_empty()
-                || self.endpoint.starts_with("https://")
-                || self.endpoint.starts_with("http://"),
+                || self
+                    .endpoint
+                    .split_once("://")
+                    .is_some_and(|(protocol, _)| {
+                        protocol.eq_ignore_ascii_case("https")
+                            || protocol.eq_ignore_ascii_case("http")
+                    }),
             "S3 endpoint must be an http:// or https:// URL"
         );
         ensure!(
             !self.endpoint.contains(['?', '#', '@', ' ']),
             "S3 endpoint must be a plain service URL without credentials, query or fragment"
         );
+        if !self.endpoint.is_empty() {
+            crate::media::validate_network_url(&self.endpoint, "S3 endpoint")?;
+            let (_, rest) = self.endpoint.split_once("://").unwrap();
+            ensure!(
+                rest.split_once('/')
+                    .is_none_or(|(_, path)| path.trim_matches('/').is_empty()),
+                "S3 endpoint must be a service URL without a path; put the object folder in S3 key prefix"
+            );
+            if !self.path_style {
+                let host = rest.split('/').next().unwrap();
+                ensure!(
+                    !host.starts_with('['),
+                    "S3 endpoint with an IPv6 address requires path-style addressing"
+                );
+            }
+        }
         ensure!(
             !self.region.is_empty()
                 && self.region.len() <= 64
@@ -108,20 +153,20 @@ impl Bucket {
                     || b == b'-'
                     || b == b'.')
                 && self.bucket.as_bytes()[0].is_ascii_alphanumeric()
-                && self.bucket.as_bytes()[self.bucket.len() - 1].is_ascii_alphanumeric(),
-            "S3 bucket names are 3-63 lowercase letters, digits, dots and hyphens"
+                && self.bucket.as_bytes()[self.bucket.len() - 1].is_ascii_alphanumeric()
+                && !self.bucket.contains("..")
+                && self.bucket.parse::<std::net::Ipv4Addr>().is_err(),
+            "S3 bucket names are 3-63 lowercase letters, digits, dots and hyphens, must start/end with a letter or digit, and cannot contain adjacent dots or be an IP address"
         );
-        ensure!(
-            self.prefix.len() <= 512
-                && !self.prefix.starts_with('/')
-                && !self
-                    .prefix
-                    .split('/')
-                    .any(|part| part == ".." || part == ".")
-                && !self.prefix.contains(['\\', '\0']),
-            "S3 key prefix must be relative, like cameras/line-1/"
-        );
-        match &self.credentials {
+        validate_prefix(&self.prefix)?;
+        self.credentials.validate()?;
+        Ok(())
+    }
+}
+
+impl Credentials {
+    pub fn validate(&self) -> Result<()> {
+        match self {
             Credentials::Keychain { access_key_id } => ensure!(
                 !access_key_id.is_empty()
                     && access_key_id.len() <= 128
@@ -134,7 +179,7 @@ impl Bucket {
                     && name
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
-                "AWS profile name is invalid"
+                "AWS profile name must contain 1-64 ASCII letters, digits, dots, underscores or hyphens"
             ),
             Credentials::Environment => {}
         }
@@ -144,21 +189,23 @@ impl Bucket {
 
 impl Destination {
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            !self.name.is_empty()
-                && self.name.len() <= 64
-                && self
-                    .name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-                && !self.name.starts_with('.'),
-            "destination names are 1-64 letters, digits, '.', '-' and '_'"
-        );
+        validate_name(&self.name)?;
         match &self.target {
-            Target::Folder { path } => ensure!(
-                path.is_absolute(),
-                "a folder destination needs an absolute path"
-            ),
+            Target::Folder { path } => {
+                ensure!(
+                    path.to_str().is_some(),
+                    "a folder destination needs a path with valid UTF-8; rename the folder or choose another destination"
+                );
+                ensure!(
+                    path.is_absolute()
+                        && !path
+                            .as_os_str()
+                            .as_encoded_bytes()
+                            .iter()
+                            .any(|b| b.is_ascii_control()),
+                    "a folder destination needs an absolute path without control characters"
+                );
+            }
             Target::S3(bucket) => bucket.validate()?,
         }
         Ok(())
@@ -182,6 +229,19 @@ impl Destination {
             ),
         }
     }
+}
+
+pub fn validate_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            && !name.starts_with('.'),
+        "destination names are 1-64 letters, digits, '.', '-' and '_' and cannot start with '.'"
+    );
+    Ok(())
 }
 
 /// Where bucket destinations stage files before upload: the platform's
@@ -237,6 +297,21 @@ fn read() -> Result<File> {
     let file: File = serde_json::from_slice(&bytes)
         .with_context(|| format!("invalid destination list {}", path.display()))?;
     ensure!(file.version == 1, "unsupported destination list version");
+    ensure!(
+        file.destinations.len() <= 256,
+        "too many saved destinations (maximum 256)"
+    );
+    let mut names = std::collections::HashSet::new();
+    for destination in &file.destinations {
+        destination
+            .validate()
+            .with_context(|| format!("invalid saved destination {}", destination.name))?;
+        ensure!(
+            names.insert(&destination.name),
+            "duplicate saved destination name {}",
+            destination.name
+        );
+    }
     Ok(file)
 }
 
@@ -248,13 +323,21 @@ pub fn preferred() -> Option<String> {
 }
 
 pub fn set_preferred(name: Option<&str>) -> Result<()> {
+    if let Some(name) = name {
+        validate_name(name)?;
+    }
     locked(|file| {
+        ensure!(
+            name.is_none_or(|name| file.destinations.iter().any(|d| d.name == name)),
+            "preferred destination no longer exists"
+        );
         file.preferred = name.map(str::to_string);
         Ok(())
     })
 }
 
 pub fn get(name: &str) -> Result<Destination> {
+    validate_name(name)?;
     list()?.into_iter().find(|d| d.name == name).ok_or_else(|| {
         anyhow!("destination {name} not found; list them with `capturefab destination list`")
     })
@@ -406,6 +489,7 @@ pub fn save(destination: Destination) -> Result<()> {
 }
 
 pub fn remove(name: &str) -> Result<Destination> {
+    validate_name(name)?;
     locked(|file| {
         let all = &mut file.destinations;
         let index = all
@@ -437,7 +521,8 @@ pub struct Resolved {
 /// one it must be relative (a file name, folder or `{frame}` template) and is
 /// placed inside the destination's folder or staging area.
 pub fn resolve(name: Option<&str>, output: &str) -> Result<Resolved> {
-    let Some(name) = name.filter(|n| !n.is_empty()) else {
+    validate_output(name, output)?;
+    let Some(name) = name else {
         return Ok(Resolved {
             output: output.into(),
             destination: None,
@@ -450,19 +535,22 @@ pub fn resolve(name: Option<&str>, output: &str) -> Result<Resolved> {
 }
 
 pub fn resolve_with(destination: &Destination, output: &str) -> Result<Resolved> {
+    destination.validate()?;
+    validate_output(Some(&destination.name), output)?;
     let relative = Path::new(output);
-    ensure!(
-        !output.is_empty()
-            && relative.is_relative()
-            && !relative.components().any(|c| matches!(
-                c,
-                std::path::Component::ParentDir
-                    | std::path::Component::Prefix(_)
-                    | std::path::Component::RootDir
-            )),
-        "with a destination, the output is a name inside it (for example captures/run-1 or shot-{{frame}}.png), not {output}"
-    );
     let root = destination.local_root();
+    ensure!(
+        root.is_absolute(),
+        "destination staging folder must use an absolute path; check CAPTUREFAB_STAGING_DIR"
+    );
+    let output_path = root.join(relative);
+    let output = output_path.to_str().context("destination output path must be valid UTF-8; rename the folder or choose another destination")?.to_owned();
+    let canonical_root = resolve_existing_ancestor(&root)?;
+    let candidate = resolve_existing_ancestor(&output_path)?;
+    ensure!(
+        candidate.starts_with(&canonical_root),
+        "destination output escapes its folder through a symbolic link; choose a path inside the destination"
+    );
     if let Target::Folder { path } = &destination.target {
         crate::volumes::ensure_present(path)?;
         ensure!(
@@ -481,11 +569,56 @@ pub fn resolve_with(destination: &Destination, output: &str) -> Result<Resolved>
         }
     };
     Ok(Resolved {
-        output: root.join(relative).to_string_lossy().into_owned(),
+        output,
         destination: Some(destination.name.clone()),
         upload,
         root: Some(root),
     })
+}
+
+/// Check an output's shape before settings or storage can change. Network
+/// forwarding can use URLs without a destination; named destinations use paths.
+pub fn validate_output(name: Option<&str>, output: &str) -> Result<()> {
+    ensure!(
+        !output.trim().is_empty() && output.len() <= 16384 && !output.chars().any(char::is_control),
+        "capture output needs a path without control characters (maximum 16384 bytes)"
+    );
+    if let Some(name) = name {
+        validate_name(name)?;
+        let relative = Path::new(output);
+        ensure!(
+            relative.is_relative()
+                && !output.contains("://")
+                && !output.starts_with("file:")
+                && !relative.components().any(|c| matches!(
+                    c,
+                    std::path::Component::ParentDir
+                        | std::path::Component::Prefix(_)
+                        | std::path::Component::RootDir
+                )),
+            "with a destination, the output must be a relative name inside it, such as captures/run-1 or shot-{{frame}}.png"
+        );
+    }
+    Ok(())
+}
+
+/// Resolve existing symlinks without creating directories for an invalid output.
+fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => fs::canonicalize(path)
+            .with_context(|| format!("cannot resolve destination path {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .context("destination path has no existing ancestor")?;
+            let name = path
+                .file_name()
+                .context("invalid destination output path")?;
+            Ok(resolve_existing_ancestor(parent)?.join(name))
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("cannot inspect destination path {}", path.display())),
+    }
 }
 
 impl Resolved {
@@ -509,26 +642,68 @@ impl Resolved {
     }
 }
 
+fn validate_prefix(prefix: &str) -> Result<()> {
+    ensure!(
+        prefix.len() <= 512,
+        "S3 key prefix must be at most 512 bytes"
+    );
+    ensure!(
+        !prefix.starts_with('/')
+            && !prefix.contains('\\')
+            && !prefix.chars().any(char::is_control)
+            && !prefix.split('/').any(|part| matches!(part, "." | "..")),
+        "S3 key prefix must be relative, without backslashes, control characters or . and .. components, like cameras/line-1/"
+    );
+    Ok(())
+}
+
 /// The object key for a staged file: the prefix plus its path below the
 /// staging root, with forward slashes.
 pub fn object_key(prefix: &str, root: &Path, path: &Path) -> Result<String> {
+    validate_prefix(prefix)?;
     let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let relative = path
         .strip_prefix(&root)
         .map_err(|_| anyhow!("{} is outside the staging folder", path.display()))?;
+    ensure!(
+        relative
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_))),
+        "object key must remain inside the staging folder"
+    );
     let parts: Vec<String> = relative
         .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
+        .map(|c| {
+            c.as_os_str()
+                .to_str()
+                .map(str::to_owned)
+                .context("S3 object paths must contain valid UTF-8")
+        })
+        .collect::<Result<_>>()?;
     ensure!(!parts.is_empty(), "empty object key");
-    let mut key = prefix.trim_start_matches('/').to_string();
+    let mut key = prefix.to_string();
     if !key.is_empty() && !key.ends_with('/') {
         key.push('/');
     }
     key.push_str(&parts.join("/"));
-    ensure!(key.len() <= 1024, "object key is longer than 1024 bytes");
+    validate_object_key(&key)?;
     Ok(key)
+}
+
+pub(crate) fn validate_object_key(key: &str) -> Result<()> {
+    ensure!(
+        !key.is_empty() && key.len() <= 1024,
+        "S3 object key must contain 1..1024 bytes"
+    );
+    ensure!(
+        !key.starts_with('/')
+            && !key.contains('\\')
+            && !key.chars().any(char::is_control)
+            && !key.split('/').any(|part| matches!(part, "." | "..")),
+        "S3 object key must be a relative path without control characters or '.'/'..' components"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -701,6 +876,41 @@ mod tests {
 
     #[test]
     fn destinations_validate_names_paths_and_buckets() {
+        let saved = Destination {
+            name: "archive".into(),
+            target: Target::S3(bucket()),
+        };
+        assert_eq!(
+            serde_json::from_value::<Destination>(serde_json::to_value(&saved).unwrap()).unwrap(),
+            saved
+        );
+        let mut serialized = serde_json::to_value(bucket()).unwrap();
+        serialized["path_stlye"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<Bucket>(serialized)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field `path_stlye`")
+        );
+        assert!(
+            serde_json::from_value::<Credentials>(
+                serde_json::json!({"source": "profile", "name": "default", "profile": "misspelled"})
+            )
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::from_value::<Credentials>(serde_json::json!({"source": "environment"}))
+                .unwrap(),
+            Credentials::Environment
+        );
+        assert!(
+            serde_json::from_value::<Credentials>(
+                serde_json::json!({"source": "environment", "profile": "misspelled"})
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field `profile`")
+        );
         let folder = |name: &str, path: &str| Destination {
             name: name.into(),
             target: Target::Folder { path: path.into() },
@@ -725,10 +935,24 @@ mod tests {
         assert!(s3(|_| {}).is_ok());
         assert!(s3(|b| b.bucket = "Upper".into()).is_err());
         assert!(s3(|b| b.bucket = "ab".into()).is_err());
+        assert!(s3(|b| b.bucket = "camera..archive".into()).is_err());
+        assert!(s3(|b| b.bucket = "192.168.1.2".into()).is_err());
         assert!(s3(|b| b.prefix = "/abs".into()).is_err());
         assert!(s3(|b| b.prefix = "a/../b".into()).is_err());
         assert!(s3(|b| b.endpoint = "ftp://x".into()).is_err());
         assert!(s3(|b| b.endpoint = "https://user:pw@host".into()).is_err());
+        for endpoint in [
+            "https://",
+            "https://host:0",
+            "https://host:65536",
+            "https://[broken]",
+            "https://host/service",
+            "https://host\t",
+        ] {
+            let mut bucket = bucket();
+            bucket.endpoint = endpoint.into();
+            assert!(bucket.validate().is_err(), "{endpoint}");
+        }
         assert!(s3(|b| b.region = "us east".into()).is_err());
         assert!(
             s3(|b| b.credentials = Credentials::Keychain {
@@ -745,6 +969,40 @@ mod tests {
     }
 
     #[test]
+    fn bucket_input_preserves_data_and_explains_prefix_and_profile_limits() {
+        let mut b = bucket();
+        b.endpoint = "HTTP://MinIO.Example:9000///".into();
+        b.prefix = " camera é /Exact %2f /".into();
+        b.credentials = Credentials::Profile {
+            name: "Lab.Profile_1-Prod".into(),
+        };
+        b.validate().unwrap();
+        assert!(b.insecure());
+        assert_eq!(b.endpoint, "HTTP://MinIO.Example:9000///");
+        assert_eq!(b.prefix, " camera é /Exact %2f /");
+        let root = std::env::temp_dir().join("capturefab-prefix-validation");
+        assert_eq!(
+            object_key(&b.prefix, &root, &root.join(" clip.mkv ")).unwrap(),
+            " camera é /Exact %2f / clip.mkv "
+        );
+        b.prefix = "x".repeat(513);
+        assert!(b.validate().unwrap_err().to_string().contains("512 bytes"));
+        assert!(
+            object_key(&b.prefix, &root, &root.join("clip.mkv"))
+                .unwrap_err()
+                .to_string()
+                .contains("512 bytes")
+        );
+        b.prefix = String::new();
+        b.credentials = Credentials::Profile {
+            name: "has spaces".into(),
+        };
+        let error = b.validate().unwrap_err().to_string();
+        assert!(error.starts_with("AWS profile"));
+        assert!(error.contains("1-64") && error.contains("letters"));
+    }
+
+    #[test]
     fn resolution_places_relative_outputs_inside_the_destination() {
         let dir = std::env::temp_dir().join(format!("capturefab-dest-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -758,7 +1016,15 @@ mod tests {
             dir.join("run-1/shot-{frame}.png")
         );
         assert!(resolved.upload.is_none());
-        for bad in ["/etc/x.png", "../x.png", "a/../../x.png", ""] {
+        for bad in [
+            "/etc/x.png",
+            "../x.png",
+            "a/../../x.png",
+            "",
+            "\0file",
+            "file:out.mp4",
+            "https://host/live",
+        ] {
             assert!(resolve_with(&folder, bad).is_err(), "{bad}");
         }
         let staged = Destination {
@@ -791,5 +1057,60 @@ mod tests {
         );
         assert_eq!(key("", "/staging/archive/a.png").unwrap(), "a.png");
         assert!(key("x", "/elsewhere/a.png").is_err());
+        assert!(key("/x", "/staging/archive/a.png").is_err());
+        assert!(key("x", "/staging/archive/../outside.png").is_err());
+        assert!(key("x", "/staging/archive/a\n.png").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn named_outputs_cannot_escape_through_existing_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "capturefab-destination-symlink-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("folder")).unwrap();
+        fs::create_dir_all(root.join("outside")).unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), root.join("folder/link")).unwrap();
+        let destination = Destination {
+            name: "lab".into(),
+            target: Target::Folder {
+                path: root.join("folder"),
+            },
+        };
+        let error = resolve_with(&destination, "link/new/run/shot.png").unwrap_err();
+        assert!(error.to_string().contains("symbolic link"));
+        assert!(!root.join("outside/new").exists());
+        assert!(resolve_with(&destination, "inside/shot.png").is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unsupported_folder_encoding_is_rejected_without_lossy_path_redirection() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = std::env::temp_dir().join(std::ffi::OsString::from_vec(
+            b"capturefab-invalid-utf8-\xff".to_vec(),
+        ));
+        let destination = Destination {
+            name: "lab".into(),
+            target: Target::Folder { path: root.clone() },
+        };
+        assert!(
+            destination
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("valid UTF-8")
+        );
+        assert!(
+            resolve_with(&destination, "new/shot.png")
+                .unwrap_err()
+                .to_string()
+                .contains("valid UTF-8")
+        );
+        assert!(!root.join("new").exists());
+        let replacement_path = PathBuf::from(root.to_string_lossy().as_ref());
+        assert!(!replacement_path.join("new").exists());
     }
 }

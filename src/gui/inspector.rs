@@ -550,15 +550,28 @@ fn form_row<'a>(
     unit_label: &'a str,
     p: &'static Palette,
 ) -> Element<'a, Message> {
-    field(
-        label,
-        unit(container(control).width(CONTROL).into(), unit_label, p),
-        p,
-    )
+    row![
+        container(text(label).size(style::BODY).color(p.secondary))
+            .padding(iced::Padding::ZERO.top(5.0))
+            .width(Fill),
+        container(control).width(CONTROL),
+        container(text(unit_label).size(style::SMALL).color(p.secondary))
+            .padding(iced::Padding::ZERO.top(6.0))
+            .width(28.0),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Start)
+    .into()
 }
 
 /// What a schedule will do: "10 frames, one every 2.5 seconds".
 fn schedule_text(count: u32, interval: f64) -> String {
+    if interval == 0.0 {
+        return format!(
+            "{}, captured consecutively",
+            plural(count.into(), "frame", "frames")
+        );
+    }
     format!(
         "{}, one every {} {}",
         plural(count.into(), "frame", "frames"),
@@ -1073,7 +1086,13 @@ impl Workbench {
         // its control shows what it asked for, and an earlier refusal waits
         // for its outcome.
         let asked = self.asked(name);
-        let refused = self.refusal(name, asked);
+        let draft_error = self
+            .edits
+            .get(name)
+            .filter(|_| writable && !command)
+            .and_then(|value| feature.validate_input(value).err())
+            .map(|error| format!("{error:#}"));
+        let refused = draft_error.as_ref().or_else(|| self.refusal(name, asked));
         let current = feature_value(feature);
         // The caption's left side, and whether this row holds a text field,
         // which keeps its caption line so nothing moves as an edit begins.
@@ -1088,7 +1107,11 @@ impl Workbench {
             button(text("Scan & save").size(style::SMALL))
                 .padding([4, 10])
                 .style(style::secondary)
-                .on_press_maybe((!self.pending(Job::Capture)).then_some(Message::Capture))
+                .on_press_maybe(
+                    (!self.pending(Job::Capture)
+                        && self.validate_input(&self.capture_command(false)).is_ok())
+                    .then_some(Message::Capture),
+                )
                 .into()
         } else if command && name == "AcquisitionStart" {
             self.stream_toggle(p)
@@ -1196,7 +1219,11 @@ impl Workbench {
                     button(text("Apply").size(style::CAPTION))
                         .padding([0, 4])
                         .style(style::link)
-                        .on_press(Message::Commit(feature.name.clone())),
+                        .on_press_maybe(
+                            draft_error
+                                .is_none()
+                                .then(|| Message::Commit(feature.name.clone())),
+                        ),
                     Action::FocusCamera.hint("Apply", Os::CURRENT),
                 )
             } else {
@@ -1310,8 +1337,8 @@ impl Workbench {
             .get(&key)
             .cloned()
             .unwrap_or_else(|| self.num_text(key));
-        let valid = !self.drafts.contains_key(&key) || num_valid(key, &value);
-        text_input("", &value)
+        let valid = num_valid(key, &value);
+        let input = text_input("", &value)
             .id(format!("number:{key:?}"))
             .on_input(move |value| Message::Num(key, value))
             .size(style::BODY)
@@ -1322,8 +1349,12 @@ impl Workbench {
                 style::input
             } else {
                 style::input_invalid
-            })
-            .into()
+            });
+        let mut content = column![input].spacing(4);
+        if !valid {
+            content = content.push(field_error(num_requirement(key), Palette::of(self.dark())));
+        }
+        content.into()
     }
 
     pub(super) fn capture_settings(&self, p: &'static Palette) -> Element<'_, Message> {
@@ -1332,7 +1363,8 @@ impl Workbench {
         let capturing = self.pending(Job::Capture);
         let saved = self.just_saved(self.snapshot.active_camera.as_deref());
         let os = Os::CURRENT;
-        let ready = connected && !self.output.trim().is_empty();
+        let problem = self.validate_input(&self.capture_command(false)).err();
+        let ready = connected && problem.is_none();
         // Busy actions keep their blue fill; unavailable actions use a
         // neutral fill and need the same readable ink as their labels.
         let action_ink = if ready || capturing {
@@ -1387,7 +1419,17 @@ impl Workbench {
                 p
             ),
             self.capture_to
-                .view(&self.output, "Output path", self.dark())
+                .view(
+                    &self.output,
+                    "Output path",
+                    self.dark(),
+                    crate::destination::validate_output(
+                        self.capture_to.selected.as_deref(),
+                        &self.output
+                    )
+                    .is_err()
+                        || crate::engine::validate_capture_output(&self.output).is_err()
+                )
                 .map(Message::CapturePicker),
             form_row(
                 if scanner { "Pages" } else { "Frames" },
@@ -1416,6 +1458,7 @@ impl Workbench {
         ]
         .spacing(ROW_GAP);
         if self.schedule_enabled {
+            let problem = self.validate_input(&self.capture_command(true)).err();
             save = save
                 .push(form_row("Start after", self.num(Num::Delay), "s", p))
                 .push(form_row("Frame interval", self.num(Num::Interval), "s", p))
@@ -1431,8 +1474,11 @@ impl Workbench {
                     .width(Fill)
                     .padding([8, 14])
                     .style(style::secondary)
-                    .on_press_maybe(ready.then_some(Message::Schedule)),
+                    .on_press_maybe((connected && problem.is_none()).then_some(Message::Schedule)),
                 );
+            if let Some(problem) = problem {
+                save = save.push(field_error(problem.to_string(), p));
+            }
         }
         column![
             save,
@@ -1465,8 +1511,8 @@ impl Workbench {
         if !connected {
             return Some(reason("Connect a camera to capture.", p));
         }
-        if self.output.trim().is_empty() {
-            return Some(reason("Enter a file name to save to.", p));
+        if let Err(error) = self.validate_input(&self.capture_command(false)) {
+            return Some(field_error(error.to_string(), p));
         }
         let here =
             |camera: &Option<String>| camera.is_none() || *camera == self.snapshot.active_camera;
@@ -1580,7 +1626,8 @@ impl Workbench {
     fn forward_form(&self, p: &'static Palette) -> Element<'_, Message> {
         let connected = self.snapshot.connected.is_some();
         let starting = self.forward_pending() == Some(false);
-        let ready = connected && !self.forward_output.trim().is_empty();
+        let problem = self.validate_input(&self.forward_command()).err();
+        let ready = connected && problem.is_none();
         let action_ink = if ready || starting {
             Color::WHITE
         } else {
@@ -1605,8 +1652,8 @@ impl Workbench {
         .spacing(8);
         if !connected {
             action = action.push(reason("Connect a camera to forward it.", p));
-        } else if self.forward_output.trim().is_empty() {
-            action = action.push(reason("Enter a stream URL or a file name.", p));
+        } else if let Some(problem) = problem {
+            action = action.push(field_error(problem.to_string(), p));
         }
         column![
             section("Forward to a recorder", None, p),
@@ -1614,7 +1661,9 @@ impl Workbench {
                 .size(style::SMALL)
                 .color(p.secondary),
             self.record_to
-                .view(&self.forward_output, "Stream URL or file", self.dark())
+                .view(&self.forward_output, "Stream URL or file", self.dark(),
+                    crate::destination::validate_output(self.record_to.selected.as_deref(), &self.forward_output).is_err()
+                        || crate::media::validate_forward_output(&self.forward_output).is_err())
                 .map(Message::RecordPicker),
             form_row(
                 "Codec",
@@ -1633,29 +1682,31 @@ impl Workbench {
             ),
             form_row(
                 "Encoder",
-                tip(
+                column![tip(
                     text_input("auto", &self.forward_encoder)
                         .id("forward-encoder")
                         .on_input(Message::Encoder)
                         .size(style::BODY)
                         .padding([5, 8])
                         .width(Fill)
-                        .style(style::input),
+                        .style(if crate::media::validate_encoder(self.forward_codec, self.forward_encoder.trim()).is_ok() { style::input } else { style::input_invalid }),
                     "auto picks an available encoder. Enter an FFmpeg encoder name to choose one.",
                 ),
+                self.forward_field_error(true, p)].spacing(4),
                 "",
                 p,
             ),
             form_row("Frame rate", self.num(Num::Fps), "fps", p),
             form_row(
                 "Bitrate",
-                text_input("4M", &self.forward_bitrate)
+                column![text_input("4M", &self.forward_bitrate)
                     .id("forward-bitrate")
                     .on_input(Message::Bitrate)
                     .size(style::BODY)
                     .padding([5, 8])
                     .width(Fill)
-                    .style(style::input),
+                    .style(if crate::media::validate_bitrate(self.forward_bitrate.trim()).is_ok() { style::input } else { style::input_invalid }),
+                    self.forward_field_error(false, p)].spacing(4),
                 "",
                 p,
             ),
@@ -1672,6 +1723,18 @@ impl Workbench {
         ]
         .spacing(ROW_GAP)
         .into()
+    }
+
+    fn forward_field_error(&self, encoder: bool, p: &'static Palette) -> Element<'_, Message> {
+        let result = if encoder {
+            crate::media::validate_encoder(self.forward_codec, self.forward_encoder.trim())
+        } else {
+            crate::media::validate_bitrate(self.forward_bitrate.trim())
+        };
+        match result {
+            Ok(()) => space().into(),
+            Err(error) => field_error(error.to_string(), p),
+        }
     }
 
     /// While forwarding: where to, with what, and how to stop. Its settings

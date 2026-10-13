@@ -144,6 +144,7 @@ impl Workbench {
     fn capture_button(&self, p: &'static Palette) -> Element<'_, Message> {
         let os = Os::CURRENT;
         let connected = self.snapshot.connected.is_some();
+        let problem = self.validate_input(&self.capture_command(false)).err();
         let scanner = self.scanner_selected();
         let capturing = self.pending(Job::Capture);
         // One capture runs at a time, from any camera; saved is per camera.
@@ -187,11 +188,15 @@ impl Workbench {
                 };
                 style::secondary(theme, status)
             })
-            .on_press_maybe((connected && !capturing).then_some(Message::Capture)),
+            .on_press_maybe(
+                (connected && !capturing && problem.is_none()).then_some(Message::Capture),
+            ),
             if capturing {
                 "Saving the capture…".to_owned()
             } else if !connected {
                 "Select a camera to capture from".to_owned()
+            } else if let Some(problem) = problem {
+                problem.to_string()
             } else {
                 Action::Capture.hint("Save using the settings in Capture", os)
             },

@@ -177,6 +177,7 @@ enum Field {
     Bucket,
     Prefix,
     AccessKey,
+    Secret,
     Profile,
 }
 
@@ -316,7 +317,7 @@ impl Field {
     /// The field a message from `Destination::validate` is about, by its
     /// opening words, as `cli::error_code` classifies errors.
     fn of(message: &str) -> Option<Field> {
-        const OPENINGS: [(&str, Field); 8] = [
+        const OPENINGS: [(&str, Field); 9] = [
             ("destination names", Field::Name),
             ("a folder destination", Field::Folder),
             ("S3 endpoint", Field::Endpoint),
@@ -324,6 +325,7 @@ impl Field {
             ("S3 bucket", Field::Bucket),
             ("S3 key prefix", Field::Prefix),
             ("S3 access key", Field::AccessKey),
+            ("S3 secret access key", Field::Secret),
             ("AWS profile", Field::Profile),
         ];
         OPENINGS
@@ -382,7 +384,7 @@ impl Editor {
             name,
             name_touched: true,
             s3: false,
-            folder: folder.to_string_lossy().into_owned(),
+            folder: folder.to_str().unwrap_or_default().to_owned(),
             provider: 0,
             endpoint: String::new(),
             region: "us-east-1".into(),
@@ -398,7 +400,11 @@ impl Editor {
             profile: "default".into(),
             keep_local: false,
             advanced: false,
-            invalid: Vec::new(),
+            invalid: if folder.to_str().is_none() {
+                vec![(Field::Folder, folder_encoding_error().into())]
+            } else {
+                Vec::new()
+            },
             message: None,
             testing: None,
             saving: None,
@@ -417,7 +423,13 @@ impl Editor {
         let mut editor = Self::new_folder(destination.name.clone(), PathBuf::new());
         editor.original = Some(destination.name.clone());
         match &destination.target {
-            Target::Folder { path } => editor.folder = path.to_string_lossy().into_owned(),
+            Target::Folder { path } => {
+                if let Some(path) = path.to_str() {
+                    editor.folder = path.into();
+                } else {
+                    editor.invalid = vec![(Field::Folder, folder_encoding_error().into())];
+                }
+            }
             Target::S3(bucket) => {
                 editor.s3 = true;
                 editor.endpoint = bucket.endpoint.clone();
@@ -493,7 +505,7 @@ impl Editor {
     /// Whether the Advanced fields differ from what a new bucket of this
     /// service starts with, so they show without being asked for.
     fn custom_advanced(&self) -> bool {
-        self.prefix.trim() != DEFAULT_PREFIX || self.path_style != PROVIDERS[self.provider].3
+        self.prefix != DEFAULT_PREFIX || self.path_style != PROVIDERS[self.provider].3
     }
 
     /// The access key ID changed at `at`: whether the keychain holds its
@@ -577,9 +589,11 @@ impl Editor {
                 endpoint: value(Field::Endpoint, &self.endpoint, ""),
                 region: value(Field::Region, &self.region, "us-east-1"),
                 bucket: value(Field::Bucket, &self.bucket, "bucket"),
-                prefix: value(Field::Prefix, &self.prefix, "")
-                    .trim_start_matches('/')
-                    .into(),
+                prefix: if stand_ins.contains(&Field::Prefix) {
+                    String::new()
+                } else {
+                    self.prefix.clone()
+                },
                 path_style: self.path_style,
                 credentials: match self.source {
                     Source::Keychain => Credentials::Keychain {
@@ -597,7 +611,7 @@ impl Editor {
                 path: if stand_ins.contains(&Field::Folder) {
                     std::env::temp_dir()
                 } else {
-                    PathBuf::from(self.folder.trim())
+                    PathBuf::from(&self.folder)
                 },
             }
         };
@@ -610,6 +624,10 @@ impl Editor {
     fn destination(&self) -> anyhow::Result<Destination> {
         let destination = self.build(&[]);
         destination.validate()?;
+        #[cfg(feature = "s3")]
+        if self.s3 && self.source == Source::Keychain && !self.secret.is_empty() {
+            crate::s3::validate_secret(&self.secret)?;
+        }
         Ok(destination)
     }
 
@@ -632,6 +650,14 @@ impl Editor {
         // A name that follows an unusable bucket is the bucket's problem.
         if !self.name_touched && found.iter().any(|(field, _)| *field == Field::Bucket) {
             found.retain(|(field, _)| *field != Field::Name);
+        }
+        #[cfg(feature = "s3")]
+        if self.s3
+            && self.source == Source::Keychain
+            && !self.secret.is_empty()
+            && let Err(error) = crate::s3::validate_secret(&self.secret)
+        {
+            found.push((Field::Secret, error.to_string()));
         }
         found
     }
@@ -1512,11 +1538,15 @@ impl Picker {
                     .set_title("Save captures in")
                     .pick_folder()
                 {
+                    if folder.to_str().is_none() {
+                        self.notice = Some((folder_encoding_error().into(), true));
+                        return;
+                    }
                     let name = Path::new(output.as_str())
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "capture.png".into());
-                    *output = folder.join(name).to_string_lossy().into_owned();
+                    *output = folder.join(name).to_str().unwrap().to_owned();
                 }
             }
             Message::UseVolume(index) => {
@@ -1583,6 +1613,10 @@ impl Picker {
                     .set_title("Save captures in")
                     .pick_folder()
                 {
+                    if folder.to_str().is_none() {
+                        self.notice = Some((folder_encoding_error().into(), true));
+                        return;
+                    }
                     let name = folder
                         .file_name()
                         .map(|n| safe_name(&n.to_string_lossy()))
@@ -1686,7 +1720,14 @@ impl Picker {
                         let Some(folder) = rfd::FileDialog::new().pick_folder() else {
                             return;
                         };
-                        editor.folder = folder.to_string_lossy().into_owned();
+                        let Some(folder) = folder.to_str() else {
+                            editor.invalid.retain(|(field, _)| *field != Field::Folder);
+                            editor
+                                .invalid
+                                .push((Field::Folder, folder_encoding_error().into()));
+                            return;
+                        };
+                        editor.folder = folder.into();
                         Some(Field::Folder)
                     }
                     Message::Provider(Provider(index)) => {
@@ -1732,7 +1773,7 @@ impl Picker {
                     }
                     Message::Secret(value) => {
                         editor.secret = value;
-                        None
+                        Some(Field::Secret)
                     }
                     Message::Profile(value) => {
                         editor.profile = value;
@@ -1814,6 +1855,7 @@ impl Picker {
         output: &'a str,
         local_label: &'a str,
         dark: bool,
+        invalid_output: bool,
     ) -> Element<'a, Message> {
         let p = Palette::of(dark);
         let choices: Vec<Choice> = std::iter::once(Choice {
@@ -1876,7 +1918,11 @@ impl Picker {
                                 .on_input(Message::Output)
                                 .size(style::BODY)
                                 .padding([6, 10])
-                                .style(style::input),
+                                .style(if invalid_output {
+                                    style::input_invalid
+                                } else {
+                                    style::input
+                                }),
                             super::tip(
                                 button(icon(Icon::Folder, 15.0, p.secondary))
                                     .padding(6)
@@ -1910,7 +1956,11 @@ impl Picker {
                             .on_input(Message::Output)
                             .size(style::BODY)
                             .padding([6, 10])
-                            .style(style::input),
+                            .style(if invalid_output {
+                                style::input_invalid
+                            } else {
+                                style::input
+                            }),
                     )
                     .push(self.summary(destination, p));
             }
@@ -2433,7 +2483,13 @@ impl Picker {
                         .secure(true)
                         .size(style::BODY)
                         .padding([6, 10])
-                        .style(style::input)
+                        .style(
+                            if editor.refusal(Field::Secret).is_some() {
+                                style::input_invalid
+                            } else {
+                                style::input
+                            }
+                        )
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center);
@@ -2453,7 +2509,7 @@ impl Picker {
                             .into(),
                         ),
                     ))
-                    .push(field("Secret key", secret.into()))
+                    .push(checked(Field::Secret, field("Secret key", secret.into())))
                     .push(field("", caption(KEYCHAIN_NOTE, p)))
                 }
                 Source::Profile => form.push(checked(
@@ -2805,7 +2861,7 @@ fn stored_badge<'a>(p: &'static Palette) -> Element<'a, Message> {
 
 /// The Advanced group's values, shown while it is closed.
 fn advanced_summary(editor: &Editor) -> String {
-    let prefix = match editor.prefix.trim() {
+    let prefix = match editor.prefix.as_str() {
         "" => "No key prefix",
         prefix => prefix,
     };
@@ -2814,6 +2870,10 @@ fn advanced_summary(editor: &Editor) -> String {
     } else {
         prefix.into()
     }
+}
+
+fn folder_encoding_error() -> &'static str {
+    "A folder destination needs a UTF-8 path; choose a folder without invalid text bytes."
 }
 
 #[cfg(test)]
@@ -3168,6 +3228,46 @@ mod tests {
         }
         let folder = Editor::new_folder("archive".into(), "relative".into());
         assert_eq!(fields(&folder), [Field::Folder]);
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn invalid_typed_secrets_fail_before_save_and_mark_the_secret_field() {
+        let mut editor = bucket(|e| e.secret = "x".repeat(4097));
+        editor.refuse(editor.destination().unwrap_err());
+        assert!(editor.refusal(Field::Secret).is_some());
+        editor.secret = " Unicode secret é \t ".into();
+        editor.edited(Some(Field::Secret));
+        assert!(editor.destination().is_ok());
+        assert_eq!(editor.secret_to_store().unwrap().1, " Unicode secret é \t ");
+    }
+
+    #[test]
+    fn destination_paths_preserve_meaningful_whitespace() {
+        let editor = Editor::new_folder("archive".into(), "/tmp/archive ".into());
+        let destination = editor.destination().unwrap();
+        let Target::Folder { path } = destination.target else {
+            panic!("expected folder destination");
+        };
+        assert_eq!(path, PathBuf::from("/tmp/archive "));
+
+        let editor = bucket(|e| e.prefix = " images ".into());
+        let destination = editor.destination().unwrap();
+        let Target::S3(bucket) = destination.target else {
+            panic!("expected bucket destination");
+        };
+        assert_eq!(bucket.prefix, " images ");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_editor_refuses_paths_that_cannot_be_preserved() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/archive-\xff".to_vec()));
+        let editor = Editor::new_folder("archive".into(), path);
+        assert!(editor.destination().is_err());
+        assert!(editor.refusal(Field::Folder).unwrap().contains("UTF-8"));
+        assert!(!editor.folder.contains('\u{fffd}'));
     }
 
     #[test]

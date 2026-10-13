@@ -18,6 +18,7 @@ use std::{
 pub const VERSION: u32 = 1;
 const MAX_REQUEST: usize = 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Descriptor {
     pub version: u32,
     pub name: String,
@@ -26,11 +27,13 @@ pub struct Descriptor {
     pub token: String,
 }
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Request {
     version: u32,
     token: String,
     #[serde(default)]
     camera: Option<String>,
+    #[serde(deserialize_with = "crate::session::deserialize_command")]
     command: SessionCommand,
 }
 /// One of the bounded concurrent RPC client slots, released on drop.
@@ -75,7 +78,7 @@ pub fn session_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir);
     home.join(".cache").join("capturefab").join("sessions")
 }
-fn validate_name(name: &str) -> Result<()> {
+pub fn validate_name(name: &str) -> Result<()> {
     ensure!(
         !matches!(name, "storage" | "storage-policy"),
         "session name is reserved for storage bookkeeping; choose a different name"
@@ -143,7 +146,10 @@ pub fn read_descriptor(name: &str) -> Result<Descriptor> {
         d.version == VERSION
             && d.name == name
             && d.address.ip() == Ipv4Addr::LOCALHOST
-            && d.token.len() == 64,
+            && d.address.port() != 0
+            && d.pid != 0
+            && d.token.len() == 64
+            && d.token.bytes().all(|b| b.is_ascii_hexdigit()),
         "invalid session descriptor or protocol version"
     );
     Ok(d)
@@ -168,21 +174,27 @@ fn serve_client(mut stream: TcpStream, h: SessionHandle, token: String) -> Resul
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let line = read_line(&mut BufReader::new(stream.try_clone()?), MAX_REQUEST)?;
-    let request: Request = serde_json::from_slice(&line)?;
-    ensure!(
-        request.version == VERSION && constant_eq(&token, &request.token),
-        "unauthorized RPC request"
-    );
-    ensure!(
-        !matches!(&request.command,SessionCommand::Capture{output,..} if output=="-"),
-        "remote captures require an output file"
-    );
-    let result = if let Some(camera) = request.camera {
-        h.request_to(&camera, request.command)
-    } else {
-        h.request(request.command)
-    };
+    let result = (|| -> Result<Value> {
+        let line = read_line(&mut BufReader::new(stream.try_clone()?), MAX_REQUEST)?;
+        let request: Request = serde_json::from_slice(&line).context("invalid RPC request")?;
+        ensure!(
+            request.version == VERSION,
+            "session protocol version mismatch"
+        );
+        ensure!(
+            constant_eq(&token, &request.token),
+            "unauthorized RPC request"
+        );
+        ensure!(
+            !matches!(&request.command,SessionCommand::Capture{output,..} if output=="-"),
+            "remote captures require an output file"
+        );
+        if let Some(camera) = request.camera {
+            h.request_to(&camera, request.command)
+        } else {
+            h.request(request.command)
+        }
+    })();
     let response = match result {
         Ok(v) => json!({"version":VERSION,"ok":true,"result":v}),
         Err(e) => json!({"version":VERSION,"ok":false,"error":{"message":format!("{e:#}")}}),
@@ -314,20 +326,28 @@ pub fn call_to(
     command: SessionCommand,
     timeout: Duration,
 ) -> Result<Value> {
+    command.validate()?;
+    ensure!(
+        !matches!(&command, SessionCommand::Capture { output, .. } if output == "-"),
+        "remote captures require an output file"
+    );
+    if let Some(camera) = camera {
+        crate::session::validate_selector(camera)?;
+    }
+    ensure!(!timeout.is_zero(), "RPC timeout must be positive");
     let descriptor = read_descriptor(name)?;
+    let request = serde_json::to_vec(&Request {
+        version: VERSION,
+        token: descriptor.token,
+        camera: camera.map(str::to_owned),
+        command,
+    })?;
+    ensure!(request.len() < MAX_REQUEST, "RPC request exceeds 1 MiB");
     let mut stream = TcpStream::connect_timeout(&descriptor.address, Duration::from_secs(2))
         .with_context(|| format!("session '{name}' is not responding; it may be stale"))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    serde_json::to_writer(
-        &mut stream,
-        &Request {
-            version: VERSION,
-            token: descriptor.token,
-            camera: camera.map(str::to_owned),
-            command,
-        },
-    )?;
+    stream.write_all(&request)?;
     stream.write_all(b"\n")?;
     let response: Value =
         serde_json::from_slice(&read_line(&mut BufReader::new(stream), 16 * 1024 * 1024)?)?;
@@ -372,6 +392,45 @@ pub fn list() -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn malformed_requests_return_actionable_errors() {
+        for (request, field) in [
+            (
+                "{\"version\":1,\"token\":\"t\",\"command\":{\"op\":\"status\"},\"camrea\":\"sim:0\"}\n",
+                "camrea",
+            ),
+            (
+                "{\"version\":1,\"token\":\"t\",\"command\":{\"op\":\"status\",\"unknown\":1}}\n",
+                "unknown",
+            ),
+        ] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            let handle = SessionHandle::new();
+            let server = std::thread::spawn({
+                let handle = handle.clone();
+                move || serve_client(stream, handle, "t".into())
+            });
+            client.write_all(request.as_bytes()).unwrap();
+            let response: Value =
+                serde_json::from_slice(&read_line(&mut BufReader::new(client), 1 << 20).unwrap())
+                    .unwrap();
+            assert_eq!(response["ok"], false);
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("unknown field `{field}`"))
+            );
+            server.join().unwrap().unwrap();
+            let snapshot = handle.snapshot();
+            assert!(snapshot.logs.is_empty());
+            assert!(snapshot.cameras.is_empty());
+            assert!(snapshot.last_error.is_none());
+            handle.shutdown();
+        }
+    }
     #[test]
     fn bounded_rpc_lines_and_auth() {
         assert!(read_line(&mut BufReader::new(b"abc\n".as_slice()), 3).is_err());

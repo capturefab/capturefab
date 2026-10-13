@@ -98,10 +98,20 @@ fn unescape(field: &str) -> String {
     while i < bytes.len() {
         if bytes[i] == b'\\'
             && i + 3 < bytes.len()
-            && let Ok(value) = u8::from_str_radix(&field[i + 1..i + 4], 8)
+            && bytes[i + 1..i + 4]
+                .iter()
+                .all(|b| (b'0'..=b'7').contains(b))
         {
-            out.push(value);
-            i += 4;
+            let value = (bytes[i + 1] - b'0') as u16 * 64
+                + (bytes[i + 2] - b'0') as u16 * 8
+                + (bytes[i + 3] - b'0') as u16;
+            if value <= u8::MAX as u16 {
+                out.push(value as u8);
+                i += 4;
+                continue;
+            }
+            out.push(bytes[i]);
+            i += 1;
         } else {
             out.push(bytes[i]);
             i += 1;
@@ -331,5 +341,7 @@ mod tests {
     fn octal_escapes_decode() {
         assert_eq!(unescape("a\\040b\\011c"), "a b\tc");
         assert_eq!(unescape("plain"), "plain");
+        assert_eq!(unescape("a\\中b"), "a\\中b");
+        assert_eq!(unescape("a\\777b"), "a\\777b");
     }
 }

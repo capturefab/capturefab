@@ -10,6 +10,12 @@ capturefab --help
 
 Successful structured output goes to stdout; diagnostics go to stderr. Check the process exit code before using a result. JSON output is versioned. Keep credentials out of logs, command transcripts, and generated configuration files whenever possible.
 
+Malformed supplied field values return `usage` (exit 2) before connecting or applying capture/forward `--set` and `--auto`. Live camera, missing destination/drive, storage and I/O failures retain their operation categories. Session commands and RPC envelopes reject unknown fields; use `schema` rather than guessing field names. Rejected writes to auto-managed features leave auto mode enabled. Multiple valid assignments still execute sequentially, so a later live failure does not undo earlier successful writes.
+
+Durations and timestamp fractions must resolve to whole milliseconds (`1.001s` is valid, `1.1ms` is rejected); `--max-age` requires whole seconds, at least `1s`, with delete-oldest. All scheduled frames must fall within 10 years; a past timestamp starts immediately and a zero RPC interval captures consecutive frames. A camera rejects overlapping future output files in its active jobs. Capture paths support only `{frame}` and do not accept network URLs. Recording reservations must fit the requested budget; Capturefab does not silently reduce `--max-file-size`. Use `--duration` only for direct forwarding and `stop-forward` for sessions.
+
+Explicit `CAPTUREFAB_MAX_CAMERAS` must be an integer in 1–64. `CAPTUREFAB_FRAME_BYTES` must be 4096–268435456 bytes and a multiple of 64. Malformed overrides fail before worker startup; they do not fall back to defaults.
+
 ## Use an existing visible session
 
 List sessions before opening a separate camera connection. A user may already have the camera connected in the GUI. Camera control is often exclusive.

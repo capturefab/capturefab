@@ -28,6 +28,18 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 static HWACCEL: OnceLock<String> = OnceLock::new();
 pub fn configure_hwaccel(value: &str) -> Result<()> {
+    validate_hwaccel(value)?;
+    if let Err(value) = HWACCEL.set(value.to_owned()) {
+        ensure!(
+            HWACCEL.get() == Some(&value),
+            "hardware acceleration is already configured for {}; restart the process to select {value}",
+            HWACCEL.get().unwrap()
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_hwaccel(value: &str) -> Result<()> {
     ensure!(
         [
             "auto",
@@ -44,9 +56,8 @@ pub fn configure_hwaccel(value: &str) -> Result<()> {
             "opencl"
         ]
         .contains(&value),
-        "unsupported hardware acceleration method"
+        "unsupported hardware acceleration method {value}; use auto, none, videotoolbox, cuda, qsv, vaapi, d3d11va, dxva2, vulkan, drm or opencl"
     );
-    let _ = HWACCEL.set(value.to_owned());
     Ok(())
 }
 pub fn hwaccel() -> String {
@@ -101,14 +112,17 @@ pub fn redact_url(url: &str) -> String {
     result
 }
 fn redact_log(message: &str, source: &str) -> String {
-    message.replace(source, &redact_url(source))
+    let canonical = canonical_scheme(source);
+    message
+        .replace(source, &redact_url(source))
+        .replace(&canonical, &redact_url(&canonical))
 }
 fn scheme(url: &str) -> Option<String> {
     if url.len() >= 3 && url.as_bytes()[1] == b':' && matches!(url.as_bytes()[2], b'\\' | b'/') {
         return None;
     }
     let (name, _) = url.split_once(':')?;
-    if !name.is_empty()
+    if name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
@@ -118,11 +132,112 @@ fn scheme(url: &str) -> Option<String> {
         None
     }
 }
-fn validate_source(url: &str) -> Result<()> {
+/// FFmpeg protocol names are case-sensitive even though URL schemes are not.
+/// Preserve the authority, path and query exactly as supplied.
+fn canonical_scheme(url: &str) -> String {
+    match scheme(url) {
+        Some(protocol) => format!("{protocol}:{}", url.split_once(':').unwrap().1),
+        None => url.to_owned(),
+    }
+}
+/// Validate the authority and escaping of a network URL without resolving DNS
+/// or contacting the service. Error messages never repeat credential-bearing URLs.
+pub(crate) fn validate_network_url(url: &str, label: &str) -> Result<()> {
     ensure!(
-        !url.is_empty()
-            && url.len() <= 16384
-            && !url.bytes().any(|b| b == 0 || b == b'\r' || b == b'\n'),
+        url.len() <= 16384 && !url.chars().any(|c| c.is_control() || c.is_whitespace()),
+        "{label} must not contain whitespace or control characters; percent-encode URL values"
+    );
+    let (protocol, rest) = url.split_once("://").context(format!(
+        "{label} must include a protocol and host, for example rtsp://camera/live"
+    ))?;
+    let protocol = protocol.to_ascii_lowercase();
+    ensure!(
+        scheme(url).as_deref() == Some(protocol.as_str()),
+        "{label} protocol is invalid"
+    );
+    let mut bytes = url.as_bytes().iter();
+    while let Some(&byte) = bytes.next() {
+        if byte == b'%' {
+            ensure!(
+                bytes.next().is_some_and(u8::is_ascii_hexdigit)
+                    && bytes.next().is_some_and(u8::is_ascii_hexdigit),
+                "{label} contains invalid percent escaping; use % followed by two hexadecimal digits"
+            );
+        }
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = if matches!(protocol.as_str(), "udp" | "rtp") {
+        authority.strip_prefix('@').unwrap_or(authority)
+    } else if let Some((userinfo, host)) = authority.rsplit_once('@') {
+        ensure!(
+            !userinfo.is_empty() && !userinfo.contains('@'),
+            "{label} credentials are invalid"
+        );
+        host
+    } else {
+        authority
+    };
+    let (host, port) = if let Some(ipv6) = host_port.strip_prefix('[') {
+        let (host, suffix) = ipv6.split_once(']').context(format!(
+            "{label} IPv6 address is invalid; enclose it in brackets"
+        ))?;
+        let address = host.split_once("%25").map_or(host, |(ip, _)| ip);
+        ensure!(
+            address.parse::<std::net::Ipv6Addr>().is_ok(),
+            "{label} IPv6 address is invalid"
+        );
+        if let Some((_, zone)) = host.split_once("%25") {
+            ensure!(
+                !zone.is_empty()
+                    && zone
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
+                "{label} IPv6 zone is invalid"
+            );
+        }
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(
+                suffix
+                    .strip_prefix(':')
+                    .context(format!("{label} port is invalid"))?,
+            )
+        };
+        (host, port)
+    } else if let Some((host, port)) = host_port.rsplit_once(':') {
+        ensure!(
+            !host.contains(':'),
+            "{label} IPv6 addresses must be enclosed in brackets"
+        );
+        (host, Some(port))
+    } else {
+        (host_port, None)
+    };
+    let binding = matches!(protocol.as_str(), "udp" | "tcp" | "srt" | "rtp") && port.is_some();
+    ensure!(!host.is_empty() || binding, "{label} needs a host");
+    if !host_port.starts_with('[') {
+        ensure!(
+            host.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b)),
+            "{label} host is invalid; use a DNS name or an IP address"
+        );
+    }
+    if let Some(port) = port {
+        ensure!(
+            !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit())
+                && port.parse::<u16>().is_ok_and(|port| port > 0),
+            "{label} port must be an integer within 1..65535"
+        );
+    }
+    Ok(())
+}
+
+/// Validate media source syntax without opening files, devices or sockets.
+pub fn validate_source_shape(url: &str) -> Result<()> {
+    ensure!(
+        !url.is_empty() && url.len() <= 16384 && !url.chars().any(char::is_control),
         "invalid media source URL"
     );
     if let Some(protocol) = scheme(url) {
@@ -146,10 +261,35 @@ fn validate_source(url: &str) -> Result<()> {
             ),
             "unsupported media protocol {protocol}"
         );
-    } else {
+        if !matches!(
+            protocol.as_str(),
+            "file" | "avfoundation" | "v4l2" | "dshow"
+        ) {
+            validate_network_url(url, "media source URL")?;
+        } else if protocol == "file" {
+            local_file_path(url)?;
+        } else {
+            native_source(url)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_source(url: &str) -> Result<()> {
+    validate_source_shape(url)?;
+    if is_recording(url) {
+        let path = local_file_path(url)?;
+        let metadata = fs::metadata(&path).map_err(|error| {
+            let message = if error.kind() == std::io::ErrorKind::NotFound {
+                format!("media file not found: {}", path.display())
+            } else {
+                format!("cannot inspect media file {}", path.display())
+            };
+            anyhow::Error::new(error).context(message)
+        })?;
         ensure!(
-            std::path::Path::new(url).is_file(),
-            "media file does not exist"
+            metadata.is_file(),
+            "media source path must name a regular file"
         );
     }
     Ok(())
@@ -605,10 +745,15 @@ impl Decoder {
     }
     fn spawn_configured(source: &str, timeout: Duration, options: &[String]) -> Result<Self> {
         validate_source(source)?;
+        ensure!(
+            !timeout.is_zero() && Instant::now().checked_add(timeout).is_some(),
+            "media timeout must be positive and fit in the monotonic clock"
+        );
         let exe = executable()?;
         let mut cmd = command(&exe);
         cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
         let acceleration = hwaccel();
+        validate_hwaccel(&acceleration)?;
         if !matches!(acceleration.as_str(), "none" | "off") {
             cmd.args(["-hwaccel", &acceleration]);
         }
@@ -617,7 +762,10 @@ impl Decoder {
                 cmd.args(["-f", format]);
                 input
             }
-            None => source.into(),
+            None if scheme(source).as_deref() == Some("file") => {
+                format!("file:{}", local_file_path(source)?.to_string_lossy())
+            }
+            None => canonical_scheme(source),
         };
         cmd.args(options);
         if matches!(scheme(source).as_deref(), Some("rtsp" | "rtsps")) {
@@ -1053,6 +1201,10 @@ fn native_source(source: &str) -> Result<(String, Option<NativeOptions>)> {
         return Ok((source.into(), None));
     }
     let (base, query) = source.split_once('?').unwrap_or((source, ""));
+    ensure!(
+        !base.split_once(':').unwrap().1.trim().is_empty(),
+        "native media source needs a device name or index"
+    );
     let mut options = NativeOptions::default();
     for pair in query.split('&').filter(|s| !s.is_empty()) {
         let (key, value) = pair
@@ -1060,6 +1212,10 @@ fn native_source(source: &str) -> Result<(String, Option<NativeOptions>)> {
             .context("native camera options need key=value")?;
         match key {
             "fps" => {
+                ensure!(
+                    options.fps.is_none(),
+                    "native camera fps option was supplied more than once"
+                );
                 let fps: f64 = value
                     .parse()
                     .context("native camera fps must be a number")?;
@@ -1070,6 +1226,10 @@ fn native_source(source: &str) -> Result<(String, Option<NativeOptions>)> {
                 options.fps = Some(fps);
             }
             "size" => {
+                ensure!(
+                    options.size.is_none(),
+                    "native camera size option was supplied more than once"
+                );
                 let (w, h) = value
                     .split_once('x')
                     .context("native camera size must be WIDTHxHEIGHT")?;
@@ -1232,6 +1392,11 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
     open_url(&source, timeout)
 }
 pub fn open_url(source: &str, timeout: Duration) -> Result<Box<dyn Backend>> {
+    validate_source(source)?;
+    ensure!(
+        !timeout.is_zero() && Instant::now().checked_add(timeout).is_some(),
+        "media timeout must be positive and fit in the monotonic clock"
+    );
     let (source, options) = native_source(source)?;
     let mut backend = MediaBackend {
         source,
@@ -1423,6 +1588,7 @@ impl Backend for MediaBackend {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForwardConfig {
     pub output: String,
     pub codec: String,
@@ -1437,6 +1603,48 @@ pub struct ForwardConfig {
     /// name inside it, and bucket destinations upload the finished file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<String>,
+}
+impl ForwardConfig {
+    /// Validate forwarding settings before starting a process, changing camera
+    /// settings, reserving storage or looking up a saved destination.
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.fps.is_finite() && (0.1..=240.0).contains(&self.fps),
+            "forwarding FPS must be a finite number within 0.1..240"
+        );
+        let family = codec_family(&self.codec)?;
+        validate_encoder(&self.codec, &self.encoder)?;
+        if jetson_encoder(&self.encoder) {
+            jetson_framerate(self.fps)?;
+        }
+        validate_bitrate(&self.bitrate)?;
+        output_args(&self.output)?;
+        crate::destination::validate_output(self.destination.as_deref(), &self.output)?;
+        let recording = recording_output(&self.output)?;
+        if self.destination.is_some() {
+            ensure!(
+                recording.is_some(),
+                "a destination holds recordings; omit --destination for network streams"
+            );
+        }
+        // Storage fields remain valid even when a network stream does not use them.
+        self.storage.validate()?;
+        ensure!(
+            self.max_file_bytes > 0,
+            "recording reservation must be positive"
+        );
+        if let Some((_, container)) = recording {
+            ensure!(
+                self.max_file_bytes <= self.storage.max_bytes,
+                "recording reservation must be no greater than the storage byte budget"
+            );
+            ensure!(
+                container != "webm" || family == "av1",
+                "WebM recordings require the av1 codec; use .mkv or .mp4 for h264 or hevc"
+            );
+        }
+        Ok(())
+    }
 }
 pub fn default_recording_cap() -> u64 {
     512 * 1024 * 1024
@@ -1497,18 +1705,58 @@ fn codec_family(codec: &str) -> Result<&'static str> {
         _ => bail!("unsupported forwarding codec {codec}; use h264, hevc or av1"),
     }
 }
+fn encoder_family(encoder: &str) -> Option<&'static str> {
+    match encoder {
+        "h264" | "libx264" | "libx264rgb" | "libopenh264" | "nvv4l2h264enc" => Some("h264"),
+        "hevc" | "libx265" | "nvv4l2h265enc" => Some("hevc"),
+        "av1" | "libsvtav1" | "libaom-av1" | "librav1e" | "nvv4l2av1enc" => Some("av1"),
+        name if name.starts_with("h264_") => Some("h264"),
+        name if name.starts_with("hevc_") => Some("hevc"),
+        name if name.starts_with("av1_") => Some("av1"),
+        _ => None,
+    }
+}
+pub fn validate_encoder(codec: &str, encoder: &str) -> Result<()> {
+    let family = codec_family(codec)?;
+    ensure!(
+        !encoder.is_empty()
+            && encoder.len() <= 64
+            && encoder.as_bytes()[0].is_ascii_alphanumeric()
+            && encoder
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)),
+        "invalid forwarding encoder name; use auto or an FFmpeg video encoder such as libx264"
+    );
+    if let Some(encoder_family) = encoder_family(encoder) {
+        ensure!(
+            family == encoder_family,
+            "forwarding encoder {encoder} encodes {encoder_family}, but the selected codec is {family}"
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_bitrate(bitrate: &str) -> Result<()> {
+    bits_per_second(bitrate).map(|_| ())
+}
 fn select_encoder(exe: &Executable, config: &ForwardConfig) -> Result<String> {
     let family = codec_family(&config.codec)?;
     if config.encoder != "auto" {
-        ensure!(
-            !config.encoder.is_empty()
-                && config.encoder.len() <= 64
-                && config
-                    .encoder
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
-            "invalid FFmpeg encoder name"
-        );
+        validate_encoder(&config.codec, &config.encoder)?;
+        if jetson_encoder(&config.encoder) {
+            ensure!(
+                probe_jetson(&config.encoder),
+                "forwarding encoder {} is unavailable or cannot encode on this device",
+                config.encoder
+            );
+        } else {
+            let (_, available) = bounded_output(
+                exe,
+                &["-hide_banner".into(), "-encoders".into()],
+                Duration::from_secs(5),
+            )?;
+            validate_encoder_listing(&available, &config.encoder, family)?;
+        }
         return Ok(config.encoder.clone());
     }
     // Vendor encoders first, then cross-vendor Vulkan Video, then software.
@@ -1603,6 +1851,26 @@ fn select_encoder(exe: &Executable, config: &ForwardConfig) -> Result<String> {
         "no usable {family} encoder found in bundled FFmpeg; choose --encoder explicitly or provide a build with a software encoder"
     )
 }
+
+fn validate_encoder_listing(listing: &str, encoder: &str, family: &str) -> Result<()> {
+    let line = listing.lines().find(|line| line.split_whitespace().nth(1) == Some(encoder))
+        .with_context(|| format!("forwarding encoder {encoder} is unavailable in this FFmpeg build; use auto or choose an installed encoder"))?;
+    ensure!(
+        line.split_whitespace()
+            .next()
+            .is_some_and(|flags| flags.starts_with('V')),
+        "forwarding encoder {encoder} must be a video encoder"
+    );
+    let declared = line
+        .split_once("(codec ")
+        .and_then(|(_, suffix)| suffix.split_once(')').map(|(codec, _)| codec));
+    let declared = declared.or_else(|| encoder_family(encoder));
+    ensure!(
+        declared == Some(family),
+        "forwarding encoder {encoder} does not encode the selected {family} codec; choose a matching encoder or change --codec"
+    );
+    Ok(())
+}
 /// NVIDIA Jetson hardware encoders, reached through NVIDIA's GStreamer
 /// elements: on Jetson the video engine is a V4L2 device that FFmpeg's NVENC
 /// and generic V4L2 wrappers cannot drive. GStreamer runs as a separate
@@ -1616,6 +1884,54 @@ fn jetson_parser(encoder: &str) -> &'static str {
         "nvv4l2h265enc" => "h265parse",
         _ => "av1parse",
     }
+}
+
+/// GStreamer fraction fields use signed 32-bit numerator and denominator.
+/// Continued fractions recover rates such as 30000/1001 without rounding to
+/// decimal milliseconds. Accept a rate only if the fraction reproduces the
+/// requested floating-point value exactly.
+fn jetson_framerate(fps: f64) -> Result<(u32, u32)> {
+    ensure!(
+        fps.is_finite() && (0.1..=240.0).contains(&fps),
+        "forwarding FPS must be a finite number within 0.1..240"
+    );
+    const LIMIT: u64 = i32::MAX as u64;
+    let (mut previous_numerator, mut numerator) = (0u64, 1u64);
+    let (mut previous_denominator, mut denominator) = (1u64, 0u64);
+    let mut remainder = fps;
+    for _ in 0..64 {
+        let coefficient = remainder.floor();
+        let numerator_limit = (LIMIT - previous_numerator)
+            .checked_div(numerator)
+            .unwrap_or(LIMIT);
+        let denominator_limit = (LIMIT - previous_denominator)
+            .checked_div(denominator)
+            .unwrap_or(LIMIT);
+        let maximum = numerator_limit.min(denominator_limit);
+        let multiplier = if coefficient <= maximum as f64 {
+            coefficient as u64
+        } else {
+            maximum
+        };
+        let next_numerator = multiplier * numerator + previous_numerator;
+        let next_denominator = multiplier * denominator + previous_denominator;
+        if next_denominator > 0 && next_numerator as f64 / next_denominator as f64 == fps {
+            return Ok((next_numerator as u32, next_denominator as u32));
+        }
+        if multiplier as f64 != coefficient {
+            break;
+        }
+        let fraction = remainder - coefficient;
+        if fraction <= 0.0 {
+            break;
+        }
+        remainder = 1.0 / fraction;
+        (previous_numerator, numerator) = (numerator, next_numerator);
+        (previous_denominator, denominator) = (denominator, next_denominator);
+    }
+    bail!(
+        "Jetson forwarding FPS {fps} cannot be represented exactly with 32-bit fraction fields; choose a simpler frame rate or a different encoder"
+    )
 }
 /// Run a helper tool briefly; true when it exits successfully in time.
 fn tool_succeeds(program: &str, args: &[&str], timeout: Duration) -> bool {
@@ -1670,18 +1986,51 @@ fn probe_jetson(encoder: &str) -> bool {
 }
 /// Bits per second from a bitrate like `4M`, `2500k` or `800000`.
 fn bits_per_second(bitrate: &str) -> Result<u64> {
-    let (number, scale) = match bitrate.chars().last() {
-        Some('k' | 'K') => (&bitrate[..bitrate.len() - 1], 1e3),
-        Some('M') => (&bitrate[..bitrate.len() - 1], 1e6),
-        Some('G') => (&bitrate[..bitrate.len() - 1], 1e9),
-        _ => (bitrate, 1.0),
-    };
-    let value: f64 = number.parse().context("invalid forwarding bitrate")?;
     ensure!(
-        value.is_finite() && value > 0.0 && value * scale <= u32::MAX as f64,
-        "forwarding bitrate out of range"
+        !bitrate.is_empty() && bitrate.len() <= 32,
+        "forwarding bitrate needs a positive bit rate, for example 4M or 2500k"
     );
-    Ok((value * scale) as u64)
+    let (number, power) = match bitrate.chars().last() {
+        Some('k' | 'K') => (&bitrate[..bitrate.len() - 1], 3u32),
+        Some('M') => (&bitrate[..bitrate.len() - 1], 6),
+        Some('G') => (&bitrate[..bitrate.len() - 1], 9),
+        _ => (bitrate, 0),
+    };
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    ensure!(
+        !number.is_empty()
+            && number.bytes().any(|b| b.is_ascii_digit())
+            && whole
+                .bytes()
+                .chain(fraction.bytes())
+                .all(|b| b.is_ascii_digit()),
+        "invalid forwarding bitrate; use a number with an optional k, M or G suffix (for example 4M)"
+    );
+    let fraction = fraction.trim_end_matches('0');
+    ensure!(
+        fraction.len() <= power as usize,
+        "forwarding bitrate must resolve to a whole number of bits per second"
+    );
+    let whole = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse::<u64>()
+            .context("forwarding bitrate is too large")?
+    };
+    let fractional = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<u64>()? * 10u64.pow(power - fraction.len() as u32)
+    };
+    let value = whole
+        .checked_mul(10u64.pow(power))
+        .and_then(|whole| whole.checked_add(fractional));
+    ensure!(
+        value.is_some_and(|value| (1..=u32::MAX as u64).contains(&value)),
+        "forwarding bitrate must be within 1..4294967295 bits per second"
+    );
+    Ok(value.unwrap())
 }
 /// Frames handed to a Jetson encoder: formats `nvvidconv` accepts in system
 /// memory and converts on the VIC engine.
@@ -1818,13 +2167,21 @@ fn encoder_output_options(encoder: &str, input: EncoderInput) -> Vec<String> {
     }
     options
 }
+/// Check a forwarding URL or recording path without opening an encoder.
+pub fn validate_forward_output(output: &str) -> Result<()> {
+    output_args(output)?;
+    recording_output(output)?;
+    Ok(())
+}
+
 fn output_args(output: &str) -> Result<Vec<String>> {
     ensure!(
-        !output.is_empty()
-            && output.len() <= 16384
-            && !output.bytes().any(|b| b == 0 || b == b'\n' || b == b'\r'),
+        !output.is_empty() && output.len() <= 16384 && !output.chars().any(char::is_control),
         "invalid forwarding destination"
     );
+    if !is_recording(output) {
+        validate_network_url(output, "forwarding destination URL")?;
+    }
     let mut args = Vec::new();
     match scheme(output).as_deref() {
         Some("rtsp" | "rtsps") => {
@@ -1844,7 +2201,7 @@ fn output_args(output: &str) -> Result<Vec<String>> {
     let destination = if scheme(output).is_none() && output.starts_with('-') {
         format!("file:{output}")
     } else {
-        output.to_string()
+        canonical_scheme(output)
     };
     args.push(destination);
     Ok(args)
@@ -1853,16 +2210,15 @@ fn recording_output(output: &str) -> Result<Option<(PathBuf, &'static str)>> {
     if !is_recording(output) {
         return Ok(None);
     }
-    let path = if scheme(output).as_deref() == Some("file") {
-        output.split_once(':').unwrap().1
-    } else {
-        output
-    };
+    let path = local_file_path(output)?;
     ensure!(
-        !path.is_empty() && path != "-",
+        !path.as_os_str().is_empty()
+            && path != std::path::Path::new("-")
+            && !output.ends_with('/')
+            && !(cfg!(windows) && output.ends_with('\\'))
+            && path.file_name().is_some(),
         "recording needs an output file"
     );
-    let path = PathBuf::from(path);
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
@@ -1876,6 +2232,64 @@ fn recording_output(output: &str) -> Result<Option<(PathBuf, &'static str)>> {
         _ => bail!("unsupported recording container: use .mkv, .mp4, .mov, .ts or .webm"),
     };
     Ok(Some((path, container)))
+}
+
+fn local_file_path(value: &str) -> Result<PathBuf> {
+    if scheme(value).as_deref() != Some("file") {
+        return Ok(value.into());
+    }
+    let path = value.split_once(':').unwrap().1;
+    ensure!(!path.is_empty(), "file URL needs a path");
+    if let Some(rest) = path.strip_prefix("//") {
+        ensure!(
+            !rest.contains(['?', '#']),
+            "file URL cannot contain a query or fragment; percent-encode filename characters or use a plain path"
+        );
+        let (authority, path) = rest
+            .split_once('/')
+            .context("file URL needs a local file path")?;
+        ensure!(
+            authority.is_empty() || authority.eq_ignore_ascii_case("localhost") || cfg!(windows),
+            "file URL host must be localhost; use a mounted network folder for other hosts"
+        );
+        let path = decode_file_url_path(path)?;
+        if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
+            if cfg!(windows)
+                && path.len() >= 3
+                && path.as_bytes()[0].is_ascii_alphabetic()
+                && path.as_bytes()[1] == b':'
+                && path.as_bytes()[2] == b'/'
+            {
+                return Ok(path.into());
+            }
+            return Ok(PathBuf::from(format!("/{path}")));
+        }
+        return Ok(PathBuf::from(format!("//{authority}/{path}")));
+    }
+    Ok(path.into())
+}
+
+fn decode_file_url_path(path: &str) -> Result<String> {
+    let mut bytes = Vec::with_capacity(path.len());
+    let mut source = path.as_bytes().iter();
+    while let Some(&byte) = source.next() {
+        if byte != b'%' {
+            bytes.push(byte);
+            continue;
+        }
+        let high = source.next().and_then(|b| (*b as char).to_digit(16));
+        let low = source.next().and_then(|b| (*b as char).to_digit(16));
+        let (Some(high), Some(low)) = (high, low) else {
+            bail!("file URL path contains invalid percent escaping");
+        };
+        bytes.push((high * 16 + low) as u8);
+    }
+    let decoded = String::from_utf8(bytes).context("file URL path must be valid UTF-8")?;
+    ensure!(
+        !decoded.chars().any(char::is_control),
+        "file URL path must not contain encoded control characters"
+    );
+    Ok(decoded)
 }
 /// How a camera frame is handed to FFmpeg unchanged: its rawvideo pixel format,
 /// bytes per pixel and whether it carries color. Sending sensor-native bytes
@@ -1915,6 +2329,7 @@ impl RawInput {
 }
 impl Forwarder {
     pub fn new(mut config: ForwardConfig) -> Result<Self> {
+        config.validate()?;
         let destination = match config.destination.as_deref() {
             Some(name) => {
                 ensure!(
@@ -1928,28 +2343,6 @@ impl Forwarder {
             }
             None => None,
         };
-        ensure!(
-            config.fps.is_finite() && (0.1..=240.0).contains(&config.fps),
-            "forwarding FPS must be within 0.1..240"
-        );
-        codec_family(&config.codec)?;
-        output_args(&config.output)?;
-        if recording_output(&config.output)?.is_some() {
-            config.storage.validate()?;
-            ensure!(
-                config.max_file_bytes > 0 && config.max_file_bytes <= config.storage.max_bytes,
-                "Storage full: recording reservation must be positive and no greater than the storage byte budget"
-            );
-        }
-        ensure!(
-            !config.bitrate.is_empty()
-                && config.bitrate.len() <= 32
-                && config
-                    .bitrate
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'k' | b'K' | b'M' | b'G')),
-            "invalid forwarding bitrate (for example 4M)"
-        );
         Ok(Self {
             config,
             process: None,
@@ -1974,6 +2367,7 @@ impl Forwarder {
         let mut cmd = command(&exe);
         let mut stage = None;
         if let Some(input) = jetson {
+            let (fps_numerator, fps_denominator) = jetson_framerate(self.config.fps)?;
             let gop = ((self.config.fps * 2.0).round().max(1.0) as u32).to_string();
             let mut gst = Command::new("gst-launch-1.0");
             gst.args([
@@ -1985,10 +2379,7 @@ impl Forwarder {
                 &format!("width={width}"),
                 &format!("height={height}"),
                 &format!("format={}", input.caps()),
-                &format!(
-                    "framerate={}/1000",
-                    (self.config.fps * 1000.0).round() as u64
-                ),
+                &format!("framerate={fps_numerator}/{fps_denominator}"),
                 "!",
                 "nvvidconv",
                 "!",
@@ -2476,6 +2867,74 @@ mod tests {
         assert!(info("rtsp://camera/live\n-x").is_err());
     }
     #[test]
+    fn backend_urls_lowercase_only_the_scheme_and_keep_credentials_redacted() {
+        let source = "RTSP://User:P%40ss@Camera.Example:554/Live/%aB?token=Secret%2f&Mode=TCP";
+        let canonical = "rtsp://User:P%40ss@Camera.Example:554/Live/%aB?token=Secret%2f&Mode=TCP";
+        assert_eq!(canonical_scheme(source), canonical);
+        assert_eq!(output_args(source).unwrap().last().unwrap(), canonical);
+        assert_eq!(
+            canonical_scheme(" C:\\My Captures\\record.mkv "),
+            " C:\\My Captures\\record.mkv "
+        );
+        assert_eq!(
+            canonical_scheme("C:\\My Captures\\record.mkv"),
+            "C:\\My Captures\\record.mkv"
+        );
+        let log = redact_log(&format!("cannot open {source} or {canonical}"), source);
+        assert!(!log.contains("P%40ss"));
+        assert!(!log.contains("Secret%2f"));
+        assert!(log.contains("Camera.Example:554/Live/%aB"));
+        assert!(log.contains("Mode=TCP"));
+    }
+    #[test]
+    fn network_sources_validate_hosts_ports_and_escaping_without_disclosing_credentials() {
+        for source in [
+            "rtsp://user:secret@camera:554/live",
+            "RTSP://camera/live",
+            "https://camera/stream?token=a%2Fb",
+            "srt://[::1]:8890",
+            "udp://@239.1.2.3:5000",
+            "tcp://:5000?listen=1",
+        ] {
+            assert!(validate_source(source).is_ok(), "{source}");
+        }
+        for source in [
+            "rtsp:",
+            "rtsp:///live",
+            "https://",
+            "rtsp://camera:0/live",
+            "rtsp://camera:65536/live",
+            "rtsp://camera:/live",
+            "rtsp://[oops]:554/live",
+            "rtsp://::1:554/live",
+            "https://camera/a%2",
+            "https://camera/a b",
+            "avfoundation:?fps=30",
+            "v4l2:/dev/video0?fps=30&fps=60",
+            "dshow:video=Camera?size=640x480&size=1280x720",
+        ] {
+            assert!(validate_source(source).is_err(), "{source}");
+        }
+        let error = validate_source("rtsp://user:secret@camera:99999/live").unwrap_err();
+        assert!(error.to_string().contains("1..65535"));
+        assert!(!format!("{error:#}").contains("secret"));
+        assert!(local_file_path("file://remote/a.mkv").is_err() || cfg!(windows));
+        assert_eq!(
+            local_file_path("file://localhost/tmp/a.mkv").unwrap(),
+            PathBuf::from("/tmp/a.mkv")
+        );
+        assert_eq!(
+            local_file_path("file:///tmp/clip%20%C3%A9%23.mkv").unwrap(),
+            PathBuf::from("/tmp/clip é#.mkv")
+        );
+        assert_eq!(
+            local_file_path("file:literal%20name.mkv").unwrap(),
+            PathBuf::from("literal%20name.mkv")
+        );
+        assert!(local_file_path("file:///tmp/clip%00.mkv").is_err());
+        assert!(local_file_path("file:///tmp/clip%QQ.mkv").is_err());
+    }
+    #[test]
     fn forwarding_output_selection() {
         assert_eq!(
             output_args("rtsp://host/live").unwrap(),
@@ -2495,6 +2954,25 @@ mod tests {
     }
     #[test]
     fn jetson_inputs_and_bitrates() {
+        for (fps, expected) in [
+            (30.0, (30, 1)),
+            (0.1, (1, 10)),
+            (30.12345, (602469, 20000)),
+            (30000.0 / 1001.0, (30000, 1001)),
+            (240.0, (240, 1)),
+        ] {
+            let fraction = jetson_framerate(fps).unwrap();
+            assert_eq!(fraction, expected);
+            assert_eq!(fraction.0 as f64 / fraction.1 as f64, fps);
+        }
+        let unrepresentable = f64::from_bits(30.0f64.to_bits() + 1);
+        assert!(
+            jetson_framerate(unrepresentable)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be represented exactly")
+        );
+        assert!(jetson_framerate(f64::NAN).is_err());
         assert_eq!(bits_per_second("4M").unwrap(), 4_000_000);
         assert_eq!(bits_per_second("2500k").unwrap(), 2_500_000);
         assert_eq!(bits_per_second("800000").unwrap(), 800_000);
@@ -2779,9 +3257,9 @@ mod tests {
             timestamp_ns: 0,
             data: vec![0; 64 * 48 * 3],
         };
-        forward.push(frame.clone()).unwrap();
-        thread::sleep(Duration::from_millis(100));
-        assert!(forward.stop().is_err());
+        let error = forward.push(frame.clone()).unwrap_err();
+        assert!(format!("{error:#}").contains("is unavailable in this FFmpeg build"));
+        forward.stop().unwrap();
         assert!(
             !path.exists(),
             "invalid recordings must be removed and release their reservation"
@@ -2829,6 +3307,8 @@ mod tests {
     }
     #[test]
     fn forwarding_configuration_fails_closed() {
+        assert!(validate_hwaccel("cuda").is_ok());
+        assert!(validate_hwaccel("unexpected").is_err());
         let config = ForwardConfig {
             output: "video.mp4".into(),
             codec: "h264".into(),
@@ -2840,9 +3320,73 @@ mod tests {
             destination: None,
         };
         assert!(Forwarder::new(config.clone()).is_ok());
+        let mut serialized = serde_json::to_value(&config).unwrap();
+        serialized["bitarte"] = json!("8M");
+        assert!(
+            serde_json::from_value::<ForwardConfig>(serialized)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field `bitarte`")
+        );
+        for bitrate in [
+            "0",
+            "0M",
+            "NaN",
+            "inf",
+            "1.2.3M",
+            "4MM",
+            "5G",
+            "0.0000001M",
+            "4294967296",
+        ] {
+            let mut invalid = config.clone();
+            invalid.bitrate = bitrate.into();
+            assert!(invalid.validate().is_err(), "{bitrate}");
+        }
+        for (bitrate, expected) in [
+            ("2.01k", 2010),
+            (".5M", 500_000),
+            ("1.000000M", 1_000_000),
+            ("0.000001M", 1),
+            ("4294967295", u32::MAX as u64),
+        ] {
+            assert_eq!(bits_per_second(bitrate).unwrap(), expected, "{bitrate}");
+        }
+        for encoder in ["", "-i", "libx264;", "libx265"] {
+            let mut invalid = config.clone();
+            invalid.encoder = encoder.into();
+            assert!(invalid.validate().is_err(), "{encoder}");
+        }
+        assert!(validate_encoder("av1", "libaom-av1").is_ok());
+        for output in [
+            "https://",
+            "rtsp://camera:70000/live",
+            "file:",
+            "video.mp4/",
+            "video.webm",
+        ] {
+            let mut invalid = config.clone();
+            invalid.output = output.into();
+            assert!(invalid.validate().is_err(), "{output}");
+        }
         let mut invalid = config;
         invalid.fps = f64::NAN;
         assert!(Forwarder::new(invalid).is_err());
+    }
+    #[test]
+    fn explicit_encoders_must_be_installed_video_encoders_for_the_selected_codec() {
+        let listing = " V....D libx264 H.264 (codec h264)\n V....D libaom-av1 AV1 (codec av1)\n A..... aac AAC\n V..... mjpeg Motion JPEG\n V....D custom New encoder (codec hevc)\n";
+        assert!(validate_encoder_listing(listing, "libx264", "h264").is_ok());
+        assert!(validate_encoder_listing(listing, "libaom-av1", "av1").is_ok());
+        assert!(validate_encoder_listing(listing, "custom", "hevc").is_ok());
+        for (encoder, family) in [
+            ("libx264", "av1"),
+            ("aac", "h264"),
+            ("mjpeg", "h264"),
+            ("missing", "h264"),
+        ] {
+            assert!(validate_encoder_listing(listing, encoder, family).is_err());
+        }
     }
     const C920_MODES: &str = "\
 [in#0 @ 0x77dac14000] Selected video size (16x16) is not supported by the device.
@@ -2982,9 +3526,8 @@ Error opening input files: Input/output error
             .set(&mut camera, "AcquisitionFrameRate", "29.97")
             .unwrap_err();
         assert!(
-            error
-                .to_string()
-                .starts_with("1920x1080@29.97 is not supported by HD Pro Webcam C920; supported: 1920x1080@30, 1920x1080@24,")
+            format!("{error:#}")
+                .contains("1920x1080@29.97 is not supported by HD Pro Webcam C920; supported: 1920x1080@30, 1920x1080@24,")
         );
         nodes
             .set(&mut camera, "AcquisitionFrameRate", "30")

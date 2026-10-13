@@ -52,13 +52,21 @@ pub struct Keys {
 
 /// Store a secret access key in the OS credential store.
 pub fn store_secret(access_key_id: &str, secret: &str) -> Result<()> {
-    ensure!(!secret.is_empty(), "the secret access key is empty");
+    Credentials::Keychain {
+        access_key_id: access_key_id.into(),
+    }
+    .validate()?;
+    validate_secret(secret)?;
     keyring::Entry::new(KEYCHAIN_SERVICE, access_key_id)
         .and_then(|entry| entry.set_password(secret))
         .map_err(|e| anyhow!("cannot save the secret key in the OS credential store: {e}"))
 }
 
 pub fn delete_secret(access_key_id: &str) -> Result<()> {
+    Credentials::Keychain {
+        access_key_id: access_key_id.into(),
+    }
+    .validate()?;
     match keyring::Entry::new(KEYCHAIN_SERVICE, access_key_id)
         .and_then(|entry| entry.inner.delete_credential())
     {
@@ -78,6 +86,10 @@ pub fn has_secret(access_key_id: &str) -> bool {
 /// locked or unavailable credential store: a save must never mistake an
 /// unreadable existing key for an empty slot and then overwrite it.
 pub(crate) fn read_secret(access_key_id: &str) -> Result<Option<String>> {
+    Credentials::Keychain {
+        access_key_id: access_key_id.into(),
+    }
+    .validate()?;
     match keyring::Entry::new(KEYCHAIN_SERVICE, access_key_id)
         .and_then(|entry| entry.get_password())
     {
@@ -130,8 +142,36 @@ fn credentials_file() -> Option<std::path::PathBuf> {
     )
 }
 
+pub fn validate_secret(secret: &str) -> Result<()> {
+    ensure!(
+        !secret.is_empty() && secret.len() <= 4096,
+        "S3 secret access key must contain 1..4096 bytes"
+    );
+    Ok(())
+}
+
+impl Keys {
+    fn validate(&self) -> Result<()> {
+        Credentials::Keychain {
+            access_key_id: self.id.clone(),
+        }
+        .validate()?;
+        validate_secret(&self.secret)?;
+        if let Some(token) = &self.token {
+            ensure!(
+                !token.is_empty()
+                    && token.len() <= 16384
+                    && token.bytes().all(|b| b.is_ascii_graphic()),
+                "AWS session token must contain 1..16384 printable ASCII characters without whitespace"
+            );
+        }
+        Ok(())
+    }
+}
+
 pub fn keys(credentials: &Credentials) -> Result<Keys> {
-    match credentials {
+    credentials.validate()?;
+    let keys: Result<Keys> = match credentials {
         Credentials::Keychain { access_key_id } => {
             let secret = keyring::Entry::new(KEYCHAIN_SERVICE, access_key_id)
                 .and_then(|entry| entry.get_password())
@@ -173,7 +213,11 @@ pub fn keys(credentials: &Credentials) -> Result<Keys> {
                 .into()),
             }
         }
-    }
+    };
+    let keys = keys?;
+    keys.validate()
+        .map_err(|error| Permanent(error.to_string()))?;
+    Ok(keys)
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +394,7 @@ fn error_text(body: &str) -> String {
 
 impl Client {
     pub fn new(bucket: &Bucket) -> Result<Self> {
+        bucket.validate()?;
         let keys = keys(&bucket.credentials)?;
         Self::with_keys(bucket, keys)
     }
@@ -359,7 +404,8 @@ impl Client {
         let Credentials::Keychain { access_key_id } = &bucket.credentials else {
             bail!("a typed secret requires an access key ID");
         };
-        ensure!(!secret.is_empty(), "the secret access key is empty");
+        bucket.validate()?;
+        validate_secret(&secret)?;
         Self::with_keys(
             bucket,
             Keys {
@@ -371,6 +417,8 @@ impl Client {
     }
 
     fn with_keys(bucket: &Bucket, keys: Keys) -> Result<Self> {
+        bucket.validate()?;
+        keys.validate()?;
         let service = bucket.service_url();
         let (scheme, authority) = service
             .split_once("://")
@@ -397,7 +445,7 @@ impl Client {
             bucket: bucket.clone(),
             keys,
             agent,
-            origin: format!("{scheme}://{host}"),
+            origin: format!("{}://{host}", scheme.to_ascii_lowercase()),
             host,
         })
     }
@@ -540,6 +588,27 @@ impl Client {
     /// Upload a local file to `key`, unless an object with that key exists.
     /// `sha256` is the file's expected hash; it is re-verified while reading.
     pub fn upload(&self, path: &Path, key: &str, sha256: &str, size: u64) -> Result<()> {
+        crate::destination::validate_object_key(key)
+            .map_err(|error| Permanent(error.to_string()))?;
+        ensure!(
+            sha256.len() == 64
+                && sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            Permanent(
+                "S3 upload checksum must be a lowercase SHA-256 hash (64 hexadecimal digits)"
+                    .into()
+            )
+        );
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("inspect upload file {}", path.display()))?;
+        ensure!(
+            metadata.is_file() && metadata.len() == size,
+            Permanent(format!(
+                "{} changed size after it was queued; not uploaded",
+                path.display()
+            ))
+        );
         if size > MULTIPART_THRESHOLD {
             return self.upload_parts(path, key, sha256, size);
         }
@@ -808,5 +877,75 @@ mod tests {
             "AccessDenied: Access Denied"
         );
         assert_eq!(content_type(Path::new("a/b.JPG")), "image/jpeg");
+    }
+    #[test]
+    fn invalid_s3_keys_and_upload_requests_fail_before_credentials_or_network() {
+        assert!(validate_secret("").is_err());
+        assert!(validate_secret(&"x".repeat(4097)).is_err());
+        for secret in ["has whitespace", "line\nfeed", "unicodeé"] {
+            assert!(validate_secret(secret).is_ok());
+        }
+        let valid = Keys {
+            id: "access-key".into(),
+            secret: "printable/secret+value=".into(),
+            token: Some("token+value=".into()),
+        };
+        assert!(valid.validate().is_ok());
+        let invalid = Keys {
+            token: Some("bad\r\nheader".into()),
+            ..valid
+        };
+        assert!(invalid.validate().is_err());
+        let bucket = Bucket {
+            endpoint: "https://".into(),
+            region: "us-east-1".into(),
+            bucket: "camera-archive".into(),
+            prefix: String::new(),
+            path_style: true,
+            credentials: Credentials::Environment,
+            keep_local: true,
+        };
+        assert!(
+            Client::new(&bucket)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("S3 endpoint")
+        );
+        assert!(
+            store_secret("", "secret")
+                .unwrap_err()
+                .to_string()
+                .contains("access key ID")
+        );
+    }
+
+    #[test]
+    fn client_lowercases_only_the_endpoint_scheme() {
+        let bucket = Bucket {
+            endpoint: "HTTPS://MinIO.Example:9000/".into(),
+            region: "us-east-1".into(),
+            bucket: "camera-archive".into(),
+            prefix: "Exact %2f /".into(),
+            path_style: true,
+            credentials: Credentials::Environment,
+            keep_local: true,
+        };
+        let client = Client::with_keys(
+            &bucket,
+            Keys {
+                id: "access".into(),
+                secret: "secret".into(),
+                token: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(client.origin, "https://MinIO.Example:9000");
+        assert_eq!(client.host, "MinIO.Example:9000");
+        assert_eq!(client.bucket.prefix, "Exact %2f /");
+        assert_eq!(
+            client.path("Exact %2f /clip.mkv"),
+            "/camera-archive/Exact%20%252f%20/clip.mkv"
+        );
     }
 }

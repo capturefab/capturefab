@@ -49,7 +49,7 @@ const BRIGHT: &str = "too bright at minimum exposure";
 pub fn validate_balance(balance: f64) -> Result<f64> {
     ensure!(
         balance.is_finite() && (0.0..=1.0).contains(&balance),
-        "balance must be between 0 (quality) and 1 (frame rate)"
+        "balance must be a finite number between 0 (quality) and 1 (frame rate)"
     );
     Ok(balance)
 }
@@ -410,11 +410,16 @@ impl AutoController {
         }
         Ok(())
     }
-    pub fn set_forward_fps(&mut self, fps: Option<f64>) {
+    pub fn set_forward_fps(&mut self, fps: Option<f64>) -> Result<()> {
+        ensure!(
+            fps.is_none_or(|fps| fps.is_finite() && fps > 0.0),
+            "forwarding frame rate must be a finite number greater than zero"
+        );
         if self.caps.forward_fps != fps {
             self.caps.forward_fps = fps;
             self.stale = true;
         }
+        Ok(())
     }
     pub fn observe(&mut self, frame: &Frame, now: Instant) {
         if let Some(last) = self.last_frame {
@@ -1868,6 +1873,32 @@ mod tests {
     }
 
     #[test]
+    fn invalid_auto_inputs_do_not_change_controller_or_camera_state() {
+        let fake = Fake::new(true);
+        let mut camera = fake.camera();
+        for balance in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
+            assert!(AutoController::enter(&mut camera, balance).is_err());
+            assert!(fake.writes.lock().unwrap().is_empty());
+        }
+        let mut auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        auto.set_forward_fps(Some(20.0)).unwrap();
+        let status = auto.status().clone();
+        let writes = fake.writes.lock().unwrap().clone();
+        for balance in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+            assert!(auto.set_balance(&mut camera, balance).is_err());
+            assert_eq!(auto.status(), &status);
+            assert_eq!(*fake.writes.lock().unwrap(), writes);
+        }
+        for fps in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+            assert!(auto.set_forward_fps(Some(fps)).is_err());
+            assert_eq!(auto.caps.forward_fps, Some(20.0));
+            assert_eq!(auto.status(), &status);
+        }
+        auto.set_forward_fps(None).unwrap();
+        assert_eq!(auto.caps.forward_fps, None);
+    }
+
+    #[test]
     fn meter_handles_formats_without_bayer_aliasing() {
         let mono = meter(&frame(MONO8, 4, 4, vec![128; 16])).unwrap();
         assert!(near(mono.mean, 128.0 / 255.0) && near(mono.p99, 128.0 / 255.0));
@@ -2534,7 +2565,7 @@ mod tests {
         assert_eq!(auto.period, None);
         assert!(camera.is_streaming());
         assert!(!auto.converged());
-        auto.set_forward_fps(Some(20.0));
+        auto.set_forward_fps(Some(20.0)).unwrap();
         auto.tick(&mut camera, now);
         assert_eq!(auto.status().target_fps, Some(120.0));
         assert!(auto.manages("VideoMode"));

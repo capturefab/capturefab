@@ -20,7 +20,7 @@ const LEDGER_LIMIT: u64 = 64 * 1024 * 1024;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StoragePolicy {
     pub max_bytes: u64,
     pub max_files: u32,
@@ -252,16 +252,11 @@ impl Manager {
     }
     fn writer(&self, path: &Path, policy: &StoragePolicy, reserve: u64) -> Result<StorageWriter> {
         policy.validate()?;
+        ensure!(reserve > 0, "capture storage reservation must be positive");
         ensure!(
-            reserve > 0 && reserve <= policy.max_bytes,
+            reserve <= policy.max_bytes,
             "Storage full: reservation {reserve} bytes exceeds the {} byte budget; lower --max-file-size or explicitly configure a larger storage budget",
             policy.max_bytes
-        );
-        let (base, path) = output_path(path)?;
-        ensure!(
-            !path.exists() && fs::symlink_metadata(&path).is_err(),
-            "capture output already exists: {}; choose a new file name",
-            path.display()
         );
         let mut locked = self.lock()?;
         let policy = policy.constrained_by(&locked.configured_policy()?);
@@ -270,6 +265,7 @@ impl Manager {
             "Storage full: reservation {reserve} bytes exceeds the configured {} byte global budget; lower the recording reservation or explicitly configure a larger storage policy",
             policy.max_bytes
         );
+        let (base, path) = output_path(path)?;
         ensure!(
             fs::symlink_metadata(&path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
             "capture output already exists or cannot be inspected: {}; choose a new file name and check directory permissions",
@@ -335,6 +331,14 @@ impl Manager {
 }
 
 fn output_path(path: &Path) -> Result<(PathBuf, PathBuf)> {
+    ensure!(
+        !path
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .any(|b| b.is_ascii_control()),
+        "capture output path must not contain control characters"
+    );
     let name = path
         .file_name()
         .filter(|name| !name.is_empty())
@@ -1024,6 +1028,14 @@ mod tests {
     }
     #[test]
     fn byte_units_are_checked() {
+        let error = serde_json::from_value::<StoragePolicy>(json!({"max_fiels": 5})).unwrap_err();
+        assert!(error.to_string().contains("unknown field `max_fiels`"));
+        assert_eq!(
+            serde_json::from_value::<StoragePolicy>(json!({"max_files": 5}))
+                .unwrap()
+                .max_files,
+            5
+        );
         assert_eq!(parse_bytes("10GiB").unwrap(), 10 * 1024u64.pow(3));
         assert_eq!(parse_bytes("10G").unwrap(), 10 * 1024u64.pow(3));
         assert_eq!(parse_bytes("10GB").unwrap(), 10_000_000_000);
@@ -1031,6 +1043,51 @@ mod tests {
         for invalid in ["0", "-1", "1.5GB", "10words", "18446744073709551615TB"] {
             assert!(parse_bytes(invalid).is_err());
         }
+    }
+    #[test]
+    fn invalid_storage_inputs_do_not_create_output_directories_or_delete_retained_files() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        completed(
+            &manager,
+            &temp.path("retained"),
+            &policy(10, 1, "stop"),
+            b"data",
+        );
+        for invalid_path in ["new/control\0.png", "new/control\n.png"] {
+            assert!(
+                manager
+                    .writer(&temp.path(invalid_path), &policy(10, 1, "delete-oldest"), 1)
+                    .is_err()
+            );
+            assert!(!temp.path("new").exists());
+            assert!(temp.path("retained").exists());
+        }
+        manager
+            .lock()
+            .unwrap()
+            .configure_policy(&policy(10, 1, "stop"))
+            .unwrap();
+        assert!(
+            manager
+                .writer(
+                    &temp.path("new/output.png"),
+                    &policy(20, 1, "delete-oldest"),
+                    11
+                )
+                .is_err()
+        );
+        assert!(!temp.path("new").exists());
+        assert!(temp.path("retained").exists());
+        assert!(
+            manager
+                .writer(&temp.path("zero/output.png"), &policy(10, 1, "stop"), 0)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("positive")
+        );
+        assert!(!temp.path("zero").exists());
     }
     #[test]
     fn reservations_are_global_across_managers_and_directories() {

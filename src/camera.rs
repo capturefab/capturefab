@@ -62,8 +62,48 @@ pub struct Camera {
     streaming: bool,
     xml: String,
 }
+/// Reject malformed known source forms without checking availability or build capabilities.
+/// Bare camera IDs and serials are resolved against discovery results on open.
+pub fn validate_selector_shape(selector: &str) -> Result<()> {
+    ensure!(
+        !selector.trim().is_empty() && !selector.chars().any(char::is_control),
+        "camera selector must be nonempty and contain no control characters"
+    );
+    if let Some(name) = selector.strip_prefix("sim:") {
+        ensure!(
+            !name.trim().is_empty(),
+            "simulator selector needs a name, for example sim:0"
+        );
+    } else if let Some(ip) = selector.strip_prefix("gige:") {
+        ip.parse::<Ipv4Addr>()
+            .context("GigE selector needs an IPv4 address, for example gige:192.168.1.10")?;
+    } else if crate::scanner::is_source(selector) {
+        crate::scanner::validate_selector_shape(selector)?;
+    } else if crate::onvif::is_source(selector) {
+        crate::onvif::validate_source_shape(selector)?;
+    } else if crate::media::is_url_source(selector) || selector.contains("://") {
+        crate::media::validate_source_shape(selector)?;
+    }
+    Ok(())
+}
+
+/// Check both selector syntax and local source availability before opening.
+pub fn validate_selector(selector: &str) -> Result<()> {
+    validate_selector_shape(selector)?;
+    if crate::scanner::is_source(selector) {
+        crate::scanner::info(selector)?;
+    } else if crate::onvif::is_source(selector) {
+        crate::onvif::validate_source(selector)?;
+    } else if (crate::media::is_source(selector) || selector.contains("://"))
+        && !crate::onvif::is_source(selector)
+    {
+        crate::media::validate_source(selector)?;
+    }
+    Ok(())
+}
 impl Camera {
     pub fn open(selector: &str, known: &[CameraInfo], timeout: Duration) -> Result<Self> {
+        validate_selector(selector)?;
         if crate::onvif::is_source(selector) {
             let (info, backend) = crate::onvif::connect(selector, timeout)?;
             return Self::from_backend(info, backend);
@@ -79,7 +119,11 @@ impl Camera {
                 .unwrap_or_else(|| crate::scanner::info(selector))?
         } else if crate::media::is_source(selector) {
             crate::media::info(selector)?
-        } else if let Ok(ip) = selector.trim_start_matches("gige:").parse::<Ipv4Addr>() {
+        } else if let Ok(ip) = selector
+            .strip_prefix("gige:")
+            .unwrap_or(selector)
+            .parse::<Ipv4Addr>()
+        {
             crate::transport::gige::probe(ip, timeout)?
         } else {
             let matches: Vec<_> = known
@@ -146,6 +190,9 @@ impl Camera {
     }
     pub fn set(&mut self, name: &str, value: &str) -> Result<()> {
         self.nodes.set(self.backend.as_mut(), name, value)
+    }
+    pub fn validate_set(&mut self, name: &str, value: &str) -> Result<()> {
+        self.nodes.validate_set(self.backend.as_mut(), name, value)
     }
     pub fn has(&self, name: &str) -> bool {
         self.nodes.has(name)
@@ -235,6 +282,47 @@ impl Drop for Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_selectors_fail_before_opening_a_backend() {
+        for selector in [
+            "",
+            "  ",
+            "sim:",
+            "sim:   ",
+            "sim:a\0b",
+            "sim:a\nb",
+            "gige:",
+            "gige:not-an-ip",
+            "gige:gige:127.0.0.1",
+            "scanner:unknown:device",
+        ] {
+            assert!(validate_selector(selector).is_err(), "{selector:?}");
+            assert!(Camera::open(selector, &[], Duration::from_millis(1)).is_err());
+        }
+        assert!(Camera::open("sim:named camera", &[], Duration::from_millis(1)).is_ok());
+    }
+
+    #[test]
+    fn selector_shape_does_not_depend_on_local_availability() {
+        let source = format!(
+            "file:/private/tmp/capturefab-missing-{}-{}.mp4",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        validate_selector_shape(&source).unwrap();
+        assert!(validate_selector(&source).is_err());
+        for source in [
+            "scanner:sane:device",
+            "scanner:wia:device",
+            "scanner:ica:device",
+        ] {
+            validate_selector_shape(source).unwrap();
+        }
+    }
 
     #[test]
     #[ignore = "requires FFmpeg"]

@@ -51,6 +51,44 @@ pub struct Item {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
+impl Item {
+    fn validate(&self) -> Result<()> {
+        validate_id(&self.id)?;
+        crate::destination::validate_name(&self.destination)?;
+        self.bucket.validate()?;
+        crate::destination::validate_object_key(&self.key)?;
+        ensure!(
+            self.path.is_absolute()
+                && !self
+                    .path
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .iter()
+                    .any(|b| b.is_ascii_control()),
+            "queued upload path must be absolute without control characters"
+        );
+        ensure!(
+            self.sha256.len() == 64
+                && self
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "queued upload checksum must be a lowercase SHA-256 hash (64 hexadecimal digits)"
+        );
+        Ok(())
+    }
+}
+
+pub fn validate_id(id: &str) -> Result<()> {
+    ensure!(
+        id.len() == 16
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "upload ID must contain 16 lowercase hexadecimal digits; choose an ID from upload status"
+    );
+    Ok(())
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Queue {
@@ -91,8 +129,14 @@ fn with_queue<T>(update: impl FnOnce(&mut Queue) -> Result<T>) -> Result<T> {
     lock.lock_exclusive().context("lock the upload queue")?;
     let path = dir.join("uploads.json");
     let mut queue = match fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .with_context(|| format!("invalid upload queue {}", path.display()))?,
+        Ok(bytes) => {
+            ensure!(
+                bytes.len() <= 256 * 1024 * 1024,
+                "upload queue is too large (maximum 256 MiB)"
+            );
+            serde_json::from_slice(&bytes)
+                .with_context(|| format!("invalid upload queue {}", path.display()))?
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Queue {
             version: 1,
             ..Queue::default()
@@ -100,6 +144,16 @@ fn with_queue<T>(update: impl FnOnce(&mut Queue) -> Result<T>) -> Result<T> {
         Err(e) => return Err(e).context("read the upload queue"),
     };
     ensure!(queue.version == 1, "unsupported upload queue version");
+    ensure!(
+        queue.items.len() <= MAX_ITEMS,
+        "upload queue contains too many items (maximum {MAX_ITEMS})"
+    );
+    let mut ids = std::collections::HashSet::new();
+    for item in &queue.items {
+        item.validate()
+            .with_context(|| format!("invalid queued upload {}", item.id))?;
+        ensure!(ids.insert(&item.id), "duplicate upload ID {}", item.id);
+    }
     let result = update(&mut queue)?;
     let temp = dir.join(format!("uploads.json.{}.tmp", std::process::id()));
     let mut options = fs::OpenOptions::new();
@@ -119,27 +173,46 @@ fn with_queue<T>(update: impl FnOnce(&mut Queue) -> Result<T>) -> Result<T> {
 /// Wakes this process's uploader when it queues a file itself.
 static WAKE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-fn id() -> String {
+fn id() -> Result<String> {
     let mut bytes = [0u8; 8];
-    let _ = getrandom::fill(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    getrandom::fill(&mut bytes).map_err(|error| anyhow!("cannot generate upload ID: {error}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Queue a finished, ledger-recorded file for upload as `key`.
 pub fn enqueue(destination: &str, bucket: &Bucket, path: &Path, key: &str) -> Result<()> {
-    let sha256 = crate::storage::hold_for_upload(path, true)?;
+    crate::destination::validate_name(destination)?;
+    bucket.validate()?;
+    crate::destination::validate_object_key(key)?;
     let path = fs::canonicalize(path)?;
     let bytes = fs::metadata(&path)?.len();
-    with_queue(|queue| {
+    let mut held = false;
+    let result = with_queue(|queue| {
+        if let Some(existing) = queue.items.iter().find(|item| item.path == path) {
+            ensure!(
+                existing.destination == destination
+                    && existing.bucket == *bucket
+                    && existing.key == key,
+                "this file is already queued for a different upload; retry or forget the existing upload first"
+            );
+            return Ok(());
+        }
         ensure!(
             queue.items.len() < MAX_ITEMS,
             "the upload queue is full ({MAX_ITEMS} files); check the destination and retry failed uploads"
         );
+        let id = id()?;
+        ensure!(
+            !queue.items.iter().any(|item| item.id == id),
+            "upload ID collision; retry queueing this file"
+        );
+        let sha256 = crate::storage::hold_for_upload(&path, true)?;
+        held = true;
         queue.items.push(Item {
-            id: id(),
+            id,
             destination: destination.into(),
             bucket: bucket.clone(),
-            path,
+            path: path.clone(),
             key: key.into(),
             bytes,
             sha256,
@@ -150,7 +223,14 @@ pub fn enqueue(destination: &str, bucket: &Bucket, path: &Path, key: &str) -> Re
             error: None,
         });
         Ok(())
-    })?;
+    });
+    if let Err(error) = result {
+        if held {
+            crate::storage::hold_for_upload(&path, false)
+                .context("release capture after it could not be queued for upload")?;
+        }
+        return Err(error);
+    }
     WAKE.1.notify_all();
     Ok(())
 }
@@ -165,7 +245,11 @@ pub fn status() -> Result<Value> {
             .iter()
             .filter(|i| i.state != State::Failed)
             .map(|i| i.bytes)
-            .sum();
+            .try_fold(0u64, |total, bytes| {
+                total
+                    .checked_add(bytes)
+                    .context("queued upload byte count exceeds u64")
+            })?;
         let recent: Vec<_> = queue.items.iter().rev().take(200).collect();
         Ok(json!({
             "pending": count(State::Pending),
@@ -184,6 +268,9 @@ pub fn status() -> Result<Value> {
 
 /// Move failed uploads (all, or one by id) back to pending.
 pub fn retry(id: Option<&str>) -> Result<usize> {
+    if let Some(id) = id {
+        validate_id(id)?;
+    }
     let changed = with_queue(|queue| {
         let mut changed = 0;
         for item in &mut queue.items {
@@ -194,6 +281,10 @@ pub fn retry(id: Option<&str>) -> Result<usize> {
                 changed += 1;
             }
         }
+        ensure!(
+            id.is_none() || changed > 0,
+            "no failed upload with the requested ID; choose an ID from upload status"
+        );
         Ok(changed)
     })?;
     WAKE.1.notify_all();
@@ -203,6 +294,7 @@ pub fn retry(id: Option<&str>) -> Result<usize> {
 /// Drop a failed upload from the queue; its local file is kept and released
 /// to normal retention.
 pub fn forget(id: &str) -> Result<Item> {
+    validate_id(id)?;
     let item = with_queue(|queue| {
         let index = queue
             .items
@@ -360,7 +452,14 @@ fn upload_one(clients: &mut HashMap<String, crate::s3::Client>, item: &Item) -> 
     if !clients.contains_key(&key) {
         clients.insert(key.clone(), crate::s3::Client::new(&item.bucket)?);
     }
-    clients[&key].upload(&item.path, &item.key, &item.sha256, meta.len())
+    ensure!(
+        meta.is_file() && meta.len() == item.bytes,
+        crate::s3::Permanent(format!(
+            "local file {} changed size after it was queued; not uploaded",
+            item.path.display()
+        ))
+    );
+    clients[&key].upload(&item.path, &item.key, &item.sha256, item.bytes)
 }
 
 /// After a verified upload: delete the local copy, or release it to normal
@@ -387,6 +486,10 @@ fn finish_local(item: &Item) {
 /// Start the uploader and wait until nothing is waiting to upload now, or the
 /// timeout passes; for CLI captures that should not exit with uploads queued.
 pub fn drain(timeout: Duration) -> Result<Value> {
+    ensure!(
+        std::time::Instant::now().checked_add(timeout).is_some(),
+        "upload wait timeout does not fit in the monotonic clock"
+    );
     start();
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -400,5 +503,51 @@ pub fn drain(timeout: Duration) -> Result<Value> {
             return status();
         }
         thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queued_upload_metadata_requires_valid_destination_key_path_and_checksum() {
+        let item = Item {
+            id: "0123456789abcdef".into(),
+            destination: "archive".into(),
+            bucket: Bucket {
+                endpoint: "https://storage.example".into(),
+                region: "auto".into(),
+                bucket: "camera-archive".into(),
+                prefix: String::new(),
+                path_style: true,
+                credentials: crate::destination::Credentials::Environment,
+                keep_local: true,
+            },
+            path: std::env::temp_dir().join("capturefab-valid-upload.png"),
+            key: "line-1/shot.png".into(),
+            bytes: 10,
+            sha256: "a".repeat(64),
+            queued: 0,
+            attempts: 0,
+            next_attempt: 0,
+            state: State::Pending,
+            error: None,
+        };
+        assert!(item.validate().is_ok());
+        let mut invalid = item.clone();
+        invalid.key = "../outside".into();
+        assert!(invalid.validate().is_err());
+        invalid = item.clone();
+        invalid.sha256 = "A".repeat(64);
+        assert!(invalid.validate().is_err());
+        invalid = item.clone();
+        invalid.path = "relative.png".into();
+        assert!(invalid.validate().is_err());
+        for id in ["", "bad", "0123456789ABCDEF", "0123456789abcdeg"] {
+            assert!(validate_id(id).is_err());
+            assert!(retry(Some(id)).is_err());
+            assert!(forget(id).is_err());
+        }
     }
 }

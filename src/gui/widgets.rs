@@ -275,21 +275,6 @@ impl<M> iced::widget::canvas::Program<M> for Chevron {
     }
 }
 
-/// A label on the left and its control on the right.
-pub(super) fn field<'a>(
-    label: &'a str,
-    control: Element<'a, Message>,
-    p: &'static Palette,
-) -> Element<'a, Message> {
-    row![
-        text(label).size(style::BODY).color(p.secondary).width(Fill),
-        control,
-    ]
-    .spacing(10)
-    .align_y(Alignment::Center)
-    .into()
-}
-
 /// An error caption under the field it concerns. Pair it with
 /// `style::input_invalid` on the field.
 pub(super) fn field_error<'a, M: 'a>(
@@ -306,23 +291,6 @@ pub(super) fn field_error<'a, M: 'a>(
             .color(Level::Error.color(p)),
     ]
     .spacing(5)
-    .into()
-}
-
-pub(super) fn unit<'a>(
-    control: Element<'a, Message>,
-    unit: &'a str,
-    p: &'static Palette,
-) -> Element<'a, Message> {
-    row![
-        control,
-        text(unit)
-            .size(style::SMALL)
-            .color(p.secondary)
-            .width(Length::Fixed(28.0)),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center)
     .into()
 }
 

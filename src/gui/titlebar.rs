@@ -676,7 +676,10 @@ impl Workbench {
                 )
                 .padding([5, 12])
                 .style(style::secondary)
-                .on_press_maybe((!scanning).then_some(Message::Capture)),
+                .on_press_maybe(
+                    (!scanning && self.validate_input(&self.capture_command(false)).is_ok())
+                        .then_some(Message::Capture),
+                ),
                 Action::Capture.hint("Scan a page and save using the Capture settings", os),
             ));
         } else if let Some(phase) = phase {

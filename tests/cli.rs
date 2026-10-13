@@ -38,6 +38,202 @@ fn json(dir: &PathBuf, args: &[&str]) -> Value {
 }
 
 #[test]
+fn invalid_inputs_fail_before_creating_camera_resources() {
+    let dir = std::env::temp_dir().join(format!(
+        "capturefab-validation-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    for args in [
+        vec!["--camera", "sim:0", "capture", "-o", "rtsp://host/stream"],
+        vec!["--camera", "sim:0", "capture", "-o", "shot-{unknown}.png"],
+        vec![
+            "--camera",
+            "sim:0",
+            "capture",
+            "-o",
+            "shot.png",
+            "--delay",
+            "1.1ms",
+            "--set",
+            "Width=128",
+        ],
+        vec![
+            "--camera", "sim:0", "forward", "-o", "shot.mp4", "--fps", "NaN", "--auto",
+        ],
+        vec![
+            "--camera",
+            "sim:0",
+            "memory",
+            "read",
+            "18446744073709551615",
+            "2",
+        ],
+        vec!["--camera", "sim:0", "set", "Width=128", "=bad"],
+        vec!["--camera", "gige:gige:192.0.2.1", "get", "Width"],
+        vec!["--camera", "sim:0", "serve", "--name", "../bad"],
+        vec!["--camera", "sim:0", "xml", "-o", ""],
+        vec!["--camera", "sim:0", "gui", "--screenshot", ""],
+        vec!["destination", "remove", "../bad"],
+        vec!["destination", "test", "../bad"],
+        vec![
+            "destination",
+            "add-s3",
+            "cloud",
+            "--bucket",
+            "bad bucket",
+            "--env",
+            "--no-check",
+        ],
+        vec!["destination", "add-s3", "cloud", "--bucket", "bucket"],
+    ] {
+        let result = cmd(&dir, &[&["--json"][..], args.as_slice()].concat());
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        let response: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(response["error"]["code"], "usage");
+        assert!(
+            !dir.exists(),
+            "invalid input created camera/session resources: {args:?}"
+        );
+    }
+    for (name, value) in [
+        ("CAPTUREFAB_FRAME_BYTES", "4097"),
+        ("CAPTUREFAB_FRAME_BYTES", "not-a-number"),
+        ("CAPTUREFAB_MAX_CAMERAS", "0"),
+    ] {
+        let result = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+            .env("CAPTUREFAB_SESSION_DIR", &dir)
+            .env(name, value)
+            .args(["--json", "--camera", "sim:0", "get", "Width"])
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stdout).contains(name));
+        assert!(
+            !dir.exists(),
+            "invalid {name} created camera/session resources"
+        );
+    }
+}
+
+#[test]
+fn rpc_rejects_ignored_fields_before_accessing_a_session() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!(
+        "capturefab-json-validation-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    for request in [
+        r#"{"op":"status","unknown":1}"#,
+        r#"{"op":"status","op":"start"}"#,
+    ] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+            .env("CAPTUREFAB_SESSION_DIR", &dir)
+            .args(["--json", "--session", "missing", "rpc"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(request.as_bytes())
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        let response: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(response["error"]["code"], "usage");
+        assert!(!dir.exists());
+    }
+}
+
+#[test]
+fn live_source_unavailability_keeps_its_operation_category() {
+    let dir = std::env::temp_dir().join(format!(
+        "capturefab-source-validation-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let source = format!("file:{}", dir.join("missing.mp4").display());
+    let result = cmd(&dir, &["--json", "--camera", &source, "get", "Width"]);
+    assert_eq!(
+        result.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&result.stdout).unwrap()["error"]["code"],
+        "unavailable"
+    );
+    assert!(!dir.exists());
+    let result = cmd(
+        &dir,
+        &[
+            "--json",
+            "--camera",
+            "onvif:https://192.0.2.1/onvif/device_service",
+            "get",
+            "Width",
+        ],
+    );
+    assert_eq!(
+        result.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+    assert!(!dir.exists());
+    #[cfg(not(feature = "scanner"))]
+    {
+        let result = cmd(
+            &dir,
+            &["--json", "--camera", "scanner:sane:test", "get", "Width"],
+        );
+        assert_eq!(
+            result.status.code(),
+            Some(5),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        assert!(!dir.exists());
+    }
+    #[cfg(feature = "s3")]
+    for command in ["retry", "forget"] {
+        let result = cmd(&dir, &["--json", "uploads", command, "bad-id"]);
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        assert!(!dir.exists());
+    }
+}
+
+#[test]
 fn undo_redo_camera_session_contract() {
     let dir = std::env::temp_dir().join(format!(
         "capturefab-history-test-{}-{}",
@@ -613,6 +809,58 @@ fn auto_mode_session_contract() {
     );
     assert_eq!(session(&["auto"])["auto"]["balance"], 0.25);
     assert_eq!(session(&["status"])["cameras"][0]["auto"]["balance"], 0.25);
+    let before_width = session(&["get", "Width"])["features"][0]["value"].clone();
+    for args in [
+        vec![
+            "capture",
+            "-o",
+            "rtsp://host/capture",
+            "--set",
+            "Width=128",
+            "--auto",
+            "--balance",
+            "quality",
+        ],
+        vec![
+            "capture",
+            "-o",
+            "bad.png",
+            "--delay",
+            "wrong",
+            "--set",
+            "Width=128",
+            "--auto",
+            "--balance",
+            "quality",
+        ],
+        vec![
+            "forward",
+            "-o",
+            "bad.mp4",
+            "--fps",
+            "NaN",
+            "--auto",
+            "--balance",
+            "quality",
+        ],
+        vec!["set", "ExposureTime=NaN"],
+    ] {
+        let invalid = cmd(
+            &dir,
+            &[&["--json", "--session", "auto-ci"][..], args.as_slice()].concat(),
+        );
+        assert!(!invalid.status.success(), "{args:?}");
+        assert_eq!(
+            session(&["status"])["auto"]["balance"],
+            0.25,
+            "invalid input changed auto mode: {args:?}"
+        );
+        assert_eq!(
+            session(&["get", "Width"])["features"][0]["value"],
+            before_width,
+            "invalid input changed a feature: {args:?}"
+        );
+    }
     assert!(session(&["manual"])["auto"].is_null());
     assert!(session(&["status"])["auto"].is_null());
     let saved = dir.join("session.png");

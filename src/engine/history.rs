@@ -615,6 +615,10 @@ pub(super) fn process(
     scheduled_stream: &mut bool,
     command: SessionCommand,
 ) -> Result<Value> {
+    command.validate()?;
+    if let SessionCommand::Set { feature, value } = &command {
+        camera_mut(camera)?.validate_set(feature, value)?;
+    }
     let busy = forwarder.is_some() || jobs.iter().any(|job| job.info.active());
     let scanner = camera.as_ref().is_some_and(Camera::is_scanner);
     match &command {

@@ -72,7 +72,7 @@ impl ImageFormat {
 #[derive(Debug, Args)]
 pub struct StorageArgs {
     /// Maximum owned bytes across all outputs (default: saved global policy, initially 10GiB)
-    #[arg(long)]
+    #[arg(long, value_parser = parse_bytes_text)]
     max_space: Option<String>,
     /// Maximum owned files (default: saved global policy, initially 10000)
     #[arg(long,value_parser=clap::value_parser!(u32).range(1..=100_000))]
@@ -84,7 +84,7 @@ pub struct StorageArgs {
     #[arg(long,value_parser=["stop","delete-oldest"])]
     on_full: Option<String>,
     /// Expire owned files older than this duration; requires delete-oldest policy
-    #[arg(long, conflicts_with = "no_max_age")]
+    #[arg(long, conflicts_with = "no_max_age", value_parser = parse_age_text)]
     max_age: Option<String>,
     /// Clear a previously configured age limit
     #[arg(long)]
@@ -92,7 +92,13 @@ pub struct StorageArgs {
 }
 impl StorageArgs {
     fn policy(&self) -> Result<crate::storage::StoragePolicy> {
-        let mut policy = crate::storage::configured_policy()?;
+        let policy = crate::storage::configured_policy()?;
+        input(self.apply_policy(policy))
+    }
+    fn apply_policy(
+        &self,
+        mut policy: crate::storage::StoragePolicy,
+    ) -> Result<crate::storage::StoragePolicy> {
         if let Some(space) = &self.max_space {
             policy.max_bytes = crate::storage::parse_bytes(space)?;
         }
@@ -109,7 +115,12 @@ impl StorageArgs {
             policy.max_age_seconds = None;
         }
         if let Some(age) = &self.max_age {
-            policy.max_age_seconds = Some(crate::scheduling::parse_duration(age)?.div_ceil(1000));
+            let millis = crate::scheduling::parse_duration(age)?;
+            ensure!(
+                millis.is_multiple_of(1000),
+                "--max-age must resolve to a whole number of seconds (minimum 1s)"
+            );
+            policy.max_age_seconds = Some(millis / 1000);
         }
         ensure!(
             policy.max_age_seconds.is_none() || policy.on_full == "delete-oldest",
@@ -199,7 +210,7 @@ pub enum UploadsCommand {
     Forget { id: String },
     /// Upload everything that is due, then report
     Wait {
-        #[arg(long, default_value = "10m")]
+        #[arg(long, default_value = "10m", value_parser = parse_duration_text)]
         timeout: String,
     },
 }
@@ -294,10 +305,10 @@ pub enum Command {
         #[arg(long, default_value = "4M")]
         bitrate: String,
         /// Direct capture duration in seconds; with --session forwarding continues until stop-forward
-        #[arg(long)]
+        #[arg(long, value_parser = parse_duration_text)]
         duration: Option<String>,
         /// Bounded maximum size of a local recording file
-        #[arg(long, default_value = "512MiB")]
+        #[arg(long, default_value = "512MiB", value_parser = parse_bytes_text)]
         max_file_size: String,
         /// Saved destination (see `destination list`); --output is then a name inside it
         #[arg(long)]
@@ -331,13 +342,13 @@ pub enum Command {
         #[arg(long = "set")]
         settings: Vec<String>,
         /// Begin at a timestamp with timezone, e.g. 2026-10-05T09:00:00-04:00
-        #[arg(long, conflicts_with = "delay")]
+        #[arg(long, conflicts_with = "delay", value_parser = parse_at_text)]
         at: Option<String>,
         /// Begin after a delay, e.g. 30s or 5m
-        #[arg(long)]
+        #[arg(long, value_parser = parse_duration_text)]
         delay: Option<String>,
         /// Time between frames, e.g. 10s; count bounds the time lapse
-        #[arg(long)]
+        #[arg(long, value_parser = parse_duration_text)]
         interval: Option<String>,
         /// Saved destination (see `destination list`); --output is then a name inside it
         #[arg(long)]
@@ -350,7 +361,10 @@ pub enum Command {
     /// List capture schedules in a persistent session
     Jobs,
     /// Cancel a scheduled capture job on the selected camera
-    Cancel { id: u64 },
+    Cancel {
+        #[arg(value_parser = clap::value_parser!(u64).range(1..))]
+        id: u64,
+    },
     /// Manage saved capture destinations: folders, external drives and S3 buckets
     #[command(visible_alias = "destinations")]
     Destination {
@@ -439,6 +453,28 @@ fn parse_address(s: &str) -> std::result::Result<u64, String> {
     }
     .map_err(|e| e.to_string())
 }
+fn parse_duration_text(s: &str) -> std::result::Result<String, String> {
+    crate::scheduling::parse_duration(s)
+        .map(|_| s.into())
+        .map_err(|e| e.to_string())
+}
+fn parse_age_text(s: &str) -> std::result::Result<String, String> {
+    let millis = crate::scheduling::parse_duration(s).map_err(|e| e.to_string())?;
+    if !millis.is_multiple_of(1000) {
+        return Err("maximum age must resolve to a whole number of seconds (minimum 1s)".into());
+    }
+    Ok(s.into())
+}
+fn parse_at_text(s: &str) -> std::result::Result<String, String> {
+    crate::scheduling::parse_at(s)
+        .map(|_| s.into())
+        .map_err(|e| e.to_string())
+}
+fn parse_bytes_text(s: &str) -> std::result::Result<String, String> {
+    crate::storage::parse_bytes(s)
+        .map(|_| s.into())
+        .map_err(|e| e.to_string())
+}
 fn parse_balance(s: &str) -> std::result::Result<f64, String> {
     match s {
         "quality" => Ok(0.0),
@@ -456,9 +492,14 @@ fn parse_balance(s: &str) -> std::result::Result<f64, String> {
 fn assignment(s: &str) -> Result<(String, String)> {
     let (k, v) = s.split_once('=').context("expected FEATURE=VALUE")?;
     ensure!(
-        !k.is_empty() && !v.is_empty(),
-        "expected a nonempty FEATURE=VALUE"
+        !k.is_empty(),
+        "expected a nonempty feature name in FEATURE=VALUE"
     );
+    SessionCommand::Set {
+        feature: k.into(),
+        value: v.into(),
+    }
+    .validate()?;
     Ok((k.into(), v.into()))
 }
 fn hex(s: &str) -> Result<Vec<u8>> {
@@ -472,6 +513,28 @@ fn hex(s: &str) -> Result<Vec<u8>> {
         .iter()
         .map(|p| Ok(u8::from_str_radix(std::str::from_utf8(p)?, 16)?))
         .collect()
+}
+
+#[cfg(feature = "s3")]
+fn read_secret(reader: impl io::Read) -> Result<String> {
+    use std::io::Read;
+    let mut data = Vec::new();
+    // Allow a maximum-size key followed by CRLF, plus one byte to detect an
+    // oversized input without reading an unbounded pipe into memory.
+    reader.take(4099).read_to_end(&mut data)?;
+    ensure!(
+        data.len() <= 4098,
+        "S3 secret stdin exceeds 4096 bytes plus a terminal newline"
+    );
+    if data.last() == Some(&b'\n') {
+        data.pop();
+        if data.last() == Some(&b'\r') {
+            data.pop();
+        }
+    }
+    let secret = String::from_utf8(data).context("S3 secret stdin must be UTF-8")?;
+    crate::s3::validate_secret(&secret)?;
+    Ok(secret)
 }
 
 struct Client<'a> {
@@ -497,6 +560,7 @@ impl<'a> Client<'a> {
         Ok(c)
     }
     fn call(&self, command: SessionCommand) -> Result<Value> {
+        command.validate()?;
         if let Some(name) = &self.cli.session {
             let ms = match &command {
                 SessionCommand::Capture {
@@ -527,6 +591,296 @@ impl<'a> Client<'a> {
         Ok(result)
     }
 }
+
+#[derive(Debug)]
+struct InvalidInput(String);
+impl std::fmt::Display for InvalidInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for InvalidInput {}
+fn input<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        if error.chain().any(|cause| cause.is::<std::io::Error>()) {
+            error
+        } else {
+            InvalidInput(format!("{error:#}")).into()
+        }
+    })
+}
+
+/// Prepare all command arguments before connecting or applying --set/--auto.
+fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
+    crate::media::validate_hwaccel(&cli.hwaccel)?;
+    if let Some(camera) = &cli.camera {
+        crate::session::validate_selector(camera)?;
+        if cli.session.is_none() {
+            SessionCommand::Connect {
+                camera: camera.clone(),
+                timeout_ms: cli.timeout_ms,
+            }
+            .validate()?;
+        }
+    }
+    if let Some(session) = &cli.session {
+        ipc::validate_name(session)?;
+    }
+    crate::session::validate_timeout(cli.timeout_ms)?;
+    let command = match &cli.command {
+        Some(Command::Destination { command }) => {
+            let name = match command {
+                DestinationCommand::List => None,
+                DestinationCommand::AddFolder { name, path } => {
+                    ensure!(
+                        !path.as_os_str().is_empty(),
+                        "destination folder path must be nonempty"
+                    );
+                    Some(name)
+                }
+                DestinationCommand::AddS3 { name, .. }
+                | DestinationCommand::Remove { name, .. }
+                | DestinationCommand::Test { name } => Some(name),
+            };
+            if let Some(name) = name {
+                crate::destination::validate_name(name)?;
+            }
+            None
+        }
+        Some(Command::Uploads {
+            command: Some(UploadsCommand::Retry { id: Some(id) } | UploadsCommand::Forget { id }),
+        }) => {
+            #[cfg(feature = "s3")]
+            crate::upload::validate_id(id)?;
+            #[cfg(not(feature = "s3"))]
+            let _ = id;
+            None
+        }
+        Some(Command::Gui {
+            name, screenshot, ..
+        }) => {
+            ipc::validate_name(name)?;
+            if let Some(path) = screenshot {
+                ensure!(
+                    !path.as_os_str().is_empty(),
+                    "screenshot output path must be nonempty"
+                );
+            }
+            None
+        }
+        Some(Command::Serve { name, .. }) => {
+            ipc::validate_name(name)?;
+            None
+        }
+        Some(Command::Onvif {
+            command:
+                OnvifCommand::Resolve {
+                    endpoint,
+                    username,
+                    password,
+                    profile,
+                },
+        }) => {
+            ensure!(
+                username.is_some() == password.is_some(),
+                "provide both --username and --password (or CAPTUREFAB_CAMERA_PASSWORD)"
+            );
+            if let Some(username) = username {
+                ensure!(
+                    !username.is_empty() && !username.chars().any(char::is_control),
+                    "ONVIF username must be nonempty and contain no control characters"
+                );
+            }
+            if let Some(profile) = profile {
+                ensure!(
+                    !profile.is_empty()
+                        && profile.len() <= 1024
+                        && !profile.chars().any(char::is_control),
+                    "ONVIF profile must be nonempty and contain no control characters (maximum 1024 bytes)"
+                );
+            }
+            crate::onvif::validate_source(&format!("onvif:{endpoint}"))?;
+            None
+        }
+        Some(Command::Set { assignments }) => {
+            for value in assignments {
+                assignment(value)?;
+            }
+            None
+        }
+        Some(Command::Get { features }) => {
+            for feature in features {
+                SessionCommand::Get {
+                    feature: feature.clone(),
+                }
+                .validate()?;
+            }
+            None
+        }
+        Some(Command::Execute { feature }) => Some(SessionCommand::Execute {
+            feature: feature.clone(),
+        }),
+        Some(Command::Connect { camera }) => Some(SessionCommand::Connect {
+            camera: camera.clone(),
+            timeout_ms: cli.timeout_ms,
+        }),
+        Some(Command::Select { camera }) => Some(SessionCommand::Select {
+            camera: camera.clone(),
+        }),
+        Some(Command::Capture {
+            output,
+            count,
+            format,
+            settings,
+            at,
+            delay,
+            interval,
+            destination,
+            ..
+        }) => {
+            ensure!(
+                output != "-" || (cli.session.is_none() && !cli.json && *count == 1),
+                "binary stdout needs one frame, a direct --camera, and no --json"
+            );
+            for setting in settings {
+                assignment(setting)?;
+            }
+            let command = if at.is_some() || delay.is_some() || interval.is_some() {
+                let first_at_ms = match at {
+                    Some(at) => crate::scheduling::parse_at(at)?,
+                    None => crate::scheduling::now_ms()
+                        .checked_add(
+                            delay
+                                .as_deref()
+                                .map(crate::scheduling::parse_duration)
+                                .transpose()?
+                                .unwrap_or(0),
+                        )
+                        .context("capture time overflows")?,
+                };
+                SessionCommand::Schedule {
+                    output: output.clone(),
+                    count: *count,
+                    timeout_ms: cli.timeout_ms,
+                    format: format.name().into(),
+                    first_at_ms,
+                    interval_ms: interval
+                        .as_deref()
+                        .map(crate::scheduling::parse_duration)
+                        .transpose()?
+                        .unwrap_or(0),
+                    storage: crate::storage::StoragePolicy::default(),
+                    destination: destination.clone(),
+                }
+            } else {
+                SessionCommand::Capture {
+                    output: output.clone(),
+                    count: *count,
+                    timeout_ms: cli.timeout_ms,
+                    format: format.name().into(),
+                    storage: crate::storage::StoragePolicy::default(),
+                    destination: destination.clone(),
+                }
+            };
+            Some(command)
+        }
+        Some(Command::Forward {
+            output,
+            codec,
+            encoder,
+            fps,
+            bitrate,
+            duration,
+            max_file_size,
+            destination,
+            ..
+        }) => {
+            ensure!(
+                cli.session.is_none() || duration.is_none(),
+                "--duration applies to direct forwarding only; with --session use stop-forward"
+            );
+            if let Some(duration) = duration {
+                crate::scheduling::parse_duration(duration)?;
+            }
+            Some(SessionCommand::Forward {
+                output: output.clone(),
+                codec: codec.clone(),
+                encoder: encoder.clone(),
+                fps: *fps,
+                bitrate: bitrate.clone(),
+                storage: crate::storage::StoragePolicy {
+                    max_bytes: u64::MAX,
+                    ..Default::default()
+                },
+                max_file_bytes: crate::storage::parse_bytes(max_file_size)?,
+                destination: destination.clone(),
+            })
+        }
+        Some(Command::Memory { command }) => Some(match command {
+            MemoryCommand::Read { address, length } => SessionCommand::ReadMemory {
+                address: *address,
+                length: *length as usize,
+            },
+            MemoryCommand::Write { address, data } => SessionCommand::WriteMemory {
+                address: *address,
+                data: hex(data)?,
+            },
+        }),
+        Some(Command::Xml { output: Some(path) }) => {
+            ensure!(
+                !path.as_os_str().is_empty(),
+                "XML output path must be nonempty"
+            );
+            None
+        }
+        _ => None,
+    };
+    if let Some(command) = &command {
+        command.validate()?;
+    }
+    Ok(command)
+}
+fn prepare_outputs(cli: &Cli, command: &mut Option<SessionCommand>) -> Result<()> {
+    if let (
+        Some(command),
+        Some(Command::Capture { storage, .. } | Command::Forward { storage, .. }),
+    ) = (command, &cli.command)
+    {
+        match command {
+            SessionCommand::Capture {
+                storage: policy, ..
+            }
+            | SessionCommand::Schedule {
+                storage: policy, ..
+            }
+            | SessionCommand::Forward {
+                storage: policy, ..
+            } => *policy = storage.policy()?,
+            _ => unreachable!(),
+        }
+        input(command.validate())?;
+        if let SessionCommand::Capture {
+            output,
+            count,
+            format,
+            destination,
+            ..
+        }
+        | SessionCommand::Schedule {
+            output,
+            count,
+            format,
+            destination,
+            ..
+        } = command
+            && output != "-"
+        {
+            let resolved = crate::destination::resolve(destination.as_deref(), output)?;
+            crate::engine::preflight_capture_output(&resolved.output, *count, format)?;
+        }
+    }
+    Ok(())
+}
 impl Drop for Client<'_> {
     fn drop(&mut self) {
         if let Some(h) = &self.local {
@@ -536,7 +890,14 @@ impl Drop for Client<'_> {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
-    crate::media::configure_hwaccel(&cli.hwaccel)?;
+    let mut prepared = input(prepare(&cli))?;
+    if cli.session.is_none()
+        && let Some(camera) = &cli.camera
+    {
+        crate::camera::validate_selector(camera)?;
+    }
+    prepare_outputs(&cli, &mut prepared)?;
+    input(crate::media::configure_hwaccel(&cli.hwaccel))?;
     match &cli.command {
         None | Some(Command::Gui { .. }) => {
             ensure!(
@@ -793,15 +1154,10 @@ pub fn run(cli: Cli) -> Result<()> {
         })?,
         Command::Forward {
             output: destination,
-            codec,
-            encoder,
-            fps,
-            bitrate,
             duration,
-            max_file_size,
             destination: saved,
-            storage,
             auto,
+            ..
         } => {
             let until = duration
                 .as_deref()
@@ -809,17 +1165,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 .transpose()?
                 .map(Duration::from_millis);
             auto.apply(&client)?;
-            let result = client.call(SessionCommand::Forward {
-                output: destination.clone(),
-                codec: codec.clone(),
-                encoder: encoder.clone(),
-                fps: *fps,
-                bitrate: bitrate.clone(),
-                storage: storage.policy()?,
-                max_file_bytes: crate::storage::parse_bytes(max_file_size)?
-                    .min(storage.policy()?.max_bytes),
-                destination: saved.clone(),
-            })?;
+            let result = client.call(prepared.clone().unwrap())?;
             if cli.session.is_none() {
                 if !cli.json {
                     eprintln!(
@@ -873,20 +1219,12 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Status => client.call(SessionCommand::Status)?,
         Command::Capture {
             output: destination,
-            count,
             format,
             settings,
-            at,
-            delay,
-            interval,
             destination: saved,
-            storage,
             auto,
+            ..
         } => {
-            ensure!(
-                destination != "-" || (cli.session.is_none() && !cli.json && *count == 1),
-                "binary stdout needs one frame, a direct --camera, and no --json"
-            );
             let settings = settings
                 .iter()
                 .map(|s| assignment(s))
@@ -895,37 +1233,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 client.set(feature, value)?;
             }
             auto.apply(&client)?;
-            let policy = storage.policy()?;
-            if at.is_some() || delay.is_some() || interval.is_some() {
-                ensure!(
-                    destination != "-",
-                    "scheduled capture requires a file or directory"
-                );
-                let first_at_ms = if let Some(at) = at {
-                    crate::scheduling::parse_at(at)?
-                } else {
-                    crate::scheduling::now_ms().saturating_add(
-                        delay
-                            .as_deref()
-                            .map(crate::scheduling::parse_duration)
-                            .transpose()?
-                            .unwrap_or(0),
-                    )
-                };
-                let result = client.call(SessionCommand::Schedule {
-                    output: destination.clone(),
-                    count: *count,
-                    timeout_ms: cli.timeout_ms,
-                    format: format.name().into(),
-                    first_at_ms,
-                    interval_ms: interval
-                        .as_deref()
-                        .map(crate::scheduling::parse_duration)
-                        .transpose()?
-                        .unwrap_or(0),
-                    storage: policy,
-                    destination: saved.clone(),
-                })?;
+            if matches!(prepared, Some(SessionCommand::Schedule { .. })) {
+                let result = client.call(prepared.clone().unwrap())?;
                 if cli.session.is_some() {
                     return output(&cli, result);
                 }
@@ -962,14 +1271,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
-            let result = client.call(SessionCommand::Capture {
-                output: destination.clone(),
-                count: *count,
-                timeout_ms: cli.timeout_ms,
-                format: format.name().into(),
-                storage: policy,
-                destination: saved.clone(),
-            })?;
+            let result = client.call(prepared.clone().unwrap())?;
             if destination == "-" {
                 let frame = client
                     .local
@@ -1017,13 +1319,19 @@ pub fn run(cli: Cli) -> Result<()> {
         },
         Command::Rpc => {
             use std::io::Read;
-            let mut data = String::new();
-            io::stdin()
-                .take(1024 * 1024 + 1)
-                .read_to_string(&mut data)?;
-            ensure!(data.len() <= 1024 * 1024, "RPC stdin exceeds 1 MiB");
-            let command: SessionCommand = serde_json::from_str(&data)
-                .context("stdin must be a SessionCommand JSON object; see capturefab schema")?;
+            let mut data = Vec::new();
+            io::stdin().take(1024 * 1024 + 1).read_to_end(&mut data)?;
+            if data.len() > 1024 * 1024 {
+                return Err(InvalidInput("RPC stdin exceeds 1 MiB".into()).into());
+            }
+            let command: SessionCommand = input(
+                SessionCommand::from_json_slice(&data)
+                    .context("stdin must be a SessionCommand JSON object; see capturefab schema"),
+            )?;
+            input(command.validate())?;
+            if matches!(&command, SessionCommand::Capture { output, .. } if output == "-") {
+                return Err(InvalidInput("remote captures require an output file".into()).into());
+            }
             client.call(command)?
         }
         _ => unreachable!(),
@@ -1159,7 +1467,7 @@ fn schema() -> Value {
     contract["limits"]["shared_memory_slots_per_camera"] = json!(3);
     contract["scanners"] = json!({"enumeration":"scanners --json or discover --json; transport is scanner","backends":{"linux":"SANE scanimage (installed separately)","windows":"Windows Image Acquisition (WIA)","macos":"ImageCaptureCore (bundled native helper)"},"feature":"scanner; enabled by default","settings":{"ScanResolution":{"default":150,"range":[75,600],"unit":"dpi"},"ScanMode":{"default":"Color","choices":["Color","Gray","Lineart"]},"ScanSource":{"default":"Default","choices":["Default","Flatbed","Feeder"]}},"acquisition":"capture requests one page; count requests successive pages, including feeder pages; connecting/start never scans; forwarding and auto exposure are unsupported","timeout":"Use --timeout-ms 60000 for physical scans; GUI scanner timeout defaults to 60000. Each page has its own deadline and timeout cancels the helper.","outputs":"Existing capture image formats, destinations and storage quotas; no PDF/OCR conversion","limits":{"frame_bytes":134217728,"shared_ring_default_bytes_per_slot":134217728},"compatibility":"Driver-dependent settings; unsupported resolutions, modes and source names fail without silent fallback. SANE source names vary between drivers."});
     contract["storage"] = json!({"default":crate::storage::StoragePolicy::default(),"scope":"All Capturefab-owned capture and recording files across output directories in this user's session directory. Reservations count toward quota. Existing/unowned/modified files are never deleted.","recording_file_cap_default":crate::media::default_recording_cap(),"on_full":["stop","delete-oldest"],"status":"capturefab storage --json","error":"storage_full; exit 6"});
-    contract["scheduling"] = json!({"cli":"capture --at RFC3339 | --delay 30s; --interval 10s -n 100","lifetime":"Schedules run while the GUI, serve session or direct CLI process remains running; jobs are not persisted across exit.","interval":"First time plus captured count times interval; no unbounded backlog. Each job has a per-frame transport timeout.","states":["pending","running","complete","cancelled","failed"]});
+    contract["scheduling"] = json!({"cli":"capture --at RFC3339 | --delay 30s; --interval 10s -n 100","lifetime":"Schedules run while the GUI, serve session or direct CLI process remains running; jobs are not persisted across exit.","interval":"First time plus captured count times interval; zero interval captures consecutive frames. All frames must fall within 10 years. A past first timestamp starts immediately. Durations must resolve to whole milliseconds. Each job has a per-frame transport timeout.","states":["pending","running","complete","cancelled","failed"]});
     contract["auto"] = json!({"cli":"--session NAME auto [--balance B] | manual [--revert]; capture|forward|serve --auto [--balance B]","default":"manual; connecting never enables auto mode and it ends on disconnect","balance":"0 favors image quality, 1 favors frame rate; quality, balanced and frame-rate mean 0, 0.5 and 1; omitted keeps the current value, initially 0.5","status":"status.auto and cameras[].auto; null in manual mode","strategies":["firmware","software","video-mode","none"],"states":["waiting","converging","stable","limited"],"settled":["stable","limited"],"manual":"Setting a feature in auto.managed switches that camera to manual first and the set result adds \"auto\":null; manual turns ExposureAuto, GainAuto and BalanceWhiteAuto off so values hold","persistence":"Camera settings written by auto mode remain after manual, like set; manual --revert, disconnect and session exit restore their previous values (best effort)","capture":"--set applies before --auto; capture saves once exposure settles or after min(timeout_ms/2, 3 s) and result.auto reports the state; with --session auto mode stays on afterwards"});
     contract["history"] = json!({
         "cli":"--session NAME [--camera ID] history | undo | redo",
@@ -1239,13 +1547,14 @@ fn destination_command(command: &DestinationCommand) -> Result<Value> {
         }
         DestinationCommand::AddFolder { name, path } => {
             let path = std::path::absolute(path)?;
+            let saved = Destination {
+                name: name.clone(),
+                target: Target::Folder { path: path.clone() },
+            };
+            input(saved.validate())?;
             crate::volumes::ensure_present(&path)?;
             std::fs::create_dir_all(&path)
                 .with_context(|| format!("cannot create {}", path.display()))?;
-            let saved = Destination {
-                name: name.clone(),
-                target: Target::Folder { path },
-            };
             destination::save(saved.clone())?;
             json!({"destination": describe(&saved)})
         }
@@ -1269,9 +1578,7 @@ fn destination_command(command: &DestinationCommand) -> Result<Value> {
                 },
                 (_, Some(name), _) => Credentials::Profile { name: name.clone() },
                 (_, _, true) => Credentials::Environment,
-                _ => anyhow::bail!(
-                    "choose credentials: --access-key-id ID --secret-stdin, --profile NAME or --env"
-                ),
+                _ => return Err(InvalidInput("choose credentials: --access-key-id ID --secret-stdin, --profile NAME or --env".into()).into()),
             };
             let saved = Destination {
                 name: name.clone(),
@@ -1285,7 +1592,7 @@ fn destination_command(command: &DestinationCommand) -> Result<Value> {
                     keep_local: *keep_local,
                 }),
             };
-            saved.validate()?;
+            input(saved.validate())?;
             #[cfg(not(feature = "s3"))]
             {
                 let _ = (secret_stdin, no_check);
@@ -1296,9 +1603,8 @@ fn destination_command(command: &DestinationCommand) -> Result<Value> {
             #[cfg(feature = "s3")]
             {
                 if *secret_stdin {
-                    let mut secret = String::new();
-                    io::stdin().read_line(&mut secret)?;
-                    crate::s3::store_secret(access_key_id.as_deref().unwrap_or(""), secret.trim())?;
+                    let secret = input(read_secret(io::stdin().lock()))?;
+                    crate::s3::store_secret(access_key_id.as_deref().unwrap_or(""), &secret)?;
                 }
                 let Target::S3(bucket) = &saved.target else {
                     unreachable!()
@@ -1400,6 +1706,9 @@ fn uploads_command(command: Option<&UploadsCommand>) -> Result<Value> {
 }
 
 pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
+    if error.chain().any(|cause| cause.is::<InvalidInput>()) {
+        return ("usage", 2);
+    }
     let s = format!("{error:#}").to_ascii_lowercase();
     if s.contains("storage full") || s.contains("no space left") {
         ("storage_full", 6)
@@ -1431,6 +1740,36 @@ pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(feature = "s3")]
+    fn secret_stdin_preserves_key_bytes_and_bounds_reads() {
+        for (input, expected) in [
+            (" key \t", " key \t"),
+            (" key \t\n", " key \t"),
+            (" key \t\r\n", " key \t"),
+            ("clé 密钥 \n", "clé 密钥 "),
+            ("key\n\n", "key\n"),
+            ("key\r", "key\r"),
+        ] {
+            assert_eq!(read_secret(input.as_bytes()).unwrap(), expected);
+        }
+        let maximum = "x".repeat(4096);
+        assert_eq!(read_secret(maximum.as_bytes()).unwrap(), maximum);
+        assert_eq!(
+            read_secret(format!("{maximum}\r\n").as_bytes()).unwrap(),
+            maximum
+        );
+        for input in [
+            String::new(),
+            "\r\n".into(),
+            "x".repeat(4097),
+            format!("{}\n", "x".repeat(4097)),
+            "x".repeat(10000),
+        ] {
+            assert!(read_secret(input.as_bytes()).is_err());
+        }
+        assert!(read_secret(&b"\xff\n"[..]).is_err());
+    }
     #[test]
     fn unix_cli_contract() {
         Cli::command().debug_assert();

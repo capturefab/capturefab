@@ -31,6 +31,53 @@ pub struct FeatureInfo {
     pub error: Option<String>,
 }
 
+impl FeatureInfo {
+    /// Check a draft against the displayed metadata. The camera checks its live
+    /// constraints again before writing, since selectors and limits can change.
+    pub fn validate_input(&self, text: &str) -> Result<()> {
+        let value = input_value(&self.name, &self.kind, text)?;
+        match self.kind.as_str() {
+            "Enumeration" => ensure!(
+                self.choices.iter().any(|choice| choice == text),
+                "{} must be one of: {}",
+                self.name,
+                self.choices.join(", ")
+            ),
+            "StringReg" => ensure!(
+                !text.contains('\0'),
+                "{} cannot contain a NUL character",
+                self.name
+            ),
+            "String" => {}
+            "Boolean" => {}
+            _ => {
+                // FeatureInfo uses floats for its display bounds. A rounded
+                // large integer limit must not reject a valid 64-bit value.
+                let exact_bound = |bound: Option<f64>| {
+                    bound
+                        .filter(|v| !integer_kind(&self.kind) || v.abs() < (1u64 << 53) as f64)
+                        .map(|v| json!(v))
+                };
+                validate_numeric(
+                    &self.name,
+                    &self.kind,
+                    &value,
+                    exact_bound(self.min),
+                    exact_bound(self.max),
+                    if integer_kind(&self.kind)
+                        && self.min.is_some_and(|v| v.abs() >= (1u64 << 53) as f64)
+                    {
+                        None
+                    } else {
+                        exact_bound(self.inc)
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Bounds {
     pub min: Option<f64>,
@@ -63,7 +110,7 @@ impl Node {
     fn host_value(&self) -> bool {
         matches!(
             self.kind.as_str(),
-            "Integer" | "Float" | "Boolean" | "Enumeration"
+            "Integer" | "Float" | "String" | "Boolean" | "Enumeration"
         ) && self.prop("Value").is_some()
     }
     fn value(&self, text: &str) -> Result<Value> {
@@ -341,6 +388,16 @@ impl NodeMap {
         Ok(())
     }
     fn access(&self, io: &mut dyn RegisterIo, name: &str, write: bool, depth: usize) -> Result<()> {
+        self.access_inner(io, name, write, depth, true)
+    }
+    fn access_inner(
+        &self,
+        io: &mut dyn RegisterIo,
+        name: &str,
+        write: bool,
+        depth: usize,
+        check_lock: bool,
+    ) -> Result<()> {
         let node = self.node(name, depth)?;
         self.available(io, node, depth)?;
         for key in ["AccessMode", "ImposedAccessMode"] {
@@ -356,7 +413,10 @@ impl NodeMap {
                 );
             }
         }
-        if write && let Some(link) = node.prop("pIsLocked") {
+        if write
+            && check_lock
+            && let Some(link) = node.prop("pIsLocked")
+        {
             ensure!(self.number(io, link, depth + 1)? == 0.0, "{name} is locked");
         }
         Ok(())
@@ -541,7 +601,7 @@ impl NodeMap {
                     self.get_inner(io, link, depth + 1)
                 } else if let Some(value) = n.prop("Value") {
                     if n.kind == "String" {
-                        Ok(json!(value))
+                        Ok(n.stored.borrow().clone().unwrap_or_else(|| json!(value)))
                     } else {
                         n.value(value)
                     }
@@ -550,25 +610,30 @@ impl NodeMap {
                 }
             }
             "Boolean" => {
-                let value = self.value_number(io, n, depth)?;
+                let value = self.raw_value(io, n, depth)?;
                 let on = self
-                    .property_number(io, n, "OnValue", depth)?
-                    .unwrap_or(1.0);
+                    .property_value(io, n, "OnValue", depth)?
+                    .unwrap_or_else(|| json!(1));
                 let off = self
-                    .property_number(io, n, "OffValue", depth)?
-                    .unwrap_or(0.0);
+                    .property_value(io, n, "OffValue", depth)?
+                    .unwrap_or_else(|| json!(0));
                 ensure!(
-                    value == on || value == off,
+                    !numeric_equal(&on, &off)?,
+                    "{name} has identical OnValue and OffValue"
+                );
+                let enabled = numeric_equal(&value, &on)?;
+                ensure!(
+                    enabled || numeric_equal(&value, &off)?,
                     "{name} contains an undefined boolean value"
                 );
-                Ok(json!(value == on))
+                Ok(json!(enabled))
             }
             "Enumeration" => {
-                let value = self.value_number(io, n, depth)?;
+                let value = self.raw_value(io, n, depth)?;
                 for entry in self.enum_entries(n) {
                     let en = self.node(entry, depth + 1)?;
                     if self.available(io, en, depth + 1).is_ok()
-                        && self.value_number(io, en, depth + 1)? == value
+                        && numeric_equal(&self.raw_value(io, en, depth + 1)?, &value)?
                     {
                         return Ok(json!(en.prop("Symbolic").unwrap_or_else(|| {
                             entry.strip_prefix(&format!("{name}_")).unwrap_or(entry)
@@ -599,10 +664,19 @@ impl NodeMap {
         }
     }
     fn value_number(&self, io: &mut dyn RegisterIo, n: &Node, depth: usize) -> Result<f64> {
+        number(&self.raw_value(io, n, depth)?)
+    }
+    fn raw_value(&self, io: &mut dyn RegisterIo, n: &Node, depth: usize) -> Result<Value> {
         if let Some(link) = self.resolve_value_link(io, n, depth)? {
-            self.number(io, link, depth + 1)
+            let node = self.node(link, depth + 1)?;
+            if node.kind == "Enumeration" {
+                self.access(io, link, false, depth + 1)?;
+                self.raw_value(io, node, depth + 1)
+            } else {
+                self.get_inner(io, link, depth + 1)
+            }
         } else if let Some(v) = n.prop("Value") {
-            number(&n.value(v)?)
+            n.value(v)
         } else {
             bail!("node has no numeric value")
         }
@@ -671,10 +745,28 @@ impl NodeMap {
         key: &str,
         depth: usize,
     ) -> Result<Option<f64>> {
+        self.property_value(io, n, key, depth)?
+            .as_ref()
+            .map(number)
+            .transpose()
+    }
+    fn property_value(
+        &self,
+        io: &mut dyn RegisterIo,
+        n: &Node,
+        key: &str,
+        depth: usize,
+    ) -> Result<Option<Value>> {
         if let Some(link) = n.prop(&format!("p{key}")) {
-            Ok(Some(self.number(io, link, depth + 1)?))
+            let node = self.node(link, depth + 1)?;
+            if node.kind == "Enumeration" {
+                self.access(io, link, false, depth + 1)?;
+                self.raw_value(io, node, depth + 1).map(Some)
+            } else {
+                self.get_inner(io, link, depth + 1).map(Some)
+            }
         } else {
-            n.prop(key).map(|s| number(&literal(s)?)).transpose()
+            n.prop(key).map(literal).transpose()
         }
     }
     fn register(&self, io: &mut dyn RegisterIo, n: &Node, depth: usize) -> Result<(u64, usize)> {
@@ -772,18 +864,28 @@ impl NodeMap {
     }
     pub fn set(&self, io: &mut dyn RegisterIo, name: &str, value: &str) -> Result<()> {
         let n = self.node(name, 0)?;
-        let v = match n.kind.as_str() {
-            "String" | "StringReg" => json!(value),
-            "Boolean" => match value.to_ascii_lowercase().as_str() {
-                "true" | "1" | "on" => json!(true),
-                "false" | "0" | "off" => json!(false),
-                _ => bail!("boolean must be true or false"),
-            },
-            "Enumeration" => json!(value),
-            "Command" => bail!("use execute for command {name}"),
-            _ => literal(value)?,
+        let kind = if n.kind == "Float" && self.direct_integer_target(io, name, 0)? {
+            "Integer"
+        } else {
+            &n.kind
         };
-        self.set_inner(io, name, &v, 0)
+        let v = input_value(name, kind, value)?;
+        self.set_inner(io, name, &v, 0, true)
+            .map_err(|error| anyhow!("cannot set {name} to {value:?}: {error:#}"))
+    }
+    /// Validate without changing host values or camera registers. Temporary
+    /// locks are checked by the actual write, allowing auto-to-manual takeover
+    /// to validate the value before disabling camera auto settings.
+    pub fn validate_set(&self, io: &mut dyn RegisterIo, name: &str, value: &str) -> Result<()> {
+        let n = self.node(name, 0)?;
+        let kind = if n.kind == "Float" && self.direct_integer_target(io, name, 0)? {
+            "Integer"
+        } else {
+            &n.kind
+        };
+        let v = input_value(name, kind, value)?;
+        self.set_inner(io, name, &v, 0, false)
+            .map_err(|error| anyhow!("cannot set {name} to {value:?}: {error:#}"))
     }
     fn set_inner(
         &self,
@@ -791,8 +893,9 @@ impl NodeMap {
         name: &str,
         value: &Value,
         depth: usize,
+        write: bool,
     ) -> Result<()> {
-        self.access(io, name, true, depth)?;
+        self.access_inner(io, name, true, depth, write)?;
         let n = self.node(name, depth)?;
         ensure!(
             matches!(
@@ -815,12 +918,17 @@ impl NodeMap {
         let translated = match n.kind.as_str() {
             "Boolean" => {
                 let on = value.as_bool().context("expected boolean")?;
-                let key = if on { "OnValue" } else { "OffValue" };
-                if let Some(link) = n.prop(&format!("p{key}")) {
-                    self.get_inner(io, link, depth + 1)?
-                } else {
-                    literal(n.prop(key).unwrap_or(if on { "1" } else { "0" }))?
-                }
+                let enabled = self
+                    .property_value(io, n, "OnValue", depth)?
+                    .unwrap_or_else(|| json!(1));
+                let disabled = self
+                    .property_value(io, n, "OffValue", depth)?
+                    .unwrap_or_else(|| json!(0));
+                ensure!(
+                    !numeric_equal(&enabled, &disabled)?,
+                    "{name} has identical OnValue and OffValue"
+                );
+                if on { enabled } else { disabled }
             }
             "Enumeration" => {
                 let symbol = value.as_str().context("expected enumeration symbol")?;
@@ -836,9 +944,16 @@ impl NodeMap {
                                     })
                         })
                     })
-                    .ok_or_else(|| anyhow!("unknown {name} choice {symbol}"))?;
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "unknown {name} choice {symbol:?}; choose one of: {}",
+                            self.entry_names(io, name, n).join(", ")
+                        )
+                    })?;
                 let en = self.node(entry, depth + 1)?;
-                self.available(io, en, depth + 1)?;
+                self.available(io, en, depth + 1).with_context(|| {
+                    format!("{name} choice {symbol:?} is currently unavailable")
+                })?;
                 if let Some(link) = en.prop("pValue") {
                     self.get_inner(io, link, depth + 1)?
                 } else {
@@ -859,30 +974,29 @@ impl NodeMap {
             n.kind.as_str(),
             "String" | "StringReg" | "Boolean" | "Enumeration"
         ) {
-            let v = number(value)?;
-            for (key, cmp) in [("Min", true), ("Max", false)] {
-                if let Some(bound) = self.property_number(io, n, key, depth)? {
-                    ensure!(
-                        if cmp { v >= bound } else { v <= bound },
-                        "{name} violates {key}={bound}"
-                    );
+            let mut constraint = |key| -> Result<Option<Value>> {
+                if let Some(link) = n.prop(&format!("p{key}")) {
+                    self.get_inner(io, link, depth + 1).map(Some)
+                } else {
+                    n.prop(key)
+                        .map(|text| {
+                            if integer_kind(&n.kind) {
+                                integer_literal(text)
+                            } else {
+                                literal(text)
+                            }
+                        })
+                        .transpose()
                 }
-            }
-            if let Some(inc) = self.property_number(io, n, "Inc", depth)? {
-                ensure!(inc > 0.0, "{name} has invalid increment");
-                let base = self.property_number(io, n, "Min", depth)?.unwrap_or(0.0);
-                let steps = (v - base) / inc;
-                ensure!(
-                    (steps - steps.round()).abs() < 1e-7,
-                    "{name} requires increment {inc} from {base}"
-                );
-            }
-            if matches!(
-                n.kind.as_str(),
-                "Integer" | "IntReg" | "MaskedIntReg" | "IntConverter"
-            ) {
-                ensure!(v.fract() == 0.0, "{name} requires an integer");
-            }
+            };
+            validate_numeric(
+                name,
+                &n.kind,
+                value,
+                constraint("Min")?,
+                constraint("Max")?,
+                constraint("Inc")?,
+            )?;
         }
         if let Some(link) = self.resolve_value_link(io, n, depth)? {
             let translated = if n.kind == "Converter" && self.integer_target(link, depth + 1)? {
@@ -895,14 +1009,17 @@ impl NodeMap {
             } else {
                 translated
             };
-            return self.set_inner(io, link, &translated, depth + 1);
+            return self.set_inner(io, link, &translated, depth + 1, write);
         }
         if n.host_value() {
-            n.stored.replace(Some(if n.kind == "Integer" {
+            let stored = if n.kind == "Integer" {
                 json!(signed_integer(&translated)?)
             } else {
                 translated
-            }));
+            };
+            if write {
+                n.stored.replace(Some(stored));
+            }
             return Ok(());
         }
         let (addr, len) = self.register(io, n, depth)?;
@@ -922,13 +1039,19 @@ impl NodeMap {
                     if bits < 64 {
                         ensure!(
                             i >= -(1i64 << (bits - 1)) && i < (1i64 << (bits - 1)),
-                            "signed register value out of range"
+                            "{name} requires a signed {bits}-bit integer from {} to {}",
+                            -(1i64 << (bits - 1)),
+                            (1i64 << (bits - 1)) - 1
                         );
                     }
                     (i as u64) & bit_mask(bits)
                 } else {
                     let u = unsigned_integer(&translated)?;
-                    ensure!(u <= bit_mask(bits), "register value out of range");
+                    ensure!(
+                        u <= bit_mask(bits),
+                        "{name} requires an unsigned {bits}-bit integer from 0 to {}",
+                        bit_mask(bits)
+                    );
                     u
                 };
                 let raw = if n.kind == "MaskedIntReg" {
@@ -946,7 +1069,16 @@ impl NodeMap {
                 let v = number(&translated)?;
                 match len {
                     4 => {
-                        ensure!((v as f32).is_finite(), "value exceeds float32 range");
+                        ensure!(
+                            (v as f32).is_finite(),
+                            "{name} exceeds the float32 range (maximum magnitude {})",
+                            f32::MAX
+                        );
+                        ensure!(
+                            v == 0.0 || v as f32 != 0.0,
+                            "{name} is too small for a nonzero float32 value; use 0 or a representable value (smallest magnitude {})",
+                            f32::from_bits(1)
+                        );
                         encode_integer((v as f32).to_bits() as u64, 4, n.big_endian())
                     }
                     8 => encode_integer(v.to_bits(), 8, n.big_endian()),
@@ -955,9 +1087,12 @@ impl NodeMap {
             }
             "StringReg" => {
                 let s = translated.as_str().context("expected string")?;
+                ensure!(!s.contains('\0'), "{name} cannot contain a NUL character");
                 ensure!(
-                    !s.contains('\0') && s.len() < len,
-                    "string needs room for a NUL terminator ({len} bytes)"
+                    s.len() <= len,
+                    "{name} allows at most {} UTF-8 bytes; entered {} bytes",
+                    len,
+                    s.len()
                 );
                 let mut out = vec![0; len];
                 out[..s.len()].copy_from_slice(s.as_bytes());
@@ -965,7 +1100,11 @@ impl NodeMap {
             }
             _ => bail!("{name} has no supported writable register"),
         };
-        io.write_memory(addr, &bytes)
+        if write {
+            io.write_memory(addr, &bytes)
+        } else {
+            Ok(())
+        }
     }
     fn integer_target(&self, name: &str, depth: usize) -> Result<bool> {
         let node = self.node(name, depth)?;
@@ -980,6 +1119,23 @@ impl NodeMap {
             }
             _ => Ok(false),
         }
+    }
+    fn direct_integer_target(
+        &self,
+        io: &mut dyn RegisterIo,
+        name: &str,
+        depth: usize,
+    ) -> Result<bool> {
+        let node = self.node(name, depth)?;
+        if integer_kind(&node.kind) {
+            return Ok(true);
+        }
+        if node.kind == "Float"
+            && let Some(link) = self.resolve_value_link(io, node, depth)?
+        {
+            return self.direct_integer_target(io, link, depth + 1);
+        }
+        Ok(false)
     }
     pub fn execute(&self, io: &mut dyn RegisterIo, name: &str) -> Result<()> {
         self.access(io, name, true, 0)?;
@@ -998,6 +1154,7 @@ impl NodeMap {
             n.prop("pValue").context("command has no pValue")?,
             &v,
             1,
+            true,
         )
     }
     fn formula(
@@ -1074,6 +1231,190 @@ fn number(v: &Value) -> Result<f64> {
     ensure!(n.is_finite(), "expected finite number");
     Ok(n)
 }
+fn integer_kind(kind: &str) -> bool {
+    matches!(kind, "Integer" | "IntReg" | "MaskedIntReg" | "IntConverter")
+}
+fn numeric_equal(a: &Value, b: &Value) -> Result<bool> {
+    let integer = |value: &Value| {
+        value
+            .as_i64()
+            .map(i128::from)
+            .or_else(|| value.as_u64().map(i128::from))
+    };
+    match (integer(a), integer(b)) {
+        (Some(a), Some(b)) => Ok(a == b),
+        (Some(integer), None) | (None, Some(integer)) => {
+            let value = number(if a.is_i64() || a.is_u64() { b } else { a })?;
+            Ok(value.fract() == 0.0 && value.abs() <= u64::MAX as f64 && value as i128 == integer)
+        }
+        (None, None) => Ok(number(a)? == number(b)?),
+    }
+}
+fn input_value(name: &str, kind: &str, text: &str) -> Result<Value> {
+    match kind {
+        "String" | "StringReg" | "Enumeration" => Ok(json!(text)),
+        "Boolean" => match text.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "on" => Ok(json!(true)),
+            "false" | "0" | "off" => Ok(json!(false)),
+            _ => bail!("{name} must be true or false (also accepts 1/0 and on/off)"),
+        },
+        "Command" => bail!("use execute for command {name}"),
+        _ if integer_kind(kind) => {
+            integer_literal(text).with_context(|| format!("{name} requires an exact integer"))
+        }
+        _ => literal(text).with_context(|| format!("{name} requires a finite number")),
+    }
+}
+/// Parse integral decimal, scientific and hexadecimal forms without first
+/// rounding through f64. The allowed range covers signed and unsigned registers.
+fn integer_literal(text: &str) -> Result<Value> {
+    let text = text.trim();
+    let (negative, body) = if let Some(body) = text.strip_prefix('-') {
+        (true, body)
+    } else {
+        (false, text.strip_prefix('+').unwrap_or(text))
+    };
+    let magnitude = if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).context("invalid hexadecimal integer or integer overflow")?
+    } else {
+        let mut parts = body.split(['e', 'E']);
+        let mantissa = parts.next().unwrap_or("");
+        let exponent = parts
+            .next()
+            .map(|s| s.parse::<i32>())
+            .transpose()
+            .context("invalid integer exponent")?
+            .unwrap_or(0);
+        ensure!(parts.next().is_none(), "invalid integer exponent");
+        let mut decimals = mantissa.split('.');
+        let whole = decimals.next().unwrap_or("");
+        let fraction = decimals.next().unwrap_or("");
+        ensure!(
+            decimals.next().is_none()
+                && !(whole.is_empty() && fraction.is_empty())
+                && whole
+                    .bytes()
+                    .chain(fraction.bytes())
+                    .all(|b| b.is_ascii_digit()),
+            "expected a decimal or hexadecimal integer"
+        );
+        let mut digits = format!("{whole}{fraction}")
+            .trim_start_matches('0')
+            .to_owned();
+        if digits.is_empty() {
+            return Ok(json!(0));
+        }
+        let shift = i64::from(exponent) - fraction.len() as i64;
+        if shift < 0 {
+            let remove = usize::try_from(-shift).context("integer exponent overflow")?;
+            ensure!(
+                remove <= digits.len()
+                    && digits[digits.len() - remove..].bytes().all(|b| b == b'0'),
+                "fractional values are not allowed"
+            );
+            digits.truncate(digits.len() - remove);
+        } else {
+            ensure!(
+                shift <= 20 && digits.len() + shift as usize <= 20,
+                "integer overflow"
+            );
+            digits.extend(std::iter::repeat_n('0', shift as usize));
+        }
+        digits.parse::<u64>().context("integer overflow")?
+    };
+    if negative {
+        let value = -i128::from(magnitude);
+        ensure!(value >= i128::from(i64::MIN), "signed integer overflow");
+        Ok(json!(value as i64))
+    } else {
+        Ok(json!(magnitude))
+    }
+}
+fn exact_integer(value: &Value) -> Result<i128> {
+    if let Some(value) = value.as_i64() {
+        return Ok(i128::from(value));
+    }
+    if let Some(value) = value.as_u64() {
+        return Ok(i128::from(value));
+    }
+    let value = value.as_f64().context("expected an integer")?;
+    ensure!(
+        value.is_finite() && value.fract() == 0.0 && value.abs() <= (1u64 << 53) as f64,
+        "expected an exactly representable integer"
+    );
+    Ok(value as i128)
+}
+fn validate_numeric(
+    name: &str,
+    kind: &str,
+    value: &Value,
+    min: Option<Value>,
+    max: Option<Value>,
+    inc: Option<Value>,
+) -> Result<()> {
+    if integer_kind(kind) {
+        let value = exact_integer(value).with_context(|| format!("{name} requires an integer"))?;
+        let min = min.as_ref().map(exact_integer).transpose()?;
+        let max = max.as_ref().map(exact_integer).transpose()?;
+        ensure!(
+            !min.zip(max).is_some_and(|(low, high)| low > high),
+            "{name} has invalid camera bounds"
+        );
+        if let Some(min) = min {
+            ensure!(
+                value >= min,
+                "{name} violates Min={min}; enter {min} or greater"
+            );
+        }
+        if let Some(max) = max {
+            ensure!(
+                value <= max,
+                "{name} violates Max={max}; enter {max} or less"
+            );
+        }
+        if let Some(inc) = inc.as_ref().map(exact_integer).transpose()? {
+            ensure!(inc > 0, "{name} has invalid camera increment {inc}");
+            let base = min.unwrap_or(0);
+            ensure!(
+                (value - base) % inc == 0,
+                "{name} requires increment {inc} from {base}"
+            );
+        }
+    } else {
+        let value = number(value)?;
+        let min = min.as_ref().map(number).transpose()?;
+        let max = max.as_ref().map(number).transpose()?;
+        ensure!(
+            !min.zip(max).is_some_and(|(low, high)| low > high),
+            "{name} has invalid camera bounds"
+        );
+        if let Some(min) = min {
+            ensure!(
+                value >= min,
+                "{name} violates Min={min}; enter {min} or greater"
+            );
+        }
+        if let Some(max) = max {
+            ensure!(
+                value <= max,
+                "{name} violates Max={max}; enter {max} or less"
+            );
+        }
+        if let Some(inc) = inc.as_ref().map(number).transpose()? {
+            ensure!(inc > 0.0, "{name} has invalid camera increment {inc}");
+            let base = min.unwrap_or(0.0);
+            let steps = (value - base) / inc;
+            let nearest = base + steps.round() * inc;
+            let tolerance = (8.0 * f64::EPSILON * value.abs().max(base.abs()).max(nearest.abs()))
+                .min(inc * 1e-7);
+            ensure!(
+                nearest.is_finite() && (value - nearest).abs() <= tolerance,
+                "{name} requires increment {inc} from {base}; nearest value is {nearest}"
+            );
+        }
+    }
+    Ok(())
+}
 fn signed_integer(v: &Value) -> Result<i64> {
     if let Some(value) = v.as_i64() {
         return Ok(value);
@@ -1102,18 +1443,9 @@ fn unsigned(v: &Value) -> Result<u64> {
 }
 fn literal(s: &str) -> Result<Value> {
     let s = s.trim();
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        return Ok(json!(
-            u64::from_str_radix(hex, 16).context("invalid hexadecimal number")?
-        ));
-    }
-    if let Some(hex) = s.strip_prefix("-0x").or_else(|| s.strip_prefix("-0X")) {
-        return Ok(json!(
-            i64::from_str_radix(hex, 16)
-                .context("invalid hexadecimal number")?
-                .checked_neg()
-                .context("integer overflow")?
-        ));
+    let body = s.strip_prefix(['+', '-']).unwrap_or(s);
+    if body.starts_with("0x") || body.starts_with("0X") {
+        return integer_literal(s);
     }
     if let Ok(i) = s.parse::<i64>() {
         return Ok(json!(i));
@@ -1121,8 +1453,21 @@ fn literal(s: &str) -> Result<Value> {
     if let Ok(u) = s.parse::<u64>() {
         return Ok(json!(u));
     }
+    if let Ok(integer) = integer_literal(s) {
+        return Ok(integer);
+    }
     let n: f64 = s.parse().context("invalid numeric value")?;
     ensure!(n.is_finite(), "expected finite number");
+    ensure!(
+        n != 0.0
+            || !s
+                .split(['e', 'E'])
+                .next()
+                .unwrap_or(s)
+                .bytes()
+                .any(|b| (b'1'..=b'9').contains(&b)),
+        "numeric value is too small to represent; enter 0 explicitly or a representable nonzero value"
+    );
     Ok(json!(n))
 }
 fn integer_formula(v: f64) -> Result<Value> {
@@ -1591,6 +1936,183 @@ mod tests {
         m.set(&mut io, "S", "-2").unwrap();
         assert_eq!(m.get(&mut io, "S").unwrap(), -2);
         assert_eq!(io.read_memory(8, 2).unwrap(), [255, 254]);
+    }
+    #[test]
+    fn integer_inputs_and_limits_do_not_round_through_floating_point() {
+        let m = map(concat!(
+            "<Integer Name='Count'><pValue>R</pValue><Min>9007199254740992</Min><Max>9007199254741000</Max><Inc>2</Inc></Integer>",
+            "<IntReg Name='R'><Address>0</Address><Length>8</Length></IntReg>",
+            "<Float Name='Alias'><pValue>Count</pValue></Float>",
+            "<IntReg Name='Signed'><Address>8</Address><Length>8</Length><Sign>Signed</Sign></IntReg>"
+        ));
+        let mut io = Memory::default();
+        m.set(&mut io, "Count", "9007199254740994.0").unwrap();
+        assert_eq!(
+            m.get(&mut io, "Count").unwrap(),
+            json!(9_007_199_254_740_994u64)
+        );
+        m.set(&mut io, "Count", "9.007199254741e15").unwrap();
+        assert_eq!(
+            m.get(&mut io, "Count").unwrap(),
+            json!(9_007_199_254_741_000u64)
+        );
+        let before = io.bytes.clone();
+        for value in [
+            "9007199254740993",
+            "9007199254741001",
+            "9007199254740992.1",
+            "18446744073709551616",
+            "1e100",
+            "NaN",
+        ] {
+            assert!(m.set(&mut io, "Count", value).is_err(), "{value}");
+            assert_eq!(io.bytes, before);
+        }
+        assert!(m.set(&mut io, "Alias", "9007199254740992.1").is_err());
+        m.set(&mut io, "Signed", "-0x8000000000000000").unwrap();
+        assert_eq!(m.get(&mut io, "Signed").unwrap(), json!(i64::MIN));
+        assert!(m.set(&mut io, "Signed", "-0x8000000000000001").is_err());
+    }
+    #[test]
+    fn float_inputs_allow_roundoff_but_reject_off_increment_and_nonfinite_values() {
+        let m = map(
+            "<Float Name='Level'><pValue>R</pValue><Min>0</Min><Max>1</Max><Inc>0.1</Inc></Float><FloatReg Name='R'><Address>0</Address><Length>8</Length></FloatReg>",
+        );
+        let mut io = Memory::default();
+        m.set(&mut io, "Level", "0.3").unwrap();
+        let before = io.bytes.clone();
+        for value in [
+            "0.300000001",
+            "0.15",
+            "-0.1",
+            "1.1",
+            "NaN",
+            "inf",
+            "-inf",
+            "",
+        ] {
+            assert!(m.set(&mut io, "Level", value).is_err(), "{value}");
+            assert_eq!(io.bytes, before);
+        }
+        let feature = m
+            .features(&mut io)
+            .into_iter()
+            .find(|f| f.name == "Level")
+            .unwrap();
+        assert!(feature.validate_input("0.3").is_ok());
+        assert!(feature.validate_input("0.300000001").is_err());
+    }
+    #[test]
+    fn preflight_does_not_mutate_values_and_allows_temporary_auto_locks() {
+        let m = map(concat!(
+            "<Integer Name='Locked'><Value>1</Value></Integer>",
+            "<Integer Name='Level'><pValue>R</pValue><Min>0</Min><Max>10</Max><Inc>2</Inc><pIsLocked>Locked</pIsLocked></Integer>",
+            "<IntReg Name='R'><Address>0</Address><Length>4</Length></IntReg>",
+            "<Integer Name='Host'><Value>4</Value><Min>0</Min><Max>10</Max></Integer>",
+            "<Integer Name='Readonly'><Value>4</Value><AccessMode>RO</AccessMode></Integer>"
+        ));
+        let mut io = Memory::default();
+        m.validate_set(&mut io, "Level", "6").unwrap();
+        let feature = m
+            .features(&mut io)
+            .into_iter()
+            .find(|f| f.name == "Level")
+            .unwrap();
+        assert!(!feature.writable);
+        feature.validate_input("6").unwrap();
+        assert!(io.bytes.is_empty());
+        assert!(m.set(&mut io, "Level", "6").is_err());
+        assert!(m.validate_set(&mut io, "Level", "5").is_err());
+        assert!(m.validate_set(&mut io, "Readonly", "6").is_err());
+        m.validate_set(&mut io, "Host", "8").unwrap();
+        assert_eq!(m.get(&mut io, "Host").unwrap(), 4);
+        m.set(&mut io, "Locked", "0").unwrap();
+        m.set(&mut io, "Level", "6").unwrap();
+        assert_eq!(m.get(&mut io, "Level").unwrap(), 6);
+    }
+    #[test]
+    fn register_storage_limits_reject_overflow_and_underflow_without_writes() {
+        let m = map(concat!(
+            "<IntReg Name='Unsigned'><Address>0</Address><Length>1</Length></IntReg>",
+            "<MaskedIntReg Name='Signed'><Address>4</Address><Length>4</Length><LSB>4</LSB><MSB>7</MSB><Sign>Signed</Sign></MaskedIntReg>",
+            "<FloatReg Name='F32'><Address>8</Address><Length>4</Length></FloatReg>",
+            "<FloatReg Name='F64'><Address>16</Address><Length>8</Length></FloatReg>"
+        ));
+        let mut io = Memory::default();
+        m.set(&mut io, "Unsigned", "255").unwrap();
+        io.write_memory(4, &0xa5a5a5a5u32.to_le_bytes()).unwrap();
+        m.set(&mut io, "Signed", "-8").unwrap();
+        assert_eq!(m.get(&mut io, "Signed").unwrap(), -8);
+        assert_eq!(io.read_memory(4, 4).unwrap(), 0xa5a5a585u32.to_le_bytes());
+        m.set(&mut io, "F32", "0.1").unwrap();
+        let before = io.bytes.clone();
+        for (feature, value) in [
+            ("Unsigned", "256"),
+            ("Unsigned", "-1"),
+            ("Signed", "-9"),
+            ("Signed", "8"),
+            ("F32", "1e40"),
+            ("F32", "1e-100"),
+            ("F64", "1e400"),
+            ("F64", "1e-400"),
+        ] {
+            assert!(m.set(&mut io, feature, value).is_err(), "{feature}={value}");
+            assert_eq!(io.bytes, before);
+        }
+    }
+    #[test]
+    fn string_values_preserve_input_and_validate_register_byte_capacity() {
+        let m = map(
+            "<String Name='Host'><Value>initial</Value></String><String Name='Label'><pValue>R</pValue></String><StringReg Name='R'><Address>0</Address><Length>4</Length></StringReg>",
+        );
+        let mut io = Memory::default();
+        for value in ["", " spaced ", "é", "a\0b"] {
+            m.set(&mut io, "Host", value).unwrap();
+            assert_eq!(m.get(&mut io, "Host").unwrap(), value);
+        }
+        m.set(&mut io, "Label", "éé").unwrap();
+        assert_eq!(m.get(&mut io, "Label").unwrap(), "éé");
+        let before = io.bytes.clone();
+        for value in ["12345", "ééé", "a\0b"] {
+            assert!(m.set(&mut io, "Label", value).is_err());
+            assert_eq!(io.bytes, before);
+        }
+        m.set(&mut io, "Label", "").unwrap();
+        assert_eq!(io.read_memory(0, 4).unwrap(), [0; 4]);
+    }
+    #[test]
+    fn boolean_and_enum_errors_describe_valid_inputs() {
+        let m = map(
+            "<Boolean Name='Enabled'><Value>0</Value></Boolean><Enumeration Name='Mode'><Value>0</Value><EnumEntry Name='Slow'><Value>0</Value></EnumEntry><EnumEntry Name='Fast'><Value>1</Value></EnumEntry></Enumeration>",
+        );
+        let mut io = Memory::default();
+        m.set(&mut io, "Enabled", " ON ").unwrap();
+        assert_eq!(m.get(&mut io, "Enabled").unwrap(), true);
+        let error = format!("{:#}", m.set(&mut io, "Enabled", "yes").unwrap_err());
+        assert!(error.contains("true or false"), "{error}");
+        let error = format!("{:#}", m.set(&mut io, "Mode", "unknown").unwrap_err());
+        assert!(error.contains("Slow, Fast"), "{error}");
+        assert_eq!(m.get(&mut io, "Mode").unwrap(), "Slow");
+    }
+    #[test]
+    fn boolean_and_enum_readback_preserves_distinct_64_bit_values() {
+        let m = map(concat!(
+            "<Boolean Name='Enabled'><pValue>R</pValue><OnValue>9007199254740993</OnValue><OffValue>9007199254740992</OffValue></Boolean>",
+            "<Enumeration Name='Mode'><pValue>R</pValue><EnumEntry Name='First'><Value>9007199254740992</Value></EnumEntry><EnumEntry Name='Second'><Value>9007199254740993</Value></EnumEntry></Enumeration>",
+            "<IntReg Name='R'><Address>0</Address><Length>8</Length></IntReg>",
+            "<Boolean Name='Invalid'><Value>1</Value><OnValue>1</OnValue><OffValue>1</OffValue></Boolean>"
+        ));
+        let mut io = Memory::default();
+        for (symbol, enabled) in [("Second", true), ("First", false)] {
+            m.set(&mut io, "Mode", symbol).unwrap();
+            assert_eq!(m.get(&mut io, "Mode").unwrap(), symbol);
+            assert_eq!(m.get(&mut io, "Enabled").unwrap(), enabled);
+            m.set(&mut io, "Enabled", if enabled { "true" } else { "false" })
+                .unwrap();
+            assert_eq!(m.get(&mut io, "Mode").unwrap(), symbol);
+        }
+        assert!(m.get(&mut io, "Invalid").is_err());
+        assert!(m.set(&mut io, "Invalid", "false").is_err());
     }
     fn basler() -> NodeMap {
         let mut xml = concat!(

@@ -120,6 +120,292 @@ pub enum SessionCommand {
     },
     StopForward,
 }
+/// Deserialize JSON control messages without accepting ignored fields on
+/// Serde's internally tagged unit variants or duplicate object fields.
+pub fn deserialize_command<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<SessionCommand, D::Error> {
+    let StrictValue(value) = StrictValue::deserialize(deserializer)?;
+    if let Value::Object(fields) = &value
+        && fields.get("op").and_then(Value::as_str).is_some_and(|op| {
+            matches!(
+                op,
+                "disconnect"
+                    | "start"
+                    | "stop"
+                    | "undo"
+                    | "redo"
+                    | "jobs"
+                    | "status"
+                    | "features"
+                    | "xml"
+                    | "stop_forward"
+            )
+        })
+        && let Some(field) = fields.keys().find(|key| key.as_str() != "op")
+    {
+        return Err(serde::de::Error::custom(format!(
+            "unknown field `{field}`; this operation only accepts `op`"
+        )));
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+struct StrictValue(Value);
+impl<'de> Deserialize<'de> for StrictValue {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = StrictValue;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value")
+            }
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                value: bool,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(StrictValue(Value::Bool(value)))
+            }
+            fn visit_i64<E: serde::de::Error>(
+                self,
+                value: i64,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(StrictValue(Value::Number(value.into())))
+            }
+            fn visit_u64<E: serde::de::Error>(
+                self,
+                value: u64,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(StrictValue(Value::Number(value.into())))
+            }
+            fn visit_f64<E: serde::de::Error>(
+                self,
+                value: f64,
+            ) -> std::result::Result<Self::Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(|number| StrictValue(Value::Number(number)))
+                    .ok_or_else(|| E::custom("JSON numbers must be finite"))
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(StrictValue(Value::String(value.into())))
+            }
+            fn visit_string<E: serde::de::Error>(
+                self,
+                value: String,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(StrictValue(Value::String(value)))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(StrictValue(Value::Null))
+            }
+            fn visit_none<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                self.visit_unit()
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut values: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut result = Vec::new();
+                while let Some(StrictValue(value)) = values.next_element()? {
+                    result.push(value);
+                }
+                Ok(StrictValue(Value::Array(result)))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut values: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut result = serde_json::Map::new();
+                while let Some(key) = values.next_key::<String>()? {
+                    if result.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!("duplicate field `{key}`")));
+                    }
+                    let StrictValue(value) = values.next_value()?;
+                    result.insert(key, value);
+                }
+                Ok(StrictValue(Value::Object(result)))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+impl SessionCommand {
+    pub fn from_json_slice(data: &[u8]) -> Result<Self> {
+        let mut deserializer = serde_json::Deserializer::from_slice(data);
+        let command = deserialize_command(&mut deserializer)?;
+        deserializer.end()?;
+        Ok(command)
+    }
+    /// Validate supplied values before queueing a command or changing a camera.
+    /// Live feature bounds and destination availability are checked again by
+    /// their owners when the command executes.
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Discover { timeout_ms, .. } => validate_timeout(*timeout_ms)?,
+            Self::Connect { camera, timeout_ms } => {
+                validate_selector(camera)?;
+                validate_timeout(*timeout_ms)?;
+                maximum_cameras()?;
+                frame_capacity(false)?;
+            }
+            Self::Select { camera } => validate_selector(camera)?,
+            Self::Get { feature } | Self::Execute { feature } | Self::Set { feature, .. } => {
+                ensure!(
+                    !feature.is_empty()
+                        && !feature
+                            .chars()
+                            .any(|c| c.is_whitespace() || c.is_control() || c == '='),
+                    "feature name must be nonempty and contain no whitespace, control characters or '='"
+                );
+            }
+            Self::ReplayCameraChange { token, .. } => {
+                ensure!(
+                    !token.is_empty() && !token.chars().any(char::is_control),
+                    "history token must be nonempty and contain no control characters"
+                );
+            }
+            Self::Auto {
+                balance: Some(balance),
+            } => {
+                ensure!(
+                    balance.is_finite() && (0.0..=1.0).contains(balance),
+                    "auto balance must be a finite number from 0 (quality) to 1 (frame rate)"
+                );
+            }
+            Self::Capture {
+                output,
+                count,
+                timeout_ms,
+                format,
+                storage,
+                destination,
+            }
+            | Self::Schedule {
+                output,
+                count,
+                timeout_ms,
+                format,
+                storage,
+                destination,
+                ..
+            } => {
+                validate_timeout(*timeout_ms)?;
+                ensure!((1..=100_000).contains(count), "count must be 1..100000");
+                ensure!(
+                    ["png", "jpeg", "raw", "pgm", "ppm"].contains(&format.as_str()),
+                    "format must be png, jpeg, raw, pgm or ppm"
+                );
+                storage.validate()?;
+                crate::destination::validate_output(destination.as_deref(), output)?;
+                crate::engine::validate_capture_output(output)?;
+                if matches!(self, Self::Schedule { .. }) {
+                    ensure!(
+                        output != "-",
+                        "scheduled capture requires a file or directory"
+                    );
+                } else {
+                    ensure!(
+                        output != "-" || (*count == 1 && destination.is_none()),
+                        "stdout output needs one frame and cannot use a destination"
+                    );
+                }
+                if let Self::Schedule {
+                    first_at_ms,
+                    interval_ms,
+                    ..
+                } = self
+                {
+                    crate::scheduling::validate_schedule(*first_at_ms, *interval_ms, *count)?;
+                }
+            }
+            Self::CancelJob { id } => ensure!(*id > 0, "capture job ID must be positive"),
+            Self::ReadMemory { address, length } => validate_memory(*address, *length)?,
+            Self::WriteMemory { address, data } => validate_memory(*address, data.len())?,
+            Self::Forward {
+                output,
+                codec,
+                encoder,
+                fps,
+                bitrate,
+                storage,
+                max_file_bytes,
+                destination,
+            } => {
+                crate::media::ForwardConfig {
+                    output: output.clone(),
+                    codec: codec.clone(),
+                    encoder: encoder.clone(),
+                    fps: *fps,
+                    bitrate: bitrate.clone(),
+                    storage: storage.clone(),
+                    max_file_bytes: *max_file_bytes,
+                    destination: destination.clone(),
+                }
+                .validate()?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+pub fn validate_timeout(timeout_ms: u64) -> Result<()> {
+    ensure!(
+        (1..=60_000).contains(&timeout_ms),
+        "timeout must be 1..60000 milliseconds"
+    );
+    Ok(())
+}
+pub fn validate_selector(camera: &str) -> Result<()> {
+    crate::camera::validate_selector_shape(camera)
+}
+fn validate_memory(address: u64, length: usize) -> Result<()> {
+    ensure!(
+        (1..=65_536).contains(&length),
+        "memory length must be 1..65536"
+    );
+    ensure!(
+        address.checked_add((length - 1) as u64).is_some(),
+        "memory address range overflows"
+    );
+    Ok(())
+}
+fn env_usize(name: &str, default: usize) -> Result<usize> {
+    match std::env::var_os(name) {
+        None => Ok(default),
+        Some(value) => value
+            .to_str()
+            .with_context(|| format!("{name} must be a positive integer"))?
+            .parse::<usize>()
+            .with_context(|| format!("{name} must be a positive integer")),
+    }
+}
+fn maximum_cameras() -> Result<usize> {
+    let maximum = env_usize("CAPTUREFAB_MAX_CAMERAS", 16)?;
+    ensure!(
+        (1..=64).contains(&maximum),
+        "CAPTUREFAB_MAX_CAMERAS must be 1..64"
+    );
+    Ok(maximum)
+}
+fn frame_capacity(scanner: bool) -> Result<usize> {
+    let capacity = env_usize(
+        "CAPTUREFAB_FRAME_BYTES",
+        if scanner {
+            128 * 1024 * 1024
+        } else {
+            DEFAULT_CAPACITY
+        },
+    )?;
+    ensure!(
+        (4096..=256 * 1024 * 1024).contains(&capacity) && capacity.is_multiple_of(64),
+        "CAPTUREFAB_FRAME_BYTES must be 4096..268435456, aligned to 64 bytes"
+    );
+    Ok(capacity)
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     pub time: String,
@@ -266,6 +552,7 @@ struct Process {
 }
 impl Process {
     fn spawn(scanner: bool) -> Result<Self> {
+        let capacity = frame_capacity(scanner)?;
         let dir = crate::ipc::session_dir();
         crate::ipc::ensure_private_dir(&dir)?;
         let mut random = [0u8; 16];
@@ -275,18 +562,6 @@ impl Process {
             .map(|v| format!("{v:02x}"))
             .collect::<String>();
         let path = dir.join(format!("worker-{name}.shm"));
-        let capacity = std::env::var("CAPTUREFAB_FRAME_BYTES")
-            .ok()
-            .map(|s| s.parse::<usize>())
-            .transpose()
-            .context("CAPTUREFAB_FRAME_BYTES must be a number")?
-            // A letter/A4 page at 600 dpi in RGB needs about 100 MiB. Scanner
-            // pages retain their full resolution in the shared preview ring.
-            .unwrap_or(if scanner {
-                128 * 1024 * 1024
-            } else {
-                DEFAULT_CAPACITY
-            });
         let ring = SharedRing::create(&path, capacity)?;
         let executable = std::env::var_os("CAPTUREFAB_EXECUTABLE")
             .map(std::path::PathBuf::from)
@@ -730,6 +1005,10 @@ impl SessionHandle {
         Some(order.reserve())
     }
     fn submit_target(&self, target: Option<String>, command: SessionCommand) -> Result<Reply> {
+        command.validate()?;
+        if let Some(camera) = &target {
+            validate_selector(camera)?;
+        }
         ensure!(
             !self.inner.quitting.load(Ordering::Relaxed),
             "session is shutting down"
@@ -854,16 +1133,8 @@ impl SessionHandle {
                         .active_camera = Some(info.id.clone());
                     return Ok(json!({"connected":info,"worker_pid":p.child.id()}));
                 }
-                let maximum = std::env::var("CAPTUREFAB_MAX_CAMERAS")
-                    .ok()
-                    .map(|s| s.parse::<usize>())
-                    .transpose()
-                    .context("CAPTUREFAB_MAX_CAMERAS must be a number")?
-                    .unwrap_or(16);
-                ensure!(
-                    (1..=64).contains(&maximum),
-                    "CAPTUREFAB_MAX_CAMERAS must be 1..64"
-                );
+                crate::camera::validate_selector(&camera)?;
+                let maximum = maximum_cameras()?;
                 ensure!(
                     self.workers().len() < maximum,
                     "camera limit reached ({maximum}); disconnect a camera or increase CAPTUREFAB_MAX_CAMERAS"
@@ -1033,7 +1304,7 @@ pub fn run_worker(path: &std::path::Path) -> Result<()> {
             {
                 break;
             }
-            let command: SessionCommand = serde_json::from_slice(&data)?;
+            let command = SessionCommand::from_json_slice(&data)?;
             let result = if matches!(command, SessionCommand::Status) {
                 Ok(None)
             } else {
@@ -1067,6 +1338,86 @@ pub fn run_worker(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn strict_json_commands_reject_ignored_or_duplicate_fields() {
+        for op in [
+            "disconnect",
+            "start",
+            "stop",
+            "undo",
+            "redo",
+            "jobs",
+            "status",
+            "features",
+            "xml",
+            "stop_forward",
+        ] {
+            let valid = format!(r#"{{"op":"{op}"}}"#);
+            assert!(SessionCommand::from_json_slice(valid.as_bytes()).is_ok());
+            let extra = format!(r#"{{"op":"{op}","unknown":1}}"#);
+            assert!(
+                SessionCommand::from_json_slice(extra.as_bytes())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown field `unknown`")
+            );
+        }
+        for (command, field) in [
+            (r#"{"op":"status","op":"start"}"#, "op"),
+            (
+                r#"{"op":"set","feature":"Width","feature":"Height","value":"8"}"#,
+                "feature",
+            ),
+            (
+                r#"{"op":"capture","output":"frame.png","count":1,"timeout_ms":1000,"format":"png","storage":{"max_files":1,"max_files":2}}"#,
+                "max_files",
+            ),
+        ] {
+            assert!(
+                SessionCommand::from_json_slice(command.as_bytes())
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&format!("duplicate field `{field}`"))
+            );
+        }
+        assert!(SessionCommand::from_json_slice(br#"{"op":"status"} {}"#).is_err());
+    }
+    #[test]
+    fn invalid_command_values_are_rejected_before_queueing() {
+        let handle = SessionHandle::new();
+        for command in [
+            SessionCommand::Connect {
+                camera: "sim:0".into(),
+                timeout_ms: 0,
+            },
+            SessionCommand::Select { camera: " ".into() },
+            SessionCommand::Auto {
+                balance: Some(f64::NAN),
+            },
+            SessionCommand::Auto {
+                balance: Some(1.01),
+            },
+            SessionCommand::Get {
+                feature: "Width\n".into(),
+            },
+            SessionCommand::ReadMemory {
+                address: u64::MAX,
+                length: 2,
+            },
+            SessionCommand::WriteMemory {
+                address: 0,
+                data: vec![],
+            },
+            SessionCommand::CancelJob { id: 0 },
+        ] {
+            assert!(handle.submit(command).is_err());
+        }
+        let snapshot = handle.snapshot();
+        assert!(snapshot.cameras.is_empty());
+        assert!(snapshot.logs.is_empty());
+        assert!(snapshot.last_error.is_none());
+        handle.shutdown();
+    }
 
     fn width_command() -> SessionCommand {
         SessionCommand::Set {

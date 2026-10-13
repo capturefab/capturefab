@@ -98,6 +98,7 @@ impl WorkerHandle {
         self.frame.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
     pub fn submit(&self, command: SessionCommand) -> Result<Reply> {
+        command.validate()?;
         ensure!(
             !self.quitting.load(Ordering::Relaxed),
             "session is shutting down"
@@ -259,7 +260,7 @@ fn stop_forward(
         .unwrap_or_else(|e| e.into_inner())
         .forwarding = None;
     if let Some(a) = auto.as_mut() {
-        a.set_forward_fps(None);
+        a.set_forward_fps(None)?;
     }
     if let Some((mut f, _)) = forwarder.take() {
         f.stop()
@@ -316,7 +317,7 @@ fn process_plain(
             camera_mut(camera)?.start()?;
             *forwarder = Some((f, fps));
             if let Some(a) = auto.as_mut() {
-                a.set_forward_fps(Some(fps));
+                a.set_forward_fps(Some(fps))?;
             }
             refresh(h, camera, false);
             h.state
@@ -410,6 +411,7 @@ fn process_plain(
             Ok(json!({"name":feature,"value":camera_mut(camera)?.get(&feature)?}))
         }
         SessionCommand::Set { feature, value } => {
+            camera_mut(camera)?.validate_set(&feature, &value)?;
             let switched = auto.as_ref().is_some_and(|a| a.manages(&feature));
             if switched {
                 release_auto(h, auto, camera, false)?;
@@ -492,6 +494,8 @@ fn process_plain(
         } => {
             validate_capture(&output, count, timeout_ms, &format)?;
             let resolved = crate::destination::resolve(destination.as_deref(), &output)?;
+            preflight_capture_output(&resolved.output, count, &format)?;
+            validate_schedule_outputs(&resolved.output, count, &format, jobs)?;
             storage.validate()?;
             ensure!(
                 output != "-",
@@ -501,14 +505,7 @@ fn process_plain(
                 jobs.iter().filter(|j| j.info.active()).count() < 32,
                 "capture schedule queue is full (32 active jobs)"
             );
-            ensure!(
-                interval_ms <= 315_576_000_000,
-                "interval must be at most 10 years"
-            );
-            ensure!(
-                first_at_ms <= crate::scheduling::now_ms().saturating_add(315_576_000_000),
-                "capture time must be within 10 years"
-            );
+            crate::scheduling::validate_schedule(first_at_ms, interval_ms, count)?;
             camera_mut(camera)?;
             let first_at_ms = first_at_ms.max(crate::scheduling::now_ms());
             let info = crate::scheduling::CaptureJob {
@@ -555,7 +552,7 @@ fn process_plain(
                 None => {
                     let balance = balance.unwrap_or(crate::auto::DEFAULT_BALANCE);
                     let mut controller = AutoController::enter(c, balance)?;
-                    controller.set_forward_fps(forwarder.as_ref().map(|(_, fps)| *fps));
+                    controller.set_forward_fps(forwarder.as_ref().map(|(_, fps)| *fps))?;
                     *auto = Some(controller);
                     true
                 }
@@ -622,6 +619,9 @@ fn process_plain(
             };
             validate_capture(&output, count, timeout_ms, &format)?;
             storage.validate()?;
+            if output != "-" {
+                preflight_capture_output(&resolved.output, count, &format)?;
+            }
             let duration = timeout(timeout_ms)?;
             ensure!((1..=100_000).contains(&count), "count must be 1..100000");
             ensure!(
@@ -749,7 +749,132 @@ fn validate_capture(output: &str, count: u32, timeout_ms: u64, format: &str) -> 
         ["png", "jpeg", "raw", "ppm", "pgm"].contains(&format),
         "format must be png, jpeg, raw, pgm or ppm"
     );
-    ensure!(!output.is_empty(), "provide an output path");
+    validate_capture_output(output)?;
+    Ok(())
+}
+pub fn validate_capture_output(output: &str) -> Result<()> {
+    crate::destination::validate_output(None, output)?;
+    ensure!(
+        !output.contains("://") && !output.starts_with("file:"),
+        "capture output must be a file or directory; use forward for a network stream"
+    );
+    let literal = output.replace("{frame}", "");
+    ensure!(
+        !literal.contains(['{', '}']),
+        "capture output only supports the {{frame}} placeholder"
+    );
+    Ok(())
+}
+/// Reject collisions and unusable parent paths before settings are changed or
+/// acquisition starts. The storage writer still creates each file atomically.
+pub fn preflight_capture_output(output: &str, count: u32, format: &str) -> Result<()> {
+    validate_capture_output(output)?;
+    ensure!((1..=100_000).contains(&count), "count must be 1..100000");
+    for index in 0..count {
+        let path = output_path(output, count, index, format);
+        preflight_scanner_output(&path)?;
+        let mut ancestor = path.parent();
+        while let Some(parent) = ancestor.filter(|parent| !parent.as_os_str().is_empty()) {
+            match std::fs::metadata(parent) {
+                Ok(metadata) => {
+                    ensure!(
+                        metadata.is_dir(),
+                        "capture output parent is not a directory: {}",
+                        parent.display()
+                    );
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    ancestor = parent.parent()
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("inspect capture output parent {}", parent.display())
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+fn planned_path(path: &std::path::Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut existing = absolute.as_path();
+    let mut missing = Vec::new();
+    let mut resolved = loop {
+        match std::fs::canonicalize(existing) {
+            Ok(path) => break path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(
+                    existing
+                        .file_name()
+                        .context("capture output has no file name")?,
+                );
+                existing = existing
+                    .parent()
+                    .context("capture output has no existing ancestor")?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("resolve capture output {}", path.display()));
+            }
+        }
+    };
+    for name in missing.into_iter().rev() {
+        resolved.push(name);
+    }
+    Ok(resolved)
+}
+fn validate_schedule_outputs(
+    output: &str,
+    count: u32,
+    format: &str,
+    jobs: &[Scheduled],
+) -> Result<()> {
+    use std::{
+        collections::{HashMap, hash_map::DefaultHasher},
+        hash::{Hash, Hasher},
+    };
+    let active = jobs
+        .iter()
+        .filter(|job| job.info.active())
+        .collect::<Vec<_>>();
+    if active.is_empty() {
+        return Ok(());
+    }
+    // Store indexes, not potentially 16 KiB paths. Compare actual paths on a
+    // hash match so collisions cannot reject a distinct requested output.
+    let hash = |path: &std::path::Path| {
+        let mut hasher = DefaultHasher::new();
+        path.hash(&mut hasher);
+        hasher.finish()
+    };
+    let mut requested = HashMap::<u64, Vec<u32>>::new();
+    for index in 0..count {
+        let path = planned_path(&output_path(output, count, index, format))?;
+        requested.entry(hash(&path)).or_default().push(index);
+    }
+    for job in active {
+        for index in job.info.captured..job.info.count {
+            let existing = planned_path(&output_path(
+                &job.info.output,
+                job.info.count,
+                index,
+                &job.format,
+            ))?;
+            if let Some(candidates) = requested.get(&hash(&existing)) {
+                for &candidate in candidates {
+                    let path = planned_path(&output_path(output, count, candidate, format))?;
+                    ensure!(
+                        path != existing,
+                        "capture output is already scheduled by active job {}: {}; choose a different path or cancel that job",
+                        job.info.id,
+                        existing.display()
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 fn cancel_jobs(jobs: &mut [Scheduled]) {
@@ -1069,6 +1194,57 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn active_jobs_reject_overlapping_output_files() {
+        let handle = WorkerHandle::new();
+        handle
+            .request(SessionCommand::Connect {
+                camera: "sim:0".into(),
+                timeout_ms: 100,
+            })
+            .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "capturefab-job-conflict-{}-{}",
+            std::process::id(),
+            crate::scheduling::now_ms()
+        ));
+        let schedule = |output: String, count: u32, format: &str| SessionCommand::Schedule {
+            output,
+            count,
+            timeout_ms: 100,
+            format: format.into(),
+            first_at_ms: crate::scheduling::now_ms() + 60_000,
+            interval_ms: 1000,
+            storage: Default::default(),
+            destination: None,
+        };
+        let directory = root.to_string_lossy().into_owned();
+        handle
+            .request(schedule(directory.clone(), 3, "raw"))
+            .unwrap();
+        for (output, count, format) in [
+            (directory.clone(), 2, "raw"),
+            (
+                root.join("frame-000002.raw").to_string_lossy().into_owned(),
+                1,
+                "png",
+            ),
+        ] {
+            let error = handle.request(schedule(output, count, format)).unwrap_err();
+            assert!(error.to_string().contains("already scheduled"), "{error:#}");
+        }
+        // The directory transform includes the format; these are distinct paths.
+        handle.request(schedule(directory, 3, "png")).unwrap();
+        assert_eq!(
+            handle.request(SessionCommand::Jobs).unwrap()["jobs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(!root.exists());
+        handle.shutdown();
+    }
     #[test]
     fn session_simulator_configuration_and_acquisition() {
         let h = WorkerHandle::new();
@@ -1580,7 +1756,7 @@ mod tests {
         let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
         let (mut next_job, mut started) = (1, false);
         let now = crate::scheduling::now_ms();
-        for first_at_ms in [now, now, now + 60_000] {
+        for (index, first_at_ms) in [now, now, now + 60_000].into_iter().enumerate() {
             process(
                 &h,
                 &mut camera,
@@ -1590,7 +1766,7 @@ mod tests {
                 &mut next_job,
                 &mut started,
                 SessionCommand::Schedule {
-                    output: "scan.png".into(),
+                    output: format!("scan-{index}.png"),
                     count: 2,
                     timeout_ms: 1000,
                     format: "png".into(),

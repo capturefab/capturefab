@@ -147,13 +147,29 @@ impl RegisterIo for Simulator {
         let rate = f64::from_le_bytes(proposed[0x120..0x128].try_into()?);
         ensure!(
             rate.is_finite() && (1.0..=120.0).contains(&rate),
-            "frame rate out of bounds"
+            "simulator frame rate must be a finite number from 1 to 120 Hz"
+        );
+        let exposure = f64::from_le_bytes(proposed[0x110..0x118].try_into()?);
+        ensure!(
+            exposure.is_finite() && (10.0..=1_000_000.0).contains(&exposure),
+            "simulator exposure must be a finite number from 10 to 1000000 microseconds"
+        );
+        let gain = f64::from_le_bytes(proposed[0x118..0x120].try_into()?);
+        ensure!(
+            gain.is_finite() && (0.0..=24.0).contains(&gain),
+            "simulator gain must be a finite number from 0 to 24 dB"
+        );
+        let control = u32::from_le_bytes(proposed[0x130..0x134].try_into()?);
+        ensure!(
+            control <= 1,
+            "simulator acquisition control must be 0 (stop) or 1 (start)"
         );
         self.memory = proposed;
         self.refresh_payload();
         Ok(())
     }
 }
+
 impl Backend for Simulator {
     fn xml(&mut self) -> Result<String> {
         Ok(XML.into())
@@ -238,5 +254,32 @@ impl Backend for Simulator {
             timestamp_ns: self.epoch.elapsed().as_nanos() as u64,
             data,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_raw_feature_writes_leave_simulator_state_unchanged() {
+        let mut simulator = Simulator::default();
+        for (address, values) in [
+            (0x110, [f64::NAN, f64::INFINITY, 0.0, 1_000_001.0]),
+            (0x118, [f64::NAN, f64::NEG_INFINITY, -1.0, 25.0]),
+            (0x120, [f64::NAN, f64::INFINITY, 0.0, 121.0]),
+        ] {
+            let before = simulator.read_memory(address, 8).unwrap();
+            for value in values {
+                assert!(
+                    simulator
+                        .write_memory(address, &value.to_le_bytes())
+                        .is_err()
+                );
+                assert_eq!(simulator.read_memory(address, 8).unwrap(), before);
+            }
+        }
+        assert!(simulator.write_memory(0x130, &2u32.to_le_bytes()).is_err());
+        assert_eq!(simulator.read_memory(0x130, 4).unwrap(), [0; 4]);
     }
 }

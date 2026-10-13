@@ -158,11 +158,14 @@ impl Workbench {
         let shown = self.tile_controls(id);
         if shown > 0.01 {
             let glass = |kind: Icon, hint: String, on: Message| {
+                let enabled = !matches!(&on, Message::CaptureCamera(_))
+                    || (!self.pending(Job::Capture)
+                        && self.validate_input(&self.capture_command(false)).is_ok());
                 tip(
                     button(icon(kind, 14.0, fade(style::STAGE.text, shown)))
                         .padding(5)
                         .style(style::on_glass(false, shown))
-                        .on_press(on),
+                        .on_press_maybe(enabled.then_some(on)),
                     hint,
                 )
             };

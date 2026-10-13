@@ -75,7 +75,11 @@ impl Workbench {
                     )
                     .padding([7, 12])
                     .style(style::on_glass(false, 1.0))
-                    .on_press_maybe((!self.pending(Job::Capture)).then_some(Message::Capture)),
+                    .on_press_maybe(
+                        (!self.pending(Job::Capture)
+                            && self.validate_input(&self.capture_command(false)).is_ok())
+                        .then_some(Message::Capture),
+                    ),
                 ),
             );
         }

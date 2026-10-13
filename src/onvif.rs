@@ -125,6 +125,7 @@ fn parse_discovery(xml: &str, source: SocketAddr) -> Result<Vec<OnvifDevice>> {
     Ok(result)
 }
 pub fn discover(timeout: Duration) -> Result<Vec<OnvifDevice>> {
+    validate_timeout(timeout)?;
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .context("cannot open ONVIF discovery socket")?;
     socket.set_multicast_ttl_v4(1)?;
@@ -187,26 +188,46 @@ struct HttpUrl {
     path: String,
 }
 fn parse_url(url: &str) -> Result<HttpUrl> {
+    parse_endpoint(url, false)
+}
+fn parse_endpoint(url: &str, allow_https: bool) -> Result<HttpUrl> {
+    crate::media::validate_network_url(url, "ONVIF endpoint URL")?;
     ensure!(
         !url.bytes().any(|b| b <= 32 || b == 127),
         "invalid ONVIF endpoint URL"
     );
+    let (protocol, rest) = url
+        .split_once("://")
+        .context("ONVIF endpoint must use http://")?;
     ensure!(
-        !url.starts_with("https://"),
+        allow_https || !protocol.eq_ignore_ascii_case("https"),
         "HTTPS ONVIF SOAP is not supported in this build; use a camera's HTTP ONVIF service endpoint (HTTPS media playback remains available through FFmpeg)"
     );
-    let rest = url
-        .strip_prefix("http://")
-        .context("ONVIF endpoint must use http://")?;
-    let (authority, path) = rest
-        .split_once('/')
-        .map(|(a, p)| (a, format!("/{p}")))
-        .unwrap_or((rest, "/".into()));
     ensure!(
-        !authority.is_empty()
-            && !authority.contains('@')
-            && !authority.contains('#')
-            && !path.contains('#'),
+        protocol.eq_ignore_ascii_case("http") || protocol.eq_ignore_ascii_case("https"),
+        "ONVIF endpoint must use http:// or https://"
+    );
+    let default_port = if protocol.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let path: String = if rest[end..].starts_with('?') {
+        format!("/{}", &rest[end..])
+    } else if end == rest.len() {
+        "/".into()
+    } else {
+        rest[end..].into()
+    };
+    ensure!(
+        !url.contains('#'),
+        "ONVIF endpoint URL must not contain a fragment; percent-encode a literal # in the service path"
+    );
+    ensure!(!authority.is_empty(), "ONVIF endpoint URL needs a host");
+    ensure!(
+        !authority.contains('@'),
         "ONVIF credentials must be supplied separately from the endpoint URL"
     );
     let (host, port) = if authority.starts_with('[') {
@@ -218,13 +239,13 @@ fn parse_url(url: &str) -> Result<HttpUrl> {
                 authority[end + 1..].is_empty(),
                 "invalid IPv6 endpoint port"
             );
-            80
+            default_port
         };
         (authority[1..end].to_string(), port)
     } else if let Some((host, port)) = authority.rsplit_once(':') {
         (host.to_string(), port.parse::<u16>()?)
     } else {
-        (authority.to_string(), 80)
+        (authority.to_string(), default_port)
     };
     ensure!(
         !host.is_empty() && port > 0,
@@ -366,6 +387,7 @@ fn request(
     authorization: Option<&str>,
     timeout: Duration,
 ) -> Result<HttpResponse> {
+    validate_timeout(timeout)?;
     let addresses = (url.host.as_str(), url.port)
         .to_socket_addrs()
         .context("cannot resolve ONVIF host")?
@@ -435,15 +457,7 @@ fn utc_timestamp(seconds: u64) -> String {
     )
 }
 fn security(credentials: &Credentials) -> Result<String> {
-    ensure!(
-        credentials.username.len() <= 1024 && credentials.password.len() <= 4096,
-        "ONVIF credentials exceed size limit"
-    );
-    ensure!(
-        !credentials.username.chars().any(char::is_control)
-            && !credentials.password.chars().any(char::is_control),
-        "ONVIF credentials must not contain control characters"
-    );
+    validate_credentials(credentials)?;
     let mut nonce = [0u8; 20];
     getrandom::fill(&mut nonce).map_err(|e| anyhow!("cannot generate ONVIF nonce: {e}"))?;
     let created = utc_timestamp(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
@@ -499,6 +513,28 @@ fn digest_fields(challenge: &str) -> Result<BTreeMap<String, String>> {
         }
     }
     Ok(result)
+}
+
+fn validate_timeout(timeout: Duration) -> Result<()> {
+    ensure!(
+        !timeout.is_zero() && Instant::now().checked_add(timeout).is_some(),
+        "ONVIF timeout must be positive and fit in the monotonic clock"
+    );
+    Ok(())
+}
+
+fn validate_credentials(credentials: &Credentials) -> Result<()> {
+    ensure!(!credentials.username.is_empty(), "ONVIF username is empty");
+    ensure!(
+        credentials.username.len() <= 1024 && credentials.password.len() <= 4096,
+        "ONVIF credentials exceed size limit"
+    );
+    ensure!(
+        !credentials.username.chars().any(char::is_control)
+            && !credentials.password.chars().any(char::is_control),
+        "ONVIF credentials must not contain control characters"
+    );
+    Ok(())
 }
 fn md5_hex(s: &str) -> String {
     format!("{:x}", Md5::digest(s.as_bytes()))
@@ -618,6 +654,17 @@ pub fn resolve(
     profile: Option<&str>,
     timeout: Duration,
 ) -> Result<Vec<OnvifStream>> {
+    validate_timeout(timeout)?;
+    parse_url(endpoint)?;
+    if let Some(credentials) = credentials {
+        validate_credentials(credentials)?;
+    }
+    if let Some(profile) = profile {
+        ensure!(
+            !profile.is_empty() && profile.len() <= 1024 && !profile.chars().any(char::is_control),
+            "ONVIF profile token needs 1..1024 bytes without control characters"
+        );
+    }
     let capabilities = soap(
         endpoint,
         DEVICE_NS,
@@ -702,6 +749,7 @@ pub fn resolve(
                 ),
                 "ONVIF camera returned an unsupported streaming URI"
             );
+            crate::media::validate_source(&uri)?;
             Ok(uri)
         })();
         let uri = match uri {
@@ -735,7 +783,9 @@ pub fn resolve(
 
 /// Recognize ONVIF locators before the general media URL handler.
 pub fn is_source(source: &str) -> bool {
-    source.starts_with("onvif:")
+    source
+        .get(..6)
+        .is_some_and(|protocol| protocol.eq_ignore_ascii_case("onvif:"))
 }
 fn percent_decode(text: &str) -> Result<String> {
     let mut bytes = Vec::with_capacity(text.len());
@@ -776,19 +826,34 @@ fn percent_encode(text: &str) -> String {
         .collect()
 }
 fn source_endpoint(source: &str) -> Result<(String, Option<Credentials>)> {
-    if let Some(endpoint) = source.strip_prefix("onvif:")
-        && (endpoint.starts_with("http://") || endpoint.starts_with("https://"))
-    {
-        parse_url(endpoint)?;
+    source_endpoint_impl(source, false)
+}
+fn source_endpoint_impl(source: &str, allow_https: bool) -> Result<(String, Option<Credentials>)> {
+    ensure!(
+        source.len() <= 16384 && !source.chars().any(|c| c.is_control() || c.is_whitespace()),
+        "invalid ONVIF source URL; percent-encode credentials and path values"
+    );
+    ensure!(
+        is_source(source),
+        "ONVIF source must use onvif:http://HOST/service or onvif://USER:PASS@HOST/service"
+    );
+    let endpoint = &source[6..];
+    if endpoint.split_once("://").is_some_and(|(protocol, _)| {
+        protocol.eq_ignore_ascii_case("http") || protocol.eq_ignore_ascii_case("https")
+    }) {
+        parse_endpoint(endpoint, allow_https)?;
         return Ok((endpoint.into(), None));
     }
-    let rest = source.strip_prefix("onvif://").context(
+    let rest = endpoint.strip_prefix("//").context(
         "ONVIF source must use onvif:http://HOST/service or onvif://USER:PASS@HOST/service",
     )?;
-    let (authority, path) = rest
-        .split_once('/')
-        .map(|(a, p)| (a, format!("/{p}")))
-        .unwrap_or((rest, "/onvif/device_service".into()));
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let path = if rest[end..].starts_with('?') || end == rest.len() {
+        format!("/onvif/device_service{}", &rest[end..])
+    } else {
+        rest[end..].to_owned()
+    };
     let (host, credentials) = if let Some((userinfo, host)) = authority.rsplit_once('@') {
         let (username, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
         let username = percent_decode(username)?;
@@ -804,8 +869,20 @@ fn source_endpoint(source: &str) -> Result<(String, Option<Credentials>)> {
         (authority, None)
     };
     let endpoint = format!("http://{host}{path}");
-    parse_url(&endpoint)?;
+    parse_endpoint(&endpoint, allow_https)?;
+    if let Some(credentials) = &credentials {
+        validate_credentials(credentials)?;
+    }
     Ok((endpoint, credentials))
+}
+
+/// Validate a camera locator before discovery, authentication or camera changes.
+pub fn validate_source(source: &str) -> Result<()> {
+    source_endpoint(source).map(|_| ())
+}
+/// Check locator syntax without testing whether this build can contact the service.
+pub fn validate_source_shape(source: &str) -> Result<()> {
+    source_endpoint_impl(source, true).map(|_| ())
 }
 fn authenticated_uri(uri: &str, credentials: Option<&Credentials>) -> Result<String> {
     let Some(credentials) = credentials else {
@@ -900,6 +977,84 @@ mod tests {
         let devices = parse_discovery(xml, "192.168.1.3:3702".parse().unwrap()).unwrap();
         assert_eq!(devices[0].uuid, "urn:uuid:test");
         assert_eq!(devices[0].addresses.len(), 2);
+    }
+    #[test]
+    fn locators_and_profiles_fail_before_network_or_credential_side_effects() {
+        for source in [
+            "onvif://camera",
+            "onvif://user:pass@camera:80/service",
+            "onvif://user%20name:p%40ss@camera",
+            "onvif:http://[::1]/service",
+        ] {
+            assert!(validate_source(source).is_ok(), "{source}");
+        }
+        for source in [
+            "onvif://",
+            "onvif://user:secret@:80/service",
+            "onvif://camera:0",
+            "onvif://camera:65536",
+            "onvif://[bad]/service",
+            "onvif://user:%0A@camera",
+            "onvif://user:pass@camera#fragment",
+            "onvif://user:p%QQ@camera",
+        ] {
+            assert!(validate_source(source).is_err(), "{source}");
+        }
+        let endpoint = parse_url("http://camera?mode=media").unwrap();
+        assert_eq!(endpoint.host, "camera");
+        assert_eq!(endpoint.path, "/?mode=media");
+        let (endpoint, _) = source_endpoint("onvif://camera?mode=media").unwrap();
+        assert_eq!(endpoint, "http://camera/onvif/device_service?mode=media");
+        let error = resolve(
+            "http://camera/service",
+            None,
+            Some(""),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("profile token"));
+        assert!(
+            discover(Duration::ZERO)
+                .unwrap_err()
+                .to_string()
+                .contains("positive")
+        );
+        assert!(discover(Duration::MAX).is_err());
+    }
+    #[test]
+    fn endpoint_schemes_ignore_case_and_fragments_have_specific_errors() {
+        let direct = "ONVIF:HTTP://Camera.Example:8080/Exact/%2f?Mode=Media";
+        assert!(is_source(direct));
+        let (endpoint, credentials) = source_endpoint(direct).unwrap();
+        assert_eq!(endpoint, "HTTP://Camera.Example:8080/Exact/%2f?Mode=Media");
+        assert!(credentials.is_none());
+        let parsed = parse_url(&endpoint).unwrap();
+        assert_eq!(parsed.host, "Camera.Example");
+        assert_eq!(parsed.authority, "Camera.Example:8080");
+        assert_eq!(parsed.path, "/Exact/%2f?Mode=Media");
+        let (endpoint, credentials) =
+            source_endpoint("OnViF://User:P%40ss@Camera.Example/Exact/%2f").unwrap();
+        assert_eq!(endpoint, "http://Camera.Example/Exact/%2f");
+        assert_eq!(credentials.unwrap().password, "P@ss");
+        for source in [
+            "onvif:http://camera/service#profile",
+            "ONVIF://User:secret@Camera/Service#profile",
+        ] {
+            let error = validate_source(source).unwrap_err().to_string();
+            assert!(error.contains("fragment"), "{error}");
+            assert!(!error.contains("secret"));
+            assert!(!error.contains("credentials"));
+        }
+        assert!(parse_url("http://camera/service%23profile").is_ok());
+        assert!(
+            validate_source("ONVIF:HTTPS://camera/service")
+                .unwrap_err()
+                .to_string()
+                .contains("not supported")
+        );
+        assert!(validate_source_shape("ONVIF:HTTPS://camera/service").is_ok());
+        assert!(validate_source_shape("onvif:https://camera:0/service").is_err());
+        assert!(validate_source_shape("onvif:https://camera/service#profile").is_err());
     }
     #[test]
     fn http_fixed_and_chunked_body_limits() {

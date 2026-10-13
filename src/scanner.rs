@@ -28,6 +28,11 @@ fn locator(selector: &str) -> Result<(&str, &str)> {
     Ok((backend, device))
 }
 
+/// Validate a driver locator without requiring that driver or build feature.
+pub fn validate_selector_shape(selector: &str) -> Result<()> {
+    locator(selector).map(|_| ())
+}
+
 fn host_backend() -> &'static str {
     match std::env::consts::OS {
         "linux" => "sane",
@@ -471,14 +476,18 @@ mod implementation {
         }
         fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
             ensure!(data.len() == 4, "unsupported scanner register size");
+            let value = u32::from_le_bytes(data.try_into()?);
             if address == 16 {
+                ensure!(
+                    value <= 1,
+                    "scanner acquisition control must be 0 (stop) or 1 (start)"
+                );
                 return Ok(());
             }
             ensure!(
                 !self.running && self.pending.is_none(),
                 "stop scanner acquisition before changing scan settings"
             );
-            let value = u32::from_le_bytes(data.try_into()?);
             match address {
                 20 => {
                     ensure!(
@@ -825,6 +834,24 @@ mod implementation {
             scanner.stop().unwrap();
             scanner.write_memory(20, &300u32.to_le_bytes()).unwrap();
             assert_eq!(scanner.dpi, 300);
+        }
+
+        #[test]
+        fn invalid_scan_settings_do_not_change_the_requested_scan() {
+            let mut scanner = Scanner::new("not a real device".into());
+            for (address, values) in [
+                (20, [0, 74, 601, u32::MAX]),
+                (24, [3, 4, 5, u32::MAX]),
+                (28, [3, 4, 5, u32::MAX]),
+                (16, [2, 3, 4, u32::MAX]),
+            ] {
+                for value in values {
+                    assert!(scanner.write_memory(address, &value.to_le_bytes()).is_err());
+                    assert_eq!((scanner.dpi, scanner.mode, scanner.source), (150, 0, 0));
+                    assert!(!scanner.running);
+                    assert!(scanner.pending.is_none());
+                }
+            }
         }
     }
 }
