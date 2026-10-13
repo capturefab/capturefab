@@ -4,6 +4,7 @@
 <key>CFBundleIdentifier</key><string>org.capturefab.desktop</string>
 <key>CFBundleName</key><string>Capturefab</string>
 <key>CFBundleExecutable</key><string>capturefab</string>
+<key>CFBundleIconFile</key><string>capturefab.icns</string>
 <key>NSCameraUsageDescription</key><string>Capturefab discovers and captures frames from the cameras you select.</string>
 <key>NSLocalNetworkUsageDescription</key><string>Capturefab finds and captures from scanners and GigE Vision, ONVIF and RTSP cameras on your local network.</string>
 <key>NSHighResolutionCapable</key><true/>

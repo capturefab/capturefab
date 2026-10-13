@@ -116,8 +116,11 @@
     };
     text('platform-hint', hints[os.value] || 'Choose the computer running capturefab. Architecture selection is required when the browser cannot identify it reliably.');
   };
-  for (const control of [os, arch, variant]) control.addEventListener('change', () => { if (control === arch) processorChosen = true; updateHint(); renderSelection(); });
-  document.querySelector('.platform-form').addEventListener('submit', (event) => event.preventDefault());
+  const hasDownloadPanel = Boolean(os && arch && variant);
+  if (hasDownloadPanel) {
+    for (const control of [os, arch, variant]) control.addEventListener('change', () => { if (control === arch) processorChosen = true; updateHint(); renderSelection(); });
+    document.querySelector('.platform-form').addEventListener('submit', (event) => event.preventDefault());
+  }
   const detectPlatform = async () => {
     const platform = navigator.userAgentData?.platform || navigator.platform || '';
     const ua = navigator.userAgent || '';
@@ -137,7 +140,7 @@
     } else if (/\baarch64\b|\barm64\b/i.test(ua) && os.value === 'linux') arch.value = 'aarch64';
     updateHint(); renderSelection();
   };
-  fetch('releases.json', { cache: 'no-cache' })
+  if (hasDownloadPanel) fetch('releases.json', { cache: 'no-cache' })
     .then((response) => { if (!response.ok) throw new Error('manifest unavailable'); return response.json(); })
     .then((data) => {
       if (data.schema_version !== 1 || !Array.isArray(data.releases)) throw new Error('unsupported manifest');
@@ -155,7 +158,7 @@
       clearDownload();
       tableNotice('Open all downloads or releases.json to inspect the available builds.');
     });
-  detectPlatform();
+  if (hasDownloadPanel) detectPlatform();
   const copy = async (value) => {
     if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(value);
     const area = document.createElement('textarea'); area.value = value; area.style.position = 'fixed'; area.style.opacity = '0';

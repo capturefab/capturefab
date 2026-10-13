@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#fafaf7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#181b20" media="(prefers-color-scheme: dark)">
+  <meta name="description" content="Search the Capturefab documentation: connect cameras and scanners, inspect features, capture images, schedule jobs, record video, save to S3 and automate the desktop or CLI.">
+  <meta property="og:title" content="Capturefab documentation">
+  <meta property="og:description" content="Practical guides, real app screenshots and a searchable reference for the camera workbench.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://capturefab.com/docs.html">
+  <meta property="og:image" content="https://capturefab.com/images/gui.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <title>Documentation — Capturefab</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="favicon.ico" sizes="16x16 32x32 48x48">
+  <link rel="icon" href="favicon-32.png" type="image/png" sizes="32x32">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml" sizes="any">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png" sizes="180x180">
+  <link rel="canonical" href="https://capturefab.com/docs.html">
+  <link rel="alternate" type="application/atom+xml" title="Capturefab releases" href="feed.xml">
+  <script src="app.js" defer></script>
+  <script src="docs.js" defer></script>
+</head>
+<body class="docs-page">
+  <a class="skip-link" href="#main">Skip to documentation</a>
+  <div class="shell">
+    <header class="site-header">
+      <a class="wordmark" href="index.html" aria-label="Capturefab home"><img class="logo" src="favicon.svg" width="128" height="128" alt="" aria-hidden="true">Capturefab</a>
+      <nav aria-label="Main navigation">
+        <a href="index.html">Product</a>
+        <a href="docs.html" aria-current="page">Documentation</a>
+        <a href="downloads.html">Downloads</a>
+        <a href="https://github.com/capturefab/capturefab">Source <span aria-hidden="true">↗</span></a>
+      </nav>
+      <a class="search-trigger" href="docs.html#search" aria-label="Search documentation"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span>Search docs</span><kbd>Ctrl K</kbd></a>
+    </header>
+    <main id="main" class="docs-layout">
+      <aside class="docs-sidebar" aria-label="Documentation navigation">
+        <div class="sidebar-group"><p>Start here</p><a href="#getting-started">Your first capture</a><a href="#installation">Install &amp; verify</a><a href="#workspace">The workspace</a></div>
+        <div class="sidebar-group"><p>Connect &amp; inspect</p><a href="#discovery">Find and connect cameras</a><a href="#sources">Source locators</a><a href="#scanners">Document scanners</a><a href="#features">Camera features</a><a href="#auto-exposure">Auto exposure &amp; frame rate</a><a href="#preview">Preview &amp; zoom</a><a href="#scopes">Histogram &amp; focus</a></div>
+        <div class="sidebar-group"><p>Capture &amp; save</p><a href="#capture">Capture images</a><a href="#scheduling">Scheduled captures</a><a href="#destinations">Folders, drives &amp; S3</a><a href="#uploads">Upload queue</a><a href="#storage">Storage &amp; retention</a><a href="#activity">Activity &amp; saved paths</a><a href="#undo-redo">Undo &amp; redo</a></div>
+        <div class="sidebar-group"><p>Record &amp; automate</p><a href="#recording">Record video</a><a href="#forwarding">Forward a stream</a><a href="#sessions">Sessions &amp; automation</a><a href="#cli-reference">CLI &amp; JSON reference</a></div>
+        <div class="sidebar-group"><p>Reference</p><a href="#shortcuts">Keyboard shortcuts</a><a href="#troubleshooting">Troubleshooting</a><a href="#architecture">Build, architecture &amp; licensing</a></div>
+        <a class="sidebar-source" href="https://github.com/capturefab/capturefab/issues">Report a documentation issue ↗</a>
+      </aside>
+      <div class="docs-content">
+        <details class="docs-mobile-nav">
+          <summary>Browse documentation topics</summary>
+          <nav aria-label="Documentation topics">
+            <a href="#getting-started">Your first capture</a><a href="#installation">Install &amp; verify</a><a href="#workspace">The workspace</a><a href="#discovery">Find and connect cameras</a><a href="#sources">Source locators</a><a href="#scanners">Document scanners</a><a href="#features">Camera features</a><a href="#auto-exposure">Auto exposure &amp; frame rate</a><a href="#preview">Preview &amp; zoom</a><a href="#scopes">Histogram &amp; focus</a><a href="#capture">Capture images</a><a href="#scheduling">Scheduled captures</a><a href="#destinations">Folders, drives &amp; S3</a><a href="#uploads">Upload queue</a><a href="#storage">Storage &amp; retention</a><a href="#activity">Activity &amp; saved paths</a><a href="#undo-redo">Undo &amp; redo</a><a href="#recording">Record video</a><a href="#forwarding">Forward a stream</a><a href="#sessions">Sessions &amp; automation</a><a href="#cli-reference">CLI &amp; JSON reference</a><a href="#shortcuts">Keyboard shortcuts</a><a href="#troubleshooting">Troubleshooting</a><a href="#architecture">Build, architecture &amp; licensing</a>
+          </nav>
+        </details>
+        <header class="docs-head">
+          <p class="eyebrow">Documentation</p>
+          <h1>Everything you need to capture.</h1>
+          <p class="lead">From the first connected camera to an automated capture pipeline. Follow a task, inspect a real app view, or find the exact command you need.</p>
+          <div id="search" class="docs-search">
+            <label for="docs-query">Search the documentation</label>
+            <input id="docs-query" type="search" placeholder="Search cameras, capture, S3, commands…" aria-controls="docs-results" autocomplete="off">
+            <p id="docs-search-status" class="search-status" role="status" aria-live="polite">Search features, tasks and CLI examples.</p>
+            <div id="docs-results" class="docs-results" hidden></div>
+          </div>
+          <noscript><p class="notice">Use the topic navigation or your browser’s Find command to search this page. Every guide is readable without JavaScript.</p></noscript>
+        </header>
+        <div class="docs-start-grid" aria-label="Popular documentation">
+          <a href="#getting-started"><span class="eyebrow">5 minute guide</span><strong>Save your first image</strong><span>Start with the simulator. No hardware needed.</span></a>
+          <a href="#discovery"><span class="eyebrow">Connect</span><strong>Find your camera</strong><span>Industrial cameras, webcams, streams and scanners.</span></a>
+          <a href="#sessions"><span class="eyebrow">Automate</span><strong>Control an open session</strong><span>The same camera, from the app and your scripts.</span></a>
+        </div>
+
+        <article class="doc-section" id="getting-started" data-doc-section data-doc-title="Your first capture" data-doc-category="Start here" data-doc-tags="quickstart,getting started,simulator,first image,demo">
+          <p class="eyebrow">Start here</p><h2>Your first capture</h2>
+          <p class="doc-summary">Open a camera, inspect a frame and save an image. The built-in pattern camera lets you follow along before connecting hardware.</p>
+          <ol>
+            <li><a href="downloads.html">Download</a> the desktop build for your operating system and processor, verify its checksum, then open <code>capturefab</code>.</li>
+            <li>Enable <strong>Include simulated cameras</strong> in the sidebar and choose a <strong>Pattern camera</strong>, or enter <code>sim:0</code> as the camera address. Connect it and start its stream.</li>
+            <li>Select the camera. Open <strong>Features</strong> to inspect its settings; open <strong>Capture</strong> to save a frame.</li>
+            <li>Set an <strong>Output path</strong> such as <code>first.png</code>, leave <strong>Frames</strong> at 1 and <strong>Format</strong> at PNG, then choose <strong>Capture &amp; save</strong>.</li>
+          </ol>
+          <p>Capture acquires a frame even when the preview is stopped. The path shown below the save button confirms where the file went. Existing files are never overwritten: choose a new name for each attempt.</p>
+          <div class="code-wrap"><pre><code># The same first capture from a terminal
+capturefab --camera sim:0 capture -o first.png
+
+# Inspect the simulator, then capture a sequence
+capturefab --camera sim:0 features
+capturefab --camera sim:0 capture -n 10 -o first-frames</code></pre><button class="copy-button" type="button" aria-label="Copy first capture commands">Copy</button></div>
+          <p class="doc-note">Screenshots show the current development app with simulator sources. Controls can differ by release.</p>
+        </article>
+
+        <article class="doc-section" id="installation" data-doc-section data-doc-title="Install and verify a release" data-doc-category="Start here" data-doc-tags="install,download,linux,macos,windows,arm64,checksum,headless">
+          <p class="eyebrow">Start here</p><h2>Install and verify a release</h2>
+          <p class="doc-summary">Choose a desktop build for the app and CLI, or a headless build for machines without a display. Match the installed operating system’s architecture.</p>
+          <p>The <a href="downloads.html">download page</a> lists published artifacts and their SHA-256 checksums. An empty release manifest means a release has not been published. Apple silicon uses ARM64; Intel and AMD PCs usually use x64. On Raspberry Pi and Jetson, match the installed OS: a 64-bit processor may run a 32-bit system.</p>
+          <div class="table-scroll"><table><caption>Verify the downloaded file</caption><thead><tr><th scope="col">System</th><th scope="col">Command</th></tr></thead><tbody><tr><td>Linux</td><td><code>sha256sum DOWNLOADED_FILE</code></td></tr><tr><td>macOS</td><td><code>shasum -a 256 DOWNLOADED_FILE</code></td></tr><tr><td>Windows PowerShell</td><td><code>Get-FileHash DOWNLOADED_FILE -Algorithm SHA256</code></td></tr></tbody></table></div>
+          <p>Compare the result with the checksum for that exact asset. On Linux or macOS, make a downloaded standalone executable runnable with <code>chmod +x ./capturefab</code>, then launch <code>./capturefab</code>. Put it on your <code>PATH</code> to use the shorter commands in these guides.</p>
+          <p>Release binaries bundle a separate FFmpeg executable. A separately installed Aravis, FFmpeg, libusb, vendor SDK or Python is not required. Operating system graphics and camera drivers are still required; document scanners have <a href="#scanners">platform driver requirements</a>.</p>
+          <div class="code-wrap"><pre><code>capturefab --version
+capturefab doctor --json
+# Optional: verify GitHub build provenance
+gh attestation verify DOWNLOADED_FILE --repo capturefab/capturefab</code></pre><button class="copy-button" type="button" aria-label="Copy installation checks">Copy</button></div>
+          <p>For a source build, see <a href="#architecture">Build, architecture &amp; licensing</a>.</p>
+        </article>
+
+        <article class="doc-section" id="workspace" data-doc-section data-doc-title="Understand the workspace" data-doc-category="Start here" data-doc-tags="workspace,desktop,overview,tiles,sidebar,inspector,appearance,multiple cameras">
+          <p class="eyebrow">Start here</p><h2>Understand the workspace</h2>
+          <p class="doc-summary">The camera list, preview and inspector keep connection, image and settings in view. Select a camera to make its controls active.</p>
+          <figure class="doc-figure"><a class="screenshot-link" href="images/docs/workspace.png" aria-label="Enlarge the desktop workspace screenshot"><img src="images/docs/workspace.png" width="2200" height="1400" loading="lazy" decoding="async" alt="Capturefab in dark appearance with four live Pattern camera previews, the connected camera list at left and the selected camera’s Features inspector at right"></a><figcaption>Four simulator cameras stream in the overview. The selected camera’s controls stay beside the preview; the left sidebar keeps the other sources within reach.</figcaption></figure>
+          <dl class="doc-definitions"><dt>Camera list</dt><dd>Find discovered, connected and recently used sources. Enter an IP address, stream URL or video file to connect directly.</dd><dt>Preview stage</dt><dd>See connected cameras together, then open one camera for a larger view. Streaming state, frame rate and errors belong to each camera.</dd><dt>Inspector</dt><dd><strong>Features</strong> edits camera settings, <strong>Capture</strong> saves images and schedules, and <strong>Forward</strong> records video or publishes a stream.</dd><dt>Activity</dt><dd>Read commands, warnings and errors for the selected camera, including commands sent from another terminal.</dd></dl>
+          <p>Press <kbd>Enter</kbd> to open the selected camera and <kbd>Esc</kbd> to return to all cameras when no input field has focus. Use the bottom toolbar to show or hide the camera list, settings and Activity. <a href="#shortcuts">Keyboard shortcuts</a> cover these actions.</p>
+          <p>The app follows your system’s light or dark appearance and remembers workspace settings and recent camera addresses. Addresses containing credentials or secret query parameters are not saved. You can override appearance at launch with <code>CAPTUREFAB_APPEARANCE=light</code> or <code>dark</code>.</p>
+        </article>
+
+        <article class="doc-section" id="discovery" data-doc-section data-doc-title="Find and connect cameras" data-doc-category="Connect and inspect" data-doc-tags="discover,connect,gige,usb,webcam,onvif,ip,address,serial,disconnect">
+          <p class="eyebrow">Connect &amp; inspect</p><h2>Find and connect cameras</h2>
+          <p class="doc-summary">Discovery lists network, USB3 Vision, host-driver and ONVIF cameras, plus platform scanners. Connect a result or enter a source directly.</p>
+          <figure class="doc-figure"><a class="screenshot-link" href="images/docs/cameras.png" aria-label="Enlarge the camera list screenshot"><img src="images/docs/cameras.png" width="480" height="1400" loading="lazy" decoding="async" alt="Camera sidebar with four connected Pattern cameras, a discovery control, an Add camera, IP or stream URL field, and the Include simulated cameras checkbox"></a><figcaption>The camera list keeps connected sources above the direct-address field. Enable <strong>Include simulated cameras</strong> to discover Pattern cameras without hardware.</figcaption></figure>
+          <ol><li>Run discovery from the camera list. Check any discovery warning before assuming a missing device is unavailable.</li><li>Choose the camera to connect. Select its tile or list entry to inspect it.</li><li>Start streaming for a continuous preview. Stop acquisition before changing a camera’s geometry or native video mode.</li></ol>
+          <div class="code-wrap"><pre><code>capturefab discover --json
+capturefab native --json           # webcams and capture cards
+capturefab onvif discover --json   # ONVIF devices on the LAN
+capturefab scanners --json
+capturefab --simulate discover    # include the pattern camera
+
+# Reuse an open desktop session
+capturefab sessions
+capturefab --session gui connect sim:0
+capturefab --session gui start</code></pre><button class="copy-button" type="button" aria-label="Copy discovery and connection commands">Copy</button></div>
+          <p>Camera selectors accept a discovered ID, unique serial or GigE IPv4 address. A GigE camera needs a reachable address on the camera’s subnet. USB3 Vision needs userspace access: USB permissions on Linux, an available IOKit interface on macOS and WinUSB on Windows. Native webcams may require the OS camera permission.</p>
+          <p>Use <code>--session NAME</code> when the camera is already connected in the app; opening a second connection can fail because camera control is often exclusive. <code>--camera ID</code> targets a connected camera without changing the visible selection. <code>select ID</code> changes the inspector selection; <code>disconnect</code> releases the addressed camera.</p>
+        </article>
+
+        <article class="doc-section" id="sources" data-doc-section data-doc-title="Camera and media source locators" data-doc-category="Connect and inspect" data-doc-tags="locator,rtsp,srt,rtmp,http,file,onvif,avfoundation,v4l2,dshow,video mode,hdmi,csi">
+          <p class="eyebrow">Connect &amp; inspect</p><h2>Camera and media source locators</h2>
+          <p class="doc-summary">A source locator tells Capturefab which camera, stream or file to open. Quote locators containing spaces or URL query parameters.</p>
+          <div class="table-scroll"><table><caption>Source examples</caption><thead><tr><th scope="col">Source</th><th scope="col">Locator</th><th scope="col">What to check</th></tr></thead><tbody>
+            <tr><td>Simulator</td><td><code>sim:0</code>, <code>sim:1</code></td><td>Built in; useful for learning and scripts.</td></tr>
+            <tr><td>GigE / USB3 Vision</td><td>Discovered ID, serial or <code>192.168.1.10</code></td><td>Network reachability or USB access.</td></tr>
+            <tr><td>macOS webcam</td><td><code>avfoundation:0</code></td><td>Use the ID returned by <code>native</code>.</td></tr>
+            <tr><td>Linux webcam</td><td><code>v4l2:/dev/video0</code></td><td>A supported host video driver and permission.</td></tr>
+            <tr><td>Windows webcam</td><td><code>dshow:video=Camera Name</code></td><td>Use the exact device name.</td></tr>
+            <tr><td>Network stream</td><td><code>rtsp://camera/live</code>, <code>srt://host:8890</code></td><td>Reachable stream and protocol support in FFmpeg.</td></tr>
+            <tr><td>ONVIF</td><td><code>onvif:http://camera/onvif/device_service</code></td><td>HTTP SOAP endpoint and resolvable media profile.</td></tr>
+            <tr><td>Video file</td><td><code>/path/to/clip.mp4</code></td><td>A readable file with a format FFmpeg can decode.</td></tr>
+          </tbody></table></div>
+          <h3>Choose a native camera mode</h3>
+          <p>Native locators accept <code>?size=1280x720&amp;fps=30</code>. Inspect <strong>Features</strong> for advertised <code>VideoMode</code> choices or set supported <code>Width</code>, <code>Height</code> and <code>AcquisitionFrameRate</code> before starting acquisition. Actual modes depend on the driver; V4L2 format listings do not establish frame-rate bounds.</p>
+          <div class="code-wrap"><pre><code>capturefab --camera 'avfoundation:0?size=1280x720&amp;fps=30' capture -o webcam.png
+capturefab --camera 'rtsp://camera/live' capture -o network.png
+capturefab --camera '/path/to/clip.mp4' capture -o video-frame.png
+capturefab onvif resolve 'http://camera/onvif/device_service' --username admin --json</code></pre><button class="copy-button" type="button" aria-label="Copy media source examples">Copy</button></div>
+          <p>For ONVIF, supply the password through <code>CAPTUREFAB_CAMERA_PASSWORD</code>. Authenticated locators also use <code>onvif://USER:PASS@HOST/onvif/device_service</code>; percent-encode reserved characters. UI and status redact credentials, but your shell may still record typed secrets. HTTPS SOAP and Media2-only devices are currently unsupported.</p>
+          <p>HDMI capture devices appear through their host video driver. CSI cameras need an accessible supported OS video device; libcamera-only pipelines and proprietary tethering protocols are not implemented. <code>capturefab compatibility MODEL</code> provides connection guidance; it does not certify a camera.</p>
+        </article>
+
+        <article class="doc-section" id="scanners" data-doc-section data-doc-title="Scan documents" data-doc-category="Connect and inspect" data-doc-tags="scanner,scan,document,sane,wia,imagecapturecore,dpi,feeder,flatbed,pages">
+          <p class="eyebrow">Connect &amp; inspect</p><h2>Scan documents</h2>
+          <p class="doc-summary">Scanners use the same capture, preview, destination, schedule and storage tools. Each capture requests one page.</p>
+          <p>Discover a scanner, connect its full ID and choose <strong>Scan resolution</strong>, <strong>Scan mode</strong> and <strong>Scan source</strong> in Features. Open Capture and choose <strong>Scan &amp; save</strong>. Connecting or starting acquisition does not scan a page.</p>
+          <div class="table-scroll"><table><caption>Scanner controls</caption><thead><tr><th scope="col">Feature</th><th scope="col">Values</th><th scope="col">Default</th></tr></thead><tbody><tr><td><code>ScanResolution</code></td><td>75–600 dpi</td><td>150</td></tr><tr><td><code>ScanMode</code></td><td><code>Color</code>, <code>Gray</code>, <code>Lineart</code></td><td>Color</td></tr><tr><td><code>ScanSource</code></td><td><code>Default</code>, <code>Flatbed</code>, <code>Feeder</code></td><td>Default, leaving the driver’s source unchanged</td></tr></tbody></table></div>
+          <div class="code-wrap"><pre><code>capturefab scanners --json
+# Replace DEVICE with the full returned scanner ID
+capturefab --camera 'scanner:sane:DEVICE' --timeout-ms 60000 capture \
+  --set ScanResolution=300 --set ScanMode=Gray --set ScanSource=Feeder \
+  -n 5 -o pages</code></pre><button class="copy-button" type="button" aria-label="Copy scanner commands">Copy</button></div>
+          <p>Linux uses installed SANE <code>scanimage</code> and backends; <code>CAPTUREFAB_SCANIMAGE</code> can select its path. Windows uses a WIA driver through Windows PowerShell. macOS uses a bundled ImageCaptureCore helper and a compatible driver. Drivers may reject settings they do not support; Capturefab does not silently substitute another mode. Use <code>Default</code> for a SANE driver with source names other than Flatbed or Automatic Document Feeder.</p>
+          <p>The GUI’s scanner timeout starts at 60 seconds; use <code>--timeout-ms 60000</code> for CLI scans. A timeout, stop or disconnect terminates acquisition. Multi-page captures save separate images, not one PDF. Samples normalize to 8-bit RGB or grayscale with a 128 MiB page limit. PDF assembly, OCR, forwarding and camera auto exposure are not provided. Physical scanner compatibility has not been validated.</p>
+        </article>
+
+        <article class="doc-section" id="features" data-doc-section data-doc-title="Inspect and change camera features" data-doc-category="Connect and inspect" data-doc-tags="features,genicam,exposure,gain,pixel format,width,height,apply,read only,locked,trigger">
+          <p class="eyebrow">Connect &amp; inspect</p><h2>Inspect and change camera features</h2>
+          <p class="doc-summary">The Features panel reads the camera’s live feature map, including current values, access, choices, bounds and units.</p>
+          <figure class="doc-figure"><a class="screenshot-link" href="images/docs/features.png" aria-label="Enlarge the Features inspector screenshot"><img src="images/docs/features.png" width="632" height="1304" loading="lazy" decoding="async" alt="Features inspector showing Manual and Auto exposure controls, feature search, image settings locked while streaming, and editable Acquisition Frame Rate, Exposure Time and Gain values with bounds"></a><figcaption>The Features inspector shows what can be changed now. Image settings are locked during this stream, while exposure, gain and frame-rate fields remain available.</figcaption></figure>
+          <ol><li>Select a connected camera and open <strong>Features</strong>. Search by feature name, display label or description.</li><li>For a numeric or text field, edit the value and press <kbd>Enter</kbd> or choose <strong>Apply</strong>. Choice menus and checkboxes apply their changes directly.</li><li>Read back the accepted value. A camera may round a value to its supported increment. A rejected write displays its reason at the field.</li></ol>
+          <p>Features are grouped into <strong>Image</strong>, <strong>Acquisition</strong>, <strong>Device</strong>, <strong>Transport</strong> and <strong>Other</strong>. Exact names and availability depend on the source. Hover a label for its underlying feature name and description. The <strong>Locked while streaming</strong> banner offers <strong>Stop</strong> for settings that acquisition currently locks.</p>
+          <div class="code-wrap"><pre><code>capturefab --camera sim:0 features --filter Exposure
+capturefab --camera sim:0 get Width Height PixelFormat ExposureTime
+capturefab --camera sim:0 set ExposureTime=5000 Gain=0
+# A camera command, when the device exposes it
+capturefab --session bench execute TriggerSoftware</code></pre><button class="copy-button" type="button" aria-label="Copy feature inspection commands">Copy</button></div>
+          <p>CLI assignments run in the given order; a later failure does not roll back earlier successful writes. Inspect features first and read back important settings. A manual edit to a feature managed by Auto switches that camera to manual. Reversible acknowledged settings can use <a href="#undo-redo">Undo and Redo</a>.</p>
+        </article>
+
+        <article class="doc-section" id="auto-exposure" data-doc-section data-doc-title="Tune auto exposure and frame rate" data-doc-category="Connect and inspect" data-doc-tags="auto,manual,exposure,gain,white balance,frame rate,balance,revert,stable,limited">
+          <p class="eyebrow">Connect &amp; inspect</p><h2>Tune auto exposure and frame rate</h2>
+          <p class="doc-summary">Enable Auto for one camera, then choose the balance between image quality and frame rate. Cameras start in manual mode.</p>
+          <p>In Features, use the <strong>Exposure</strong> card to switch from <strong>Manual</strong> to <strong>Auto</strong>. Move the slider toward <strong>Quality</strong> for longer exposure with less gain, or toward <strong>Frame rate</strong> for shorter exposure with more gain. The midpoint is the initial balance, 0.5.</p>
+          <p>Auto prefers the camera’s own automatic exposure, gain and white balance controls; otherwise Capturefab adjusts exposure and gain. It may raise frame-rate or GigE throughput limits when the link has headroom, then backs off on packet loss. Expand <strong>Auto changes</strong> to see changes and their reasons. <strong>Stable</strong> and <strong>Limited</strong> are settled states; <strong>Waiting</strong> means acquisition is stopped.</p>
+          <div class="code-wrap"><pre><code>capturefab --session bench auto --balance quality
+capturefab --session bench auto --balance 0.5
+capturefab --session bench status --json
+capturefab --session bench manual
+capturefab --session bench manual --revert
+
+capturefab --camera sim:0 capture --auto --balance 0.25 -o tuned.png</code></pre><button class="copy-button" type="button" aria-label="Copy auto exposure commands">Copy</button></div>
+          <p><code>manual</code> disables camera auto functions and holds their current values. <code>manual --revert</code> restores the settings Auto changed. Disconnecting, ending a direct command or closing the session also restores those settings where possible. In a persistent session, <code>capture --auto</code> leaves Auto enabled after the capture.</p>
+          <p>For <code>capture --auto</code>, repeated <code>--set</code> assignments apply first. Capture waits briefly for exposure to settle, bounded by half the transport timeout and at most 3 seconds; it can still save before settling. Inspect <code>result.auto.state</code> in JSON when that matters.</p>
+        </article>
+
+        <article class="doc-section" id="preview" data-doc-section data-doc-title="Preview, zoom and compare cameras" data-doc-category="Connect and inspect" data-doc-tags="preview,zoom,fit,actual pixels,image mode,fullscreen,multiple cameras,streaming">
+          <p class="eyebrow">Connect &amp; inspect</p><h2>Preview, zoom and compare cameras</h2>
+          <p class="doc-summary">Keep the overview for multiple live cameras, or open one camera to inspect its image at a useful scale.</p>
+          <p>Connect more than one source to show a grid. Selecting a camera changes the inspector; opening it gives the preview more room. Press <kbd>Esc</kbd> outside a field to return to the grid. Each camera acquires independently, so selecting another camera does not stop its stream.</p>
+          <ul><li><strong>Fit</strong> centers the entire frame in the available area. Use <kbd>⌘0</kbd> on macOS or <kbd>Ctrl+0</kbd> elsewhere.</li><li><strong>Actual pixels</strong> shows the image at 1:1 with <kbd>⌥⌘0</kbd> or <kbd>Ctrl+Alt+0</kbd>.</li><li><strong>Zoom in / out</strong> uses <kbd>⌘+</kbd> / <kbd>⌘−</kbd> or <kbd>Ctrl+=</kbd> / <kbd>Ctrl+−</kbd>.</li><li><strong>Image only</strong> hides workspace panels. Press <kbd>F</kbd> when no field has focus, then press it again to return.</li></ul>
+          <p>The live preview favors the latest frame instead of building a queue when rendering falls behind. Preview scale changes the display, not the capture’s saved resolution. The default session supports 16 connected cameras; <code>CAPTUREFAB_MAX_CAMERAS</code> accepts 1–64.</p>
+          <p>If the preview fails, open the camera’s Activity details. <a href="#troubleshooting">Troubleshooting</a> covers frame timeouts, graphics fallback and transport diagnostics.</p>
+        </article>
+
+        <article class="doc-section" id="scopes" data-doc-section data-doc-title="Read the histogram and focus scores" data-doc-category="Connect and inspect" data-doc-tags="histogram,focus,region,roi,sharpness,laplacian,tenengrad,brenner,variance,shadows,highlights,peak">
+          <p class="eyebrow">Connect &amp; inspect</p><h2>Read the histogram and focus scores</h2>
+          <p class="doc-summary">Check clipped shadows and highlights, then use a movable focus region to compare sharpness while adjusting the lens.</p>
+          <figure class="doc-figure"><a class="screenshot-link" href="images/docs/scopes.png" aria-label="Enlarge the histogram and focus screenshot"><img src="images/docs/scopes.png" width="1316" height="804" loading="lazy" decoding="async" alt="Simulator preview with an outlined focus region, a Histogram card showing mean, shadows and highlights, and a Focus card with Laplacian, Tenengrad, Brenner and Variance metrics"></a><figcaption>The histogram measures intensity and clipping. The focus card tracks sharpness within the outlined region and compares its current score with the observed peak.</figcaption></figure>
+          <h3>Histogram</h3>
+          <p>Press <kbd>H</kbd> outside an input field to show the <strong>Histogram</strong>. It displays <strong>Mean</strong> intensity, <strong>Shadows</strong> crushed to black and <strong>Highlights</strong> with a blown-out channel. Use it alongside Exposure and Gain; the histogram itself does not change camera settings.</p>
+          <h3>Focus region</h3>
+          <ol><li>Press <kbd>R</kbd> outside a field to show the focus region and score.</li><li>Move and resize the region over useful detail in the image.</li><li>Choose a metric and adjust the lens to raise the score. Compare the trend and <strong>% of peak</strong> under similar lighting and scene content.</li><li>Use <strong>Reset peak</strong> after changing the scene or starting a new adjustment.</li></ol>
+          <div class="table-scroll"><table><caption>Focus metrics</caption><thead><tr><th scope="col">Metric</th><th scope="col">What it measures</th></tr></thead><tbody><tr><td>Laplacian</td><td>Variance of the Laplacian; responds to fine edges.</td></tr><tr><td>Tenengrad</td><td>Squared Sobel gradient; useful on strong edges and in noise.</td></tr><tr><td>Brenner</td><td>Squared differences two pixels apart; favors fine texture.</td></tr><tr><td>Variance</td><td>Normalized intensity variance; a contrast measure, gentle on noise.</td></tr></tbody></table></div>
+          <p>The score is a relative image measurement, not a lens calibration or autofocus command. A change in subject, lighting, gain or region can change it independently of focus.</p>
+        </article>
+
+        <article class="doc-section" id="capture" data-doc-section data-doc-title="Capture images and sequences" data-doc-category="Capture and save" data-doc-tags="capture,save,png,jpeg,jpg,raw,pgm,ppm,sequence,frames,template,stdout,timeout">
+          <p class="eyebrow">Capture &amp; save</p><h2>Capture images and sequences</h2>
+          <p class="doc-summary">Save one complete frame to a file, multiple frames to a directory, or a named sequence using a frame template.</p>
+          <figure class="doc-figure"><a class="screenshot-link" href="images/docs/capture.png" aria-label="Enlarge the Capture panel screenshot"><img src="images/docs/capture.png" width="632" height="1304" loading="lazy" decoding="async" alt="Capture panel with Save to, output path, Frames, Format and Timeout controls, the Capture and save button, a scheduling checkbox and expanded Storage and retention limits"></a><figcaption>Set the destination, output name and image format together. The same panel keeps storage limits beside the capture controls.</figcaption></figure>
+          <ol><li>Open <strong>Capture</strong> for the selected camera.</li><li>Choose <strong>Save to</strong> and enter an <strong>Output path</strong>. Set <strong>Frames</strong>, <strong>Format</strong> and <strong>Timeout</strong>.</li><li>Choose <strong>Capture &amp; save</strong>. Check the saved path or error below the button.</li></ol>
+          <div class="code-wrap"><pre><code>capturefab --camera sim:0 capture -o frame.png
+capturefab --camera sim:0 capture -n 10 -o frames
+capturefab --camera sim:0 capture -n 10 -o 'run-{frame}.png'
+capturefab --camera sim:0 capture --format jpeg -o frame.jpg
+capturefab --camera sim:0 capture --set Width=640 --set Height=480 -o configured.png
+
+# One binary image to stdout; do not combine with --json
+capturefab --camera sim:0 capture -o - --format ppm &gt; frame.ppm</code></pre><button class="copy-button" type="button" aria-label="Copy image capture commands">Copy</button></div>
+          <div class="table-scroll"><table><caption>Image formats</caption><thead><tr><th scope="col">Format</th><th scope="col">Use</th></tr></thead><tbody><tr><td><code>png</code></td><td>Default lossless image output.</td></tr><tr><td><code>jpeg</code> / <code>jpg</code></td><td>Smaller lossy stills, quality 90; requires the JPEG build feature.</td></tr><tr><td><code>raw</code></td><td>Preserve frame bytes when image conversion is unsupported or unnecessary.</td></tr><tr><td><code>pgm</code></td><td>Portable grayscale output.</td></tr><tr><td><code>ppm</code></td><td>Portable RGB output.</td></tr></tbody></table></div>
+          <p><code>--timeout-ms</code> is the per-frame transport deadline, initially 2,000 ms, from 1 to 60,000 ms. <code>--count</code> accepts 1–100,000 frames. Capture never silently replaces an existing output file; use a new name, directory or template. For delayed and repeated captures, see <a href="#scheduling">Scheduled captures</a>.</p>
+        </article>
+
+        <article class="doc-section" id="scheduling" data-doc-section data-doc-title="Schedule captures and timelapses" data-doc-category="Capture and save" data-doc-tags="schedule,jobs,timelapse,interval,delay,at,timestamp,timezone,cancel,scheduled captures">
+          <p class="eyebrow">Capture &amp; save</p><h2>Schedule captures and timelapses</h2>
+          <p class="doc-summary">Start later or capture at intervals. Each running session exposes job progress, the next frame time and cancellation.</p>
+          <figure class="doc-figure"><a class="screenshot-link" href="images/docs/schedule.png" aria-label="Enlarge the scheduled capture controls screenshot"><img src="images/docs/schedule.png" width="570" height="358" loading="lazy" decoding="async" alt="Enabled Capture on a schedule checkbox, Start after set to 5 seconds, Frame interval set to 60 seconds, and the Schedule capture button"></a><figcaption>Enable scheduling to reveal the delay and interval. This example starts after 5 seconds and captures every 60 seconds.</figcaption></figure>
+          <ol><li>In Capture, set the output, frame count and format.</li><li>Enable <strong>Capture on a schedule</strong>. Enter <strong>Start after</strong> and <strong>Frame interval</strong> in seconds.</li><li>Choose <strong>Schedule capture</strong>. The <strong>Scheduled jobs</strong> section shows progress and a <strong>Stop</strong> button for pending or running work.</li></ol>
+          <div class="code-wrap"><pre><code># Direct commands wait for their job to finish
+capturefab --camera sim:0 capture --delay 30s -o later.png
+capturefab --camera sim:0 capture --interval 10s -n 360 -o timelapse
+
+# Existing sessions return a job ID
+capturefab --session bench capture --delay 5s --interval 1m -n 60 -o timed-frames
+capturefab --session bench jobs --json
+capturefab --session bench cancel 1
+
+# Use a future timestamp with an explicit timezone
+capturefab --session bench capture --at 2026-12-01T09:00:00-05:00 \
+  --interval 1m -n 100 -o morning</code></pre><button class="copy-button" type="button" aria-label="Copy scheduling commands">Copy</button></div>
+          <p><code>--at</code> and <code>--delay</code> are alternatives. Durations accept <code>ms</code>, <code>s</code>, <code>m</code>, <code>h</code>, <code>d</code>, or plain seconds. The frame count bounds a timelapse. Every acquisition still has a bounded transport timeout.</p>
+          <p>Keep the GUI, headless session or direct command running: schedules do not survive process exit. Stopping acquisition with <code>stop</code> cancels pending capture jobs on that camera. A stopped or failed job remains visible with its progress and error.</p>
+        </article>
+
+        <article class="doc-section" id="destinations" data-doc-section data-doc-title="Save to folders, external drives and S3" data-doc-category="Capture and save" data-doc-tags="destination,folder,drive,external,removable,network share,s3,r2,b2,minio,aws,bucket,credentials">
+          <p class="eyebrow">Capture &amp; save</p><h2>Save to folders, external drives and S3</h2>
+          <p class="doc-summary">Save a named destination once, then reuse it for images, schedules and local video recordings.</p>
+          <figure class="doc-figure"><a class="screenshot-link" href="images/docs/destinations.png" aria-label="Enlarge the destination manager screenshot"><img src="images/docs/destinations.png" width="1144" height="704" loading="lazy" decoding="async" alt="Destinations manager with example archive folder and line-1 S3 bucket entries, Edit and Remove actions, and Add folder and Add S3 bucket buttons"></a><figcaption>Saved folders and buckets share one destination list. <code>archive</code> and <code>line-1</code> are demonstration destinations in this screenshot.</figcaption></figure>
+          <ol><li>Open <strong>Manage…</strong> beside <strong>Save to</strong> in Capture or Forward.</li><li>Choose <strong>Add folder…</strong> for a local, external or network folder, or <strong>Add S3 bucket…</strong> for S3-compatible storage.</li><li>Enter a name and destination details. Use <strong>Test</strong> to check access, then <strong>Save</strong>.</li><li>Select the saved destination in <strong>Save to</strong>. Enter the file, folder or <code>{frame}</code> template relative to that destination.</li></ol>
+          <div class="code-wrap"><pre><code>capturefab volumes --json
+capturefab destination add-folder archive '/path/to/captures'
+capturefab destination list --json
+capturefab destination test archive
+capturefab --camera sim:0 capture --destination archive -o run-1 -n 10
+
+# Use an existing AWS profile; no secret in the command
+capturefab destination add-s3 cloud --bucket YOUR_BUCKET \
+  --region us-east-1 --prefix captures/ --profile YOUR_PROFILE
+capturefab --camera sim:0 capture --destination cloud -o frame.png</code></pre><button class="copy-button" type="button" aria-label="Copy destination commands">Copy</button></div>
+          <h3>Bucket credentials and providers</h3>
+          <p>Choose an access key kept in the OS keychain, an AWS shared-credentials profile, or environment credentials from the uploading process. Destination settings contain no secret keys. The CLI accepts <code>--access-key-id</code> with <code>--secret-stdin</code> to read the secret from stdin; keep secrets out of command lines.</p>
+          <p>For non-AWS services, set the service <code>--endpoint</code>, correct <code>--region</code> and, when required, <code>--path-style</code>. A <code>--prefix</code> adds a bucket key prefix. <code>--keep-local</code> retains local copies after verified upload. S3 operations require a build with the <code>s3</code> feature.</p>
+          <p>Mounted drives appear as shortcuts in the picker. If an external drive is absent, Capturefab refuses to write beneath its unmounted mount point. Removing a destination does not remove its files. <code>destination remove NAME --forget-secret</code> also removes its saved keychain secret.</p>
+        </article>
+
+        <article class="doc-section" id="uploads" data-doc-section data-doc-title="Monitor and recover uploads" data-doc-category="Capture and save" data-doc-tags="uploads,queue,retry,failed,pending,uploader,forget,wait,s3,local copies">
+          <p class="eyebrow">Capture &amp; save</p><h2>Monitor and recover uploads</h2>
+          <p class="doc-summary">Bucket captures finish locally before entering a persistent upload queue. Failed uploads retain their local files and can be retried.</p>
+          <p>The destination picker shows waiting or failed uploads and a <strong>Retry</strong> action. Keep a GUI or <code>serve</code> session running to drain the queue. One process at a time holds the uploader lock. A queued file is protected from storage retention until its upload succeeds.</p>
+          <div class="code-wrap"><pre><code>capturefab uploads --json
+capturefab uploads retry
+capturefab uploads retry UPLOAD_ID
+capturefab uploads wait --timeout 10m --json
+# Remove a failed queue entry while keeping its local file
+capturefab uploads forget UPLOAD_ID</code></pre><button class="copy-button" type="button" aria-label="Copy upload recovery commands">Copy</button></div>
+          <p>Status reports <code>pending</code>, <code>uploading</code>, <code>failed</code> entries with their errors, uploaded totals and whether an uploader is running. Direct <code>--camera</code> captures to a bucket wait for their uploads and include <code>uploads</code> in the result. A persistent session returns local capture results with <code>queued_uploads</code>; inspect the queue for remote completion.</p>
+          <p>If uploading fails, test the destination, check its bucket, endpoint, region and credentials, then retry. Existing remote objects are not overwritten; a key collision must be resolved with a new output name. Use <code>--keep-local</code> on a bucket destination when completed uploads should leave a local archive.</p>
+        </article>
+
+        <article class="doc-section" id="storage" data-doc-section data-doc-title="Set storage budgets and retention" data-doc-category="Capture and save" data-doc-tags="storage,quota,budget,retention,disk full,delete oldest,max space,max files,max age,storage_full">
+          <p class="eyebrow">Capture &amp; save</p><h2>Set storage budgets and retention</h2>
+          <p class="doc-summary">Capturefab tracks the files it owns across output folders and processes. The initial shared ceiling is 10 GiB and 10,000 files.</p>
+          <p>Open <strong>Storage &amp; retention</strong> in Capture or Forward. <strong>Disk budget</strong> and <strong>File limit</strong> bound owned output. <strong>At capacity</strong> chooses stopping or deleting the oldest eligible files. <strong>Limit capture age</strong> and <strong>Keep for</strong> add age retention when deletion is enabled.</p>
+          <div class="code-wrap"><pre><code>capturefab storage --json
+capturefab storage configure --max-space 2GiB --max-files 1000 --on-full stop
+capturefab --camera sim:0 capture -n 100 -o frames --max-space 1GiB
+
+# Explicitly allow deletion of verified Capturefab-owned files
+capturefab --camera sim:0 capture --interval 1m -n 10000 -o history \
+  --max-space 1GiB --delete-oldest --max-age 7d
+# Remove a saved age limit
+capturefab storage configure --no-max-age</code></pre><button class="copy-button" type="button" aria-label="Copy storage configuration commands">Copy</button></div>
+          <p><code>storage configure</code> persists the global policy across restarts; per-command limits can lower its ceiling. Active recording reservations count toward the same budget. A video file also has a separate maximum size, initially 512 MiB. The budget covers Capturefab capture and recording data, not unrelated files on the disk.</p>
+          <p>The default stop policy reports <code>storage_full</code>, exit code 6. Deletion is explicit: <code>--delete-oldest</code> only removes completed owned files whose identity and SHA-256 still match. User files, modified captures, replacements and active recordings are protected. Age retention runs when allocating new captures. Queued uploads are held back from retention.</p>
+          <p>Processes sharing <code>CAPTUREFAB_SESSION_DIR</code> share the ledger and budget. Changing that directory creates a separate ledger. Missing owned files release their recorded usage; crash-released OS locks allow interrupted reservations to be reconciled.</p>
+        </article>
+
+        <article class="doc-section" id="activity" data-doc-section data-doc-title="Find saved paths and inspect Activity" data-doc-category="Capture and save" data-doc-tags="activity,log,errors,details,saved path,copy log,capture history,events">
+          <p class="eyebrow">Capture &amp; save</p><h2>Find saved paths and inspect Activity</h2>
+          <p class="doc-summary">Confirm the latest saved output under the capture button and use Activity for the command history and full error details.</p>
+          <p>After a successful capture, the line below <strong>Capture &amp; save</strong> shows the saved filename or sequence folder and the named destination, when used. Hover for the path or use its copy button. For scheduled output, check the job’s path and frame count in <strong>Scheduled jobs</strong>.</p>
+          <p>Open <strong>Activity</strong> from the bottom toolbar, or press <kbd>⌘J</kbd> / <kbd>Ctrl+J</kbd>. Events show command results, warnings and errors for the selected camera. Error notices offer <strong>Details</strong>; an error on another camera’s tile can select that camera and open its full Activity message.</p>
+          <p>Use <strong>Copy log</strong> to include the actual error in a bug report. Commands sent through a CLI session appear in the same app log, so you can see what automation changed. The Activity log is session feedback; the storage ledger tracks owned files and usage.</p>
+          <div class="code-wrap"><pre><code>capturefab --session bench status --json
+capturefab --session bench jobs --json
+capturefab storage --json
+capturefab uploads --json</code></pre><button class="copy-button" type="button" aria-label="Copy status commands">Copy</button></div>
+        </article>
+
+        <article class="doc-section" id="undo-redo" data-doc-section data-doc-title="Undo and redo changes" data-doc-category="Capture and save" data-doc-tags="undo,redo,history,reversible,editing,settings,ctrl z,command z,conflict">
+          <p class="eyebrow">Capture &amp; save</p><h2>Undo and redo changes</h2>
+          <p class="doc-summary">Undo edits in the desktop and acknowledged reversible camera changes. Each connected camera shares its change history with session clients.</p>
+          <figure class="doc-figure"><a class="screenshot-link" href="images/docs/history.png" aria-label="Enlarge the Undo and Redo controls screenshot"><img src="images/docs/history.png" width="352" height="78" loading="lazy" decoding="async" alt="Destination manager footer showing Undo with the Command Z shortcut and a disabled Redo with Shift Command Z"></a><figcaption>The destination editor also offers Undo and Redo. This macOS view shows the shortcuts beside each action; Redo is disabled when no undone change is available.</figcaption></figure>
+          <p>Use the bottom toolbar’s Undo and Redo controls, <kbd>⌘Z</kbd> / <kbd>⇧⌘Z</kbd> on macOS, or <kbd>Ctrl+Z</kbd> / <kbd>Ctrl+Shift+Z</kbd> elsewhere. <kbd>Ctrl+Y</kbd> also redoes outside macOS. Continuous edits are grouped into one change; a new change clears redo.</p>
+          <div class="code-wrap"><pre><code>capturefab --session bench --camera sim:0 history --json
+capturefab --session bench --camera sim:0 undo --json
+capturefab --session bench --camera sim:0 redo --json</code></pre><button class="copy-button" type="button" aria-label="Copy undo and redo commands">Copy</button></div>
+          <p>Camera history covers reversible feature writes, auto/manual and streaming changes. <code>status.history</code> and <code>cameras[].history</code> expose the next undo/redo labels, or <code>null</code>. History is bounded and lasts for the camera connection. Replay checks the camera state; a conflict or failed replay keeps the entry for inspection.</p>
+          <p>Capture files, uploads, recording, schedules, connection changes, arbitrary camera commands and raw memory writes have external effects that camera history cannot reverse. Stopping a stream with schedules or forwarding is also excluded. Inspect the next label before undoing a change made by another session client.</p>
+        </article>
+
+        <article class="doc-section" id="recording" data-doc-section data-doc-title="Record bounded video files" data-doc-category="Record and automate" data-doc-tags="record,recording,video,mkv,mp4,mov,ts,webm,codec,encoder,max file size,duration">
+          <p class="eyebrow">Record &amp; automate</p><h2>Record bounded video files</h2>
+          <p class="doc-summary">The Forward panel also records to a local video file. A shared storage budget and per-file size limit bound its output.</p>
+          <ol><li>Open <strong>Forward</strong> and choose <strong>Save to</strong>.</li><li>Enter a recording filename such as <code>clip.mkv</code> in <strong>Stream URL or file</strong>.</li><li>Choose <strong>Codec</strong>, <strong>Encoder</strong>, <strong>Frame rate</strong>, <strong>Bitrate</strong> and <strong>Maximum file</strong>.</li><li>Choose <strong>Start forwarding</strong>. Stop forwarding to finish the file.</li></ol>
+          <div class="code-wrap"><pre><code># record is an alias of forward
+capturefab --camera sim:0 record -o clip.mkv --duration 30s \
+  --codec h264 --encoder auto --fps 30 --bitrate 4M --max-file-size 512MiB
+
+# A persistent session records until stopped
+capturefab --session bench record -o clip.mp4 --destination archive
+capturefab --session bench stop-forward</code></pre><button class="copy-button" type="button" aria-label="Copy recording commands">Copy</button></div>
+          <p>Local <code>.mkv</code>, fragmented <code>.mp4</code> / <code>.mov</code>, <code>.ts</code> and suitable <code>.webm</code> files use a bounded writer. Select a codec that the container accepts. <code>--duration</code> limits a direct command; with <code>--session</code>, recording continues until <code>stop-forward</code>. The default codec is H.264, frame rate 30 fps, bitrate <code>4M</code>, and maximum file size 512 MiB.</p>
+          <p>Encoder <code>auto</code> probes usable hardware before falling back to software. Enter an FFmpeg encoder name to choose explicitly. Use <code>doctor</code> and <code>ffmpeg</code> to inspect this machine and build. A saved S3 destination queues the finished recording for upload.</p>
+        </article>
+
+        <article class="doc-section" id="forwarding" data-doc-section data-doc-title="Forward a stream to a recorder" data-doc-category="Record and automate" data-doc-tags="forward,rtsp,srt,rtmp,udp,http,mediamtx,nvr,encoder,hardware,hls,stop forward">
+          <p class="eyebrow">Record &amp; automate</p><h2>Forward a stream to a recorder</h2>
+          <p class="doc-summary">Publish frames to an existing RTSP, SRT, RTMP, UDP or HTTP destination. The receiver or recording server must already be running.</p>
+          <figure class="doc-figure"><a class="screenshot-link" href="images/docs/forwarding.png" aria-label="Enlarge the Forward panel screenshot"><img src="images/docs/forwarding.png" width="632" height="1200" loading="lazy" decoding="async" alt="Forward panel with a stream URL or file field, H.264 codec, automatic encoder, frame rate, bitrate, maximum local file size and Start forwarding button"></a><figcaption>The same form publishes to a stream URL or records to a file. Codec, encoder, rate and bitrate are explicit; Maximum file bounds local recording output.</figcaption></figure>
+          <p>In <strong>Forward</strong>, enter the receiving endpoint in <strong>Stream URL or file</strong>. Set the codec, encoder, rate and bitrate, then choose <strong>Start forwarding</strong>. The active forward card shows its destination and a stop control; changing the form does not alter an already running forward.</p>
+          <div class="code-wrap"><pre><code>capturefab --camera sim:0 forward \
+  --output rtsp://localhost:8554/camera \
+  --encoder auto --fps 30 --bitrate 4M --duration 60s
+
+capturefab --session bench forward --output rtsp://localhost:8554/camera
+capturefab --session bench stop-forward
+capturefab doctor --json
+capturefab ffmpeg --json</code></pre><button class="copy-button" type="button" aria-label="Copy stream forwarding commands">Copy</button></div>
+          <p>Frames use a bounded latest-frame queue. Encoder availability comes from a real probe of the build and host drivers; GPU branding alone does not establish support. <code>--encoder</code> chooses encoding, while the global <code>--hwaccel</code> option controls FFmpeg input decoding.</p>
+          <p>Protocol and codec support depend on the bundled FFmpeg configuration. Local HLS output is not implemented; a server such as MediaMTX can serve HLS from the stream you publish. Scanner sources do not forward.</p>
+        </article>
+
+        <article class="doc-section" id="sessions" data-doc-section data-doc-title="Control the app from a script or headless session" data-doc-category="Record and automate" data-doc-tags="session,serve,gui,automation,scripts,agents,rpc,ipc,headless,connect,select,multiple cameras">
+          <p class="eyebrow">Record &amp; automate</p><h2>Control the app from a script or headless session</h2>
+          <p class="doc-summary">Attach CLI commands to the camera connection already open in the desktop. Use serve for the same persistent interface without a window.</p>
+          <p>Run <code>sessions</code> first to find the existing session name. The ordinary desktop defaults to <code>gui</code>; an explicitly named window or headless session may use another name. The Capture panel’s <strong>Automation</strong> section and the Quick guide can copy a command for the visible session.</p>
+          <div class="code-wrap"><pre><code>capturefab gui --name bench
+# In another terminal:
+capturefab sessions --json
+capturefab --session bench connect sim:0
+capturefab --session bench connect sim:1
+capturefab --session bench --camera sim:0 set ExposureTime=2500
+capturefab --session bench --camera sim:1 capture -o second.png
+capturefab --session bench status --json
+
+# An alternative to the desktop, kept running in the foreground
+capturefab --camera sim:0 serve --name headless --stream</code></pre><button class="copy-button" type="button" aria-label="Copy session automation commands">Copy</button></div>
+          <p><code>--camera ID</code> targets one connected camera without changing visible selection. <code>select ID</code> changes that selection. <code>connect ID</code>, <code>disconnect</code>, <code>start</code> and <code>stop</code> manage a persistent camera. Set <code>CAPTUREFAB_SESSION</code> to avoid repeating <code>--session</code>.</p>
+          <h3>Send session JSON directly</h3>
+          <div class="code-wrap"><pre><code>capturefab schema --json
+printf '%s\n' '{"op":"get","feature":"Width"}' | capturefab --session bench rpc --json</code></pre><button class="copy-button" type="button" aria-label="Copy RPC example">Copy</button></div>
+          <p>The session server uses loopback TCP and a private local token. The descriptor and token live in the private session directory; this is a local automation interface. GUI commands and CLI/RPC clients share camera state, history and Activity. Direct <code>--camera</code> commands without <code>--session</code> create a temporary connection for that command.</p>
+          <p>See the <a href="agents.md">agent instructions</a> and <a href="llms.txt">llms.txt</a> for automation guidance. The installed binary’s <code>schema</code> and <code>--help</code> are authoritative for its version.</p>
+        </article>
+
+        <article class="doc-section" id="cli-reference" data-doc-section data-doc-title="CLI and JSON reference" data-doc-category="Record and automate" data-doc-tags="cli,reference,json,schema,exit code,flags,help,completions,xml,memory,stdout,stderr">
+          <p class="eyebrow">Record &amp; automate</p><h2>CLI and JSON reference</h2>
+          <p class="doc-summary">Explicit subcommands provide a versioned automation contract. Use help for a command’s flags and schema for CLI and session shapes.</p>
+          <div class="code-wrap"><pre><code>capturefab --help
+capturefab capture --help
+capturefab destination add-s3 --help
+capturefab schema --json
+capturefab completions fish &gt; capturefab.fish</code></pre><button class="copy-button" type="button" aria-label="Copy CLI reference commands">Copy</button></div>
+          <div class="table-scroll"><table><caption>Global options</caption><thead><tr><th scope="col">Option</th><th scope="col">Behavior</th></tr></thead><tbody><tr><td><code>-c</code>, <code>--camera ID</code></td><td>Select a source directly or target a connected session camera.</td></tr><tr><td><code>--session NAME</code></td><td>Use an existing desktop or headless session. Also reads <code>CAPTUREFAB_SESSION</code>.</td></tr><tr><td><code>--json</code></td><td>Emit a version 1 result envelope on stdout.</td></tr><tr><td><code>--timeout-ms N</code></td><td>Per-operation timeout, 1–60,000 ms; default 2,000.</td></tr><tr><td><code>--simulate</code></td><td>Include the built-in pattern camera in discovery.</td></tr><tr><td><code>--hwaccel VALUE</code></td><td>FFmpeg input decoding acceleration; default <code>auto</code>. Also reads <code>CAPTUREFAB_HWACCEL</code>.</td></tr></tbody></table></div>
+          <div class="table-scroll"><table><caption>Command families</caption><thead><tr><th scope="col">Task</th><th scope="col">Commands</th></tr></thead><tbody><tr><td>Find sources</td><td><code>discover</code> (aliases <code>list</code>, <code>cameras</code>), <code>native</code>, <code>scanners</code>, <code>onvif discover</code>, <code>onvif resolve</code>, <code>compatibility</code></td></tr><tr><td>Inspect and configure</td><td><code>info</code>, <code>features</code>, <code>get</code>, <code>set</code>, <code>execute</code>, <code>auto</code>, <code>manual</code>, <code>history</code>, <code>undo</code>, <code>redo</code></td></tr><tr><td>Acquire and deliver</td><td><code>capture</code>, <code>jobs</code>, <code>cancel</code>, <code>forward</code> / <code>record</code>, <code>stop-forward</code></td></tr><tr><td>Save and retain</td><td><code>destination</code> / <code>destinations</code>, <code>volumes</code>, <code>uploads</code>, <code>storage</code></td></tr><tr><td>Persistent sessions</td><td><code>gui</code>, <code>serve</code>, <code>sessions</code>, <code>status</code>, <code>connect</code>, <code>select</code>, <code>disconnect</code>, <code>start</code>, <code>stop</code>, <code>rpc</code></td></tr><tr><td>Diagnostics and tooling</td><td><code>doctor</code>, <code>ffmpeg</code>, <code>xml</code>, <code>memory read</code>, <code>memory write</code>, <code>schema</code>, <code>completions</code></td></tr></tbody></table></div>
+          <h3>JSON results and exit codes</h3>
+          <p>Success and error envelopes go to stdout; diagnostics go to stderr. Check the exit code before consuming the result. Field order is not significant. Binary image stdout with <code>capture -o -</code>, raw XML output, native completions and normal help/version output follow their own Unix conventions.</p>
+          <div class="code-wrap"><pre><code>{"version":1,"ok":true,"result":{}}
+{"version":1,"ok":false,"error":{"code":"unavailable","message":"…"}}</code></pre><button class="copy-button" type="button" aria-label="Copy JSON envelope examples">Copy</button></div>
+          <div class="table-scroll"><table><caption>Process exit codes</caption><thead><tr><th scope="col">Code</th><th scope="col">Category</th><th scope="col">Typical cause</th></tr></thead><tbody><tr><td>0</td><td>success</td><td>The command completed.</td></tr><tr><td>1</td><td><code>operation_failed</code></td><td>Camera, file or I/O failure without a more specific category.</td></tr><tr><td>2</td><td><code>usage</code></td><td>Invalid arguments or command.</td></tr><tr><td>3</td><td><code>unavailable</code></td><td>Missing camera/session, exclusive control or an unmounted drive.</td></tr><tr><td>4</td><td><code>timeout</code></td><td>No frame or response before the deadline.</td></tr><tr><td>5</td><td><code>unsupported</code></td><td>A feature, format or capability unavailable in the source or build.</td></tr><tr><td>6</td><td><code>storage_full</code></td><td>The configured budget or disk is full.</td></tr></tbody></table></div>
+          <h3>Advanced camera diagnostics</h3>
+          <p><code>xml -o camera.xml</code> saves the camera’s GenICam XML. <code>memory read ADDRESS LENGTH</code> accepts decimal or <code>0x</code> addresses, with lengths up to 65,536 bytes. <code>memory write ADDRESS HEX_BYTES</code> writes raw register bytes and is not undoable; use named features for routine configuration.</p>
+        </article>
+
+        <article class="doc-section" id="shortcuts" data-doc-section data-doc-title="Keyboard shortcuts" data-doc-category="Reference" data-doc-tags="keyboard,shortcuts,keys,hotkeys,quick guide,mac,windows,linux,undo,zoom">
+          <p class="eyebrow">Reference</p><h2>Keyboard shortcuts</h2>
+          <p class="doc-summary">Use the app’s Quick guide for bindings on your platform. Plain keys act on the workspace only when no field has keyboard focus.</p>
+          <div class="table-scroll"><table><caption>Desktop shortcuts</caption><thead><tr><th scope="col">Action</th><th scope="col">macOS</th><th scope="col">Windows / Linux</th></tr></thead><tbody>
+            <tr><td>Undo / Redo</td><td><kbd>⌘Z</kbd> / <kbd>⇧⌘Z</kbd></td><td><kbd>Ctrl+Z</kbd> / <kbd>Ctrl+Shift+Z</kbd> or <kbd>Ctrl+Y</kbd></td></tr>
+            <tr><td>Discover cameras</td><td><kbd>⌘R</kbd></td><td><kbd>Ctrl+R</kbd> or <kbd>F5</kbd></td></tr>
+            <tr><td>Connect to address</td><td><kbd>⌘L</kbd></td><td><kbd>Ctrl+L</kbd></td></tr>
+            <tr><td>Next / previous camera</td><td><kbd>⌥⌘→</kbd> / <kbd>⌥⌘←</kbd></td><td><kbd>Ctrl+PgDn</kbd> / <kbd>Ctrl+PgUp</kbd></td></tr>
+            <tr><td>Open selected / overview</td><td><kbd>Enter</kbd> / <kbd>Esc</kbd></td><td><kbd>Enter</kbd> / <kbd>Esc</kbd></td></tr>
+            <tr><td>Start / stop stream</td><td><kbd>Space</kbd></td><td><kbd>Space</kbd></td></tr>
+            <tr><td>Capture and save</td><td><kbd>⌘S</kbd></td><td><kbd>Ctrl+S</kbd></td></tr>
+            <tr><td>Auto / manual</td><td><kbd>⇧⌘A</kbd></td><td><kbd>Ctrl+Shift+A</kbd></td></tr>
+            <tr><td>Search features</td><td><kbd>⌘F</kbd></td><td><kbd>Ctrl+F</kbd></td></tr>
+            <tr><td>Features / Capture / Forward</td><td><kbd>⌘1</kbd> / <kbd>⌘2</kbd> / <kbd>⌘3</kbd></td><td><kbd>Ctrl+1</kbd> / <kbd>Ctrl+2</kbd> / <kbd>Ctrl+3</kbd></td></tr>
+            <tr><td>Zoom in / out</td><td><kbd>⌘+</kbd> / <kbd>⌘−</kbd></td><td><kbd>Ctrl+=</kbd> / <kbd>Ctrl+−</kbd></td></tr>
+            <tr><td>Fit / actual pixels</td><td><kbd>⌘0</kbd> / <kbd>⌥⌘0</kbd></td><td><kbd>Ctrl+0</kbd> / <kbd>Ctrl+Alt+0</kbd></td></tr>
+            <tr><td>Activity / camera list / settings</td><td><kbd>⌘J</kbd> / <kbd>⌘B</kbd> / <kbd>⌘I</kbd></td><td><kbd>Ctrl+J</kbd> / <kbd>Ctrl+B</kbd> / <kbd>Ctrl+I</kbd></td></tr>
+            <tr><td>Image only / histogram / focus</td><td><kbd>F</kbd> / <kbd>H</kbd> / <kbd>R</kbd></td><td><kbd>F</kbd> / <kbd>H</kbd> / <kbd>R</kbd></td></tr>
+            <tr><td>Copy session command</td><td><kbd>⇧⌘C</kbd></td><td><kbd>Ctrl+Shift+C</kbd></td></tr>
+            <tr><td>Full screen</td><td><kbd>⌃⌘F</kbd></td><td><kbd>F11</kbd></td></tr>
+            <tr><td>Quick guide</td><td><kbd>⌘?</kbd> or <kbd>F1</kbd></td><td><kbd>F1</kbd> or <kbd>Ctrl+/</kbd></td></tr>
+          </tbody></table></div>
+          <p>Click outside an input or press <kbd>Esc</kbd> to leave it before using plain keys. <kbd>Enter</kbd> in a feature field applies its draft. Standard OS window closing shortcuts also apply.</p>
+        </article>
+
+        <article class="doc-section" id="troubleshooting" data-doc-section data-doc-title="Troubleshooting" data-doc-category="Reference" data-doc-tags="troubleshooting,error,timeout,unavailable,unsupported,usb,permissions,gige,packets,ffmpeg,gpu,black preview,disk full">
+          <p class="eyebrow">Reference</p><h2>Troubleshooting</h2>
+          <p class="doc-summary">Start with the complete Activity error, then inspect the source and compiled capabilities before changing settings.</p>
+          <div class="code-wrap"><pre><code>capturefab doctor --json
+capturefab ffmpeg --json
+capturefab discover --json
+capturefab sessions --json
+capturefab --session bench status --json</code></pre><button class="copy-button" type="button" aria-label="Copy troubleshooting commands">Copy</button></div>
+          <details class="doc-faq"><summary>A camera is missing or cannot connect</summary><p>Read discovery warnings and try its exact discovered ID. For GigE, check that the camera is reachable on its subnet and inspect the network interfaces in <code>doctor</code>. For USB3 Vision, check OS access and the required interface driver. For webcams, grant camera permission and use the ID from <code>native</code>. If the app already holds the camera, use its session instead of opening another connection.</p></details>
+          <details class="doc-faq"><summary>Acquisition times out or loses GigE packets</summary><p>Check that the camera is streaming and its trigger configuration can produce frames. Increase <code>--timeout-ms</code> for a slow source, within the 60,000 ms limit. Inspect transport status for packet size, receive buffer, resend and loss counters. GigE implements bounded packet resend when advertised by the camera. Stop acquisition before changing stream-locked format or geometry features.</p></details>
+          <details class="doc-faq"><summary>A feature is locked or a setting is rejected</summary><p>Inspect live access, bounds, increments and choices in Features. Choose Stop beside <strong>Locked while streaming</strong>, then apply the value again. A truly read-only source does not become writable by stopping. Native <code>VideoMode</code> choices are driver-specific. Read back important values after a write; a rejected field keeps the camera’s reason.</p></details>
+          <details class="doc-faq"><summary>A frame’s pixel format is unsupported</summary><p>Image conversion handles Mono8, unpacked Mono10/12/16, RGB/BGR8 and Bayer8. Unsupported packed, chunk, multipart or GenDC formats fail explicitly. Select an advertised supported <code>PixelFormat</code> while stopped, or use <code>--format raw</code> to preserve bytes when appropriate. The simulator offers Mono8, RGB8, Mono12 and BayerRG8.</p></details>
+          <details class="doc-faq"><summary>A stream, video file or encoder fails</summary><p>Check <code>ffmpeg --json</code> for this build’s protocols and encoders. Verify the receiving server is running and the endpoint is reachable. Try encoder <code>auto</code>; hardware encoding requires a successful real probe and host drivers. A development build may need <code>CAPTUREFAB_FFMPEG=/absolute/path/to/ffmpeg</code>. Release builds bundle their FFmpeg executable.</p></details>
+          <details class="doc-faq"><summary>The preview has a graphics problem</summary><p>The app renders with wgpu and can fall back to software. Start with <code>ICED_BACKEND=tiny-skia</code> to force software rendering. <code>CAPTUREFAB_GPU_PREVIEW=0</code> keeps the GPU renderer but converts camera frames on the CPU. Use <code>CAPTUREFAB_APPEARANCE=light</code> or <code>dark</code> to override appearance.</p></details>
+          <details class="doc-faq"><summary>Capture stops with storage_full or an absent drive</summary><p>Run <code>storage --json</code> to see the shared budget and reservations. Free space or select another output; change the budget only intentionally. A missing external drive returns unavailable rather than writing into an empty mount directory. Inspect failed uploads as they keep local files protected from retention. Existing output names cause errors; use a new filename.</p></details>
+          <details class="doc-faq"><summary>A scanner does not respond or rejects a setting</summary><p>Check scanner runtime availability in <code>doctor</code> and the required host driver. Use the full <code>scanner:</code> ID and a 60-second timeout. Set <code>ScanSource=Default</code> if the driver uses another source name. Scanner drivers can support a subset of the offered settings. Auto exposure and forwarding are unsupported for scanner sources.</p></details>
+          <p>For a reproducible bug report, include the app version, OS, source type, exact command, relevant <code>doctor</code> output and Activity error. Review logs for private data before sharing them through <a href="https://github.com/capturefab/capturefab/issues">GitHub Issues</a>.</p>
+        </article>
+
+        <article class="doc-section" id="architecture" data-doc-section data-doc-title="Build, architecture and licensing" data-doc-category="Reference" data-doc-tags="architecture,source,rust,build,cargo,ffmpeg,license,mit,gpl,shared memory,process,environment variables">
+          <p class="eyebrow">Reference</p><h2>Build, architecture and licensing</h2>
+          <p class="doc-summary">One Rust executable provides the native desktop and CLI. Each connected camera owns a separate worker process and bounded shared-memory frame ring.</p>
+          <p>The desktop, direct CLI and session clients send the same commands to a coordinator. Every camera worker exclusively owns its transport, live feature map, capture schedules and forwarder. Commands use bounded JSON control channels; frames travel through a three-slot shared-memory ring with the newest frame preferred. FFmpeg handles media and encoding in a separate executable process.</p>
+          <p>GigE Vision, USB3 Vision and GenICam are native Rust implementations. This is an initial implementation under rapid development, not complete Aravis or vendor SDK feature parity. Camera behavior and support may change between releases.</p>
+          <h3>Build from source</h3>
+          <p>Install a stable Rust toolchain, a C compiler and CMake, plus NASM on x86 for libjpeg-turbo SIMD. Build tools are development dependencies. A development build can use <code>CAPTUREFAB_FFMPEG</code>; release builds embed the configured FFmpeg binary and matching notices.</p>
+          <div class="code-wrap"><pre><code>git clone https://github.com/capturefab/capturefab
+cd capturefab
+cargo build --release
+# Headless build with camera, scanner and image features
+cargo build --release --no-default-features \
+  --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox
+target/release/capturefab --camera sim:0 capture -o first.png
+cargo test</code></pre><button class="copy-button" type="button" aria-label="Copy source build commands">Copy</button></div>
+          <div class="table-scroll"><table><caption>Runtime configuration</caption><thead><tr><th scope="col">Environment variable</th><th scope="col">Purpose</th></tr></thead><tbody><tr><td><code>CAPTUREFAB_SESSION</code></td><td>Default named session for CLI clients.</td></tr><tr><td><code>CAPTUREFAB_SESSION_DIR</code></td><td>Session descriptors, frame rings, settings and shared storage ledger. Use an isolated directory for experiments.</td></tr><tr><td><code>CAPTUREFAB_MAX_CAMERAS</code></td><td>Connected camera limit, 1–64; initial value 16.</td></tr><tr><td><code>CAPTUREFAB_FRAME_BYTES</code></td><td>Ring payload per slot, up to 256 MiB. Cameras initially use 16 MiB; full scanner IDs use 128 MiB.</td></tr><tr><td><code>CAPTUREFAB_FFMPEG</code></td><td>Absolute path overriding the FFmpeg executable at runtime.</td></tr><tr><td><code>CAPTUREFAB_HWACCEL</code></td><td>Default FFmpeg decoding acceleration.</td></tr><tr><td><code>CAPTUREFAB_APPEARANCE</code></td><td><code>light</code> or <code>dark</code> appearance override.</td></tr></tbody></table></div>
+          <h3>Licensing and release provenance</h3>
+          <p>Capturefab is <a href="https://github.com/capturefab/capturefab/blob/main/LICENSE">MIT licensed</a>. Release binaries bundle a separately executed GPLv3 FFmpeg payload, including x264, SRT and OpenSSL with their own licenses. FFmpeg is not linked into Capturefab. Redistribution of a bundled release must include FFmpeg’s complete corresponding source, build scripts and notices.</p>
+          <p>See the <a href="https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md">FFmpeg build and compliance guide</a>, <a href="https://github.com/capturefab/capturefab/blob/main/docs/release.md">release process</a> and <a href="releases.json">release manifest</a> for exact build metadata, checksums and available provenance. Source and licensing notices accompany published builds.</p>
+        </article>
+      </div>
+    </main>
+    <footer class="site-footer">
+      <div class="brand"><p>Capturefab</p><small>A camera workbench, open at every layer.<br>Capturefab is MIT licensed. The bundled FFmpeg is GPLv3 and ships with its source.</small></div>
+      <div><h4>Project</h4><ul><li><a href="https://github.com/capturefab/capturefab">Source</a></li><li><a href="https://github.com/capturefab/capturefab/issues">Issues</a></li><li><a href="downloads.html">Downloads</a></li><li><a href="feed.xml">Release feed</a></li></ul></div>
+      <div><h4>Documentation</h4><ul><li><a href="#getting-started">Quickstart</a></li><li><a href="#cli-reference">CLI reference</a></li><li><a href="#troubleshooting">Troubleshooting</a></li><li><a href="#architecture">Build &amp; licensing</a></li></ul></div>
+      <div><h4>For automation</h4><ul><li><a href="agents.md">Agent instructions</a></li><li><a href="llms.txt">llms.txt</a></li><li><a href="releases.json">Release manifest</a></li></ul></div>
+    </footer>
+  </div>
+</body>
+</html>

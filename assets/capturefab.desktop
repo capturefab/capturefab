@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Capturefab
+Comment=Discover cameras, inspect images and capture frames
+Exec=capturefab
+Icon=capturefab
+Terminal=false
+Categories=Graphics;Video;AudioVideo;
+StartupWMClass=capturefab

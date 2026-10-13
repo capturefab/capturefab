@@ -1,4 +1,5 @@
 //! The native workbench. Camera I/O lives on the session worker, never the UI thread.
+mod brand;
 mod camera_history;
 mod destinations;
 mod format;
@@ -209,6 +210,8 @@ pub fn run_capture(
             ]),
         )
     };
+    #[cfg(target_os = "macos")]
+    brand::set_dock_icon();
     iced::application(boot, Workbench::update, Workbench::view)
         .title(Workbench::title)
         .subscription(Workbench::subscription)
@@ -218,6 +221,7 @@ pub fn run_capture(
         .font(icon::FILL_BYTES)
         .antialiasing(true)
         .window(window::Settings {
+            icon: Some(brand::window_icon()),
             size: window_size,
             position: window::Position::Centered,
             min_size: Some(Size::new(900.0, 620.0)),
@@ -226,6 +230,11 @@ pub fn run_capture(
                 title_hidden: true,
                 titlebar_transparent: true,
                 fullsize_content_view: true,
+            },
+            #[cfg(target_os = "linux")]
+            platform_specific: window::settings::PlatformSpecific {
+                application_id: "capturefab".into(),
+                ..Default::default()
             },
             ..window::Settings::default()
         })

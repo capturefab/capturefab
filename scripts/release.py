@@ -412,13 +412,28 @@ def package(args, binary, variant):
         if args.os == 'macos' and variant == 'desktop':
             app = stage / 'Capturefab.app' / 'Contents'
             (app / 'MacOS').mkdir(parents=True)
+            (app / 'Resources').mkdir()
             shutil.copy2(executable, app / 'MacOS' / 'capturefab')
+            shutil.copy2(ROOT / 'assets/icons/capturefab.icns', app / 'Resources/capturefab.icns')
             info = plistlib.loads((ROOT / 'assets' / 'Info.plist').read_bytes())
             short = '.'.join(SEMVER.fullmatch(args.version).groups()[:3])
             info.update(CFBundlePackageType='APPL', CFBundleShortVersionString=short, CFBundleVersion=short)
             (app / 'Info.plist').write_bytes(plistlib.dumps(info))
             if signed == 'apple-developer-id':
                 codesign(app.parent, entitlements)
+        if args.os == 'linux' and variant == 'desktop':
+            applications = stage / 'share/applications'
+            applications.mkdir(parents=True)
+            shutil.copy2(ROOT / 'assets/capturefab.desktop', applications / 'capturefab.desktop')
+            for size, suffix in [('scalable', 'svg'), ('256x256', 'png')]:
+                icons = stage / 'share/icons/hicolor' / size / 'apps'
+                icons.mkdir(parents=True)
+                shutil.copy2(ROOT / f'assets/icons/capturefab.{suffix}', icons / f'capturefab.{suffix}')
+            (stage / 'INSTALL-DESKTOP.txt').write_text(
+                'To add Capturefab to your application launcher, install capturefab on your PATH,\n'
+                'then copy the contents of share/ into ~/.local/share/ (or /usr/local/share/\n'
+                'for all users). Keep the applications/ and icons/ subdirectories intact.\n'
+            )
         path = output / (stem + ('.zip' if args.os in ['macos', 'windows'] else '.tar.gz'))
         archive_tree(stage, path, stem)
         if args.os == 'macos' and signed == 'apple-developer-id' and os.environ.get('MACOS_NOTARY_PROFILE'):

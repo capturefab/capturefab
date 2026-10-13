@@ -1,11 +1,10 @@
 //! Phosphor icons (MIT, assets/fonts) drawn as font glyphs, so they stay crisp
-//! at any size and take their color from the palette. The app mark is drawn.
+//! at any size and take their color from the palette. The app mark uses the
+//! shared brand artwork.
 use crate::types::Transport;
-use iced::widget::canvas::{self, Frame, Geometry, LineCap, Path, Stroke};
-use iced::widget::{container, text, text_input};
-use iced::{
-    Color, Element, Font, Point, Rectangle, Renderer, Size, Theme, Vector, alignment, mouse,
-};
+use iced::widget::canvas::{self, Geometry, LineCap, Path, Stroke};
+use iced::widget::{container, image, text, text_input};
+use iced::{Color, Element, Font, Rectangle, Renderer, Theme, Vector, alignment, mouse};
 use std::cell::Cell;
 
 pub const REGULAR_BYTES: &[u8] = include_bytes!("../../assets/fonts/Phosphor.ttf");
@@ -60,7 +59,7 @@ pub enum Icon {
     FolderPlus,
     /// Drives: local, external or network storage.
     HardDrives,
-    /// The app mark: a rounded lens body.
+    /// The app mark: a capture-frame C, lens and recording light.
     Mark,
 }
 
@@ -136,10 +135,7 @@ pub fn input_icon(kind: Icon) -> text_input::Icon<Font> {
 
 pub fn icon<'a, Message: 'a>(icon: Icon, size: f32, color: Color) -> Element<'a, Message> {
     if icon == Icon::Mark {
-        return canvas::Canvas::new(Mark { color })
-            .width(size)
-            .height(size)
-            .into();
+        return image(super::brand::mark()).width(size).height(size).into();
     }
     let (font, code) = icon.glyph();
     container(
@@ -155,39 +151,6 @@ pub fn icon<'a, Message: 'a>(icon: Icon, size: f32, color: Color) -> Element<'a,
     .align_x(alignment::Horizontal::Center)
     .align_y(alignment::Vertical::Center)
     .into()
-}
-
-struct Mark {
-    color: Color,
-}
-
-impl<Message> canvas::Program<Message> for Mark {
-    type State = ();
-
-    fn draw(
-        &self,
-        _state: &(),
-        renderer: &Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
-        let s = bounds.width.min(bounds.height) / 16.0;
-        let p = |x: f32, y: f32| Point::new(x * s, y * s);
-        frame.fill(
-            &Path::rounded_rectangle(p(0.5, 0.5), Size::new(15.0 * s, 15.0 * s), (4.0 * s).into()),
-            self.color,
-        );
-        frame.stroke(
-            &Path::circle(p(8.0, 8.0), 3.8 * s),
-            Stroke::default()
-                .with_color(Color::WHITE)
-                .with_width(1.6 * s),
-        );
-        frame.fill(&Path::circle(p(8.0, 8.0), 1.3 * s), Color::WHITE);
-        vec![frame.into_geometry()]
-    }
 }
 
 /// Spokes in the activity indicator, one lit per step.

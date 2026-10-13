@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the dependency-free static site, generated release pages, Atom feed, and published-asset manifest."""
+"""Validate static pages, documentation search, generated release pages, and published assets."""
 import hashlib
 import importlib.util
 import json
@@ -38,11 +38,18 @@ class Page(HTMLParser):
                 self.errors.append(f"duplicate id: {attrs['id']}")
             self.ids.add(attrs["id"])
         if tag == "img":
-            if not attrs.get("alt"):
+            if "alt" not in attrs or (not attrs["alt"] and attrs.get("aria-hidden") != "true"):
                 self.errors.append("image without descriptive alternative text")
             self.images.append((attrs.get("src", ""), attrs.get("width"), attrs.get("height")))
         if tag == "script":
             self.scripts.append(attrs.get("src", ""))
+        runtime_url = None
+        if tag in {"img", "script", "iframe", "audio", "video", "source"}:
+            runtime_url = attrs.get("src")
+        elif tag == "link" and attrs.get("rel") == "stylesheet":
+            runtime_url = attrs.get("href")
+        if runtime_url and (urlsplit(runtime_url).scheme or urlsplit(runtime_url).netloc):
+            self.errors.append(f"remote runtime dependency: {runtime_url}")
         for name in ("href", "src"):
             if attrs.get(name):
                 self.links.append(attrs[name])
@@ -54,35 +61,45 @@ def image_size(path):
     data = path.read_bytes()
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return struct.unpack(">II", data[16:24])
-    svg = ET.fromstring(data)
-    return int(svg.get("width")), int(svg.get("height"))
+    if path.suffix.lower() == ".svg":
+        svg = ET.fromstring(data)
+        return int(svg.get("width")), int(svg.get("height"))
+    raise ValueError(f"unsupported image format: {path.name}; use PNG or SVG")
 
 
 def check_pages(root, errors):
     pages = {}
-    for name in ("index.html", "downloads.html"):
+    for path in sorted(root.rglob("*.html")):
+        name = path.relative_to(root).as_posix()
         page = pages[name] = Page()
-        page.feed((root / name).read_text(encoding="utf-8"))
+        page.feed(path.read_text(encoding="utf-8"))
         errors.extend(f"{name}: {error}" for error in page.errors)
         if not (page.lang and page.main):
             errors.append(f"{name}: semantic page language/main missing")
-    if pages["index.html"].scripts != ["app.js"] or pages["downloads.html"].scripts:
-        errors.append("unexpected script dependency")
+    scripts = {"index.html": ["app.js", "docs.js"], "docs.html": ["app.js", "docs.js"], "downloads.html": ["docs.js"]}
+    for name, page in pages.items():
+        if page.scripts != scripts.get(name, []):
+            errors.append(f"{name}: unexpected or missing script dependency: {page.scripts}")
     for name, page in pages.items():
         for link in page.links:
             url = urlsplit(link)
             if url.scheme or url.netloc:
                 continue
-            target = unquote(url.path) or name
+            target = (Path(name).parent / unquote(url.path)).as_posix() if url.path else name
             if not (root / target).is_file():
                 errors.append(f"{name}: missing local resource: {link}")
-            elif url.fragment and target in pages and url.fragment not in pages[target].ids:
+            elif url.fragment and target in pages and unquote(url.fragment) not in pages[target].ids:
                 errors.append(f"{name}: missing anchor: {link}")
         for src, width, height in page.images:
-            path = root / unquote(urlsplit(src).path)
-            size = image_size(path) if path.is_file() else None
-            if size and size != (int(width or 0), int(height or 0)):
-                errors.append(f"{name}: {src} is {size[0]}x{size[1]}, not {width}x{height}")
+            if urlsplit(src).scheme or urlsplit(src).netloc:
+                continue
+            path = root / Path(name).parent / unquote(urlsplit(src).path)
+            try:
+                size = image_size(path) if path.is_file() else None
+                if size and size != (int(width or 0), int(height or 0)):
+                    errors.append(f"{name}: {src} is {size[0]}x{size[1]}, not {width}x{height}")
+            except (ValueError, ET.ParseError, struct.error) as error:
+                errors.append(f"{name}: cannot validate {src}: {error}")
 
 
 def check_svgs(root, errors):
@@ -157,16 +174,34 @@ def check_generated(root, errors):
             errors.append(f"{path.name} is stale; run scripts/site-release.py")
 
 
+def check_search_index(root, errors):
+    spec = importlib.util.spec_from_file_location("docs_search", Path(__file__).with_name("docs-search.py"))
+    search = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(search)
+    try:
+        text = search.generated(root)
+    except (ValueError, OSError) as error:
+        errors.append(f"cannot generate documentation search: {error}")
+        return
+    path = root / "search-index.json"
+    if not path.is_file() or path.read_text(encoding="utf-8") != text:
+        errors.append("search-index.json is stale; run scripts/docs-search.py")
+
+
 def validate(root=ROOT):
     errors = []
     check_pages(root, errors)
     check_svgs(root, errors)
-    css = (root / "style.css").read_text(encoding="utf-8")
-    if "@import" in css or "url(" in css or "prefers-color-scheme" not in css or "focus-visible" not in css:
-        errors.append("style.css: remote dependency or missing color-scheme/focus styles")
+    for path in sorted(root.rglob("*.css")):
+        css = path.read_text(encoding="utf-8")
+        if "@import" in css or "url(" in css:
+            errors.append(f"{path.name}: remote runtime dependency")
+        if path.name == "style.css" and ("prefers-color-scheme" not in css or "focus-visible" not in css):
+            errors.append("style.css: missing color-scheme/focus styles")
     versions = check_manifest(root, errors)
     check_feed(root, versions, errors)
     check_generated(root, errors)
+    check_search_index(root, errors)
     return errors, versions
 
 
@@ -174,7 +209,7 @@ def main():
     errors, versions = validate()
     if errors:
         sys.exit("\n".join(errors))
-    print(f"Static site validated; {len(versions)} releases, current downloads page and Atom feed, no remote runtime dependencies.")
+    print(f"Static site validated; current documentation search, {len(versions)} releases, downloads page and Atom feed, no remote runtime dependencies.")
 
 
 if __name__ == "__main__":

@@ -64,6 +64,15 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CAPTUREFAB_FFMPEG_LICENSE");
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
     let target = env::var("TARGET").expect("Cargo TARGET");
+    if target.ends_with("windows-msvc") {
+        // Pre-exported, architecture-independent icon resources. LINK accepts
+        // .res directly, so building needs no additional resource compiler.
+        let resource =
+            PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory"))
+                .join("assets/icons/capturefab.res");
+        println!("cargo:rerun-if-changed={}", resource.display());
+        println!("cargo:rustc-link-arg-bin=capturefab={}", resource.display());
+    }
     build_macos_scanner(&out, &target);
     if target.contains("apple-darwin") {
         let plist =

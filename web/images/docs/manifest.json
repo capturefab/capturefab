@@ -1,0 +1,210 @@
+{
+  "method": "Actual iced desktop renderer screenshots; crop only, no generated or reconstructed interface.",
+  "source_note": "Current development desktop build from the workspace source.",
+  "binary_sha256": "a43975fcb6fbe9408de89399bea7e86dc29e7ec28afb4996e8adf2da35d2df87",
+  "logical_window": [
+    1100,
+    700
+  ],
+  "demo": "Built-in simulator cameras. Destination names, paths and scheduled jobs are built-in demonstration scenes.",
+  "images": [
+    {
+      "file": "workspace.png",
+      "source": "source/workspace.png",
+      "source_sha256": "b543fcc87cfa59236c3fadfccf5e51e8bbb16f30e1661eb5c5ff6155d501691f",
+      "source_size": [
+        2200,
+        1400
+      ],
+      "crop_pixels": [
+        0,
+        0,
+        2200,
+        1400
+      ],
+      "size": [
+        2200,
+        1400
+      ],
+      "sha256": "b543fcc87cfa59236c3fadfccf5e51e8bbb16f30e1661eb5c5ff6155d501691f",
+      "scene": "dark,features,focus,exposure",
+      "description": "Four simulator cameras in the live workbench, with camera list and the selected camera's inspector."
+    },
+    {
+      "file": "cameras.png",
+      "source": "source/workspace.png",
+      "source_sha256": "b543fcc87cfa59236c3fadfccf5e51e8bbb16f30e1661eb5c5ff6155d501691f",
+      "source_size": [
+        2200,
+        1400
+      ],
+      "crop_pixels": [
+        0,
+        0,
+        480,
+        1400
+      ],
+      "size": [
+        480,
+        1400
+      ],
+      "sha256": "2d75c5e5710b1d241d5d6d00d93fcd5ef28f31eeb0ae7e6c9330d94fbabbc0c0",
+      "scene": "dark,features,focus,exposure",
+      "description": "Connected simulator camera list and controls for finding or adding a source."
+    },
+    {
+      "file": "features.png",
+      "source": "source/features.png",
+      "source_sha256": "66a07cb1842cee98df5c6332b2a634205171f559e584f7d2a08d2942aa54f9f3",
+      "source_size": [
+        2200,
+        1400
+      ],
+      "crop_pixels": [
+        1568,
+        0,
+        2200,
+        1304
+      ],
+      "size": [
+        632,
+        1304
+      ],
+      "sha256": "a3f61430f709da55bf5f177b06ad154e4ca91572fb4ac539808bb70db953cc55",
+      "scene": "dark,features,noscopes",
+      "description": "The selected camera's Features inspector with GenICam names, bounds and editable values."
+    },
+    {
+      "file": "capture.png",
+      "source": "source/capture.png",
+      "source_sha256": "e0db67eb7c88bb00fe3832a323ff45e188beb439c4b4ba3f4f12ad8f1214473c",
+      "source_size": [
+        2200,
+        1400
+      ],
+      "crop_pixels": [
+        1568,
+        0,
+        2200,
+        1304
+      ],
+      "size": [
+        632,
+        1304
+      ],
+      "sha256": "dba09cf8a85b500e5a36c55787d6485653cc6cc956fadef39882856ed0c28b7a",
+      "scene": "dark,capture,noscopes,inspector-storage",
+      "description": "Save frames form, output format, timeout and global storage limits."
+    },
+    {
+      "file": "schedule.png",
+      "source": "source/schedule.png",
+      "source_sha256": "29e7fda7f044a14d61d741b61be79f2ce7fa6ee9ff111cbe926b4c8672340b59",
+      "source_size": [
+        2200,
+        1400
+      ],
+      "crop_pixels": [
+        1600,
+        854,
+        2170,
+        1212
+      ],
+      "size": [
+        570,
+        358
+      ],
+      "sha256": "989649299c9b4348a31d463958fbfae1cde52a05f45bf06058d47b2cc5e42c28",
+      "scene": "dark,capture,noscopes,inspector-widest,scheduled",
+      "description": "The capture scheduling form with start delay and frame interval."
+    },
+    {
+      "file": "destinations.png",
+      "source": "source/destinations.png",
+      "source_sha256": "1bec66fd4be842b8d35f95f66ba1a5997519e8b2dc8fae9090516934d26ac46e",
+      "source_size": [
+        2200,
+        1400
+      ],
+      "crop_pixels": [
+        528,
+        348,
+        1672,
+        1052
+      ],
+      "size": [
+        1144,
+        704
+      ],
+      "sha256": "501f5159b0c3e9bc22bd55f92142722dc80be0e8b280b7b280c6961ae8ab527f",
+      "scene": "dark,destinations-list,noscopes",
+      "description": "Destination manager showing example folder and S3-compatible bucket destinations."
+    },
+    {
+      "file": "scopes.png",
+      "source": "source/scopes.png",
+      "source_sha256": "54af55c711f36a420cef8ee121e76f3530d78a448067b88b24cf1f1f3748f640",
+      "source_size": [
+        2200,
+        1400
+      ],
+      "crop_pixels": [
+        876,
+        80,
+        2192,
+        884
+      ],
+      "size": [
+        1316,
+        804
+      ],
+      "sha256": "e8c2230e5f339fe78903e421ca24c8591e6eecf8d92bcd66c3873805173b4059",
+      "scene": "dark,noinspector,nosidebar,focus,exposure",
+      "description": "Live focus metric and exposure histogram alongside the focus region on a simulator image."
+    },
+    {
+      "file": "forwarding.png",
+      "source": "source/forwarding.png",
+      "source_sha256": "adf76ea2f2363b1de1ff0bf460f2b833fdffd4877a419d00b2403c9c245d5703",
+      "source_size": [
+        2200,
+        1400
+      ],
+      "crop_pixels": [
+        1568,
+        0,
+        2200,
+        1200
+      ],
+      "size": [
+        632,
+        1200
+      ],
+      "sha256": "c0cf4bf9654bf432733065ea5fec71363cd4ed05af06f255690943573bdc5e0b",
+      "scene": "dark,forward,noscopes",
+      "description": "Forward and record form with codec, bitrate, frame rate and encoder settings."
+    },
+    {
+      "file": "history.png",
+      "source": "source/destinations.png",
+      "source_sha256": "1bec66fd4be842b8d35f95f66ba1a5997519e8b2dc8fae9090516934d26ac46e",
+      "source_size": [
+        2200,
+        1400
+      ],
+      "crop_pixels": [
+        576,
+        872,
+        928,
+        950
+      ],
+      "size": [
+        352,
+        78
+      ],
+      "sha256": "4bafd332f99011ea2b2adb532fbc2256b7724f5fd047c1c0878947afe6596748",
+      "scene": "dark,destinations-list,noscopes",
+      "description": "Undo and Redo controls in the destination manager; macOS keyboard shortcuts are shown."
+    }
+  ]
+}

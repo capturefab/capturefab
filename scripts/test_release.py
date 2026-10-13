@@ -283,6 +283,9 @@ class ReleaseTests(unittest.TestCase):
             with zipfile.ZipFile(path) as archive:
                 stem = 'capturefab-1.2.3-rc.1-macos-aarch64-desktop'
                 info = plistlib.loads(archive.read(f'{stem}/Capturefab.app/Contents/Info.plist'))
+                self.assertEqual(info['CFBundleIconFile'], 'capturefab.icns')
+                self.assertEqual(archive.read(f'{stem}/Capturefab.app/Contents/Resources/capturefab.icns'),
+                                 (release.ROOT / 'assets/icons/capturefab.icns').read_bytes())
                 self.assertEqual(archive.read(f'{stem}/THIRD-PARTY-LICENSES.txt'), b'crate licenses')
                 self.assertTrue(archive.getinfo(f'{stem}/capturefab').external_attr >> 16 & 0o100)
                 self.assertIn(f'{stem}/media-licenses/NOTICE.txt', archive.namelist())
@@ -596,16 +599,21 @@ class SiteValidatorTests(unittest.TestCase):
         (self.web / 'releases.json').write_text(json.dumps(dict(schema_version=1, latest='1.2.3', releases=[published('1.2.3')])))
         errors = self.errors()
         self.assertIn('downloads.html is stale', errors)
-        self.assertIn('feed.xml: 0 entries for 1 releases', errors)
+        self.assertIn('feed.xml is stale', errors)
 
     def test_detects_missing_anchor_and_active_svg(self):
         downloads = self.web / 'downloads.html'
-        downloads.write_text(downloads.read_text().replace('href="index.html#download"', 'href="index.html#missing"'))
+        downloads.write_text(downloads.read_text().replace('href="docs.html"', 'href="docs.html#missing"'))
         image = self.web / 'images' / 'cli.svg'
         image.write_text(image.read_text().replace('</svg>', '<script>alert(1)</script></svg>'))
         errors = self.errors()
-        self.assertIn('downloads.html: missing anchor: index.html#missing', errors)
+        self.assertIn('downloads.html: missing anchor: docs.html#missing', errors)
         self.assertIn('cli.svg: active or remote SVG content in <script>', errors)
+
+    def test_detects_stale_documentation_search(self):
+        docs = self.web / 'docs.html'
+        docs.write_text(docs.read_text().replace('class="doc-summary">', 'class="doc-summary">Updated documentation. ', 1))
+        self.assertIn('search-index.json is stale', self.errors())
 
 
 if __name__ == '__main__':

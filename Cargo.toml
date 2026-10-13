@@ -9,7 +9,7 @@ repository = "https://github.com/capturefab/capturefab"
 
 [features]
 default = ["gui", "usb", "scanner", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "s3"]
-gui = ["dep:iced", "dep:bytemuck", "dep:rfd", "dep:objc2", "dep:objc2-app-kit"]
+gui = ["dep:iced", "dep:bytemuck", "dep:rfd", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
 usb = ["dep:nusb"]
 # Document scanners: SANE scanimage, Windows WIA and macOS ImageCaptureCore.
 # Drivers run in disposable helper processes, never in the UI.
@@ -63,7 +63,8 @@ rfd = { version = "0.17", optional = true }
 # Transparency settings; already in the tree via rfd.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", optional = true }
-objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "NSAccessibility", "NSResponder", "NSScreen", "NSView", "NSWindow", "NSWorkspace"] }
+objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "NSAccessibility", "NSApplication", "NSImage", "NSResponder", "NSScreen", "NSView", "NSWindow", "NSWorkspace"] }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSData"] }
 
 # ARMv8 SHA-2 instructions for storage integrity hashing. x86 already selects
 # SHA-NI at runtime without this; the asm crate does not assemble under MSVC.
