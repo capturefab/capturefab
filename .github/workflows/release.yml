@@ -4,7 +4,7 @@ on:
   push:
     tags: ['v*']
     # Merging a pull request that raises the version (see prepare-release.yml)
-    # tags the merge commit and releases it. Path filters do not apply to tags.
+    # creates an RC draft and promotes it after validation. Path filters do not apply to tags.
     branches: [main]
     paths: [Cargo.toml]
   workflow_dispatch:
@@ -12,7 +12,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.repository }}
   cancel-in-progress: false
 
 env:
@@ -31,8 +31,6 @@ jobs:
       build: ${{ steps.version.outputs.build }}
       # Draft, attest and publish (false for a dry run from a branch).
       release: ${{ steps.version.outputs.release }}
-      # The tag does not exist yet: create it on this commit.
-      create-tag: ${{ steps.version.outputs.create_tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -41,9 +39,14 @@ jobs:
         env:
           BEFORE: ${{ github.event.before }}
         run: |
-          build=true release=false create_tag=false
+          build=true release=false
           if [ "$GITHUB_REF_TYPE" = tag ]; then
-            version=$(python3 scripts/release.py version --version "$GITHUB_REF_NAME")
+            version=$(python3 scripts/release.py version)
+            suffix=${GITHUB_REF_NAME#"v$version-rc."}
+            if [ "$GITHUB_REF_NAME" != "v$version" ] && ! [[ "$GITHUB_REF_NAME" == "v$version-rc."* && "$suffix" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::Tag must match Cargo.toml or its -rc.N candidate"
+              exit 1
+            fi
             release=true
           elif [ "$GITHUB_EVENT_NAME" = push ]; then
             version=$(python3 scripts/release.py version)
@@ -57,16 +60,16 @@ jobs:
               echo "Cargo.toml changed without a new version ($previous -> $version); nothing to release." >> "$GITHUB_STEP_SUMMARY"
             elif git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
               build=false
-              echo "v$version is already tagged; push the tag again or run this workflow on it to rebuild." >> "$GITHUB_STEP_SUMMARY"
+              echo "v$version is already tagged; no new release from this version bump." >> "$GITHUB_STEP_SUMMARY"
             else
-              release=true create_tag=true
+              release=true
             fi
           else
             # A manual run from a branch is a dry run that only leaves artifacts.
             version=$(python3 scripts/release.py version)
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          { echo "build=$build"; echo "release=$release"; echo "create_tag=$create_tag"; } >> "$GITHUB_OUTPUT"
+          { echo "build=$build"; echo "release=$release"; } >> "$GITHUB_OUTPUT"
       - name: Require Apple signing and notarization for releases
         if: steps.version.outputs.release == 'true' && vars.CAPTUREFAB_ALLOW_UNSIGNED_MACOS != 'true'
         env:
@@ -79,28 +82,38 @@ jobs:
             exit 1
           fi
 
-  tag:
-    name: Tag the release commit
+  candidate:
+    name: Create draft release candidate
     needs: version
-    if: needs.version.outputs.create-tag == 'true'
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.version.outputs.release == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: write
+    outputs:
+      release-id: ${{ steps.candidate.outputs.release_id }}
+      candidate-tag: ${{ steps.candidate.outputs.candidate_tag }}
     steps:
-      # A tag created with this token starts no new workflow run; this run
-      # builds and releases it.
-      - env:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: candidate
+        env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v${{ needs.version.outputs.version }}
-        run: |
-          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" >/dev/null
-          echo "Tagged $GITHUB_SHA as $TAG." >> "$GITHUB_STEP_SUMMARY"
+        run: python3 scripts/release-candidate.py create --repository "$GITHUB_REPOSITORY" --version "${{ needs.version.outputs.version }}" --sha "$GITHUB_SHA"
+
+  validate:
+    name: Test release candidate
+    needs: [version, candidate]
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.version.outputs.build == 'true' && (needs.candidate.result == 'success' || needs.version.outputs.release != 'true') }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
 
   build:
     name: Build ${{ matrix.os }} ${{ matrix.arch }}
-    needs: [version, tag]
-    if: ${{ !cancelled() && needs.version.result == 'success' && needs.version.outputs.build == 'true' && needs.tag.result != 'failure' }}
+    needs: [version, candidate]
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.version.outputs.build == 'true' && (needs.candidate.result == 'success' || needs.version.outputs.release != 'true') }}
     permissions:
       contents: read
     strategy:
@@ -367,8 +380,8 @@ jobs:
 
   draft:
     name: Upload to a draft GitHub release
-    needs: [version, tag, assemble, attest]
-    if: ${{ !cancelled() && needs.version.outputs.release == 'true' && needs.assemble.result == 'success' && needs.attest.result != 'failure' }}
+    needs: [version, candidate, assemble, attest]
+    if: ${{ !cancelled() && needs.version.outputs.release == 'true' && needs.candidate.result == 'success' && needs.assemble.result == 'success' && (needs.attest.result == 'success' || (vars.CAPTUREFAB_ATTEST == 'false' && needs.attest.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -383,10 +396,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.version.outputs.version }}
+          CANDIDATE_TAG: ${{ needs.candidate.outputs.candidate-tag }}
         run: |
           # GitHub's notes list merged pull requests since the previous tag,
           # grouped by label as .github/release.yml configures.
-          generated=$(gh api "repos/$GH_REPO/releases/generate-notes" -f tag_name="v$VERSION" --jq .body) || generated=''
+          generated=$(gh api "repos/$GH_REPO/releases/generate-notes" -f tag_name="$CANDIDATE_TAG" -f target_commitish="$GITHUB_SHA" --jq .body) || generated=''
           {
             if [ -n "$generated" ]; then printf '%s\n\n' "$generated"; fi
             echo '## Downloads and verification'
@@ -398,8 +412,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.version.outputs.version }}
+          CANDIDATE_TAG: ${{ needs.candidate.outputs.candidate-tag }}
         run: |
-          tag="v$VERSION"
+          tag="$CANDIDATE_TAG"
           notes="$RUNNER_TEMP/notes.md"
           files=()
           for file in dist/release/*; do
@@ -407,10 +422,6 @@ jobs:
           done
           state=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null || echo missing)
           case $state in
-            missing)
-              flags=(--draft --verify-tag --title "Capturefab $VERSION" --notes-file "$notes")
-              if [[ ${VERSION%%+*} == *-* ]]; then flags+=(--prerelease); fi
-              gh release create "$tag" "${files[@]}" "${flags[@]}" ;;
             true)
               existing=$(gh release view "$tag" --json assets --jq '.assets[].name')
               while IFS= read -r asset; do
@@ -427,47 +438,31 @@ jobs:
               gh release edit "$tag" --notes-file "$notes"
               gh release upload "$tag" "${files[@]}" --clobber ;;
             *)
-              echo "::error::$tag is already published; this workflow only creates or updates draft releases"
+              echo "::error::$tag candidate draft is missing or already published; refusing to upload"
               exit 1 ;;
           esac
           echo "Draft: $(gh release view "$tag" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"
 
   publish:
-    name: Publish the release
-    needs: [version, draft]
-    if: ${{ !cancelled() && needs.draft.result == 'success' }}
+    name: Promote successful release candidate
+    needs: [version, candidate, validate, build, assemble, attest, draft]
+    if: ${{ !cancelled() && needs.candidate.result == 'success' && needs.validate.result == 'success' && needs.build.result == 'success' && needs.assemble.result == 'success' && needs.draft.result == 'success' && (needs.attest.result == 'success' || (vars.CAPTUREFAB_ATTEST == 'false' && needs.attest.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    # Configure required reviewers on this environment: the job, and so the
-    # release, waits for their approval after they have reviewed the draft.
-    environment:
-      name: release
-      url: ${{ github.server_url }}/${{ github.repository }}/releases/tag/v${{ needs.version.outputs.version }}
     permissions:
       contents: write
     outputs:
       published: ${{ steps.publish.outputs.published }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - id: publish
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.version.outputs.version }}
-          AUTO_PUBLISH: ${{ vars.CAPTUREFAB_AUTO_PUBLISH }}
-        run: |
-          # Without required reviewers the environment would publish
-          # unattended; leave the draft unless that is explicitly wanted.
-          reviewers=$(gh api "repos/$GH_REPO/environments/release" --jq '[.protection_rules[]? | select(.type == "required_reviewers")] | length' 2>/dev/null || echo 0)
-          if [ "$reviewers" = 0 ] && [ "$AUTO_PUBLISH" != true ]; then
-            echo "::warning::The release environment has no required reviewers; v$VERSION stays a draft. Add reviewers, or set CAPTUREFAB_AUTO_PUBLISH=true to publish without approval."
-            echo "published=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          flags=(--draft=false)
-          if [[ ${VERSION%%+*} != *-* ]]; then flags+=(--latest); fi
-          gh release edit "v$VERSION" "${flags[@]}"
-          echo "published=true" >> "$GITHUB_OUTPUT"
-          echo "Published $(gh release view "v$VERSION" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"
+          RELEASE_ID: ${{ needs.candidate.outputs.release-id }}
+        run: python3 scripts/release-candidate.py promote --repository "$GITHUB_REPOSITORY" --version "$VERSION" --sha "$GITHUB_SHA" --release-id "$RELEASE_ID"
 
   site:
     name: Update the downloads page

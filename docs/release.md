@@ -1,14 +1,15 @@
 # Releasing Capturefab
 
-Releases are SemVer tags (`v0.2.0`, `v0.3.0-rc.1`) whose version matches `Cargo.toml`. A release starts from the GitHub UI and runs end to end in GitHub Actions: a pull request raises the version, merging it tags the commit, every target is built and smoke-tested, the artifacts are attested, a draft release is created with generated notes, and after a person approves the `release` environment the release is published and the downloads page is updated. People still decide what is published: publishing waits for that approval, and stays a draft when the environment has no required reviewers.
+Every release starts as a GitHub draft release candidate with an explicit tag such as `v0.3.0-rc.1`. `Cargo.toml` holds the intended final version (`0.3.0`); the RC tag points to that exact commit. The workflow creates the draft before building, runs the full CI suite and every platform build, smoke-tests and attests the artifacts, then automatically promotes that same release to `v0.3.0`. Promotion creates the final tag on the validated commit, clears the draft and prerelease flags, and updates the downloads site. The RC tag remains as an audit trail. No rebuild or artifact replacement happens during promotion.
 
+Failed or cancelled validation leaves the candidate in draft state and does not create the final tag. Rerunning the workflow on the same commit reuses its draft; a changed commit gets the next unused `-rc.N` tag. Existing tags are never moved and existing final releases are never replaced. Release runs are serialized to prevent concurrent candidate allocation and promotion.
 ## Workflows
 
 | Workflow | Trigger | Does | Token permissions |
 | --- | --- | --- | --- |
-| `ci.yml` | push to `main`, pull requests, manual | `cargo fmt --check`, strict Clippy with all features, `cargo test` on Linux x64 and ARM64, macOS Apple silicon and Intel, Windows x64 and ARM64 (with a per-runner summary of the hardware accelerators `doctor` finds), the headless build, `scripts/test-site.py`, `node --check web/app.js`, `node --check web/docs.js`, documentation search checks and the script unit tests | `contents: read` |
+| `ci.yml` | push to `main`, pull requests, manual, reusable call from Release | `cargo fmt --check`, strict Clippy with all features, `cargo test` on Linux x64 and ARM64, macOS Apple silicon and Intel, Windows x64 and ARM64 (with a per-runner summary of the hardware accelerators `doctor` finds), the headless build, `scripts/test-site.py`, `node --check web/app.js`, `node --check web/docs.js`, documentation search checks and the script unit tests | `contents: read` |
 | `prepare-release.yml` | manual, with a version | Raises the version in `Cargo.toml` and `Cargo.lock` (`release.py set-version`, which refuses a version that is not newer or is already tagged), pushes `release/vVERSION`, opens a pull request labeled `release` and starts CI on it | `contents`, `pull-requests`, `issues` and `actions: write` |
-| `release.yml` | a push to `main` that raises the version in `Cargo.toml`; a `v*` tag push; manual | Tags the commit when the version is new, builds every target below, assembles checksums, manifest, SBOM, notes and corresponding source, attests them, creates or updates a **draft** with GitHub-generated notes, then publishes it once the `release` environment is approved and commits the new release to `web/`. A manual run from a branch is a dry run that only leaves workflow artifacts; a push to `main` that does not raise the version does nothing. A published release is never modified. | `contents: read`; `contents: write` for the tag, draft, publish and site jobs; `id-token` and `attestations: write` for attestation; `pull-requests` and `actions: write` for the site job |
+| `release.yml` | a push to `main` that raises the version in `Cargo.toml`; a `v*` tag push; manual | Creates an explicitly tagged `-rc.N` draft before building, calls the full CI workflow, builds and smoke-tests every target, assembles and attests the artifacts, uploads to the draft and promotes it automatically only after all checks pass. Manual branch runs are dry runs. Published releases are never modified. | `contents: read`; `contents: write` for candidate, upload, promotion and site jobs; `id-token` and `attestations: write` for attestation; `pull-requests` and `actions: write` for the site job |
 | `pages.yml` | manual, and started by the release workflow after it updates `web/` | Validates `web/` and deploys it to capturefab.com as a Cloudflare Worker with static assets (`site/`, `cf deploy`), but only from the default branch and only when the repository variable `CAPTUREFAB_PUBLISH_SITE` is `true` | `contents: read`; the `CLOUDFLARE_API_TOKEN` secret |
 
 All actions are pinned to full commit SHAs. Checkouts do not persist credentials; the jobs that push pass the job token for that one command.
@@ -34,27 +35,49 @@ Not built by the workflow, so the manifest lists it as unavailable:
 
 ## One-time repository setup
 
-1. **Settings → Environments → New environment `release`**: add required reviewers (and optionally prevent self-review). Without required reviewers the publish job leaves the release as a draft, unless the repository variable `CAPTUREFAB_AUTO_PUBLISH` is `true`.
+1. Promotion is automatic after validation. The workflow no longer uses the `release` environment or `CAPTUREFAB_AUTO_PUBLISH`; existing environment reviewers do not gate future releases.
 2. **Settings → Actions → General → Workflow permissions**: allow GitHub Actions to create pull requests, so `prepare-release.yml` and the site job can open them. Otherwise they push a branch and say so in the run summary.
-3. If tag rulesets restrict who may create `v*` tags, allow GitHub Actions to create them, or the release workflow cannot tag the merged version.
+3. If tag rulesets restrict who may create `v*` tags, allow GitHub Actions to create both `vVERSION-rc.N` and `vVERSION`, or the release workflow cannot create candidates or promote them.
 4. To deploy the site, add a Cloudflare API token with Workers Scripts edit, Workers Routes edit and DNS edit on the capturefab.com zone as the repository secret `CLOUDFLARE_API_TOKEN`, and set `CAPTUREFAB_PUBLISH_SITE=true`. `site/cloudflare.config.ts` names the Worker and its custom domain; `site/wrangler.config.ts` points its assets at `web/`.
 5. If `main` is protected, the site job opens a pull request with the `web/` changes instead of pushing; run the Pages workflow after merging it.
 
 ## Cutting a release
 
-1. **Actions → Prepare release → Run workflow** with the version, for example `0.2.0` or `0.3.0-rc.1`. It opens the pull request `Release v0.2.0` and starts CI on it.
-2. Review and merge the pull request. The Release workflow tags the merge commit `v0.2.0`, builds, attests and drafts the release. Notes start with GitHub's generated list of merged pull requests since the previous tag, grouped by label as `.github/release.yml` configures, followed by each artifact's validation (`native-smoke-passed` or `cross-compiled`), platform signature, unavailable targets and verification instructions.
-3. Review the draft from the link in the run summary, then approve the waiting `release` deployment. The workflow publishes the release (marked latest unless it is a prerelease), commits it to `web/releases.json`, `web/downloads.html` and `web/feed.xml`, and starts the Pages deployment.
+1. **Actions → Prepare release → Run workflow** with the intended version, for example `0.3.0`. It opens the pull request `Release v0.3.0` and starts CI on it. Do not add an RC suffix to `Cargo.toml`; candidate numbering is managed by the Release workflow.
+2. Review and merge the pull request. The Release workflow creates `v0.3.0-rc.1` and a draft prerelease on that tag, then runs CI and the six native platform builds. Generated notes and artifacts are uploaded to this draft. It remains unpublished while validation is pending or failed.
+3. When the complete CI suite, every platform build (both desktop and headless), assembly, configured attestations and draft upload succeed, the workflow verifies the original candidate ID, draft state and commit, creates `v0.3.0`, and publishes that same release under the final tag. It clears the prerelease flag for stable versions and marks them latest. Intentional SemVer prerelease versions retain their prerelease status. No manual approval is required.
+4. If validation fails, inspect the workflow logs and rerun failed jobs or the workflow on the RC tag. For a source fix, keep the intended version and run on a new RC tag at the fixed commit; the workflow allocates the next candidate number. The failed draft stays available for inspection. A manual run on a branch remains a dry run and cannot publish.
 
-Pushing a tag yourself (`git tag v0.2.0 && git push origin v0.2.0`) still works when `Cargo.toml` already has that version, and runs the same jobs from the build onwards. To rebuild an existing tag, run the Release workflow manually and choose the tag; a published release is never modified. To update the site by hand instead:
+Directly pushing an RC tag is supported when its base version matches `Cargo.toml`, for example `git tag -a v0.3.0-rc.1 -m "Release candidate" && git push origin v0.3.0-rc.1`. A pre-existing RC tag on the same commit without a release is reused; otherwise the workflow allocates the next free RC tag. A legacy final-version tag push also goes through a draft RC and all validation before publication; ordinary version-bump releases create the final tag only during promotion. Published versions cannot be rebuilt in place.
+
+To update the site by hand after publication:
 
 ```sh
-gh release download v0.2.0 --pattern releases.json --dir /tmp/capturefab-v0.2.0
-python3 scripts/site-release.py --merge /tmp/capturefab-v0.2.0/releases.json
+gh release download v0.3.0 --pattern releases.json --dir /tmp/capturefab-v0.3.0
+python3 scripts/site-release.py --merge /tmp/capturefab-v0.3.0/releases.json
 python3 scripts/test-site.py
 ```
 
 A release contains, per target, `capturefab-VERSION-OS-ARCH-{desktop,headless}` archives (`.tar.gz` on Linux, `.zip` elsewhere; macOS desktop adds `Capturefab.app`) and `capturefab-VERSION-OS-ARCH-media-sources.tar.gz`, plus `capturefab-VERSION-source.tar.gz` (the exact committed tree, all `Cargo.lock` dependency sources in `vendor/`, and an offline Cargo configuration), `releases.json`, `capturefab-VERSION-sbom.cdx.json` (a CycloneDX bill of materials: the Rust crates linked into any variant with their `Cargo.lock` checksums, and the pinned FFmpeg, x264, SRT, OpenSSL and GPU header versions with their source checksums), and `SHA256SUMS` covering every file. Assembly refuses uncommitted changes and missing or modified corresponding-source archives. The FFmpeg source archives must match the build recipe's pinned checksums, including enabled GPU headers. Each package holds `LICENSE`, `THIRD-PARTY-LICENSES.txt` (license texts of the Rust crates compiled into that executable), `media-licenses/` and the FFmpeg build manifest.
+
+## Agent iteration
+
+`AGENTS.md` defines the release loop for coding agents. `scripts/release-agent.py` provides JSON status and explicit actions, using the local Git/SSH credentials to push candidates and `gh` to inspect GitHub. Starting a candidate requires a clean, committed worktree and refuses an existing final tag. It validates the push remote, allocates the next unused RC number across local and remote tags, and pushes only that candidate tag. It never force-pushes or moves a tag.
+
+```sh
+# After committing the release or a candidate fix:
+python3 scripts/release-agent.py start
+# Use the commit returned by start; once discovered, follow the exact run ID:
+python3 scripts/release-agent.py status --commit COMMIT_SHA
+python3 scripts/release-agent.py status --run RUN_ID
+python3 scripts/release-agent.py logs --run RUN_ID
+# Only for transient infrastructure failures on unchanged source:
+python3 scripts/release-agent.py retry --run RUN_ID
+```
+
+For build or test failures, inspect all failed jobs, fix and locally validate the cause, commit the fix, then start the next RC. Do not rerun an old candidate expecting it to include local source changes. Existing failed drafts and tags remain available for diagnosis. A new RC must pass the whole promotion gate, including targets that passed on the previous candidate.
+
+For a transient runner or service failure, `retry` reruns failed jobs on the same commit. It needs Actions write access; inspection needs read access, and `start` needs Git push access. Missing credentials, signing failures or unavailable infrastructure are reported as blockers rather than bypassed. Agents monitor with bounded polls, report progress, and continue through automatic promotion and verification of the final release. JSON status distinguishes a candidate failure from a site failure after publication, so a site repair does not create another binary release. The script does not generate or execute source fixes itself; the coding agent diagnoses and edits using the job evidence.
 
 ## Signing and provenance
 
@@ -78,7 +101,7 @@ Needs an Apple Developer Program membership; the Account Holder creates the cert
 1. In Keychain Access → Certificate Assistant → Request a Certificate From a Certificate Authority, save a CSR to disk. At [developer.apple.com → Certificates](https://developer.apple.com/account/resources/certificates/add) choose **Developer ID Application** (not Apple Development or Apple Distribution), upload the CSR and open the downloaded certificate so it joins your login keychain with its private key.
 2. Check it with `security find-identity -v -p codesigning`; it reads `Developer ID Application: NAME (TEAMID)`. In Keychain Access, export that identity (certificate with its key) as a `.p12` with a strong password.
 3. At [App Store Connect → Users and Access → Integrations → Team Keys](https://appstoreconnect.apple.com/access/integrations/api), create a key with the Developer role. Note its Key ID and the Issuer ID shown above the list, and download the `.p8` (it can be downloaded only once).
-4. As a repository admin, store the secrets and protect publishing:
+4. As a repository admin, store the signing secrets:
 
 ```sh
 base64 -i DeveloperID.p12 | gh secret set MACOS_CERTIFICATE_P12_BASE64 --repo capturefab/capturefab
@@ -88,7 +111,7 @@ gh secret set MACOS_NOTARY_KEY_ID --repo capturefab/capturefab --body KEYID
 gh secret set MACOS_NOTARY_ISSUER --repo capturefab/capturefab --body ISSUER-UUID
 ```
 
-Then add required reviewers to the `release` environment (Settings → Environments → release), or set the variable `CAPTUREFAB_AUTO_PUBLISH=true`. Without either, releases stay drafts and the site is not updated. Set `CAPTUREFAB_PUBLISH_SITE=true` and the `CLOUDFLARE_API_TOKEN` secret so the downloads page deploys after publishing.
+Successful candidates are promoted automatically after all validation passes. Set `CAPTUREFAB_PUBLISH_SITE=true` and the `CLOUDFLARE_API_TOKEN` secret so the downloads page deploys after publishing.
 
 To check notarization locally before relying on CI: `xcrun notarytool store-credentials capturefab-notary --key AuthKey_KEYID.p8 --key-id KEYID --issuer ISSUER-UUID`, then run `release.py build` with `MACOS_SIGN_IDENTITY` set to the identity hash and `MACOS_NOTARY_PROFILE=capturefab-notary`. After downloading a release, `spctl --assess --type execute -vv Capturefab.app` should report `source=Notarized Developer ID`.
 

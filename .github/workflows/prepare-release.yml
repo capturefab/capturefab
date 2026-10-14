@@ -2,12 +2,12 @@ name: Prepare release
 
 # Start a release from the GitHub UI: raise the version on a branch and open a
 # pull request. Merging it makes the Release workflow tag that commit, build
-# every target and draft the release.
+# every target and automatically promote the draft candidate after CI passes.
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version to release, for example 0.2.0 or 0.3.0-rc.1
+        description: Version to release, for example 0.3.0 (the workflow creates -rc.N tags)
         required: true
         type: string
 
@@ -72,7 +72,7 @@ jobs:
           body=$(printf '%s\n' \
             "Raises the version $CHANGE." \
             '' \
-            "Merging this pull request makes the Release workflow tag the merge commit \`v$VERSION\`, build and smoke-test every target, attest the artifacts and create a draft release with generated notes. Publishing then waits for approval in the \`release\` environment." \
+            "Merging this pull request makes the Release workflow create a draft candidate tagged \`v$VERSION-rc.N\`, run the full CI suite, build and smoke-test every target and attest the artifacts. When all checks pass, it creates \`v$VERSION\` and automatically publishes the same release. Failed candidates remain drafts." \
             '' \
             'CI was started on this branch by the Prepare release workflow; its checks appear on this pull request.')
           if url=$(gh pr create --base "${{ github.event.repository.default_branch }}" --head "$branch" --title "Release v$VERSION" --label release --body "$body"); then
