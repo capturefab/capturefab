@@ -2,6 +2,39 @@ use crate::types::{Backend, CameraInfo, Frame, MONO8, RGB8, RegisterIo, Transpor
 use anyhow::{Result, bail, ensure};
 use std::time::{Duration, Instant};
 
+pub mod replay;
+
+/// A replay selector keeps the path literal, including spaces and colons.
+pub fn replay_source(selector: &str) -> Option<&std::path::Path> {
+    selector
+        .strip_prefix("sim:replay:")
+        .map(std::path::Path::new)
+}
+
+pub fn validate_selector_shape(selector: &str) -> Result<()> {
+    let name = selector.strip_prefix("sim:").unwrap_or(selector);
+    ensure!(
+        !name.trim().is_empty(),
+        "simulator selector needs a name, for example sim:0"
+    );
+    if name == "replay" || name.starts_with("replay:") {
+        ensure!(
+            replay_source(selector).is_some_and(|path| !path.as_os_str().is_empty()),
+            "replay simulator needs a file or directory, for example sim:replay:/data/frames"
+        );
+    }
+    Ok(())
+}
+
+pub fn open(selector: &str, timeout: Duration) -> Result<Box<dyn Backend>> {
+    validate_selector_shape(selector)?;
+    if let Some(source) = replay_source(selector) {
+        replay::open(source, 640, 480, 30.0, timeout)
+    } else {
+        Ok(Box::new(Simulator::for_selector(selector)))
+    }
+}
+
 pub fn info() -> CameraInfo {
     info_named("sim:0")
 }
@@ -10,7 +43,12 @@ pub fn info_named(id: &str) -> CameraInfo {
         id: id.into(),
         transport: Transport::Simulator,
         vendor: "Capturefab".into(),
-        model: SimKind::from_selector(id).model().into(),
+        model: if replay_source(id).is_some() {
+            "Replay camera"
+        } else {
+            SimKind::from_selector(id).model()
+        }
+        .into(),
         serial: format!("SIM{}", id.trim_start_matches("sim:")),
         address: None,
         profile: Default::default(),

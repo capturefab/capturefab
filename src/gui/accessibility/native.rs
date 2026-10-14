@@ -87,11 +87,9 @@ pub(super) fn sync(id: window::Id, handle: &dyn window::Window, bridge: &Bridge)
     let Some(tree) = bridge.tree(id) else {
         return false;
     };
-    ADAPTERS.with(|adapters| {
+    let result = ADAPTERS.with(|adapters| {
         let mut adapters = adapters.borrow_mut();
-        let Some(adapter) = adapters.get_mut(&id) else {
-            return false;
-        };
+        let adapter = adapters.get_mut(&id)?;
         #[cfg(target_os = "linux")]
         if let Some((outer, inner)) = x11_bounds(handle) {
             adapter.set_root_window_bounds(outer, inner);
@@ -99,13 +97,26 @@ pub(super) fn sync(id: window::Id, handle: &dyn window::Window, bridge: &Bridge)
         #[cfg(not(target_os = "linux"))]
         let _ = handle;
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        if let Some(events) = adapter.update_if_active(|| tree) {
-            events.raise();
-        }
+        let result = adapter.update_if_active(|| tree);
         #[cfg(target_os = "linux")]
-        adapter.update_if_active(|| tree);
-        true
-    })
+        let result = {
+            adapter.update_if_active(|| tree);
+            true
+        };
+        Some(result)
+    });
+    let Some(result) = result else {
+        return false;
+    };
+    // Native notification delivery can synchronously reenter accessibility.
+    // Release the adapter map's runtime borrow before raising any events.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if let Some(events) = result {
+        events.raise();
+    }
+    #[cfg(target_os = "linux")]
+    let _ = result;
+    true
 }
 
 /// AT-SPI screen coordinates need the actual X11 client origin, including the
@@ -175,24 +186,41 @@ fn x11_bounds(handle: &dyn window::Window) -> Option<(accesskit::Rect, accesskit
 }
 
 pub(super) fn focused(id: window::Id, focused: bool) -> bool {
-    ADAPTERS.with(|adapters| {
+    let result = ADAPTERS.with(|adapters| {
         let mut adapters = adapters.borrow_mut();
-        let Some(adapter) = adapters.get_mut(&id) else {
-            return false;
-        };
+        let adapter = adapters.get_mut(&id)?;
         #[cfg(target_os = "macos")]
-        if let Some(events) = adapter.update_view_focus_state(focused) {
-            events.raise();
-        }
+        let result = adapter.update_view_focus_state(focused);
         #[cfg(target_os = "linux")]
-        adapter.update_window_focus_state(focused);
+        let result = {
+            adapter.update_window_focus_state(focused);
+            true
+        };
         // The Windows subclass handles native WM_SETFOCUS/WM_KILLFOCUS.
         #[cfg(target_os = "windows")]
-        let _ = (adapter, focused);
-        true
-    })
+        let result = {
+            let _ = (adapter, focused);
+            true
+        };
+        Some(result)
+    });
+    let Some(result) = result else {
+        return false;
+    };
+    #[cfg(target_os = "macos")]
+    if let Some(events) = result {
+        events.raise();
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = result;
+    true
 }
 
 pub(super) fn detach(id: window::Id) -> bool {
-    ADAPTERS.with(|adapters| adapters.borrow_mut().remove(&id).is_some())
+    let adapter = ADAPTERS.with(|adapters| adapters.borrow_mut().remove(&id));
+    let removed = adapter.is_some();
+    // Dropping the native adapter can deliver element-destroyed notifications.
+    // Keep that teardown outside the adapter map's runtime borrow as well.
+    drop(adapter);
+    removed
 }

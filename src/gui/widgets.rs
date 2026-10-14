@@ -1,21 +1,40 @@
 //! Small building blocks shared by the views.
 use super::*;
 use iced::widget::{Row, Stack, column};
+mod keyboard_scroll;
+#[cfg(test)]
+mod keyboard_scroll_panel_tests;
+#[cfg(test)]
+mod keyboard_scroll_tests;
+mod pinned_body;
 mod radio_group;
 
 pub(super) use super::oneline::one_line;
 
-/// Room a sheet's pinned header takes: padding around the title row, as
-/// tall as its title's line, and the hairline under it.
-const SHEET_HEADER: f32 = SHEET_INSET + style::line_height(style::DISPLAY) + 13.0 + 1.0;
-/// Room a sheet's pinned footer takes: hairline, padding and a button row.
-const SHEET_FOOTER: f32 = 1.0 + 12.0 + 32.0 + 12.0;
 /// Inset of a sheet's content from its edges.
 const SHEET_INSET: f32 = 24.0;
 /// How far a sheet rises into place as it opens.
 const SHEET_RISE: f32 = 12.0;
 /// The scrolling body of the sheet that shows; only one shows at a time.
 pub(super) const SHEET_BODY: &str = "sheet-body";
+pub(super) const ACTIVITY_BODY: &str = "activity-body";
+
+/// Activity keeps newer entries at the bottom. Its pinned action provides a
+/// keyboard entry point without taking scrolling keys from the other panes.
+pub(super) fn activity_scroll<'a, M: 'a>(content: Element<'a, M>) -> Element<'a, M> {
+    keyboard_scroll::panel(content, ACTIVITY_BODY, scrollable::Anchor::End)
+}
+
+/// Windows places the affirmative action before cancellation in a row;
+/// macOS and GNOME put cancellation first. Narrow native alert stacks put
+/// the affirmative action above cancellation on all three platforms.
+pub(super) fn dialog_actions<T>(cancel: T, affirmative: T, stacked: bool) -> (T, T) {
+    if stacked || cfg!(target_os = "windows") {
+        (affirmative, cancel)
+    } else {
+        (cancel, affirmative)
+    }
+}
 
 pub(super) fn focus_address() -> Task<Message> {
     Task::batch([
@@ -635,6 +654,7 @@ pub(super) struct SheetFrame<'a, M> {
     close_enabled: bool,
     body: Element<'a, M>,
     footer: Option<Element<'a, M>>,
+    default_action: Option<M>,
     width: f32,
     max_height: f32,
     scrolled: bool,
@@ -659,6 +679,7 @@ pub(super) fn sheet_frame<'a, M: Clone + 'static>(
         close_enabled: true,
         body: body.into(),
         footer: None,
+        default_action: None,
         width: 560.0,
         max_height: 640.0,
         scrolled: false,
@@ -701,6 +722,13 @@ impl<'a, M: Clone + 'a> SheetFrame<'a, M> {
         self
     }
 
+    /// Return activates this enabled primary action, with the platform's
+    /// distinction between the default button and keyboard focus.
+    pub(super) fn default_action(mut self, action: Option<M>) -> Self {
+        self.default_action = action;
+        self
+    }
+
     pub(super) fn size(mut self, width: f32, max_height: f32) -> Self {
         self.width = width;
         self.max_height = max_height;
@@ -733,6 +761,7 @@ impl<'a, M: Clone + 'static> From<SheetFrame<'a, M>> for Element<'a, M> {
             close_enabled,
             body,
             footer,
+            default_action,
             width,
             max_height,
             scrolled,
@@ -757,11 +786,12 @@ impl<'a, M: Clone + 'static> From<SheetFrame<'a, M>> for Element<'a, M> {
         }
         let head = head
             .push(accessibility::label(
-                text(title).size(style::DISPLAY).font(style::BOLD).into(),
-                title_name,
+                one_line(title, style::DISPLAY, style::BOLD, p.text)
+                    .width(Fill)
+                    .into(),
+                title_name.clone(),
                 accessibility::Role::Heading,
             ))
-            .push(space::horizontal())
             .push(tip(
                 button(icon(Icon::Close, 14.0, p.secondary))
                     .name(close_name)
@@ -771,7 +801,6 @@ impl<'a, M: Clone + 'static> From<SheetFrame<'a, M>> for Element<'a, M> {
                     .on_press_maybe(close_enabled.then_some(close)),
                 Action::Overview.hint("Close", Os::CURRENT),
             ));
-        let room = max_height - SHEET_HEADER - if footer.is_some() { SHEET_FOOTER } else { 0.0 };
         // A marker of no size at the body's top edge tells when it scrolls
         // under the header: only on the change, not on every scroll step.
         // Half a pixel of slack absorbs rounding at the top.
@@ -813,16 +842,30 @@ impl<'a, M: Clone + 'static> From<SheetFrame<'a, M>> for Element<'a, M> {
                 left: SHEET_INSET,
             }),
             edge,
-            // Capped explicitly: a shrinking scrollable would otherwise take
-            // the footer's room too.
-            container(body).max_height(room.max(120.0)),
+            // Measure the actual header/footer first. The body uses only
+            // what remains, while still shrinking for a short form.
+            pinned_body::wrap(body.into()),
         ];
         if let Some(footer) = footer {
             sheet = sheet
                 .push(rule::horizontal(1).style(style::line))
                 .push(container(footer).width(Fill).padding([12.0, SHEET_INSET]));
         }
-        container(sheet).width(width).style(style::sheet).into()
+        accessibility::modal_group(
+            keyboard_history::default_action(
+                keyboard_scroll::wrap(
+                    container(pinned_body::column(sheet.into()))
+                        .width(width)
+                        .max_height(max_height.max(0.0))
+                        .style(style::sheet)
+                        .into(),
+                    SHEET_BODY,
+                ),
+                default_action,
+            ),
+            title_name,
+            accessibility::Role::Dialog,
+        )
     }
 }
 
@@ -855,6 +898,86 @@ pub(super) fn spark<'a, M: Clone + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_sheet_is_a_named_modal_dialog_with_retained_native_close() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced::futures::StreamExt;
+        let renderer = super::super::destinations::layout_tests::renderer();
+        let mut tree = Tree::empty();
+        let mut previous = None;
+        for content in ["Loading report…", "Report available."] {
+            let mut view: Element<'_, Message> = sheet_frame(
+                "Session analytics",
+                Message::Analytics(false),
+                text(content),
+                Palette::of(false),
+            )
+            .mark(Icon::Activity)
+            .size(500.0, 420.0)
+            .into();
+            tree.diff(view.as_widget());
+            let layout = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(500.0, 420.0)),
+            );
+            let (snapshot, bridge, window) = accessibility::snapshot_widget(
+                view.as_widget_mut(),
+                &mut tree,
+                Layout::new(&layout),
+                &renderer,
+            );
+            let named = |name, role| {
+                snapshot
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| node.label() == Some(name) && node.role() == role)
+                    .unwrap()
+            };
+            let (dialog_id, dialog) = named("Session analytics", accessibility::Role::Dialog);
+            let (heading_id, _) = named("Session analytics", accessibility::Role::Heading);
+            let (close_id, close) = named("Close Session analytics", accessibility::Role::Button);
+            let (content_id, _) = named(content, accessibility::Role::Label);
+            assert!(dialog.is_modal());
+            assert!(!dialog.supports_action(accesskit::Action::Focus));
+            assert!(!dialog.supports_action(accesskit::Action::Click));
+            for child in [heading_id, close_id, content_id] {
+                assert!(dialog.children().contains(child));
+                assert_eq!(
+                    snapshot
+                        .nodes
+                        .iter()
+                        .filter(|(_, node)| node.children().contains(child))
+                        .count(),
+                    1,
+                    "each visible control belongs to the dialog once"
+                );
+            }
+            let root = &snapshot.nodes.iter().find(|(id, _)| id.0 == 0).unwrap().1;
+            assert_eq!(root.children(), [*dialog_id]);
+            if let Some(previous) = previous {
+                assert_eq!((*dialog_id, *close_id), previous);
+            }
+            previous = Some((*dialog_id, *close_id));
+            assert!(close.supports_action(accesskit::Action::Click));
+            let task = bridge.dispatch(accessibility::Request {
+                window,
+                replay: None,
+                action: accesskit::ActionRequest {
+                    action: accesskit::Action::Click,
+                    target: *close_id,
+                    data: None,
+                },
+            });
+            let mut actions = iced_runtime::task::into_stream(task).unwrap();
+            assert!(matches!(
+                iced::futures::executor::block_on(actions.next()),
+                Some(iced_runtime::Action::Output(Message::Analytics(false)))
+            ));
+            assert!(iced::futures::executor::block_on(actions.next()).is_none());
+        }
+    }
 
     #[test]
     fn slider_keys_step_snap_and_reach_the_bounds() {

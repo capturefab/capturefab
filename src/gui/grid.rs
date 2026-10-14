@@ -159,7 +159,7 @@ impl Workbench {
         if shown > 0.01 {
             let glass = |kind: Icon, hint: String, on: Message| {
                 let enabled = !matches!(&on, Message::CaptureCamera(_))
-                    || (!self.pending(Job::Capture)
+                    || (!self.pending_for(Job::Capture, id)
                         && self.validate_input(&self.capture_command(false)).is_ok());
                 tip(
                     button(icon(kind, 14.0, fade(style::STAGE.text, shown)))
@@ -226,8 +226,12 @@ impl Workbench {
                     ..container::Style::default()
                 }
             }));
-            layers =
-                layers.push(container(space().width(Fill).height(Fill)).style(style::ring(ring)));
+            layers = layers.push(
+                container(space().width(Fill).height(Fill)).style(style::ring(
+                    ring,
+                    self.selection_emphasized(keyboard_history::Area::Image),
+                )),
+            );
         }
         container(
             mouse_area(layers)
@@ -311,16 +315,21 @@ impl Workbench {
                 (52.0, 14.0),
             ));
         }
-        caption
-            .push(
-                text(format!("{:.1} fps", camera.fps))
-                    .size(style::SMALL)
-                    .color(stage.secondary)
-                    .width(58)
-                    .align_x(Alignment::End)
-                    .wrapping(text::Wrapping::None),
-            )
-            .into()
+        let caption = caption.push(
+            text(format!("{:.1} fps", camera.fps))
+                .size(style::SMALL)
+                .color(stage.secondary)
+                .width(58)
+                .align_x(Alignment::End)
+                .wrapping(text::Wrapping::None),
+        );
+        if let Some(status) = self.network_status(&camera.info) {
+            column![caption, self.network_indicator(status, stage)]
+                .spacing(3)
+                .into()
+        } else {
+            caption.into()
+        }
     }
 }
 

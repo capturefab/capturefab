@@ -293,6 +293,8 @@ pub(super) fn group_barrier(message: &Message) -> bool {
         | Message::StartForward
         | Message::StopForward
         | Message::RefreshFeatures
+        | Message::ScanNetwork
+        | Message::NetworkReport(_)
         | Message::Help(_)
         | Message::CapturePicker(_)
         | Message::RecordPicker(_) => gesture(message).is_none(),
@@ -675,6 +677,7 @@ impl Workbench {
                 matches!(
                     pending.job,
                     Job::Set(_)
+                        | Job::NetworkScan
                         | Job::AutoOn
                         | Job::AutoOff
                         | Job::Balance
@@ -702,7 +705,7 @@ impl Workbench {
             }
             return Task::none();
         }
-        if self.help_open {
+        if self.help_open || self.network_open || self.analytics.open {
             return Task::none();
         }
         let entry = if undo {

@@ -344,7 +344,7 @@ pub fn info(url: &str) -> Result<CameraInfo> {
         profile: Default::default(),
     })
 }
-struct Executable {
+pub(crate) struct Executable {
     path: PathBuf,
     directory: Option<PathBuf>,
 }
@@ -357,7 +357,7 @@ impl Drop for Executable {
     }
 }
 static EXECUTABLE: OnceLock<Mutex<Weak<Executable>>> = OnceLock::new();
-fn executable() -> Result<Arc<Executable>> {
+pub(crate) fn executable() -> Result<Arc<Executable>> {
     if let Some(path) = std::env::var_os("CAPTUREFAB_FFMPEG") {
         ensure!(
             !path.is_empty(),
@@ -432,7 +432,7 @@ fn executable() -> Result<Arc<Executable>> {
     *cached = Arc::downgrade(&executable);
     Ok(executable)
 }
-fn command(exe: &Executable) -> Command {
+pub(crate) fn command(exe: &Executable) -> Command {
     let mut cmd = Command::new(&exe.path);
     #[cfg(windows)]
     {
@@ -745,6 +745,14 @@ impl Decoder {
         Self::spawn_configured(source, timeout, &[])
     }
     fn spawn_configured(source: &str, timeout: Duration, options: &[String]) -> Result<Self> {
+        Self::spawn_with_output(source, timeout, options, &[])
+    }
+    fn spawn_with_output(
+        source: &str,
+        timeout: Duration,
+        options: &[String],
+        output_options: &[String],
+    ) -> Result<Self> {
         validate_source(source)?;
         ensure!(
             !timeout.is_zero() && Instant::now().checked_add(timeout).is_some(),
@@ -781,26 +789,26 @@ impl Decoder {
         {
             cmd.args(["-rw_timeout", &timeout.as_micros().max(1).to_string()]);
         }
-        cmd.args([
-            "-i",
-            &input,
-            "-map",
-            "0:v:0",
-            "-an",
-            "-sn",
-            "-dn",
-            "-fps_mode",
-            "passthrough",
-            "-f",
-            "image2pipe",
-            "-c:v",
-            "ppm",
-            "-pix_fmt",
-            "rgb24",
-            "pipe:1",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        cmd.args(["-i", &input])
+            .args(output_options)
+            .args([
+                "-map",
+                "0:v:0",
+                "-an",
+                "-sn",
+                "-dn",
+                "-fps_mode",
+                "passthrough",
+                "-f",
+                "image2pipe",
+                "-c:v",
+                "ppm",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = cmd.spawn().context("cannot start FFmpeg decoder")?;
         let stdout = child.stdout.take().unwrap();
         let log = Log::new();
@@ -911,6 +919,160 @@ impl Decoder {
 impl Drop for Decoder {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Finite local decoding used by the virtual camera. This shares the media
+/// decoder's bounded queue and process lifetime, but distinguishes a clean end
+/// of a clip from a damaged input so the simulator can advance its playlist.
+pub(crate) struct ReplayDecoder(Decoder);
+impl ReplayDecoder {
+    pub(crate) fn open(
+        path: &std::path::Path,
+        width: u32,
+        height: u32,
+        fps: f64,
+        image: bool,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let mut options = vec![
+            "-protocol_whitelist".into(),
+            "file,pipe".into(),
+            "-xerror".into(),
+            "-hwaccel".into(),
+            "none".into(),
+        ];
+        if image {
+            // Literal still names must not be interpreted as image2 patterns.
+            options.extend([
+                "-f".into(),
+                "image2".into(),
+                "-pattern_type".into(),
+                "none".into(),
+            ]);
+        } else {
+            let extension = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let format = match extension.as_str() {
+                "mp4" | "m4v" | "mov" => "mov",
+                "mkv" | "webm" => "matroska",
+                "ts" | "mts" | "m2ts" => "mpegts",
+                "mpg" | "mpeg" | "vob" => "mpeg",
+                "avi" => "avi",
+                "flv" => "flv",
+                "wmv" => "asf",
+                "ogv" => "ogg",
+                _ => bail!("unsupported simulation video extension: {extension}"),
+            };
+            // Do not autodetect a renamed playlist or manifest as local video.
+            options.extend(["-f".into(), format.into()]);
+        }
+        let mut output = Self::output(width, height, (!image).then_some(fps));
+        if image {
+            output.extend(["-frames:v".into(), "1".into()]);
+        }
+        Self::spawn(path, timeout, &options, &output)
+    }
+    pub(crate) fn sequence(
+        manifest: &std::path::Path,
+        width: u32,
+        height: u32,
+        fps: f64,
+        count: usize,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let options = [
+            "-protocol_whitelist",
+            "file,pipe",
+            "-xerror",
+            "-hwaccel",
+            "none",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-reinit_filter",
+            "0",
+        ]
+        .map(str::to_string);
+        let mut output = Self::output(width, height, Some(fps));
+        output.extend(["-frames:v".into(), count.to_string()]);
+        Self::spawn(manifest, timeout, &options, &output)
+    }
+    fn output(width: u32, height: u32, fps: Option<f64>) -> Vec<String> {
+        let mut filter = format!(
+            "scale={width}:{height}:force_original_aspect_ratio=decrease:eval=frame,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:eval=frame"
+        );
+        if let Some(fps) = fps {
+            filter.push_str(&format!(",fps={fps}"));
+        }
+        vec!["-vf".into(), filter, "-threads".into(), "1".into()]
+    }
+    fn spawn(
+        path: &std::path::Path,
+        timeout: Duration,
+        options: &[String],
+        output: &[String],
+    ) -> Result<Self> {
+        let source = path
+            .to_str()
+            .context("simulation source path is not valid UTF-8")?;
+        Decoder::spawn_with_output(source, timeout, options, output).map(Self)
+    }
+    pub(crate) fn next(&mut self, timeout: Duration) -> Result<Option<Frame>> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .context("simulation frame timeout exceeds the monotonic clock")?;
+        loop {
+            let mut state = self.0.queue.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(frame) = state.frames.pop_front() {
+                self.0.queue.changed.notify_all();
+                return Ok(Some(frame));
+            }
+            if let Some(error) = &state.error {
+                let error = error.clone();
+                drop(state);
+                if error == "media stream ended" {
+                    if let Some(status) = self.0.child.try_wait()? {
+                        if status.success() {
+                            return Ok(None);
+                        }
+                        bail!(
+                            "cannot decode simulation media {}: {}",
+                            self.0.source,
+                            self.0.log.text(&self.0.source).trim()
+                        );
+                    }
+                    ensure!(
+                        Instant::now() < deadline,
+                        "simulation media decoder did not exit before the frame timeout"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                bail!(
+                    "cannot decode simulation media {}: {}: {}",
+                    self.0.source,
+                    error,
+                    self.0.log.text(&self.0.source).trim()
+                );
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            ensure!(
+                !remaining.is_zero(),
+                "simulation media frame timed out: {}",
+                self.0.source
+            );
+            let _ = self
+                .0
+                .queue
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+        }
     }
 }
 fn native_input(source: &str) -> Result<Option<(&'static str, String)>> {

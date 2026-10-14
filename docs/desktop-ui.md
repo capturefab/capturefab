@@ -9,6 +9,31 @@ The audit began on October 13, 2026. The accessibility bridge described below is
 implemented, rather than a proposed toolkit migration. Platform runtime checks
 must supplement the source and regression evidence.
 
+The workbench now distinguishes the last window used for commands from the
+window currently receiving keyboard input. Losing app focus leaves drafts and
+command context intact while selections use a neutral background. macOS also
+subdues blue control accents; Windows and Linux retain their control accents.
+Each native window has its own cached theme and explicit view palette, including
+destination editors and image controls. Status colors and image data retain
+their meaning. Inactive styling has source and widget evidence; native inactive
+visual inspection remains pending. This follows Apple's
+[unemphasized selection guidance](https://developer.apple.com/documentation/appkit/nscolor/unemphasizedselectedcontentbackgroundcolor?language=_8)
+and Windows' separate
+[inactive selection color](https://learn.microsoft.com/en-us/dotnet/api/system.windows.systemcolors.inactiveselectionhighlightbrush?view=windowsdesktop-10.0).
+
+Camera-list and image selections also follow the focused content area. Actual
+widget focus takes priority; a visible pointer press supplies the area when no
+widget owns focus. Sheets suspend this tracking and retain the previous area.
+Editor context is cached per native window, so editor metadata received before
+a delayed activation event still enables the correct native Edit commands.
+
+Shared sheets handle unmodified Page, arrow, Home and End keys after their
+children. Editors, open menus and radio groups retain their own navigation;
+inactive windows and obscured parent sheets do not scroll. Header and footer
+actions remain pinned. Native window-close requests first dismiss the current
+sheet or return from its editor, using the same cancellation path as Close Window.
+Quit retains its explicit save-and-exit path.
+
 ## Requirements and current evidence
 
 | Requirement | Implemented source evidence | Runtime gate or remaining gap |
@@ -18,12 +43,63 @@ must supplement the source and regression evidence.
 | App settings | `gui/settings.rs` provides System/Light/Dark, Standard/Large/Larger interface sizes and simulated-camera discovery. On macOS, Settings is a separate native window with closing enabled and minimize/resize disabled. Other desktops and screenshot fixtures use a sheet with a named Close action. Both apply the same preferences automatically. AppKit exposes Settings and Command-comma. | Verify opening, repeated opening, close/Escape, independent main-window focus and persistence. The screenshot sheet is a fixture presentation and is not evidence of the separate macOS window. |
 | Persistent preferences | `gui/prefs.rs` serializes writes, rejects stale snapshots across Saver instances and provides an acknowledged flush after file sync and rename. Root close/quit waits for that flush and retains the window if saving fails. `gui/close_error.rs` presents an accessible modal above the focused window's current content, with Retry and Cancel; its error body scrolls while actions remain visible. Retry preserves the intended close/quit, and cancellation retains drafts. | A real failed write on macOS displayed the error above native Settings, focused Retry, contained Tab navigation and cancelled with Escape while retaining Settings. Restoring the destination and pressing Return on Retry saved and quit. Rapid changes and other platform failure presentation need runtime coverage. |
 | Platform appearance and display accessibility | `gui/style.rs`, `gui/motion.rs` and `gui/prefs.rs` use platform fonts and live system appearance/accessibility preferences. Increased contrast strengthens text, outlines, glass and scrollbars. Reduced motion snaps movement already in progress. Larger interface sizes apply factors 1.15 and 1.3 independently of display DPI. | Verify light/dark, Increase Contrast, Reduce Motion/Transparency and scrollbar preferences on the actual desktops. Windows contrast themes and Linux desktop settings need platform runtime coverage. |
-| Keyboard operation and visible focus | `gui/button.rs` adds Tab/Shift-Tab, Enter, Space release, disabled exclusion and focus rings. Shared checkboxes, radio segments, numeric slider controls and disclosures expose corresponding behavior. `gui/pick_list.rs` adds arrow/Home/End/Page navigation, type-ahead, selection, cancellation and long-menu scrolling. `gui/keyboard_history.rs` guards modal input and forwards native clipboard edits to real editors. | Complete critical workflows without a pointer. Check focus visibility, compound-control navigation, native-menu editing, dropdown cancellation inside a sheet and focus restoration. |
+| Keyboard operation and visible focus | `gui/button.rs` adds Tab/Shift-Tab, Enter, Space release, disabled exclusion and focus rings. Shared checkboxes, radio segments, numeric slider controls and disclosures expose corresponding behavior. `gui/pick_list.rs` adds arrow/Home/End/Page navigation, type-ahead, selection, cancellation and long-menu scrolling. `gui/keyboard_history.rs` guards modal input and forwards native clipboard edits to real editors. Scoped dialog defaults preserve popup confirmation and IME composition. `gui/accessibility/scroll.rs` reveals the freshly focused control after Tab/Shift-Tab and native focus. | The compact macOS workflow revealed Capture fully through Tab at 900×620 with Larger interface size. Complete remaining critical workflows without a pointer on each desktop, including focus restoration and native-menu editing. |
 | Native assistive technology | `gui/accessibility.rs` collects actual widget semantics and bounds. `gui/accessibility/native.rs` installs AccessKit adapters on each hidden native window before showing it. Buttons, checkboxes, radio choices, sliders, disclosures, pick lists, options and text fields publish roles, names, states and supported actions. | Inspect the actual native tree and complete workflows with VoiceOver, Narrator and Orca. A source test cannot establish that the operating system exposes or operates the intended control. |
-| Validation, failures and progress | Text-field semantics expose the current draft, invalid state and validation description through `gui/text_input.rs`. Shared headings and errors use semantic Heading and Alert wrappers. Toolbar notices use Alert/Status live regions; important errors remain until a new command, newer error or dismissal, and the activity log retains them. Preview content has an Image description without a frame-arrival live region. | Verify actionable error recovery, notice announcements and reading order. Pending/completed states must be understandable without color and must not flood announcements during camera refresh. |
+| Validation, failures and progress | Text-field semantics expose the current draft, invalid state and precise validation reason through `gui/text_input.rs`. Capture/recording output and bitrate errors appear inline and in field descriptions. Shared headings and errors use semantic Heading and Alert wrappers. Toolbar notices announce the command outcome with its details once through Alert/Status live regions; important errors remain until a new command, newer error or dismissal, and the activity log retains them. Local file output labels the action Start recording; stream output uses Start forwarding. Preview content has an Image description without a frame-arrival live region. | Verify actionable error recovery, notice announcements and reading order. Pending/completed states must be understandable without color and must not flood announcements during camera refresh. |
 | Destructive actions and preservation | Destination removal has an explicit confirmation and leaves files untouched. `storage.rs` protects changed external files, active recordings and queued uploads. `gui/storage_policy.rs` reads the configured policy on a worker, and the inspector distinguishes requested values from actual app-wide/effective limits. Captions explain permanent deletion, write-triggered age enforcement and when app-wide Delete oldest overrides Stop. Loading/unavailable states avoid presenting an unknown policy as confirmed. | Runtime verify configured policy changes, failed policy reads and deletion/removal flows. Source coverage establishes policy disclosure behavior, rather than actual deletion or assistive-technology usability. |
-| Layout and high DPI | iced layout uses logical units. Root accessibility bounds multiply native display scale by interface scale. Inspector docking adapts to width; settings and sheet bodies scroll. Initial/restored sizes and auxiliary windows are fitted after interface-scale changes. | Verify welcome, overview, inspector, destination editor, errors and settings at minimum sizes, 1x/Retina and Windows/Linux scales, including longer labels. Check clipping, offscreen control bounds and hit testing after scrolling. |
+| Layout and high DPI | iced layout uses logical units. Native accessibility bounds apply nested scroll translations and viewport clipping before native display/interface scaling. Sheets measure and reserve their actual header/footer height before allocating the scroll body. Inspector docking adapts to width; settings and sheet bodies scroll. Initial/restored sizes and auxiliary windows are fitted after interface-scale changes. Actual widget layouts cover long titles/errors, pinned actions, compact inspectors and focused-control reveal at every interface size. | Verify welcome, overview, inspector, destination editor, errors and settings at 1x/Retina and Windows/Linux scales, including longer labels. Software geometry and macOS compact checks do not establish other desktops' native hit testing or multi-monitor behavior. |
 | Complete native workflows | Camera work continues through the shared session/worker model. Pointer, keyboard, menu and accessibility actions use the same messages, draft validation, command refusal and local undo history. | On each supported platform, test discovery, connect, selection, features, capture, destinations, recording, stop, failures, settings and window closure through keyboard and assistive technology. |
+
+## CLI and agent activity in the workbench
+
+Camera commands automatically attach to the only authenticated active GUI or
+headless session. `--session NAME` pins one when several are open; `--direct`
+requests a temporary worker. Desktop and browser camera focus is local to each
+participant; `select ID` changes the default for CLI calls without `--camera`.
+Inspection, configuration, capture and
+recording can connect a missing source to the persistent session. Workflow files
+apply the same commands in order; see [CLI workflows](cli-workflows.md).
+
+`session/activity.rs` keeps command activity at the coordinator level, outside
+per-camera snapshots. Entries record the actor (`id`, `name`, human/agent kind),
+origin (`client` or `gui`), target,
+operation, feature, label, queued/running/succeeded/failed state, submission/start/
+completion timestamps, result detail, total `file_count` and saved-file previews.
+Completed capture previews retain at most the first eight paths; schedule previews
+advance with the job. Journal strings are capped without truncating the original
+command result's file list. The timeline retains 200
+completed entries plus active commands and schedules for the session lifetime; changing or
+disconnecting the selected camera does not erase it. Status polling and
+authenticated session probes do not generate entries. URL credentials and secret
+query fields are redacted before publication.
+
+`gui/client_activity.rs` marks new client work in the Activity indicator and
+tracks each command's transitions independently so concurrent cameras can finish
+out of order. Toolbar progress shows active client work while open panels and
+keyboard focus stay in place. A condition-variable activity subscription wakes
+the desktop immediately for each shared change; the browser uses the same
+revision through the waiting `/api/activity` endpoint. Activity identifies each
+participant and retains errors and saved paths. Completed external feature writes update the
+normal inspector feedback; external captures update saved-file and shutter
+feedback. Scheduled captures update the most recently saved path as jobs advance,
+including jobs on other cameras. A completed schedule/start-forward command means
+the job/encoder was accepted; schedule entries retain actor attribution and job
+status/progress through completion, failure or cancellation. Ongoing forwarding
+remains visible in the camera state until stopped. Camera actions explicitly
+target the desktop's locally selected camera, including previews and captures.
+Other participants' pending captures do not disable the human's own capture
+controls; the coordinator queues same-camera commands in submission order.
+
+This behavior can be inspected without a GUI through `status --json`'s
+`result.activity`. Camera-targeted status retains all coordinator cameras,
+activity, logs and devices alongside the queried camera's fields. `target_camera`
+identifies that canonical camera; `active_camera` retains the session default for
+CLI calls, independently of a client's local selection. Source tests cover
+transition deduplication, out-of-order
+completion, preserved camera attribution and redaction; runtime checks should
+also exercise an agent changing a nonselected camera, a failed capture and
+selection/disconnect while Activity is open on each platform. These additions do
+not establish native assistive-technology or hardware compatibility by themselves.
 
 ## Implemented accessibility architecture
 
@@ -68,6 +144,21 @@ internal replay has a distinct token; invalidation cancels pending and queued
 callbacks. Disabled fields remain readable and leave focus traversal. Password fields expose
 masked values in both the field and text run, without publishing the secret.
 
+The exact published `iced_widget` 0.14.2 source is vendored with a small,
+default-off `show_unfocused_selection` opt-in. Capturefab enables it to retain
+the real editor's selected range while its window is inactive. It uses the
+cached shaped paragraph and existing horizontal offset, without activating
+input, caret or IME. Selection layers intersect the caller's viewport, including
+when scrolled. The upstream diff, license and archive verification are in
+`vendor/iced_widget-0.14.2/PATCH.md`. Existing single-rectangle mixed-direction
+selection geometry is unchanged.
+
+Network report cards group their visible details beneath concise adapter or
+camera identities. The report indicator keeps a stable short name; changing
+loss and resend counters are in its description. Software semantic-tree tests
+verify child ownership, full detail exactly once, stable identity and native
+Click routing. Spoken reading order still requires native assistive technology.
+
 Each window is created hidden. The root `WindowOpened` branch attaches the native
 adapter through `window::run`, then shows and focuses the window. Adapters are
 stored, updated and dropped on that window's UI thread. macOS uses
@@ -79,6 +170,11 @@ lifecycle APIs are documented by the adapter sources:
 [Windows 0.29.2](https://docs.rs/accesskit_windows/0.29.2/accesskit_windows/),
 [Linux 0.17.2](https://docs.rs/accesskit_unix/0.17.2/accesskit_unix/).
 
+Native update and focus notifications are raised after releasing the adapter
+map's mutable borrow. Detach removes the adapter from that map before dropping
+it. This permits synchronous native accessibility callbacks during notification
+delivery or teardown without reentering a borrowed map.
+
 A bounded, nonblocking action channel feeds the workbench subscription. Native
 activation, focus, increment/decrement, value editing, selected-text replacement,
 popup expansion/collapse, option focus and scrolling use existing messages or
@@ -88,9 +184,23 @@ Modal changes invalidate previous routes immediately; background guards exclude
 the hidden parent subtree and close its popups while preserving editor selection.
 
 The outer semantic wrapper collects the laid-out tree on redraw and publishes a
-native update when it changes. Bounds use native DPI multiplied by interface
-scale. Window movement also requests a sync. The Linux adapter obtains physical
-X11 client/frame positions from the borrowed live Xlib handles. Wayland does not
+native update when it changes. `gui/accessibility/scroll.rs` tracks each nested
+scroll viewport, transforms child coordinates into their visible positions and
+clips native bounds to the intersected viewports and window. Full content bounds
+are retained separately for reveal actions. Popup rows already use window
+coordinates and their own scrolling, so enclosing document offsets are not
+applied again.
+
+Tab/Shift-Tab and native Focus/ScrollIntoView use a fresh operation on the current
+widget tree. It locates the current control and scroll path, reveals the innermost
+viewport first, then computes each outer offset from the resulting position.
+Offsets round outward to whole logical pixels, preventing iced's final rounded
+translation from leaving part of a focused control behind an edge. Keyboard
+reveal preserves the editor's existing focus and selection; window markers keep
+the operation scoped to the requested native window. Bounds then use native DPI
+multiplied by interface scale. Window movement also requests a sync. The Linux
+adapter obtains physical X11 client/frame positions from the borrowed live Xlib
+handles. Wayland does not
 provide global window positions through the same API; screen-coordinate behavior
 must be verified with the compositor and AT-SPI clients rather than inferred from
 an X11 result.
@@ -98,6 +208,17 @@ an X11 result.
 Alerts are atomic, assertive live regions; ordinary status is atomic and polite.
 Field errors, toolbar notices and headings carry their visible meaning. Preview
 images describe the camera/status without announcing every incoming frame.
+Alert and Status nodes also expose the notice as their text value, which the
+macOS AccessKit consumer requires when constructing an announcement; a label and
+live-region metadata alone did not produce that event.
+
+`gui/widgets/pinned_body.rs` allocates the measured sheet header and footer before
+shrinking the scroll body. Long destination titles use a single visual line while
+retaining their full native Heading label. Completed service/path errors remain
+readable in a permanent body slot; the footer keeps a one-line summary and
+tooltip, so an asynchronous outcome neither pushes actions out of the sheet nor
+replaces an active field's widget state. Compact inspector layouts preserve their
+scroll region and selected camera identity beside long model names.
 
 ## Source and build verification
 
@@ -108,8 +229,7 @@ The broad GUI regression command is:
 cargo test --offline --no-default-features --features gui gui:: --lib --quiet
 ```
 
-A completed broad run passed 344 tests, with zero failures. Focused
-coverage includes:
+Focused coverage includes:
 
 - Native menu keyboard navigation, disabled/separator skipping, editor-context
   preservation and routing through the workbench command/history path.
@@ -124,6 +244,21 @@ coverage includes:
   bounds following actual native scrollbar dragging.
 - Semantic bounds at a non-unit scale, parent relationships, static-label naming
   and refusal of removed/disabled native actions.
+- Nested scroll transforms and clipping, native focus/scroll reveal, popup
+  coordinates, unrelated-window exclusion and retained editor selection.
+- Native-focus tests execute the actual iced task stream for window restoration,
+  activation and scoped widget focus in order. Disabled routes cannot restore or activate a
+  window, and compound controls receive their real focus callbacks.
+- Actual compact destination editors and all inspector tabs, long errors/titles,
+  pinned header/footer actions and full focused-control visibility after Tab and
+  Shift-Tab at all interface sizes. Pointer activation uses the scrolled geometry.
+- Actual Help/network sheet body offsets after Page, arrow, Home and End keys,
+  with pinned actions and child editor/popup/radio priority. Modified keys,
+  unfocused windows and obscured parent sheets leave their scroll position intact.
+- Scoped Save/Retry defaults, platform action order, Return from every enabled
+  single-line destination field, Space on the focused button and cancellation
+  focus restoration. Popup selection and IME commit do not submit the enclosing
+  dialog, and held Return does not submit twice.
 - Component message mapping, tooltip fallback naming, stable Alert identity and
   exclusion of duplicate error text or inappropriate focus actions.
 - Text selection/replacement with multi-code-point graphemes, real editor focus,
@@ -134,32 +269,55 @@ coverage includes:
 - Retention wording, invalid drafts, platform key conventions, four-appearance
   contrast checks, reduced-motion behavior, scaled sizing and acknowledged
   preference persistence.
+- Precise capture/recording validation and recovery, stable field identities,
+  correct recording/forwarding labels and a single live command announcement
+  containing both outcome and details.
 
-A full `cargo test --offline --all-features --quiet` run passed 577 library
-tests and nine CLI integration tests; nine library tests and one doctest were
-ignored. This includes the final focus recovery, panel-opening, search-field
-identity, tab-selection, menu semantics, native editing, save-busy form and X11
-work-area regressions. Final all-feature, all-target Clippy passed with warnings
-treated as errors, and formatting and diff-whitespace checks passed.
+The latest full suite passed 743 library tests, with 11 ignored (754 total), plus
+12 CLI, nine remote and three simulation integration tests. One CLI test and one
+doctest were ignored.
+It includes focus recovery, panel-opening, search-field
+identity, tab selection, menu semantics, native editing, save-busy forms, compact
+geometry, scroll reveal, sheet keyboard navigation/native Close, per-window
+focus/style, dialog defaults and X11 work-area regressions. Strict all-feature,
+all-target Clippy passed with warnings treated as errors; formatting and
+diff-whitespace checks passed. Focused accessibility and desktop-menu runs passed
+16 and six tests respectively, including the actual restore→activate→scoped-focus
+task stream and native live-value consumer behavior.
+
+The focused keyboard-history suite passed 24 tests, including actual pane focus,
+visible pointer targeting, modal preservation and delayed window activation.
+All 11 editor tests passed on macOS; the three shaped-selection rendering tests
+also passed on genuine Linux. These include forward/reverse long ranges,
+Unicode, secure text, alignment, actual software pixel clipping at all three
+interface scales and preserved refocus behavior. The eight network tests passed.
 
 An offline Linux GUI library check passed in a network-disabled Rust container
 with the source and dependency registry mounted read-only. macOS GUI library
-checks and the focused accessibility suite also passed.
+checks and the focused accessibility suite also passed. All 20 style tests passed
+on the host and in a genuine Linux build, including platform-specific inactive
+selection/control behavior and contrast. These are source/widget checks, without
+native inactive-window visual evidence.
 The actual Linux GUI preference tests passed 31 of 31, including X11 CARDINAL32
 property decoding, desktop selection, monitor intersection, native frame fitting
-and DPI/interface-scale conversions. Cached Linux environments include no X11
+and DPI/interface-scale conversions. The seven compact-layout and focus-reveal
+tests passed with the software renderer on macOS and Linux. Measured cases cover
+destination sheets down to 640×360 native size and 316-unit-wide inspectors down
+to 360 native height, with Standard/Large/Larger scales, long content, actual
+scrolling and action bounds. Cached Linux environments include no X11
 or Wayland display server, so these checks do not provide native visual or AT-SPI
 runtime evidence.
 
-A genuine Windows `x86_64-pc-windows-msvc` check passed for the GUI library,
+An earlier genuine Windows `x86_64-pc-windows-msvc` check passed for the GUI library,
 binary and unit-test targets. The host has Homebrew Rust 1.98.1 and matching
 `rust-src`, but no installed Windows standard library or Windows SDK. Cargo's
 `build-std` compiled the target standard library from that source; a temporary
 configuration supplies its missing cached dependencies from the installed Rust
 source's vendor directory. No Windows cfg values were forced onto a macOS build.
 
-The isolated snapshot contains `Cargo.toml`, `Cargo.lock`, `build.rs`, `src`,
-`assets` and `benches` under `/private/tmp/capturefab-windows-buildstd-source`.
+That earlier successful snapshot contains `Cargo.toml`, `Cargo.lock`, `build.rs`, `src`,
+`assets`, `benches` and `tests` under
+`/private/tmp/capturefab-windows-buildstd-source-native-events-final`.
 The scoped overrides are retained in
 `/private/tmp/capturefab-windows-std-scoped-config.toml`, with compiler artifacts
 under `/private/tmp/capturefab-windows-check-target`. From that snapshot, the
@@ -175,14 +333,25 @@ RUSTC_BOOTSTRAP=1 CARGO_TARGET_DIR=/private/tmp/capturefab-windows-check-target 
 
 This configuration enables the GUI while disabling the other default features.
 The snapshot was refreshed and the check repeated after the native Windows
-work-area fitting and the final native edit queue, disabled-field, focus, tab
-and selection changes. It checks
+work-area fitting, native edit queue, disabled-field, focus, tab, selection,
+scroll-reveal and native notification/teardown changes. It checks
 Windows-specific code and the AccessKit Windows adapter, including native window
 handles, focus, updates and teardown, plus the Win32 monitor work-area, client/frame,
 DPI and window-position APIs. It compiles their unit-test targets
 without executing them and does not link a Windows executable. Remaining warnings
 were existing `media.rs`/`volumes.rs` Windows warnings and a feature-limited JPEG
 test import. The adapter's Windows-only unused focus binding was corrected.
+
+A fresh check of the current source, Cargo files and bundled DuckDB/SVG
+dependencies used the same genuine MSVC target and scoped configuration from
+`/private/tmp/capturefab-windows-window-focus-current`. It ended with exit code
+101 in `libduckdb-sys` 1.4.5 before Capturefab's GUI type-check: the Windows-target
+C++ compiler could not find `<memory>`, included by DuckDB's `constants.hpp:11`.
+The host lacks the Windows-target C++ standard-library/toolchain headers.
+The full output is retained in
+`/private/tmp/capturefab-windows-window-focus-current.check.log`. The blocked
+check was not retried without a toolchain change. The older successful snapshot
+does not verify the latest per-window focus/style or bundled-dependency changes.
 
 The separate `gui,s3` cross-check stopped in `ring` 0.17.14's C build because the
 Windows CRT/SDK header `assert.h` is unavailable; this is a toolchain prerequisite
@@ -195,7 +364,12 @@ establish runtime usability or full HIG completion.
 
 The running app's sidebar has no brand/logo block. Its top row contains Cameras,
 the camera count and refresh, keeping discovery controls at the start of the
-sidebar.
+sidebar. A fresh build was visually checked at 900×620 with Larger interface size
+after the explicit sidebar-branding request. No Capturefab text, logo or
+branding-only space appeared in the sidebar; the top area contained Cameras,
+refresh and the functional Scan network/Results row. The isolated app then quit
+normally, and its descriptor's PID 14952 was absent from `ps`. VoiceOver was left
+unchanged.
 
 The built application's native accessibility tree was inspected and operated
 during this pass. It exposes meaningful control labels and the preview Image.
@@ -203,10 +377,25 @@ Native accessibility actions changed appearance to Light, selected Larger
 interface size and toggled simulated-camera discovery. Settings opened as a
 separate native window with no minimize action and a disabled zoom control;
 Command-W dismissed Settings and retained the main window.
+The native Window menu listed both windows and disabled Minimize/Zoom for
+Settings. Command-M minimized the main camera window while Settings remained
+available. Selecting the camera window's native Window-menu entry restored it,
+retained the stream and returned to the previously focused output field.
 
 The native combo-box options selected JPEG through the regular message path.
 Native text-field SetValue configured a temporary JPEG output, and native Capture
 activation captured a simulator frame and saved an approximately 28 KB JPEG file.
+
+An additional October 14 macOS workflow used an isolated test bundle/session and
+the installed FFmpeg executable. Keyboard input connected `sim:0`; native Start
+activation began acquisition. Command-3 opened Forward, native SetValue configured
+a temporary `.mkv` output, and native actions started and stopped recording. The
+saved file decoded as H.264 at 640×480 and 30 fps, with 388 readable frames.
+Command-2 opened Capture; native SetValue configured a temporary `.png` output,
+and Command-S saved a valid 640×480 PNG. Test outputs stayed in the isolated
+session directory. Repeating Command-S refused the existing filename, preserved
+the original image bytes and exposed a Details action that opened the same
+failure in Activity.
 
 Keyboard-only navigation connected the simulator through Command-L and Return,
 then reached and activated Start through Tab and Space. Command-F opened feature
@@ -220,6 +409,10 @@ The final built application also accepted native SetValue in the camera address
 field with a composed emoji draft. Subsequent keyboard input appended at the
 correct end. Native selection of that composed character followed by keyboard
 replacement changed only the selected character, retaining the surrounding text.
+
+At 900×620 native window size with Larger interface size, Tab navigation scrolled
+the Capture inspector until the entire Capture button was visible. This checks
+the focused-control reveal in the built app as well as the software layout tests.
 
 In the S3 destination editor, Escape first closed only the dropdown. Subsequent
 Escape presses returned from the draft to the destination manager, then from the
@@ -239,9 +432,39 @@ The final build separately verified Command-period cancellation, the Cancel/Retr
 labels and action layout, and successful save-and-quit through Return on Retry.
 This final smoke test was repeated on October 14, 2026.
 
-On Linux, Ctrl+W closes the current window or sheet and Ctrl+Q quits the app,
-including from a sheet or Settings. The File menu exposes the same Quit shortcut;
-these distinct commands follow the [GNOME keyboard guidance](https://developer.gnome.org/hig/reference/keyboard.html).
+The compact native alert separately verified the distinction between its default
+and focused action: Return with Cancel focused invoked Retry, while Space on
+Cancel dismissed the alert and restored focus to the destination manager's Close
+button. After restoring the temporary preference destination, native Quit ended
+PID 48090 and removed the isolated session's `gui.json` IPC descriptor. This
+checks process/session cleanup, beyond disappearance of the app's windows.
+
+The final smoke test after the native adapter fix used the refreshed isolated
+bundle at 900×620/Larger and confirmed the sidebar had no branding, native editing
+followed by keyboard input retained `👩‍💻draftx`, Command-comma/Command-W preserved
+the focused address draft across Settings, and native Quit ended PID 68130,
+removed `gui.json` and left a regular preferences file without a backup.
+
+The latest fresh bundle/session smoke at 900×620/Larger connected `sim:0` through
+Command-L, opened Settings with Command-comma and returned to the focused main
+address draft through Command-W. Native SetValue followed by keyboard input again
+retained `👩‍💻draftx`. With the guide's Close action focused, six Down arrows
+visibly scrolled to lower guide content while the header and Close stayed pinned.
+Clicking the actual native OS window-close control dismissed only the guide and
+restored the underlying address draft and focus. Command-2, native SetValue of a
+new PNG path and Command-S saved a 640×480 PNG verified by `ffprobe`; the native
+notice contained the save outcome and full path. Native Quit ended the descriptor's
+actual PID 92301, confirmed by its absence from `ps`, removed `gui.json` and left
+the preferences intact.
+
+An app-switch attempt did not yield an inactive-window capture. These native runs
+therefore establish the recorded editing, sheet, capture and exit behavior, while
+inactive appearance remains source/widget evidence.
+
+Source and regression coverage establish separate Linux Ctrl+W close-window/sheet
+and Ctrl+Q quit commands, including from a sheet or Settings. The File menu
+exposes the same Quit shortcut; these distinct commands follow the
+[GNOME keyboard guidance](https://developer.gnome.org/hig/reference/keyboard.html).
 Destination editor draft fields, selectors, checkboxes, folder selection and
 save/navigation actions disable during a pending save. Advanced disclosure stays
 available so users can read the frozen values. Actual widget tests cover folder
@@ -256,10 +479,31 @@ checks do not establish full HIG completion.
 
 The close error follows Apple's [Alerts guidelines](https://developer.apple.com/design/human-interface-guidelines/alerts):
 Cancel dismisses the failed close, Retry is the default action, and compact
-vertical layouts put the default above Cancel. Escape and Command-period cancel
-the alert on macOS.
+vertical layouts put Retry above Cancel. Escape and Command-period cancel the
+alert on macOS. Destination Save and close-error Retry are scoped default actions;
+Return invokes them on macOS while Space activates the focused control, following
+Apple's [button roles](https://developer.apple.com/design/human-interface-guidelines/buttons)
+and [keyboard event conventions](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/EventOverview/HandlingKeyEvents/HandlingKeyEvents.html).
+Single-line editor submission emits Save once, while an open popup or active IME
+composition retains Return. Destination removal initially focuses Cancel and has
+no destructive default; cancellation restores the row's removal trigger without
+resetting its scroll position.
+
+Horizontal dismissal actions place the affirmative action before Cancel on
+Windows, following Microsoft's [dialog guidance](https://learn.microsoft.com/en-us/windows/apps/develop/ui/controls/dialogs-and-flyouts/dialogs),
+and after Cancel on macOS/Linux. The Linux order follows the
+[GNOME dialog guidance](https://developer.gnome.org/hig/patterns/feedback/dialogs.html).
+On Windows/Linux, focused controls that handle Return retain that action; the
+scoped default handles otherwise unconsumed Return. Actual widget regressions
+cover these platform branches, including disabled defaults and preserved drafts.
 
 ## Runtime acceptance gates
+
+Remaining focused checks include finer per-pane focus and inactive text-selection
+appearance on native desktops, spoken network-card hierarchy and descriptions,
+announcements, and native focus from background or minimized windows.
+Widget/rendering/task/consumer tests establish the implemented behavior and
+routing; these platform interactions still require native checks.
 
 The full objective is verified only when the following checks pass on each
 supported desktop and their results are recorded:

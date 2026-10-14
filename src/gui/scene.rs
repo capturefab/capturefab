@@ -97,6 +97,7 @@ impl Workbench {
                 // Taken by `run_capture`, which then connects no cameras.
                 "welcome" => {}
                 "help" => self.help_open = true,
+                "analytics" => self.analytics.open = true,
                 "capture" => self.tab = Tab::Capture,
                 "forward" => self.tab = Tab::Forward,
                 "features" => self.tab = Tab::Features,
@@ -351,6 +352,7 @@ impl Workbench {
             } else if request
                 .streams_started
                 .is_some_and(|started| started.elapsed() > Duration::from_millis(1600))
+                && self.analytics_staged()
                 && self
                     .snapshot
                     .cameras

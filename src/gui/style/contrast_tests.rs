@@ -63,11 +63,22 @@ const BUTTON_STATES: [button::Status; 3] = [
     button::Status::Pressed,
 ];
 
+fn window_appearances() -> impl Iterator<Item = (Theme, &'static Palette)> {
+    [false, true].into_iter().flat_map(|dark| {
+        [false, true].into_iter().flat_map(move |increased| {
+            [false, true].into_iter().map(move |active| {
+                (
+                    window_theme_appearance(dark, increased, active),
+                    Palette::window_appearance(dark, increased, active),
+                )
+            })
+        })
+    })
+}
+
 #[test]
 fn disabled_actions_keep_their_names_readable() {
-    for (dark, increased) in [(false, false), (true, false), (false, true), (true, true)] {
-        let theme = theme_appearance(dark, increased);
-        let p = Palette::appearance(dark, increased);
+    for (theme, p) in window_appearances() {
         let status = button::Status::Disabled;
         for style in [
             primary(&theme, status),
@@ -105,9 +116,7 @@ fn disabled_actions_keep_their_names_readable() {
 
 #[test]
 fn enabled_input_styles_keep_labels_selection_and_boundaries_visible() {
-    for (dark, increased) in [(false, false), (true, false), (false, true), (true, true)] {
-        let theme = theme_appearance(dark, increased);
-        let p = Palette::appearance(dark, increased);
+    for (theme, p) in window_appearances() {
         for status in [
             text_input::Status::Active,
             text_input::Status::Hovered,
@@ -151,9 +160,7 @@ fn enabled_input_styles_keep_labels_selection_and_boundaries_visible() {
 
 #[test]
 fn pick_list_and_menu_outputs_keep_choices_and_placeholders_readable() {
-    for (dark, increased) in [(false, false), (true, false), (false, true), (true, true)] {
-        let theme = theme_appearance(dark, increased);
-        let p = Palette::appearance(dark, increased);
+    for (theme, p) in window_appearances() {
         for status in [
             pick_list::Status::Active,
             pick_list::Status::Hovered,
@@ -200,9 +207,7 @@ fn pick_list_and_menu_outputs_keep_choices_and_placeholders_readable() {
 
 #[test]
 fn enabled_action_styles_read_in_every_interaction_state() {
-    for (dark, increased) in [(false, false), (true, false), (false, true), (true, true)] {
-        let theme = theme_appearance(dark, increased);
-        let p = Palette::appearance(dark, increased);
+    for (theme, p) in window_appearances() {
         for status in BUTTON_STATES {
             let styles = [
                 primary(&theme, status),
@@ -214,8 +219,10 @@ fn enabled_action_styles_read_in_every_interaction_state() {
                 card(&theme, status),
                 toggle(false)(&theme, status),
                 toggle(true)(&theme, status),
-                row(0.0)(&theme, status),
-                row(1.0)(&theme, status),
+                row(0.0, true)(&theme, status),
+                row(1.0, true)(&theme, status),
+                row(0.0, false)(&theme, status),
+                row(1.0, false)(&theme, status),
             ];
             for style in styles {
                 for surface in panel_surfaces(p, &theme) {
@@ -266,9 +273,7 @@ fn enabled_action_styles_read_in_every_interaction_state() {
 
 #[test]
 fn checkboxes_sliders_and_progress_have_visible_functional_marks() {
-    for (dark, increased) in [(false, false), (true, false), (false, true), (true, true)] {
-        let theme = theme_appearance(dark, increased);
-        let p = Palette::appearance(dark, increased);
+    for (theme, p) in window_appearances() {
         for checked in [false, true] {
             for status in [
                 checkbox::Status::Active {
@@ -345,8 +350,7 @@ fn gradient_at(background: Background, offset: f32) -> Color {
 
 #[test]
 fn stage_layers_read_over_extreme_image_colors_in_both_appearances() {
-    for (dark, increased) in [(false, false), (true, false), (false, true), (true, true)] {
-        let theme = theme_appearance(dark, increased);
+    for (theme, _) in window_appearances() {
         for picture in [
             Color::WHITE,
             Color::BLACK,
@@ -417,8 +421,7 @@ fn stage_layers_read_over_extreme_image_colors_in_both_appearances() {
 
 #[test]
 fn fallback_widgets_inherit_readable_theme_colors() {
-    for (dark, increased) in [(false, false), (true, false), (false, true), (true, true)] {
-        let theme = theme_appearance(dark, increased);
+    for (theme, _) in window_appearances() {
         for status in BUTTON_STATES {
             let style = button::primary(&theme, status);
             reads(

@@ -200,12 +200,26 @@ impl Workbench {
             )
         } else if self.help_open {
             modal(body, self.help(p, height), Some(Message::Help(false)), t)
+        } else if self.network_open {
+            modal(
+                body,
+                self.network_sheet(p, height),
+                Some(Message::NetworkReport(false)),
+                t,
+            )
+        } else if self.analytics.open {
+            modal(
+                body,
+                self.analytics_sheet(p, height),
+                Some(Message::Analytics(false)),
+                t,
+            )
         } else if self.capture_to.manager_open {
             modal(
                 body,
                 accessibility::mapped(
                     self.capture_to.manager(
-                        p.dark,
+                        p,
                         height,
                         spin,
                         now,
@@ -227,7 +241,7 @@ impl Workbench {
                 body,
                 accessibility::mapped(
                     self.record_to.manager(
-                        p.dark,
+                        p,
                         height,
                         spin,
                         now,
@@ -295,7 +309,7 @@ impl Workbench {
                 .color(p.secondary),
             text(plain_keys_note(os)).size(style::SMALL).color(p.secondary),
             heading("Control this window from a terminal or agent", p),
-            text("Copy the session command to attach your terminal or coding agent. Session commands update this window and share its camera connection.")
+            text("Copy the session command to attach your terminal or coding agent. Everyone shares camera connections, settings and captures. Activity shows who acted and capture progress; your selected camera and unfinished edits stay local.")
                 .size(style::BODY),
             self.copyable(self.session_command(), p),
             self.copyable("capturefab --help".into(), p),
@@ -310,7 +324,7 @@ impl Workbench {
         .spacing(14);
         if more {
             body = body.push(
-                text("Add stream URLs directly. Native camera sources use avfoundation:// on macOS, v4l2:// on Linux, and dshow:// on Windows. GigE: use a reachable address on the camera's subnet. USB3: the operating system must allow access to the camera. Activity shows connection and capture errors.")
+                text("Add stream URLs directly. Use sim:replay:PATH to loop a video file or a folder of image frames or videos, sorted by filename without searching subfolders. Native camera sources use avfoundation:// on macOS, v4l2:// on Linux, and dshow:// on Windows. GigE: use a reachable address on the camera's subnet. USB3: the operating system must allow access to the camera. Activity shows connection and capture errors.")
                     .size(style::SMALL)
                     .color(p.secondary),
             );

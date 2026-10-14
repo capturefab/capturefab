@@ -45,7 +45,9 @@ struct DecoratedOperation<'a, M, N> {
 
 impl<M: Clone + 'static, N: Clone + 'static> Operation for DecoratedOperation<'_, M, N> {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
-        operate(self);
+        let decoration = self.decoration;
+        self.inner
+            .traverse(&mut |inner| operate(&mut DecoratedOperation { inner, decoration }));
     }
     fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
         self.inner.container(id, bounds);
@@ -106,6 +108,7 @@ impl<M: Clone + 'static, N: Clone + 'static> Operation for DecoratedOperation<'_
                 mapped.node = control.node.clone();
                 mapped.focused = control.focused;
                 mapped.focusable = control.focusable;
+                mapped.window_coordinates = control.window_coordinates;
                 mapped.children = control.children.clone();
                 mapped.activate = control.activate.clone().map(map);
                 mapped.on_focus = control.on_focus.clone().map(map);

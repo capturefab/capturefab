@@ -1,5 +1,6 @@
 //! Shared light and dark colors: blue for interaction and selection, green for
 //! success/live acquisition, amber for attention, and red for errors or removal.
+use iced::theme::Base;
 use iced::widget::{
     button, checkbox, container, overlay::menu, pick_list, progress_bar, rule, scrollable, slider,
     text_input,
@@ -15,10 +16,11 @@ const fn alpha(color: Color, a: f32) -> Color {
     Color { a, ..color }
 }
 
-/// Named colors of one appearance. Views take these from `Palette::of(dark)`,
-/// styles from the theme, so both always agree.
+/// Named colors of one window appearance. Views take these from
+/// `Palette::for_window`, styles from the theme, so both always agree.
 pub struct Palette {
     pub dark: bool,
+    window_active: bool,
     /// Stage controls need to read over composited glass on any camera image.
     on_image: bool,
     /// Main content and inspector.
@@ -59,6 +61,7 @@ pub struct Palette {
 
 pub const LIGHT: Palette = Palette {
     dark: false,
+    window_active: true,
     on_image: false,
     base: rgb(0xFFFFFF),
     sidebar: rgb(0xF5F5F7),
@@ -86,6 +89,7 @@ pub const LIGHT: Palette = Palette {
 
 pub const DARK: Palette = Palette {
     dark: true,
+    window_active: true,
     on_image: false,
     base: rgb(0x1E1E20),
     sidebar: rgb(0x29292C),
@@ -146,16 +150,91 @@ pub const STAGE: &Palette = &Palette {
     ..DARK
 };
 
+/// A background window retains its selected content, but selection no longer
+/// promises keyboard input. macOS also removes the color from control accents;
+/// Windows and Linux keep those accents distinct from inactive selections.
+const fn inactive(mut p: Palette, neutral_controls: bool) -> Palette {
+    p.window_active = false;
+    p.selected = if p.dark { rgb(0x3D3D43) } else { rgb(0xE1E1E6) };
+    let increased = p.text.r == 1.0 || p.text.r == 0.0;
+    if !increased {
+        // Neutral selection is slightly stronger than the blue tint. Keep
+        // functional outlines visible against that surface as well as fields.
+        p.control_border = if p.dark { rgb(0x8A8A94) } else { rgb(0x7E7E86) };
+    }
+    if neutral_controls {
+        p.accent = if p.dark {
+            if increased {
+                rgb(0xC0C0C8)
+            } else {
+                rgb(0xA0A0A8)
+            }
+        } else if increased {
+            rgb(0x44444C)
+        } else {
+            rgb(0x64646B)
+        };
+        p.accent_text = if p.dark {
+            if increased {
+                rgb(0xE0E0E8)
+            } else {
+                rgb(0xCACAD2)
+            }
+        } else if increased {
+            rgb(0x3C3C43)
+        } else {
+            rgb(0x515159)
+        };
+        p.accent_fill = if p.dark {
+            rgb(0x74747C)
+        } else if increased {
+            rgb(0x47474F)
+        } else {
+            rgb(0x66666D)
+        };
+        p.accent_soft = alpha(p.accent, p.accent_soft.a);
+    }
+    p
+}
+
+const INACTIVE: [Palette; 4] = [
+    inactive(LIGHT, cfg!(target_os = "macos")),
+    inactive(DARK, cfg!(target_os = "macos")),
+    inactive(LIGHT_CONTRAST, cfg!(target_os = "macos")),
+    inactive(DARK_CONTRAST, cfg!(target_os = "macos")),
+];
+
+const STAGE_INACTIVE: &Palette = &Palette {
+    window_active: false,
+    accent: rgb(0xA0A0A8),
+    accent_text: ON_STAGE_SECONDARY,
+    ..*STAGE
+};
+
+/// Explicit preview-control glyphs use the same inactive accent as the styles.
+/// Image data, acquisition status and analytic overlays keep their own hues.
+pub fn stage_palette(active: bool) -> &'static Palette {
+    if !active && cfg!(target_os = "macos") {
+        STAGE_INACTIVE
+    } else {
+        STAGE
+    }
+}
+
 /// The strongest tint text sits on: a pressed button or selected text.
 const TINT: f32 = 0.30;
 
 impl Palette {
-    fn increased(&self) -> bool {
+    pub(super) fn increased(&self) -> bool {
         self.text == Color::WHITE || self.text == Color::BLACK
     }
 
     pub fn of(dark: bool) -> &'static Palette {
         Self::appearance(dark, super::motion::increase_contrast())
+    }
+
+    pub fn for_window(dark: bool, active: bool) -> &'static Palette {
+        Self::window_appearance(dark, super::motion::increase_contrast(), active)
     }
 
     fn appearance(dark: bool, increased: bool) -> &'static Palette {
@@ -168,10 +247,19 @@ impl Palette {
     }
     fn from(theme: &Theme) -> &'static Palette {
         let dark = theme.extended_palette().is_dark;
-        Self::appearance(
+        Self::window_appearance(
             dark,
             theme.palette().text == Self::appearance(dark, true).text,
+            !theme.name().ends_with(" Inactive"),
         )
+    }
+
+    fn window_appearance(dark: bool, increased: bool, active: bool) -> &'static Palette {
+        if active {
+            Self::appearance(dark, increased)
+        } else {
+            &INACTIVE[usize::from(dark) + 2 * usize::from(increased)]
+        }
     }
 
     /// `color` for text and icons: deepened (light) or lightened (dark) just
@@ -185,7 +273,8 @@ impl Palette {
             Color::BLACK
         };
         let tint = Color { a: 1.0, ..color };
-        let tinted = [self.base, self.sidebar, self.field, well_fill(self)]
+        let tinted = self
+            .grounds()
             .map(|surface| luminance(mix(surface, tint, TINT)));
         let mut amount = 0.0;
         let plain = self.grounds().map(luminance);
@@ -250,20 +339,45 @@ fn contrast(a: f32, b: f32) -> f32 {
 }
 
 /// The iced theme for an appearance; widgets left unstyled still match.
+#[cfg(test)]
 pub fn theme(dark: bool) -> Theme {
     theme_appearance(dark, super::motion::increase_contrast())
 }
 
+pub fn window_theme(dark: bool, active: bool) -> Theme {
+    window_theme_appearance(dark, super::motion::increase_contrast(), active)
+}
+
+#[cfg(test)]
 fn theme_appearance(dark: bool, increased: bool) -> Theme {
-    static THEMES: OnceLock<[Theme; 4]> = OnceLock::new();
+    window_theme_appearance(dark, increased, true)
+}
+
+fn window_theme_appearance(dark: bool, increased: bool, active: bool) -> Theme {
+    static THEMES: OnceLock<[Theme; 8]> = OnceLock::new();
     let themes = THEMES.get_or_init(|| {
-        [&LIGHT, &DARK, &LIGHT_CONTRAST, &DARK_CONTRAST].map(|p| {
+        [
+            &LIGHT,
+            &DARK,
+            &LIGHT_CONTRAST,
+            &DARK_CONTRAST,
+            &INACTIVE[0],
+            &INACTIVE[1],
+            &INACTIVE[2],
+            &INACTIVE[3],
+        ]
+        .map(|p| {
+            let name = match (p.dark, p.increased()) {
+                (false, false) => "Capturefab Light",
+                (true, false) => "Capturefab Dark",
+                (false, true) => "Capturefab Light Increased Contrast",
+                (true, true) => "Capturefab Dark Increased Contrast",
+            };
             Theme::custom_with_fn(
-                match (p.dark, p.text == Color::WHITE || p.text == Color::BLACK) {
-                    (false, false) => "Capturefab Light",
-                    (true, false) => "Capturefab Dark",
-                    (false, true) => "Capturefab Light Increased Contrast",
-                    (true, true) => "Capturefab Dark Increased Contrast",
+                if p.window_active {
+                    name.to_owned()
+                } else {
+                    format!("{name} Inactive")
                 },
                 iced::theme::Palette {
                     background: p.base,
@@ -295,7 +409,7 @@ fn theme_appearance(dark: bool, increased: bool) -> Theme {
             )
         })
     });
-    themes[usize::from(dark) + 2 * usize::from(increased)].clone()
+    themes[usize::from(dark) + 2 * usize::from(increased) + 4 * usize::from(!active)].clone()
 }
 
 /// The platform's interface font. Linux uses fontconfig's generic families,
@@ -462,10 +576,17 @@ pub fn tile(theme: &Theme) -> container::Style {
 }
 
 /// The accent ring drawn over the selected tile; `shown` fades it.
-pub fn ring(shown: f32) -> impl Fn(&Theme) -> container::Style {
-    move |_theme| container::Style {
+pub fn ring(shown: f32, emphasized: bool) -> impl Fn(&Theme) -> container::Style {
+    move |theme| container::Style {
         border: Border {
-            color: alpha(STAGE.accent, shown),
+            color: alpha(
+                if emphasized && Palette::from(theme).window_active {
+                    STAGE.accent
+                } else {
+                    STAGE_INACTIVE.accent
+                },
+                shown,
+            ),
             width: 2.5,
             radius: RADIUS_MEDIUM.into(),
         },
@@ -807,15 +928,20 @@ pub fn danger(theme: &Theme, status: button::Status) -> button::Style {
 
 /// A sidebar list row, with the selected fill drawn in by `selected`, from
 /// 0 to 1, so the highlight can cross-fade from one row to the next.
-pub fn row(selected: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
+pub fn row(selected: f32, emphasized: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
         let p = Palette::from(theme);
+        let selection = if emphasized {
+            p.selected
+        } else {
+            Palette::window_appearance(p.dark, p.increased(), false).selected
+        };
         let rest = match status {
             button::Status::Hovered => p.hover,
-            button::Status::Pressed => p.selected,
-            _ => alpha(p.selected, 0.0),
+            button::Status::Pressed => selection,
+            _ => alpha(selection, 0.0),
         };
-        let fill = mix(rest, p.selected, selected.clamp(0.0, 1.0));
+        let fill = mix(rest, selection, selected.clamp(0.0, 1.0));
         button_base((fill.a > 0.0).then_some(fill), p.text, RADIUS)
     }
 }
@@ -837,9 +963,9 @@ pub fn segment_label(lit: f32) -> impl Fn(&Theme, button::Status) -> button::Sty
 
 /// An icon or text button on dark glass; `shown` fades it with its overlay.
 pub fn on_glass(active: bool, shown: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |_theme, status| {
+    move |theme, status| {
         let rest = if active {
-            STAGE.accent_text
+            stage_palette(Palette::from(theme).window_active).accent_text
         } else {
             ON_STAGE_SECONDARY
         };
@@ -900,6 +1026,7 @@ pub fn bare(_theme: &Theme, _status: button::Status) -> button::Style {
 
 pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
     let p = Palette::from(theme);
+    let status = input_status(p, status);
     let border = match status {
         text_input::Status::Focused { .. } => Border {
             color: p.accent,
@@ -929,7 +1056,24 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
         } else {
             p.text
         },
-        selection: alpha(p.accent, 0.3),
+        selection: alpha(
+            if p.window_active {
+                p.accent
+            } else {
+                p.control_border
+            },
+            0.3,
+        ),
+    }
+}
+
+/// iced retains editor focus across window activation, including its Focused
+/// style status. Keep that saved focus without drawing an active-window ring.
+fn input_status(p: &Palette, status: text_input::Status) -> text_input::Status {
+    if !p.window_active && matches!(status, text_input::Status::Focused { .. }) {
+        text_input::Status::Active
+    } else {
+        status
     }
 }
 
@@ -949,6 +1093,7 @@ pub fn input_invalid(theme: &Theme, status: text_input::Status) -> text_input::S
 /// A field holding an edit that has not been applied yet.
 pub fn input_dirty(theme: &Theme, status: text_input::Status) -> text_input::Style {
     let p = Palette::from(theme);
+    let status = input_status(p, status);
     let mut style = input(theme, status);
     if !matches!(status, text_input::Status::Focused { .. }) {
         style.border = hairline(p.accent, RADIUS_SMALL);
@@ -960,6 +1105,7 @@ pub fn input_dirty(theme: &Theme, status: text_input::Status) -> text_input::Sty
 /// `t` goes from 1 to 0.
 pub fn input_flash(t: f32) -> impl Fn(&Theme, text_input::Status) -> text_input::Style {
     move |theme, status| {
+        let status = input_status(Palette::from(theme), status);
         let mut style = input(theme, status);
         if t <= 0.0 {
             return style;
@@ -1060,6 +1206,9 @@ pub fn check(theme: &Theme, status: checkbox::Status) -> checkbox::Style {
 
 pub fn slide(theme: &Theme, status: slider::Status) -> slider::Style {
     let p = Palette::from(theme);
+    // A white thumb against the inactive macOS gray rail needs a separate
+    // dark edge; reusing the gray fill would blend both edges into the rail.
+    let strong_handle = p.increased() || (!p.window_active && cfg!(target_os = "macos"));
     slider::Style {
         rail: slider::Rail {
             backgrounds: (p.accent.into(), track(p).into()),
@@ -1075,8 +1224,8 @@ pub fn slide(theme: &Theme, status: slider::Status) -> slider::Style {
                 },
             },
             background: Color::WHITE.into(),
-            border_width: if p.increased() { 2.0 } else { 1.0 },
-            border_color: if p.increased() {
+            border_width: if strong_handle { 2.0 } else { 1.0 },
+            border_color: if strong_handle {
                 Color::BLACK
             } else {
                 p.accent_fill
@@ -1209,15 +1358,102 @@ mod tests {
     fn increased_contrast_themes_select_the_matching_widget_palette() {
         for dark in [false, true] {
             for increased in [false, true] {
-                let theme = theme_appearance(dark, increased);
-                let p = Palette::appearance(dark, increased);
-                assert!(std::ptr::eq(Palette::from(&theme), p));
-                assert_eq!(theme.palette().background, p.base);
-                assert_eq!(theme.palette().text, p.text);
-                assert_eq!(theme.extended_palette().primary.base.color, p.accent_fill);
-                assert_eq!(theme.extended_palette().primary.base.text, Color::WHITE);
+                for active in [false, true] {
+                    let theme = window_theme_appearance(dark, increased, active);
+                    let p = Palette::window_appearance(dark, increased, active);
+                    assert!(std::ptr::eq(Palette::from(&theme), p));
+                    assert_eq!(theme.palette().background, p.base);
+                    assert_eq!(theme.palette().text, p.text);
+                    assert_eq!(theme.extended_palette().primary.base.color, p.accent_fill);
+                    assert_eq!(theme.extended_palette().primary.base.text, Color::WHITE);
+                    assert_eq!(Palette::from(&theme).window_active, active);
+                }
             }
         }
+    }
+
+    #[test]
+    fn inactive_platform_policies_keep_status_and_readable_selected_content() {
+        for active in [LIGHT, DARK, LIGHT_CONTRAST, DARK_CONTRAST] {
+            for neutral_controls in [false, true] {
+                let p = inactive(Palette { ..active }, neutral_controls);
+                assert!(!p.window_active);
+                assert_ne!(p.selected, active.selected);
+                assert_eq!((p.text, p.secondary), (active.text, active.secondary));
+                assert_eq!(
+                    (p.live, p.warn, p.danger),
+                    (active.live, active.warn, active.danger)
+                );
+                assert_eq!(
+                    (p.base, p.sidebar, p.field),
+                    (active.base, active.sidebar, active.field)
+                );
+                assert!(ratio(p.text, p.selected) >= 4.5);
+                assert!(ratio(p.secondary, p.selected) >= 4.5);
+                assert!(ratio(p.control_border, p.selected) >= 3.0);
+                assert!(ratio(Color::WHITE, p.accent_fill) >= 4.5);
+                if neutral_controls {
+                    assert_ne!(p.accent_fill, active.accent_fill);
+                    assert!(ratio(p.accent_text, p.base) >= 4.5);
+                } else {
+                    assert_eq!(
+                        (p.accent, p.accent_fill, p.accent_text),
+                        (active.accent, active.accent_fill, active.accent_text)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inactive_editor_focus_is_not_disabled_or_drawn_as_the_key_window() {
+        for dark in [false, true] {
+            for increased in [false, true] {
+                let theme = window_theme_appearance(dark, increased, false);
+                let p = Palette::from(&theme);
+                let focused = text_input::Status::Focused { is_hovered: false };
+                let ordinary = input(&theme, text_input::Status::Active);
+                let unfocused = input(&theme, focused);
+                assert_eq!(unfocused.border, ordinary.border);
+                assert_eq!(unfocused.background, ordinary.background);
+                assert_eq!(unfocused.value, p.text);
+                assert_ne!(
+                    unfocused.value,
+                    input(&theme, text_input::Status::Disabled).value
+                );
+                assert_eq!(input_invalid(&theme, focused).border.color, p.danger);
+                assert_eq!(input_dirty(&theme, focused).border.color, p.accent);
+                assert_eq!(ring(1.0, true)(&theme).border.color, STAGE_INACTIVE.accent);
+                assert_ne!(ring(1.0, true)(&theme).border.color, STAGE.accent);
+            }
+        }
+    }
+
+    #[test]
+    fn window_themes_remain_independent_while_another_window_takes_focus() {
+        let main = window_theme_appearance(false, false, false);
+        let settings = window_theme_appearance(false, false, true);
+        assert_ne!(main.name(), settings.name());
+        assert_eq!(
+            row(1.0, true)(&main, button::Status::Active).background,
+            Some(INACTIVE[0].selected.into())
+        );
+        assert_eq!(
+            row(1.0, true)(&settings, button::Status::Active).background,
+            Some(LIGHT.selected.into())
+        );
+        let restored = window_theme_appearance(false, false, true);
+        assert_eq!(
+            row(1.0, true)(&restored, button::Status::Active).background,
+            Some(LIGHT.selected.into())
+        );
+        // Looking up a restored foreground window must not recolor the
+        // already constructed background window or allocate a new theme.
+        assert!(!Palette::from(&main).window_active);
+        let (Theme::Custom(settings), Theme::Custom(restored)) = (settings, restored) else {
+            panic!("window themes must use the cached custom appearances");
+        };
+        assert!(std::sync::Arc::ptr_eq(&settings, &restored));
     }
 
     #[test]

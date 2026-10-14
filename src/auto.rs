@@ -778,10 +778,19 @@ impl AutoController {
         .into_iter()
         .find(|f| camera.has(f));
         if camera.info.transport == Transport::GigE {
-            let speed = read_any(camera, &["DeviceLinkSpeed"])
-                .map(|(_, v)| v / 8.0)
-                .or_else(|| read_any(camera, &["GevLinkSpeed"]).map(|(_, v)| v * 125_000.0));
-            self.caps.link = Some(speed.filter(|v| *v > 0.0).unwrap_or(125e6));
+            let speed = crate::network::camera_link_bytes_per_second(camera);
+            let physical = speed.filter(|v| *v > 0.0).unwrap_or_else(|| {
+                camera
+                    .network_budget_bytes_per_second()
+                    .map_or(125e6, |budget| budget as f64 / 0.92)
+            });
+            // The scan accounts for the host's actual NIC and other cameras.
+            // Keep the controller's 92% policy inside that shared budget.
+            self.caps.link = Some(
+                camera
+                    .network_budget_bytes_per_second()
+                    .map_or(physical, |budget| physical.min(budget as f64 / 0.92)),
+            );
         }
         self.caps.triggered = camera.get("TriggerMode").is_ok_and(|v| v == "On")
             && camera
@@ -1034,6 +1043,26 @@ impl AutoController {
         }
     }
     fn limiter_off(&mut self, camera: &mut Camera, c: &Caps) {
+        if camera.network_budget_bytes_per_second().is_some() && !c.triggered {
+            if let Some(f) = c.frame_rate {
+                let cap = policy(c, self.status.balance).fps_max;
+                self.apply(
+                    camera,
+                    f,
+                    json!(cap),
+                    "frame rate within scanned network budget",
+                );
+                if let Some(enable) = c.frame_rate_enable {
+                    let on = if enable == "AcquisitionFrameRateMode" {
+                        json!("On")
+                    } else {
+                        json!(true)
+                    };
+                    self.apply(camera, enable, on, "scanned network budget active");
+                }
+            }
+            return;
+        }
         if let Some(f) = c.frame_rate_enable {
             let off = match f {
                 "AcquisitionFrameRateMode" => json!("Off"),
@@ -1087,7 +1116,7 @@ impl AutoController {
                 json!(limit),
                 "throughput within the link budget",
             );
-        } else if limit < cap {
+        } else if limit < cap || camera.network_budget_bytes_per_second().is_some() {
             self.apply(camera, feature, json!(limit), "preserve bandwidth backoff");
             if let Some(enable) = c.frame_rate_enable {
                 let on = match enable {
@@ -1714,7 +1743,7 @@ impl AutoController {
             .caps
             .frame_rate_enable
             .context("frame-rate limiter has no enable feature")?;
-        let on = limit < cap;
+        let on = limit < cap || camera.network_budget_bytes_per_second().is_some();
         if on {
             self.write(camera, feature, json!(limit), Some(why))?;
         }
@@ -2541,6 +2570,56 @@ mod tests {
         assert_eq!(auto.bandwidth.as_ref().unwrap().aimd.limit, 115e6);
         auto.release(&mut camera, true).unwrap();
         assert_eq!(fake.u32(THROUGHPUT), 125_000_000);
+    }
+
+    #[test]
+    fn scanned_shared_budget_survives_auto_replanning_and_backoff() {
+        let fake = Fake::new(true);
+        fake.set_lost(0);
+        fake.set_u32(THROUGHPUT, 125_000_000);
+        let mut camera = fake.camera();
+        camera.set_network_budget_bytes_per_second(40_000_000);
+        let mut auto = AutoController::enter(&mut camera, 1.0).unwrap();
+        assert!(fake.u32(THROUGHPUT) <= 40_000_000);
+        assert!(auto.bandwidth.as_ref().unwrap().aimd.cap <= 40_000_000.0);
+        camera.set_network_budget_bytes_per_second(20_000_000);
+        auto.invalidate();
+        auto.tick(&mut camera, Instant::now());
+        assert!(fake.u32(THROUGHPUT) <= 20_000_000);
+        assert!(auto.bandwidth.as_ref().unwrap().aimd.cap <= 20_000_000.0);
+    }
+
+    #[test]
+    fn scanned_fast_link_is_not_limited_by_assumed_one_gigabit_speed() {
+        let fake = Fake::new(true);
+        let mut camera = fake.camera();
+        camera.set_network_budget_bytes_per_second(400_000_000);
+        let auto = AutoController::enter(&mut camera, 1.0).unwrap();
+        assert!((auto.caps.link.unwrap() * 0.92 - 400_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn scan_frame_rate_fallback_stays_enabled_in_auto_at_full_budget() {
+        let mut fake = Fake::new(true);
+        fake.set_lost(0);
+        fake.xml = fake
+            .xml
+            .replace("DeviceLinkThroughputLimit", "UnusedThroughputLimit");
+        let mut camera = fake.camera();
+        camera.set_network_budget_bytes_per_second(40_000_000);
+        let mut auto = AutoController::enter(&mut camera, 1.0).unwrap();
+        assert_eq!(fake.u32(ENABLE), 1);
+        let cap = 40_000_000.0 / (1.05 * 2_304_000.0);
+        assert!(fake.f64(RATE) <= cap + 1e-6);
+        auto.invalidate();
+        auto.tick(&mut camera, Instant::now());
+        assert_eq!(fake.u32(ENABLE), 1);
+        assert!(fake.f64(RATE) <= cap + 1e-6);
+        camera.start().unwrap();
+        let mut now = Instant::now();
+        drive(&mut auto, &mut camera, &mut now, 1.0, 120);
+        assert_eq!(fake.u32(ENABLE), 1);
+        assert!(fake.f64(RATE) <= cap + 1e-6);
     }
 
     #[test]

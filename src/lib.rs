@@ -1,5 +1,6 @@
 #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
 pub mod accel;
+pub mod analytics;
 pub mod auto;
 pub mod camera;
 pub mod camera_profile;
@@ -14,15 +15,18 @@ pub mod gui;
 pub mod ipc;
 pub mod jpeg;
 pub mod media;
+pub mod network;
 #[cfg(feature = "nvjpeg")]
 pub mod nvjpeg;
 pub mod onvif;
+pub mod remote;
 #[cfg(feature = "s3")]
 pub mod s3;
 pub mod scanner;
 pub mod scheduling;
 pub mod session;
 pub mod shared_memory;
+pub mod simulation;
 pub mod storage;
 pub mod transport;
 pub mod types;
@@ -33,3 +37,4 @@ pub mod vajpeg;
 pub mod volumes;
 #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
 pub mod vtjpeg;
+pub mod workflow;

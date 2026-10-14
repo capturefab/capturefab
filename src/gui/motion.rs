@@ -422,6 +422,8 @@ impl Workbench {
 
     pub(super) fn sheet_open(&self) -> bool {
         self.help_open
+            || self.network_open
+            || self.analytics.open
             || (self.settings_open && self.settings_window.is_none())
             || self.capture_to.manager_open
             || self.record_to.manager_open

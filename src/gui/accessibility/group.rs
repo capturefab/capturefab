@@ -10,6 +10,39 @@ pub(in crate::gui) fn group<'a, M: 'static>(
         content,
         name,
         role,
+        id: None,
+        modal: role == Role::AlertDialog,
+    })
+}
+
+pub(in crate::gui) fn modal_group<'a, M: 'static>(
+    content: Element<'a, M>,
+    name: String,
+    role: Role,
+) -> Element<'a, M> {
+    Element::new(Group {
+        content,
+        name,
+        role,
+        id: None,
+        modal: true,
+    })
+}
+
+/// A journal-owned ID preserves a noninteractive group's identity when the
+/// widget toolkit reorders or reconstructs its children. Callers allocate from
+/// the shared allocator and retain IDs only while the journal entry exists.
+pub(in crate::gui) fn group_with_id<'a, M: 'static>(
+    content: Element<'a, M>,
+    name: String,
+    id: NodeId,
+) -> Element<'a, M> {
+    Element::new(Group {
+        content,
+        name,
+        role: Role::Group,
+        id: Some(id),
+        modal: false,
     })
 }
 
@@ -17,6 +50,8 @@ struct Group<'a, M, R: renderer::Renderer = iced::Renderer> {
     content: Element<'a, M, Theme, R>,
     name: String,
     role: Role,
+    id: Option<NodeId>,
+    modal: bool,
 }
 
 pub(super) struct Marker {
@@ -85,9 +120,13 @@ impl<M: 'static, R: renderer::Renderer> Widget<M, Theme, R> for Group<'_, M, R> 
         operation: &mut dyn Operation,
     ) {
         let control = tree.state.downcast_mut::<Control<M>>();
+        let state_id = control.id;
+        if let Some(id) = self.id {
+            control.id = id;
+        }
         control.node = Node::new(self.role);
         control.node.set_label(self.name.as_str());
-        if self.role == Role::AlertDialog {
+        if self.modal {
             control.node.set_modal();
         }
         control.focusable = false;
@@ -97,6 +136,10 @@ impl<M: 'static, R: renderer::Renderer> Widget<M, Theme, R> for Group<'_, M, R> 
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
         scope(operation, layout.bounds(), control.id, false);
+        // The optional journal identity belongs only to this view. Preserve
+        // the widget state's own allocation if the same tree is later reused
+        // for an ordinary group or a different journal entry.
+        control.id = state_id;
     }
     fn update(
         &mut self,
@@ -168,6 +211,8 @@ mod tests {
             .into(),
             name: "Failure details".into(),
             role: Role::Group,
+            id: None,
+            modal: false,
         };
         let content = iced::widget::Column::new().push(Element::new(nested)).push(
             Button::<_, ()>::new(iced::widget::Space::new().width(80).height(24))
@@ -178,6 +223,8 @@ mod tests {
             content: content.into(),
             name: "Couldn't save preferences".into(),
             role: Role::AlertDialog,
+            id: None,
+            modal: true,
         };
         let mut tree = Tree::new(&dialog as &dyn Widget<Message, Theme, ()>);
         let node = dialog.layout(
@@ -223,5 +270,59 @@ mod tests {
                 .iter()
                 .any(|(id, node)| *id == id_before && node.role() == Role::AlertDialog)
         );
+    }
+
+    #[test]
+    fn replacing_an_explicit_journal_group_with_an_ordinary_group_restores_its_own_identity() {
+        let explicit = new_node_id();
+        let mut group = Group {
+            content: iced::widget::Text::<Theme, ()>::new("Command details").into(),
+            name: "Command 1".into(),
+            role: Role::Group,
+            id: Some(explicit),
+            modal: false,
+        };
+        let mut tree = Tree::new(&group as &dyn Widget<Message, Theme, ()>);
+        let own_id = tree.state.downcast_ref::<Control<Message>>().id;
+        assert_ne!(own_id, explicit);
+        let layout = group.layout(
+            &mut tree,
+            &(),
+            &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+        );
+        let (journal, _, _) = snapshot_widget(&mut group, &mut tree, Layout::new(&layout), &());
+        assert!(
+            journal
+                .nodes
+                .iter()
+                .any(|(id, node)| *id == explicit && node.label() == Some("Command 1"))
+        );
+        assert_eq!(tree.state.downcast_ref::<Control<Message>>().id, own_id);
+        group.id = None;
+        group.name = "Session details".into();
+        group.diff(&mut tree);
+        let (ordinary, bridge, window) =
+            snapshot_widget(&mut group, &mut tree, Layout::new(&layout), &());
+        assert!(
+            ordinary
+                .nodes
+                .iter()
+                .any(|(id, node)| *id == own_id && node.label() == Some("Session details"))
+        );
+        assert!(!ordinary.nodes.iter().any(|(id, _)| *id == explicit));
+        for action in [Action::Focus, Action::Click] {
+            assert!(
+                iced_runtime::task::into_stream(bridge.dispatch(Request {
+                    window,
+                    replay: None,
+                    action: ActionRequest {
+                        action,
+                        target: explicit,
+                        data: None
+                    },
+                }))
+                .is_none()
+            );
+        }
     }
 }

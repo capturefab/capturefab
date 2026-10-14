@@ -57,7 +57,7 @@ impl Workbench {
         if let Some(error) = &self.close_error
             && error.window == id
         {
-            let p = Palette::of(self.dark());
+            let p = self.window_palette(id);
             let details = error
                 .details
                 .strip_prefix("Could not save settings: ")
@@ -81,12 +81,13 @@ fn close_alert<'a>(details: &'a str, p: &'static Palette, viewport: Size) -> Ele
         .padding([7, 18])
         .style(style::primary)
         .on_press(Message::RetryClose);
+    let (first, second) = dialog_actions(keep, retry, compact);
     let footer: Element<'_, Message> = if compact {
-        column![retry.width(Fill), keep.width(Fill)]
+        column![first.width(Fill), second.width(Fill)]
             .spacing(10)
             .into()
     } else {
-        row![space::horizontal(), keep, retry]
+        row![space::horizontal(), first, second]
             .spacing(10)
             .align_y(Alignment::Center)
             .into()
@@ -121,7 +122,7 @@ fn close_alert<'a>(details: &'a str, p: &'static Palette, viewport: Size) -> Ele
     .width(width)
     .style(style::sheet);
     let alert = keyboard_history::escape_guard(accessibility::group(
-        alert.into(),
+        keyboard_history::default_action(alert.into(), Some(Message::RetryClose)),
         TITLE.into(),
         accessibility::Role::AlertDialog,
     ));

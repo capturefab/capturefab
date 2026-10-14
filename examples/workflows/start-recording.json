@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "steps": [
+    {"command": {"op": "connect", "camera": "sim:recording", "timeout_ms": 2000}},
+    {"camera": "sim:recording", "command": {"op": "set", "feature": "Width", "value": "640"}},
+    {"camera": "sim:recording", "command": {"op": "set", "feature": "Height", "value": "480"}},
+    {"camera": "sim:recording", "command": {
+      "op": "forward", "output": "video/clip.mkv",
+      "codec": "h264", "encoder": "auto", "fps": 30.0, "bitrate": "4M",
+      "max_file_bytes": 67108864,
+      "storage": {"max_bytes": 536870912, "max_files": 100, "on_full": "stop"}
+    }}
+  ]
+}

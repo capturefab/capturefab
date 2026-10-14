@@ -899,7 +899,7 @@ impl Workbench {
     fn stage_controls(&self, shown: f32) -> Element<'_, Message> {
         let os = Os::CURRENT;
         let snapshot = &self.snapshot;
-        let stage = style::STAGE;
+        let stage = style::stage_palette(self.key_window == Some(self.main_window));
         let zoom_actual = !self.fit && (self.zoom - 1.0).abs() < 0.01;
         let ink = |active: bool, enabled: bool| {
             let color = if active {

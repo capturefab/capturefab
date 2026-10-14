@@ -47,7 +47,7 @@ pub(super) const DISCOVERING: &str =
     "Looking for webcams, GigE Vision, USB3 Vision and ONVIF cameras…";
 /// What the address field takes, in full.
 pub(super) const ADDRESSES: &str =
-    "IP address, stream URL (RTSP, SRT, RTMP, HTTP), onvif: address or video file";
+    "IP address, stream URL (RTSP, SRT, RTMP, HTTP), onvif: address, video file or sim:replay:PATH";
 /// What the address field takes, in the room under it.
 const ADDRESS_HINT: &str = "IP, stream URL, onvif: or video file";
 
@@ -396,6 +396,9 @@ fn read_address(input: &str, devices: &[CameraInfo], file: Option<bool>) -> Opti
     if crate::onvif::is_source(input) {
         return Some(format!("Will try ONVIF at {}", host(input)));
     }
+    if crate::transport::simulator::replay_source(input).is_some() {
+        return Some("Will loop the test file or folder as a simulated camera".into());
+    }
     if input.starts_with("sim:") {
         return Some("Will try a simulated camera".into());
     }
@@ -666,10 +669,31 @@ impl Workbench {
                         })
                         .into()
                 ),
+                container(
+                    row![
+                        self.network_scan_button(p),
+                        space::horizontal(),
+                        button(text("Results").size(style::SMALL))
+                            .name("Open network scan results")
+                            .padding([4, 5])
+                            .style(style::plain)
+                            .on_press_maybe(
+                                self.snapshot
+                                    .network_scan
+                                    .as_ref()
+                                    .map(|_| Message::NetworkReport(true))
+                            ),
+                    ]
+                    .align_y(Alignment::Center),
+                )
+                .padding([6.0, EDGE + INSET]),
                 space().height(4),
-                container(scrollable(list).height(Fill).style(style::scroll))
-                    .height(Fill)
-                    .padding([0.0, EDGE]),
+                container(keyboard_history::content_scope(
+                    scrollable(list).height(Fill).style(style::scroll).into(),
+                    keyboard_history::Area::CameraList,
+                ))
+                .height(Fill)
+                .padding([0.0, EDGE]),
                 self.sidebar_footer(p),
             ]
             .padding(iced::Padding {
@@ -698,11 +722,18 @@ impl Workbench {
         let failure = (state.is_none() && !connecting)
             .then(|| self.side.connect_failures.get(id))
             .flatten();
+        let network = self.network_status(camera);
         let stalled = state
             .filter(|state| state.streaming)
             .and_then(|_| self.stalled(id));
         let dot_state = match state {
             Some(state) => self.camera_state(state),
+            None if network
+                .as_ref()
+                .is_some_and(|status| status.level == Level::Error) =>
+            {
+                CameraState::Failed
+            }
             None if failure.is_some() => CameraState::Failed,
             None => CameraState::Offline,
         };
@@ -715,29 +746,46 @@ impl Workbench {
             ("Connecting…".to_owned(), p.secondary)
         } else if let Some((error, _)) = failure {
             (capitalize(first_line(error)), p.ink(p.danger))
+        } else if let Some(status) = &network {
+            (status.label.to_owned(), status.color(p))
         } else {
             (place(camera), p.secondary)
         };
         let status = state.and_then(|state| camera_status(state, self.camera_error(id), p));
-        let mut hint = match state {
-            Some(_) => format!("{} {} · {}", camera.vendor, camera.model, dot_state.about()),
-            None => format!("Connect to {} {}", camera.vendor, camera.model),
+        let identity = format!("{} {} · {}", camera.vendor, camera.model, identity(camera));
+        let name = if state.is_some() {
+            identity
+        } else {
+            format!("Connect to {identity}")
+        };
+        let mut about = match state {
+            Some(_) => format!(
+                "{}{}",
+                if active { "Current camera. " } else { "" },
+                dot_state.about()
+            ),
+            None if connecting => "Connecting…".into(),
+            None => "Not connected.".into(),
         };
         let profile = state.map_or(&camera.profile, |state| &state.info.profile);
-        hint.push_str(&format!(
+        if let Some(status) = &network {
+            about.push_str(&format!("\n{}\n{}", place(camera), status.detail));
+        }
+        about.push_str(&format!(
             "\n{}\nDetected from {}",
             profile.kind.summary(),
             profile.source
         ));
         // The dot says it stalled; for how long is here.
         if let Some(silent) = stalled {
-            hint = format!("{hint}\n{}", silence(silent));
+            about = format!("{about}\n{}", silence(silent));
         }
-        if let Some((_, about)) = &status {
-            hint = format!("{hint}\n{about}");
+        if let Some((_, status)) = &status {
+            about = format!("{about}\n{status}");
         } else if let Some((error, _)) = failure {
-            hint = format!("{hint}\nCould not connect: {error}");
+            about = format!("{about}\nCould not connect: {error}");
         }
+        let hint = format!("{name}\n{about}");
         let mut line = row![
             lead(glyph),
             column![
@@ -785,10 +833,14 @@ impl Workbench {
         }
         let base = tip(
             button(line)
-                .name(hint.clone())
+                .name(name)
+                .description(about)
                 .width(Fill)
                 .padding([7.0, INSET])
-                .style(style::row(self.selection_level(id)))
+                .style(style::row(
+                    self.selection_level(id),
+                    self.selection_emphasized(keyboard_history::Area::CameraList),
+                ))
                 .on_press_maybe((!connecting).then(|| Message::CameraRow(camera.id.clone()))),
             hint,
         );
@@ -823,7 +875,10 @@ impl Workbench {
             .name(format!("Connecting to {}", short_address(target)))
             .width(Fill)
             .padding([7.0, INSET])
-            .style(style::row(0.0))
+            .style(style::row(
+                0.0,
+                self.selection_emphasized(keyboard_history::Area::CameraList),
+            ))
             .into()
     }
 
@@ -886,7 +941,10 @@ impl Workbench {
                     .name(format!("Reconnect {}", entry.label))
                     .width(Fill)
                     .padding([7.0, INSET])
-                    .style(style::row(0.0))
+                    .style(style::row(
+                        0.0,
+                        self.selection_emphasized(keyboard_history::Area::CameraList),
+                    ))
                     .on_press_maybe(
                         (!connecting).then(|| Message::CameraRow(entry.target.clone())),
                     ),
@@ -1338,7 +1396,7 @@ mod tests {
             let theme = style::theme(dark);
             let p = Palette::of(dark);
             let fill = |amount: f32, status: Status| {
-                style::row(amount)(&theme, status)
+                style::row(amount, true)(&theme, status)
                     .background
                     .map(|background| match background {
                         iced::Background::Color(color) => color,
@@ -1516,5 +1574,76 @@ mod tests {
         bench.sync_animations();
         assert!(bench.sidebar_shown());
         assert_eq!(bench.sidebar_slide.target(), 1.0);
+    }
+
+    #[test]
+    fn native_camera_identity_stays_stable_while_status_changes() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced::futures::StreamExt;
+        let renderer = super::super::destinations::layout_tests::renderer();
+        let mut bench = bench();
+        let camera = super::super::liveness::streaming_camera(10, 0, 30.0);
+        let name = format!(
+            "{} {} · {}",
+            camera.info.vendor,
+            camera.info.model,
+            identity(&camera.info)
+        );
+        bench.snapshot.active_camera = Some(camera.info.id.clone());
+        bench.snapshot.cameras = vec![camera];
+        let mut tree = Tree::empty();
+        let mut previous = None;
+        for (streaming, recording) in [(false, false), (true, false), (true, true)] {
+            bench.snapshot.cameras[0].streaming = streaming;
+            bench.snapshot.cameras[0].forwarding =
+                recording.then(|| "recordings/line-1.mkv".into());
+            let camera = &bench.snapshot.cameras[0];
+            let mut view = bench.camera_row(&camera.info, 0, Palette::of(false));
+            tree.diff(view.as_widget());
+            let layout = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(320.0, 100.0)),
+            );
+            let (snapshot, bridge, window) = accessibility::snapshot_widget(
+                view.as_widget_mut(),
+                &mut tree,
+                Layout::new(&layout),
+                &renderer,
+            );
+            let (id, control) = snapshot
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(name.as_str()))
+                .expect("camera has a concise native identity");
+            let description = control.description().unwrap();
+            assert!(description.starts_with("Current camera. "));
+            assert!(description.contains(if streaming { "streaming" } else { "connected" }));
+            assert_eq!(description.contains("Recording to "), recording);
+            assert!(description.contains("Detected from "));
+            assert!(
+                control.live().is_none(),
+                "frame updates are not announcements"
+            );
+            if let Some(previous) = previous {
+                assert_eq!(*id, previous, "status retains the native target");
+            }
+            previous = Some(*id);
+            let task = bridge.dispatch(accessibility::Request {
+                window,
+                replay: None,
+                action: accesskit::ActionRequest {
+                    action: accesskit::Action::Click,
+                    target: *id,
+                    data: None,
+                },
+            });
+            let mut actions = iced_runtime::task::into_stream(task).unwrap();
+            assert!(matches!(
+                iced::futures::executor::block_on(actions.next()),
+                Some(iced_runtime::Action::Output(Message::CameraRow(id))) if id == camera.info.id
+            ));
+            assert!(iced::futures::executor::block_on(actions.next()).is_none());
+        }
     }
 }

@@ -84,6 +84,10 @@ pub trait Backend: RegisterIo {
     }
     fn next_frame(&mut self, timeout: Duration) -> Result<Frame>;
     fn stop(&mut self) -> Result<()>;
+    /// Re-evaluate transport settings while acquisition is stopped.
+    fn optimize_network(&mut self, _payload_size: usize) -> Result<crate::network::NetworkTuning> {
+        anyhow::bail!("network tuning is only available for GigE Vision cameras")
+    }
     fn stats(&self) -> Option<TransportStats> {
         None
     }

@@ -1,0 +1,71 @@
+--- a/src/text_input.rs
++++ b/src/text_input.rs
+@@ -107,6 +107,7 @@
+     placeholder: String,
+     value: Value,
+     is_secure: bool,
++    show_unfocused_selection: bool,
+     font: Option<Renderer::Font>,
+     width: Length,
+     padding: Padding,
+@@ -138,6 +139,7 @@
+             placeholder: String::from(placeholder),
+             value: Value::new(value),
+             is_secure: false,
++            show_unfocused_selection: false,
+             font: None,
+             width: Length::Fill,
+             padding: DEFAULT_PADDING,
+@@ -162,6 +164,16 @@
+     /// Converts the [`TextInput`] into a secure password input.
+     pub fn secure(mut self, is_secure: bool) -> Self {
+         self.is_secure = is_secure;
++        self
++    }
++
++    /// Keeps the retained selected range visible when its window loses focus.
++    ///
++    /// This does not draw an inactive caret or change editor focus, keyboard
++    /// input, or input-method behavior. The caller's style supplies the
++    /// unemphasized selection color. Defaults to `false`.
++    pub fn show_unfocused_selection(mut self, show: bool) -> Self {
++        self.show_unfocused_selection = show;
+         self
+     }
+ 
+@@ -498,11 +510,16 @@
+ 
+         let text = value.to_string();
+ 
+-        let (cursor, offset, is_selecting) = if let Some(focus) = state
+-            .is_focused
+-            .as_ref()
+-            .filter(|focus| focus.is_window_focused)
+-        {
++        let (cursor, offset, is_selecting) = if let Some(focus) =
++            state.is_focused.as_ref().filter(|focus| {
++                focus.is_window_focused
++                    || (self.show_unfocused_selection
++                        && !is_disabled
++                        && matches!(
++                            state.cursor.state(value),
++                            cursor::State::Selection { .. }
++                        ))
++            }) {
+             match state.cursor.state(value) {
+                 cursor::State::Index(position) => {
+                     let (text_value_width, offset) =
+@@ -630,8 +647,11 @@
+         };
+ 
+         if is_selecting {
+-            renderer
+-                .with_layer(text_bounds, |renderer| draw(renderer, *viewport));
++            if let Some(visible_bounds) = text_bounds.intersection(viewport) {
++                renderer.with_layer(visible_bounds, |renderer| {
++                    draw(renderer, visible_bounds);
++                });
++            }
+         } else {
+             draw(renderer, text_bounds);
+         }

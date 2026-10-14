@@ -144,7 +144,11 @@ fn settings_close_alert_routes_escape_once_and_restores_the_obscured_control() {
             );
             assert_eq!(
                 controls.tab_stops,
-                [Id::new("close-keep-open"), Id::new("close-retry")],
+                if cfg!(target_os = "windows") {
+                    [Id::new("close-retry"), Id::new("close-keep-open")]
+                } else {
+                    [Id::new("close-keep-open"), Id::new("close-retry")]
+                },
                 "only alert actions participate in traversal"
             );
             apply(
@@ -377,6 +381,87 @@ fn command_period_uses_the_subscription_cancel_path_only_on_macos() {
 }
 
 #[test]
+fn actual_close_alert_return_uses_default_retry_and_space_uses_focused_cancel() {
+    let renderer = renderer();
+    for focus in ["close-keep-open", "close-retry", "none"] {
+        let mut app = Workbench::new(SessionHandle::new(), "alert-test".into(), false, None);
+        let id = window::Id::unique();
+        app.settings_window = Some(id);
+        app.settings_open = true;
+        app.focused_window = id;
+        let _ = app.show_close_error(crate::gui::CloseTarget::Quit, "disk full".into());
+        let mut view = app.window_view(id);
+        let mut tree = Tree::empty();
+        let node = layout(&mut view, &mut tree, &renderer);
+        if focus != "none" {
+            apply(
+                &mut view,
+                &mut tree,
+                &node,
+                &renderer,
+                operation::focusable::focus::<()>(Id::new(focus)),
+            );
+        }
+        let mut messages = Vec::new();
+        view.as_widget_mut().update(
+            &mut tree,
+            &tests::named_press(keyboard::key::Named::Enter, keyboard::Modifiers::empty()),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &Rectangle::with_size(node.size()),
+        );
+        assert_eq!(messages.len(), 1);
+        let expected_cancel = Os::CURRENT != Os::Mac && focus == "close-keep-open";
+        assert!(matches!(inner(&messages[0]), Message::KeepOpen) == expected_cancel);
+        assert!(matches!(inner(&messages[0]), Message::RetryClose) != expected_cancel);
+        apply(
+            &mut view,
+            &mut tree,
+            &node,
+            &renderer,
+            operation::focusable::focus::<()>(Id::new("close-keep-open")),
+        );
+        messages.clear();
+        view.as_widget_mut().update(
+            &mut tree,
+            &tests::named_press(keyboard::key::Named::Space, keyboard::Modifiers::empty()),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &Rectangle::with_size(node.size()),
+        );
+        assert!(messages.is_empty());
+        let released = Event::Keyboard(keyboard::Event::KeyReleased {
+            key: keyboard::Key::Named(keyboard::key::Named::Space),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Space),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+        });
+        view.as_widget_mut().update(
+            &mut tree,
+            &released,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &Rectangle::with_size(node.size()),
+        );
+        assert!(
+            matches!(messages.as_slice(), [message] if matches!(inner(message), Message::KeepOpen))
+        );
+    }
+}
+
+#[test]
 fn long_close_error_keeps_native_dialog_actions_inside_small_scaled_viewports() {
     use crate::gui::accessibility::{Role, snapshot_widget};
     use crate::gui::prefs::UiScale;
@@ -439,10 +524,17 @@ fn long_close_error_keeps_native_dialog_actions_inside_small_scaled_viewports() 
                 .bounds()
                 .unwrap();
             if (retry.y0 - cancel.y0).abs() < 1.0 {
-                assert!(
-                    retry.x0 > cancel.x1,
-                    "the default action is trailing in a row"
-                );
+                if cfg!(target_os = "windows") {
+                    assert!(
+                        retry.x1 < cancel.x0,
+                        "Windows places the safe cancellation last"
+                    );
+                } else {
+                    assert!(
+                        retry.x0 > cancel.x1,
+                        "macOS and GNOME place cancellation first"
+                    );
+                }
             } else {
                 assert!(
                     retry.y1 < cancel.y0,

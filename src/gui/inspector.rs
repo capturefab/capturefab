@@ -9,6 +9,8 @@ use std::hash::{Hash, Hasher};
 /// The width of every control in the panel's forms and feature rows, so
 /// their edges line up.
 const CONTROL: f32 = 136.0;
+#[cfg(test)]
+mod layout_tests;
 /// Room between the panel's sections.
 const SECTION_GAP: f32 = 20.0;
 /// Room between the rows of a section.
@@ -1068,14 +1070,19 @@ fn reason<'a>(why: &'a str, p: &'static Palette) -> Element<'a, Message> {
     text(why).size(style::SMALL).color(p.secondary).into()
 }
 
-/// A failure's line, as `field_error` lays it out, in secondary ink while
-/// another try is on its way.
-fn quiet_error<'a>(message: String, p: &'static Palette) -> Element<'a, Message> {
+/// Field captions and the toolbar own live announcements. Keep an action's
+/// explanation readable without announcing it again; quiet it during a retry.
+fn error_caption<'a>(message: String, quiet: bool, p: &'static Palette) -> Element<'a, Message> {
+    let ink = if quiet {
+        p.secondary
+    } else {
+        Level::Error.color(p)
+    };
     row![
-        container(icon(Level::Error.icon(), 11.0, p.secondary))
+        container(icon(Level::Error.icon(), 11.0, ink))
             .height(style::line_height(style::CAPTION))
             .align_y(Alignment::Center),
-        text(message).size(style::CAPTION).color(p.secondary),
+        text(message).size(style::CAPTION).color(ink),
     ]
     .spacing(5)
     .into()
@@ -1151,6 +1158,14 @@ impl Workbench {
         if let Some(context) = self.camera_context(p) {
             panel = panel.push(context);
         }
+        if let Some(status) = self
+            .snapshot
+            .connected
+            .as_ref()
+            .and_then(|camera| self.network_status(camera))
+        {
+            panel = panel.push(container(self.network_indicator(status, p)).padding([4, 14]));
+        }
         let body: Element<'_, Message> =
             if self.tab == Tab::Features && self.snapshot.connected.is_none() {
                 self.no_camera(p)
@@ -1208,8 +1223,14 @@ impl Workbench {
             .map_or(CameraState::Idle, |state| self.camera_state(state));
         let line = row![
             container(status_dot(state, 6.0, p)).center_x(13),
-            one_line(camera.model.as_str(), style::SMALL, style::MEDIUM, p.text),
-            one_line(identity(camera), style::SMALL, style::SANS, p.secondary).width(Fill),
+            tip(
+                one_line(camera.model.as_str(), style::SMALL, style::MEDIUM, p.text).yield_room(),
+                camera.model.as_str(),
+            ),
+            tip(
+                one_line(identity(camera), style::SMALL, style::SANS, p.secondary).width(Fill),
+                identity(camera),
+            ),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
@@ -1635,7 +1656,7 @@ impl Workbench {
                 .padding([4, 10])
                 .style(style::secondary)
                 .on_press_maybe(
-                    (!self.pending(Job::Capture)
+                    (!self.capturing_here()
                         && self.validate_input(&self.capture_command(false)).is_ok())
                     .then_some(Message::Capture),
                 )
@@ -1894,7 +1915,10 @@ impl Workbench {
             });
         let mut content = column![input].spacing(4);
         if !valid {
-            content = content.push(field_error(num_requirement(key), Palette::of(self.dark())));
+            content = content.push(field_error(
+                num_requirement(key),
+                self.window_palette(self.main_window),
+            ));
         }
         content.into()
     }
@@ -1903,7 +1927,7 @@ impl Workbench {
         let connected = self.snapshot.connected.is_some();
         let scanner = self.scanner_selected();
         let kind = self.camera_kind();
-        let capturing = self.pending(Job::Capture);
+        let capturing = self.capturing_here();
         let saved = self.just_saved(self.snapshot.active_camera.as_deref());
         let os = Os::CURRENT;
         let problem = self.validate_input(&self.capture_command(false)).err();
@@ -1961,13 +1985,14 @@ impl Workbench {
                 self.capture_to.view(
                     &self.output,
                     "Output path",
-                    self.dark(),
+                    p,
                     crate::destination::validate_output(
                         self.capture_to.selected.as_deref(),
                         &self.output
                     )
-                    .is_err()
-                        || crate::engine::validate_capture_output(&self.output).is_err(),
+                    .and_then(|_| crate::engine::validate_capture_output(&self.output))
+                    .err()
+                    .map(|error| error.to_string()),
                 ),
                 Message::CapturePicker,
             ),
@@ -2035,7 +2060,7 @@ impl Workbench {
                     .on_press_maybe((connected && problem.is_none()).then_some(Message::Schedule)),
                 );
             if let Some(problem) = problem {
-                save = save.push(field_error(problem.to_string(), p));
+                save = save.push(error_caption(problem.to_string(), false, p));
             }
         }
         column![
@@ -2070,7 +2095,7 @@ impl Workbench {
             return Some(reason("Connect a camera to capture.", p));
         }
         if let Err(error) = self.validate_input(&self.capture_command(false)) {
-            return Some(field_error(error.to_string(), p));
+            return Some(error_caption(error.to_string(), false, p));
         }
         let here =
             |camera: &Option<String>| camera.is_none() || *camera == self.snapshot.active_camera;
@@ -2081,11 +2106,7 @@ impl Workbench {
             .filter(|(camera, _)| here(camera))
         {
             let first = capitalize(first_line(error));
-            let line = if capturing {
-                quiet_error(first, p)
-            } else {
-                field_error(first, p)
-            };
+            let line = error_caption(first, capturing, p);
             return Some(tip(container(line).width(Fill), error.clone()));
         }
         let saved = self
@@ -2188,6 +2209,7 @@ impl Workbench {
 
     fn forward_form(&self, p: &'static Palette) -> Element<'_, Message> {
         let connected = self.snapshot.connected.is_some();
+        let recording = Output::of(&self.forward_output).recording();
         let starting = self.forward_pending() == Some(false);
         let problem = self.validate_input(&self.forward_command()).err();
         let ready = connected && problem.is_none();
@@ -2205,6 +2227,8 @@ impl Workbench {
             glyph,
             if starting {
                 "Starting…"
+            } else if recording {
+                "Start recording"
             } else {
                 "Start forwarding"
             },
@@ -2214,19 +2238,27 @@ impl Workbench {
         )]
         .spacing(8);
         if !connected {
-            action = action.push(reason("Connect a camera to forward it.", p));
+            action = action.push(reason(
+                if recording {
+                    "Connect a camera to record."
+                } else {
+                    "Connect a camera to forward it."
+                },
+                p,
+            ));
         } else if let Some(problem) = problem {
-            action = action.push(field_error(problem.to_string(), p));
+            action = action.push(error_caption(problem.to_string(), false, p));
         }
         column![
-            section("Forward to a recorder", None, p),
-            text("Publish this camera to MediaMTX, an NVR or a recording file.")
+            section(if recording { "Record to a file" } else { "Forward to a recorder" }, None, p),
+            text(if recording { "Save this camera's video to a recording file." } else { "Publish this camera to MediaMTX or an NVR." })
                 .size(style::SMALL)
                 .color(p.secondary),
             accessibility::mapped(
-                self.record_to.view(&self.forward_output, "Stream URL or file", self.dark(),
-                    crate::destination::validate_output(self.record_to.selected.as_deref(), &self.forward_output).is_err()
-                        || crate::media::validate_forward_output(&self.forward_output).is_err()),
+                self.record_to.view(&self.forward_output, "Stream URL or file", p,
+                    crate::destination::validate_output(self.record_to.selected.as_deref(), &self.forward_output)
+                        .and_then(|_| crate::media::validate_forward_output(&self.forward_output))
+                        .err().map(|error| error.to_string())),
                 Message::RecordPicker,
             ),
             form_row(
@@ -2269,6 +2301,7 @@ impl Workbench {
                 column![text_input("4M", &self.forward_bitrate)
                     .name("Recording bitrate")
                     .description("An FFmpeg bitrate, such as 4M for four megabits per second.")
+                    .invalid(crate::media::validate_bitrate(self.forward_bitrate.trim()).err().map(|error| error.to_string()))
                     .id("forward-bitrate")
                     .on_input(Message::Bitrate)
                     .size(style::BODY)
@@ -2538,6 +2571,228 @@ impl Workbench {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn actual_capture_and_recording_fields_expose_precise_invalid_drafts_and_recovery() {
+        use iced::advanced::{renderer::Headless, widget::Tree};
+        let renderer = iced::futures::executor::block_on(iced::Renderer::new(
+            iced::Font::default(),
+            iced::Pixels(16.0),
+            Some("tiny-skia"),
+        ))
+        .expect("software renderer");
+        let mut bench = bench();
+        bench.snapshot.connected = Some(liveness::streaming_camera(0, 0, 0.0).info);
+        bench.capture_to = destinations::Picker::new(false, false);
+        bench.record_to = destinations::Picker::new(false, true);
+        let mut tree = Tree::empty();
+        let mut identity = None;
+        for (invalid, value) in [(true, "rtsp://host/live"), (false, "capture.png")] {
+            let _ = bench.update(Message::CapturePicker(destinations::Message::Output(
+                value.into(),
+            )));
+            let mut view = bench.capture_settings(Palette::of(false));
+            tree.diff(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &iced::advanced::layout::Limits::new(Size::ZERO, Size::new(320.0, 800.0)),
+            );
+            let (native, _, _) = accessibility::snapshot_widget(
+                view.as_widget_mut(),
+                &mut tree,
+                iced::advanced::Layout::new(&node),
+                &renderer,
+            );
+            let (id, field) = native
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == accessibility::Role::TextInput
+                        && node.label() == Some("Output path")
+                })
+                .unwrap();
+            assert_eq!(field.value(), Some(value));
+            assert_eq!(field.invalid(), invalid.then_some(accesskit::Invalid::True));
+            if invalid {
+                let cause = field.description().unwrap();
+                assert_eq!(
+                    native
+                        .nodes
+                        .iter()
+                        .filter(|(_, node)| node.live() == Some(accesskit::Live::Assertive)
+                            && node.label() == Some(cause))
+                        .count(),
+                    1
+                );
+            }
+            assert_eq!(
+                field.description(),
+                invalid.then_some(
+                    "capture output must be a file or directory; use forward for a network stream"
+                )
+            );
+            assert!(field.supports_action(accesskit::Action::SetValue));
+            if let Some(identity) = identity {
+                assert_eq!(*id, identity);
+            }
+            identity = Some(*id);
+        }
+        let mut tree = Tree::empty();
+        let mut identities = None;
+        for (invalid, output, bitrate) in [
+            (true, "recording.unsupported", "invalid"),
+            (false, "recording.mkv", "4M"),
+            (false, "rtsp://localhost:8554/camera", "4M"),
+        ] {
+            let _ = bench.update(Message::RecordPicker(destinations::Message::Output(
+                output.into(),
+            )));
+            let _ = bench.update(Message::Bitrate(bitrate.into()));
+            let output_error = crate::media::validate_forward_output(output)
+                .err()
+                .map(|error| error.to_string());
+            let bitrate_error = crate::media::validate_bitrate(bitrate)
+                .err()
+                .map(|error| error.to_string());
+            let mut view = bench.forward_form(Palette::of(false));
+            tree.diff(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &iced::advanced::layout::Limits::new(Size::ZERO, Size::new(320.0, 800.0)),
+            );
+            let (native, _, _) = accessibility::snapshot_widget(
+                view.as_widget_mut(),
+                &mut tree,
+                iced::advanced::Layout::new(&node),
+                &renderer,
+            );
+            let (output_id, output_field) = native
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == accessibility::Role::TextInput
+                        && node.label() == Some("Stream URL or file")
+                })
+                .unwrap();
+            let (bitrate_id, bitrate_field) = native
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some("Recording bitrate"))
+                .unwrap();
+            assert_eq!(output_field.value(), Some(output));
+            assert_eq!(
+                output_field.invalid(),
+                invalid.then_some(accesskit::Invalid::True)
+            );
+            assert_eq!(output_field.description(), output_error.as_deref());
+            for cause in [output_error.as_deref(), bitrate_error.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                assert_eq!(
+                    native
+                        .nodes
+                        .iter()
+                        .filter(|(_, node)| node.live() == Some(accesskit::Live::Assertive)
+                            && node.label() == Some(cause))
+                        .count(),
+                    1,
+                    "each invalid draft is announced once: {cause}"
+                );
+            }
+            assert_eq!(bitrate_field.value(), Some(bitrate));
+            assert_eq!(
+                bitrate_field.invalid(),
+                invalid.then_some(accesskit::Invalid::True)
+            );
+            assert_eq!(
+                bitrate_field.description(),
+                bitrate_error.as_deref().or(Some(
+                    "An FFmpeg bitrate, such as 4M for four megabits per second."
+                ))
+            );
+            let start = native
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.label()
+                        == Some(if Output::of(output).recording() {
+                            "Start recording"
+                        } else {
+                            "Start forwarding"
+                        })
+                })
+                .unwrap();
+            assert_eq!(start.1.is_disabled(), invalid);
+            assert_eq!(start.1.supports_action(accesskit::Action::Click), !invalid);
+            let current = (*output_id, *bitrate_id);
+            if let Some(identities) = identities {
+                assert_eq!(current, identities);
+            }
+            identities = Some(current);
+        }
+    }
+
+    #[test]
+    fn capture_failure_has_one_live_announcement_and_a_readable_inline_outcome() {
+        use iced::advanced::{renderer::Headless, widget::Tree};
+        let renderer = iced::futures::executor::block_on(iced::Renderer::new(
+            iced::Font::default(),
+            iced::Pixels(16.0),
+            Some("tiny-skia"),
+        ))
+        .expect("software renderer");
+        let mut bench = bench();
+        bench.snapshot.connected = Some(liveness::streaming_camera(0, 0, 0.0).info);
+        bench.capture_to = destinations::Picker::new(false, false);
+        bench.output = "capture.png".into();
+        bench.inspect.capture_failed = Some((
+            bench.snapshot.active_camera.clone(),
+            "permission denied".into(),
+        ));
+        bench.put_notice(
+            "Capture failed: permission denied".into(),
+            Some("permission denied".into()),
+            Level::Error,
+        );
+        let mut view: Element<'_, Message> = iced::widget::column![
+            bench.capture_settings(Palette::of(false)),
+            bench.toolbar(Palette::of(false))
+        ]
+        .into();
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &iced::advanced::layout::Limits::new(Size::ZERO, Size::new(420.0, 1000.0)),
+        );
+        let (native, _, _) = accessibility::snapshot_widget(
+            view.as_widget_mut(),
+            &mut tree,
+            iced::advanced::Layout::new(&node),
+            &renderer,
+        );
+        let alerts: Vec<_> = native
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.live() == Some(accesskit::Live::Assertive))
+            .collect();
+        assert_eq!(alerts.len(), 1, "the command outcome is announced once");
+        assert_eq!(
+            alerts[0].1.label(),
+            Some("Capture failed: permission denied")
+        );
+        assert!(
+            native
+                .nodes
+                .iter()
+                .any(|(_, node)| node.role() == accessibility::Role::Label
+                    && node.label() == Some("Permission denied")
+                    && node.live().is_none())
+        );
+    }
 
     #[test]
     fn search_preserves_editor_focus_and_selection_when_clear_action_changes() {

@@ -1,6 +1,6 @@
 [package]
 name = "capturefab"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Rust camera workbench for GenICam GigE Vision and USB3 Vision"
@@ -43,7 +43,7 @@ if-addrs = "0.13"
 socket2 = "0.6"
 ctrlc = "3.4"
 getrandom = "0.3"
-iced = { version = "0.14", optional = true, default-features = false, features = ["wgpu", "tiny-skia", "crisp", "web-colors", "smol", "linux-theme-detection", "x11", "wayland", "image-without-codecs", "canvas", "advanced"] }
+iced = { version = "0.14", optional = true, default-features = false, features = ["wgpu", "tiny-skia", "crisp", "web-colors", "smol", "linux-theme-detection", "x11", "wayland", "image-without-codecs", "svg", "canvas", "advanced"] }
 accesskit = { version = "0.21.1", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
 bytemuck = { version = "1", optional = true, features = ["derive"] }
@@ -55,6 +55,9 @@ md-5 = "0.10"
 sha2 = "0.10"
 fs2 = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Session analytics stays entirely in memory; bundling keeps releases portable.
+duckdb = { version = "~1.4.4", default-features = false, features = ["bundled"] }
+plotters = { version = "0.3.7", default-features = false, features = ["svg_backend", "line_series", "area_series"] }
 turbojpeg = { version = "1.5", optional = true, default-features = false, features = ["cmake", "require-simd"] }
 libloading = { version = "0.8", optional = true }
 ureq = { version = "3.4", optional = true, default-features = false, features = ["rustls", "platform-verifier"] }
@@ -90,6 +93,10 @@ x11-dl = { version = "2.21", optional = true }
 sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
+# Exercises the same semantic value/transition consumer as native adapters.
+accesskit_consumer = "0.31"
+# Verifies native focus task ordering and executes its real widget operation.
+iced_runtime = "0.14"
 # Validates the GUI's WGSL frame shader in unit tests; already in the tree via wgpu.
 naga = { version = "27", features = ["wgsl-in"] }
 # Blocks on wgpu device requests in the GPU preview test.
@@ -106,3 +113,8 @@ debug = 0
 [[bench]]
 name = "runtime"
 harness = false
+
+# Keep iced's real editor while retaining selected text in inactive windows.
+# Exact 0.14.2 sources and the small opt-in diff are documented in the vendor.
+[patch.crates-io]
+iced_widget = { path = "vendor/iced_widget-0.14.2" }

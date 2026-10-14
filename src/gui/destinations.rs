@@ -41,10 +41,16 @@ const DEFAULT_PREFIX: &str = "capturefab/";
 /// Ids of the editor fields that take focus as it opens.
 const NAME_FIELD: &str = "destination-name";
 const BUCKET_FIELD: &str = "destination-bucket";
+const REMOVE_CANCEL: &str = "destination-remove-cancel";
+const REMOVE_TRIGGER: &str = "destination-remove-trigger";
 /// Width of the destination sheets.
 const SHEET_WIDTH: f32 = 560.0;
 #[cfg(test)]
+mod confirmation_tests;
+#[cfg(test)]
 mod form_tests;
+#[cfg(test)]
+pub(super) mod layout_tests;
 static SECRET_WRITES: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 static NEXT_SECRET_WRITE: AtomicU64 = AtomicU64::new(1);
 
@@ -1031,6 +1037,8 @@ pub struct Picker {
     backlog: History,
     editor: Option<Editor>,
     removing: Option<String>,
+    /// The one row whose removal trigger regains focus after cancellation.
+    removal_focus: Option<String>,
     pub manager_open: bool,
     /// The outcome of the manager's last change; true for a problem.
     notice: Option<(String, bool)>,
@@ -1042,7 +1050,7 @@ pub struct Picker {
     scrolled: bool,
     /// The page changed, so its body is due to snap to its top.
     to_top: bool,
-    /// The field to focus once an editor that just opened shows.
+    /// The control to focus after an editor or confirmation changes.
     focus: Option<&'static str>,
     /// Remember the choice for the next launch (the capture panel does).
     remember: bool,
@@ -1085,6 +1093,7 @@ impl Picker {
             backlog: History::every(Duration::from_secs(1), Duration::from_secs(120)),
             editor: None,
             removing: None,
+            removal_focus: None,
             manager_open: false,
             notice: None,
             saved_glow: Flashes::new(SAVED_GLOW),
@@ -1439,7 +1448,7 @@ impl Picker {
         self.advanced_turn.show(open, now);
     }
 
-    /// The id of the field to focus, once, after an editor opened.
+    /// The id of the control to focus, once, after a page or confirmation changes.
     pub fn take_focus(&mut self) -> Option<&'static str> {
         self.focus.take()
     }
@@ -1459,6 +1468,7 @@ impl Picker {
             .set(if editor.advanced { 1.0 } else { 0.0 });
         self.editor = Some(editor);
         self.removing = None;
+        self.removal_focus = None;
         self.scrolled = false;
         self.to_top = true;
     }
@@ -1468,8 +1478,15 @@ impl Picker {
         self.editor = None;
         self.advanced_turn.set(0.0);
         self.removing = None;
+        self.removal_focus = None;
         self.scrolled = false;
         self.to_top = true;
+    }
+
+    fn cancel_removal(&mut self) {
+        if self.removing.take().is_some() {
+            self.focus = Some(REMOVE_TRIGGER);
+        }
     }
 
     /// Where a capture with this output goes, for compact displays.
@@ -1607,11 +1624,17 @@ impl Picker {
                         );
                         self.notice =
                             Some((format!("Removed {name}; its files are untouched"), false));
+                        self.focus = Some("sheet-close");
                     }
                     Err(error) => self.notice = Some((format!("{error:#}"), true)),
                 }
             }
-            Message::ConfirmRemove(name) => self.removing = name,
+            Message::ConfirmRemove(Some(name)) => {
+                self.removal_focus = Some(name.clone());
+                self.removing = Some(name);
+                self.focus = Some(REMOVE_CANCEL);
+            }
+            Message::ConfirmRemove(None) => self.cancel_removal(),
             Message::AddFolder => {
                 self.removing = None;
                 if let Some(folder) = rfd::FileDialog::new()
@@ -1630,6 +1653,7 @@ impl Picker {
                 }
             }
             Message::AddBucket => self.open_editor(Editor::new_bucket()),
+            Message::Cancel if self.removing.is_some() => self.cancel_removal(),
             Message::Cancel => self.close_editor(),
             // The folder and keychain may be slow to answer, so saving
             // finishes in `tick`.
@@ -1859,10 +1883,9 @@ impl Picker {
         &'a self,
         output: &'a str,
         local_label: &'a str,
-        dark: bool,
-        invalid_output: bool,
+        p: &'static Palette,
+        output_error: Option<String>,
     ) -> Element<'a, Message> {
-        let p = Palette::of(dark);
         let choices: Vec<Choice> = std::iter::once(Choice {
             name: None,
             label: "This computer".into(),
@@ -1917,10 +1940,7 @@ impl Picker {
                         row![
                             text_input(local_example, output)
                                 .name(local_label)
-                                .invalid(
-                                    invalid_output
-                                        .then(|| "Enter a valid output path or stream URL.".into())
-                                )
+                                .invalid(output_error.clone())
                                 .id(if self.recording {
                                     "record-output"
                                 } else {
@@ -1929,7 +1949,7 @@ impl Picker {
                                 .on_input(Message::Output)
                                 .size(style::BODY)
                                 .padding([6, 10])
-                                .style(if invalid_output {
+                                .style(if output_error.is_some() {
                                     style::input_invalid
                                 } else {
                                     style::input
@@ -1964,10 +1984,7 @@ impl Picker {
                             } else {
                                 "Capture name in destination"
                             })
-                            .invalid(
-                                invalid_output
-                                    .then(|| "Enter a valid file name or capture template.".into()),
-                            )
+                            .invalid(output_error.clone())
                             .id(if self.recording {
                                 "record-output"
                             } else {
@@ -1976,7 +1993,7 @@ impl Picker {
                             .on_input(Message::Output)
                             .size(style::BODY)
                             .padding([6, 10])
-                            .style(if invalid_output {
+                            .style(if output_error.is_some() {
                                 style::input_invalid
                             } else {
                                 style::input
@@ -1984,6 +2001,9 @@ impl Picker {
                     )
                     .push(self.summary(destination, p));
             }
+        }
+        if let Some(error) = output_error {
+            content = content.push(field_error(error, p));
         }
         if !self.volumes.is_empty() {
             let drives = self
@@ -2207,14 +2227,13 @@ impl Picker {
     /// row just saved and turns the Advanced chevron.
     pub fn manager(
         &self,
-        dark: bool,
+        p: &'static Palette,
         max_height: f32,
         spin: usize,
         now: Instant,
         undo_label: Option<&str>,
         redo_label: Option<&str>,
     ) -> Element<'_, Message> {
-        let p = Palette::of(dark);
         let page = match &self.editor {
             None => self.list(p, now, undo_label, redo_label),
             Some(editor) => self.form(editor, p, spin, now),
@@ -2303,22 +2322,32 @@ impl Picker {
     ) -> Element<'a, Message> {
         let name = destination.name.clone();
         let (first, second) = if self.removing.as_deref() == Some(name.as_str()) {
-            (
-                button(text("Remove").size(style::SMALL))
-                    .style(style::danger)
-                    .on_press(Message::Remove(name)),
-                button(text("Cancel").size(style::SMALL))
-                    .style(style::plain)
-                    .on_press(Message::ConfirmRemove(None)),
-            )
+            let cancel = button(text("Cancel").size(style::SMALL))
+                .name(format!("Cancel removal of {name}"))
+                .id(REMOVE_CANCEL)
+                .style(style::plain)
+                .on_press(Message::ConfirmRemove(None));
+            let remove = button(text("Remove").size(style::SMALL))
+                .name(format!("Remove destination {name}"))
+                .style(style::danger)
+                .on_press(Message::Remove(name));
+            super::widgets::dialog_actions(cancel, remove, false)
         } else {
+            let remove = button(text("Remove").size(style::SMALL))
+                .name(format!("Remove destination {name}"))
+                .style(style::plain)
+                .on_press(Message::ConfirmRemove(Some(name.clone())));
+            let remove = if self.removal_focus.as_deref() == Some(name.as_str()) {
+                remove.id(REMOVE_TRIGGER)
+            } else {
+                remove
+            };
             (
                 button(text("Edit…").size(style::SMALL))
+                    .name(format!("Edit destination {name}"))
                     .style(style::link)
-                    .on_press(Message::Edit(name.clone())),
-                button(text("Remove").size(style::SMALL))
-                    .style(style::plain)
-                    .on_press(Message::ConfirmRemove(Some(name))),
+                    .on_press(Message::Edit(name)),
+                remove,
             )
         };
         let description = destination.describe();
@@ -2375,6 +2404,7 @@ impl Picker {
     ) -> SheetFrame<'a, Message> {
         let editable = !self.mutation_busy();
         let saving = editor.saving.is_some();
+        let can_save = editable && !editor.checking_secret();
         let field = |label: &'a str, control: Element<'a, Message>| -> Element<'a, Message> {
             row![
                 text(label)
@@ -2417,7 +2447,7 @@ impl Picker {
                 })
                 .invalid(editor.refusal(kind).map(str::to_owned))
                 .on_input_maybe(editable.then_some(on))
-                .on_submit_maybe(editable.then_some(Message::Save))
+                .on_submit_maybe(can_save.then_some(Message::Save))
                 .size(style::BODY)
                 .padding([6, 10])
                 .style(look)
@@ -2437,6 +2467,22 @@ impl Picker {
                 ),
             ),
         );
+        let status_visible = !saving && editor.testing.is_none() && editor.message.is_some();
+        let full_status: Element<'a, Message> = if !saving
+            && editor.testing.is_none()
+            && let Some((message, error)) = &editor.message
+        {
+            // Full service/path errors remain readable in the scroll body;
+            // they must not consume the pinned actions' entire viewport.
+            status(
+                message.clone(),
+                if *error { Status::Failed } else { Status::Done },
+                spin,
+                p,
+            )
+        } else {
+            space().into()
+        };
         let mut form =
             column![history_controls(self.undo_label(), self.redo_label(), p)].spacing(10);
         if editor.s3 {
@@ -2519,7 +2565,7 @@ impl Picker {
                         .name("S3 secret access key")
                         .invalid(editor.refusal(Field::Secret).map(str::to_owned))
                         .on_input_maybe(editable.then_some(Message::Secret))
-                        .on_submit_maybe(editable.then_some(Message::Save))
+                        .on_submit_maybe(can_save.then_some(Message::Save))
                         .secure(true)
                         .size(style::BODY)
                         .padding([6, 10])
@@ -2639,19 +2685,18 @@ impl Picker {
             ));
         }
         let testing = editor.testing.is_some();
-        let checking_secret = editor.checking_secret();
         let outcome = if saving {
-            status("Saving…".into(), Status::Working, spin, p)
+            compact_status("Saving…".into(), Status::Working, spin, p)
         } else if testing {
             let doing = if editor.s3 {
                 "Checking the bucket…"
             } else {
                 "Checking the folder…"
             };
-            status(doing.into(), Status::Working, spin, p)
+            compact_status(doing.into(), Status::Working, spin, p)
         } else if let Some((message, error)) = &editor.message {
             let outcome = if *error { Status::Failed } else { Status::Done };
-            status(message.clone(), outcome, spin, p)
+            super::tip(compact_status(message.clone(), outcome, spin, p), message)
         } else {
             space().into()
         };
@@ -2662,12 +2707,8 @@ impl Picker {
         let save = button(text("Save").size(style::BODY))
             .padding([7, 18])
             .style(style::primary)
-            .on_press_maybe((editable && !checking_secret).then_some(Message::Save));
-        let (first, second) = if cfg!(target_os = "windows") {
-            (save, cancel)
-        } else {
-            (cancel, save)
-        };
+            .on_press_maybe(can_save.then_some(Message::Save));
+        let (first, second) = super::widgets::dialog_actions(cancel, save, false);
         let footer = row![
             super::tip(
                 button(text("Test").size(style::BODY))
@@ -2691,10 +2732,14 @@ impl Picker {
             None if editor.s3 => "New S3 bucket".into(),
             None => "New folder".into(),
         };
-        sheet_frame(title, Message::CloseManager, form, p)
+        // Keep the outcome after the fields in a permanent slot. Background
+        // checks must not move an active editor or rebuild its widget state.
+        let body = column![form, full_status].spacing(if status_visible { 12.0 } else { 0.0 });
+        sheet_frame(title, Message::CloseManager, body, p)
             .back(Some(Message::Cancel))
             .back_enabled(editable)
             .close_enabled(editable)
+            .default_action(can_save.then_some(Message::Save))
             .footer(footer)
     }
 
@@ -2828,6 +2873,25 @@ fn status<'a>(
     spin: usize,
     p: &'static Palette,
 ) -> Element<'a, Message> {
+    status_line(message, status, spin, p, false)
+}
+
+fn compact_status<'a>(
+    message: String,
+    status: Status,
+    spin: usize,
+    p: &'static Palette,
+) -> Element<'a, Message> {
+    status_line(message, status, spin, p, true)
+}
+
+fn status_line<'a>(
+    message: String,
+    status: Status,
+    spin: usize,
+    p: &'static Palette,
+    compact: bool,
+) -> Element<'a, Message> {
     let ink = if status == Status::Failed {
         Level::Error.color(p)
     } else {
@@ -2838,14 +2902,26 @@ fn status<'a>(
         Status::Done => Level::Done.mark(13.0, p),
         Status::Failed => Level::Error.mark(13.0, p),
     };
+    let line: Element<'a, Message> = if compact {
+        one_line(message, style::SMALL, style::SANS, ink)
+            .width(Fill)
+            .into()
+    } else {
+        text(message)
+            .size(style::SMALL)
+            .color(ink)
+            .width(Fill)
+            .into()
+    };
     row![
         // On the first line, should the text wrap.
         container(glyph)
             .height(Length::Fixed(style::line_height(style::SMALL)))
             .align_y(Alignment::Center),
-        text(message).size(style::SMALL).color(ink),
+        line,
     ]
     .spacing(6)
+    .width(Fill)
     .into()
 }
 
@@ -3088,7 +3164,7 @@ mod tests {
         picker.editor = Some(bucket(|editor| editor.source = Source::Environment));
         let mut tree = Tree::empty();
         let mut inspect = |picker: &Picker| {
-            let mut view = picker.manager(false, 640.0, 0, Instant::now(), None, None);
+            let mut view = picker.manager(Palette::of(false), 640.0, 0, Instant::now(), None, None);
             tree.diff(view.as_widget());
             let node = view.as_widget_mut().layout(
                 &mut tree,

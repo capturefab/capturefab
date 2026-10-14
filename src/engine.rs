@@ -19,6 +19,9 @@ use std::{
 
 use crate::session::{LogEntry, SessionCommand, SessionSnapshot};
 mod history;
+mod network_defaults;
+#[cfg(test)]
+mod network_tests;
 use history::process;
 type Reply = Receiver<Result<Value>>;
 struct Envelope {
@@ -30,12 +33,14 @@ struct Envelope {
 #[derive(Default)]
 struct Counters {
     frames: AtomicU64,
+    received_bytes: AtomicU64,
     dropped: AtomicU64,
     fps_bits: AtomicU64,
 }
 impl Counters {
     fn reset(&self) {
         self.frames.store(0, Ordering::Relaxed);
+        self.received_bytes.store(0, Ordering::Relaxed);
         self.dropped.store(0, Ordering::Relaxed);
         self.set_fps(0.0);
     }
@@ -89,6 +94,7 @@ impl WorkerHandle {
     pub fn snapshot(&self) -> SessionSnapshot {
         let mut s = self.state.read().unwrap_or_else(|e| e.into_inner()).clone();
         s.frames = self.counters.frames.load(Ordering::Relaxed);
+        s.received_bytes = self.counters.received_bytes.load(Ordering::Relaxed);
         s.dropped = self.counters.dropped.load(Ordering::Relaxed);
         s.fps = f64::from_bits(self.counters.fps_bits.load(Ordering::Relaxed));
         s
@@ -152,6 +158,9 @@ impl WorkerHandle {
             self.log("error", format!("Shared frame buffer: {e:#}"));
         }
         self.counters.frames.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .received_bytes
+            .fetch_add(frame.data.len() as u64, Ordering::Relaxed);
         if self.ring.is_none() {
             *self.frame.write().unwrap_or_else(|e| e.into_inner()) = Some(frame);
             return None;
@@ -281,11 +290,51 @@ fn process_plain(
     command: SessionCommand,
 ) -> Result<Value> {
     match command {
-        SessionCommand::Status => Ok(serde_json::to_value(h.snapshot())?),
+        SessionCommand::Status => {
+            refresh(h, camera, false);
+            Ok(serde_json::to_value(h.snapshot())?)
+        }
         SessionCommand::Undo | SessionCommand::Redo | SessionCommand::ReplayCameraChange { .. } => {
             anyhow::bail!("history commands must be handled by the camera journal")
         }
         SessionCommand::Select { .. } => anyhow::bail!("selection belongs to the coordinator"),
+        SessionCommand::Activity { .. } => anyhow::bail!("activity belongs to the coordinator"),
+        SessionCommand::NetworkScan { .. } => {
+            anyhow::bail!("network scan belongs to the coordinator")
+        }
+        SessionCommand::OptimizeNetwork { bytes_per_second } => {
+            ensure!(
+                forwarder.is_none() && !jobs.iter().any(|job| job.info.active()),
+                "Stop recording, forwarding and scheduled captures, then scan again to apply network defaults"
+            );
+            let c = camera_mut(camera)?;
+            ensure!(
+                c.info.transport == crate::types::Transport::GigE,
+                "network optimization requires a GigE camera"
+            );
+            let streaming = c.is_streaming();
+            let stopped = if streaming { c.stop() } else { Ok(()) };
+            let tuned = stopped.and_then(|_| network_defaults::apply(c, bytes_per_second));
+            if let Some(controller) = auto.as_mut() {
+                controller.invalidate();
+            }
+            // Resume even when a probe or camera setting failed. Never leave a
+            // previously running preview stopped as a side effect of scanning.
+            let resumed = if streaming { c.start() } else { Ok(()) };
+            refresh(h, camera, true);
+            let tuning = match (tuned, resumed) {
+                (Ok(tuning), Ok(())) => tuning,
+                (Err(error), Ok(())) => return Err(error),
+                (Ok(_), Err(error)) => {
+                    return Err(error).context("resuming stream after network scan");
+                }
+                (Err(tuning), Err(resume)) => anyhow::bail!(
+                    "Network defaults failed: {tuning:#}; stream could not resume: {resume:#}"
+                ),
+            };
+            h.log("info", "GigE network defaults applied".into());
+            Ok(json!({"tuning":tuning}))
+        }
         SessionCommand::Forward {
             output,
             codec,

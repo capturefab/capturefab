@@ -59,12 +59,19 @@ fn main() {
             return;
         }
         let (code, exit) = cli::error_code(&error);
+        let workflow_failure = error.downcast_ref::<capturefab::workflow::WorkflowFailure>();
+        let message = workflow_failure
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("{error:#}"));
         if json_mode {
-            let _ = cli::write_json(
-                &json!({"version":1,"ok":false,"error":{"code":code,"message":format!("{error:#}")}}),
-            );
+            let mut envelope =
+                json!({"version":1,"ok":false,"error":{"code":code,"message":message}});
+            if let Some(failure) = workflow_failure {
+                envelope["error"]["details"] = failure.result();
+            }
+            let _ = cli::write_json(&envelope);
         } else {
-            eprintln!("capturefab: {error:#}");
+            eprintln!("capturefab: {message}");
         }
         std::process::exit(exit)
     }

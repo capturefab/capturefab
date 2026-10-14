@@ -39,7 +39,9 @@ impl<'a, M: Clone + 'static, R: text::Renderer + 'a> TextInput<'a, M, R> {
     pub(super) fn new(placeholder: &str, value: &str) -> Self {
         let id = Id::unique();
         Self {
-            inner: text_input::TextInput::new(placeholder, value).id(id.clone()),
+            inner: text_input::TextInput::new(placeholder, value)
+                .id(id.clone())
+                .show_unfocused_selection(true),
             id,
             name: placeholder.to_owned(),
             description: None,
@@ -125,6 +127,12 @@ struct State<M> {
     text_id: accesskit::NodeId,
     native_input: NativeInput,
     focus_return: super::keyboard_history::FocusReturn,
+    ime: ImeMarker,
+}
+
+#[derive(Default)]
+pub(in crate::gui) struct ImeMarker {
+    pub composing: bool,
 }
 
 impl<M> Default for State<M> {
@@ -136,6 +144,7 @@ impl<M> Default for State<M> {
             text_id: Control::<()>::new(Role::TextRun).id,
             native_input: NativeInput::default(),
             focus_return,
+            ime: ImeMarker::default(),
         }
     }
 }
@@ -372,6 +381,7 @@ impl<'a, M: Clone + 'static, R: text::Renderer + 'a> Widget<M, Theme, R> for Tex
             .state
             .downcast_mut::<text_input::State<R::Paragraph>>();
         if self.on_input.is_none() {
+            state.ime.composing = false;
             state.focus_return.pending |= editor.is_focused();
             editor.unfocus();
             state.native_input.cancel();
@@ -492,6 +502,10 @@ impl<'a, M: Clone + 'static, R: text::Renderer + 'a> Widget<M, Theme, R> for Tex
         state.focus_return.id = self.id.clone();
         state.focus_return.available = self.on_input.is_some();
         operation.custom(Some(&self.id), layout.bounds(), &mut state.focus_return);
+        if !editor.is_focused() {
+            state.ime.composing = false;
+        }
+        operation.custom(Some(&self.id), layout.bounds(), &mut state.ime);
         operation.custom(Some(&self.id), layout.bounds(), control);
         if let Some(request) = control.requested.take()
             && request.action == Action::SetTextSelection
@@ -529,6 +543,30 @@ impl<'a, M: Clone + 'static, R: text::Renderer + 'a> Widget<M, Theme, R> for Tex
         shell: &mut Shell<'_, M>,
         viewport: &Rectangle,
     ) {
+        let editor_focused = tree.children[0]
+            .state
+            .downcast_ref::<text_input::State<R::Paragraph>>()
+            .is_focused();
+        let state = tree.state.downcast_mut::<State<M>>();
+        match event {
+            Event::InputMethod(iced::advanced::input_method::Event::Preedit(text, _)) => {
+                state.ime.composing = editor_focused && self.on_input.is_some() && !text.is_empty();
+            }
+            Event::InputMethod(
+                iced::advanced::input_method::Event::Commit(_)
+                | iced::advanced::input_method::Event::Closed,
+            )
+            | Event::Window(iced::window::Event::Unfocused) => state.ime.composing = false,
+            Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                modifiers,
+                ..
+            }) if editor_focused && state.ime.composing && modifiers.is_empty() => {
+                shell.capture_event();
+                return;
+            }
+            _ => {}
+        }
         self.inner.update(
             &mut tree.children[0],
             event,
@@ -576,6 +614,9 @@ impl<'a, M: Clone + 'static, R: text::Renderer + 'a> From<TextInput<'a, M, R>>
         Self::new(input)
     }
 }
+
+#[cfg(test)]
+mod render_tests;
 
 #[cfg(test)]
 mod tests {

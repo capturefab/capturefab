@@ -29,7 +29,7 @@ impl Workbench {
                 style::ON_STAGE_SECONDARY
             ),
             space().height(6),
-            text(if scanner && self.pending(Job::Capture) {
+            text(if scanner && self.capturing_here() {
                 "Scanning document…"
             } else if scanner {
                 "Ready to scan a document"
@@ -76,7 +76,7 @@ impl Workbench {
                     .padding([7, 12])
                     .style(style::on_glass(false, 1.0))
                     .on_press_maybe(
-                        (!self.pending(Job::Capture)
+                        (!self.capturing_here()
                             && self.validate_input(&self.capture_command(false)).is_ok())
                         .then_some(Message::Capture),
                     ),

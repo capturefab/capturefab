@@ -69,6 +69,19 @@ impl Notice {
     pub(super) fn about(&self) -> String {
         self.detail.clone().unwrap_or_else(|| self.text.clone())
     }
+
+    /// A live announcement states the outcome as well as any fuller path or
+    /// error context. Tooltips may show details alone because the visible line
+    /// supplies their context; a screen reader's live event needs both.
+    pub(super) fn announcement(&self) -> String {
+        match self.detail.as_deref() {
+            None | Some("") => self.text.clone(),
+            Some(detail) if self.text.ends_with(first_line(detail)) => {
+                format!("{}{}", self.text, &detail[first_line(detail).len()..])
+            }
+            Some(detail) => format!("{}\n{detail}", self.text),
+        }
+    }
 }
 
 /// The last capture that saved files.
@@ -324,6 +337,7 @@ fn outcome(job: &Job, value: &Value) -> Option<(String, Option<String>, Level)> 
     match job {
         Job::Capture => Some(saved(value)),
         Job::Discover => Some(discovered(value)),
+        Job::NetworkScan => Some(network_scanned(value)),
         Job::Connect => done(match value["connected"]["model"].as_str() {
             Some(model) => format!("Connected to {model}"),
             None => "Connected".into(),
@@ -383,6 +397,7 @@ fn failure(job: &Job) -> String {
     let text = match job {
         Job::Capture => "Capture failed",
         Job::Discover => "Discovery failed",
+        Job::NetworkScan => "Network scan failed",
         Job::Connect => "Could not connect",
         Job::Disconnect => "Could not disconnect",
         Job::Select => "Could not select the camera",
@@ -403,6 +418,46 @@ fn failure(job: &Job) -> String {
         Job::Execute(feature) => return format!("Could not execute {}", words(feature)),
     };
     text.into()
+}
+
+fn network_scanned(value: &Value) -> (String, Option<String>, Level) {
+    let Ok(report) =
+        serde_json::from_value::<crate::network::NetworkScan>(value["network_scan"].clone())
+    else {
+        return ("Network scan complete".into(), None, Level::Done);
+    };
+    let mut issues = report.warnings.clone();
+    for camera in &report.cameras {
+        if matches!(
+            camera.health,
+            crate::network::NetworkHealth::Unreachable
+                | crate::network::NetworkHealth::Limited
+                | crate::network::NetworkHealth::Unstable
+        ) {
+            issues.push(format!("{}: {}", camera.camera.model, camera.summary));
+        }
+        if let Some(tuning) = &camera.tuning {
+            issues.extend(
+                tuning
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("{}: {warning}", camera.camera.model)),
+            );
+        }
+    }
+    if issues.is_empty() {
+        (
+            "Network scan complete · see connection results".into(),
+            None,
+            Level::Done,
+        )
+    } else {
+        (
+            "Network scan complete · connections need attention".into(),
+            Some(issues.join("\n")),
+            Level::Warning,
+        )
+    }
 }
 
 /// "Saved capture-0001.png", "Saved 10 files to captures".

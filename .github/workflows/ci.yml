@@ -106,6 +106,25 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --locked --no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox
 
+  wasm:
+    name: WASM remote workbench
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal -c clippy -c rustfmt -t wasm32-unknown-unknown --no-self-update && rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: web-client
+      - run: cargo fmt --manifest-path web-client/Cargo.toml --check
+      - run: cargo test --manifest-path web-client/Cargo.toml --locked
+      - run: cargo clippy --manifest-path web-client/Cargo.toml --locked --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+      - run: sh web-client/build.sh
+      - run: cargo test --locked --no-default-features --test remote
+
   site:
     name: Site and release scripts
     runs-on: ubuntu-24.04

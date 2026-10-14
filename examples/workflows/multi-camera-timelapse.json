@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "steps": [
+    {"command": {"op": "connect", "camera": "sim:0", "timeout_ms": 2000}},
+    {"command": {"op": "connect", "camera": "sim:1", "timeout_ms": 2000}},
+    {"camera": "sim:0", "command": {"op": "set", "feature": "Width", "value": "640"}},
+    {"camera": "sim:0", "command": {"op": "set", "feature": "Height", "value": "480"}},
+    {"camera": "sim:0", "command": {"op": "set", "feature": "ExposureTime", "value": "2500"}},
+    {"camera": "sim:1", "command": {"op": "set", "feature": "Width", "value": "640"}},
+    {"camera": "sim:1", "command": {"op": "set", "feature": "Height", "value": "480"}},
+    {"camera": "sim:1", "command": {"op": "set", "feature": "ExposureTime", "value": "5000"}},
+    {"camera": "sim:0", "command": {"op": "start"}},
+    {"camera": "sim:1", "command": {"op": "start"}},
+    {"camera": "sim:0", "command": {
+      "op": "schedule", "output": "captures/camera-a/frame-{frame}.png",
+      "count": 60, "timeout_ms": 2000, "format": "png",
+      "first_at_ms": 0, "interval_ms": 10000,
+      "storage": {"max_bytes": 536870912, "max_files": 1000, "on_full": "stop"}
+    }},
+    {"camera": "sim:1", "command": {
+      "op": "schedule", "output": "captures/camera-b/frame-{frame}.png",
+      "count": 60, "timeout_ms": 2000, "format": "png",
+      "first_at_ms": 0, "interval_ms": 10000,
+      "storage": {"max_bytes": 536870912, "max_files": 1000, "on_full": "stop"}
+    }}
+  ]
+}

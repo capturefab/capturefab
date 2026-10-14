@@ -8,17 +8,19 @@ capturefab doctor --json
 capturefab --help
 ```
 
-Successful structured output goes to stdout; diagnostics go to stderr. Check the process exit code before using a result. JSON output is versioned. Keep credentials out of logs, command transcripts, and generated configuration files whenever possible.
+Successful structured output goes to stdout; diagnostics go to stderr. Check the process exit code before using a result. Every `--json` data command, including `schema`, returns `{"version":1,"ok":true,"result":...}` or `{"version":1,"ok":false,"error":{"code":"...","message":"..."}}`. Read the automation contract from `schema --json`'s `result`; plain `schema` prints that contract directly. Its `cli` command tree lists subcommands, options, defaults and accepted values. Keep credentials out of logs, command transcripts, and generated configuration files whenever possible.
+
+Exit codes are 1 `operation_failed`, 2 `usage`, 3 `unavailable`, 4 `timeout`, 5 `unsupported`, and 6 `storage_full`. `--timeout-ms` is a per-frame/transport deadline (1–60000 ms); `--request-timeout 5m` is a session request deadline. The default request deadline adapts to capture count. A client timeout does not cancel an already accepted session command; inspect `status` before retrying writes.
 
 Malformed supplied field values return `usage` (exit 2) before connecting or applying capture/forward `--set` and `--auto`. Live camera, missing destination/drive, storage and I/O failures retain their operation categories. Session commands and RPC envelopes reject unknown fields; use `schema` rather than guessing field names. Rejected writes to auto-managed features leave auto mode enabled. Multiple valid assignments still execute sequentially, so a later live failure does not undo earlier successful writes.
 
-Durations and timestamp fractions must resolve to whole milliseconds (`1.001s` is valid, `1.1ms` is rejected); `--max-age` requires whole seconds, at least `1s`, with delete-oldest. All scheduled frames must fall within 10 years; a past timestamp starts immediately and a zero RPC interval captures consecutive frames. A camera rejects overlapping future output files in its active jobs. Capture paths support only `{frame}` and do not accept network URLs. Recording reservations must fit the requested budget; Capturefab does not silently reduce `--max-file-size`. Use `--duration` only for direct forwarding and `stop-forward` for sessions.
+Durations and timestamp fractions must resolve to whole milliseconds (`1.001s` is valid, `1.1ms` is rejected); `--max-age` requires whole seconds, at least `1s`, with delete-oldest. All scheduled frames must fall within 10 years; a past timestamp starts immediately and a zero RPC interval captures consecutive frames. A camera rejects overlapping future output files in its active jobs. Capture paths support only `{frame}` and do not accept network URLs. Recording reservations must fit the requested budget; Capturefab does not silently reduce `--max-file-size`. `record`/`forward --duration 30s` works with both temporary workers and persistent sessions. It keeps the CLI alive and stops the encoder at the deadline or Ctrl-C. Without a duration, session forwarding returns immediately and requires `stop-forward`; direct forwarding stays in the foreground.
 
 Explicit `CAPTUREFAB_MAX_CAMERAS` must be an integer in 1–64. `CAPTUREFAB_FRAME_BYTES` must be 4096–268435456 bytes and a multiple of 64. Malformed overrides fail before worker startup; they do not fall back to defaults.
 
 ## Use an existing visible session
 
-List sessions before opening a separate camera connection. A user may already have the camera connected in the GUI. Camera control is often exclusive.
+Camera/session commands, discovery and network scans automatically attach to the only authenticated active GUI or `serve` session. With none, supported camera commands use a temporary worker. With several, choose `--session NAME` or receive `usage` (exit 2); the CLI never guesses. List sessions to identify a user's visible workbench, or use `--direct --camera ID` for a separate temporary worker. Binary stdout captures use a temporary worker and cannot combine with `--session`; use `--direct` to override an environment session. Camera control is often exclusive.
 
 ```sh
 capturefab sessions --json
@@ -29,7 +31,15 @@ capturefab --session gui set ExposureTime=5000
 capturefab --session gui capture -n 10 -o frames --json
 ```
 
-Use the session name returned by `sessions`; it may differ from `gui`. `connect` adds a camera to a persistent session. Use `select` or `--camera` to choose a particular connected camera when multiple cameras are present. Use `rpc` with `schema` for the complete versioned local session interface.
+Use the session name returned by `sessions`; it may differ from `gui`. `CAPTUREFAB_SESSION` pins camera/session commands; `CAPTUREFAB_CAMERA` supplies a default camera. `--direct` overrides the environment session and conflicts only with explicit `--session`. Inspection, feature writes, capture, recording, XML and memory commands connect a missing `--camera` source to the session. Persistent controls such as `start` and `auto` require an already connected camera; use `connect ID` first. Desktop and browser camera selection is local to each participant; `select ID` sets the default for CLI calls that omit `--camera`. Use explicit targets when collaborating. Use `rpc` with `schema` for the complete versioned local session interface.
+
+Humans and agents share capture sessions: commands are ordered per camera, cameras run independently, and overlapping schedules share acquisition. Use `--actor NAME --actor-kind agent` (or `CAPTUREFAB_ACTOR` and `CAPTUREFAB_ACTOR_KIND`) to identify an agent; human is the default kind. Desktop and browser activity updates immediately without moving camera selection, drafts or focus. Activity includes `id`, `origin` (`client`/`gui`), `actor` (`id`, `name`, `kind`), `operation`, `camera`, `feature`, `label`, `state`, timestamps, detail and saved files. JSON states are `queued`, `running`, `succeeded`, `failed`; timestamps are Unix milliseconds. `status --json` exposes global activity and `activity_revision`, including when targeted to a busy camera. Read-only observations and authenticated session probes do not create entries. The session retains 200 completed entries plus active commands/jobs across selection and disconnect.
+
+Journal strings/path previews are capped: completed captures retain at most the first eight paths in `files`, while `file_count` gives the actual total; schedule previews advance with acquired frames. The capture command's result still returns its complete file list. Targeted `--camera ID status --json` keeps full coordinator context (`cameras`, `devices`, `network_scan`, logs and activity) with queried-camera fields at the top level. `target_camera` identifies the canonical queried ID; `active_camera` retains the session default for untargeted CLI calls, independently of desktop/browser local selection.
+
+For immediate private IPC observation without an HTTP listener, call `capturefab --session NAME activity --json`, then `activity --after REV --wait 20s --json` with the returned revision. Each call returns one versioned `{revision,activity}` response, including on timeout, bypasses camera queues and creates no activity entry. RPC accepts `{"op":"activity","after":12,"timeout_ms":20000}`.
+
+For immediate agent observation over HTTP, fetch `/api/activity`, then repeat `/api/activity?after=REV&timeout_ms=20000` with the returned `result.revision`. All watchers wake on command and scheduled job changes. The response includes retained history; timeouts return current history, and stale or future revisions return immediately. Maximum timeout is 25000ms. `POST /api/command` optionally accepts `actor:{id,name,kind}` alongside `version`, `camera`, `command`; actor metadata is display attribution, not authentication. See [remote control](https://github.com/capturefab/capturefab/blob/main/docs/remote-control.md). Schedule state `succeeded` acknowledges creation; `entry.job` tracks `id`, `worker_pid`, `status`, `count`, `captured`, `last_file`, `error` through completion/cancellation/failure. Forward success acknowledges encoder start; consult camera status for ongoing forwarding.
 
 Reversible camera changes from GUI, CLI and RPC clients share each camera worker's bounded history. Use `capturefab --session NAME [--camera ID] history --json` to inspect the next undo/redo labels, and `undo` or `redo` to apply them. RPC accepts `{"op":"undo"}` and `{"op":"redo"}`; `status.history` and `cameras[].history` hold the labels. Replay detects conflicting state and retains the entry on failure. History lasts for the camera connection; a new change clears redo. Captures, uploads, recordings, schedules, connection changes, arbitrary commands and raw memory writes cannot be reversed by this camera history. Stopping a stream with schedules or forwarding is also excluded. Inspect the labels before undoing someone else's changes.
 
@@ -43,21 +53,42 @@ capturefab --camera 192.168.1.10 serve --name bench --stream
 capturefab --session bench status --json
 ```
 
+## Apply repeatable JSON workflows
+
+Use workflow files for ordered multi-camera setup and acquisition without shell escaping. [The workflow guide](https://github.com/capturefab/capturefab/blob/main/docs/cli-workflows.md) includes [validated examples](https://github.com/capturefab/capturefab/tree/main/examples/workflows) for timelapse, scanner feeders and bounded recording.
+
+```sh
+capturefab workflow validate workflow.json --json
+capturefab workflow apply workflow.json --dry-run --json
+capturefab --session bench workflow apply workflow.json --json
+```
+
+The document is `{"version":1,"steps":[{"command":{"op":"connect","camera":"sim:0","timeout_ms":2000}},{"camera":"sim:0","command":{"op":"capture","output":"shot.png","count":1,"timeout_ms":2000,"format":"png"}}]}`. Each optional step `camera` addresses an existing connection; `connect` and `select` use `command.camera` and must omit the outer target. `discover` and `network_scan` also omit it. Command fields are the same strict RPC fields; CLI conveniences such as `--set`, inferred formats, `--duration` and unit-bearing strings are not workflow fields.
+
+Validation and dry-run are offline, resolve outputs and redact URL credentials. Files/stdin are capped at 1 MiB and 1–256 steps; unknown and duplicate fields fail. Every step passes offline validation before any command runs. Live feature bounds, destinations and output availability remain execution checks. Apply requires a persistent session (automatically selected when there is exactly one), rejects global `--camera`, executes sequentially and stops at the first failure. Earlier effects remain; `error.details.completed`, `completed_steps` and one-based `failed_step` support recovery. Do not blindly replay the full file after a partial failure: captures never overwrite.
+
+Relative local sources and outputs use the workflow file directory, or caller directory for `workflow ... -`. `file:relative.mkv` and `sim:replay:relative-folder` sources resolve in connect/select commands and outer camera targets; bare existing filenames are recognized as file sources. Ordinary CLI/RPC source and output paths use the caller directory. Prefer explicit `file:` for local-source names that could also identify a camera. Network/device locators, destination-relative names and stream URLs stay unchanged. Workflow captures cannot use binary stdout. Scheduling and encoder startup return immediately; keep the session alive and stop them explicitly. For timed recording, use the CLI's `record --duration` rather than adding a nonexistent workflow duration field.
+
+PowerShell can use the same files directly. For stdin, use `Get-Content -Raw workflow.json | capturefab workflow validate - --json`; this changes the output base to the calling directory.
+
 ## Discover, inspect, configure, acquire
 
 ```sh
 capturefab discover --json
+capturefab --session bench network-scan --json
 capturefab --camera 192.168.1.10 features --json
 capturefab --camera 192.168.1.10 get Width Height PixelFormat --json
 capturefab --camera 192.168.1.10 set ExposureTime=5000
 capturefab --camera 192.168.1.10 capture -n 10 -o frames --json
 ```
 
-Selectors can be a discovered camera ID, unique serial, or GigE IPv4 address. GenICam feature names, access modes, increments, selectors, and bounds depend on the device. Inspect `features` and read back important settings. Capture outputs never silently overwrite existing files. Use `--format raw` when preserving an unsupported pixel format matters.
+Selectors can be a discovered camera ID, unique serial, or GigE IPv4 address. GenICam feature names, access modes, increments, selectors, and bounds depend on the device. Inspect `features` and read back important settings. Capture outputs never silently overwrite existing files. Known single-file or `{frame}` template extensions infer PNG/JPEG/raw/PGM/PPM; directory sequences default to PNG. `--format` overrides inference. Use `--format raw` when preserving an unsupported pixel format matters.
+
+`network-scan` inventories IPv4 interfaces, rediscovers GigE cameras, checks control reachability and tunes connected GigE cameras with a budget shared per receive interface. RPC: `{"op":"network_scan","timeout_ms":1000}`; result and status retain `network_scan` with `interfaces`, `cameras`, `warnings` and `scanned_at_ms`. Camera entries expose `reachable`, `health` (`unreachable`, `limited`, `unverified`, `ready`, `unstable`), `summary`, `details` and optional `tuning`. Discovery alone never proves a fast or stable stream. Preview streams pause/resume for packet probes; recording, forwarding and active schedules prevent tuning, with an actionable report. Host IPs, routes and MTUs stay unchanged. Per-camera RPC `{"op":"optimize_network","bytes_per_second":100000000}` applies a supplied budget; use `network_scan` for shared-link accounting. These writes are outside undo history; auto mode honors the budget during the connection.
 
 ## Camera profiles and specialized acquisition
 
-Camera identity JSON now includes `profile: {kind, source, evidence, capabilities}`. Read it in `discover` result `devices[]`, `info` result `camera`, and `status` result `connected` or `cameras[].info`. Discovery may have only identity hints; connection refines the profile from readable features. Kinds are `unknown`, `area_scan`, `line_scan`, `depth`, `microscope`, `thermal` and `document_scanner`. Sources are `unknown`, `transport`, `identity`, `features` and `device_metadata`. `evidence` is a string array explaining the classification; `capabilities` is an array of advertised control families. `schema.camera_profiles` describes the enum values and fields. Profiles add metadata to identities; the JSON envelope and capture formats are unchanged.
+Camera identity JSON now includes `profile: {kind, source, evidence, capabilities}`. Read it in `discover` result `devices[]`, `info` result `camera`, and `status` result `connected` or `cameras[].info`. Discovery may have only identity hints; connection refines the profile from readable features. Kinds are `unknown`, `area_scan`, `line_scan`, `depth`, `microscope`, `thermal` and `document_scanner`. Sources are `unknown`, `transport`, `identity`, `features` and `device_metadata`. `evidence` is a string array explaining the classification; `capabilities` is an array of advertised control families. `schema --json`'s `result.camera_profiles` describes the enum values and fields. Profiles add metadata to identities; the JSON envelope and capture formats are unchanged.
 
 Detection prioritizes scanner transport, explicit `DeviceType`/`CameraType`/`SensorType` class, explicit `DeviceScanType=Linescan`, specialty feature families, remaining declared scan geometry, model identity, then conventional frame dimensions/timing. `Height=1`, high bit depth and a vendor name alone are not type evidence. A profile does not guarantee a feature exists or is writable: inspect the live feature list, selector values, choices and bounds before setting it.
 
@@ -109,7 +140,7 @@ Native camera locators are `avfoundation:0` on macOS, `v4l2:/dev/video0` on Linu
 
 Native locators accept `?size=WIDTHxHEIGHT&fps=RATE`. Inspect `features` for advertised `VideoMode` choices and set a supported mode, `Width`, `Height`, or `AcquisitionFrameRate` before acquisition; stop a live session before changing them. V4L2 format listings do not establish frame-rate bounds. GigE transport status includes packet size, receive buffer, bounded resend and loss counters.
 
-Media inputs and forwarding use bundled FFmpeg in release builds. Inspect `capturefab ffmpeg --json` to see the actual build's protocols and encoders. SRT support depends on the bundled FFmpeg configuration.
+Media inputs and forwarding use bundled FFmpeg in release builds. Inspect `capturefab ffmpeg --json` to see the actual build's protocols and encoders. SRT support depends on the bundled FFmpeg configuration. `--hwaccel` configures decoding in new direct, GUI or `serve` workers; an existing session retains its setting.
 
 ## Scan documents
 

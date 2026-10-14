@@ -24,12 +24,17 @@ mod decorate;
 mod group;
 mod label;
 mod native;
+mod scroll;
 pub(super) use decorate::{mapped, named};
-pub(super) use group::{group, scope};
+pub(super) use group::{group, group_with_id, modal_group, scope};
 pub(super) use label::label;
 
 const ROOT: NodeId = NodeId(0);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(super) fn new_node_id() -> NodeId {
+    NodeId(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+}
 
 pub(super) type ValueHandler<M> = Arc<dyn Fn(String) -> M + Send + Sync>;
 
@@ -42,6 +47,9 @@ pub(super) struct Control<M> {
     pub node: Node,
     pub focused: bool,
     pub focusable: bool,
+    /// Popup rows are laid out in window coordinates and have their own
+    /// viewport, outside the scrollable containing the closed control.
+    pub window_coordinates: Option<Rectangle>,
     pub children: Vec<(NodeId, Node)>,
     pub activate: Option<M>,
     /// Controls whose logical focus has its own model (such as desktop menus)
@@ -60,11 +68,12 @@ pub(super) struct Control<M> {
 impl<M> Control<M> {
     pub fn new(role: Role) -> Self {
         Self {
-            id: NodeId(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
+            id: new_node_id(),
             focus_id: Id::unique(),
             node: Node::new(role),
             focused: false,
             focusable: true,
+            window_coordinates: None,
             children: Vec::new(),
             activate: None,
             on_focus: None,
@@ -80,7 +89,6 @@ impl<M> Control<M> {
 
 #[derive(Clone)]
 struct Route {
-    focus: Id,
     activate: Option<Message>,
     on_focus: Option<Message>,
     increment: Option<Message>,
@@ -91,6 +99,7 @@ struct Route {
     widget_actions: Vec<Action>,
     widget_focus: bool,
     focusable: bool,
+    reveal: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -210,13 +219,41 @@ impl Bridge {
             }
         };
         match request.action.action {
-            Action::Focus if route.on_focus.is_some() => {
-                Task::done(route.on_focus.clone().unwrap())
+            Action::Focus => {
+                if !route.focusable && !route.widget_focus && route.on_focus.is_none() {
+                    return Task::none();
+                }
+                let focus = if route.focusable || route.widget_focus {
+                    // Explicit widget IDs can be reused in separate native
+                    // windows. Locate scopes both focus and scroll reveal to
+                    // the requested window, including controls without scroll.
+                    iced::advanced::widget::operate(scroll::Locate::node(
+                        request.action.target,
+                        request.window,
+                        true,
+                    ))
+                } else {
+                    Task::none()
+                };
+                let focus = if route.widget_focus {
+                    focus.chain(iced::advanced::widget::operate(WidgetAction(
+                        request.action,
+                        request.window,
+                    )))
+                } else {
+                    focus
+                };
+                let focus = if let Some(message) = &route.on_focus {
+                    focus.chain(Task::done(message.clone()))
+                } else {
+                    focus
+                };
+                // AccessKit forwards native focus requests; it does not make
+                // the owning NSWindow/HWND the active keyboard window.
+                window::minimize(request.window, false)
+                    .chain(window::gain_focus(request.window))
+                    .chain(focus)
             }
-            Action::Focus if route.widget_focus => {
-                iced::advanced::widget::operate(WidgetAction(request.action, request.window))
-            }
-            Action::Focus if route.focusable => iced::widget::operation::focus(route.focus.clone()),
             Action::Click if route.activate.is_some() => {
                 Task::done(route.activate.clone().unwrap())
             }
@@ -247,6 +284,9 @@ impl Bridge {
                 }
                 iced::advanced::widget::operate(WidgetAction(request.action, request.window))
             }
+            Action::ScrollIntoView if route.reveal => iced::advanced::widget::operate(
+                scroll::Locate::node(request.action.target, request.window, false),
+            ),
             action if route.widget_actions.contains(&action) => {
                 iced::advanced::widget::operate(WidgetAction(request.action, request.window))
             }
@@ -336,8 +376,10 @@ struct Collector {
     routes: HashMap<NodeId, Route>,
     focus: NodeId,
     scale: f64,
-    text_counts: HashMap<String, u64>,
+    text_counts: HashMap<(Option<NodeId>, String), u64>,
     groups: Vec<(NodeId, usize)>,
+    viewport: scroll::Viewport,
+    content_bounds: HashMap<NodeId, Rect>,
 }
 
 impl Collector {
@@ -349,6 +391,8 @@ impl Collector {
             scale: scale.max(0.1) as f64,
             text_counts: HashMap::new(),
             groups: Vec::new(),
+            viewport: scroll::Viewport::default(),
+            content_bounds: HashMap::new(),
         }
     }
 
@@ -392,7 +436,23 @@ fn rect(bounds: Rectangle, scale: f64) -> Rect {
 
 impl Operation for Collector {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        let saved = self.viewport.enter();
         operate(self);
+        if let Some(saved) = saved {
+            self.viewport.exit(saved);
+        }
+    }
+
+    fn scrollable(
+        &mut self,
+        _: Option<&Id>,
+        bounds: Rectangle,
+        content: Rectangle,
+        translation: Vector,
+        state: &mut dyn iced::advanced::widget::operation::Scrollable,
+    ) {
+        self.viewport
+            .scrollable(bounds, content, translation, state);
     }
 
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
@@ -419,7 +479,11 @@ impl Operation for Collector {
         }
         if let Some(control) = state.downcast_ref::<Control<Message>>() {
             let mut node = control.node.clone();
-            node.set_bounds(rect(bounds, self.scale));
+            let (visible, full) = self.viewport.bounds(bounds, control.window_coordinates);
+            node.set_bounds(rect(visible, self.scale));
+            self.content_bounds
+                .insert(control.id, rect(full, self.scale));
+            let reveal = self.viewport.scrolled() && control.window_coordinates.is_none();
             if !node.is_disabled() {
                 if control.focusable {
                     node.add_action(Action::Focus);
@@ -439,10 +503,12 @@ impl Operation for Collector {
                 if control.replace_selected_text.is_some() {
                     node.add_action(Action::ReplaceSelectedText);
                 }
+                if reveal {
+                    node.add_action(Action::ScrollIntoView);
+                }
                 self.routes.insert(
                     control.id,
                     Route {
-                        focus: control.focus_id.clone(),
                         activate: control.activate.clone(),
                         on_focus: control.on_focus.clone(),
                         increment: control.increment.clone(),
@@ -462,13 +528,14 @@ impl Operation for Collector {
                         .collect(),
                         widget_focus: node.role() == Role::ListBoxOption,
                         focusable: control.focusable,
+                        reveal,
                     },
                 );
             }
             for (id, child) in &control.children {
                 let mut child = child.clone();
                 if child.bounds().is_none() {
-                    child.set_bounds(rect(bounds, self.scale));
+                    child.set_bounds(rect(visible, self.scale));
                 }
                 self.nodes.push((*id, child));
             }
@@ -488,10 +555,12 @@ impl Operation for Collector {
         {
             return;
         }
-        let bounds = rect(bounds, self.scale);
+        let (visible, full) = self.viewport.bounds(bounds, None);
+        let bounds = rect(visible, self.scale);
+        let full = rect(full, self.scale);
         // Text within a control supplies its fallback name. It is not exposed
         // a second time as unrelated static text.
-        if let Some((_, node)) = self.nodes.iter_mut().rev().find(|(_, node)| {
+        if let Some((_, node)) = self.nodes.iter_mut().rev().find(|(id, node)| {
             matches!(
                 node.role(),
                 Role::Button
@@ -507,11 +576,11 @@ impl Operation for Collector {
                     | Role::Alert
                     | Role::Status
                     | Role::Image
-            ) && node.bounds().is_some_and(|parent| {
-                parent.x0 <= bounds.x0
-                    && parent.y0 <= bounds.y0
-                    && parent.x1 >= bounds.x1
-                    && parent.y1 >= bounds.y1
+            ) && self.content_bounds.get(id).is_some_and(|parent| {
+                parent.x0 <= full.x0
+                    && parent.y0 <= full.y0
+                    && parent.x1 >= full.x1
+                    && parent.y1 >= full.y1
             })
         }) {
             if node
@@ -522,8 +591,18 @@ impl Operation for Collector {
             }
             return;
         }
-        let count = self.text_counts.entry(text.to_owned()).or_default();
+        // A journal row's identical path or timestamp belongs to that row.
+        // Counts shared across the whole window would move its native text ID
+        // when another row containing the same caption is inserted first.
+        let parent = self.groups.last().map(|(id, _)| *id);
+        let count = self
+            .text_counts
+            .entry((parent, text.to_owned()))
+            .or_default();
         let mut hash = std::collections::hash_map::DefaultHasher::new();
+        if let Some(parent) = parent {
+            parent.hash(&mut hash);
+        }
         text.hash(&mut hash);
         count.hash(&mut hash);
         *count += 1;
@@ -556,6 +635,16 @@ impl Operation<Message> for WidgetAction {
         // the changed popup or text-selection state.
         iced::advanced::widget::operation::Outcome::Some(Message::AccessibilityChanged(self.1))
     }
+}
+
+/// Chain after keyboard traversal. This reads the newly focused real widget,
+/// scrolls its ancestors, and preserves its caret and selection.
+pub(super) fn reveal_focus(id: window::Id) -> Task<Message> {
+    iced::advanced::widget::operate(focus_reveal_operation(id))
+}
+
+pub(super) fn focus_reveal_operation(id: window::Id) -> impl Operation<Message> {
+    scroll::Locate::focused(id)
 }
 
 pub(super) fn wrap<'a>(
@@ -633,9 +722,25 @@ impl Widget<Message, Theme, iced::Renderer> for Semantics<'_> {
         renderer: &iced::Renderer,
         operation: &mut dyn Operation,
     ) {
+        operation.custom(
+            None,
+            layout.bounds(),
+            &mut scroll::WindowMarker {
+                id: self.id,
+                begin: true,
+            },
+        );
         self.content
             .as_widget_mut()
             .operate(tree, layout, renderer, operation);
+        operation.custom(
+            None,
+            layout.bounds(),
+            &mut scroll::WindowMarker {
+                id: self.id,
+                begin: false,
+            },
+        );
     }
     fn update(
         &mut self,
@@ -653,6 +758,7 @@ impl Widget<Message, Theme, iced::Renderer> for Semantics<'_> {
         );
         if matches!(event, Event::Window(window::Event::RedrawRequested(_))) {
             let mut collector = Collector::new(self.scale);
+            collector.viewport.root(layout.bounds());
             self.content
                 .as_widget_mut()
                 .operate(tree, layout, renderer, &mut collector);

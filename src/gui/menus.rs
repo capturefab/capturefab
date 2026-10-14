@@ -84,7 +84,11 @@ impl Workbench {
             Some(Item::action(
                 label.map_or_else(|| name.into(), |label| format!("{name} {label}")),
                 if undo { Action::Undo } else { Action::Redo },
-                label.is_some() && !busy && !self.help_open,
+                label.is_some()
+                    && !busy
+                    && !self.help_open
+                    && !self.network_open
+                    && !self.analytics.open,
             ))
         };
         let edit = |title, command, key| {
@@ -114,7 +118,7 @@ impl Workbench {
                     action(
                         "Capture and Save",
                         Action::Capture,
-                        camera && !self.pending(Job::Capture),
+                        camera && !self.capturing_here(),
                     ),
                     Some(Item::command(
                         "Schedule Capture",

@@ -361,6 +361,7 @@ pub(super) fn streaming_camera(frames: u64, dropped: u64, fps: f64) -> CameraSna
         features: Vec::new(),
         streaming: true,
         frames,
+        received_bytes: 0,
         dropped,
         fps,
         last_error: None,

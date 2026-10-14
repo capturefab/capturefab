@@ -662,7 +662,7 @@ impl Workbench {
             ));
         }
         if self.scanner_selected() {
-            let scanning = self.pending(Job::Capture);
+            let scanning = self.capturing_here();
             actions = actions.push(tip(
                 button(
                     row![

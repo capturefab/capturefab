@@ -39,7 +39,29 @@ struct Items<'a> {
 }
 impl Operation for Items<'_> {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
-        operate(self);
+        let index = &mut self.index;
+        let (role, focus, override_focus, inputs, shortcuts, headers) = (
+            self.role,
+            self.focus,
+            self.override_focus,
+            self.inputs,
+            self.shortcuts,
+            self.headers,
+        );
+        self.inner.traverse(&mut |inner| {
+            let mut items = Items {
+                inner,
+                role,
+                focus,
+                override_focus,
+                inputs,
+                shortcuts,
+                index: *index,
+                headers,
+            };
+            operate(&mut items);
+            *index = items.index;
+        });
     }
     fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
         self.inner.container(id, bounds);
@@ -86,6 +108,14 @@ impl Operation for Items<'_> {
                 .get(self.index)
                 .copied()
                 .map(Message::DesktopMenu);
+            // Menu navigation has logical focus in DesktopState while the
+            // document editor retains its caret/selection for Edit commands.
+            // It advertises native Focus without routing through widget focus.
+            let widget_focusable = control.focusable;
+            control.focusable = false;
+            if !control.node.is_disabled() {
+                control.node.add_action(accesskit::Action::Focus);
+            }
             if let Some(shortcut) = self.shortcuts.get(self.index).and_then(Option::as_ref) {
                 control.node.set_keyboard_shortcut(shortcut.as_str());
             }
@@ -99,6 +129,9 @@ impl Operation for Items<'_> {
                 self.headers.lock().unwrap().push(control.id);
             }
             self.index += 1;
+            self.inner.custom(id, bounds, control);
+            control.focusable = widget_focusable;
+            return;
         }
         self.inner.custom(id, bounds, state);
     }
@@ -348,7 +381,7 @@ mod tests {
             routes.0[1].2,
             Some(Message::DesktopMenu(Input::Open(1)))
         ));
-        assert!(
+        assert_eq!(
             bridge
                 .dispatch(accessibility::Request {
                     window,
@@ -359,8 +392,9 @@ mod tests {
                         data: None
                     },
                 })
-                .units()
-                > 0
+                .units(),
+            3,
+            "native menu focus restores and activates its window, then routes logical focus without clearing the document editor"
         );
         let mut state = DesktopState::default();
         assert!(

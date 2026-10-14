@@ -21,17 +21,21 @@ capturefab --camera 192.168.1.10 set ExposureTime=5000 Gain=0
 capturefab --camera 192.168.1.10 capture -n 10 -o frames
 ```
 
-Use `--json` for versioned machine-readable results. Human-readable output stays simple; diagnostics go to stderr; JSON success and error envelopes go to stdout; exit status reports failure. `--help`, `--version`, native shell completions and binary stdout follow normal Unix conventions. Existing output files are never overwritten.
+Camera commands automatically use the only running GUI or `serve` session, so the workbench shows what an agent is doing. With no session, camera operations use a temporary worker. Use `--direct --camera ID` to request that explicitly; if several sessions are running, choose `--session NAME`. `--camera` can also come from `CAPTUREFAB_CAMERA`.
+
+Use `--json` for versioned machine-readable results. Human-readable output stays simple; diagnostics go to stderr; JSON success and error envelopes go to stdout; exit status reports failure. `--help`, `--version`, native shell completions and binary stdout follow normal shell conventions. Existing output files are never overwritten. A single filename or `{frame}` template infers its image format from `.png`, `.jpg`/`.jpeg`, `.raw`, `.pgm` or `.ppm`; directory sequences default to PNG, and `--format` overrides inference.
 
 ```sh
 capturefab discover --json
-capturefab --camera sim:0 capture --set Width=640 --set Height=480 -o - -f ppm > frame.ppm
+capturefab --direct --camera sim:0 capture --set Width=640 --set Height=480 -o - -f ppm > frame.ppm
 capturefab completions fish > capturefab.fish
 capturefab schema > automation-contract.json
 capturefab doctor --json
 ```
 
-Commands work from bash, zsh, fish, PowerShell, tmux, Ghostty, Warp, Claude Code, Codex, OpenCode and other tools that launch processes and read JSON. Terminal integrations do not require a particular emulator, agent framework, shell plugin or escape sequence.
+`schema --json` uses the same envelope as other JSON commands; its contract is in `result`, including a command tree with each option, default and accepted value. Plain `schema` prints the contract directly. `--timeout-ms` bounds a frame or transport operation; `--request-timeout 5m` sets the client deadline for a session request. A timed-out request can still finish in the session, so inspect `status` before retrying a write.
+
+Commands work from bash, zsh, fish, PowerShell, tmux, Ghostty, Warp, Claude Code, Codex, OpenCode and other tools that launch processes and read JSON. For repeatable multi-camera setup, use [JSON workflows](docs/cli-workflows.md) to avoid shell quoting and preserve an inspectable plan.
 
 ## One session, many cameras
 
@@ -47,7 +51,21 @@ capturefab --session bench --camera sim:1 capture -o second.png
 capturefab --session bench status --json
 ```
 
-Use `serve --name bench` for a headless session. `--camera` targets a connected camera without changing the visible selection; `select ID` changes the inspector selection. Session clients authenticate with a private local token. Commands and errors appear in the GUI activity view. `capturefab sessions` lists available sessions. Set `CAPTUREFAB_SESSION` to avoid repeating `--session`.
+Use `serve --name bench` for a headless session. Desktop windows and browser tabs keep their own selected camera. `select ID` sets the session default for CLI calls that omit `--camera`; explicitly target a camera when collaborating. Inspection, configuration, capture and recording commands connect a missing `--camera` source to the persistent session. `start`, `stop`, `auto` and other persistent controls address an already connected camera. Session clients authenticate with a private local token. `capturefab sessions` lists available sessions; set `CAPTUREFAB_SESSION` to pin one without repeating `--session`. `--direct` overrides that environment default and conflicts only with an explicit `--session`.
+
+People and AI agents can capture from the same cameras together. Commands are ordered per camera, and different cameras work independently. Overlapping scheduled jobs share acquisition. The desktop toolbar and browser's **Session activity** show who acted, on which camera, with queued/running/completed/failed states, errors, saved files and ongoing job progress. Activity updates wake clients immediately and preserve their camera selection, drafts and focus. Camera selection and disconnect do not erase the history. `status --json`, including targeted status during captures, exposes the same timeline in `result.activity` and its revision in `result.activity_revision`. Status polling does not create entries.
+
+Journal strings and saved-path previews are capped: completed captures keep at most the first eight paths, while `file_count` gives the total and command results retain the complete file list. Targeted `--camera ID status` keeps all cameras and session activity; `target_camera` identifies the queried camera and `active_camera` retains the coordinator's selection for CLI defaults.
+
+Give automation a recognizable name with `--actor NAME --actor-kind agent`; people use `--actor NAME` (human is the default). `CAPTUREFAB_ACTOR` and `CAPTUREFAB_ACTOR_KIND` supply these defaults. Names are display attribution, not authentication. Browser tabs have their own participant identity and editable name. HTTP automation can include an `actor` object and watch `/api/activity`; see [remote control](docs/remote-control.md).
+
+```sh
+capturefab --session bench --camera sim:0 --actor focus-agent --actor-kind agent capture -o agent.png
+capturefab --session bench --camera sim:0 --actor Alice capture -o alice.png
+capturefab --session bench activity --json
+# Wait for changes using the revision returned above:
+capturefab --session bench activity --after 12 --wait 20s --json
+```
 
 ```sh
 printf '%s\n' '{"op":"get","feature":"Width"}' | capturefab --session bench rpc --json
@@ -55,6 +73,41 @@ capturefab --session bench select sim:0
 capturefab --session bench start
 capturefab --session bench stop
 ```
+
+## Repeatable workflows
+
+Validate an ordered JSON plan before connecting to cameras, then apply it to the visible workbench or a headless session:
+
+```sh
+capturefab workflow validate examples/workflows/multi-camera-timelapse.json --json
+capturefab workflow apply examples/workflows/multi-camera-timelapse.json --dry-run --json
+capturefab --session bench workflow apply examples/workflows/multi-camera-timelapse.json --json
+```
+
+Workflow steps use the session RPC commands, can target different cameras, and reject unknown or duplicate fields. Files are limited to 1 MiB and 1–256 steps. Every step is validated before execution; live device capabilities and output availability are checked when each step runs. Execution stops at the first failure and retains earlier effects; JSON `error.details` identifies the failed step and completed results. Jobs and encoders remain in the session after the workflow command exits.
+
+Relative capture and recording paths resolve beside the workflow file; stdin workflows use the calling directory. Local `file:relative.mkv` and `sim:replay:relative-folder` sources use that same base, including workflow camera targets. Bare existing filenames are recognized as file sources. Ordinary CLI/RPC sources and outputs use the calling terminal's directory. Network/device locators and names inside `--destination` keep their meaning. Workflows require file outputs for captures. See the [workflow guide and runnable examples](docs/cli-workflows.md) for timelapse, feeder scans and bounded recording.
+
+## Remote browser control
+
+Build the WebAssembly client with `./web-client/build.sh`, then run a headless server with `capturefab serve --name remote --listen 100.101.102.103:8787 --web-dir web-client/dist`. Open the server URL from another laptop on the same tailnet to discover cameras, edit settings, preview frames and set up captures or schedules. Anyone who can reach the listener can control captures; tailnet policy and the host firewall provide the access boundary. Capture files and jobs stay on the server; the local CLI can control the same session. See [remote setup and Tailscale HTTPS](docs/remote-control.md).
+
+## Session analytics
+
+The desktop toolbar's **Analytics** button and the browser's **Session analytics** panel show acquired frames, payload throughput, missed frames and camera contributions for the current session. DuckDB collects one-second samples in memory, retaining at most 24 hours and 250,000 rows; totals continue across camera reconnects. The HTTP listener exposes JSON readiness at `/health`, Prometheus counters and gauges at `/metrics`, and the Plotters chart at `/api/analytics.svg`. See [analytics and monitoring](docs/remote-control.md#analytics-and-monitoring) for the endpoint contract and retention limits.
+
+## GigE network setup
+
+Use **Scan network** in the camera sidebar to check GigE interfaces, camera reachability, link speed and MTU, then apply network defaults to connected cameras. The report distinguishes discovery from a working control connection and from observed stream stability. Slow Ethernet, Wi-Fi, routed paths and unknown link speeds stay visibly flagged. Live camera badges show waiting traffic, retries and lost frames.
+
+The scan retests packet sizes, requests a larger receive buffer and shares a conservative bandwidth budget between connected cameras on each receive interface. It uses a camera throughput limiter or packet delay when supported, with a frame-rate fallback. Auto mode respects the scanned budget. Preview streams briefly pause and resume; recording, forwarding and scheduled captures must be stopped before their cameras can be tuned. Unsupported settings and host buffer limits appear in the report. Host IP addresses, routes and MTUs are not changed.
+
+```sh
+capturefab network-scan --json                       # inspect discovered cameras
+capturefab --session bench network-scan --json       # also tune connected GigE cameras
+```
+
+RPC accepts `{"op":"network_scan","timeout_ms":1000}` and returns `network_scan`, also retained in session status. The per-camera `{"op":"optimize_network","bytes_per_second":100000000}` operation applies a supplied budget; prefer the session scan to account for cameras sharing an interface. Network defaults are camera configuration writes, persist for the connection, and are outside camera undo history. Packet probing and pacing use supported camera features; see [Basler's network parameter reference](https://docs.baslerweb.com/network-related-parameters) for packet-size and inter-packet-delay behavior.
 
 ## Camera types and controls
 
@@ -74,6 +127,8 @@ Line history and depth/thermal color maps are display aids. **Sensor pixels** sw
 `discover --json`, `info --json` and connected identities in `status --json` include `CameraInfo.profile`: `kind`, `source`, `evidence` and `capabilities`. Kinds are `unknown`, `area_scan`, `line_scan`, `depth`, `microscope`, `thermal` and `document_scanner`. Discovery may have only identity hints; connection refines the profile from readable features. Detection prioritizes the scanner transport, explicit device class metadata, explicit line-scan geometry, specialty feature families, remaining declared scan geometry, model identity, and conventional frame dimensions/timing. A one-row ROI, high bit depth or vendor name alone does not identify a specialty camera.
 
 Try the typed simulators without hardware. Each accepts an optional name, such as `sim:line:conveyor`; `sim:0` and arbitrary other names retain the area-scan pattern camera.
+
+Use `sim:replay:PATH` to loop test videos or a single-level folder of image frames/videos. `capturefab simulate run --preset onvif --source PATH` hosts a virtual network camera for an NVR or computer vision pipeline; `simulate presets` lists GigE Vision, RTSP, ONVIF and vision presets. See [simulation and integration testing](docs/simulation.md) for setup and examples.
 
 ```sh
 capturefab --camera sim:line capture --set Height=64 \
@@ -166,7 +221,7 @@ capturefab storage configure --max-space 2GiB --max-files 1000 --on-full stop
 
 `storage configure` persists a global ceiling across restarts; per-command limits can lower it. The default policy stops with an actionable `storage_full` error (exit 6) instead of silently deleting data. `--delete-oldest` explicitly permits retention to remove Capturefab-owned files. The ledger verifies file identity and SHA-256 before deleting: existing files, user replacements, altered captures and active recordings are protected. Age retention is enforced when allocating new captures. Missing files release their ledger usage; interrupted reservations are reconciled through crash-released OS locks. Ordinary disk-full and write errors stop capture and remove safely identifiable failed output.
 
-`--max-age` requires whole seconds, at least `1s`, and a delete-oldest policy. Recording reservations must fit the requested storage budget; an oversized `--max-file-size` is rejected rather than reduced. `--duration` applies to direct forwarding; persistent sessions use `stop-forward`.
+`--max-age` requires whole seconds, at least `1s`, and a delete-oldest policy. Recording reservations must fit the requested storage budget; an oversized `--max-file-size` is rejected rather than reduced. `record`/`forward --duration 30s` works in temporary workers and persistent sessions: the CLI waits, then stops the encoder, including on Ctrl-C. Without a duration, persistent sessions return immediately and continue until `stop-forward`; direct commands stay in the foreground until Ctrl-C.
 
 The budget covers capture/recording data, not unrelated files on the disk. Runtime frame rings, queues and extracted FFmpeg are separately bounded. Use the same `CAPTUREFAB_SESSION_DIR` for sessions that should share a storage budget. Changing it creates a separate ledger and budget.
 
@@ -217,7 +272,7 @@ capturefab onvif resolve http://192.168.1.10/onvif/device_service --username adm
 capturefab --camera 'onvif://admin:password@192.168.1.10/onvif/device_service' capture -o ip-camera.png
 ```
 
-Forwarding uses a bounded latest-frame queue and probes an encoder before selecting it. Candidates, in order, are the vendor encoders (Apple VideoToolbox, NVIDIA NVENC including AV1, NVIDIA Jetson through its GStreamer `nvv4l2h264enc`/`nvv4l2h265enc`/`nvv4l2av1enc` elements, AMD AMF, Intel QSV, VAAPI), then cross-vendor Vulkan Video (`h264_vulkan`, `hevc_vulkan`, `av1_vulkan`), Windows Media Foundation and Linux V4L2, where the build and host drivers support them; software H.264/HEVC is the fallback. On Jetson the GStreamer encoder runs as a separate process and FFmpeg remuxes and delivers its stream. `--encoder` selects explicitly and `--hwaccel` controls FFmpeg decoding. Hardware availability is established by a real probe, not chipset branding. Frames reach FFmpeg in their sensor format (gray, 10/12/16-bit gray, Bayer or packed RGB), handed from the camera worker to the writer thread without a copy, so color conversion runs in FFmpeg's SIMD scaler or the encoder hardware rather than on the camera thread; NVENC and AMF receive packed RGB for color sources and convert it on the GPU when their probe accepts that input. See [FFmpeg builds](docs/ffmpeg-build.md). `.mkv`, fragmented `.mp4`/`.mov`, `.ts` and suitable `.webm` recordings use a bounded Rust writer. Serve HLS through MediaMTX rather than local files outside the retention manager.
+Forwarding uses a bounded latest-frame queue and probes an encoder before selecting it. Candidates, in order, are the vendor encoders (Apple VideoToolbox, NVIDIA NVENC including AV1, NVIDIA Jetson through its GStreamer `nvv4l2h264enc`/`nvv4l2h265enc`/`nvv4l2av1enc` elements, AMD AMF, Intel QSV, VAAPI), then cross-vendor Vulkan Video (`h264_vulkan`, `hevc_vulkan`, `av1_vulkan`), Windows Media Foundation and Linux V4L2, where the build and host drivers support them; software H.264/HEVC is the fallback. On Jetson the GStreamer encoder runs as a separate process and FFmpeg remuxes and delivers its stream. `--encoder` selects explicitly and `--hwaccel` controls decoding for new direct, GUI or `serve` workers; existing sessions retain their decoding setting. Hardware availability is established by a real probe, not chipset branding. Frames reach FFmpeg in their sensor format (gray, 10/12/16-bit gray, Bayer or packed RGB), handed from the camera worker to the writer thread without a copy, so color conversion runs in FFmpeg's SIMD scaler or the encoder hardware rather than on the camera thread; NVENC and AMF receive packed RGB for color sources and convert it on the GPU when their probe accepts that input. See [FFmpeg builds](docs/ffmpeg-build.md). `.mkv`, fragmented `.mp4`/`.mov`, `.ts` and suitable `.webm` recordings use a bounded Rust writer. Serve HLS through MediaMTX rather than local files outside the retention manager.
 
 ## Debugging and limits
 

@@ -66,6 +66,7 @@ pub struct Camera {
     streaming: bool,
     xml: String,
     profile_metadata: Vec<FeatureInfo>,
+    network_budget_bytes_per_second: Option<u64>,
 }
 /// Reject malformed known source forms without checking availability or build capabilities.
 /// Bare camera IDs and serials are resolved against discovery results on open.
@@ -74,11 +75,8 @@ pub fn validate_selector_shape(selector: &str) -> Result<()> {
         !selector.trim().is_empty() && !selector.chars().any(char::is_control),
         "camera selector must be nonempty and contain no control characters"
     );
-    if let Some(name) = selector.strip_prefix("sim:") {
-        ensure!(
-            !name.trim().is_empty(),
-            "simulator selector needs a name, for example sim:0"
-        );
+    if selector.starts_with("sim:") {
+        crate::transport::simulator::validate_selector_shape(selector)?;
     } else if let Some(ip) = selector.strip_prefix("gige:") {
         ip.parse::<Ipv4Addr>()
             .context("GigE selector needs an IPv4 address, for example gige:192.168.1.10")?;
@@ -95,7 +93,9 @@ pub fn validate_selector_shape(selector: &str) -> Result<()> {
 /// Check both selector syntax and local source availability before opening.
 pub fn validate_selector(selector: &str) -> Result<()> {
     validate_selector_shape(selector)?;
-    if crate::scanner::is_source(selector) {
+    if let Some(source) = crate::transport::simulator::replay_source(selector) {
+        crate::transport::simulator::replay::source_files(source)?;
+    } else if crate::scanner::is_source(selector) {
         crate::scanner::info(selector)?;
     } else if crate::onvif::is_source(selector) {
         crate::onvif::validate_source(selector)?;
@@ -142,9 +142,7 @@ impl Camera {
             matches[0].clone()
         };
         let backend: Box<dyn Backend> = match info.transport {
-            Transport::Simulator => Box::new(crate::transport::simulator::Simulator::for_selector(
-                &info.id,
-            )),
+            Transport::Simulator => crate::transport::simulator::open(&info.id, timeout)?,
             Transport::Scanner => crate::scanner::open(&info)?,
             Transport::Media => {
                 if crate::onvif::is_source(&info.id) {
@@ -197,6 +195,7 @@ impl Camera {
             streaming: false,
             xml,
             profile_metadata,
+            network_budget_bytes_per_second: None,
         })
     }
     pub fn features(&mut self) -> Vec<FeatureInfo> {
@@ -233,6 +232,9 @@ impl Camera {
     pub fn has(&self, name: &str) -> bool {
         self.nodes.has(name)
     }
+    pub(crate) fn feature_unit(&self, name: &str) -> Option<&str> {
+        self.nodes.unit(name)
+    }
     pub fn is_writable(&mut self, name: &str) -> bool {
         self.nodes.is_writable(self.backend.as_mut(), name)
     }
@@ -244,6 +246,28 @@ impl Camera {
     }
     pub fn stats(&self) -> Option<TransportStats> {
         self.backend.stats()
+    }
+    pub fn network_budget_bytes_per_second(&self) -> Option<u64> {
+        self.network_budget_bytes_per_second
+    }
+    pub(crate) fn set_network_budget_bytes_per_second(&mut self, budget: u64) {
+        self.network_budget_bytes_per_second = Some(budget.max(1));
+    }
+    /// Apply measured GigE defaults without interfering with an acquisition.
+    pub fn optimize_network(&mut self) -> Result<crate::network::NetworkTuning> {
+        ensure!(
+            !self.streaming,
+            "stop acquisition before optimizing the camera network"
+        );
+        let size = self
+            .get("PayloadSize")?
+            .as_u64()
+            .context("PayloadSize must be a positive integer")?;
+        ensure!(
+            size > 0 && size <= 256 * 1024 * 1024,
+            "camera payload exceeds 256 MiB limit"
+        );
+        self.backend.optimize_network(size as usize)
     }
     pub fn execute(&mut self, name: &str) -> Result<()> {
         ensure!(

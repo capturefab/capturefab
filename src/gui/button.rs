@@ -22,6 +22,7 @@ where
     id: Option<Id>,
     on_key_press: Option<Box<KeyHandler<'a, M>>>,
     name: Option<String>,
+    description: Option<String>,
     role: accessibility::Role,
     checked: Option<bool>,
     selected: Option<bool>,
@@ -45,6 +46,7 @@ impl<'a, M: Clone + 'static, R: renderer::Renderer + 'a> Button<'a, M, R> {
             id: None,
             on_key_press: None,
             name: None,
+            description: None,
             role: accessibility::Role::Button,
             checked: None,
             selected: None,
@@ -58,6 +60,10 @@ impl<'a, M: Clone + 'static, R: renderer::Renderer + 'a> Button<'a, M, R> {
     }
     pub(super) fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
+        self
+    }
+    pub(super) fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
         self
     }
     pub(super) fn role(mut self, role: accessibility::Role) -> Self {
@@ -210,6 +216,9 @@ impl<'a, M: Clone + 'static, R: renderer::Renderer + 'a> Widget<M, Theme, R> for
         let state = tree.state.downcast_mut::<State<M>>();
         let mut node = accessibility::Node::new(self.role);
         node.set_label(self.name.as_deref().unwrap_or("Button"));
+        if let Some(description) = &self.description {
+            node.set_description(description.as_str());
+        }
         if let Some(checked) = self.checked {
             node.set_toggled(if checked {
                 accessibility::Toggled::True
@@ -669,6 +678,7 @@ mod tests {
     fn semantic_control_keeps_its_identity_and_native_focus_across_view_diff() {
         let mut button = Button::<_, ()>::new(iced::widget::Space::new())
             .name("Include simulated cameras")
+            .description("Include test cameras when discovering sources")
             .role(accessibility::Role::CheckBox)
             .checked(true)
             .on_press(false);
@@ -703,6 +713,29 @@ mod tests {
             Some(accessibility::Toggled::True)
         );
         assert_eq!(state.control.activate, Some(false));
+
+        // Live details may change without renaming or replacing the focused
+        // control. Its native identity and real keyboard focus stay intact.
+        button = button.description("Test cameras are included in discovery");
+        button.diff(&mut tree);
+        let mut count = iced::advanced::widget::operation::focusable::count();
+        button.operate(
+            &mut tree,
+            Layout::new(&node),
+            &(),
+            &mut iced::advanced::widget::operation::black_box(&mut count),
+        );
+        let state = tree.state.downcast_ref::<State<bool>>();
+        assert!(state.focused);
+        assert_eq!(state.control.id, id);
+        assert_eq!(
+            state.control.node.label(),
+            Some("Include simulated cameras")
+        );
+        assert_eq!(
+            state.control.node.description(),
+            Some("Test cameras are included in discovery")
+        );
 
         button = button.checked(false).on_press_maybe(None);
         button.diff(&mut tree);

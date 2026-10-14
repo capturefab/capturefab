@@ -218,6 +218,7 @@ pub fn well_formed(bytes: &[u8], width: u32, height: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "jpeg")]
     use crate::types::RGB8;
     fn frame(pixel_format: u32, width: u32, height: u32, bytes: usize) -> Frame {
         Frame {

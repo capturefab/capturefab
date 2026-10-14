@@ -221,6 +221,10 @@ impl NodeMap {
     pub fn has(&self, name: &str) -> bool {
         self.nodes.contains_key(name)
     }
+
+    pub(crate) fn unit(&self, name: &str) -> Option<&str> {
+        self.nodes.get(name)?.prop("Unit")
+    }
     /// Selectors that address a feature's value, including selectors hidden
     /// behind register address expressions. Undo must read and write the
     /// same selected bank even when the inspector has since selected another.

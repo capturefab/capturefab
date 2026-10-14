@@ -486,6 +486,7 @@ impl<'a, T: ToString + PartialEq + Clone + 'a, M: Clone + 'static, R: text::Rend
                 let choice = &mut state.choices[index];
                 choice.focus_id = focus_id.clone();
                 choice.focused = state.highlighted == Some(index);
+                choice.window_coordinates = state.menu_bounds;
                 choice.node = accessibility::Node::new(accessibility::Role::ListBoxOption);
                 choice.node.set_label(option.to_string());
                 choice

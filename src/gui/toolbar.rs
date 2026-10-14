@@ -93,6 +93,8 @@ impl Workbench {
                 match unseen {
                     Some(Level::Error) => "Session activity: new errors",
                     Some(_) => "Session activity: new warnings",
+                    None if self.client_activity.unread =>
+                        "Session activity: new actions from other participants",
                     None => "Session activity",
                 },
                 os
@@ -112,6 +114,12 @@ impl Workbench {
                 .align_right(Fill)
                 .padding([5, 5]),
             );
+        } else if self.client_activity.unread && !self.logs_open {
+            activity = activity.push(
+                container(dot(p.accent, 6.0))
+                    .align_right(Fill)
+                    .padding([5, 5]),
+            );
         }
         column![
             rule::horizontal(1).style(style::line),
@@ -120,6 +128,14 @@ impl Workbench {
                     container(left).width(Fill).clip(true),
                     container(self.status(width, p)).max_width(width).clip(true),
                     row![history_button(true), history_button(false)].spacing(2),
+                    tip_above(
+                        button(text("Analytics").size(style::SMALL))
+                            .name("Session analytics for all cameras")
+                            .padding([4, 6])
+                            .style(style::plain)
+                            .on_press(Message::Analytics(true)),
+                        "Frame rate, payload throughput and missed frames for this session",
+                    ),
                     activity,
                 ]
                 .spacing(10)
@@ -137,7 +153,7 @@ impl Workbench {
     /// must keep for the capture controls when they show.
     fn status_width(&self, capture: bool) -> f32 {
         // Padding, gaps and the Activity button.
-        let mut room = self.main_width() - 2.0 * (GUTTER - 6.0) - 3.0 * 10.0 - 128.0;
+        let mut room = self.main_width() - 2.0 * (GUTTER - 6.0) - 4.0 * 10.0 - 198.0;
         if capture {
             room -= CAPTURE_ROOM;
         }
@@ -151,8 +167,9 @@ impl Workbench {
         let connected = self.snapshot.connected.is_some();
         let problem = self.validate_input(&self.capture_command(false)).err();
         let scanner = self.scanner_selected();
-        let capturing = self.pending(Job::Capture);
-        // One capture runs at a time, from any camera; saved is per camera.
+        let capturing = self.capturing_here();
+        // This user's pending capture is per camera. Other participants can
+        // keep capturing while this button queues the user's own request.
         let saved = !capturing && self.just_saved(self.snapshot.active_camera.as_deref());
         let (glyph, label): (Element<'_, Message>, _) = if capturing {
             (
@@ -225,6 +242,7 @@ impl Workbench {
             }
             // The camera list's spinners.
             Job::Discover | Job::Connect => self.sidebar_shown(),
+            Job::NetworkScan => self.sidebar_shown() || self.network_open,
             _ => false,
         }
     }
@@ -233,6 +251,84 @@ impl Workbench {
     /// way that shows nowhere else, else the camera's link.
     fn status(&self, width: f32, p: &'static Palette) -> Element<'_, Message> {
         let snapshot = &self.snapshot;
+        // A long schedule must not hide a different participant's completed
+        // edit or failure. Show the newest outcome before returning to work
+        // that is still active in the session.
+        if let Some(notice) = &self.notice
+            && !self.welcome_says(notice)
+            && self.client_activity.latest_changed.is_some_and(|id| {
+                snapshot
+                    .activity
+                    .iter()
+                    .any(|entry| entry.id == id && !client_activity::active(entry))
+            })
+        {
+            return self.notice_line(notice, width, p);
+        }
+        if let Some(entry) = snapshot
+            .activity
+            .iter()
+            .filter(|entry| self.other_activity(entry) && client_activity::active(entry))
+            .max_by_key(|entry| {
+                (
+                    self.client_activity.latest_changed == Some(entry.id),
+                    client_activity::effective_state(entry)
+                        == crate::session::ActivityState::Running,
+                    entry.id,
+                )
+            })
+        {
+            let target = entry
+                .camera
+                .as_ref()
+                .map(|camera| format!(" · {camera}"))
+                .unwrap_or_default();
+            let selected_id = entry.id;
+            let others = snapshot
+                .activity
+                .iter()
+                .filter(|entry| {
+                    self.other_activity(entry)
+                        && client_activity::active(entry)
+                        && entry.id != selected_id
+                })
+                .count();
+            let more = if others > 0 {
+                format!(" · +{others} active")
+            } else {
+                String::new()
+            };
+            let label = format!(
+                "{}{} · {}: {}{}",
+                client_activity::actor_text(entry),
+                target,
+                client_activity::activity_state(entry),
+                entry.label,
+                more
+            );
+            let visible = format!(
+                "{} · {}: {}{}{}",
+                client_activity::actor_display(entry),
+                client_activity::activity_state(entry),
+                entry.label,
+                target,
+                more
+            );
+            return accessibility::label(
+                tip_above(
+                    row![
+                        icon::spinner(12.0, p.accent_text, self.spin()),
+                        container(one_line(visible, style::SMALL, style::SANS, p.secondary))
+                            .max_width((width - 19.0).max(0.0)),
+                    ]
+                    .spacing(7)
+                    .align_y(Alignment::Center),
+                    label.clone(),
+                ),
+                label,
+                accessibility::Role::Status,
+            );
+        }
         if let Some(notice) = &self.notice
             && !self.welcome_says(notice)
         {
@@ -261,6 +357,9 @@ impl Workbench {
         let Some(camera) = &snapshot.connected else {
             return space().into();
         };
+        if let Some(status) = self.network_status(camera) {
+            return self.network_indicator(status, p);
+        }
         let mut parts = row![
             text(format!("{} · {}", camera.transport, identity(camera)))
                 .size(style::SMALL)
@@ -362,7 +461,7 @@ impl Workbench {
         }
         accessibility::label(
             line.into(),
-            notice.about(),
+            notice.announcement(),
             if level == Level::Done {
                 accessibility::Role::Status
             } else {
@@ -373,9 +472,9 @@ impl Workbench {
 
     pub(super) fn activity(&self, p: &'static Palette) -> Element<'_, Message> {
         let mut lines = column![].spacing(3);
-        if self.snapshot.logs.is_empty() {
+        if self.snapshot.logs.is_empty() && self.snapshot.activity.is_empty() {
             lines = lines.push(
-                text("Session events will appear here.")
+                text("CLI, API and GUI actions will appear here, with their progress and results.")
                     .size(style::SMALL)
                     .color(p.secondary),
             );
@@ -397,7 +496,7 @@ impl Workbench {
                     .size(style::CAPTION)
                     .font(style::MONO)
                     .color(p.secondary)
-                    .width(Length::Fixed(58.0)),
+                    .width(Length::Fixed(86.0)),
                     container(mark)
                         .width(Length::Fixed(11.0))
                         // Centered on the first line, should the message wrap.
@@ -411,39 +510,45 @@ impl Workbench {
                 .spacing(6),
             );
         }
-        column![
-            rule::horizontal(1).style(style::line),
-            container(
-                column![
-                    row![
-                        text("Activity").size(style::BODY).font(style::SEMIBOLD),
-                        space::horizontal(),
-                        button(
-                            text(if self.just_copied(notice::COPIED_LOG) {
-                                "Copied"
-                            } else {
-                                "Copy log"
-                            })
-                            .size(style::SMALL)
-                        )
-                        .name("Copy activity log")
-                        .padding([3, 8])
-                        .style(style::link)
-                        .on_press(Message::CopyLog),
+        if !self.snapshot.activity.is_empty() {
+            lines = lines.push(self.client_activity_rows(p));
+        }
+        activity_scroll(
+            column![
+                rule::horizontal(1).style(style::line),
+                container(
+                    column![
+                        row![
+                            text("Activity").size(style::BODY).font(style::SEMIBOLD),
+                            space::horizontal(),
+                            button(
+                                text(if self.just_copied(notice::COPIED_LOG) {
+                                    "Copied"
+                                } else {
+                                    "Copy log"
+                                })
+                                .size(style::SMALL)
+                            )
+                            .name("Copy activity log")
+                            .padding([3, 8])
+                            .style(style::link)
+                            .on_press(Message::CopyLog),
+                        ]
+                        .align_y(Alignment::Center),
+                        scrollable(lines)
+                            .id(ACTIVITY_BODY)
+                            .anchor_bottom()
+                            .width(Fill)
+                            .height(Fill)
+                            .style(style::scroll),
                     ]
-                    .align_y(Alignment::Center),
-                    scrollable(lines)
-                        .anchor_bottom()
-                        .width(Fill)
-                        .height(Fill)
-                        .style(style::scroll),
-                ]
-                .spacing(6),
-            )
-            .height(170)
-            .padding([10.0, GUTTER]),
-        ]
-        .into()
+                    .spacing(6),
+                )
+                .height(170)
+                .padding([10.0, GUTTER]),
+            ]
+            .into(),
+        )
     }
 }
 
@@ -451,6 +556,178 @@ impl Workbench {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn shared_actions_are_announced_with_actor_camera_and_concurrent_work() {
+        use iced::advanced::{renderer::Headless, widget::Tree};
+        let renderer = iced::futures::executor::block_on(iced::Renderer::new(
+            iced::Font::default(),
+            iced::Pixels(16.0),
+            Some("tiny-skia"),
+        ))
+        .expect("software renderer");
+        let peer = |id, state| {
+            serde_json::from_value(json!({
+                "id": id, "origin": "client", "actor": {
+                    "id": format!("agent-{id}"), "name": format!("Agent {id}"), "kind": "agent"
+                }, "operation": "capture", "camera": "sim:0", "feature": null,
+                "label": "Capture frame", "state": state, "submitted_at_ms": 1,
+                "started_at_ms": 1, "finished_at_ms": null, "detail": null,
+                "file_count": 0, "files": [], "job": null
+            }))
+            .unwrap()
+        };
+        let mut bench = Workbench::new(SessionHandle::new(), "multiplayer".into(), false, None);
+        bench.snapshot.activity = vec![peer(1, "running"), peer(2, "running")];
+        bench.sync_client_activity();
+        let announcements = |bench: &Workbench| {
+            let mut view = bench.status(600.0, Palette::of(false));
+            let mut tree = Tree::new(view.as_widget());
+            let layout = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &iced::advanced::layout::Limits::new(Size::ZERO, Size::new(600.0, 50.0)),
+            );
+            let (native, _, _) = accessibility::snapshot_widget(
+                view.as_widget_mut(),
+                &mut tree,
+                iced::advanced::Layout::new(&layout),
+                &renderer,
+            );
+            native
+                .nodes
+                .iter()
+                .filter(|(_, node)| {
+                    matches!(
+                        node.role(),
+                        accessibility::Role::Status | accessibility::Role::Alert
+                    )
+                })
+                .map(|(_, node)| {
+                    (
+                        node.role(),
+                        node.label().unwrap_or_default().to_owned(),
+                        node.live(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let active = announcements(&bench);
+        assert!(active.iter().any(|(role, label, live)| {
+            *role == accessibility::Role::Status
+                && label.contains("Agent 2 [agent-2] · AI agent · sim:0 · Running")
+                && label.contains("+1 active")
+                && *live == Some(accesskit::Live::Polite)
+        }));
+        bench.snapshot.activity[1].state = crate::session::ActivityState::Failed;
+        bench.snapshot.activity[1].detail = Some("disk full".into());
+        bench.sync_client_activity();
+        let completed = announcements(&bench);
+        assert!(
+            completed.iter().any(|(role, label, live)| {
+                *role == accessibility::Role::Alert
+                    && label.contains("Agent 2 [agent-2] · sim:0 · Failed")
+                    && label.contains("Participant: AI agent · agent-2")
+                    && label.contains("disk full")
+                    && *live == Some(accesskit::Live::Assertive)
+            }),
+            "a failure remains visible while another participant's capture runs"
+        );
+    }
+
+    #[test]
+    fn native_notice_announces_outcome_with_details_and_preserves_live_identity() {
+        use iced::advanced::{renderer::Headless, widget::Tree};
+        let renderer = iced::futures::executor::block_on(iced::Renderer::new(
+            iced::Font::default(),
+            iced::Pixels(16.0),
+            Some("tiny-skia"),
+        ))
+        .expect("software renderer");
+        let bench = Workbench::new(SessionHandle::new(), "notice-test".into(), true, None);
+        let now = bench.now;
+        let cases = [
+            (
+                Job::Capture,
+                Ok(json!({"files": ["/tmp/capture.png"], "count": 1})),
+                "Saved capture.png\n/tmp/capture.png",
+                accessibility::Role::Status,
+                accesskit::Live::Polite,
+            ),
+            (
+                Job::Capture,
+                Err(anyhow::anyhow!(
+                    "output file already exists\nChoose a new file name."
+                )),
+                "Capture failed: output file already exists\nChoose a new file name.",
+                accessibility::Role::Alert,
+                accesskit::Live::Assertive,
+            ),
+            (
+                Job::Forward { recording: true },
+                Err(anyhow::anyhow!("encoder unavailable")),
+                "Could not start recording: encoder unavailable",
+                accessibility::Role::Alert,
+                accesskit::Live::Assertive,
+            ),
+        ];
+        let mut tree = Tree::empty();
+        let mut previous = None;
+        for (job, result, expected, role, live) in cases {
+            let (text, detail, level) = command_notice(&job, &result).unwrap();
+            let notice = Notice {
+                text,
+                detail,
+                level,
+                at: now,
+            };
+            let mut view = bench.notice_line(&notice, 420.0, Palette::of(false));
+            tree.diff(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &iced::advanced::layout::Limits::new(Size::ZERO, Size::new(420.0, 50.0)),
+            );
+            let (native, _, _) = accessibility::snapshot_widget(
+                view.as_widget_mut(),
+                &mut tree,
+                iced::advanced::Layout::new(&node),
+                &renderer,
+            );
+            let (id, region) = native
+                .nodes
+                .iter()
+                .find(|(_, node)| node.role() == role)
+                .unwrap();
+            assert_eq!(region.label(), Some(expected));
+            assert_eq!(region.live(), Some(live));
+            assert!(region.is_live_atomic());
+            assert!(!region.supports_action(accesskit::Action::Focus));
+            assert!(!region.supports_action(accesskit::Action::Click));
+            if let Some(previous) = previous {
+                assert_eq!(*id, previous);
+            }
+            previous = Some(*id);
+            assert!(
+                !native
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.role() == accessibility::Role::Label
+                        && node.label() == Some(notice.text.as_str())),
+                "outcome text belongs to the live region once"
+            );
+            if level == Level::Error {
+                for action in ["Show activity details", "Dismiss notification"] {
+                    let node = native
+                        .nodes
+                        .iter()
+                        .find(|(_, node)| node.label() == Some(action))
+                        .unwrap();
+                    assert!(node.1.supports_action(accesskit::Action::Click));
+                }
+            }
+        }
+    }
 
     #[test]
     fn progress_shows_once_where_it_was_asked_for() {

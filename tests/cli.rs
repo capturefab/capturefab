@@ -19,10 +19,375 @@ impl Drop for Fixture {
 }
 fn cmd(dir: &PathBuf, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_capturefab"))
+        .env_remove("CAPTUREFAB_SESSION")
+        .env_remove("CAPTUREFAB_CAMERA")
         .env("CAPTUREFAB_SESSION_DIR", dir)
         .args(args)
         .output()
         .unwrap()
+}
+
+fn serve_at(dir: &PathBuf, cwd: &PathBuf, name: &str) -> Child {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+        .env_remove("CAPTUREFAB_SESSION")
+        .env_remove("CAPTUREFAB_CAMERA")
+        .env("CAPTUREFAB_SESSION_DIR", dir)
+        .current_dir(cwd)
+        .args(["--json", "serve", "--name", name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&ready).unwrap()["result"]["ready"],
+        true,
+        "{ready}"
+    );
+    child
+}
+
+#[test]
+fn automatic_session_targeting_workflow_paths_and_partial_failure() {
+    let root = std::env::temp_dir().join(format!(
+        "capturefab-workflow-cli-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let dir = root.join("sessions");
+    let caller = root.join("caller");
+    let server = root.join("server");
+    let plans = root.join("plans");
+    for path in [&caller, &server, &plans] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let _fixture = Fixture {
+        child: serve_at(&dir, &server, "visual"),
+        dir: root.clone(),
+    };
+    let out = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+        .env_remove("CAPTUREFAB_SESSION")
+        .env_remove("CAPTUREFAB_CAMERA")
+        .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .current_dir(&caller)
+        .args([
+            "--json",
+            "--camera",
+            "sim:visible",
+            "capture",
+            "-o",
+            "first.ppm",
+            "--set",
+            "Width=64",
+            "--set",
+            "Height=64",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(envelope["session"], "visual");
+    assert!(
+        std::fs::read(caller.join("first.ppm"))
+            .unwrap()
+            .starts_with(b"P6\n64 64\n")
+    );
+    assert!(!server.join("first.ppm").exists());
+    let initial = json(&dir, &["--json", "status"]);
+    let worker_pid = initial["cameras"][0]["worker_pid"].clone();
+    json(&dir, &["--json", "connect", "sim:other"]);
+    json(
+        &dir,
+        &[
+            "--json",
+            "--camera",
+            "sim:visible",
+            "set",
+            "ExposureTime=2000",
+        ],
+    );
+    let status = json(&dir, &["--json", "status"]);
+    assert_eq!(status["active_camera"], "sim:other");
+    assert!(
+        status["cameras"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|camera| camera["worker_pid"] == worker_pid)
+    );
+    assert!(
+        status["activity"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|activity| activity["operation"] == "capture" && activity["state"] == "succeeded")
+    );
+
+    let workflow = plans.join("workflow.json");
+    std::fs::write(&workflow, serde_json::to_vec(&serde_json::json!({"version":1,"steps":[
+        {"command":{"op":"connect","camera":"sim:workflow","timeout_ms":2000}},
+        {"camera":"sim:workflow","command":{"op":"set","feature":"Width","value":"64"}},
+        {"camera":"sim:workflow","command":{"op":"set","feature":"Height","value":"64"}},
+        {"camera":"sim:workflow","command":{"op":"capture","output":"frames/shot.png","count":1,"timeout_ms":2000,"format":"png"}}
+    ]})).unwrap()).unwrap();
+    let plan = json(
+        &dir,
+        &[
+            "--json",
+            "workflow",
+            "apply",
+            workflow.to_str().unwrap(),
+            "--dry-run",
+        ],
+    );
+    assert_eq!(plan["step_count"], 4);
+    assert_eq!(
+        json(&dir, &["--json", "status"])["cameras"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let applied = json(
+        &dir,
+        &["--json", "workflow", "apply", workflow.to_str().unwrap()],
+    );
+    assert_eq!(applied["completed_steps"], 4);
+    assert!(plans.join("frames/shot.png").exists());
+    assert!(!server.join("frames/shot.png").exists());
+
+    std::fs::write(&workflow, r#"{"version":1,"steps":[{"camera":"sim:workflow","command":{"op":"set","feature":"Width","value":"128"}},{"command":{"op":"status","typo":true}}]}"#).unwrap();
+    let invalid = cmd(
+        &dir,
+        &["--json", "workflow", "apply", workflow.to_str().unwrap()],
+    );
+    assert_eq!(invalid.status.code(), Some(2));
+    assert_eq!(
+        json(
+            &dir,
+            &["--json", "--camera", "sim:workflow", "get", "Width"]
+        )["features"][0]["value"],
+        64
+    );
+    std::fs::write(&workflow, r#"{"version":1,"steps":[{"camera":"sim:workflow","command":{"op":"set","feature":"Width","value":"96"}},{"camera":"sim:workflow","command":{"op":"set","feature":"NoSuchFeature","value":"1"}},{"camera":"sim:workflow","command":{"op":"stop"}}]}"#).unwrap();
+    let failed = cmd(
+        &dir,
+        &["--json", "workflow", "apply", workflow.to_str().unwrap()],
+    );
+    assert!(!failed.status.success());
+    let failure: Value = serde_json::from_slice(&failed.stdout).unwrap();
+    assert_eq!(failure["error"]["details"]["completed_steps"], 1);
+    assert_eq!(failure["error"]["details"]["failed_step"], 2);
+    assert_eq!(
+        json(
+            &dir,
+            &["--json", "--camera", "sim:workflow", "get", "Width"]
+        )["features"][0]["value"],
+        96
+    );
+}
+
+#[test]
+fn ambiguous_sessions_require_target_and_direct_bypasses_them() {
+    let dir = std::env::temp_dir().join(format!(
+        "capturefab-ambiguous-cli-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let cwd = std::env::current_dir().unwrap();
+    let _first = Fixture {
+        child: serve_at(&dir, &cwd, "first"),
+        dir: dir.clone(),
+    };
+    let _second = Fixture {
+        child: serve_at(&dir, &cwd, "second"),
+        dir: dir.clone(),
+    };
+    let out = cmd(&dir, &["--json", "--camera", "sim:0", "set", "Width=64"]);
+    assert_eq!(out.status.code(), Some(2));
+    let failure: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        failure["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("multiple sessions")
+    );
+    for name in ["first", "second"] {
+        assert!(
+            json(&dir, &["--json", "--session", name, "status"])["cameras"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert_eq!(
+        json(
+            &dir,
+            &["--json", "--direct", "--camera", "sim:0", "get", "Width"]
+        )["features"][0]["value"],
+        640
+    );
+    let env_direct = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+        .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_SESSION", "first")
+        .env("CAPTUREFAB_CAMERA", "sim:environment")
+        .args(["--json", "--direct", "get", "Width"])
+        .output()
+        .unwrap();
+    assert!(
+        env_direct.status.success(),
+        "{}",
+        String::from_utf8_lossy(&env_direct.stdout)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&env_direct.stdout).unwrap()["result"]["features"][0]["value"],
+        640
+    );
+    assert!(
+        json(&dir, &["--json", "--session", "first", "status"])["cameras"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let env_stdout = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+        .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_SESSION", "first")
+        .env_remove("CAPTUREFAB_CAMERA")
+        .args([
+            "--camera",
+            "sim:stdout",
+            "capture",
+            "-o",
+            "-",
+            "--format",
+            "raw",
+            "--set",
+            "Width=64",
+            "--set",
+            "Height=64",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        env_stdout.status.success(),
+        "{}",
+        String::from_utf8_lossy(&env_stdout.stderr)
+    );
+    assert_eq!(env_stdout.stdout.len(), 4096);
+    assert!(
+        json(&dir, &["--json", "--session", "first", "status"])["cameras"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let schema = json(&dir, &["schema", "--json"]);
+    assert!(
+        schema["cli"]["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command["name"] == "workflow")
+    );
+}
+
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn session_recording_duration_stops_original_camera_after_selection_changes() {
+    let dir = std::env::temp_dir().join(format!(
+        "capturefab-duration-cli-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let cwd = std::env::current_dir().unwrap();
+    let _fixture = Fixture {
+        child: serve_at(&dir, &cwd, "recording"),
+        dir: dir.clone(),
+    };
+    json(&dir, &["--json", "connect", "sim:recording"]);
+    json(&dir, &["--json", "set", "Width=64", "Height=64"]);
+    json(&dir, &["--json", "connect", "sim:other"]);
+    let output = dir.join("clip.mkv");
+    let mut recording = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+        .env_remove("CAPTUREFAB_SESSION")
+        .env_remove("CAPTUREFAB_CAMERA")
+        .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .args([
+            "--json",
+            "--camera",
+            "sim:recording",
+            "record",
+            "-o",
+            output.to_str().unwrap(),
+            "--encoder",
+            "libx264",
+            "--duration",
+            "2s",
+            "--fps",
+            "10",
+            "--max-file-size",
+            "8MiB",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        if recording.try_wait().unwrap().is_some() {
+            let finished = recording.wait_with_output().unwrap();
+            panic!(
+                "recording exited before it was observed: {}\n{}",
+                String::from_utf8_lossy(&finished.stdout),
+                String::from_utf8_lossy(&finished.stderr)
+            );
+        }
+        let state = json(&dir, &["--json", "--camera", "sim:recording", "status"]);
+        if state["forwarding"].is_string() {
+            break;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "recording failed to start"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    json(&dir, &["--json", "select", "sim:other"]);
+    let finished = recording.wait_with_output().unwrap();
+    assert!(
+        finished.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&finished.stdout),
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(start.elapsed() >= std::time::Duration::from_secs(2));
+    assert!(std::fs::metadata(output).unwrap().len() > 0);
+    let state = json(&dir, &["--json", "status"]);
+    assert_eq!(state["active_camera"], "sim:other");
+    assert!(
+        state["cameras"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|camera| camera["info"]["id"] == "sim:recording")
+            .unwrap()["forwarding"]
+            .is_null()
+    );
 }
 fn json(dir: &PathBuf, args: &[&str]) -> Value {
     let out = cmd(dir, args);
@@ -35,6 +400,77 @@ fn json(dir: &PathBuf, args: &[&str]) -> Value {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], true);
     v["result"].clone()
+}
+
+#[test]
+fn network_scan_preserves_active_non_gige_streams_and_retains_report() {
+    let dir = std::env::temp_dir().join(format!(
+        "capturefab-network-ci-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+        .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .args([
+            "--json",
+            "--camera",
+            "sim:0",
+            "serve",
+            "--name",
+            "network-ci",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&ready).unwrap()["result"]["ready"],
+        true,
+        "{ready}"
+    );
+    let _fixture = Fixture {
+        child,
+        dir: dir.clone(),
+    };
+    json(&dir, &["--json", "--session", "network-ci", "start"]);
+    let before = json(&dir, &["--json", "--session", "network-ci", "status"]);
+    let result = json(
+        &dir,
+        &[
+            "--json",
+            "--session",
+            "network-ci",
+            "--timeout-ms",
+            "50",
+            "network-scan",
+        ],
+    );
+    let report = &result["network_scan"];
+    assert!(report["interfaces"].is_array());
+    assert!(report["cameras"].is_array());
+    assert!(report["warnings"].is_array());
+    assert!(report["scanned_at_ms"].as_u64().unwrap() > 0);
+    assert!(report["cameras"].as_array().unwrap().iter().all(
+        |camera| camera["camera"]["transport"] == "gig_e"
+            && camera["active"] == false
+            && camera["tuning"].is_null()
+    ));
+    let after = json(&dir, &["--json", "--session", "network-ci", "status"]);
+    assert_eq!(after["network_scan"], *report);
+    assert_eq!(after["connected"]["id"], before["connected"]["id"]);
+    assert_eq!(
+        after["cameras"][0]["worker_pid"],
+        before["cameras"][0]["worker_pid"]
+    );
+    assert_eq!(after["streaming"], true);
+    assert!(after["frames"].as_u64().unwrap() >= before["frames"].as_u64().unwrap());
 }
 
 #[test]
@@ -450,13 +886,13 @@ fn undo_redo_camera_session_contract() {
         assert_eq!(camera(scanner, &["status"])["frames"], 0);
     }
     for action in ["undo", "redo", "history"] {
-        let direct = cmd(&dir, &["--json", "--camera", "sim:0", action]);
-        assert!(!direct.status.success());
+        let direct = cmd(&dir, &["--json", "--direct", "--camera", "sim:0", action]);
+        assert_eq!(direct.status.code(), Some(2));
         assert!(
             serde_json::from_slice::<Value>(&direct.stdout).unwrap()["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("needs --session")
+                .contains("--session")
         );
     }
 }
@@ -883,8 +1319,8 @@ fn auto_mode_session_contract() {
         serde_json::from_slice::<Value>(&usage.stdout).unwrap()["error"]["code"],
         "usage"
     );
-    let direct = cmd(&dir, &["--json", "--camera", "sim:0", "auto"]);
-    assert_eq!(direct.status.code(), Some(1));
+    let direct = cmd(&dir, &["--json", "--direct", "--camera", "sim:0", "auto"]);
+    assert_eq!(direct.status.code(), Some(2));
     assert!(
         serde_json::from_slice::<Value>(&direct.stdout).unwrap()["error"]["message"]
             .as_str()

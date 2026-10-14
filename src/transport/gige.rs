@@ -114,7 +114,7 @@ fn parse_ack(packet: &[u8]) -> Result<Ack<'_>> {
 }
 
 #[derive(Debug)]
-struct GvcpStatus(u16);
+pub(crate) struct GvcpStatus(pub(crate) u16);
 impl std::fmt::Display for GvcpStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let description = match self.0 {
@@ -133,6 +133,12 @@ impl std::fmt::Display for GvcpStatus {
     }
 }
 impl std::error::Error for GvcpStatus {}
+
+/// A rejected GVCP command still establishes that the camera replied. Preserve
+/// that distinction through contextual errors from repeated network probes.
+pub(crate) fn is_control_rejection(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<GvcpStatus>().is_some()
+}
 
 fn fixed_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes.split(|b| *b == 0).next().unwrap_or_default())
@@ -496,6 +502,37 @@ pub fn probe(ip: Ipv4Addr, timeout: Duration) -> Result<CameraInfo> {
     Ok(info)
 }
 
+/// Confirm a camera's unicast control path, without acquiring control or
+/// changing any register. Broadcast discovery alone does not prove reachability.
+/// All three reads share one deadline, including retries and pending ACKs.
+pub fn probe_network(ip: Ipv4Addr, timeout: Duration) -> Result<Ipv4Addr> {
+    ensure!(
+        !ip.is_unspecified() && !ip.is_multicast() && ip != Ipv4Addr::BROADCAST,
+        "expected a unicast camera IPv4 address"
+    );
+    probe_network_at(SocketAddrV4::new(ip, GVCP_PORT), timeout)
+}
+fn probe_network_at(address: SocketAddrV4, timeout: Duration) -> Result<Ipv4Addr> {
+    let timeout = bounded_timeout(timeout);
+    let deadline = Instant::now() + timeout;
+    let mut control = Control::connect(address, timeout)?;
+    for read in 1..=3 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(
+            !remaining.is_zero(),
+            "camera control path did not pass three reads before the deadline"
+        );
+        control.timeout = remaining;
+        control
+            .read_register(GVCP_CAPABILITY)
+            .with_context(|| format!("camera control path failed check {read} of 3"))?;
+    }
+    match control.socket.local_addr()? {
+        SocketAddr::V4(local) => Ok(*local.ip()),
+        _ => bail!("camera control route is not IPv4"),
+    }
+}
+
 struct Heartbeat {
     shutdown: Arc<(Mutex<bool>, Condvar)>,
     failure: Arc<Mutex<Option<String>>>,
@@ -762,7 +799,7 @@ impl Backend for GigE {
                     .collect();
                 if !negotiated {
                     notes.push(format!(
-                        "camera sent no test packet; if frames time out, allow inbound UDP from {}",
+                        "camera did not pass repeated stream packet tests; if frames time out, allow inbound UDP from {}",
                         self.camera_ip
                     ));
                 }
@@ -791,6 +828,120 @@ impl Backend for GigE {
                 Err(error)
             }
         }
+    }
+    fn optimize_network(&mut self, payload_size: usize) -> Result<crate::network::NetworkTuning> {
+        ensure!(
+            self.stream.is_none(),
+            "stop GigE receiving before optimizing the network"
+        );
+        ensure!(
+            payload_size > 0 && payload_size <= MAX_PAYLOAD,
+            "camera payload size must be 1..=128 MiB"
+        );
+        self.heartbeat.check()?;
+        // Both successful and unsuccessful prior negotiations must be retried
+        // after the user changes the cable, interface or firewall configuration.
+        self.packet_size = None;
+        let socket =
+            UdpSocket::bind((self.host_ip, 0)).context("opening GVSP network test socket")?;
+        let receive = socket2::SockRef::from(&socket);
+        request_receive_buffer(payload_size, |size| receive.set_recv_buffer_size(size));
+        let receive_buffer = receive.recv_buffer_size().ok();
+        let port = socket.local_addr()?.port();
+        let mtu = host_mtu(self.host_ip);
+        let cap = mtu.unwrap_or(PACKET_SIZE_MAX).min(PACKET_SIZE_MAX) & !3;
+        ensure!(
+            cap >= 576,
+            "network interface MTU is too small for GigE Vision streaming"
+        );
+        let mut buffer = vec![0; 65_536];
+        let mut control = self
+            .control
+            .lock()
+            .map_err(|_| anyhow!("GVCP mutex poisoned"))?;
+        let saved_timeout = control.timeout;
+        // A network scan must not spend the normal, potentially long camera
+        // timeout on each rejected test size.
+        control.timeout = saved_timeout.min(Duration::from_millis(200));
+        let result = (|| -> Result<(u32, Option<u32>)> {
+            let address = control.read_register(STREAM_ADDRESS)?;
+            let stream_port = control.read_register(STREAM_PORT)?;
+            let original = control.read_register(STREAM_PACKET_SIZE)?;
+            let tuned = (|| -> Result<(u32, Option<u32>)> {
+                control.write_register(STREAM_ADDRESS, u32::from(self.host_ip))?;
+                control.write_register(STREAM_PORT, port as u32)?;
+                let negotiated = ladder(
+                    |size| {
+                        probe_packet_size(
+                            &mut control,
+                            &socket,
+                            &mut buffer,
+                            IpAddr::V4(self.camera_ip),
+                            original,
+                            size,
+                        )
+                    },
+                    cap,
+                    mtu.is_some(),
+                );
+                let selected = negotiated.unwrap_or(cap.min(1500));
+                control.write_register(
+                    STREAM_PACKET_SIZE,
+                    (original & (SCPS_NO_FRAGMENT | SCPS_BIG_ENDIAN)) | selected,
+                )?;
+                let actual = control.read_register(STREAM_PACKET_SIZE)? & 0xffff;
+                ensure!(
+                    (576..=selected).contains(&actual)
+                        && (negotiated.is_none() || actual == selected),
+                    "camera did not retain the selected {selected}-byte packet size (read back {actual})"
+                );
+                Ok((actual, negotiated))
+            })();
+            // A temporary test destination must never remain in the camera,
+            // even when a command, packet test or settings readback fails.
+            let restore_address = control.write_register(STREAM_ADDRESS, address);
+            let restore_port = control.write_register(STREAM_PORT, stream_port);
+            if tuned.is_err() || restore_address.is_err() || restore_port.is_err() {
+                let restore_packet =
+                    control.write_register(STREAM_PACKET_SIZE, original & !SCPS_FIRE);
+                restore_address.context("restoring stream address after network test")?;
+                restore_port.context("restoring stream port after network test")?;
+                restore_packet.context("restoring packet size after failed network test")?;
+            }
+            tuned
+        })();
+        control.timeout = saved_timeout;
+        let (packet_size, negotiated) = result?;
+        self.packet_size = Some(negotiated);
+        let mut warnings = Vec::new();
+        if negotiated.is_none() {
+            warnings.push(format!("Stream delivery is unverified: the camera did not deliver three consecutive test packets. Applied a conservative {packet_size}-byte packet size; check inbound UDP, the cable and the camera's network path."));
+        }
+        if let Some(note) =
+            receive_buffer.and_then(|bytes| receive_buffer_note(bytes, payload_size))
+        {
+            warnings.push(note);
+        }
+        self.stats.packet_size = Some(packet_size);
+        self.stats.receive_buffer_bytes = receive_buffer.map(|bytes| bytes as u64);
+        self.stats.notes = warnings.clone();
+        let packet_change = if negotiated.is_some() {
+            format!(
+                "Stream packet size: {packet_size} bytes, verified with three consecutive test packets"
+            )
+        } else {
+            format!("Stream packet size: {packet_size} bytes (conservative default)")
+        };
+        let mut changes = vec![packet_change];
+        if let Some(bytes) = receive_buffer {
+            changes.push(format!("Receive buffer: {bytes} bytes; this buffer policy will also be applied when acquisition resumes"));
+        }
+        Ok(crate::network::NetworkTuning {
+            packet_size: Some(packet_size),
+            throughput_limit_bps: None,
+            changes,
+            warnings,
+        })
     }
     fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
         self.heartbeat.check()?;
@@ -908,22 +1059,19 @@ fn receive_buffer_note(bytes: usize, payload: usize) -> Option<String> {
     })
 }
 fn host_mtu(host: Ipv4Addr) -> Option<u32> {
-    if !cfg!(target_os = "linux") {
-        return None;
-    }
-    let interface = if_addrs::get_if_addrs()
+    crate::network::interfaces()
         .ok()?
         .into_iter()
-        .find(|interface| interface.ip() == IpAddr::V4(host))?;
-    std::fs::read_to_string(format!("/sys/class/net/{}/mtu", interface.name))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+        .find(|interface| interface.address == host)
+        .and_then(|interface| interface.mtu)
 }
 fn drain(socket: &UdpSocket, buffer: &mut [u8]) {
     if socket.set_nonblocking(true).is_ok() {
-        while socket.recv(buffer).is_ok() {}
+        for _ in 0..256 {
+            if socket.recv(buffer).is_err() {
+                break;
+            }
+        }
         let _ = socket.set_nonblocking(false);
     }
 }
@@ -935,31 +1083,42 @@ fn probe_packet_size(
     original: u32,
     size: u32,
 ) -> Option<u32> {
-    drain(socket, buffer);
+    let control_peer = control.socket.peer_addr().ok()?;
     let mut readback = None;
     for _ in 0..3 {
+        drain(socket, buffer);
         let value = (original & SCPS_BIG_ENDIAN) | SCPS_FIRE | SCPS_NO_FRAGMENT | size;
         control.write_register(STREAM_PACKET_SIZE, value).ok()?;
-        let tested = match readback {
-            Some(tested) => tested,
-            None => *readback.insert(control.read_register(STREAM_PACKET_SIZE).ok()? & 0xffff),
-        };
+        let tested = control.read_register(STREAM_PACKET_SIZE).ok()? & 0xffff;
+        if !(576..=size).contains(&tested) || readback.is_some_and(|previous| previous != tested) {
+            return None;
+        }
+        readback = Some(tested);
         let deadline = Instant::now() + TEST_WAIT;
+        let mut received = false;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() || socket.set_read_timeout(Some(remaining)).is_err() {
                 break;
             }
             match socket.recv_from(buffer) {
-                Ok((length, source)) if source.ip() == camera && length + 28 == tested as usize => {
-                    return Some(tested);
+                Ok((length, source))
+                    if source.ip() == camera
+                        && source != control_peer
+                        && length + 28 == tested as usize =>
+                {
+                    received = true;
+                    break;
                 }
                 Err(error) if is_receive_timeout(&error) => break,
                 _ => {}
             }
         }
+        if !received {
+            return None;
+        }
     }
-    None
+    readback
 }
 fn ladder(mut test: impl FnMut(u32) -> Option<u32>, cap: u32, mtu_known: bool) -> Option<u32> {
     if cap > 1500
@@ -1724,6 +1883,10 @@ mod tests {
         stale: bool,
         clamp: Option<u32>,
         reject_above: Option<u32>,
+        test_packet_budget: Option<usize>,
+        rejected_packet_sizes: Vec<u32>,
+        register_reads: Vec<u32>,
+        register_writes: Vec<(u32, u32)>,
         resend_status: u16,
         frames: HashMap<u64, Vec<Vec<u8>>>,
         requests: Vec<(Vec<u8>, u16)>,
@@ -1740,6 +1903,7 @@ mod tests {
             )
         }
         fn write(&mut self, address: u32, value: u32, stream: &UdpSocket) -> u16 {
+            self.register_writes.push((address, value));
             if address != STREAM_PACKET_SIZE {
                 self.registers.insert(address, value);
                 return 0;
@@ -1748,13 +1912,18 @@ mod tests {
             if self
                 .reject_above
                 .is_some_and(|limit| value & 0xffff > limit)
+                || self.rejected_packet_sizes.contains(&(value & 0xffff))
             {
                 return 0x8002;
             }
             let size = self
                 .clamp
                 .map_or(value & 0xffff, |clamp| clamp.min(value & 0xffff));
-            if value & SCPS_FIRE != 0 && self.test_packets {
+            let can_test = self.test_packet_budget.is_none_or(|left| left > 0);
+            if value & SCPS_FIRE != 0 && self.test_packets && can_test {
+                if let Some(left) = &mut self.test_packet_budget {
+                    *left -= 1;
+                }
                 let stale = vec![0; size as usize - 29];
                 let fired = vec![0; size as usize - 28];
                 for (packet, send) in [
@@ -1837,6 +2006,7 @@ mod tests {
                         READ_REGISTER => {
                             let addresses: Vec<u32> =
                                 packet[8..].chunks(4).map(|a| be32(a, 0)).collect();
+                            camera.register_reads.extend(&addresses);
                             if addresses.iter().any(|a| camera.unreadable.contains(a)) {
                                 ack(command + 1, id, 0x8003, &[])
                             } else {
@@ -2525,6 +2695,120 @@ mod tests {
         assert!(negotiate(stale, 1500, true).is_some_and(|size| (1350..=1400).contains(&size)));
     }
     #[test]
+    fn network_probe_requires_three_read_only_unicast_responses() {
+        let fake = Fake::new(|_| {});
+        assert_eq!(
+            probe_network_at(fake.address, Duration::from_millis(100)).unwrap(),
+            Ipv4Addr::LOCALHOST
+        );
+        let camera = fake.camera.lock().unwrap();
+        assert_eq!(camera.register_reads, [GVCP_CAPABILITY; 3]);
+        assert!(
+            camera.register_writes.is_empty(),
+            "a scan must not acquire camera control"
+        );
+    }
+    #[test]
+    fn network_probe_rejects_unreadable_and_silent_cameras_within_deadline() {
+        let fake = Fake::new(|camera| camera.unreadable.push(GVCP_CAPABILITY));
+        assert!(probe_network_at(fake.address, Duration::from_millis(100)).is_err());
+        assert!(fake.camera.lock().unwrap().register_writes.is_empty());
+        let silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let SocketAddr::V4(address) = silent.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let started = Instant::now();
+        assert!(probe_network_at(address, Duration::from_millis(40)).is_err());
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+    #[test]
+    fn one_test_packet_never_proves_a_reliable_stream_path() {
+        assert_eq!(
+            negotiate(
+                |camera| {
+                    camera.path_mtu = 9000;
+                    camera.test_packet_budget = Some(1);
+                },
+                9000,
+                false
+            ),
+            None
+        );
+    }
+    #[test]
+    fn network_optimization_retests_negative_cache_and_restores_destination() {
+        let saved_address = u32::from(Ipv4Addr::new(192, 0, 2, 44));
+        let flags = SCPS_NO_FRAGMENT | SCPS_BIG_ENDIAN;
+        let fake = Fake::new(|camera| {
+            camera.path_mtu = 1500;
+            camera.test_packets = true;
+            camera.registers.insert(STREAM_ADDRESS, saved_address);
+            camera.registers.insert(STREAM_PORT, 7123);
+            camera.registers.insert(STREAM_PACKET_SIZE, flags | 576);
+        });
+        let mut gige = connect(fake.address, Duration::from_millis(200)).unwrap();
+        gige.packet_size = Some(None);
+        let tuning = gige.optimize_network(8000).unwrap();
+        assert_eq!(tuning.packet_size, Some(1500));
+        assert_eq!(gige.packet_size, Some(Some(1500)));
+        assert!(
+            tuning
+                .changes
+                .iter()
+                .any(|change| change.contains("three consecutive"))
+        );
+        assert_eq!(fake.register(STREAM_ADDRESS), saved_address);
+        assert_eq!(fake.register(STREAM_PORT), 7123);
+        assert_eq!(fake.register(STREAM_PACKET_SIZE), flags | 1500);
+        assert!(gige.stream.is_none());
+    }
+    #[test]
+    fn failed_network_tests_apply_conservative_settings_without_claiming_verification() {
+        let fake = Fake::new(|camera| {
+            camera.path_mtu = 9000;
+            camera.test_packets = true;
+            camera.test_packet_budget = Some(1);
+            camera
+                .registers
+                .insert(STREAM_ADDRESS, u32::from(Ipv4Addr::LOCALHOST));
+            camera.registers.insert(STREAM_PORT, 8123);
+            camera.registers.insert(STREAM_PACKET_SIZE, 9000);
+        });
+        let mut gige = connect(fake.address, Duration::from_millis(200)).unwrap();
+        let tuning = gige.optimize_network(8000).unwrap();
+        assert_eq!(tuning.packet_size, Some(1500));
+        assert_eq!(fake.register(STREAM_PACKET_SIZE), 1500);
+        assert_eq!(fake.register(STREAM_PORT), 8123);
+        assert!(
+            tuning
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unverified"))
+        );
+        assert_eq!(gige.packet_size, Some(None));
+    }
+    #[test]
+    fn rejected_network_settings_restore_packet_size_and_destination() {
+        let flags = SCPS_NO_FRAGMENT | SCPS_BIG_ENDIAN;
+        let fake = Fake::new(|camera| {
+            camera.rejected_packet_sizes = vec![1500, 576];
+            camera
+                .registers
+                .insert(STREAM_ADDRESS, u32::from(Ipv4Addr::LOCALHOST));
+            camera.registers.insert(STREAM_PORT, 8123);
+            camera.registers.insert(STREAM_PACKET_SIZE, flags | 1400);
+        });
+        let mut gige = connect(fake.address, Duration::from_millis(200)).unwrap();
+        assert!(gige.optimize_network(8000).is_err());
+        assert_eq!(
+            fake.register(STREAM_ADDRESS),
+            u32::from(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(fake.register(STREAM_PORT), 8123);
+        assert_eq!(fake.register(STREAM_PACKET_SIZE), flags | 1400);
+        assert_eq!(gige.packet_size, None);
+    }
+    #[test]
     fn start_keeps_flags_drains_test_packets_and_caches_the_size() {
         let flags = SCPS_NO_FRAGMENT | SCPS_BIG_ENDIAN;
         let fake = Fake::new(|camera| {
@@ -2539,7 +2823,12 @@ mod tests {
         gige.start(8000).unwrap();
         assert_eq!(
             fake.camera.lock().unwrap().scps_writes,
-            [SCPS_FIRE | flags | 9000, flags | 9000]
+            [
+                SCPS_FIRE | flags | 9000,
+                SCPS_FIRE | flags | 9000,
+                SCPS_FIRE | flags | 9000,
+                flags | 9000
+            ]
         );
         let socket = &gige.stream.as_ref().unwrap().socket;
         socket.set_nonblocking(true).unwrap();
@@ -2548,7 +2837,7 @@ mod tests {
         assert_eq!(gige.stats().unwrap().packet_size, Some(9000));
         gige.stop().unwrap();
         gige.start(8000).unwrap();
-        assert_eq!(fake.camera.lock().unwrap().scps_writes.len(), 4);
+        assert_eq!(fake.camera.lock().unwrap().scps_writes.len(), 8);
     }
     #[test]
     fn start_without_test_packets_keeps_1500_and_notes_the_firewall() {

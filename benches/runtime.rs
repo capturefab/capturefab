@@ -1,5 +1,11 @@
+#[cfg(any(
+    feature = "jpeg",
+    feature = "nvjpeg",
+    all(feature = "videotoolbox", target_os = "macos")
+))]
+use capturefab::jpeg;
 use capturefab::{
-    frame, jpeg,
+    frame,
     shared_memory::SharedRing,
     storage::{self, StoragePolicy},
     types::{Frame, MONO8, RGB8},
@@ -282,6 +288,11 @@ fn main() {
     // JPEG stills: libjpeg-turbo in process, Apple's JPEG engine, and nvJPEG
     // through its helper once warm (set CAPTUREFAB_EXECUTABLE to the
     // capturefab binary).
+    #[cfg(any(
+        feature = "jpeg",
+        feature = "nvjpeg",
+        all(feature = "videotoolbox", target_os = "macos")
+    ))]
     for (name, format) in [("Mono8", MONO8), ("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
         let f = frame(1920, 1200, format);
         #[cfg(feature = "jpeg")]

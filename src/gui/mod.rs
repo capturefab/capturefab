@@ -1,9 +1,11 @@
 //! The native workbench. Camera I/O lives on the session worker, never the UI thread.
 mod accessibility;
+mod analytics;
 mod brand;
 mod button;
 mod camera_history;
 mod camera_view;
+mod client_activity;
 mod close_error;
 mod destinations;
 mod format;
@@ -19,6 +21,7 @@ mod liveness;
 mod local_history;
 mod menus;
 mod motion;
+mod network;
 mod notice;
 mod oneline;
 mod pick_list;
@@ -44,7 +47,7 @@ use crate::{
     camera_profile::CameraKind,
     frame,
     genicam::FeatureInfo,
-    session::{SessionCommand, SessionHandle, SessionSnapshot},
+    session::{ActivityOrigin, SessionActor, SessionCommand, SessionHandle, SessionSnapshot},
     storage::StoragePolicy,
     types::{CameraInfo, MONO8, RGB8, TransportStats},
 };
@@ -191,6 +194,7 @@ pub fn run_capture(
         );
         app.main_window = main_window;
         app.focused_window = main_window;
+        app.key_window = Some(main_window);
         app.width = window_size.width / app.ui_scale.factor();
         app.height = window_size.height / app.ui_scale.factor();
         if let Some(path) = &screenshot {
@@ -259,7 +263,7 @@ pub fn run_capture(
             }
         })
         .subscription(Workbench::subscription)
-        .theme(|app: &Workbench, _| app.theme())
+        .theme(Workbench::window_theme)
         .scale_factor(|app: &Workbench, _| app.ui_scale.factor())
         .default_font(style::SANS)
         .font(icon::REGULAR_BYTES)
@@ -308,6 +312,34 @@ fn watch_frames(watch: &FrameWatch) -> impl iced::futures::Stream<Item = Message
                 if sequence != seen && output.try_send(Message::FrameArrived).is_ok() {
                     seen = sequence;
                     std::thread::sleep(gap.saturating_sub(poll));
+                }
+            }
+        });
+        std::future::pending::<()>().await;
+    })
+}
+
+/// Session activity has its own condition variable, so even an idle window
+/// sees another participant's action as soon as it is queued or completed.
+struct ActivityWatch(SessionHandle);
+
+impl std::hash::Hash for ActivityWatch {
+    fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {}
+}
+
+fn watch_activity(watch: &ActivityWatch) -> impl iced::futures::Stream<Item = Message> + use<> {
+    let handle = watch.0.clone();
+    iced::stream::channel(0, async move |mut output| {
+        std::thread::spawn(move || {
+            let mut seen = 0;
+            while !output.is_closed() {
+                let revision = handle.wait_for_activity(seen, Duration::from_secs(1));
+                if revision > seen {
+                    if output.try_send(Message::Tick).is_ok() {
+                        seen = revision;
+                    } else {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
                 }
             }
         });
@@ -364,6 +396,7 @@ impl Pending {
     fn label(&self) -> String {
         let label = match &self.job {
             Job::Discover => "Looking for cameras",
+            Job::NetworkScan => "Scanning network and tuning cameras",
             Job::Connect => "Connecting camera",
             Job::Disconnect => "Disconnecting",
             Job::Select => "Selecting camera",
@@ -396,6 +429,7 @@ impl Pending {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Job {
     Discover,
+    NetworkScan,
     Connect,
     Disconnect,
     Select,
@@ -544,6 +578,7 @@ enum Message {
     Menu(menus::Command),
     DesktopMenu(menus::DesktopInput),
     EditorFocused(bool),
+    ContentFocused(keyboard_history::Area),
     PopupOpen(bool),
     Settings(bool),
     Appearance(Appearance),
@@ -569,6 +604,11 @@ enum Message {
     Help(bool),
     DragWindow,
     Discover,
+    ScanNetwork,
+    NetworkReport(bool),
+    NetworkScrolled(bool),
+    Analytics(bool),
+    AnalyticsScrolled(bool),
     IncludeSimulator(bool),
     TrySimulator,
     EnterAddress,
@@ -665,7 +705,13 @@ enum CloseTarget {
 
 struct Workbench {
     main_window: window::Id,
+    /// Last window used for commands; retained when the app loses focus.
     focused_window: window::Id,
+    /// Native windows retain their editors while another window is key.
+    window_editor_focus: HashMap<window::Id, bool>,
+    /// The window currently receiving keyboard input, if the app is active.
+    key_window: Option<window::Id>,
+    content_focus: keyboard_history::Area,
     settings_window: Option<window::Id>,
     accessibility: accessibility::Bridge,
     window_scales: HashMap<window::Id, f32>,
@@ -678,7 +724,12 @@ struct Workbench {
     camera_history_state: camera_history::State,
     handle: SessionHandle,
     session: String,
+    actor: SessionActor,
     snapshot: SessionSnapshot,
+    /// This window's camera focus. Other clients may select a different
+    /// camera in the shared session without moving these editors or preview.
+    local_camera: Option<String>,
+    client_activity: client_activity::State,
     observed_camera: Option<String>,
     include_simulator: bool,
     address: String,
@@ -723,6 +774,10 @@ struct Workbench {
     screenshot: Option<ScreenshotRequest>,
     logs_open: bool,
     help_open: bool,
+    network_open: bool,
+    network_error: Option<String>,
+    network_scrolled: bool,
+    analytics: analytics::State,
     settings_open: bool,
     menu_editor: bool,
     popup_open: bool,
@@ -827,9 +882,13 @@ impl Workbench {
         motion::refresh_accessibility();
         let shown = |open: bool| if open { 1.0 } else { 0.0 };
         let main_window = window::Id::unique();
+        let client_activity = client_activity::State::from_snapshot(&handle.snapshot());
         Self {
             main_window,
             focused_window: main_window,
+            window_editor_focus: HashMap::new(),
+            key_window: Some(main_window),
+            content_focus: keyboard_history::Area::Image,
             settings_window: None,
             accessibility: Default::default(),
             window_scales: HashMap::new(),
@@ -842,7 +901,10 @@ impl Workbench {
             camera_history_state: Default::default(),
             handle,
             session,
+            actor: SessionActor::process(ActivityOrigin::Gui),
             snapshot: SessionSnapshot::default(),
+            local_camera: None,
+            client_activity,
             observed_camera: None,
             include_simulator: simulated || prefs.include_simulator,
             address: String::new(),
@@ -892,6 +954,10 @@ impl Workbench {
             screenshot: None,
             logs_open: prefs.logs_open,
             help_open: false,
+            network_open: false,
+            network_error: None,
+            network_scrolled: false,
+            analytics: Default::default(),
             settings_open: false,
             menu_editor: false,
             popup_open: false,
@@ -1081,8 +1147,20 @@ impl Workbench {
         }
     }
 
-    fn theme(&self) -> Theme {
-        style::theme(self.dark())
+    fn window_palette(&self, id: window::Id) -> &'static Palette {
+        Palette::for_window(self.dark(), self.key_window == Some(id))
+    }
+
+    fn window_theme(&self, id: window::Id) -> Theme {
+        style::window_theme(self.dark(), self.key_window == Some(id))
+    }
+
+    fn selection_emphasized(&self, area: keyboard_history::Area) -> bool {
+        self.key_window == Some(self.main_window)
+            && !self.sheet_open()
+            && self.close_error.is_none()
+            && self.closing.is_none()
+            && self.content_focus == area
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -1090,6 +1168,11 @@ impl Workbench {
         // Pending commands (connecting, discovering) tick fast enough to
         // step spinners and pulses without per-frame redraws.
         let busy = !self.pending.is_empty()
+            || self
+                .snapshot
+                .activity
+                .iter()
+                .any(|entry| entry.state.active())
             || self.screenshot.is_some()
             || self.capture_to.busy()
             || self.record_to.busy();
@@ -1118,6 +1201,7 @@ impl Workbench {
             Subscription::none()
         };
         Subscription::batch([
+            Subscription::run_with(ActivityWatch(self.handle.clone()), watch_activity),
             frames,
             arrivals,
             time::every(interval).map(|_| Message::Tick),
@@ -1243,6 +1327,7 @@ impl Workbench {
                 None,
                 SessionCommand::Connect { .. }
                 | SessionCommand::Discover { .. }
+                | SessionCommand::NetworkScan { .. }
                 | SessionCommand::Status,
             ) => None,
             (None, SessionCommand::Select { camera }) => Some(camera.clone()),
@@ -1252,10 +1337,32 @@ impl Workbench {
             SessionCommand::Set { value, .. } => Some(value.clone()),
             _ => None,
         };
-        let receiver = match camera {
-            Some(camera) => self.handle.submit_to(camera, command),
-            None => self.handle.submit(command),
+        // Pin every camera operation at submission. An external selection
+        // between rendering and execution must never redirect a human edit.
+        let target = match &command {
+            SessionCommand::Connect { .. }
+            | SessionCommand::Select { .. }
+            | SessionCommand::Discover { .. }
+            | SessionCommand::NetworkScan { .. }
+            | SessionCommand::Status => None,
+            _ => acts_on.as_deref(),
+        };
+        let selected = match &command {
+            SessionCommand::Select { camera } => Some(camera.clone()),
+            _ => None,
+        };
+        let receiver = match target {
+            Some(camera) => {
+                self.handle
+                    .submit_to_as(camera, command, ActivityOrigin::Gui, self.actor.clone())
+            }
+            None => self
+                .handle
+                .submit_as(command, ActivityOrigin::Gui, self.actor.clone()),
         }?;
+        if let Some(camera) = selected {
+            self.local_camera = Some(camera);
+        }
         self.give_way();
         self.pending.push(Pending {
             receiver,
@@ -1270,6 +1377,7 @@ impl Workbench {
     /// Whether a command doing `job` is on its way, to any camera.
     fn pending(&self, job: Job) -> bool {
         self.pending.iter().any(|p| p.job == job)
+            || job != Job::Capture && self.client_pending(&job, None)
     }
 
     /// Whether a command doing `job` is on its way to `camera`.
@@ -1277,6 +1385,14 @@ impl Workbench {
         self.pending
             .iter()
             .any(|p| p.job == job && p.camera.as_deref() == Some(camera))
+            || job != Job::Capture && self.client_pending(&job, Some(camera))
+    }
+
+    fn capturing_here(&self) -> bool {
+        self.pending.iter().any(|pending| {
+            pending.job == Job::Capture
+                && (pending.camera.is_none() || pending.camera == self.snapshot.active_camera)
+        })
     }
 
     /// While a start or stop is on its way to `camera`, alone or as part of
@@ -1291,15 +1407,35 @@ impl Workbench {
             })
             .max_by_key(|p| p.at)
             .map(|p| p.job == Job::Stop)
+            .or_else(|| {
+                if self.client_pending(&Job::Stop, Some(camera)) {
+                    Some(true)
+                } else if self.client_pending(&Job::Start, Some(camera)) {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
     }
 
     /// While a forward or recording starts or stops, whether it stops.
     fn forward_pending(&self) -> Option<bool> {
-        self.pending.iter().find_map(|p| match p.job {
-            Job::Forward { .. } => Some(false),
-            Job::StopForward { .. } => Some(true),
-            _ => None,
-        })
+        self.pending
+            .iter()
+            .find_map(|p| match p.job {
+                Job::Forward { .. } => Some(false),
+                Job::StopForward { .. } => Some(true),
+                _ => None,
+            })
+            .or_else(|| {
+                if self.client_pending(&Job::StopForward { recording: false }, None) {
+                    Some(true)
+                } else if self.client_pending(&Job::Forward { recording: false }, None) {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
     }
 
     /// `command` in a code block whose copy button confirms in place.
@@ -1312,6 +1448,8 @@ impl Workbench {
     /// overview's Auto all.
     fn auto_busy(&self) -> bool {
         self.pending.iter().any(|p| p.job.is_auto())
+            || self.client_pending(&Job::AutoOn, None)
+            || self.client_pending(&Job::AutoOff, None)
     }
 
     /// Whether auto mode is being switched or tuned on the selected camera,
@@ -1320,10 +1458,12 @@ impl Workbench {
     fn auto_busy_here(&self) -> bool {
         let camera = self.snapshot.active_camera.as_deref();
         camera.is_some()
-            && self
+            && (self
                 .pending
                 .iter()
                 .any(|p| p.job.is_auto() && p.camera.as_deref() == camera)
+                || self.client_pending(&Job::AutoOn, camera)
+                || self.client_pending(&Job::AutoOff, camera))
     }
 
     fn title(&self) -> String {
@@ -1429,6 +1569,12 @@ impl Workbench {
                 .filter_map(|warning| warning.as_str().map(str::to_owned))
                 .collect();
         }
+        if pending.job == Job::NetworkScan {
+            self.network_error = None;
+            if let Ok(report) = serde_json::from_value(result["network_scan"].clone()) {
+                self.snapshot.network_scan = Some(report);
+            }
+        }
         if let Some(feature) = pending.job.feature()
             && self.settles_row(pending)
         {
@@ -1444,6 +1590,7 @@ impl Workbench {
         let Ok(camera) = serde_json::from_value::<CameraInfo>(result["connected"].clone()) else {
             return;
         };
+        self.local_camera = Some(camera.id.clone());
         let detail = match &camera.address {
             Some(address) => format!("{} · {}", camera.transport, redact_address(address)),
             None => format!("{} · S/N {}", camera.transport, camera.serial),
@@ -1468,6 +1615,9 @@ impl Workbench {
         if pending.job == Job::Discover {
             self.side.discovery_issues = vec![full.clone()];
         }
+        if pending.job == Job::NetworkScan {
+            self.network_error = Some(full.clone());
+        }
         if let Some(feature) = pending.job.feature()
             && self.settles_row(pending)
         {
@@ -1491,70 +1641,21 @@ impl Workbench {
         self.poll_accessibility();
         let selected = self.snapshot.active_camera.clone();
         self.snapshot = self.handle.snapshot();
+        self.project_local_camera();
         self.scene.patch(&mut self.snapshot);
         self.sync_camera_history();
         if self.snapshot.active_camera != selected {
             self.ring_from = selected;
             self.ring.replay(0.0, 1.0, self.now);
         }
-        let camera_id = self
-            .snapshot
-            .connected
-            .as_ref()
-            .map(|camera| camera.id.clone());
-        if camera_id != self.observed_camera {
-            if let Some(previous) = &self.observed_camera {
-                self.camera_views
-                    .entry(previous.clone())
-                    .or_default()
-                    .focus_open = Some(self.focus.open);
-                self.camera_drafts.insert(
-                    previous.clone(),
-                    (self.edits.clone(), self.edit_sources.clone()),
-                );
-            }
-            self.observed_camera = camera_id;
-            let (edits, sources) = self
-                .observed_camera
-                .as_ref()
-                .and_then(|id| self.camera_drafts.remove(id))
-                .unwrap_or_default();
-            self.edits = edits;
-            self.edit_sources = sources;
-            self.inspect.write_errors.clear();
-            self.frame_id = None;
-            self.shown = None;
-            self.frame_meta = None;
-            self.display_error = None;
-            self.exposure = None;
-            self.focus.reset();
-            let kind = self.camera_kind();
-            if let Some(id) = &self.observed_camera {
-                let state = self.camera_views.entry(id.clone()).or_default();
-                self.focus.open = state
-                    .focus_open
-                    .unwrap_or(kind == CameraKind::Microscope || self.focus.open);
-                state.focus_open = Some(self.focus.open);
-            }
-            self.gpu.retire(MAIN_VIEW);
-        }
-        // Keep untouched editors in sync with CLI/agent changes without destroying drafts.
-        for feature in &self.snapshot.features {
-            let current = feature_value(feature);
-            if let Some(source) = self.edit_sources.get(&feature.name)
-                && source != &current
-                && self.edits.get(&feature.name) == Some(source)
-            {
-                self.edits.insert(feature.name.clone(), current.clone());
-            }
-            self.edit_sources.insert(feature.name.clone(), current);
-        }
+        self.sync_shared_editors();
         if let Some(status) = &self.snapshot.auto
             && !self.balance_dragging
             && !self.auto_busy_here()
         {
             self.balance = status.balance;
         }
+        self.sync_client_activity();
         self.sample_throughput();
         self.observe_liveness();
         self.update_frames();
@@ -1572,6 +1673,7 @@ impl Workbench {
         self.tick_side();
         self.tick_stage();
         self.tick_inspector();
+        self.tick_analytics();
         self.save_prefs();
         Task::batch([
             pages,
@@ -1677,7 +1779,7 @@ impl Workbench {
     }
 
     fn update_frame(&mut self, arrival: bool) {
-        let Some(frame) = self.handle.latest_frame() else {
+        let Some(frame) = self.selected_frame() else {
             return;
         };
         if Some(frame.id) == self.frame_id {
@@ -1746,7 +1848,7 @@ impl Workbench {
     /// Measure the latest frame again after a scope changes, so a stopped
     /// stream still shows current values.
     fn remeasure(&mut self) {
-        if let Some(frame) = self.handle.latest_frame() {
+        if let Some(frame) = self.selected_frame() {
             self.measure(&frame);
         }
     }
@@ -1841,7 +1943,7 @@ impl Workbench {
     }
 
     fn capture(&mut self) {
-        if self.pending(Job::Capture) {
+        if self.capturing_here() {
             return;
         }
         self.send(Job::Capture, self.capture_command(false));
@@ -1959,7 +2061,7 @@ impl Workbench {
         }
         self.exposure_open = !self.exposure_open;
         if self.exposure_open
-            && let Some(frame) = self.handle.latest_frame()
+            && let Some(frame) = self.selected_frame()
         {
             self.exposure = frame::exposure(&frame).ok();
         }
@@ -1972,7 +2074,7 @@ impl Workbench {
         self.focus.open = !self.focus.open;
         self.focus.reset();
         if self.focus.open
-            && let Some(frame) = self.handle.latest_frame()
+            && let Some(frame) = self.selected_frame()
             && let Ok(score) =
                 frame::sharpness(&frame, self.focus.pixels(frame.width, frame.height))
         {
@@ -2116,10 +2218,19 @@ impl Workbench {
         }
         let message = match message {
             Message::InWindow(id, message) => {
+                if let Message::EditorFocused(value) = *message {
+                    if id != self.main_window && self.settings_window != Some(id) {
+                        return Task::none();
+                    }
+                    self.window_editor_focus.insert(id, value);
+                }
                 match *message {
                     Message::EditorFocused(_) | Message::PopupOpen(_)
                         if id != self.focused_window =>
                     {
+                        return Task::none();
+                    }
+                    Message::ContentFocused(_) if id != self.main_window => {
                         return Task::none();
                     }
                     Message::Resized(_) if id != self.main_window => {
@@ -2243,11 +2354,15 @@ impl Workbench {
                     return window::gain_focus(error.window);
                 }
                 self.focused_window = id;
-                self.menu_editor = false;
+                self.key_window = Some(id);
+                self.menu_editor = self.window_editor_focus.get(&id).copied().unwrap_or(false);
                 self.popup_open = false;
                 return self.accessibility.focused(id, true).discard();
             }
             Message::WindowUnfocused(id) => {
+                if self.key_window == Some(id) {
+                    self.key_window = None;
+                }
                 self.desktop_menu = Default::default();
                 return self.accessibility.focused(id, false).discard();
             }
@@ -2256,6 +2371,9 @@ impl Workbench {
             }
             Message::CloseRequested(id) if self.settings_window == Some(id) => {
                 return self.handle_message(Message::Settings(false));
+            }
+            Message::CloseRequested(id) if id == self.main_window && self.sheet_open() => {
+                return self.dispatch_action(Action::Overview);
             }
             Message::CloseRequested(id) => return self.close(CloseTarget::Window(id)),
             Message::Quit => return self.close(CloseTarget::Quit),
@@ -2299,7 +2417,11 @@ impl Workbench {
             Message::Menu(command) => return self.menu_command(command),
             Message::StoragePolicy(reply) => self.storage_status.update(reply, self.now),
             Message::DesktopMenu(input) => return self.desktop_menu_input(input),
-            Message::EditorFocused(value) => self.menu_editor = value,
+            Message::EditorFocused(value) => {
+                self.window_editor_focus.insert(self.focused_window, value);
+                self.menu_editor = value;
+            }
+            Message::ContentFocused(area) => self.content_focus = area,
             Message::PopupOpen(value) => self.popup_open = value,
             Message::Settings(open) => {
                 #[cfg(target_os = "macos")]
@@ -2308,7 +2430,16 @@ impl Workbench {
                         self.settings_open = false;
                         self.accessibility.invalidate(self.main_window);
                         if let Some(id) = self.settings_window.take() {
+                            self.window_editor_focus.remove(&id);
+                            if self.key_window == Some(id) {
+                                self.key_window = None;
+                            }
                             self.focused_window = self.main_window;
+                            self.menu_editor = self
+                                .window_editor_focus
+                                .get(&self.main_window)
+                                .copied()
+                                .unwrap_or(false);
                             self.window_scales.remove(&id);
                             return self
                                 .accessibility
@@ -2327,6 +2458,8 @@ impl Workbench {
                         self.settings_window = Some(id);
                         self.settings_open = true;
                         self.focused_window = id;
+                        self.menu_editor =
+                            self.window_editor_focus.get(&id).copied().unwrap_or(false);
                         self.accessibility.invalidate(self.main_window);
                         return opened.map(Message::WindowOpened);
                     }
@@ -2411,13 +2544,15 @@ impl Workbench {
                         within(scope_id, focusable::focus_next())
                     }
                 };
-                return step().chain(within(scope_id, focusable::count()).then(move |count| {
-                    if count.focused.is_none() && count.total > 0 {
-                        step()
-                    } else {
-                        Task::none()
-                    }
-                }));
+                return step()
+                    .chain(within(scope_id, focusable::count()).then(move |count| {
+                        if count.focused.is_none() && count.total > 0 {
+                            step()
+                        } else {
+                            Task::none()
+                        }
+                    }))
+                    .chain(accessibility::reveal_focus(self.focused_window));
             }
             Message::Help(open) => {
                 self.show_help(open);
@@ -2439,6 +2574,11 @@ impl Workbench {
                 });
             }
             Message::Discover => self.discover(),
+            Message::ScanNetwork => return self.scan_network(),
+            Message::NetworkReport(open) => return self.show_network(open),
+            Message::NetworkScrolled(scrolled) => self.network_scrolled = scrolled,
+            Message::Analytics(open) => return self.show_analytics(open),
+            Message::AnalyticsScrolled(scrolled) => self.analytics.scrolled = scrolled,
             Message::IncludeSimulator(value) => {
                 self.include_simulator = value;
                 self.discover();
@@ -2567,14 +2707,7 @@ impl Workbench {
             }
             Message::CopyLog => {
                 self.note_copied(notice::COPIED_LOG);
-                return iced::clipboard::write(
-                    self.snapshot
-                        .logs
-                        .iter()
-                        .map(|l| format!("{} [{}] {}", l.time, l.level, l.message))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                );
+                return iced::clipboard::write(self.activity_text());
             }
             Message::CopySessionCommand => return self.copy_session_command(false),
             Message::Copy(value) => {
@@ -2758,7 +2891,7 @@ impl Workbench {
                 }
             }
             Message::CaptureCamera(id) => {
-                if !self.pending(Job::Capture) {
+                if !self.pending_for(Job::Capture, &id) {
                     self.send_to(
                         &id,
                         Job::Capture,
@@ -2833,6 +2966,8 @@ impl Workbench {
             Action::Undo => return self.replay_history(true),
             Action::Redo => return self.replay_history(false),
             Action::Overview if self.help_open => self.help_open = false,
+            Action::Overview if self.network_open => self.network_open = false,
+            Action::Overview if self.analytics.open => self.analytics.open = false,
             Action::Overview if self.settings_open && self.settings_window.is_none() => {
                 self.settings_open = false
             }
@@ -2912,7 +3047,7 @@ impl Workbench {
     fn window_view(&self, id: window::Id) -> Element<'_, Message> {
         let content = if self.settings_window == Some(id) {
             keyboard_history::guard(
-                container(self.settings_window(Palette::of(self.dark())))
+                container(self.settings_window(self.window_palette(id)))
                     .id("settings-root")
                     .into(),
                 if self.focused_window == id {
@@ -2944,8 +3079,7 @@ impl Workbench {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let dark = self.dark();
-        let p = Palette::of(dark);
+        let p = self.window_palette(self.main_window);
         // iced omits zero-width row children. Keep opening panes in the tree
         // immediately so focus commands reach them before animation advances.
         let sidebar = self.sidebar_slide.lerp(0.0, SIDEBAR, self.now).max(
@@ -3015,7 +3149,7 @@ impl Workbench {
             .push(shader(self.gpu.probe()).width(1).height(1))
             .into();
         let body = self.desktop_menus(body, p);
-        keyboard_history::guard(
+        keyboard_history::main_guard(
             self.sheets(body, p),
             if self.focused_window == self.main_window {
                 self.menu_edit
@@ -3023,6 +3157,7 @@ impl Workbench {
                 None
             },
             self.desktop_menu.active(),
+            self.sheet_open() || self.close_error.is_some() || self.closing.is_some(),
         )
     }
 
@@ -3050,7 +3185,10 @@ impl Workbench {
             self.single_view(p)
         };
         // Always a stack, so the hint coming and going keeps the views' state.
-        let content = stack![content, self.image_hint()];
+        let content = keyboard_history::content_scope(
+            stack![content, self.image_hint()].into(),
+            keyboard_history::Area::Image,
+        );
         let bars = self.bars.get(self.now);
         let mut main = column![content];
         let activity = self.activity_slide.lerp(0.0, 171.0, self.now) * bars;
@@ -3151,6 +3289,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn native_window_focus_preserves_command_context_and_ignores_late_unfocus() {
+        let mut app = Workbench::new(SessionHandle::new(), "test".into(), false, None);
+        let main = app.main_window;
+        let settings = window::Id::unique();
+        app.settings_window = Some(settings);
+        app.address = "unfinished camera draft".into();
+        let _ = app.handle_message(Message::WindowFocused(settings));
+        let _ = app.handle_message(Message::WindowUnfocused(main));
+        assert_eq!(app.key_window, Some(settings));
+        assert_eq!(app.focused_window, settings);
+        let _ = app.handle_message(Message::WindowUnfocused(settings));
+        assert_eq!(app.key_window, None);
+        assert_eq!(app.focused_window, settings);
+        let _ = app.handle_message(Message::WindowFocused(main));
+        let _ = app.handle_message(Message::WindowUnfocused(settings));
+        assert_eq!(app.key_window, Some(main));
+        assert_eq!(app.focused_window, main);
+        assert_eq!(app.address, "unfinished camera draft");
+    }
+
+    #[test]
+    fn native_close_dismisses_the_active_sheet_before_closing_the_workbench() {
+        for network in [false, true] {
+            let mut app = Workbench::new(SessionHandle::new(), "test".into(), false, None);
+            app.help_open = !network;
+            app.network_open = network;
+            app.address = "unfinished camera draft".into();
+            let _ = app.update(Message::CloseRequested(app.main_window));
+            assert!(!app.sheet_open());
+            assert!(app.closing.is_none());
+            assert_eq!(app.address, "unfinished camera draft");
+            let _ = app.update(Message::CloseRequested(app.main_window));
+            assert!(matches!(app.closing, Some(CloseTarget::Window(id)) if id == app.main_window));
+        }
+    }
+
+    #[test]
+    fn native_close_returns_from_a_destination_draft_before_closing_its_manager() {
+        let mut app = Workbench::new(SessionHandle::new(), "test".into(), false, None);
+        let output = app.output.clone();
+        app.capture_to.manager_open = true;
+        app.capture_to
+            .update(destinations::Message::AddBucket, &mut app.output);
+        app.capture_to.update(
+            destinations::Message::Name("unfinished destination".into()),
+            &mut app.output,
+        );
+        assert!(app.capture_to.editing());
+        let _ = app.update(Message::CloseRequested(app.main_window));
+        assert!(!app.capture_to.editing());
+        assert!(app.capture_to.manager_open);
+        assert!(app.closing.is_none());
+        assert_eq!(app.output, output);
+        let _ = app.update(Message::CloseRequested(app.main_window));
+        assert!(!app.capture_to.manager_open);
+        assert!(app.closing.is_none());
+        assert_eq!(app.output, output);
     }
 
     #[test]
