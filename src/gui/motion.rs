@@ -10,6 +10,8 @@
 //! Motion keeps fades and snaps movement.
 use super::*;
 use iced::animation::Easing;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use iced::futures::StreamExt;
 use std::{borrow::Borrow, hash::Hash, sync::atomic::AtomicBool};
 
 pub(super) const PANEL: Duration = Duration::from_millis(200);
@@ -47,11 +49,13 @@ const ACCESSIBILITY_POLL: Duration = Duration::from_secs(2);
 /// Below this window width the inspector floats over the stage instead of docking.
 pub(super) const NARROW: f32 = 1100.0;
 
-/// Reduce Motion and Reduce Transparency, read from the system; see `refresh_accessibility`.
+/// Native accessibility preferences; macOS polls and other desktops stream changes.
 static REDUCE_MOTION: AtomicBool = AtomicBool::new(false);
 static REDUCE_TRANSPARENCY: AtomicBool = AtomicBool::new(false);
+static INCREASE_CONTRAST: AtomicBool = AtomicBool::new(false);
+static ALWAYS_SHOW_SCROLLBARS: AtomicBool = AtomicBool::new(false);
 
-/// Read the system's Reduce Motion and Reduce Transparency settings again.
+/// Read macOS's accessibility and scrollbar settings again.
 /// Cheap; the workbench calls it at start and every couple of seconds, so
 /// changing a setting applies without a restart.
 pub(super) fn refresh_accessibility() {
@@ -66,6 +70,50 @@ pub(super) fn refresh_accessibility() {
             workspace.accessibilityDisplayShouldReduceTransparency(),
             Ordering::Relaxed,
         );
+        INCREASE_CONTRAST.store(
+            workspace.accessibilityDisplayShouldIncreaseContrast(),
+            Ordering::Relaxed,
+        );
+        if let Some(main_thread) = objc2::MainThreadMarker::new() {
+            ALWAYS_SHOW_SCROLLBARS.store(
+                objc2_app_kit::NSScroller::preferredScrollerStyle(main_thread)
+                    == objc2_app_kit::NSScrollerStyle::Legacy,
+                Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+/// Listen to native preference changes without synchronous portal/WinRT
+/// calls on the UI thread. The initial event also applies startup preferences.
+pub(super) fn accessibility_subscription() -> Subscription<Message> {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        Subscription::run(|| {
+            mundy::Preferences::stream(
+                mundy::Interest::Contrast
+                    | mundy::Interest::ReducedMotion
+                    | mundy::Interest::ReducedTransparency
+                    | mundy::Interest::ScrollbarVisibility,
+            )
+            .map(|preferences| {
+                REDUCE_MOTION.store(preferences.reduced_motion.is_reduce(), Ordering::Relaxed);
+                REDUCE_TRANSPARENCY.store(
+                    preferences.reduced_transparency.is_reduce(),
+                    Ordering::Relaxed,
+                );
+                INCREASE_CONTRAST.store(preferences.contrast.is_more(), Ordering::Relaxed);
+                ALWAYS_SHOW_SCROLLBARS.store(
+                    preferences.scrollbar_visibility.is_always(),
+                    Ordering::Relaxed,
+                );
+                Message::Tick
+            })
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        Subscription::none()
     }
 }
 
@@ -77,6 +125,14 @@ pub(super) fn reduce_motion() -> bool {
 /// Whether glass should be opaque; `style::overlay` reads it.
 pub(super) fn reduce_transparency() -> bool {
     REDUCE_TRANSPARENCY.load(Ordering::Relaxed)
+}
+
+pub(super) fn increase_contrast() -> bool {
+    INCREASE_CONTRAST.load(Ordering::Relaxed)
+}
+
+pub(super) fn always_show_scrollbars() -> bool {
+    ALWAYS_SHOW_SCROLLBARS.load(Ordering::Relaxed)
 }
 
 /// How far content still sits below its resting place as `shown` goes from
@@ -156,7 +212,15 @@ impl Motion {
 
     /// The value at `now`.
     pub(super) fn get(&self, now: Instant) -> f32 {
-        self.animation.interpolate_with(|value| value, now)
+        self.value(now, reduce_motion())
+    }
+
+    fn value(&self, now: Instant, reduced: bool) -> f32 {
+        if reduced && self.kind == Kind::Move {
+            self.target()
+        } else {
+            self.animation.interpolate_with(|value| value, now)
+        }
     }
 
     /// `a` at 0 to `b` at 1, at `now`.
@@ -170,7 +234,11 @@ impl Motion {
     }
 
     pub(super) fn animating(&self, now: Instant) -> bool {
-        self.animation.is_animating(now)
+        self.active(now, reduce_motion())
+    }
+
+    fn active(&self, now: Instant, reduced: bool) -> bool {
+        !(reduced && self.kind == Kind::Move) && self.animation.is_animating(now)
     }
 
     /// The longest any change can take.
@@ -353,7 +421,10 @@ impl Workbench {
     }
 
     pub(super) fn sheet_open(&self) -> bool {
-        self.help_open || self.capture_to.manager_open || self.record_to.manager_open
+        self.help_open
+            || (self.settings_open && self.settings_window.is_none())
+            || self.capture_to.manager_open
+            || self.record_to.manager_open
     }
 
     pub(super) fn sidebar_shown(&self) -> bool {
@@ -517,6 +588,28 @@ mod tests {
         let before = motion.get(turn + ms(10));
         motion.go(0.0, turn + ms(10));
         assert_eq!(motion.get(turn + ms(10)), before);
+    }
+
+    #[test]
+    fn enabling_reduce_motion_settles_movement_already_in_flight() {
+        let start = Instant::now();
+        for kind in [Kind::Move, Kind::Fade] {
+            let mut motion = Motion::new(0.0, ms(200), ms(100), kind);
+            motion.animation = Animation::new(0.0).duration(ms(200)).go(1.0, start);
+            let halfway = start + ms(100);
+            assert_eq!(motion.value(halfway, false), 0.5);
+            assert!(motion.active(halfway, false));
+            if kind == Kind::Move {
+                assert_eq!(motion.value(halfway, true), 1.0);
+                assert!(
+                    !motion.active(halfway, true),
+                    "no redraws for hidden movement"
+                );
+            } else {
+                assert_eq!(motion.value(halfway, true), 0.5);
+                assert!(motion.active(halfway, true), "the replacement fade remains");
+            }
+        }
     }
 
     #[test]

@@ -45,6 +45,10 @@ impl Workbench {
                         .color(p.secondary)
                         .wrapping(text::Wrapping::None),
                 ))
+                .name(format!(
+                    "Capture destination: {}",
+                    self.capture_to.label(&self.output)
+                ))
                 .padding([4, 6])
                 .style(style::plain)
                 .on_press(Message::ShowTab(Tab::Capture)),
@@ -61,6 +65,7 @@ impl Workbench {
             );
             tip_above(
                 button(text(action.label()).size(style::SMALL))
+                    .name(about.clone())
                     .padding([4, 6])
                     .style(style::plain)
                     .on_press_maybe(
@@ -178,6 +183,7 @@ impl Workbench {
                     .spacing(7)
                     .align_y(Alignment::Center),
             )
+            .name(label)
             .padding([6, 12])
             // Ignoring presses while saving would otherwise read as disabled.
             .style(move |theme, status| {
@@ -338,6 +344,7 @@ impl Workbench {
         if details {
             line = line.push(space().width(4)).push(
                 button(text("Details").size(style::SMALL))
+                    .name("Show activity details")
                     .padding([2, 6])
                     .style(faded(style::link, alpha))
                     .on_press(Message::ShowActivity),
@@ -346,13 +353,22 @@ impl Workbench {
         if dismiss {
             line = line.push(space().width(2)).push(tip_above(
                 button(icon(Icon::Close, 11.0, fade(p.secondary, alpha)))
+                    .name("Dismiss notification")
                     .padding(4)
                     .style(faded(style::plain, alpha))
                     .on_press(Message::DismissNotice),
                 "Dismiss",
             ));
         }
-        line.into()
+        accessibility::label(
+            line.into(),
+            notice.about(),
+            if level == Level::Done {
+                accessibility::Role::Status
+            } else {
+                accessibility::Role::Alert
+            },
+        )
     }
 
     pub(super) fn activity(&self, p: &'static Palette) -> Element<'_, Message> {
@@ -410,6 +426,7 @@ impl Workbench {
                             })
                             .size(style::SMALL)
                         )
+                        .name("Copy activity log")
                         .padding([3, 8])
                         .style(style::link)
                         .on_press(Message::CopyLog),

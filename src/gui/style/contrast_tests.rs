@@ -65,9 +65,9 @@ const BUTTON_STATES: [button::Status; 3] = [
 
 #[test]
 fn disabled_actions_keep_their_names_readable() {
-    for dark in [false, true] {
-        let theme = theme(dark);
-        let p = Palette::of(dark);
+    for (dark, increased) in [(false, false), (true, false), (false, true), (true, true)] {
+        let theme = theme_appearance(dark, increased);
+        let p = Palette::appearance(dark, increased);
         let status = button::Status::Disabled;
         for style in [
             primary(&theme, status),
@@ -105,9 +105,9 @@ fn disabled_actions_keep_their_names_readable() {
 
 #[test]
 fn enabled_input_styles_keep_labels_selection_and_boundaries_visible() {
-    for dark in [false, true] {
-        let theme = theme(dark);
-        let p = Palette::of(dark);
+    for (dark, increased) in [(false, false), (true, false), (false, true), (true, true)] {
+        let theme = theme_appearance(dark, increased);
+        let p = Palette::appearance(dark, increased);
         for status in [
             text_input::Status::Active,
             text_input::Status::Hovered,
@@ -151,9 +151,9 @@ fn enabled_input_styles_keep_labels_selection_and_boundaries_visible() {
 
 #[test]
 fn pick_list_and_menu_outputs_keep_choices_and_placeholders_readable() {
-    for dark in [false, true] {
-        let theme = theme(dark);
-        let p = Palette::of(dark);
+    for (dark, increased) in [(false, false), (true, false), (false, true), (true, true)] {
+        let theme = theme_appearance(dark, increased);
+        let p = Palette::appearance(dark, increased);
         for status in [
             pick_list::Status::Active,
             pick_list::Status::Hovered,
@@ -200,9 +200,9 @@ fn pick_list_and_menu_outputs_keep_choices_and_placeholders_readable() {
 
 #[test]
 fn enabled_action_styles_read_in_every_interaction_state() {
-    for dark in [false, true] {
-        let theme = theme(dark);
-        let p = Palette::of(dark);
+    for (dark, increased) in [(false, false), (true, false), (false, true), (true, true)] {
+        let theme = theme_appearance(dark, increased);
+        let p = Palette::appearance(dark, increased);
         for status in BUTTON_STATES {
             let styles = [
                 primary(&theme, status),
@@ -266,9 +266,9 @@ fn enabled_action_styles_read_in_every_interaction_state() {
 
 #[test]
 fn checkboxes_sliders_and_progress_have_visible_functional_marks() {
-    for dark in [false, true] {
-        let theme = theme(dark);
-        let p = Palette::of(dark);
+    for (dark, increased) in [(false, false), (true, false), (false, true), (true, true)] {
+        let theme = theme_appearance(dark, increased);
+        let p = Palette::appearance(dark, increased);
         for checked in [false, true] {
             for status in [
                 checkbox::Status::Active {
@@ -345,8 +345,8 @@ fn gradient_at(background: Background, offset: f32) -> Color {
 
 #[test]
 fn stage_layers_read_over_extreme_image_colors_in_both_appearances() {
-    for dark in [false, true] {
-        let theme = theme(dark);
+    for (dark, increased) in [(false, false), (true, false), (false, true), (true, true)] {
+        let theme = theme_appearance(dark, increased);
         for picture in [
             Color::WHITE,
             Color::BLACK,
@@ -417,8 +417,8 @@ fn stage_layers_read_over_extreme_image_colors_in_both_appearances() {
 
 #[test]
 fn fallback_widgets_inherit_readable_theme_colors() {
-    for dark in [false, true] {
-        let theme = theme(dark);
+    for (dark, increased) in [(false, false), (true, false), (false, true), (true, true)] {
+        let theme = theme_appearance(dark, increased);
         for status in BUTTON_STATES {
             let style = button::primary(&theme, status);
             reads(

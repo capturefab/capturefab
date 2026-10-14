@@ -829,6 +829,25 @@ impl Workbench {
             .width(Fill)
             .height(Fill)
             .style(style::stage);
+        let native = shown.size();
+        let name = snapshot
+            .connected
+            .as_ref()
+            .map_or("Camera", |camera| camera.model.as_str());
+        let image = accessibility::label(
+            image.into(),
+            format!(
+                "{name}. {} preview, {} by {} pixels.",
+                if snapshot.streaming {
+                    "Live camera"
+                } else {
+                    "Last frame"
+                },
+                native.width as u32,
+                native.height as u32
+            ),
+            accessibility::Role::Image,
+        );
         let mut layers = stack![veil(image, p.stage, 0.0, self.revealed(MAIN_VIEW))];
         if let Some(region) = self.focus_overlay(shown) {
             layers = layers.push(region);

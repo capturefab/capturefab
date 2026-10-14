@@ -1063,14 +1063,6 @@ fn schedule_text_for(kind: CameraKind, count: u32, interval: f64) -> String {
     )
 }
 
-/// What the storage section says, open or closed, of an at-capacity policy
-/// that deletes files.
-fn capacity_warning(action: &str) -> Option<&'static str> {
-    (action == "delete-oldest").then_some(
-        "At capacity, removes the oldest Capturefab managed files in the output location.",
-    )
-}
-
 /// A quiet line saying why the action above it cannot run.
 fn reason<'a>(why: &'a str, p: &'static Palette) -> Element<'a, Message> {
     text(why).size(style::SMALL).color(p.secondary).into()
@@ -1124,7 +1116,7 @@ fn wide_button<'a>(
 impl Workbench {
     pub(super) fn inspector(&self, p: &'static Palette) -> Element<'_, Message> {
         let os = Os::CURRENT;
-        let tabs = segmented(
+        let tabs = inspector_tabs(
             vec![
                 (
                     "Features",
@@ -1142,6 +1134,7 @@ impl Workbench {
                     Action::ForwardTab.hint("Forward panel", os),
                 ),
             ],
+            self.tab as usize,
             self.inspect.tab_thumb.get(self.now),
         );
         let mut panel = column![
@@ -1428,26 +1421,27 @@ impl Workbench {
                 left: 10.0,
             })
             .style(style::input);
-        if self.search.is_empty() {
-            return input.into();
+        // Keep the input at the same place in the widget tree when the clear
+        // action appears, preserving its focus, cursor and native identity.
+        let mut field = stack![input];
+        if !self.search.is_empty() {
+            field = field.push(
+                container(tip(
+                    button(icon(Icon::Close, 11.0, p.secondary))
+                        .padding(5)
+                        .style(style::plain)
+                        .on_press(Message::Search(String::new())),
+                    "Clear search",
+                ))
+                .align_right(Fill)
+                .center_y(Fill)
+                .padding(iced::Padding {
+                    right: 5.0,
+                    ..iced::Padding::ZERO
+                }),
+            );
         }
-        stack![
-            input,
-            container(tip(
-                button(icon(Icon::Close, 11.0, p.secondary))
-                    .padding(5)
-                    .style(style::plain)
-                    .on_press(Message::Search(String::new())),
-                "Clear search",
-            ))
-            .align_right(Fill)
-            .center_y(Fill)
-            .padding(iced::Padding {
-                right: 5.0,
-                ..iced::Padding::ZERO
-            }),
-        ]
-        .into()
+        field.into()
     }
 
     /// Said once per group that holds features the stream locks.
@@ -1519,6 +1513,7 @@ impl Workbench {
                     Action::ToggleAuto.hint("Tune exposure, gain and frame rate automatically", os),
                 ),
             ],
+            usize::from(auto.is_some()),
             self.inspect.mode_thumb.get(self.now),
         );
         let mut card = column![head, modes].spacing(10);
@@ -1534,10 +1529,7 @@ impl Workbench {
                 card = card
                     .push(
                         column![
-                            slider(0.0..=1.0, self.balance, Message::Balance)
-                                .step(0.01)
-                                .on_release(Message::BalanceReleased)
-                                .style(style::slide),
+                            balance_slider(self.balance),
                             row![
                                 text("Quality").size(style::CAPTION).color(p.secondary),
                                 space::horizontal(),
@@ -1710,11 +1702,9 @@ impl Workbench {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(current == "true" || current == "1"),
             };
-            iced::widget::checkbox(checked)
-                .on_toggle(move |value| Message::Set(feature.name.clone(), value.to_string()))
-                .size(16)
-                .style(style::check)
-                .into()
+            widgets::checkbox_named("", label, checked, move |value| {
+                Message::Set(feature.name.clone(), value.to_string())
+            })
         } else if !feature.choices.is_empty() {
             let glow = self.inspect.accepted.level(name, self.now);
             // What a write on its way asked for, else what the camera has.
@@ -1726,6 +1716,7 @@ impl Workbench {
                 feature.choices.iter().find(|c| *c == shown).cloned(),
                 move |value| Message::Set(feature.name.clone(), value),
             )
+            .name(label)
             .placeholder(current.clone())
             .width(CONTROL)
             .text_size(style::SMALL)
@@ -1766,9 +1757,13 @@ impl Workbench {
                 // range keeps its line too.
                 Element::from(space().height(style::line_height(style::CAPTION)))
             });
+            let feature_name = feature.name.clone();
             text_input(&current, draft)
+                .name(label)
+                .description(about)
+                .invalid(refused.cloned())
                 .id(format!("feature:{}", feature.name))
-                .on_input(move |value| Message::Draft(feature.name.clone(), value))
+                .on_input(move |value| Message::Draft(feature_name.clone(), value))
                 .on_submit(Message::Commit(feature.name.clone()))
                 .size(style::SMALL)
                 .padding([5, 8])
@@ -1874,6 +1869,18 @@ impl Workbench {
             .unwrap_or_else(|| self.num_text(key));
         let valid = num_valid(key, &value);
         let input = text_input("", &value)
+            .name(match key {
+                Num::Count => "Capture count",
+                Num::Timeout => "Capture timeout",
+                Num::Delay => "Capture delay",
+                Num::Interval => "Capture interval",
+                Num::Fps => "Recording frame rate",
+                Num::FileMib => "Maximum file size",
+                Num::QuotaGib => "Maximum storage size",
+                Num::QuotaFiles => "Maximum managed file count",
+                Num::RetentionDays => "Maximum file age",
+            })
+            .invalid((!valid).then(|| num_requirement(key).to_owned()))
             .id(format!("number:{key:?}"))
             .on_input(move |value| Message::Num(key, value))
             .size(style::BODY)
@@ -1950,8 +1957,8 @@ impl Workbench {
         }
         let mut save = column![
             head,
-            self.capture_to
-                .view(
+            accessibility::mapped(
+                self.capture_to.view(
                     &self.output,
                     "Output path",
                     self.dark(),
@@ -1960,9 +1967,10 @@ impl Workbench {
                         &self.output
                     )
                     .is_err()
-                        || crate::engine::validate_capture_output(&self.output).is_err()
-                )
-                .map(Message::CapturePicker),
+                        || crate::engine::validate_capture_output(&self.output).is_err(),
+                ),
+                Message::CapturePicker,
+            ),
             form_row(
                 match kind {
                     CameraKind::DocumentScanner => "Pages",
@@ -1976,6 +1984,7 @@ impl Workbench {
             form_row(
                 "Format",
                 pick_list(&FORMATS[..], find(&FORMATS, self.format), Message::Format)
+                    .name("Capture format")
                     .width(Fill)
                     .text_size(style::BODY)
                     .padding([5, 8])
@@ -2214,11 +2223,12 @@ impl Workbench {
             text("Publish this camera to MediaMTX, an NVR or a recording file.")
                 .size(style::SMALL)
                 .color(p.secondary),
-            self.record_to
-                .view(&self.forward_output, "Stream URL or file", self.dark(),
+            accessibility::mapped(
+                self.record_to.view(&self.forward_output, "Stream URL or file", self.dark(),
                     crate::destination::validate_output(self.record_to.selected.as_deref(), &self.forward_output).is_err()
-                        || crate::media::validate_forward_output(&self.forward_output).is_err())
-                .map(Message::RecordPicker),
+                        || crate::media::validate_forward_output(&self.forward_output).is_err()),
+                Message::RecordPicker,
+            ),
             form_row(
                 "Codec",
                 pick_list(
@@ -2226,6 +2236,7 @@ impl Workbench {
                     find(&CODECS, self.forward_codec),
                     Message::Codec
                 )
+                .name("Video codec")
                 .width(Fill)
                 .text_size(style::BODY)
                 .padding([5, 8])
@@ -2238,6 +2249,8 @@ impl Workbench {
                 "Encoder",
                 column![tip(
                     text_input("auto", &self.forward_encoder)
+                        .name("Recording encoder")
+                        .invalid(crate::media::validate_encoder(self.forward_codec, self.forward_encoder.trim()).err().map(|error| error.to_string()))
                         .id("forward-encoder")
                         .on_input(Message::Encoder)
                         .size(style::BODY)
@@ -2254,6 +2267,8 @@ impl Workbench {
             form_row(
                 "Bitrate",
                 column![text_input("4M", &self.forward_bitrate)
+                    .name("Recording bitrate")
+                    .description("An FFmpeg bitrate, such as 4M for four megabits per second.")
                     .id("forward-bitrate")
                     .on_input(Message::Bitrate)
                     .size(style::BODY)
@@ -2365,11 +2380,7 @@ impl Workbench {
 
     pub(super) fn storage_settings(&self, p: &'static Palette) -> Element<'_, Message> {
         let open = self.storage_open;
-        let summary = format!(
-            "{} GiB · {} files",
-            number(self.quota_gib),
-            grouped(self.quota_files.into()),
-        );
+        let summary = self.storage_status.state().summary(&self.storage_policy());
         let mut content = column![disclosure(
             "Storage & retention",
             (!open).then_some(summary),
@@ -2380,15 +2391,26 @@ impl Workbench {
         .spacing(ROW_GAP);
         if open {
             content = content
-                .push(form_row("Disk budget", self.num(Num::QuotaGib), "GiB", p))
-                .push(form_row("File limit", self.num(Num::QuotaFiles), "", p))
                 .push(form_row(
-                    "At capacity",
+                    "Requested budget",
+                    self.num(Num::QuotaGib),
+                    "GiB",
+                    p,
+                ))
+                .push(form_row(
+                    "Requested files",
+                    self.num(Num::QuotaFiles),
+                    "",
+                    p,
+                ))
+                .push(form_row(
+                    "Requested action",
                     pick_list(
                         &ON_FULL[..],
                         find(&ON_FULL, self.quota_action),
                         Message::OnFull,
                     )
+                    .name("Requested action when a storage limit is reached")
                     .width(Fill)
                     .text_size(style::BODY)
                     .padding([5, 8])
@@ -2398,23 +2420,28 @@ impl Workbench {
                     p,
                 ))
                 .push(checkbox(
-                    "Limit capture age",
+                    "Request an age limit",
                     self.retention_enabled,
                     Message::RetentionEnabled,
                 ));
             if self.retention_enabled {
                 content = content.push(form_row(
-                    "Keep for",
+                    "Requested age",
                     self.num(Num::RetentionDays),
                     "days",
                     p,
                 ));
             }
         }
-        // Said open or closed: the setting deletes files and is kept
-        // across launches.
-        if let Some(warning) = capacity_warning(self.quota_action) {
-            content = content.push(text(warning).size(style::SMALL).color(p.ink(p.warn)));
+        // The backend also merges a separately configured app-wide policy.
+        // Show its actual limits/deletion behavior even with the form folded.
+        for caption in self.storage_status.state().captions(&self.storage_policy()) {
+            let color = match caption.tone {
+                storage_policy::Tone::Normal => p.secondary,
+                storage_policy::Tone::Warning => p.ink(p.warn),
+                storage_policy::Tone::Error => p.ink(p.danger),
+            };
+            content = content.push(text(caption.text).size(style::SMALL).color(color));
         }
         content.into()
     }
@@ -2511,6 +2538,40 @@ impl Workbench {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn search_preserves_editor_focus_and_selection_when_clear_action_changes() {
+        use iced::advanced::widget::{Tree, tree::Tag};
+        use iced::widget::text_input::{State, Value, cursor};
+        type Editor = State<<iced::Renderer as iced::advanced::text::Renderer>::Paragraph>;
+
+        fn editor(tree: &mut Tree) -> Option<&mut Editor> {
+            if tree.tag == Tag::of::<Editor>() {
+                Some(tree.state.downcast_mut::<Editor>())
+            } else {
+                tree.children.iter_mut().find_map(editor)
+            }
+        }
+
+        let mut bench = bench();
+        let p = Palette::of(false);
+        let mut tree = Tree::new(bench.search_field(p).as_widget());
+        editor(&mut tree).unwrap().focus();
+        bench.search = "Exposure".into();
+        tree.diff(bench.search_field(p).as_widget());
+        let state = editor(&mut tree).unwrap();
+        assert!(state.is_focused(), "typing the first letter retains focus");
+        state.select_range(1, 3);
+        bench.search.clear();
+        tree.diff(bench.search_field(p).as_widget());
+        let state = editor(&mut tree).unwrap();
+        assert!(state.is_focused(), "clearing the field retains focus");
+        assert_eq!(
+            state.cursor().state(&Value::new("Exposure")),
+            cursor::State::Selection { start: 1, end: 3 },
+            "view changes preserve the editor state rather than replacing it"
+        );
+    }
 
     fn bench() -> Workbench {
         let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
@@ -3143,12 +3204,6 @@ mod tests {
         bench.snapshot.cameras[0].forwarding = None;
         bench.tick_inspector();
         assert!(summary(&bench).is_none());
-    }
-
-    #[test]
-    fn a_policy_that_deletes_files_is_said_even_closed() {
-        assert!(capacity_warning("delete-oldest").is_some());
-        assert!(capacity_warning("stop").is_none());
     }
 
     #[test]

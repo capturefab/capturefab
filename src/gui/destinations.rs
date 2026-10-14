@@ -5,16 +5,19 @@
 //! Disk scans, bucket checks, keychain lookups and writes, and queue status
 //! run on background threads, so a slow network share, service or credential
 //! store never stalls the interface.
+use super::button::button;
 use super::format::{capitalize, grouped, plural};
 use super::icon::{self, Icon, icon};
 use super::motion::{self, Flashes, Kind, Motion};
 use super::notice::Level;
+use super::pick_list::pick_list;
 use super::sparkline::History;
 use super::style::{self, Palette};
+use super::text_input::{self, text_input};
 use super::widgets::{SheetFrame, disclosure, fade, field_error, one_line, sheet_frame};
 use crate::destination::{self, Bucket, Credentials, Destination, Target};
 use crate::volumes::{self, Volume};
-use iced::widget::{button, column, container, pick_list, row, space, text, text_input};
+use iced::widget::{column, container, row, space, text};
 use iced::{Alignment, Element, Fill, Length, Theme};
 use serde_json::Value;
 use std::{
@@ -40,6 +43,8 @@ const NAME_FIELD: &str = "destination-name";
 const BUCKET_FIELD: &str = "destination-bucket";
 /// Width of the destination sheets.
 const SHEET_WIDTH: f32 = 560.0;
+#[cfg(test)]
+mod form_tests;
 static SECRET_WRITES: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 static NEXT_SECRET_WRITE: AtomicU64 = AtomicU64::new(1);
 
@@ -1880,6 +1885,7 @@ impl Picker {
             label("Save to", p),
             row![
                 pick_list(choices, selected, Message::Select)
+                    .name("Save destination")
                     .width(Fill)
                     .text_size(style::BODY)
                     .padding([6, 10])
@@ -1910,6 +1916,11 @@ impl Picker {
                     .push(
                         row![
                             text_input(local_example, output)
+                                .name(local_label)
+                                .invalid(
+                                    invalid_output
+                                        .then(|| "Enter a valid output path or stream URL.".into())
+                                )
                                 .id(if self.recording {
                                     "record-output"
                                 } else {
@@ -1948,6 +1959,15 @@ impl Picker {
                     ))
                     .push(
                         text_input(named_example, output)
+                            .name(if self.recording {
+                                "Recording file name in destination"
+                            } else {
+                                "Capture name in destination"
+                            })
+                            .invalid(
+                                invalid_output
+                                    .then(|| "Enter a valid file name or capture template.".into()),
+                            )
                             .id(if self.recording {
                                 "record-output"
                             } else {
@@ -2353,6 +2373,8 @@ impl Picker {
         spin: usize,
         now: Instant,
     ) -> SheetFrame<'a, Message> {
+        let editable = !self.mutation_busy();
+        let saving = editor.saving.is_some();
         let field = |label: &'a str, control: Element<'a, Message>| -> Element<'a, Message> {
             row![
                 text(label)
@@ -2382,8 +2404,20 @@ impl Picker {
                     style::input
                 };
             text_input(placeholder, value)
-                .on_input(on)
-                .on_submit(Message::Save)
+                .name(match kind {
+                    Field::Name => "Destination name",
+                    Field::Folder => "Destination folder",
+                    Field::Endpoint => "S3 endpoint",
+                    Field::Region => "S3 region",
+                    Field::Bucket => "S3 bucket",
+                    Field::Prefix => "S3 key prefix",
+                    Field::AccessKey => "S3 access key ID",
+                    Field::Secret => "S3 secret access key",
+                    Field::Profile => "AWS profile",
+                })
+                .invalid(editor.refusal(kind).map(str::to_owned))
+                .on_input_maybe(editable.then_some(on))
+                .on_submit_maybe(editable.then_some(Message::Save))
                 .size(style::BODY)
                 .padding([6, 10])
                 .style(look)
@@ -2413,6 +2447,8 @@ impl Picker {
                     Some(Provider(editor.provider)),
                     Message::Provider,
                 )
+                .name("S3-compatible service")
+                .enabled(editable)
                 .width(Fill)
                 .text_size(style::BODY)
                 .padding([6, 10])
@@ -2460,6 +2496,8 @@ impl Picker {
                 .push(field(
                     "Credentials",
                     pick_list(&Source::ALL[..], Some(editor.source), Message::Source)
+                        .name("Credentials source")
+                        .enabled(editable)
                         .width(Fill)
                         .text_size(style::BODY)
                         .padding([6, 10])
@@ -2478,8 +2516,10 @@ impl Picker {
                             },
                             &editor.secret,
                         )
-                        .on_input(Message::Secret)
-                        .on_submit(Message::Save)
+                        .name("S3 secret access key")
+                        .invalid(editor.refusal(Field::Secret).map(str::to_owned))
+                        .on_input_maybe(editable.then_some(Message::Secret))
+                        .on_submit_maybe(editable.then_some(Message::Save))
                         .secure(true)
                         .size(style::BODY)
                         .padding([6, 10])
@@ -2532,10 +2572,10 @@ impl Picker {
                 .push(name)
                 .push(field(
                     "",
-                    super::checkbox(
+                    super::widgets::checkbox_maybe(
                         "Keep local copies after upload",
                         editor.keep_local,
-                        Message::KeepLocal,
+                        editable.then_some(Message::KeepLocal),
                     ),
                 ))
                 .push(disclosure(
@@ -2563,10 +2603,10 @@ impl Picker {
                     .push(field(
                         "",
                         super::tip(
-                            super::checkbox(
+                            super::widgets::checkbox_maybe(
                                 "Path-style addressing",
                                 editor.path_style,
-                                Message::PathStyle,
+                                editable.then_some(Message::PathStyle),
                             ),
                             "Needed by MinIO and most non-AWS services",
                         ),
@@ -2588,7 +2628,7 @@ impl Picker {
                             button(icon(Icon::Folder, 15.0, p.secondary))
                                 .padding(6)
                                 .style(style::plain)
-                                .on_press(Message::BrowseFolder),
+                                .on_press_maybe(editable.then_some(Message::BrowseFolder)),
                             "Choose a folder",
                         ),
                     ]
@@ -2599,7 +2639,6 @@ impl Picker {
             ));
         }
         let testing = editor.testing.is_some();
-        let saving = editor.saving.is_some();
         let checking_secret = editor.checking_secret();
         let outcome = if saving {
             status("Saving…".into(), Status::Working, spin, p)
@@ -2619,11 +2658,11 @@ impl Picker {
         let cancel = button(text("Cancel").size(style::BODY))
             .padding([7, 14])
             .style(style::plain)
-            .on_press_maybe((!saving).then_some(Message::Cancel));
+            .on_press_maybe(editable.then_some(Message::Cancel));
         let save = button(text("Save").size(style::BODY))
             .padding([7, 18])
             .style(style::primary)
-            .on_press_maybe((!saving && !checking_secret).then_some(Message::Save));
+            .on_press_maybe((editable && !checking_secret).then_some(Message::Save));
         let (first, second) = if cfg!(target_os = "windows") {
             (save, cancel)
         } else {
@@ -2634,7 +2673,7 @@ impl Picker {
                 button(text("Test").size(style::BODY))
                     .padding([7, 14])
                     .style(style::secondary)
-                    .on_press_maybe((!testing && !saving).then_some(Message::Test)),
+                    .on_press_maybe((!testing && editable).then_some(Message::Test)),
                 if editor.s3 {
                     "Check that the bucket can be reached with these credentials"
                 } else {
@@ -2654,6 +2693,8 @@ impl Picker {
         };
         sheet_frame(title, Message::CloseManager, form, p)
             .back(Some(Message::Cancel))
+            .back_enabled(editable)
+            .close_enabled(editable)
             .footer(footer)
     }
 
@@ -2990,6 +3031,104 @@ mod tests {
         assert_eq!(changes[0].after_selection.output, "capture.png");
         assert!(!picker.mutation_busy());
         assert!(picker.take_changes().is_empty(), "delivered once");
+    }
+
+    #[test]
+    fn pending_save_disables_header_actions_and_excludes_them_from_tab_traversal() {
+        use crate::gui::accessibility::Control;
+        use iced::advanced::{
+            Layout, layout,
+            renderer::Headless,
+            widget::{Id, Operation, Tree, operation::Focusable},
+        };
+        use iced::{Rectangle, Size};
+        use std::any::Any;
+
+        #[derive(Default)]
+        struct Header {
+            controls: BTreeMap<String, (Id, bool, Option<Message>)>,
+            tab_stops: Vec<Id>,
+        }
+        impl Operation for Header {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn Any) {
+                if let Some(control) = state.downcast_ref::<Control<Message>>()
+                    && let Some(name) = control.node.label()
+                    && (name == "Back" || name.starts_with("Close "))
+                {
+                    self.controls.insert(
+                        name.into(),
+                        (
+                            control.focus_id.clone(),
+                            control.node.is_disabled(),
+                            control.activate.clone(),
+                        ),
+                    );
+                }
+            }
+            fn focusable(&mut self, id: Option<&Id>, _: Rectangle, _: &mut dyn Focusable) {
+                if let Some(id) = id {
+                    self.tab_stops.push(id.clone());
+                }
+            }
+        }
+
+        // Use the app's actual sheet, including the tooltip decorators and
+        // pinned header, with the software renderer rather than a GPU/window.
+        let renderer = iced::futures::executor::block_on(iced::Renderer::new(
+            iced::Font::default(),
+            iced::Pixels(16.0),
+            Some("tiny-skia"),
+        ))
+        .expect("the compiled software renderer is available");
+        let mut picker = Picker::new(false, false);
+        picker.manager_open = true;
+        picker.editor = Some(bucket(|editor| editor.source = Source::Environment));
+        let mut tree = Tree::empty();
+        let mut inspect = |picker: &Picker| {
+            let mut view = picker.manager(false, 640.0, 0, Instant::now(), None, None);
+            tree.diff(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(560.0, 640.0)),
+            );
+            let mut header = Header::default();
+            view.as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut header);
+            header
+        };
+        let before = inspect(&picker);
+        assert_eq!(before.controls.len(), 2);
+        let (_sender, receiver) = channel();
+        let editor = picker.editor.as_mut().unwrap();
+        editor.saving = Some((editor.destination().unwrap(), receiver));
+        let pending = inspect(&picker);
+        for (name, (id, disabled, activate)) in &pending.controls {
+            assert_eq!(
+                *id, before.controls[name].0,
+                "keep the header's tree stable"
+            );
+            assert!(*disabled, "{name} announces its temporary unavailability");
+            assert!(activate.is_none(), "{name} offers no ignored native action");
+            assert!(
+                !pending.tab_stops.contains(id),
+                "{name} is not a disabled Tab stop"
+            );
+        }
+        picker.editor.as_mut().unwrap().saving = None;
+        let after = inspect(&picker);
+        for (name, (id, disabled, activate)) in &after.controls {
+            assert_eq!(*id, before.controls[name].0);
+            assert!(!disabled);
+            assert!(after.tab_stops.contains(id));
+            assert!(matches!(
+                activate,
+                Some(Message::Cancel | Message::CloseManager)
+            ));
+        }
     }
 
     #[test]

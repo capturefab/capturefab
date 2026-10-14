@@ -1,7 +1,10 @@
 //! The native workbench. Camera I/O lives on the session worker, never the UI thread.
+mod accessibility;
 mod brand;
+mod button;
 mod camera_history;
 mod camera_view;
+mod close_error;
 mod destinations;
 mod format;
 mod gpu;
@@ -14,18 +17,23 @@ mod keyboard_history;
 mod keys;
 mod liveness;
 mod local_history;
+mod menus;
 mod motion;
 mod notice;
 mod oneline;
+mod pick_list;
 mod prefs;
 mod preview;
 mod refresh;
 mod scene;
 mod scopes;
+mod settings;
 mod sidebar;
 mod sparkline;
 mod stage;
+mod storage_policy;
 mod style;
+mod text_input;
 mod titlebar;
 mod toolbar;
 mod welcome;
@@ -41,12 +49,14 @@ use crate::{
     types::{CameraInfo, MONO8, RGB8, TransportStats},
 };
 use anyhow::Result;
+use button::button;
+use close_error::CloseError;
 use destinations::Picker;
 use format::*;
 use gpu::GpuFrames;
 use iced::widget::{
-    button, center, column, container, mouse_area, opaque, operation, pick_list, progress_bar,
-    responsive, row, rule, scrollable, shader, slider, space, stack, text, text_input, tooltip,
+    center, column, container, mouse_area, opaque, operation, progress_bar, responsive, row, rule,
+    scrollable, shader, space, stack, text, tooltip,
 };
 use iced::{
     Alignment, Animation, Color, Element, Fill, Length, Size, Subscription, Task, Theme, event,
@@ -57,8 +67,9 @@ use keys::{Action, Chord, Os};
 use liveness::{CameraState, Liveness};
 use motion::{Kind, Motion};
 use notice::{Batch, Level, Notice, Saved, command_notice};
+use pick_list::pick_list;
 pub(crate) use prefs::migrate as migrate_prefs;
-use prefs::{Prefs, Recent};
+use prefs::{Prefs, Recent, UiScale};
 use preview::Shown;
 use scene::{Scene, ScreenshotRequest};
 use std::{
@@ -67,13 +78,14 @@ use std::{
     fmt,
     path::PathBuf,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, TryRecvError},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use style::Palette;
+use text_input::text_input;
 use widgets::*;
 
 /// Height of the title bar row. On macOS it shares the window's top edge with
@@ -94,25 +106,6 @@ const GUTTER: f32 = 18.0;
 const FRAME_POLL: Duration = Duration::from_millis(2);
 /// Small overview tiles gain nothing from more than 30 redraws a second.
 const OVERVIEW_INTERVAL: Duration = Duration::from_micros(33_333);
-
-fn mac_default(domain: &str, key: &str) -> Option<String> {
-    if !cfg!(target_os = "macos") {
-        return None;
-    }
-    std::process::Command::new("/usr/bin/defaults")
-        .args(["read", domain, key])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-}
-
-fn double_click_action() -> Option<&'static str> {
-    static ACTION: OnceLock<Option<String>> = OnceLock::new();
-    ACTION
-        .get_or_init(|| mac_default("-g", "AppleActionOnDoubleClick"))
-        .as_deref()
-}
 
 pub fn run(handle: SessionHandle, session_label: String, simulated: bool) -> Result<()> {
     run_capture(handle, session_label, simulated, None, 0)
@@ -158,16 +151,48 @@ pub fn run_capture(
                 .map(|[w, h]| Size::new(w.max(900.0), h.max(620.0)))
         })
         .unwrap_or(Size::new(1280.0, 840.0));
+    let initial_scale = match std::env::var("CAPTUREFAB_UI_SCALE").as_deref() {
+        Ok("large") => UiScale::Large,
+        Ok("larger") => UiScale::Larger,
+        _ => saved
+            .as_ref()
+            .map_or(UiScale::Standard, |prefs| prefs.ui_scale),
+    };
     let boot = move || {
         let capturing = screenshot.is_some();
+        let (main_window, opened) = window::open(window::Settings {
+            icon: Some(brand::window_icon()),
+            size: Size::new(
+                window_size.width / initial_scale.factor(),
+                window_size.height / initial_scale.factor(),
+            ),
+            position: prefs::centered_window(initial_scale),
+            min_size: Some(Size::new(900.0, 620.0)),
+            exit_on_close_request: false,
+            visible: false,
+            #[cfg(target_os = "macos")]
+            platform_specific: window::settings::PlatformSpecific {
+                title_hidden: true,
+                titlebar_transparent: true,
+                fullsize_content_view: true,
+            },
+            #[cfg(target_os = "linux")]
+            platform_specific: window::settings::PlatformSpecific {
+                application_id: "capturefab".into(),
+                ..Default::default()
+            },
+            ..window::Settings::default()
+        });
         let mut app = Workbench::new(
             handle.clone(),
             session_label.clone(),
             simulated || capturing,
             saved.clone(),
         );
-        app.width = window_size.width;
-        app.height = window_size.height;
+        app.main_window = main_window;
+        app.focused_window = main_window;
+        app.width = window_size.width / app.ui_scale.factor();
+        app.height = window_size.height / app.ui_scale.factor();
         if let Some(path) = &screenshot {
             let scene = std::env::var("CAPTUREFAB_SCREENSHOT_SCENE").unwrap_or_default();
             let scene: Vec<&str> = scene.split(',').map(str::trim).collect();
@@ -211,38 +236,35 @@ pub fn run_capture(
             Task::batch([
                 system::theme().map(Message::SystemTheme),
                 window::allow_automatic_tabbing(false),
-                screen_refresh(),
+                opened.map(Message::WindowOpened).chain(Task::batch([
+                    screen_refresh(main_window),
+                    if capturing {
+                        Task::none()
+                    } else {
+                        prefs::fit_window(window_size, initial_scale)
+                    },
+                ])),
             ]),
         )
     };
     #[cfg(target_os = "macos")]
     brand::set_dock_icon();
-    iced::application(boot, Workbench::update, Workbench::view)
-        .title(Workbench::title)
+    style::initialize_fonts();
+    iced::daemon(boot, Workbench::update, Workbench::window_view)
+        .title(|app: &Workbench, id| {
+            if app.settings_window == Some(id) {
+                "Settings".into()
+            } else {
+                app.title()
+            }
+        })
         .subscription(Workbench::subscription)
-        .theme(Workbench::theme)
+        .theme(|app: &Workbench, _| app.theme())
+        .scale_factor(|app: &Workbench, _| app.ui_scale.factor())
         .default_font(style::SANS)
         .font(icon::REGULAR_BYTES)
         .font(icon::FILL_BYTES)
         .antialiasing(true)
-        .window(window::Settings {
-            icon: Some(brand::window_icon()),
-            size: window_size,
-            position: window::Position::Centered,
-            min_size: Some(Size::new(900.0, 620.0)),
-            #[cfg(target_os = "macos")]
-            platform_specific: window::settings::PlatformSpecific {
-                title_hidden: true,
-                titlebar_transparent: true,
-                fullsize_content_view: true,
-            },
-            #[cfg(target_os = "linux")]
-            platform_specific: window::settings::PlatformSpecific {
-                application_id: "capturefab".into(),
-                ..Default::default()
-            },
-            ..window::Settings::default()
-        })
         .run()
         .map_err(|err| anyhow::anyhow!("Could not start the native window: {err}"))?;
     if let Some(error) = outcome
@@ -294,10 +316,8 @@ fn watch_frames(watch: &FrameWatch) -> impl iced::futures::Stream<Item = Message
 }
 
 /// Ask the platform for the refresh interval of the window's screen.
-fn screen_refresh() -> Task<Message> {
-    window::latest()
-        .and_then(|id| window::run(id, refresh::screen_period))
-        .map(Message::ScreenRefresh)
+fn screen_refresh(id: window::Id) -> Task<Message> {
+    window::run(id, refresh::screen_period).map(Message::ScreenRefresh)
 }
 
 /// A command on its way to the session, filled in once where it is sent.
@@ -514,13 +534,38 @@ enum Message {
     Displaced,
     /// The refresh interval the window's screen reports, if any.
     ScreenRefresh(Option<Duration>),
+    StoragePolicy(storage_policy::Reply),
     SystemTheme(theme::Mode),
     Key {
         chord: Chord,
         captured: bool,
     },
     FocusNext(bool),
-    CycleAppearance,
+    Menu(menus::Command),
+    DesktopMenu(menus::DesktopInput),
+    EditorFocused(bool),
+    PopupOpen(bool),
+    Settings(bool),
+    Appearance(Appearance),
+    UiScale(UiScale),
+    ScaledViewport(Size),
+    CloseRequested(window::Id),
+    WindowOpened(window::Id),
+    WindowFocused(window::Id),
+    WindowUnfocused(window::Id),
+    InWindow(window::Id, Box<Message>),
+    AccessibilityRequest(accessibility::Request),
+    NativeInput {
+        message: Box<Message>,
+        acknowledgement: text_input::Acknowledgement,
+    },
+    AccessibilityAttached(window::Id, bool),
+    AccessibilityChanged(window::Id),
+    WindowScale(window::Id, f32),
+    Quit,
+    PrefsFlushed(std::result::Result<(), String>),
+    RetryClose,
+    KeepOpen,
     Help(bool),
     DragWindow,
     Discover,
@@ -566,6 +611,7 @@ enum Message {
     Auto(bool),
     Balance(f64),
     BalanceReleased,
+    BalanceCommit(f64),
     ToggleAutoChanges,
     Draft(String, String),
     Commit(String),
@@ -611,7 +657,18 @@ enum Message {
 
 type FeatureDrafts = (HashMap<String, String>, HashMap<String, String>);
 
+#[derive(Clone, Copy, Debug)]
+enum CloseTarget {
+    Window(window::Id),
+    Quit,
+}
+
 struct Workbench {
+    main_window: window::Id,
+    focused_window: window::Id,
+    settings_window: Option<window::Id>,
+    accessibility: accessibility::Bridge,
+    window_scales: HashMap<window::Id, f32>,
     history: history::History<local_history::Edit>,
     history_replay: Option<bool>,
     history_deferred: Vec<(String, Option<String>, local_history::Edit, Instant)>,
@@ -658,12 +715,19 @@ struct Workbench {
     balance: f64,
     balance_dragging: bool,
     storage_open: bool,
+    storage_status: storage_policy::Cache,
     auto_changes_open: bool,
     system_dark: bool,
     appearance: Appearance,
+    ui_scale: UiScale,
     screenshot: Option<ScreenshotRequest>,
     logs_open: bool,
     help_open: bool,
+    settings_open: bool,
+    menu_editor: bool,
+    popup_open: bool,
+    menu_edit: Option<keyboard_history::EditRequest>,
+    desktop_menu: menus::DesktopState,
     fit: bool,
     zoom: f32,
     /// Size of the preview stage at the last layout, so zooming from Fit
@@ -700,6 +764,9 @@ struct Workbench {
     last_saved: Option<Saved>,
     recent: Vec<Recent>,
     saved: Option<Prefs>,
+    prefs_saver: prefs::Saver,
+    closing: Option<CloseTarget>,
+    close_error: Option<CloseError>,
     prefs_changed: Option<Instant>,
     now: Instant,
     born: Instant,
@@ -759,7 +826,13 @@ impl Workbench {
         let now = Instant::now();
         motion::refresh_accessibility();
         let shown = |open: bool| if open { 1.0 } else { 0.0 };
+        let main_window = window::Id::unique();
         Self {
+            main_window,
+            focused_window: main_window,
+            settings_window: None,
+            accessibility: Default::default(),
+            window_scales: HashMap::new(),
             history: Default::default(),
             history_replay: None,
             history_deferred: Vec::new(),
@@ -802,6 +875,7 @@ impl Workbench {
             balance: crate::auto::DEFAULT_BALANCE,
             balance_dragging: false,
             storage_open: false,
+            storage_status: Default::default(),
             auto_changes_open: false,
             system_dark: false,
             // CAPTUREFAB_APPEARANCE=light|dark overrides the system, e.g. for screenshots.
@@ -810,9 +884,19 @@ impl Workbench {
                 Ok("dark") => Appearance::Dark,
                 _ => prefs.appearance,
             },
+            ui_scale: match std::env::var("CAPTUREFAB_UI_SCALE").as_deref() {
+                Ok("large") => UiScale::Large,
+                Ok("larger") => UiScale::Larger,
+                _ => prefs.ui_scale,
+            },
             screenshot: None,
             logs_open: prefs.logs_open,
             help_open: false,
+            settings_open: false,
+            menu_editor: false,
+            popup_open: false,
+            menu_edit: None,
+            desktop_menu: Default::default(),
             fit: true,
             zoom: 1.0,
             stage: Cell::new(Size::new(800.0, 600.0)),
@@ -843,6 +927,9 @@ impl Workbench {
             last_saved: None,
             recent: prefs.recent,
             saved,
+            prefs_saver: prefs::Saver::new(),
+            closing: None,
+            close_error: None,
             prefs_changed: None,
             now,
             born: now,
@@ -908,6 +995,7 @@ impl Workbench {
     fn prefs(&self) -> Prefs {
         Prefs {
             appearance: self.appearance,
+            ui_scale: self.ui_scale,
             include_simulator: self.include_simulator,
             tab: self.tab,
             exposure_open: self.exposure_open,
@@ -941,6 +1029,9 @@ impl Workbench {
     }
 
     fn save_prefs(&mut self) {
+        if self.closing.is_some() {
+            return;
+        }
         let Some(saved) = &self.saved else {
             return;
         };
@@ -953,9 +1044,22 @@ impl Workbench {
         if self.now.duration_since(changed) >= Duration::from_millis(600) {
             self.prefs_changed = None;
             self.saved = Some(prefs.clone());
-            std::thread::spawn(move || {
-                let _ = prefs::save(&prefs);
-            });
+            if let Err(error) = self.prefs_saver.save(prefs) {
+                self.set_notice("Could not save settings", Some(error), Level::Error);
+            }
+        }
+    }
+
+    fn close(&mut self, target: CloseTarget) -> Task<Message> {
+        if self.closing.is_some() {
+            return Task::none();
+        }
+        self.dismiss_close_error();
+        self.closing = Some(target);
+        if self.saved.is_none() {
+            Task::done(Message::PrefsFlushed(Ok(())))
+        } else {
+            Task::perform(self.prefs_saver.flush(self.prefs()), Message::PrefsFlushed)
         }
     }
 
@@ -1017,12 +1121,25 @@ impl Workbench {
             frames,
             arrivals,
             time::every(interval).map(|_| Message::Tick),
-            event::listen_with(|event, status, _window| match event {
+            event::listen_with(|event, status, window| {
+                let message = match event {
+                iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocused(window)),
+                iced::Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(window)),
+                iced::Event::Window(window::Event::CloseRequested) => {
+                    Some(Message::CloseRequested(window))
+                }
                 iced::Event::Window(
                     window::Event::Opened { .. }
                     | window::Event::Moved(_)
                     | window::Event::Rescaled(_),
                 ) => Some(Message::Displaced),
+                // The widget guard routes Escape after inspecting the active
+                // popup. A captured popup Escape closes only that popup.
+                iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    modifiers,
+                    ..
+                }) if modifiers.is_empty() => None,
                 iced::Event::Keyboard(keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Tab),
                     modifiers,
@@ -1046,9 +1163,20 @@ impl Workbench {
                     }
                 }),
                 _ => None,
+                };
+                message.map(|message| Message::InWindow(window, Box::new(message)))
+            }).with(self.desktop_menu.active()).filter_map(|(active, message)| {
+                if active && matches!(&message, Message::InWindow(_, inner) if matches!(**inner, Message::Key { .. } | Message::FocusNext(_))) {
+                    None
+                } else {
+                    Some(message)
+                }
             }),
             system::theme_changes().map(Message::SystemTheme),
-            window::resize_events().map(|(_, size)| Message::Resized(size)),
+            window::resize_events().map(|(id, size)| Message::InWindow(id, Box::new(Message::Resized(size)))),
+            motion::accessibility_subscription(),
+            menus::subscription(),
+            self.accessibility.subscription().map(Message::AccessibilityRequest),
         ])
     }
 
@@ -1445,7 +1573,17 @@ impl Workbench {
         self.tick_stage();
         self.tick_inspector();
         self.save_prefs();
-        Task::batch([pages, self.screenshot_tick()])
+        Task::batch([
+            pages,
+            self.screenshot_tick(),
+            if self.screenshot.is_none() {
+                self.storage_status
+                    .refresh(self.now)
+                    .map(Message::StoragePolicy)
+            } else {
+                Task::none()
+            },
+        ])
     }
 
     /// Add the newest frame rate of each streaming camera to its history,
@@ -1937,7 +2075,77 @@ impl Workbench {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // A native edit must wait for the normal validation/history update,
+        // even when that update rejects it while closing. Preserve its window
+        // context and acknowledge before the next actual widget collection.
+        let message = match message {
+            Message::NativeInput {
+                message,
+                acknowledgement,
+            } => {
+                if !acknowledgement.is_current() {
+                    return Task::none();
+                }
+                let task = self.update(*message);
+                acknowledgement.acknowledge();
+                return task;
+            }
+            Message::InWindow(id, message) => match *message {
+                Message::NativeInput {
+                    message,
+                    acknowledgement,
+                } => {
+                    if !acknowledgement.is_current() {
+                        return Task::none();
+                    }
+                    let task = self.update(Message::InWindow(id, message));
+                    acknowledgement.acknowledge();
+                    return task;
+                }
+                message => Message::InWindow(id, Box::new(message)),
+            },
+            message => message,
+        };
+        if self.closing.is_some()
+            && !matches!(
+                message,
+                Message::PrefsFlushed(_) | Message::StoragePolicy(_)
+            )
+        {
+            return Task::none();
+        }
+        let message = match message {
+            Message::InWindow(id, message) => {
+                match *message {
+                    Message::EditorFocused(_) | Message::PopupOpen(_)
+                        if id != self.focused_window =>
+                    {
+                        return Task::none();
+                    }
+                    Message::Resized(_) if id != self.main_window => {
+                        return Task::none();
+                    }
+                    Message::Displaced if id != self.main_window => {
+                        return window::scale_factor(id)
+                            .map(move |scale| Message::WindowScale(id, scale));
+                    }
+                    _ => {}
+                }
+                *message
+            }
+            message => message,
+        };
         self.now = Instant::now();
+        let scale_before = self.ui_scale;
+        let sheet_before = self.sheet_open();
+        let menus_changed = !matches!(
+            message,
+            Message::Frame(_)
+                | Message::FrameArrived
+                | Message::Pointer
+                | Message::OverControls(_)
+                | Message::HoverTile(_)
+        );
         // Apply ready completions before capturing this gesture. A destination
         // replay must never overwrite input before its history entry exists.
         self.poll_destination_history();
@@ -1949,19 +2157,197 @@ impl Workbench {
             .as_ref()
             .map(|_| local_history::LocalState::capture(self));
         let reset = matches!(message, Message::ResetFocusPeak);
-        let task = self.handle_message(message);
+        let mut task = self.handle_message(message);
         if let (Some((label, key)), Some(before)) = (gesture, before) {
             self.record_local_change(label, key, before, reset);
         }
         self.poll_destination_history();
+        if !sheet_before && self.sheet_open() {
+            self.desktop_menu = Default::default();
+        }
+        if sheet_before != self.sheet_open() {
+            self.accessibility.invalidate(self.main_window);
+        }
+        if scale_before != self.ui_scale {
+            let auxiliary = self.settings_window.map_or_else(Task::none, |id| {
+                prefs::fit_aux_window(id, settings::window_settings().size, self.ui_scale)
+            });
+            task = Task::batch([
+                task,
+                window::size(self.main_window).map(Message::ScaledViewport),
+                auxiliary,
+            ]);
+        }
         self.sync_animations();
         self.frame_gap
             .store(self.frame_gap().as_nanos() as u64, Ordering::Relaxed);
+        if menus_changed {
+            menus::sync(self);
+        }
         task
     }
 
     fn handle_message(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::InWindow(_, _) | Message::NativeInput { .. } => {
+                unreachable!("window and native edit messages are unwrapped before update")
+            }
+            Message::WindowOpened(id) => {
+                return Task::batch([
+                    self.accessibility
+                        .attach(id)
+                        .map(move |ok| Message::AccessibilityAttached(id, ok)),
+                    window::scale_factor(id).map(move |scale| Message::WindowScale(id, scale)),
+                ]);
+            }
+            Message::AccessibilityAttached(id, attached) => {
+                if !attached {
+                    self.set_notice("Accessibility connection unavailable", None, Level::Error);
+                }
+                let fit = if self.settings_window == Some(id) {
+                    prefs::fit_aux_window(id, settings::window_settings().size, self.ui_scale)
+                } else {
+                    Task::none()
+                };
+                // EWMH frame extents are supplied after the window manager
+                // maps/reparents the client; query them after requesting show.
+                let mapped_fit = if cfg!(target_os = "linux")
+                    && id == self.main_window
+                    && self.screenshot.is_none()
+                {
+                    let [width, height] = self.window.unwrap_or([1280.0, 840.0]);
+                    prefs::fit_main_window(id, Size::new(width, height), self.ui_scale)
+                } else {
+                    Task::none()
+                };
+                return fit
+                    .chain(window::set_mode(id, window::Mode::Windowed))
+                    .chain(mapped_fit)
+                    .chain(window::gain_focus(id));
+            }
+            Message::AccessibilityChanged(id) => return self.accessibility.sync(id).discard(),
+            Message::AccessibilityRequest(request) => {
+                let id = request.window;
+                return self
+                    .accessibility
+                    .dispatch(request)
+                    .map(move |message| Message::InWindow(id, Box::new(message)));
+            }
+            Message::WindowScale(id, scale) => {
+                self.window_scales.insert(id, scale);
+            }
+            Message::WindowFocused(id) => {
+                if let Some(error) = &self.close_error
+                    && id != error.window
+                {
+                    return window::gain_focus(error.window);
+                }
+                self.focused_window = id;
+                self.menu_editor = false;
+                self.popup_open = false;
+                return self.accessibility.focused(id, true).discard();
+            }
+            Message::WindowUnfocused(id) => {
+                self.desktop_menu = Default::default();
+                return self.accessibility.focused(id, false).discard();
+            }
+            Message::CloseRequested(_) if self.close_error.is_some() => {
+                self.dismiss_close_error();
+            }
+            Message::CloseRequested(id) if self.settings_window == Some(id) => {
+                return self.handle_message(Message::Settings(false));
+            }
+            Message::CloseRequested(id) => return self.close(CloseTarget::Window(id)),
+            Message::Quit => return self.close(CloseTarget::Quit),
+            Message::PrefsFlushed(result) => {
+                let target = self.closing.take();
+                match result {
+                    Ok(()) => {
+                        return match target {
+                            Some(target) => {
+                                if let CloseTarget::Window(id) = target {
+                                    debug_assert_eq!(id, self.main_window);
+                                }
+                                let mut detach =
+                                    vec![self.accessibility.detach(self.main_window).discard()];
+                                if let Some(id) = self.settings_window {
+                                    detach.push(self.accessibility.detach(id).discard());
+                                }
+                                Task::batch(detach).chain(iced::exit())
+                            }
+                            None => Task::none(),
+                        };
+                    }
+                    Err(error) => {
+                        self.set_notice(
+                            "Could not save settings",
+                            Some(error.clone()),
+                            Level::Error,
+                        );
+                        if let Some(target) = target {
+                            return self.show_close_error(target, error);
+                        }
+                    }
+                }
+            }
+            Message::RetryClose => {
+                if let Some(error) = &self.close_error {
+                    return self.close(error.target);
+                }
+            }
+            Message::KeepOpen => self.dismiss_close_error(),
+            Message::Menu(command) => return self.menu_command(command),
+            Message::StoragePolicy(reply) => self.storage_status.update(reply, self.now),
+            Message::DesktopMenu(input) => return self.desktop_menu_input(input),
+            Message::EditorFocused(value) => self.menu_editor = value,
+            Message::PopupOpen(value) => self.popup_open = value,
+            Message::Settings(open) => {
+                #[cfg(target_os = "macos")]
+                if self.screenshot.is_none() {
+                    if !open {
+                        self.settings_open = false;
+                        self.accessibility.invalidate(self.main_window);
+                        if let Some(id) = self.settings_window.take() {
+                            self.focused_window = self.main_window;
+                            self.window_scales.remove(&id);
+                            return self
+                                .accessibility
+                                .detach(id)
+                                .discard()
+                                .chain(window::close(id))
+                                .chain(window::gain_focus(self.main_window));
+                        }
+                    } else if let Some(id) = self.settings_window {
+                        return window::gain_focus(id);
+                    } else if !self.sheet_open() {
+                        let mut settings = settings::window_settings();
+                        settings.visible = false;
+                        settings.position = prefs::centered_window(self.ui_scale);
+                        let (id, opened) = window::open(settings);
+                        self.settings_window = Some(id);
+                        self.settings_open = true;
+                        self.focused_window = id;
+                        self.accessibility.invalidate(self.main_window);
+                        return opened.map(Message::WindowOpened);
+                    }
+                    return Task::none();
+                }
+                if !open || !self.sheet_open() {
+                    self.settings_open = open;
+                    if open {
+                        return operation::focus("sheet-close");
+                    }
+                }
+            }
+            Message::Appearance(value) => self.appearance = value,
+            Message::UiScale(value) => self.ui_scale = value,
+            Message::ScaledViewport(size) => {
+                self.width = size.width;
+                self.height = size.height;
+                if !self.inspector_docked() {
+                    self.inspector_peek = false;
+                }
+            }
             Message::Undo => return self.replay_history(true),
             Message::Redo => return self.replay_history(false),
             Message::FullscreenResult {
@@ -1984,37 +2370,48 @@ impl Workbench {
             Message::Frame(at) => self.refresh.redraw(at),
             Message::Displaced => {
                 self.refresh.recalibrate();
-                return screen_refresh();
+                let id = self.main_window;
+                return Task::batch([
+                    screen_refresh(id),
+                    window::scale_factor(id).map(move |scale| Message::WindowScale(id, scale)),
+                ]);
             }
             Message::ScreenRefresh(period) => self.refresh.report(period),
             Message::FrameArrived if !self.shot_staged() => self.update_frames(),
             Message::FrameArrived => {}
             Message::SystemTheme(mode) => self.system_dark = mode == theme::Mode::Dark,
-            Message::Key { chord, captured } => return self.shortcut(chord, !captured),
+            Message::Key { chord, captured } => {
+                self.desktop_menu.cancel_alt();
+                return self.shortcut(chord, !captured);
+            }
             Message::FocusNext(back) => {
                 use iced::advanced::widget::{
                     Id, Operation, operate,
                     operation::{focusable, scope},
                 };
                 fn within<T: Send + 'static>(
-                    sheet: bool,
+                    scope_id: &'static str,
                     operation: impl Operation<T> + 'static,
                 ) -> Task<T> {
-                    if sheet {
-                        operate(scope(Id::new("sheet"), operation))
-                    } else {
-                        operate(operation)
-                    }
+                    operate(scope(Id::new(scope_id), operation))
                 }
-                let sheet = self.sheet_open();
+                let scope_id = if self.close_error.is_some() {
+                    "close-error"
+                } else if self.settings_window == Some(self.focused_window) {
+                    "settings-root"
+                } else if self.sheet_open() {
+                    "sheet"
+                } else {
+                    "workbench-root"
+                };
                 let step = move || {
                     if back {
-                        within(sheet, focusable::focus_previous())
+                        within(scope_id, focusable::focus_previous())
                     } else {
-                        within(sheet, focusable::focus_next())
+                        within(scope_id, focusable::focus_next())
                     }
                 };
-                return step().chain(within(sheet, focusable::count()).then(move |count| {
+                return step().chain(within(scope_id, focusable::count()).then(move |count| {
                     if count.focused.is_none() && count.total > 0 {
                         step()
                     } else {
@@ -2022,20 +2419,23 @@ impl Workbench {
                     }
                 }));
             }
-            Message::CycleAppearance => {
-                self.appearance = match self.appearance {
-                    Appearance::System => Appearance::Light,
-                    Appearance::Light => Appearance::Dark,
-                    Appearance::Dark => Appearance::System,
+            Message::Help(open) => {
+                self.show_help(open);
+                if open && self.help_open {
+                    return operation::focus("sheet-close");
                 }
             }
-            Message::Help(open) => self.show_help(open),
-            Message::DragWindow => return window::latest().and_then(window::drag),
+            Message::DragWindow => return window::drag(self.main_window),
             Message::ZoomWindow => {
-                return window::latest().and_then(|id| match double_click_action() {
-                    Some("Minimize") => window::minimize(id, true),
-                    Some("None") => Task::none(),
-                    _ => window::toggle_maximize(id),
+                return Task::done(self.main_window).then(|id| {
+                    match prefs::double_click_action() {
+                        prefs::DoubleClickAction::Minimize => window::minimize(id, true),
+                        prefs::DoubleClickAction::None => Task::none(),
+                        prefs::DoubleClickAction::Fill => {
+                            window::run(id, prefs::fill_window).discard()
+                        }
+                        prefs::DoubleClickAction::Zoom => window::toggle_maximize(id),
+                    }
                 });
             }
             Message::Discover => self.discover(),
@@ -2090,7 +2490,10 @@ impl Workbench {
                     .snapshot
                     .cameras
                     .iter()
-                    .filter(|camera| camera.streaming != start)
+                    .filter(|camera| {
+                        camera.streaming != start
+                            && (!start || camera.info.profile.kind != CameraKind::DocumentScanner)
+                    })
                     .map(|camera| camera.info.id.clone())
                     .collect();
                 if start {
@@ -2118,6 +2521,10 @@ impl Workbench {
                         revert: false,
                     });
                 }
+            }
+            Message::BalanceCommit(value) => {
+                let _ = self.handle_message(Message::Balance(value));
+                return self.handle_message(Message::BalanceReleased);
             }
             Message::Fit => self.fit = true,
             Message::Actual => {
@@ -2183,6 +2590,7 @@ impl Workbench {
                 } else {
                     self.inspector_peek = true;
                 }
+                return operation::focus(format!("inspector-tab-{}", tab as usize));
             }
             Message::Search(value) => self.search = value,
             Message::RefreshFeatures => {
@@ -2316,10 +2724,12 @@ impl Workbench {
                 if self.inspector_docked() {
                     self.inspector_peek = false;
                 }
-                return window::latest().and_then(move |id| {
+                return Task::done(self.main_window).then(move |id| {
                     window::is_maximized(id).then(move |maximized| {
-                        window::mode(id).map(move |mode| {
-                            Message::WindowMode(mode, (!maximized).then_some(size))
+                        window::size(id).then(move |native_size| {
+                            window::mode(id).map(move |mode| {
+                                Message::WindowMode(mode, (!maximized).then_some(native_size))
+                            })
                         })
                     })
                 });
@@ -2327,7 +2737,10 @@ impl Workbench {
             Message::WindowMode(mode, size) => {
                 self.fullscreen = mode == window::Mode::Fullscreen;
                 if let (window::Mode::Windowed, Some(size)) = (mode, size) {
-                    self.window = Some([size.width, size.height]);
+                    self.window = Some([
+                        size.width * self.ui_scale.factor(),
+                        size.height * self.ui_scale.factor(),
+                    ]);
                 }
             }
             Message::Pointer => self.wake_controls(),
@@ -2379,19 +2792,51 @@ impl Workbench {
     }
 
     fn shortcut(&mut self, chord: Chord, keyboard_free: bool) -> Task<Message> {
-        let modal = self.sheet_open();
+        let modal = self.sheet_open() || self.close_error.is_some();
         // In a sheet Esc cancels or closes it, even from the field it
         // focused on opening, which took the key to leave itself.
         let keyboard_free = keyboard_free
-            || (modal && chord.key == keys::Key::Escape && chord.mods == keys::Mods::NONE);
+            || (modal
+                && !self.popup_open
+                && chord.key == keys::Key::Escape
+                && chord.mods == keys::Mods::NONE);
         let Some(action) = Action::find(&chord, keyboard_free, Os::CURRENT) else {
             return Task::none();
         };
+        self.dispatch_action(action)
+    }
+
+    pub(super) fn dispatch_action(&mut self, action: Action) -> Task<Message> {
+        if action == Action::Quit {
+            return self.handle_message(Message::Quit);
+        }
+        if self.close_error.is_some() {
+            if matches!(action, Action::Overview | Action::CloseWindow) {
+                self.dismiss_close_error();
+            }
+            return Task::none();
+        }
+        if self.settings_window == Some(self.focused_window) {
+            return match action {
+                Action::Settings => window::gain_focus(self.focused_window),
+                Action::CloseWindow | Action::Overview => {
+                    self.handle_message(Message::Settings(false))
+                }
+                Action::Undo => self.replay_history(true),
+                Action::Redo => self.replay_history(false),
+                _ => Task::none(),
+            };
+        }
+        let modal = self.sheet_open();
         let connected = self.snapshot.connected.is_some();
         match action {
             Action::Undo => return self.replay_history(true),
             Action::Redo => return self.replay_history(false),
             Action::Overview if self.help_open => self.help_open = false,
+            Action::Overview if self.settings_open && self.settings_window.is_none() => {
+                self.settings_open = false
+            }
+            Action::Settings => return self.handle_message(Message::Settings(true)),
             Action::Overview if self.capture_to.editing() => {
                 return self.picker(false, destinations::Message::Cancel);
             }
@@ -2408,16 +2853,17 @@ impl Workbench {
                     &mut self.forward_output,
                 );
             }
-            Action::Help => self.show_help(!self.help_open),
+            Action::Help => return self.handle_message(Message::Help(!self.help_open)),
             Action::CopySessionCommand => return self.copy_session_command(true),
             Action::Fullscreen => {
                 return self.fullscreen_task(None, None);
             }
-            Action::CloseWindow => return window::latest().and_then(window::close),
-            Action::ToggleSidebar => return self.handle_message(Message::ToggleSidebar),
-            Action::ToggleInspector => return self.handle_message(Message::ToggleInspector),
+            Action::CloseWindow if modal => return self.dispatch_action(Action::Overview),
+            Action::CloseWindow => return Task::done(Message::CloseRequested(self.focused_window)),
             // Sheets take the keyboard until they close.
             _ if modal => {}
+            Action::ToggleSidebar => return self.handle_message(Message::ToggleSidebar),
+            Action::ToggleInspector => return self.handle_message(Message::ToggleInspector),
             Action::Overview if self.image_mode => self.image_mode = false,
             Action::Overview if self.inspector_peek => self.inspector_peek = false,
             Action::ImageMode => self.image_mode = !self.image_mode,
@@ -2433,16 +2879,18 @@ impl Workbench {
             Action::Capture if connected => self.capture(),
             Action::ToggleAuto if connected => self.toggle_auto(),
             Action::SearchFeatures => {
-                self.tab = Tab::Features;
-                return Task::batch([
-                    operation::snap_to(inspector::SCROLL, operation::RelativeOffset::START),
-                    operation::focus("feature-search"),
-                    operation::select_all("feature-search"),
-                ]);
+                let open = self.handle_message(Message::ShowTab(Tab::Features));
+                return open
+                    .chain(operation::snap_to(
+                        inspector::SCROLL,
+                        operation::RelativeOffset::START,
+                    ))
+                    .chain(operation::focus("feature-search"))
+                    .chain(operation::select_all("feature-search"));
             }
-            Action::FeaturesTab => self.tab = Tab::Features,
-            Action::CaptureTab => self.tab = Tab::Capture,
-            Action::ForwardTab => self.tab = Tab::Forward,
+            Action::FeaturesTab => return self.handle_message(Message::ShowTab(Tab::Features)),
+            Action::CaptureTab => return self.handle_message(Message::ShowTab(Tab::Capture)),
+            Action::ForwardTab => return self.handle_message(Message::ShowTab(Tab::Forward)),
             Action::ZoomIn => self.zoom_by(1.25),
             Action::ZoomOut => self.zoom_by(1.0 / 1.25),
             Action::ZoomFit => self.fit = true,
@@ -2461,11 +2909,60 @@ impl Workbench {
 // Views
 
 impl Workbench {
+    fn window_view(&self, id: window::Id) -> Element<'_, Message> {
+        let content = if self.settings_window == Some(id) {
+            keyboard_history::guard(
+                container(self.settings_window(Palette::of(self.dark())))
+                    .id("settings-root")
+                    .into(),
+                if self.focused_window == id {
+                    self.menu_edit
+                } else {
+                    None
+                },
+                false,
+            )
+        } else {
+            container(self.view()).id("workbench-root").into()
+        };
+        accessibility::wrap(
+            self.close_error_view(
+                keyboard_history::background(content, self.closing.is_some()),
+                id,
+            ),
+            self.accessibility.clone(),
+            id,
+            if self.settings_window == Some(id) {
+                "Settings".into()
+            } else {
+                self.title()
+            },
+            self.window_scales.get(&id).copied().unwrap_or(1.0) * self.ui_scale.factor(),
+            Message::AccessibilityChanged,
+        )
+        .map(move |message| Message::InWindow(id, Box::new(message)))
+    }
+
     fn view(&self) -> Element<'_, Message> {
         let dark = self.dark();
         let p = Palette::of(dark);
-        let sidebar = self.sidebar_slide.lerp(0.0, SIDEBAR, self.now);
-        let inspector = self.inspector_slide.lerp(0.0, INSPECTOR, self.now);
+        // iced omits zero-width row children. Keep opening panes in the tree
+        // immediately so focus commands reach them before animation advances.
+        let sidebar = self.sidebar_slide.lerp(0.0, SIDEBAR, self.now).max(
+            if self.sidebar_slide.target() > 0.5 {
+                1.0
+            } else {
+                0.0
+            },
+        );
+        let inspector = self.inspector_slide.lerp(0.0, INSPECTOR, self.now).max(
+            if self.inspector_slide.target() > 0.5 {
+                1.0
+            } else {
+                0.0
+            },
+        );
+        let inspector_visible = inspector > 0.5 || self.inspector_slide.target() > 0.5;
         let docked = self.inspector_docked();
         let mut body = row![];
         // Also while it heads open, so focusing its address field finds it.
@@ -2485,7 +2982,7 @@ impl Workbench {
                 .height(Fill)
                 .style(style::base),
         );
-        if docked && inspector > 0.5 {
+        if docked && inspector_visible {
             body = body.push(rule::vertical(1).style(style::line)).push(
                 container(self.inspector(p))
                     .width(inspector)
@@ -2494,7 +2991,7 @@ impl Workbench {
             );
         }
         let mut layers = stack![body];
-        if !docked && inspector > 0.5 {
+        if !docked && inspector_visible {
             // Between the title bar and the toolbar, so the button that
             // closes it and the notices stay in reach.
             layers = layers.push(
@@ -2517,7 +3014,16 @@ impl Workbench {
         let body: Element<'_, Message> = layers
             .push(shader(self.gpu.probe()).width(1).height(1))
             .into();
-        keyboard_history::guard(self.sheets(body, p))
+        let body = self.desktop_menus(body, p);
+        keyboard_history::guard(
+            self.sheets(body, p),
+            if self.focused_window == self.main_window {
+                self.menu_edit
+            } else {
+                None
+            },
+            self.desktop_menu.active(),
+        )
     }
 
     /// The title bar row at the top of a pane; on macOS it is also the
@@ -2608,6 +3114,167 @@ fn num_requirement(key: Num) -> &'static str {
 mod tests {
     use super::*;
     use iced::futures::{FutureExt, StreamExt};
+
+    #[test]
+    fn opening_panels_build_their_editors_before_animation_frames() {
+        use iced::advanced::widget::{Tree, tree::Tag};
+        type Editor = iced::widget::text_input::State<
+            <iced::Renderer as iced::advanced::text::Renderer>::Paragraph,
+        >;
+        fn editors(tree: &Tree) -> usize {
+            usize::from(tree.tag == Tag::of::<Editor>())
+                + tree.children.iter().map(editors).sum::<usize>()
+        }
+
+        for width in [1280.0, 900.0] {
+            for action in [Action::SearchFeatures, Action::ConnectAddress] {
+                let mut app = Workbench::new(
+                    SessionHandle::new(),
+                    "test".into(),
+                    false,
+                    Some(Prefs {
+                        inspector_open: false,
+                        sidebar_open: false,
+                        ..Prefs::default()
+                    }),
+                );
+                app.width = width;
+                app.snapshot.connected = Some(crate::transport::simulator::info());
+                let before = editors(&Tree::new(app.view().as_widget()));
+                let _ = app.dispatch_action(action);
+                app.sync_animations();
+                let after = editors(&Tree::new(app.view().as_widget()));
+                assert_eq!(
+                    after,
+                    before + 1,
+                    "{action:?} is reachable at width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn auxiliary_window_resize_preserves_workbench_and_saved_window_size() {
+        let mut app = Workbench::new(SessionHandle::new(), "test".into(), false, None);
+        let settings = window::Id::unique();
+        app.settings_window = Some(settings);
+        app.window = Some([1280.0, 840.0]);
+        let _ = app.update(Message::InWindow(
+            settings,
+            Box::new(Message::Resized(Size::new(520.0, 500.0))),
+        ));
+        assert_eq!((app.width, app.height), (1280.0, 840.0));
+        assert_eq!(app.window, Some([1280.0, 840.0]));
+    }
+
+    #[test]
+    fn settings_window_blocks_camera_shortcuts_but_preserves_main_window() {
+        let mut app = Workbench::new(SessionHandle::new(), "test".into(), false, None);
+        let settings = window::Id::unique();
+        app.settings_window = Some(settings);
+        app.focused_window = settings;
+        let original = app.sidebar_open;
+        let _ = app.dispatch_action(Action::ToggleSidebar);
+        assert_eq!(app.sidebar_open, original);
+        assert!(app.closing.is_none());
+    }
+
+    #[test]
+    fn scale_adjustment_preserves_native_window_dimensions() {
+        let mut app = Workbench::new(SessionHandle::new(), "test".into(), false, None);
+        app.ui_scale = UiScale::Larger;
+        let _ = app.handle_message(Message::ScaledViewport(Size::new(800.0, 600.0)));
+        assert_eq!((app.width, app.height), (800.0, 600.0));
+        let _ = app.handle_message(Message::WindowMode(
+            window::Mode::Windowed,
+            Some(Size::new(800.0, 600.0)),
+        ));
+        assert_eq!(app.window, Some([1040.0, 780.0]));
+    }
+
+    #[test]
+    fn close_freezes_changes_and_recovers_after_a_failed_preference_flush() {
+        let mut app = Workbench::new(SessionHandle::new(), "test".into(), false, None);
+        let _ = app.close(CloseTarget::Window(app.main_window));
+        let original = app.include_simulator;
+        let _ = app.update(Message::IncludeSimulator(!original));
+        assert_eq!(app.include_simulator, original);
+        let _ = app.update(Message::PrefsFlushed(Err("disk unavailable".into())));
+        assert!(app.closing.is_none());
+        assert!(app.notice.is_some());
+        let error = app.close_error.as_ref().unwrap();
+        assert_eq!(error.window, app.main_window);
+        assert!(matches!(error.target, CloseTarget::Window(id) if id == app.main_window));
+        let _ = app.update(Message::RetryClose);
+        assert!(app.close_error.is_none());
+        assert!(matches!(app.closing, Some(CloseTarget::Window(id)) if id == app.main_window));
+    }
+
+    #[test]
+    fn failed_quit_is_visible_in_settings_and_keeps_drafts_when_cancelled() {
+        let mut app = Workbench::new(SessionHandle::new(), "test".into(), false, None);
+        let settings = window::Id::unique();
+        app.settings_window = Some(settings);
+        app.settings_open = true;
+        app.focused_window = settings;
+        app.address = "unfinished camera address".into();
+        app.help_open = true;
+        let _ = app.close(CloseTarget::Quit);
+        let _ = app.update(Message::PrefsFlushed(Err("disk full".into())));
+        let error = app.close_error.as_ref().unwrap();
+        assert_eq!(error.window, settings);
+        assert!(matches!(error.target, CloseTarget::Quit));
+        assert!(
+            app.command_menus()
+                .iter()
+                .flat_map(|menu| menu.items.iter().flatten())
+                .filter(|item| item.enabled)
+                .all(|item| matches!(
+                    item.command,
+                    menus::Command::Quit | menus::Command::Action(Action::CloseWindow)
+                ))
+        );
+        let pending = app.pending.len();
+        let _ = app.dispatch_action(Action::Discover);
+        assert_eq!(app.pending.len(), pending);
+        assert!(app.close_error.is_some());
+        let _ = app.dispatch_action(Action::Overview);
+        assert!(app.close_error.is_none());
+        assert!(app.closing.is_none());
+        assert_eq!(app.settings_window, Some(settings));
+        assert!(app.settings_open && app.help_open);
+        assert_eq!(app.address, "unfinished camera address");
+    }
+
+    #[test]
+    fn retry_after_failed_quit_preserves_quit_target_from_settings() {
+        let mut app = Workbench::new(SessionHandle::new(), "test".into(), false, None);
+        let settings = window::Id::unique();
+        app.settings_window = Some(settings);
+        app.focused_window = settings;
+        let _ = app.close(CloseTarget::Quit);
+        let _ = app.update(Message::PrefsFlushed(Err("disk full".into())));
+        let _ = app.update(Message::RetryClose);
+        assert!(app.close_error.is_none());
+        assert!(matches!(app.closing, Some(CloseTarget::Quit)));
+        assert_eq!(app.settings_window, Some(settings));
+    }
+
+    #[test]
+    fn quit_action_reaches_the_flush_path_from_sheets_and_settings() {
+        for settings in [false, true] {
+            let mut app = Workbench::new(SessionHandle::new(), "test".into(), false, None);
+            app.help_open = true;
+            if settings {
+                let id = window::Id::unique();
+                app.settings_window = Some(id);
+                app.focused_window = id;
+            }
+            let _ = app.dispatch_action(Action::Quit);
+            assert!(matches!(app.closing, Some(CloseTarget::Quit)));
+            assert!(app.help_open);
+        }
+    }
 
     #[test]
     fn scanner_timeout_is_separate_from_camera_timeout() {

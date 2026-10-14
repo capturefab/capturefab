@@ -109,6 +109,29 @@ pub const DARK: Palette = Palette {
     shadow: alpha(rgb(0x000000), 0.45),
 };
 
+/// Increase Contrast strengthens useful edges and secondary labels while
+/// preserving the user's light or dark appearance and familiar status hues.
+pub const LIGHT_CONTRAST: Palette = Palette {
+    text: Color::BLACK,
+    secondary: rgb(0x3C3C43),
+    tertiary: rgb(0x66666D),
+    control_border: rgb(0x66666D),
+    hairline: rgb(0x707078),
+    accent_text: rgb(0x144B99),
+    accent_fill: rgb(0x1755AA),
+    ..LIGHT
+};
+
+pub const DARK_CONTRAST: Palette = Palette {
+    text: Color::WHITE,
+    secondary: rgb(0xEDEDF0),
+    tertiary: rgb(0x9999A2),
+    control_border: rgb(0xB0B0B8),
+    hairline: rgb(0xA9A9B0),
+    accent_text: rgb(0xAED0FF),
+    ..DARK
+};
+
 /// Everything drawn on the stage and its glass: tiles, captions, overlays and
 /// the controls floating over the image. The stage is dark in both
 /// appearances. Its `text` and `secondary` are `ON_STAGE` and
@@ -127,11 +150,28 @@ pub const STAGE: &Palette = &Palette {
 const TINT: f32 = 0.30;
 
 impl Palette {
+    fn increased(&self) -> bool {
+        self.text == Color::WHITE || self.text == Color::BLACK
+    }
+
     pub fn of(dark: bool) -> &'static Palette {
-        if dark { &DARK } else { &LIGHT }
+        Self::appearance(dark, super::motion::increase_contrast())
+    }
+
+    fn appearance(dark: bool, increased: bool) -> &'static Palette {
+        match (dark, increased) {
+            (false, false) => &LIGHT,
+            (true, false) => &DARK,
+            (false, true) => &LIGHT_CONTRAST,
+            (true, true) => &DARK_CONTRAST,
+        }
     }
     fn from(theme: &Theme) -> &'static Palette {
-        Self::of(theme.extended_palette().is_dark)
+        let dark = theme.extended_palette().is_dark;
+        Self::appearance(
+            dark,
+            theme.palette().text == Self::appearance(dark, true).text,
+        )
     }
 
     /// `color` for text and icons: deepened (light) or lightened (dark) just
@@ -211,14 +251,19 @@ fn contrast(a: f32, b: f32) -> f32 {
 
 /// The iced theme for an appearance; widgets left unstyled still match.
 pub fn theme(dark: bool) -> Theme {
-    static THEMES: OnceLock<[Theme; 2]> = OnceLock::new();
+    theme_appearance(dark, super::motion::increase_contrast())
+}
+
+fn theme_appearance(dark: bool, increased: bool) -> Theme {
+    static THEMES: OnceLock<[Theme; 4]> = OnceLock::new();
     let themes = THEMES.get_or_init(|| {
-        [&LIGHT, &DARK].map(|p| {
+        [&LIGHT, &DARK, &LIGHT_CONTRAST, &DARK_CONTRAST].map(|p| {
             Theme::custom_with_fn(
-                if p.dark {
-                    "Capturefab Dark"
-                } else {
-                    "Capturefab Light"
+                match (p.dark, p.text == Color::WHITE || p.text == Color::BLACK) {
+                    (false, false) => "Capturefab Light",
+                    (true, false) => "Capturefab Dark",
+                    (false, true) => "Capturefab Light Increased Contrast",
+                    (true, true) => "Capturefab Dark Increased Contrast",
                 },
                 iced::theme::Palette {
                     background: p.base,
@@ -250,25 +295,57 @@ pub fn theme(dark: bool) -> Theme {
             )
         })
     });
-    themes[usize::from(dark)].clone()
+    themes[usize::from(dark) + 2 * usize::from(increased)].clone()
 }
 
-/// The platform's interface font, by family name.
-pub const SANS: Font = Font::with_name(if cfg!(target_os = "macos") {
-    "System Font"
+/// The platform's interface font. Linux uses fontconfig's generic families,
+/// configured by `initialize_fonts`, instead of choosing a distribution's font.
+pub const SANS: Font = if cfg!(target_os = "macos") {
+    Font::with_name("System Font")
 } else if cfg!(target_os = "windows") {
-    "Segoe UI"
+    Font::with_name("Segoe UI")
 } else {
-    "Noto Sans"
-});
+    Font::DEFAULT
+};
 
-pub const MONO: Font = Font::with_name(if cfg!(target_os = "macos") {
-    "Menlo"
+pub const MONO: Font = if cfg!(target_os = "macos") {
+    Font::with_name("Menlo")
 } else if cfg!(target_os = "windows") {
-    "Consolas"
+    Font::with_name("Consolas")
 } else {
-    "DejaVu Sans Mono"
-});
+    Font {
+        family: font::Family::Monospace,
+        ..Font::DEFAULT
+    }
+};
+
+/// Resolve Linux's fontconfig preferences once before any text is laid out.
+/// cosmic-text otherwise replaces its fontconfig mappings with fixed fonts.
+pub(super) fn initialize_fonts() {
+    #[cfg(target_os = "linux")]
+    {
+        use iced::advanced::graphics::text::font_system;
+        let matched = ["sans-serif", "monospace"].map(|family| {
+            std::process::Command::new("fc-match")
+                .args(["--format=%{family[0]}", family])
+                .output()
+                .ok()
+                .filter(|output| output.status.success() && output.stdout.len() <= 512)
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .filter(|name| !name.trim().is_empty())
+        });
+        let mut system = font_system()
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let db = system.raw().db_mut();
+        if let Some(family) = &matched[0] {
+            db.set_sans_serif_family(family.trim());
+        }
+        if let Some(family) = &matched[1] {
+            db.set_monospace_family(family.trim());
+        }
+    }
+}
 
 pub const MEDIUM: Font = Font {
     weight: font::Weight::Medium,
@@ -329,7 +406,11 @@ fn border(radius: f32) -> Border {
 fn hairline(color: Color, radius: f32) -> Border {
     Border {
         color,
-        width: 1.0,
+        width: if super::motion::increase_contrast() {
+            1.5
+        } else {
+            1.0
+        },
         radius: radius.into(),
     }
 }
@@ -423,17 +504,27 @@ pub fn capture_flash(level: f32) -> impl Fn(&Theme) -> container::Style {
 /// Dark glass behind controls that float over the image; `shown` fades it.
 /// Opaque while the system asks to reduce transparency.
 pub fn overlay(shown: f32) -> impl Fn(&Theme) -> container::Style {
-    glass(shown, super::motion::reduce_transparency())
+    glass(
+        shown,
+        super::motion::reduce_transparency() || super::motion::increase_contrast(),
+    )
 }
 
 /// `overlay` with its transparency chosen: opaque when `solid`.
 pub fn glass(shown: f32, solid: bool) -> impl Fn(&Theme) -> container::Style {
-    let (fill, edge) = if solid { (1.0, 0.14) } else { (0.84, 0.08) };
+    let increased = super::motion::increase_contrast();
+    let (fill, edge) = if increased {
+        (1.0, 0.65)
+    } else if solid {
+        (1.0, 0.14)
+    } else {
+        (0.84, 0.08)
+    };
     move |_theme| container::Style {
         background: Some(alpha(rgb(0x1C1C1E), fill * shown).into()),
         border: Border {
             color: alpha(Color::WHITE, edge * shown),
-            width: 1.0,
+            width: if increased { 1.5 } else { 1.0 },
             radius: RADIUS_LARGE.into(),
         },
         shadow: Shadow {
@@ -609,10 +700,15 @@ fn thumb_fill(p: &Palette) -> Color {
 // Buttons
 
 fn button_base(background: Option<Color>, text: Color, radius: f32) -> button::Style {
+    let outlined = super::motion::increase_contrast() && background.is_some();
     button::Style {
         background: background.map(Background::Color),
         text_color: text,
-        border: border(radius),
+        border: if outlined {
+            hairline(text, radius)
+        } else {
+            border(radius)
+        },
         ..button::Style::default()
     }
 }
@@ -807,7 +903,11 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
     let border = match status {
         text_input::Status::Focused { .. } => Border {
             color: p.accent,
-            width: 1.5,
+            width: if super::motion::increase_contrast() {
+                2.5
+            } else {
+                1.5
+            },
             radius: RADIUS_SMALL.into(),
         },
         text_input::Status::Hovered => hairline(p.secondary, RADIUS_SMALL),
@@ -975,8 +1075,12 @@ pub fn slide(theme: &Theme, status: slider::Status) -> slider::Style {
                 },
             },
             background: Color::WHITE.into(),
-            border_width: 1.0,
-            border_color: p.accent_fill,
+            border_width: if p.increased() { 2.0 } else { 1.0 },
+            border_color: if p.increased() {
+                Color::BLACK
+            } else {
+                p.accent_fill
+            },
         },
     }
 }
@@ -1001,7 +1105,8 @@ pub fn line(theme: &Theme) -> rule::Style {
 
 pub fn scroll(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
     let p = Palette::from(theme);
-    let shown = match status {
+    let always = super::motion::always_show_scrollbars() || super::motion::increase_contrast();
+    let shown: f32 = match status {
         scrollable::Status::Active { .. } => 0.0,
         scrollable::Status::Hovered {
             is_vertical_scrollbar_hovered,
@@ -1015,6 +1120,7 @@ pub fn scroll(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
         }
         scrollable::Status::Dragged { .. } => 0.55,
     };
+    let shown = shown.max(if always { 1.0 } else { 0.0 });
     let rail = scrollable::Rail {
         background: None,
         border: border(3.0),
@@ -1041,10 +1147,12 @@ pub fn scroll(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
 /// content overflows, so it is clear there is more below.
 pub fn sheet_scroll(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
     let mut style = scroll(theme, status);
-    if let scrollable::Status::Active {
-        is_vertical_scrollbar_disabled: false,
-        ..
-    } = status
+    if !super::motion::always_show_scrollbars()
+        && !super::motion::increase_contrast()
+        && let scrollable::Status::Active {
+            is_vertical_scrollbar_disabled: false,
+            ..
+        } = status
     {
         style.vertical_rail.scroller.background =
             alpha(Palette::from(theme).secondary, 0.22).into();
@@ -1072,6 +1180,44 @@ mod tests {
     fn contrast_follows_wcag() {
         assert!((ratio(Color::WHITE, Color::BLACK) - 21.0).abs() < 0.01);
         assert!((ratio(rgb(0x777777), Color::WHITE) - 4.48).abs() < 0.01);
+    }
+
+    #[test]
+    fn increased_contrast_strengthens_labels_and_panel_boundaries() {
+        for (normal, increased) in [(&LIGHT, &LIGHT_CONTRAST), (&DARK, &DARK_CONTRAST)] {
+            for surface in increased.grounds() {
+                assert!(ratio(increased.secondary, surface) >= 6.0);
+                assert!(ratio(increased.control_border, surface) >= 3.0);
+                assert!(ratio(increased.hairline, surface) >= 3.0);
+            }
+            assert!(
+                ratio(increased.secondary, increased.base) > ratio(normal.secondary, normal.base)
+            );
+            assert!(
+                ratio(increased.hairline, increased.base) > ratio(normal.hairline, normal.base)
+            );
+            assert!(ratio(Color::WHITE, increased.accent_fill) >= 4.5);
+            assert!(ratio(increased.accent_text, increased.base) >= 4.5);
+            assert_eq!(
+                increased.dark, normal.dark,
+                "preserves the selected appearance"
+            );
+        }
+    }
+
+    #[test]
+    fn increased_contrast_themes_select_the_matching_widget_palette() {
+        for dark in [false, true] {
+            for increased in [false, true] {
+                let theme = theme_appearance(dark, increased);
+                let p = Palette::appearance(dark, increased);
+                assert!(std::ptr::eq(Palette::from(&theme), p));
+                assert_eq!(theme.palette().background, p.base);
+                assert_eq!(theme.palette().text, p.text);
+                assert_eq!(theme.extended_palette().primary.base.color, p.accent_fill);
+                assert_eq!(theme.extended_palette().primary.base.text, Color::WHITE);
+            }
+        }
     }
 
     #[test]

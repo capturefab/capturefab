@@ -39,7 +39,7 @@ fields! {
     quota_gib: f64, quota_files: u32, retention_enabled: bool, retention_days: u64,
     quota_action: &'static str, schedule_enabled: bool, schedule_delay_seconds: u64,
     schedule_interval_seconds: f64, storage_open: bool, auto_changes_open: bool,
-    appearance: Appearance, logs_open: bool, fit: bool, zoom: f32, exposure_open: bool,
+    appearance: Appearance, ui_scale: UiScale, logs_open: bool, fit: bool, zoom: f32, exposure_open: bool,
     focus_camera: bool, sidebar_open: bool, inspector_open: bool, inspector_peek: bool,
     image_mode: bool, recent: Vec<Recent>,
 }
@@ -178,8 +178,12 @@ impl LocalChange {
 
 pub(super) fn gesture(message: &Message) -> Option<(String, Option<String>)> {
     let (label, key) = match message {
-        Message::Key { chord, captured } => {
-            let action = Action::find(chord, !captured, Os::CURRENT)?;
+        Message::Menu(menus::Command::Action(_)) | Message::Key { .. } => {
+            let action = match message {
+                Message::Menu(menus::Command::Action(action)) => *action,
+                Message::Key { chord, captured } => Action::find(chord, !captured, Os::CURRENT)?,
+                _ => unreachable!(),
+            };
             match action {
                 Action::ZoomIn | Action::ZoomOut => ("Zoom preview".into(), Some("zoom".into())),
                 Action::FeaturesTab
@@ -238,7 +242,10 @@ pub(super) fn gesture(message: &Message) -> Option<(String, Option<String>)> {
         Message::Forget(_) => ("Forget recent camera".into(), None),
         Message::Zoom(_) => ("Zoom preview".into(), Some("zoom".into())),
         Message::Fit | Message::Actual => ("Change preview scale".into(), None),
-        Message::CycleAppearance => ("Change appearance".into(), None),
+        Message::Appearance(_) => ("Change appearance".into(), None),
+        Message::UiScale(_) => ("Change interface size".into(), None),
+        Message::BalanceCommit(_) => ("Change auto exposure balance".into(), None),
+        Message::Menu(menus::Command::Schedule) => ("Change scheduling".into(), None),
         Message::IncludeSimulator(_) | Message::TrySimulator => ("Show simulator".into(), None),
         Message::Tab(_) | Message::ShowTab(_) => ("Change settings panel".into(), None),
         Message::ToggleSidebar
@@ -263,6 +270,7 @@ pub(super) fn group_barrier(message: &Message) -> bool {
         Message::Key { chord, captured } => {
             gesture(message).is_none() && Action::find(chord, !captured, Os::CURRENT).is_some()
         }
+        Message::Menu(_) => gesture(message).is_none(),
         Message::FocusNext(_)
         | Message::Commit(_)
         | Message::Set(_, _)
@@ -327,7 +335,7 @@ impl Workbench {
         desired: Option<bool>,
         replay: Option<bool>,
     ) -> Task<Message> {
-        window::latest().and_then(move |id| {
+        Task::done(self.main_window).then(move |id| {
             window::mode(id).then(move |mode| {
                 let before = mode == window::Mode::Fullscreen;
                 let expected = desired.unwrap_or(!before);

@@ -11,11 +11,29 @@ const SHEET_MIN: f32 = 320.0;
 /// Snap the sheet's body to its top when `picker` changed pages: to iced
 /// the list and an editor are one sheet, which would keep the scroll.
 fn page_top(picker: &mut Picker) -> Task<Message> {
-    if picker.take_to_top() {
-        operation::snap_to(SHEET_BODY, operation::RelativeOffset::START)
-    } else {
-        Task::none()
-    }
+    picker_page(picker, true)
+}
+
+fn picker_focus(picker: &mut Picker, was_open: bool, page_changed: bool) -> Option<&'static str> {
+    picker.take_focus().or_else(|| {
+        (picker.manager_open && (!was_open || (page_changed && !picker.editor_open())))
+            .then_some("sheet-close")
+    })
+}
+
+fn picker_page(picker: &mut Picker, was_open: bool) -> Task<Message> {
+    let changed = picker.take_to_top();
+    let focus = picker_focus(picker, was_open, changed);
+    Task::batch([
+        if changed {
+            operation::snap_to(SHEET_BODY, operation::RelativeOffset::START)
+        } else {
+            Task::none()
+        },
+        focus.map_or_else(Task::none, |id| {
+            Task::batch([operation::focus(id), operation::select_all(id)])
+        }),
+    ])
 }
 
 /// State for the sheets: the quick guide and the destination sheets (whose
@@ -75,6 +93,10 @@ impl Workbench {
             return false;
         }
         match word {
+            "settings" => {
+                self.settings_open = true;
+                true
+            }
             "help-more" => {
                 self.help_open = true;
                 self.sheets.more = true;
@@ -138,12 +160,9 @@ impl Workbench {
         } else {
             (&mut self.capture_to, &mut self.output)
         };
+        let was_open = picker.manager_open;
         picker.update(message, output);
-        let top = page_top(picker);
-        match picker.take_focus() {
-            Some(id) => Task::batch([top, operation::focus(id), operation::select_all(id)]),
-            None => top,
-        }
+        picker_page(picker, was_open)
     }
 
     /// Bring a destination sheet whose page changed on its own, as a
@@ -167,15 +186,25 @@ impl Workbench {
         body: Element<'a, Message>,
         p: &'static Palette,
     ) -> Element<'a, Message> {
+        // The parent remains at the same position in the widget tree as a
+        // sheet opens and closes, preserving its field focus and selection.
+        let body = keyboard_history::background(body, self.sheet_open());
         let t = self.sheets.shown.get(self.now);
         let (height, spin, now) = (self.sheet_height(), self.spin(), self.now);
-        if self.help_open {
+        if self.settings_open && self.settings_window.is_none() {
+            modal(
+                body,
+                self.settings_sheet(p, height),
+                Some(Message::Settings(false)),
+                t,
+            )
+        } else if self.help_open {
             modal(body, self.help(p, height), Some(Message::Help(false)), t)
         } else if self.capture_to.manager_open {
             modal(
                 body,
-                self.capture_to
-                    .manager(
+                accessibility::mapped(
+                    self.capture_to.manager(
                         p.dark,
                         height,
                         spin,
@@ -186,8 +215,9 @@ impl Workbench {
                         (!self.history_busy())
                             .then(|| self.history_label(false))
                             .flatten(),
-                    )
-                    .map(Message::CapturePicker),
+                    ),
+                    Message::CapturePicker,
+                ),
                 (!self.capture_to.editing())
                     .then_some(Message::CapturePicker(destinations::Message::CloseManager)),
                 t,
@@ -195,8 +225,8 @@ impl Workbench {
         } else if self.record_to.manager_open {
             modal(
                 body,
-                self.record_to
-                    .manager(
+                accessibility::mapped(
+                    self.record_to.manager(
                         p.dark,
                         height,
                         spin,
@@ -207,8 +237,9 @@ impl Workbench {
                         (!self.history_busy())
                             .then(|| self.history_label(false))
                             .flatten(),
-                    )
-                    .map(Message::RecordPicker),
+                    ),
+                    Message::RecordPicker,
+                ),
                 (!self.record_to.editing())
                     .then_some(Message::RecordPicker(destinations::Message::CloseManager)),
                 t,
@@ -221,7 +252,7 @@ impl Workbench {
             ]
             .into()
         } else {
-            body
+            stack![body].into()
         }
     }
 
@@ -328,6 +359,38 @@ mod tests {
     fn press(bench: &mut Workbench, action: Action) {
         let chord = action.bindings(Os::CURRENT)[0];
         let _ = bench.shortcut(chord, true);
+    }
+
+    #[test]
+    fn destination_pages_focus_opened_sheet_and_restore_list_after_editor_cancel() {
+        let mut bench = bench();
+        let picker = &mut bench.capture_to;
+        let mut output = "capture.png".to_owned();
+        picker.update(destinations::Message::OpenManager, &mut output);
+        assert_eq!(picker_focus(picker, false, false), Some("sheet-close"));
+        picker.update(destinations::Message::AddBucket, &mut output);
+        let changed = picker.take_to_top();
+        assert!(changed);
+        let field = picker_focus(picker, true, changed).expect("editor focus");
+        assert_ne!(
+            field, "sheet-close",
+            "editor's first field takes precedence"
+        );
+        picker.update(destinations::Message::Cancel, &mut output);
+        let changed = picker.take_to_top();
+        assert_eq!(picker_focus(picker, true, changed), Some("sheet-close"));
+        assert_eq!(
+            picker_focus(picker, true, false),
+            None,
+            "ordinary ticks do not reset focus"
+        );
+        picker.update(destinations::Message::CloseManager, &mut output);
+        let changed = picker.take_to_top();
+        assert_eq!(
+            picker_focus(picker, true, changed),
+            None,
+            "closed sheets retain parent focus"
+        );
     }
 
     #[test]

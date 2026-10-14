@@ -136,6 +136,11 @@ pub fn chord(
     modifiers: keyboard::Modifiers,
     os: Os,
 ) -> Option<Chord> {
+    // Super/Windows combinations belong to the desktop shell. Dropping that
+    // modifier could turn Win+R into the workbench's unmodified R command.
+    if os != Os::Mac && modifiers.logo() {
+        return None;
+    }
     use key::Named;
     let key = match key {
         keyboard::Key::Named(named) => match named {
@@ -240,11 +245,13 @@ pub enum Action {
     CopySessionCommand,
     Fullscreen,
     Help,
+    Settings,
     CloseWindow,
+    Quit,
 }
 
 impl Action {
-    pub const ALL: [Action; 29] = [
+    pub const ALL: [Action; 31] = [
         Action::Undo,
         Action::Redo,
         Action::Discover,
@@ -273,7 +280,9 @@ impl Action {
         Action::CopySessionCommand,
         Action::Fullscreen,
         Action::Help,
+        Action::Settings,
         Action::CloseWindow,
+        Action::Quit,
     ];
 
     /// Help sheet layout: section title and its actions in reading order.
@@ -328,7 +337,9 @@ impl Action {
             &[
                 Action::CopySessionCommand,
                 Action::Help,
+                Action::Settings,
                 Action::CloseWindow,
+                Action::Quit,
             ],
         ),
     ];
@@ -365,13 +376,15 @@ impl Action {
             Action::CopySessionCommand => "Copy session command",
             Action::Fullscreen => "Full screen",
             Action::Help => "This guide",
+            Action::Settings => "Settings",
             Action::CloseWindow => "Close window",
+            Action::Quit => "Quit Capturefab",
         }
     }
 
     /// Key bindings for `os`, primary first. Command chords use ⌘ on macOS and Ctrl elsewhere,
     /// reserving text-editing keys for their usual meaning and avoiding keys that
-    /// the OS menu already owns (⌘H, ⌘Q, Ctrl+W, Ctrl+Tab).
+    /// the OS menu already owns (⌘H, ⌘Q, Alt+F4, Ctrl+Tab).
     pub fn bindings(self, os: Os) -> Vec<Chord> {
         let mac = os == Os::Mac;
         let with = |mods, key| Chord { mods, key };
@@ -388,6 +401,7 @@ impl Action {
         match self {
             Action::Undo => vec![cmd('z')],
             Action::Redo if mac => vec![with(cmd_shift, Key::Char('z'))],
+            Action::Redo if os == Os::Windows => vec![cmd('y'), with(cmd_shift, Key::Char('z'))],
             Action::Redo => vec![with(cmd_shift, Key::Char('z')), cmd('y')],
             Action::Discover if mac => vec![cmd('r')],
             Action::Discover => vec![cmd('r'), bare(Key::F5)],
@@ -397,6 +411,7 @@ impl Action {
             Action::PreviousCamera if mac => vec![with(cmd_alt, Key::Left)],
             Action::PreviousCamera => vec![with(Mods::COMMAND, Key::PageUp)],
             Action::FocusCamera => vec![bare(Key::Enter)],
+            Action::Overview if mac => vec![bare(Key::Escape), cmd('.')],
             Action::Overview => vec![bare(Key::Escape)],
             Action::ToggleStream => vec![bare(Key::Space)],
             Action::Capture => vec![cmd('s')],
@@ -426,10 +441,14 @@ impl Action {
             Action::Fullscreen => vec![bare(Key::F11)],
             Action::Help if mac => vec![cmd('?'), bare(Key::F1)],
             Action::Help => vec![bare(Key::F1), cmd('/')],
+            Action::Settings => vec![cmd(',')],
             Action::CloseWindow if mac => vec![cmd('w')],
-            Action::CloseWindow if os == Os::Nix => vec![cmd('q')],
+            Action::CloseWindow if os == Os::Nix => vec![cmd('w')],
             // Windows closes with Alt+F4, which the OS handles.
             Action::CloseWindow => vec![],
+            Action::Quit if os == Os::Nix => vec![cmd('q')],
+            // AppKit owns ⌘Q; Windows uses the native window close command.
+            Action::Quit => vec![],
         }
     }
 
@@ -494,12 +513,15 @@ mod tests {
     #[test]
     fn bindings_avoid_keys_owned_by_the_os_and_text_fields() {
         for os in PLATFORMS {
-            // Text editing, the macOS app menu, and emacs-style deletions in fields elsewhere.
+            // Text editing, the macOS app menu, and emacs-style deletions in
+            // Windows fields. Linux reserves Ctrl+W for closing a window.
             let mut reserved: Vec<char> = vec!['a', 'c', 'v', 'x', 'z', 'y'];
             if os == Os::Mac {
                 reserved.extend(['h', 'q']);
-            } else {
+            } else if os == Os::Windows {
                 reserved.extend(['h', 'k', 'u', 'w']);
+            } else {
+                reserved.extend(['h', 'k', 'u']);
             }
             for action in Action::ALL {
                 if matches!(action, Action::Undo | Action::Redo) {
@@ -537,10 +559,11 @@ mod tests {
         }
         for os in PLATFORMS {
             for action in Action::ALL {
-                // Only Windows leaves window closing to the OS (Alt+F4).
+                // Native commands own Windows closing and macOS quitting.
                 assert_eq!(
                     action.bindings(os).is_empty(),
-                    action == Action::CloseWindow && os == Os::Windows,
+                    (action == Action::CloseWindow && os == Os::Windows)
+                        || (action == Action::Quit && os != Os::Nix),
                     "{action:?} on {os:?}"
                 );
             }
@@ -549,10 +572,13 @@ mod tests {
 
     #[test]
     fn shortcut_labels_follow_the_platform() {
+        assert_eq!(Action::Settings.key_label(Os::Mac), "⌘,");
+        assert_eq!(Action::Settings.key_label(Os::Windows), "Ctrl+,");
+        assert_eq!(Action::Redo.key_label(Os::Nix), "Ctrl+Shift+Z");
         assert_eq!(Action::Undo.key_label(Os::Mac), "⌘Z");
         assert_eq!(Action::Redo.key_label(Os::Mac), "⇧⌘Z");
         assert_eq!(Action::Undo.key_label(Os::Windows), "Ctrl+Z");
-        assert_eq!(Action::Redo.key_label(Os::Windows), "Ctrl+Shift+Z");
+        assert_eq!(Action::Redo.key_label(Os::Windows), "Ctrl+Y");
         assert_eq!(Action::Capture.key_label(Os::Windows), "Ctrl+S");
         assert_eq!(Action::Fullscreen.key_label(Os::Windows), "F11");
         assert_eq!(Action::ToggleAuto.key_label(Os::Nix), "Ctrl+Shift+A");
@@ -628,6 +654,47 @@ mod tests {
     }
 
     #[test]
+    fn linux_quit_and_window_close_are_distinct_even_in_a_focused_sheet_field() {
+        for keyboard_free in [false, true] {
+            for (key, action) in [('q', Action::Quit), ('w', Action::CloseWindow)] {
+                assert_eq!(
+                    Action::find(
+                        &Chord {
+                            mods: Mods::COMMAND,
+                            key: Key::Char(key),
+                        },
+                        keyboard_free,
+                        Os::Nix,
+                    ),
+                    Some(action),
+                );
+            }
+        }
+        assert_eq!(Action::Quit.key_label(Os::Nix), "Ctrl+Q");
+        assert_eq!(Action::CloseWindow.key_label(Os::Nix), "Ctrl+W");
+        assert!(Action::Quit.bindings(Os::Mac).is_empty());
+        assert!(Action::CloseWindow.bindings(Os::Windows).is_empty());
+    }
+
+    #[test]
+    fn command_period_cancels_on_macos_only_even_with_a_focused_control() {
+        let cancel = Chord {
+            mods: Mods::COMMAND,
+            key: Key::Char('.'),
+        };
+        for os in PLATFORMS {
+            for keyboard_free in [false, true] {
+                assert_eq!(
+                    Action::find(&cancel, keyboard_free, os),
+                    (os == Os::Mac).then_some(Action::Overview),
+                    "{os:?} with keyboard_free={keyboard_free}",
+                );
+            }
+            assert_eq!(Action::Overview.key_label(os), "Esc");
+        }
+    }
+
+    #[test]
     fn iced_key_presses_become_chords() {
         use keyboard::{Key as K, Modifiers as M, key::Code, key::Physical};
         let code = Physical::Code;
@@ -684,5 +751,36 @@ mod tests {
             Action::find(&dvorak.unwrap(), true, Os::Nix),
             Some(Action::Capture)
         );
+    }
+    #[test]
+    fn desktop_shell_shortcuts_do_not_dispatch_as_plain_app_commands() {
+        for os in [Os::Windows, Os::Nix] {
+            for (letter, code) in [
+                ('r', key::Code::KeyR),
+                ('f', key::Code::KeyF),
+                ('h', key::Code::KeyH),
+            ] {
+                assert!(
+                    chord(
+                        &keyboard::Key::Character(letter.to_string().into()),
+                        key::Physical::Code(code),
+                        keyboard::Modifiers::LOGO,
+                        os,
+                    )
+                    .is_none(),
+                    "the desktop shell owns Super+{letter}"
+                );
+            }
+            assert!(
+                chord(
+                    &keyboard::Key::Character("s".into()),
+                    key::Physical::Code(key::Code::KeyS),
+                    keyboard::Modifiers::LOGO | keyboard::Modifiers::CTRL,
+                    os,
+                )
+                .is_none(),
+                "Super+Ctrl must not become Ctrl"
+            );
+        }
     }
 }

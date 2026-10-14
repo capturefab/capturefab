@@ -470,7 +470,8 @@ fn quiet_checkbox<'a>(
     on: impl Fn(bool) -> Message + 'a,
     p: &'static Palette,
 ) -> Element<'a, Message> {
-    iced::widget::checkbox(checked)
+    let toggle = on(!checked);
+    let check = iced::widget::checkbox(checked)
         .label(label)
         .on_toggle(on)
         .size(14)
@@ -479,7 +480,14 @@ fn quiet_checkbox<'a>(
         .style(move |theme, status| iced::widget::checkbox::Style {
             text_color: Some(p.secondary),
             ..style::check(theme, status)
-        })
+        });
+    button(check)
+        .name(label)
+        .role(accessibility::Role::CheckBox)
+        .checked(checked)
+        .padding(0)
+        .style(style::bare)
+        .on_press(toggle)
         .into()
 }
 
@@ -551,15 +559,6 @@ impl Workbench {
         }
         let discovering = self.pending(Job::Discover);
         let spin = self.spin();
-        let brand = row![
-            icon(Icon::Mark, 16.0, p.accent),
-            text("Capturefab")
-                .size(style::HEADING)
-                .font(style::SEMIBOLD)
-                .color(p.text),
-        ]
-        .spacing(7)
-        .align_y(Alignment::Center);
         let mut header = row![
             text("Cameras")
                 .size(style::CAPTION)
@@ -588,6 +587,7 @@ impl Workbench {
         };
         let header = header.push(space::horizontal()).push(tip(
             button(refresh)
+                .name(DISCOVERS)
                 .padding(5)
                 .style(style::plain)
                 .on_press_maybe((!discovering).then_some(Message::Discover)),
@@ -655,21 +655,17 @@ impl Workbench {
         }
         container(
             column![
-                // Beside the macOS traffic lights, which sit at the left.
+                // Camera controls share the title row beside macOS traffic
+                // lights, leaving the sidebar's height for the device list.
                 self.titlebar(
-                    container(brand)
+                    container(header)
                         .padding(iced::Padding {
                             left: self.lights().max(EDGE + INSET),
+                            right: EDGE + 1.0,
                             ..iced::Padding::ZERO
                         })
                         .into()
                 ),
-                space().height(10),
-                container(header).padding(iced::Padding {
-                    right: EDGE + 1.0,
-                    left: EDGE + INSET,
-                    ..iced::Padding::ZERO
-                }),
                 space().height(4),
                 container(scrollable(list).height(Fill).style(style::scroll))
                     .height(Fill)
@@ -766,6 +762,7 @@ impl Workbench {
         let eject = || -> Element<'a, Message> {
             tip(
                 button(icon(Icon::Eject, 13.0, p.secondary))
+                    .name(format!("Disconnect {} {}", camera.vendor, camera.model))
                     .padding(4)
                     .style(style::plain)
                     .on_press(Message::Disconnect(camera.id.clone())),
@@ -788,6 +785,7 @@ impl Workbench {
         }
         let base = tip(
             button(line)
+                .name(hint.clone())
                 .width(Fill)
                 .padding([7.0, INSET])
                 .style(style::row(self.selection_level(id)))
@@ -822,6 +820,7 @@ impl Workbench {
         .spacing(8)
         .align_y(Alignment::Center);
         button(line)
+            .name(format!("Connecting to {}", short_address(target)))
             .width(Fill)
             .padding([7.0, INSET])
             .style(style::row(0.0))
@@ -875,6 +874,7 @@ impl Workbench {
         }
         let forget = tip(
             button(icon(Icon::Close, 11.0, p.secondary))
+                .name(format!("Forget {}", entry.label))
                 .padding(5)
                 .style(style::plain)
                 .on_press(Message::Forget(entry.target.clone())),
@@ -883,6 +883,7 @@ impl Workbench {
         hover(
             tip(
                 button(line)
+                    .name(format!("Reconnect {}", entry.label))
                     .width(Fill)
                     .padding([7.0, INSET])
                     .style(style::row(0.0))
@@ -921,6 +922,9 @@ impl Workbench {
         let failure = self.side.connect_failures.get(typed);
         let shake = self.side.shake(typed, self.now);
         let field = text_input("Add camera, IP or stream URL", &self.address)
+            .name("Camera address")
+            .description("Enter a camera IP address, stream URL or device identifier, then press Return to connect.")
+            .invalid(failure.map(|(error, _)| format!("Could not connect: {error}")))
             .id("connect-address")
             .icon(icon::input_icon(Icon::Plus))
             .on_input(Message::Address)
@@ -991,6 +995,7 @@ impl Workbench {
                 .spacing(5)
                 .align_y(Alignment::Center),
             )
+            .name(format!("Copy command for session {}", self.session))
             .padding([5, 6])
             .style(style::plain)
             .on_press(Message::CopySessionCommand),
@@ -1003,13 +1008,15 @@ impl Workbench {
         let settings = row![
             tip_above(
                 button(icon(appearance.0, 15.0, p.secondary))
+                    .name("Settings")
                     .padding(6)
                     .style(style::plain)
-                    .on_press(Message::CycleAppearance),
-                appearance.1,
+                    .on_press(Message::Settings(true)),
+                Action::Settings.hint("Settings", Os::CURRENT),
             ),
             tip_above(
                 button(icon(Icon::Help, 15.0, p.secondary))
+                    .name("Keyboard shortcuts and quick guide")
                     .padding(6)
                     .style(style::plain)
                     .on_press(Message::Help(true)),

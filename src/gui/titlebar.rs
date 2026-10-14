@@ -495,6 +495,7 @@ fn tag<'a>(
     about: String,
 ) -> Element<'a, Message> {
     let padding = if label.is_some() { [3, 10] } else { [3, 8] };
+    let accessible_name = label.clone().unwrap_or_else(|| about.clone());
     let mut content = row![mark].spacing(6).align_y(Alignment::Center);
     if let Some(label) = label {
         content = content.push(
@@ -506,6 +507,7 @@ fn tag<'a>(
     }
     tip(
         button(content)
+            .name(accessible_name)
             .padding(padding)
             .style(tag_style(color))
             .on_press(on),
@@ -652,6 +654,7 @@ impl Workbench {
                     .spacing(7)
                     .align_y(Alignment::Center),
                 )
+                .name("All cameras")
                 .padding([5, 12])
                 .style(style::secondary)
                 .on_press(Message::Focus(false)),
@@ -674,6 +677,7 @@ impl Workbench {
                     .spacing(7)
                     .align_y(Alignment::Center),
                 )
+                .name("Scan and save")
                 .padding([5, 12])
                 .style(style::secondary)
                 .on_press_maybe(
@@ -824,6 +828,8 @@ impl Workbench {
         };
         tip(
             button(label)
+                .name("Automatic camera tuning")
+                .checked(on)
                 .padding([5, 12])
                 // Ignoring presses would otherwise read as disabled.
                 .style(move |theme, status| {
@@ -886,12 +892,18 @@ impl Workbench {
             let ink = if all_on { p.ink(p.accent) } else { p.secondary };
             auto = auto.push(icon::spinner(12.0, ink, self.spin()));
         }
-        auto = auto.push(text(auto_label).size(style::BODY).font(style::MEDIUM));
+        auto = auto.push(
+            text(auto_label.clone())
+                .size(style::BODY)
+                .font(style::MEDIUM),
+        );
         let stopping = phase.pending();
         let stop = stopping.unwrap_or(snapshot.cameras.iter().all(|c| c.streaming));
         let actions = row![
             tip(
                 button(auto)
+                    .name(auto_label)
+                    .checked(all_on)
                     .padding([5, 12])
                     .style(move |theme, status| {
                         let status = if auto_busy {

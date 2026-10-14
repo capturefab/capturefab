@@ -1,6 +1,7 @@
 //! Small building blocks shared by the views.
 use super::*;
 use iced::widget::{Row, Stack, column};
+mod radio_group;
 
 pub(super) use super::oneline::one_line;
 
@@ -24,7 +25,7 @@ pub(super) fn focus_address() -> Task<Message> {
 }
 
 /// Tooltip in the workbench style, opening below `content`.
-pub(super) fn tip<'a, M: 'a>(
+pub(super) fn tip<'a, M: Clone + 'static>(
     content: impl Into<Element<'a, M>>,
     tip: impl ToString,
 ) -> Element<'a, M> {
@@ -33,7 +34,7 @@ pub(super) fn tip<'a, M: 'a>(
 
 /// Tooltip opening above `content`, for controls along the window's bottom
 /// edge, where one below would land on the control itself.
-pub(super) fn tip_above<'a, M: 'a>(
+pub(super) fn tip_above<'a, M: Clone + 'static>(
     content: impl Into<Element<'a, M>>,
     tip: impl ToString,
 ) -> Element<'a, M> {
@@ -41,14 +42,15 @@ pub(super) fn tip_above<'a, M: 'a>(
 }
 
 /// Tooltip at `position`. Long text wraps at 360 px.
-pub(super) fn tip_at<'a, M: 'a>(
+pub(super) fn tip_at<'a, M: Clone + 'static>(
     content: impl Into<Element<'a, M>>,
     tip: impl ToString,
     position: tooltip::Position,
 ) -> Element<'a, M> {
+    let tip = tip.to_string();
     tooltip(
-        content,
-        container(text(tip.to_string()).size(style::SMALL))
+        accessibility::named(content.into(), tip.clone()),
+        container(text(tip).size(style::SMALL))
             .max_width(360)
             .padding([5, 9])
             .style(style::tooltip),
@@ -84,19 +86,114 @@ pub(super) fn veil<'a, M: 'a>(
         .into()
 }
 
-pub(super) fn checkbox<'a, M: 'a>(
+pub(super) fn checkbox<'a, M: Clone + 'static>(
     label: &'a str,
     checked: bool,
     on: impl Fn(bool) -> M + 'a,
 ) -> Element<'a, M> {
-    iced::widget::checkbox(checked)
-        .label(label)
-        .on_toggle(on)
+    checkbox_named(label, label, checked, on)
+}
+
+pub(super) fn checkbox_maybe<'a, M: Clone + 'static>(
+    label: &'a str,
+    checked: bool,
+    on: Option<impl Fn(bool) -> M + 'a>,
+) -> Element<'a, M> {
+    checkbox_named_maybe(label, label, checked, on)
+}
+
+pub(super) fn checkbox_named<'a, M: Clone + 'static>(
+    label: &'a str,
+    accessible_name: &str,
+    checked: bool,
+    on: impl Fn(bool) -> M + 'a,
+) -> Element<'a, M> {
+    checkbox_named_maybe(label, accessible_name, checked, Some(on))
+}
+
+fn checkbox_named_maybe<'a, M: Clone + 'static>(
+    label: &'a str,
+    accessible_name: &str,
+    checked: bool,
+    on: Option<impl Fn(bool) -> M + 'a>,
+) -> Element<'a, M> {
+    let toggle = on.as_ref().map(|on| on(!checked));
+    let mut check = iced::widget::checkbox(checked)
+        .on_toggle_maybe(on)
         .size(16)
         .spacing(8)
         .text_size(style::BODY)
-        .style(style::check)
+        .style(style::check);
+    if !label.is_empty() {
+        check = check.label(label);
+    }
+    button(check)
+        .name(accessible_name)
+        .role(accessibility::Role::CheckBox)
+        .checked(checked)
+        .padding(0)
+        .style(style::bare)
+        .on_press_maybe(toggle)
         .into()
+}
+
+/// The quality/frame-rate balance slider participates in Tab traversal and
+/// changes with arrow keys. A keyboard step is committed just like a completed
+/// pointer drag, rather than leaving an unsubmitted value on screen.
+pub(super) fn balance_slider<'a>(value: f64) -> Element<'a, Message> {
+    button(
+        iced::widget::slider(0.0..=1.0, value, Message::Balance)
+            .step(0.01)
+            .on_release(Message::BalanceReleased)
+            .style(style::slide),
+    )
+    .name("Auto-exposure quality and frame-rate balance")
+    .role(accessibility::Role::Slider)
+    .value(format!("{:.0}%", value * 100.0))
+    .numeric_value(value, 0.0, 1.0, 0.01)
+    .increment(Message::BalanceCommit(
+        ((value + 0.01) * 100.0).round().min(100.0) / 100.0,
+    ))
+    .decrement(Message::BalanceCommit(
+        ((value - 0.01) * 100.0).round().max(0.0) / 100.0,
+    ))
+    .set_value(move |input| {
+        let value = input
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .unwrap_or(value);
+        Message::BalanceCommit(value.clamp(0.0, 1.0))
+    })
+    .width(Fill)
+    .padding(0)
+    .style(style::bare)
+    .on_press(Message::BalanceReleased)
+    .on_key_press(move |key, modifiers| {
+        balance_key_value(value, key, modifiers.shift()).map(|next| {
+            if next == value {
+                Vec::new()
+            } else {
+                vec![Message::Balance(next), Message::BalanceReleased]
+            }
+        })
+    })
+    .into()
+}
+
+fn balance_key_value(value: f64, key: &keyboard::Key, large_step: bool) -> Option<f64> {
+    use keyboard::{Key, key::Named};
+    let step = if large_step { 0.1 } else { 0.01 };
+    let value = match key {
+        Key::Named(Named::ArrowRight | Named::ArrowUp) => value + step,
+        Key::Named(Named::ArrowLeft | Named::ArrowDown) => value - step,
+        Key::Named(Named::PageUp) => value + 0.1,
+        Key::Named(Named::PageDown) => value - 0.1,
+        Key::Named(Named::Home) => 0.0,
+        Key::Named(Named::End) => 1.0,
+        _ => return None,
+    };
+    Some((value.clamp(0.0, 1.0) * 100.0).round() / 100.0)
 }
 
 /// Single-line text that is cut off at its container's edge.
@@ -141,8 +238,8 @@ pub(super) fn status_dot<'a, M: 'a>(state: CameraState, size: f32, p: &Palette) 
 }
 
 /// A section title: a small label above its group.
-pub(super) fn heading<'a, M: 'a>(title: &'a str, p: &'static Palette) -> Element<'a, M> {
-    container(
+pub(super) fn heading<'a, M: 'static>(title: &'a str, p: &'static Palette) -> Element<'a, M> {
+    let content = container(
         text(title)
             .size(style::CAPTION)
             .font(style::SEMIBOLD)
@@ -152,20 +249,23 @@ pub(super) fn heading<'a, M: 'a>(title: &'a str, p: &'static Palette) -> Element
         top: 6.0,
         ..iced::Padding::ZERO
     })
-    .into()
+    .into();
+    accessibility::label(content, title.into(), accessibility::Role::Heading)
 }
 
 /// A header that opens and closes the group under it. `turn` is how open it
 /// is, from 0 (closed, chevron pointing right) to 1 (open, pointing down),
 /// for the caller to animate; `summary`, if any, sums up the closed group at
 /// the right of the header.
-pub(super) fn disclosure<'a, M: Clone + 'a>(
+pub(super) fn disclosure<'a, M: Clone + 'static>(
     title: impl text::IntoFragment<'a>,
     summary: Option<String>,
     turn: f32,
     on: M,
     p: &'static Palette,
 ) -> Element<'a, M> {
+    let title = title.into_fragment();
+    let name = title.to_string();
     // The font's chevrons at rest, like every other; drawn only mid-turn.
     let chevron = if turn <= 0.0 || turn >= 1.0 {
         icon(
@@ -205,6 +305,9 @@ pub(super) fn disclosure<'a, M: Clone + 'a>(
     }
     // Flush with the content's edge; the hover fill still has room on the right.
     button(header)
+        .name(name)
+        .role(accessibility::Role::DisclosureTriangle)
+        .expanded(turn > 0.5)
         .width(Fill)
         .padding(iced::Padding {
             top: 3.0,
@@ -277,11 +380,13 @@ impl<M> iced::widget::canvas::Program<M> for Chevron {
 
 /// An error caption under the field it concerns. Pair it with
 /// `style::input_invalid` on the field.
-pub(super) fn field_error<'a, M: 'a>(
+pub(super) fn field_error<'a, M: 'static>(
     message: impl text::IntoFragment<'a>,
     p: &'static Palette,
 ) -> Element<'a, M> {
-    row![
+    let message = message.into_fragment();
+    let name = message.to_string();
+    let content = row![
         // Centered on the first line, should the message wrap.
         container(Level::Error.mark(11.0, p))
             .height(Length::Fixed(style::line_height(style::CAPTION)))
@@ -291,7 +396,8 @@ pub(super) fn field_error<'a, M: 'a>(
             .color(Level::Error.color(p)),
     ]
     .spacing(5)
-    .into()
+    .into();
+    accessibility::label(content, name, accessibility::Role::Alert)
 }
 
 /// A command in monospace with a button that copies it. `copied` (from
@@ -343,10 +449,34 @@ pub(super) fn code_block<'a>(
 /// the selection at `thumb`, a segment index the caller animates: whole
 /// numbers at rest, fractions while sliding. Labels keep one weight, so
 /// nothing reflows, and brighten as the thumb passes under them.
-pub(super) fn segmented<'a, M: Clone + 'a>(
+pub(super) fn segmented<'a, M: Clone + 'static>(
     items: Vec<(&'a str, Option<M>, String)>,
+    selected: usize,
     thumb: f32,
 ) -> Element<'a, M> {
+    segments(items, selected, thumb, false)
+}
+
+/// Inspector panes are tabs. Selection describes the current pane immediately;
+/// the thumb remains a visual animation, independent of native semantics.
+pub(super) fn inspector_tabs<'a, M: Clone + 'static>(
+    items: Vec<(&'a str, Option<M>, String)>,
+    selected: usize,
+    thumb: f32,
+) -> Element<'a, M> {
+    segments(items, selected, thumb, true)
+}
+
+fn segments<'a, M: Clone + 'static>(
+    items: Vec<(&'a str, Option<M>, String)>,
+    selected: usize,
+    thumb: f32,
+    tabs: bool,
+) -> Element<'a, M> {
+    let choices = items
+        .iter()
+        .filter_map(|(_, message, _)| message.clone())
+        .collect();
     let last = items.len().saturating_sub(1) as f32;
     let thumb = thumb.clamp(0.0, last);
     // Spacers on either side place the thumb; a zero portion would not be
@@ -375,20 +505,37 @@ pub(super) fn segmented<'a, M: Clone + 'a>(
                 .width(Fill)
                 .align_x(Alignment::Center),
         )
+        .name(label)
         .width(Fill)
         .padding([4, 12])
         .style(style::segment_label(lit))
         .on_press_maybe(on);
+        let segment = if tabs {
+            let id = match i {
+                0 => "inspector-tab-0",
+                1 => "inspector-tab-1",
+                _ => "inspector-tab-2",
+            };
+            segment
+                .id(id)
+                .role(accessibility::Role::Tab)
+                .selected(i == selected)
+        } else {
+            segment
+                .role(accessibility::Role::RadioButton)
+                .checked(i == selected)
+        };
         if hint.is_empty() {
             segment.into()
         } else {
             tip(segment, hint)
         }
     }));
-    container(Stack::new().push(labels).push_under(slide))
+    let group = container(Stack::new().push(labels).push_under(slide))
         .padding(2)
         .style(style::segment_track)
-        .into()
+        .into();
+    radio_group::wrap(group, choices, tabs)
 }
 
 pub(super) fn icon_button<'a>(
@@ -433,6 +580,7 @@ pub(super) fn stream_button<'a>(
             .spacing(7)
             .align_y(Alignment::Center),
     )
+    .name(label)
     .padding([5, 14])
     // Ignoring presses would otherwise read as disabled.
     .style(move |theme, status| base(theme, if busy { button::Status::Active } else { status }))
@@ -482,7 +630,9 @@ pub(super) struct SheetFrame<'a, M> {
     title: text::Fragment<'a>,
     mark: Option<Icon>,
     back: Option<M>,
+    back_enabled: bool,
     close: M,
+    close_enabled: bool,
     body: Element<'a, M>,
     footer: Option<Element<'a, M>>,
     width: f32,
@@ -494,7 +644,7 @@ pub(super) struct SheetFrame<'a, M> {
 
 /// A sheet titled `title` around `body`, whose close button sends `close`;
 /// 560 × 640 unless sized.
-pub(super) fn sheet_frame<'a, M: Clone + 'a>(
+pub(super) fn sheet_frame<'a, M: Clone + 'static>(
     title: impl text::IntoFragment<'a>,
     close: M,
     body: impl Into<Element<'a, M>>,
@@ -504,7 +654,9 @@ pub(super) fn sheet_frame<'a, M: Clone + 'a>(
         title: title.into_fragment(),
         mark: None,
         back: None,
+        back_enabled: true,
         close,
+        close_enabled: true,
         body: body.into(),
         footer: None,
         width: 560.0,
@@ -526,6 +678,20 @@ impl<'a, M: Clone + 'a> SheetFrame<'a, M> {
     /// the sheet, such as an editor; `None` leaves it out.
     pub(super) fn back(mut self, back: Option<M>) -> Self {
         self.back = back;
+        self
+    }
+
+    /// Keep the back control visible while an operation temporarily prevents
+    /// leaving the current page.
+    pub(super) fn back_enabled(mut self, enabled: bool) -> Self {
+        self.back_enabled = enabled;
+        self
+    }
+
+    /// Keep the close control visible while an operation temporarily prevents
+    /// dismissing the sheet.
+    pub(super) fn close_enabled(mut self, enabled: bool) -> Self {
+        self.close_enabled = enabled;
         self
     }
 
@@ -556,13 +722,15 @@ impl<'a, M: Clone + 'a> SheetFrame<'a, M> {
     }
 }
 
-impl<'a, M: Clone + 'a> From<SheetFrame<'a, M>> for Element<'a, M> {
+impl<'a, M: Clone + 'static> From<SheetFrame<'a, M>> for Element<'a, M> {
     fn from(frame: SheetFrame<'a, M>) -> Self {
         let SheetFrame {
             title,
             mark,
             back,
+            back_enabled,
             close,
+            close_enabled,
             body,
             footer,
             width,
@@ -571,13 +739,16 @@ impl<'a, M: Clone + 'a> From<SheetFrame<'a, M>> for Element<'a, M> {
             on_scroll,
             p,
         } = frame;
+        let close_name = format!("Close {title}");
+        let title_name = title.to_string();
         let mut head = row![].spacing(10).align_y(Alignment::Center);
         if let Some(back) = back {
             head = head.push(tip(
                 button(icon(Icon::ChevronLeft, 14.0, p.secondary))
+                    .name("Back")
                     .padding(6)
                     .style(style::plain)
-                    .on_press(back),
+                    .on_press_maybe(back_enabled.then_some(back)),
                 "Back",
             ));
         }
@@ -585,13 +756,19 @@ impl<'a, M: Clone + 'a> From<SheetFrame<'a, M>> for Element<'a, M> {
             head = head.push(icon(mark, 24.0, p.accent));
         }
         let head = head
-            .push(text(title).size(style::DISPLAY).font(style::BOLD))
+            .push(accessibility::label(
+                text(title).size(style::DISPLAY).font(style::BOLD).into(),
+                title_name,
+                accessibility::Role::Heading,
+            ))
             .push(space::horizontal())
             .push(tip(
                 button(icon(Icon::Close, 14.0, p.secondary))
+                    .name(close_name)
+                    .id("sheet-close")
                     .padding(6)
                     .style(style::plain)
-                    .on_press(close),
+                    .on_press_maybe(close_enabled.then_some(close)),
                 Action::Overview.hint("Close", Os::CURRENT),
             ));
         let room = max_height - SHEET_HEADER - if footer.is_some() { SHEET_FOOTER } else { 0.0 };
@@ -651,7 +828,7 @@ impl<'a, M: Clone + 'a> From<SheetFrame<'a, M>> for Element<'a, M> {
 
 /// `history` as a sparkline of `width` × `height`, explained by `about` on
 /// hover; blank space of the same size until there is a line to draw.
-pub(super) fn spark<'a, M: 'a>(
+pub(super) fn spark<'a, M: Clone + 'static>(
     history: Option<&'a sparkline::History>,
     color: Color,
     flag: Color,
@@ -672,5 +849,51 @@ pub(super) fn spark<'a, M: 'a>(
             about(history),
         ),
         None => space().width(width).height(height).into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slider_keys_step_snap_and_reach_the_bounds() {
+        use keyboard::{Key, key::Named};
+        assert_eq!(
+            balance_key_value(0.5, &Key::Named(Named::ArrowRight), false),
+            Some(0.51)
+        );
+        assert_eq!(
+            balance_key_value(0.5, &Key::Named(Named::ArrowLeft), true),
+            Some(0.4)
+        );
+        assert_eq!(
+            balance_key_value(0.95, &Key::Named(Named::PageUp), false),
+            Some(1.0)
+        );
+        assert_eq!(
+            balance_key_value(0.05, &Key::Named(Named::PageDown), false),
+            Some(0.0)
+        );
+        assert_eq!(
+            balance_key_value(0.5, &Key::Named(Named::Home), false),
+            Some(0.0)
+        );
+        assert_eq!(
+            balance_key_value(0.5, &Key::Named(Named::End), false),
+            Some(1.0)
+        );
+        assert_eq!(
+            balance_key_value(1.0, &Key::Named(Named::ArrowUp), false),
+            Some(1.0)
+        );
+        assert_eq!(
+            balance_key_value(0.0, &Key::Named(Named::ArrowDown), false),
+            Some(0.0)
+        );
+        assert_eq!(
+            balance_key_value(0.5, &Key::Named(Named::Space), false),
+            None
+        );
     }
 }
