@@ -32,9 +32,6 @@ const SCPS_FIRE: u32 = 0x8000_0000;
 const SCPS_NO_FRAGMENT: u32 = 0x4000_0000;
 const SCPS_BIG_ENDIAN: u32 = 0x2000_0000;
 const PACKET_SIZE_MAX: u32 = 9000;
-// Permit scheduler and network jitter while still requiring three consecutive
-// correctly sized packets before accepting a path.
-const TEST_WAIT: Duration = Duration::from_millis(100);
 const MEMORY_CHUNK: usize = 512;
 const MAX_XML: usize = 16 * 1024 * 1024;
 const MAX_PAYLOAD: usize = 128 * 1024 * 1024;
@@ -1096,7 +1093,10 @@ fn probe_packet_size(
             return None;
         }
         readback = Some(tested);
-        let deadline = Instant::now() + TEST_WAIT;
+        // Stream-path validation has the same configured latency budget as
+        // control traffic; a fixed short deadline mistakes host jitter for a
+        // smaller path MTU. All three packets must still pass independently.
+        let deadline = Instant::now() + control.timeout;
         let mut received = false;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2096,7 +2096,7 @@ mod tests {
             camera.test_packets = true;
             setup(camera);
         });
-        let mut control = Control::connect(fake.address, Duration::from_millis(200)).unwrap();
+        let mut control = Control::connect(fake.address, Duration::from_secs(2)).unwrap();
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = socket.local_addr().unwrap().port();
         control
