@@ -5,6 +5,53 @@ use iced::{Alignment, Font, Pixels, Size, Theme};
 
 type Paragraph = iced::advanced::graphics::text::Paragraph;
 
+#[test]
+fn collapsed_padded_viewports_publish_empty_bounds_without_reversed_clamps() {
+    let text = Rectangle::with_size(Size::new(100.0, 40.0));
+    for (width, height, expected_width, expected_height) in [
+        (-8.9, 30.0, 0.0, 30.0),
+        (80.0, -22.0, 56.0, 0.0),
+        (-8.9, -22.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0, 0.0),
+    ] {
+        assert_eq!(
+            clip(
+                text,
+                Rectangle {
+                    x: 44.0,
+                    y: 6.0,
+                    width,
+                    height
+                }
+            ),
+            Rectangle {
+                x: 44.0,
+                y: 6.0,
+                width: expected_width,
+                height: expected_height
+            }
+        );
+    }
+    // A normal visible viewport retains the exact text intersection.
+    assert_eq!(
+        clip(
+            text,
+            Rectangle {
+                x: 44.0,
+                y: 6.0,
+                width: 80.0,
+                height: 30.0
+            }
+        ),
+        Rectangle {
+            x: 44.0,
+            y: 6.0,
+            width: 56.0,
+            height: 30.0
+        }
+    );
+}
+
 fn paragraph(value: &str) -> Paragraph {
     <Paragraph as text::Paragraph>::with_text(text::Text {
         content: value,

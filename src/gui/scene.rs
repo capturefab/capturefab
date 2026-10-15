@@ -15,6 +15,87 @@ pub(super) struct ScreenshotRequest {
     pub(super) requested: bool,
     pub(super) save: Option<Receiver<Result<()>>>,
     pub(super) outcome: Arc<Mutex<Option<String>>>,
+    pub(super) sequence: ScreenshotSequence,
+}
+
+/// Optional bounded renderer frame sequence for documentation videos. Each
+/// frame is painted by the normal workbench; no desktop pixels are captured.
+#[derive(Clone, Copy)]
+pub(super) struct ScreenshotSequence {
+    frames: u32,
+    index: u32,
+    interval: Duration,
+    next: Option<Instant>,
+}
+
+impl ScreenshotSequence {
+    pub(super) fn from_env() -> Result<Self> {
+        Self::parse(
+            std::env::var("CAPTUREFAB_SCREENSHOT_FRAMES")
+                .ok()
+                .as_deref(),
+            std::env::var("CAPTUREFAB_SCREENSHOT_FPS").ok().as_deref(),
+        )
+    }
+
+    fn parse(frames: Option<&str>, fps: Option<&str>) -> Result<Self> {
+        let frames = frames.unwrap_or("1").parse::<u32>().map_err(|_| {
+            anyhow::anyhow!("CAPTUREFAB_SCREENSHOT_FRAMES must be an integer from 1 to 240")
+        })?;
+        let fps = fps.unwrap_or("8").parse::<u32>().map_err(|_| {
+            anyhow::anyhow!("CAPTUREFAB_SCREENSHOT_FPS must be an integer from 1 to 15")
+        })?;
+        anyhow::ensure!(
+            (1..=240).contains(&frames),
+            "CAPTUREFAB_SCREENSHOT_FRAMES must be an integer from 1 to 240"
+        );
+        anyhow::ensure!(
+            (1..=15).contains(&fps),
+            "CAPTUREFAB_SCREENSHOT_FPS must be an integer from 1 to 15"
+        );
+        Ok(Self {
+            frames,
+            index: 0,
+            interval: Duration::from_secs_f64(1.0 / f64::from(fps)),
+            next: None,
+        })
+    }
+
+    pub(super) fn path(&self, base: &std::path::Path) -> PathBuf {
+        if self.frames == 1 {
+            return base.to_owned();
+        }
+        let stem = base.file_stem().unwrap_or_default().to_string_lossy();
+        base.with_file_name(format!("{stem}-{:04}.png", self.index))
+    }
+
+    fn more(&mut self) -> bool {
+        self.index += 1;
+        self.index < self.frames
+    }
+
+    fn ready(&self) -> bool {
+        self.ready_at(Instant::now())
+    }
+
+    fn ready_at(&self, now: Instant) -> bool {
+        self.next.is_none_or(|next| now >= next)
+    }
+
+    fn requested(&mut self) {
+        self.next = Some(Instant::now() + self.interval);
+    }
+
+    fn timeout(&self) -> Duration {
+        // Allow startup and painting time, while keeping even a one-frame/s
+        // documentation sequence finite. This does not affect a single shot.
+        Duration::from_secs(30)
+            + if self.frames > 1 {
+                self.interval.max(Duration::from_millis(250)) * self.frames
+            } else {
+                Duration::ZERO
+            }
+    }
 }
 
 /// What a screenshot scene holds in place while the cameras start.
@@ -307,6 +388,13 @@ impl Workbench {
         };
         if let Some(receiver) = &request.save {
             match receiver.try_recv() {
+                Ok(Ok(())) if request.sequence.more() => {
+                    // Release the snapshot freeze between frames. Acquisition,
+                    // real CLI commands and normal UI updates keep running.
+                    request.staged = false;
+                    request.requested = false;
+                    request.save = None;
+                }
                 Ok(result) => {
                     return finish(
                         &request,
@@ -326,7 +414,9 @@ impl Workbench {
                 .and_then(window::screenshot)
                 .map(Message::Screenshot);
             request.requested = true;
+            request.sequence.requested();
         } else if !request.requested
+            && request.sequence.ready()
             && self.snapshot.cameras.len() == request.cameras as usize
             && self.pending.len() == self.scene.held.len()
         {
@@ -364,7 +454,7 @@ impl Workbench {
                 request.staged = true;
             }
         }
-        if request.started.elapsed() > Duration::from_secs(30) {
+        if request.started.elapsed() > request.sequence.timeout() {
             return finish(
                 &request,
                 Some(format!(
@@ -397,6 +487,54 @@ pub(super) fn save_screenshot(shot: &window::Screenshot, path: &std::path::Path)
 mod tests {
     use super::*;
     use liveness::streaming_camera;
+
+    #[test]
+    fn screenshot_sequence_preserves_single_shot_and_bounds_work() {
+        let base = std::path::Path::new("/tmp/workbench.png");
+        let mut single = ScreenshotSequence::parse(None, None).unwrap();
+        assert_eq!(single.path(base), base);
+        assert_eq!(single.timeout(), Duration::from_secs(30));
+        assert!(!single.more());
+        for value in ["0", "241", "-1", "2.5", "invalid"] {
+            assert!(ScreenshotSequence::parse(Some(value), None).is_err());
+        }
+        for value in ["0", "16", "-1", "2.5", "invalid"] {
+            assert!(ScreenshotSequence::parse(None, Some(value)).is_err());
+        }
+    }
+
+    #[test]
+    fn screenshot_sequence_names_every_frame_and_finishes() {
+        let base = std::path::Path::new("/tmp/workbench.png");
+        let mut sequence = ScreenshotSequence::parse(Some("3"), Some("5")).unwrap();
+        assert_eq!(
+            sequence.path(base),
+            std::path::Path::new("/tmp/workbench-0000.png")
+        );
+        assert!(sequence.ready());
+        let before_request = Instant::now();
+        sequence.requested();
+        assert!(
+            sequence
+                .next
+                .is_some_and(|next| next >= before_request + sequence.interval)
+        );
+        let next = sequence.next.unwrap();
+        assert!(!sequence.ready_at(next - Duration::from_nanos(1)));
+        assert!(sequence.ready_at(next));
+        assert!(sequence.more());
+        assert_eq!(
+            sequence.path(base),
+            std::path::Path::new("/tmp/workbench-0001.png")
+        );
+        assert!(sequence.more());
+        assert_eq!(
+            sequence.path(base),
+            std::path::Path::new("/tmp/workbench-0002.png")
+        );
+        assert!(!sequence.more());
+        assert!(sequence.timeout() < Duration::from_secs(31));
+    }
 
     fn bench() -> Workbench {
         let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);

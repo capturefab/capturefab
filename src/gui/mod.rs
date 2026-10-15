@@ -131,6 +131,10 @@ pub fn run_capture(
             "Window closed before the renderer screenshot was saved".into()
         })));
     let app_outcome = outcome.clone();
+    let screenshot_sequence = screenshot
+        .as_ref()
+        .map(|_| scene::ScreenshotSequence::from_env())
+        .transpose()?;
     let screenshot_size = if screenshot.is_some() {
         std::env::var("CAPTUREFAB_SCREENSHOT_SIZE")
             .ok()
@@ -227,6 +231,7 @@ pub fn run_capture(
                 requested: false,
                 save: None,
                 outcome: app_outcome.clone(),
+                sequence: screenshot_sequence.expect("validated screenshot sequence"),
             });
             for index in 0..if existing == 0 { count } else { 0 } {
                 app.send(
@@ -2998,7 +3003,7 @@ impl Workbench {
             }
             Message::Screenshot(shot) => {
                 if let Some(request) = &mut self.screenshot {
-                    let path = request.path.clone();
+                    let path = request.sequence.path(&request.path);
                     let (sender, receiver) = mpsc::channel();
                     std::thread::spawn(move || {
                         let _ = sender.send(scene::save_screenshot(&shot, &path));

@@ -261,15 +261,18 @@ impl State {
 }
 
 fn clip(bounds: Rectangle, viewport: Rectangle) -> Rectangle {
-    let x = bounds.x.clamp(viewport.x, viewport.x + viewport.width);
-    let y = bounds.y.clamp(viewport.y, viewport.y + viewport.height);
+    // A collapsing panel can briefly give its padded input a negative inner
+    // viewport. It has no visible area; preserve that empty clip instead of
+    // passing reversed limits to f32::clamp and aborting the native event loop.
+    let right = viewport.x + viewport.width.max(0.0);
+    let bottom = viewport.y + viewport.height.max(0.0);
+    let x = bounds.x.clamp(viewport.x, right);
+    let y = bounds.y.clamp(viewport.y, bottom);
     Rectangle {
         x,
         y,
-        width: ((bounds.x + bounds.width).clamp(viewport.x, viewport.x + viewport.width) - x)
-            .max(0.0),
-        height: ((bounds.y + bounds.height).clamp(viewport.y, viewport.y + viewport.height) - y)
-            .max(0.0),
+        width: ((bounds.x + bounds.width).clamp(viewport.x, right) - x).max(0.0),
+        height: ((bounds.y + bounds.height).clamp(viewport.y, bottom) - y).max(0.0),
     }
 }
 
