@@ -2,6 +2,7 @@
 pub mod accel;
 pub mod analytics;
 pub mod auto;
+pub mod autocapture;
 pub mod camera;
 pub mod camera_profile;
 pub mod cli;

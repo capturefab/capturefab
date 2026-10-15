@@ -80,6 +80,30 @@ pub enum SessionCommand {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         revert: bool,
     },
+    /// Create or resume a single-file, camera-bound capture database.
+    CaptureSessionOpen {
+        path: String,
+        create: bool,
+    },
+    CaptureSessionClose,
+    /// Capture preference learning is independent of automatic exposure.
+    AutoCapture {
+        enabled: bool,
+        sensitivity: f64,
+        cooldown_ms: u64,
+    },
+    /// Save one positive training capture directly into the active database.
+    CaptureExample {
+        timeout_ms: u64,
+    },
+    /// Fetch the next pending candidate, or a specific pending candidate.
+    CaptureReview {
+        id: Option<u64>,
+    },
+    ReviewCapture {
+        id: u64,
+        keep: bool,
+    },
     Capture {
         output: String,
         count: u32,
@@ -162,6 +186,7 @@ pub fn deserialize_command<'de, D: serde::Deserializer<'de>>(
                     | "features"
                     | "xml"
                     | "stop_forward"
+                    | "capture_session_close"
             )
         })
         && let Some(field) = fields.keys().find(|key| key.as_str() != "op")
@@ -267,6 +292,41 @@ impl SessionCommand {
     /// their owners when the command executes.
     pub fn validate(&self) -> Result<()> {
         match self {
+            Self::CaptureSessionOpen { path, .. } => {
+                ensure!(
+                    !path.trim().is_empty()
+                        && !path.chars().any(char::is_control)
+                        && path != ":memory:",
+                    "capture session requires a database file path"
+                );
+                ensure!(
+                    std::path::Path::new(path)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("duckdb")),
+                    "capture session file must have a .duckdb extension"
+                );
+            }
+            Self::AutoCapture {
+                sensitivity,
+                cooldown_ms,
+                ..
+            } => {
+                ensure!(
+                    sensitivity.is_finite() && (0.0..=1.0).contains(sensitivity),
+                    "sensitivity must be a finite number from 0 to 1"
+                );
+                ensure!(
+                    (250..=3_600_000).contains(cooldown_ms),
+                    "cooldown must be 250..3600000 milliseconds"
+                );
+            }
+            Self::CaptureExample { timeout_ms } => validate_timeout(*timeout_ms)?,
+            Self::CaptureReview { id: Some(id) } | Self::ReviewCapture { id, .. } => {
+                ensure!(
+                    *id > 0 && *id <= i64::MAX as u64,
+                    "capture ID must be 1..9223372036854775807"
+                );
+            }
             Self::Activity { timeout_ms, .. } => {
                 ensure!(
                     *timeout_ms <= 25_000,
@@ -491,6 +551,8 @@ pub struct CameraSnapshot {
     #[serde(default)]
     pub auto: Option<crate::auto::AutoStatus>,
     #[serde(default)]
+    pub capture_session: Option<crate::autocapture::SessionStatus>,
+    #[serde(default)]
     pub transport: Option<crate::types::TransportStats>,
     #[serde(default)]
     pub history: CameraHistoryStatus,
@@ -540,6 +602,8 @@ pub struct SessionSnapshot {
     #[serde(default)]
     pub auto: Option<crate::auto::AutoStatus>,
     #[serde(default)]
+    pub capture_session: Option<crate::autocapture::SessionStatus>,
+    #[serde(default)]
     pub transport: Option<crate::types::TransportStats>,
     #[serde(default)]
     pub history: CameraHistoryStatus,
@@ -569,6 +633,7 @@ fn project_selected(state: &mut SessionSnapshot) {
         state.forwarding = camera.forwarding.clone();
         state.jobs = camera.jobs.clone();
         state.auto = camera.auto.clone();
+        state.capture_session = camera.capture_session.clone();
         state.transport = camera.transport.clone();
         state.history = camera.history.clone();
         state.last_error = camera.last_error.clone();
@@ -583,6 +648,7 @@ fn project_selected(state: &mut SessionSnapshot) {
         state.forwarding = None;
         state.jobs.clear();
         state.auto = None;
+        state.capture_session = None;
         state.transport = None;
         state.history = CameraHistoryStatus::default();
     }
@@ -985,6 +1051,7 @@ impl SessionHandle {
                         forwarding: s.forwarding.clone(),
                         jobs: s.jobs.clone(),
                         auto: s.auto.clone(),
+                        capture_session: s.capture_session.clone(),
                         transport: s.transport.clone(),
                         history: s.history.clone(),
                         ring_dropped,
@@ -1855,6 +1922,7 @@ mod tests {
             forwarding: Some(format!("{id}.mp4")),
             jobs: Vec::new(),
             auto: None,
+            capture_session: None,
             transport: None,
             history: CameraHistoryStatus::default(),
             ring_dropped: 0,

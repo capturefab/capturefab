@@ -369,6 +369,7 @@ pub(super) fn streaming_camera(frames: u64, dropped: u64, fps: f64) -> CameraSna
         forwarding: None,
         jobs: Vec::new(),
         auto: None,
+        capture_session: None,
         transport: None,
         history: crate::session::CameraHistoryStatus::default(),
         ring_dropped: 0,

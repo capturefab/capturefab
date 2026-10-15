@@ -327,6 +327,7 @@ impl Activity {
                 | SessionCommand::Features
                 | SessionCommand::Xml
                 | SessionCommand::ReadMemory { .. }
+                | SessionCommand::CaptureReview { .. }
         ) {
             return None;
         }
@@ -515,6 +516,27 @@ fn describe(command: &SessionCommand) -> (&'static str, String) {
                 "Switch to manual mode"
             }
             .into(),
+        ),
+        CaptureSessionOpen { path, create } => (
+            "capture_session_open",
+            format!(
+                "{} capture session {path}",
+                if *create { "Create" } else { "Resume" }
+            ),
+        ),
+        CaptureSessionClose => ("capture_session_close", "Close capture session".into()),
+        AutoCapture { enabled, .. } => (
+            "auto_capture",
+            format!("{} auto capture", if *enabled { "Enable" } else { "Pause" }),
+        ),
+        CaptureExample { .. } => ("capture_example", "Teach capture preference".into()),
+        CaptureReview { .. } => ("capture_review", "Read capture review".into()),
+        ReviewCapture { id, keep } => (
+            "review_capture",
+            format!(
+                "{} auto capture {id}",
+                if *keep { "Keep" } else { "Discard" }
+            ),
         ),
         Capture {
             output,

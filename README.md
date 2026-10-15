@@ -76,6 +76,32 @@ capturefab --session bench start
 capturefab --session bench stop
 ```
 
+## Automatic capture and review
+
+A capture session is one portable `.duckdb` file, bound to a camera. Create or resume a session in the desktop capture controls, take a few examples, then enable **Auto capture**. User-initiated captures teach the session what matters. Review suggested frames with **Keep** or **Discard**; every decision updates the session model. Pending suggestions do not train themselves. The review card supports quick decisions while live acquisition continues.
+
+The CLI exposes the same controls through a running GUI or headless session:
+
+```sh
+capturefab --session bench connect sim:0
+capturefab --session bench --camera sim:0 capture-session new inspection.duckdb
+capturefab --session bench --camera sim:0 capture-session teach
+capturefab --session bench --camera sim:0 capture-session auto --sensitivity 0.5 --cooldown-ms 2000
+capturefab --session bench --camera sim:0 capture-session review --json
+capturefab --session bench --camera sim:0 capture-session keep 1
+capturefab --session bench --camera sim:0 capture-session discard 2
+capturefab --session bench --camera sim:0 capture-session auto --pause
+capturefab --session bench --camera sim:0 capture-session close
+# Reconnect the same camera, then restore its examples, feedback and review queue:
+capturefab --session bench --camera sim:0 capture-session resume inspection.duckdb
+```
+
+Use the IDs returned by `review`; `--id ID` retrieves a particular pending suggestion. `--json` includes a base64 RGBA preview. `status --json` exposes `capture_session` for each camera. Capture-session controls require a running session and an already connected camera. Auto capture starts live acquisition and is independent of automatic exposure. `auto --pause` retains learned examples; each `auto` command defaults sensitivity and cooldown to 0.5 and 2000 ms unless supplied.
+
+The database stores sensor frames, descriptors, settings, feedback and pending reviews. Close it before copying the file. Discarded captures release sensor pixels and retain their negative training descriptor and decision. Automatic capture pauses suggestions at 200 pending reviews or a 2 GiB stored-pixel limit; review or begin another session to continue. Reopening restores saved capture settings and restarts acquisition if auto capture was enabled; reconnect the same camera first.
+
+The built-in learner uses small spatial color/edge descriptors, nearest-example preference scoring and background novelty on the CPU. It needs no model download or cloud service. It is a lightweight baseline, with limited semantic understanding and sensitivity to camera and lighting changes. The [model research and evaluation plan](docs/auto-capture-models.md) compares DINOv2/DINOv3, AnomalyDINO, PatchCore, EfficientAD and WinCLIP as pretrained alternatives; these neural backends are not included in the initial implementation.
+
 ## Repeatable workflows
 
 Validate an ordered JSON plan before connecting to cameras, then apply it to the visible workbench or a headless session:

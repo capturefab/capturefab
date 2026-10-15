@@ -335,11 +335,53 @@ pub enum WorkflowCommand {
     },
 }
 #[derive(Debug, Subcommand)]
+pub enum CaptureSessionCommand {
+    /// Create a new camera-bound DuckDB session; existing files are never overwritten
+    New { path: PathBuf },
+    /// Resume examples, feedback and pending reviews from an existing DuckDB session
+    Resume { path: PathBuf },
+    /// Close and checkpoint the active capture database
+    Close,
+    /// Save a positive training capture in the active database
+    Teach,
+    /// Enable automatic capture, or pause it while retaining the learned examples
+    Auto {
+        #[arg(long)]
+        pause: bool,
+        /// Suggestion sensitivity, from 0 (selective) to 1 (more suggestions)
+        #[arg(long, default_value_t = 0.5, value_parser = parse_sensitivity)]
+        sensitivity: f64,
+        /// Minimum delay between suggestions, in milliseconds
+        #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u64).range(250..=3_600_000))]
+        cooldown_ms: u64,
+    },
+    /// Fetch the next pending review, or one pending capture by ID
+    Review {
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=i64::MAX as u64))]
+        id: Option<u64>,
+    },
+    /// Keep a suggested capture and learn from the positive feedback
+    Keep {
+        #[arg(value_parser = clap::value_parser!(u64).range(1..=i64::MAX as u64))]
+        id: u64,
+    },
+    /// Discard a suggested capture and learn from the negative feedback
+    Discard {
+        #[arg(value_parser = clap::value_parser!(u64).range(1..=i64::MAX as u64))]
+        id: u64,
+    },
+}
+#[derive(Debug, Subcommand)]
 pub enum Command {
     /// Validate and apply repeatable multi-camera setup, capture and recording plans
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
+    },
+    /// Learn capture preferences and review suggestions in a persistent DuckDB session
+    CaptureSession {
+        #[command(subcommand)]
+        command: CaptureSessionCommand,
     },
     /// Open the desktop GUI and expose its local automation session
     Gui {
@@ -625,6 +667,12 @@ fn parse_balance(s: &str) -> std::result::Result<f64, String> {
             }),
     }
 }
+fn parse_sensitivity(s: &str) -> std::result::Result<f64, String> {
+    s.parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        .ok_or_else(|| "expected a finite sensitivity from 0 to 1".into())
+}
 fn assignment(s: &str) -> Result<(String, String)> {
     let (k, v) = s.split_once('=').context("expected FEATURE=VALUE")?;
     ensure!(
@@ -788,6 +836,7 @@ fn request_timeout(cli: &Cli, command: &SessionCommand) -> Result<Duration> {
             } => timeout_ms
                 .saturating_mul(u64::from(*count))
                 .saturating_add(60_000),
+            SessionCommand::CaptureExample { timeout_ms } => timeout_ms.saturating_add(60_000),
             _ => 60_000,
         }
     };
@@ -829,6 +878,7 @@ fn camera_command(command: Option<&Command>) -> bool {
             command,
             Some(
                 Command::Disconnect
+                    | Command::CaptureSession { .. }
                     | Command::Start
                     | Command::Stop
                     | Command::Auto { .. }
@@ -946,6 +996,39 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
     }
     crate::session::validate_timeout(cli.timeout_ms)?;
     let command = match &cli.command {
+        Some(Command::CaptureSession { command }) => Some(match command {
+            CaptureSessionCommand::New { path } | CaptureSessionCommand::Resume { path } => {
+                SessionCommand::CaptureSessionOpen {
+                    path: path
+                        .to_str()
+                        .context("capture session path must be valid UTF-8")?
+                        .into(),
+                    create: matches!(command, CaptureSessionCommand::New { .. }),
+                }
+            }
+            CaptureSessionCommand::Close => SessionCommand::CaptureSessionClose,
+            CaptureSessionCommand::Teach => SessionCommand::CaptureExample {
+                timeout_ms: cli.timeout_ms,
+            },
+            CaptureSessionCommand::Auto {
+                pause,
+                sensitivity,
+                cooldown_ms,
+            } => SessionCommand::AutoCapture {
+                enabled: !pause,
+                sensitivity: *sensitivity,
+                cooldown_ms: *cooldown_ms,
+            },
+            CaptureSessionCommand::Review { id } => SessionCommand::CaptureReview { id: *id },
+            CaptureSessionCommand::Keep { id } => SessionCommand::ReviewCapture {
+                id: *id,
+                keep: true,
+            },
+            CaptureSessionCommand::Discard { id } => SessionCommand::ReviewCapture {
+                id: *id,
+                keep: false,
+            },
+        }),
         Some(Command::Activity { after, wait }) => Some(SessionCommand::Activity {
             after: *after,
             timeout_ms: wait
@@ -1491,6 +1574,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         &cli.command,
         Some(
             Command::Connect { .. }
+                | Command::CaptureSession { .. }
                 | Command::Select { .. }
                 | Command::Disconnect
                 | Command::Start
@@ -1696,6 +1780,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             json!({"camera":status["connected"]["id"],"history":status["history"]})
         }
         Command::Status => client.call(SessionCommand::Status)?,
+        Command::CaptureSession { .. } => client.call(prepared.clone().unwrap())?,
         Command::Activity { .. } => client.call(prepared.clone().unwrap())?,
         Command::Capture {
             output: destination,
@@ -1870,6 +1955,48 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
                 .as_str()
                 .unwrap_or("Nothing to redo")
         )?;
+    } else if let Some(Command::CaptureSession { command }) = &cli.command {
+        match command {
+            CaptureSessionCommand::Close => writeln!(out, "Capture session closed.")?,
+            CaptureSessionCommand::Review { .. } => {
+                if let Some(id) = value["capture"]["id"].as_u64() {
+                    writeln!(
+                        out,
+                        "Capture #{id}: {} (score {:.3})",
+                        value["capture"]["reason"].as_str().unwrap_or("Suggestion"),
+                        value["capture"]["score"].as_f64().unwrap_or(0.0)
+                    )?;
+                    writeln!(
+                        out,
+                        "Use capture-session keep {id} or discard {id}; --json includes the RGBA preview."
+                    )?;
+                } else {
+                    writeln!(out, "No captures pending review.")?;
+                }
+            }
+            CaptureSessionCommand::Keep { id } => {
+                writeln!(out, "Kept capture #{id}; session model updated.")?
+            }
+            CaptureSessionCommand::Discard { id } => {
+                writeln!(out, "Discarded capture #{id}; session model updated.")?
+            }
+            CaptureSessionCommand::Teach => {
+                writeln!(out, "Saved training capture #{}.", value["id"])?
+            }
+            _ => {
+                let session = &value["capture_session"];
+                writeln!(
+                    out,
+                    "{}: {} · {} manual · {} kept · {} discarded · {} pending",
+                    session["path"].as_str().unwrap_or("Capture session"),
+                    session["state"].as_str().unwrap_or("ready"),
+                    session["manual_count"],
+                    session["kept_count"],
+                    session["discarded_count"],
+                    session["pending_count"]
+                )?;
+            }
+        }
     } else if matches!(&cli.command, Some(Command::Activity { .. })) {
         writeln!(out, "Session activity · revision {}", value["revision"])?;
         for entry in value["activity"].as_array().into_iter().flatten() {
@@ -2142,6 +2269,18 @@ fn schema() -> Value {
     contract["capture"]["path_base"] = json!(
         "CLI capture/record/RPC local output paths resolve in the calling terminal; workflow paths resolve beside their file; named destination paths remain relative to the destination"
     );
+    contract["capture_session"] = json!({
+        "cli":"--session NAME [--camera ID] capture-session new PATH.duckdb | resume PATH.duckdb | close | teach | auto [--pause] [--sensitivity 0.5] [--cooldown-ms 2000] | review [--id ID] | keep ID | discard ID",
+        "scope":"Camera-bound persistent controls; connect the camera in a GUI/serve session first. Temporary --direct workers are rejected.",
+        "storage":"One .duckdb file stores raw saved frames, descriptors, capture decisions, settings and background prototypes. New refuses existing paths; resume requires an existing compatible session for this camera. Close checkpoints the database. Discard removes raw pixels while retaining negative descriptors and the decision.",
+        "paths":"CLI and RPC database paths resolve in the calling terminal; workflow database paths resolve beside the workflow file.",
+        "learning":"Manual training captures and kept suggestions are positive examples; discarded suggestions are negative examples. Pending suggestions do not train the model. The built-in model is a native visual-descriptor nearest-example baseline with background novelty; no pretrained neural weights are downloaded.",
+        "controls":"Auto capture is independent of auto exposure. auto enables acquisition; --pause pauses suggestions and keeps examples. Sensitivity and cooldown default to 0.5 and 2000ms on each auto command. Resume restores saved settings; hardware must be reconnected.",
+        "status":"status.capture_session and cameras[].capture_session; null when no capture database is open",
+        "review":"Returns {capture:null|{id,score,reason,width,height,rgba},capture_session:...}; rgba is a base64-encoded 480x360-or-smaller RGBA preview. Review IDs address pending captures; stale or repeated decisions fail.",
+        "limits":{"sensitivity":[0.0,1.0],"cooldown_ms":[250,3600000],"pending":200,"stored_pixel_bytes":2147483648_u64},
+        "research":"docs/auto-capture-models.md"
+    });
     contract["selection"]["source_base"] = json!(
         "Relative file: and sim:replay: inputs, and existing bare media paths, resolve in the calling terminal for CLI/RPC and beside the file for workflows; network/device locators keep their meaning"
     );
@@ -2248,6 +2387,16 @@ fn schema() -> Value {
         json!({"op":"undo"}),
         json!({"op":"redo"}),
         json!({"op":"replay_camera_change","token":"TOKEN_FROM_CAMERA_CHANGE","undo":true}),
+    ]);
+    commands.extend([
+        json!({"op":"capture_session_open","path":"session.duckdb","create":true}),
+        json!({"op":"capture_session_open","path":"session.duckdb","create":false}),
+        json!({"op":"capture_session_close"}),
+        json!({"op":"capture_example","timeout_ms":2000}),
+        json!({"op":"auto_capture","enabled":true,"sensitivity":0.5,"cooldown_ms":2000}),
+        json!({"op":"capture_review","id":null}),
+        json!({"op":"review_capture","id":1,"keep":true}),
+        json!({"op":"review_capture","id":2,"keep":false}),
     ]);
     contract
 }
@@ -2653,6 +2802,132 @@ mod tests {
         }
     }
     #[test]
+    fn capture_session_commands_are_camera_bound_and_prepare_before_execution() {
+        for (args, expected) in [
+            (
+                vec!["new", "session.duckdb"],
+                json!({"op":"capture_session_open","path":"session.duckdb","create":true}),
+            ),
+            (
+                vec!["resume", "session.duckdb"],
+                json!({"op":"capture_session_open","path":"session.duckdb","create":false}),
+            ),
+            (vec!["close"], json!({"op":"capture_session_close"})),
+            (
+                vec!["teach"],
+                json!({"op":"capture_example","timeout_ms":2000}),
+            ),
+            (
+                vec!["auto"],
+                json!({"op":"auto_capture","enabled":true,"sensitivity":0.5,"cooldown_ms":2000}),
+            ),
+            (
+                vec![
+                    "auto",
+                    "--pause",
+                    "--sensitivity",
+                    "0.25",
+                    "--cooldown-ms",
+                    "500",
+                ],
+                json!({"op":"auto_capture","enabled":false,"sensitivity":0.25,"cooldown_ms":500}),
+            ),
+            (vec!["review"], json!({"op":"capture_review","id":null})),
+            (
+                vec!["review", "--id", "2"],
+                json!({"op":"capture_review","id":2}),
+            ),
+            (
+                vec!["keep", "3"],
+                json!({"op":"review_capture","id":3,"keep":true}),
+            ),
+            (
+                vec!["discard", "4"],
+                json!({"op":"review_capture","id":4,"keep":false}),
+            ),
+        ] {
+            let cli = Cli::try_parse_from(
+                [
+                    "capturefab",
+                    "--session",
+                    "bench",
+                    "--camera",
+                    "sim:0",
+                    "capture-session",
+                ]
+                .into_iter()
+                .chain(args),
+            )
+            .unwrap();
+            assert!(camera_command(cli.command.as_ref()));
+            assert!(uses_session(cli.command.as_ref()));
+            assert!(
+                !one_shot_camera_command(cli.command.as_ref()),
+                "capture-session controls must not silently connect temporary cameras"
+            );
+            let command = prepare(&cli).unwrap().unwrap();
+            assert_eq!(serde_json::to_value(&command).unwrap(), expected);
+            command.validate().unwrap();
+        }
+        let cli = Cli::try_parse_from([
+            "capturefab",
+            "--session",
+            "bench",
+            "capture-session",
+            "resume",
+            "relative.duckdb",
+        ])
+        .unwrap();
+        let mut command = prepare(&cli).unwrap().unwrap();
+        caller_output(&mut command).unwrap();
+        assert!(
+            matches!(command, SessionCommand::CaptureSessionOpen { path, create: false } if std::path::Path::new(&path).is_absolute() && path.ends_with("relative.duckdb"))
+        );
+    }
+    #[test]
+    fn capture_session_rejects_invalid_settings_ids_and_paths() {
+        for args in [
+            vec!["auto", "--sensitivity", "NaN"],
+            vec!["auto", "--sensitivity", "inf"],
+            vec!["auto", "--sensitivity", "1.1"],
+            vec!["auto", "--cooldown-ms", "249"],
+            vec!["auto", "--cooldown-ms", "3600001"],
+            vec!["review", "--id", "0"],
+            vec!["keep", "0"],
+            vec!["discard", "9223372036854775808"],
+            vec!["new"],
+        ] {
+            assert!(
+                Cli::try_parse_from(["capturefab", "capture-session"].into_iter().chain(args))
+                    .is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["capturefab", "capture-session", "new", ""]).is_err());
+        for path in ["   ", ":memory:", "session.csv", "session\n.duckdb"] {
+            let cli = Cli::try_parse_from([
+                "capturefab",
+                "--session",
+                "bench",
+                "capture-session",
+                "new",
+                path,
+            ])
+            .unwrap();
+            assert!(prepare(&cli).is_err(), "invalid path accepted: {path:?}");
+        }
+        for sensitivity in ["0", "1"] {
+            let cli = Cli::try_parse_from([
+                "capturefab",
+                "capture-session",
+                "auto",
+                "--sensitivity",
+                sensitivity,
+            ])
+            .unwrap();
+            prepare(&cli).unwrap().unwrap().validate().unwrap();
+        }
+    }
+    #[test]
     fn schema_commands_parse() {
         let contract = schema();
         let commands = contract["rpc"]["commands"].as_array().unwrap();
@@ -2666,7 +2941,13 @@ mod tests {
                 "undo",
                 "redo",
                 "replay_camera_change",
-                "activity"
+                "activity",
+                "capture_session_open",
+                "capture_session_close",
+                "capture_example",
+                "auto_capture",
+                "capture_review",
+                "review_capture"
             ]
             .iter()
             .all(|op| commands.iter().any(|c| c["op"] == *op))

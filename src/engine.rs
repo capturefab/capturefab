@@ -58,6 +58,7 @@ pub struct WorkerHandle {
     thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     ring: Option<Arc<Mutex<crate::shared_memory::SharedRing>>>,
     history: Arc<Mutex<history::Journal>>,
+    capture_session: Arc<Mutex<Option<crate::autocapture::CaptureSession>>>,
 }
 impl Default for WorkerHandle {
     fn default() -> Self {
@@ -82,6 +83,7 @@ impl WorkerHandle {
             thread: Arc::new(Mutex::new(None)),
             ring,
             history: Arc::default(),
+            capture_session: Arc::default(),
         };
         let worker_handle = handle.clone();
         let thread = std::thread::Builder::new()
@@ -148,6 +150,7 @@ impl WorkerHandle {
     /// it and handed back, so a consumer such as the forwarder can take its
     /// buffer; without one it is retained here.
     fn record(&self, frame: Frame) -> Option<Frame> {
+        self.observe_capture(&frame);
         if let Some(ring) = &self.ring
             && let Err(e) = ring.lock().unwrap_or_else(|e| e.into_inner()).write(&frame)
         {
@@ -162,6 +165,51 @@ impl WorkerHandle {
             return None;
         }
         Some(frame)
+    }
+    fn publish_capture(&self, session: &crate::autocapture::CaptureSession) -> Result<()> {
+        let status = session.status()?;
+        self.state
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .capture_session = Some(status);
+        Ok(())
+    }
+    fn teach_capture(&self, frame: &Frame) -> Result<Option<u64>> {
+        let mut guard = self
+            .capture_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(session) = guard.as_mut() else {
+            return Ok(None);
+        };
+        let id = session.manual(frame)?;
+        self.publish_capture(session)?;
+        Ok(Some(id))
+    }
+    fn observe_capture(&self, frame: &Frame) {
+        let mut guard = self
+            .capture_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(session) = guard.as_mut() else {
+            return;
+        };
+        match session.observe(frame) {
+            Ok(Some(_)) => {
+                if let Err(error) = self.publish_capture(session) {
+                    self.log("error", format!("Auto capture status: {error:#}"));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // Preserve the database and all labels; acquisition continues.
+                if let Ok(status) = session.status() {
+                    let _ = session.configure(false, status.sensitivity, status.cooldown_ms);
+                }
+                let _ = self.publish_capture(session);
+                self.log("error", format!("Auto capture paused: {error:#}"));
+            }
+        }
     }
 }
 fn timeout(ms: u64) -> Result<Duration> {
@@ -286,8 +334,122 @@ fn process_plain(
     command: SessionCommand,
 ) -> Result<Value> {
     match command {
+        SessionCommand::CaptureSessionOpen { path, create } => {
+            let c = camera_mut(camera)?;
+            ensure!(
+                !c.is_scanner(),
+                "auto capture needs a streaming camera, not a document scanner"
+            );
+            let mut guard = h.capture_session.lock().unwrap_or_else(|e| e.into_inner());
+            ensure!(
+                guard.is_none(),
+                "close the current capture session before opening another"
+            );
+            let session = crate::autocapture::CaptureSession::open(
+                std::path::Path::new(&path),
+                &c.info.id,
+                create,
+            )?;
+            if session.status()?.enabled {
+                c.start()?;
+            }
+            h.publish_capture(&session)?;
+            *guard = Some(session);
+            refresh(h, camera, false);
+            Ok(json!({"capture_session":h.snapshot().capture_session}))
+        }
+        SessionCommand::CaptureSessionClose => {
+            let mut guard = h.capture_session.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(session) = guard.as_ref() {
+                session.checkpoint()?;
+            }
+            guard.take();
+            h.state
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .capture_session = None;
+            Ok(json!({"capture_session":null}))
+        }
+        SessionCommand::AutoCapture {
+            enabled,
+            sensitivity,
+            cooldown_ms,
+        } => {
+            let c = camera_mut(camera)?;
+            let mut guard = h.capture_session.lock().unwrap_or_else(|e| e.into_inner());
+            let session = guard
+                .as_mut()
+                .context("create or resume a capture session first")?;
+            // Start before arming; failed acquisition must not silently arm a session.
+            if enabled {
+                c.start()?;
+            }
+            session.configure(enabled, sensitivity, cooldown_ms)?;
+            h.publish_capture(session)?;
+            refresh(h, camera, false);
+            Ok(json!({"capture_session":h.snapshot().capture_session}))
+        }
+        SessionCommand::CaptureExample { timeout_ms } => {
+            ensure!(
+                h.capture_session
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some(),
+                "create or resume a capture session first"
+            );
+            let c = camera_mut(camera)?;
+            let was_streaming = c.is_streaming();
+            c.start()?;
+            let result = (|| -> Result<Value> {
+                c.request_frame()?;
+                let frame = next_frame(h, c, auto, Instant::now() + timeout(timeout_ms)?)?
+                    .context("frame timeout")?;
+                let id = h.teach_capture(&frame)?.context("capture session closed")?;
+                let _ = h.record(frame);
+                Ok(json!({"id":id,"capture_session":h.snapshot().capture_session}))
+            })();
+            let stopped = if !was_streaming { c.stop() } else { Ok(()) };
+            refresh(h, camera, false);
+            let value = result?;
+            stopped?;
+            Ok(value)
+        }
+        SessionCommand::CaptureReview { id } => {
+            use base64::Engine;
+            let guard = h.capture_session.lock().unwrap_or_else(|e| e.into_inner());
+            let session = guard
+                .as_ref()
+                .context("create or resume a capture session first")?;
+            let capture = match id {
+                Some(id) => session.review_capture(id)?,
+                None => session.next_review()?,
+            };
+            let capture = capture.map(|capture| -> Result<Value> {
+                let (width, height, rgba) = crate::frame::preview_rgba(&capture.frame, 480, 360)?;
+                Ok(json!({"id":capture.id,"score":capture.score,"reason":capture.reason,
+                    "width":width,"height":height,"rgba":base64::engine::general_purpose::STANDARD.encode(rgba)}))
+            }).transpose()?;
+            Ok(json!({"capture":capture,"capture_session":session.status()?}))
+        }
+        SessionCommand::ReviewCapture { id, keep } => {
+            let mut guard = h.capture_session.lock().unwrap_or_else(|e| e.into_inner());
+            let session = guard
+                .as_mut()
+                .context("create or resume a capture session first")?;
+            session.review(id, keep)?;
+            h.publish_capture(session)?;
+            Ok(json!({"id":id,"keep":keep,"capture_session":h.snapshot().capture_session}))
+        }
         SessionCommand::Status => {
             refresh(h, camera, false);
+            if let Some(session) = h
+                .capture_session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                h.publish_capture(session)?;
+            }
             Ok(serde_json::to_value(h.snapshot())?)
         }
         SessionCommand::Undo | SessionCommand::Redo | SessionCommand::ReplayCameraChange { .. } => {
@@ -433,6 +595,17 @@ fn process_plain(
             Ok(json!({"connected":h.snapshot().connected}))
         }
         SessionCommand::Disconnect => {
+            {
+                let mut guard = h.capture_session.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(session) = guard.as_ref() {
+                    session.checkpoint()?;
+                }
+                guard.take();
+            }
+            h.state
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .capture_session = None;
             cancel_jobs(jobs);
             sync_jobs(h, jobs);
             *scheduled_stream = false;
@@ -747,6 +920,12 @@ fn process_plain(
                         files.push(path.to_string_lossy().to_string());
                     }
                     frames.push(metadata);
+                    if let Err(error) = h.teach_capture(&frame) {
+                        h.log(
+                            "error",
+                            format!("Capture saved but session learning failed: {error:#}"),
+                        );
+                    }
                     let _ = h.record(frame);
                 }
                 let mut value = json!({"files":files,"frames":frames,"count":count});
@@ -1229,6 +1408,11 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
         let _ = f.stop();
     }
     let _ = release_auto(&h, &mut auto, &mut camera, true);
+    // Close/checkpoint the session even when callers retain WorkerHandle clones.
+    h.capture_session
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     if let Some(mut c) = camera
         && let Err(e) = c.stop()
     {
@@ -1236,6 +1420,8 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
     }
 }
 
+#[cfg(test)]
+mod autocapture_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
