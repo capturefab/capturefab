@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import unittest
+import subprocess
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('candidate', Path(__file__).with_name('release-candidate.py'))
@@ -114,3 +115,16 @@ class CandidateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.create()
         self.assertEqual(self.refs, {})
+
+
+class ApiErrorTests(unittest.TestCase):
+    def test_mutation_failure_preserves_github_diagnostic_without_request_payload(self):
+        error = subprocess.CalledProcessError(1, ['gh', 'api'],
+            output='{"message":"Validation Failed"}', stderr='HTTP 422: already_exists')
+        with patch.object(candidate.subprocess, 'run', side_effect=error):
+            with self.assertRaises(RuntimeError) as raised:
+                candidate.api('owner/repo', 'releases', {'body': 'private request body'})
+        self.assertIn('GitHub POST releases failed:', str(raised.exception))
+        self.assertIn('HTTP 422: already_exists', str(raised.exception))
+        self.assertIn('Validation Failed', str(raised.exception))
+        self.assertNotIn('private request body', str(raised.exception))

@@ -12,8 +12,12 @@ def api(repository, path, payload=None):
     if payload is None:
         return json.loads(subprocess.check_output(command, text=True))
     method = 'PATCH' if re.fullmatch(r'releases/\d+', path) else 'POST'
-    result = subprocess.run(command + ['--method', method, '--input', '-'],
-                            input=json.dumps(payload), text=True, capture_output=True, check=True)
+    try:
+        result = subprocess.run(command + ['--method', method, '--input', '-'],
+                                input=json.dumps(payload), text=True, capture_output=True, check=True)
+    except subprocess.CalledProcessError as error:
+        detail = '\n'.join(part.strip() for part in (error.stderr, error.stdout) if part)
+        raise RuntimeError(f'GitHub {method} {path} failed: {detail or str(error)}') from None
     return json.loads(result.stdout)
 
 
