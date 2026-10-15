@@ -297,6 +297,7 @@
   let screenshotDialog;
   let screenshotImage;
   let screenshotCaption;
+  let screenshotOriginal;
   let screenshotOpener;
   document.querySelectorAll('a[data-screenshot], a.screenshot-link').forEach((link) => link.addEventListener('click', (event) => {
     if (typeof HTMLDialogElement === 'undefined' || event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
@@ -311,13 +312,17 @@
       close.addEventListener('click', () => screenshotDialog.close());
       screenshotImage = element('img', 'screenshot-dialog-image');
       screenshotCaption = element('p', 'screenshot-dialog-caption'); screenshotCaption.id = 'screenshot-dialog-caption';
+      screenshotOriginal = element('a', 'screenshot-original', 'Open full-size image ↗');
+      screenshotOriginal.target = '_blank';
+      screenshotOriginal.rel = 'noopener';
       screenshotDialog.setAttribute('aria-describedby', screenshotCaption.id);
-      screenshotDialog.append(close, screenshotImage, screenshotCaption);
+      screenshotDialog.append(close, screenshotImage, screenshotCaption, screenshotOriginal);
       screenshotDialog.addEventListener('close', () => screenshotOpener?.focus({ preventScroll: true }));
       document.body.append(screenshotDialog);
     }
     screenshotImage.src = link.href;
     screenshotImage.alt = source.alt;
+    screenshotOriginal.href = link.href;
     screenshotCaption.textContent = link.closest('figure')?.querySelector('figcaption')?.textContent.trim() || source.alt;
     screenshotOpener = link;
     screenshotDialog.showModal();

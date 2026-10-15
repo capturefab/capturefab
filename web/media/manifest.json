@@ -1,0 +1,136 @@
+{
+  "method": "Actual iced desktop renderer frames; H.264 encoding only. No reconstructed interface or desktop recording.",
+  "source_note": "Current development desktop build from workspace source. The visible save and settings results come from real session CLI commands.",
+  "binary_sha256": "ce38cceb00ff1a153ac9ce0274ea5a94243ef78b599439a0fa07dddf3d41b9e5",
+  "demo": "Built-in simulator cameras in isolated temporary sessions. No physical cameras or saved user data.",
+  "clips": [
+    {
+      "file": "live-preview.mp4",
+      "poster": "live-preview.png",
+      "sha256": "e0bfc09ed5ce6e442a69ccd239a665d9ee380a71dfabea0821af03ca786f7d3f",
+      "poster_sha256": "7af03c5a2bb08beaf1458049c4807fdf3c52f2e6577a284288a67388d6084600",
+      "size_bytes": 429734,
+      "width": 1100,
+      "height": 700,
+      "duration_seconds": 8.0,
+      "fps": 24,
+      "codec": "h264",
+      "pixel_format": "yuv420p",
+      "audio": false,
+      "preview_frame_differences": [
+        {
+          "mean_pixel_difference": 51.188,
+          "changed_fraction": 0.985
+        },
+        {
+          "mean_pixel_difference": 52.231,
+          "changed_fraction": 0.981
+        }
+      ],
+      "source": {
+        "method": "Built-in renderer screenshot sequence with real simulator acquisition and session CLI commands",
+        "scene": "dark,features,nosidebar,noscopes",
+        "cameras": 4,
+        "frames": 64,
+        "duration_seconds": 29.174,
+        "maximum_fps": 12,
+        "observed_fps": 2.159,
+        "playback_excerpt": {
+          "start_seconds": 0,
+          "end_seconds": 8,
+          "speed": 1
+        },
+        "first_frame_sha256": "a6dbcede6c13dd7cd203331d0cfd25dea60ace2305c392d9e6d31acf7a9d3d7e",
+        "last_frame_sha256": "c186186975c15724b7fde82e26e3bc5dae3afebb6bf592a6ff2ef7fe29c9c074",
+        "actions": [
+          {
+            "after_seconds": 1.796,
+            "arguments": [
+              "--camera",
+              "sim:0",
+              "set",
+              "ExposureTime=30000"
+            ]
+          },
+          {
+            "after_seconds": 5.263,
+            "arguments": [
+              "--camera",
+              "sim:0",
+              "set",
+              "ExposureTime=10000"
+            ]
+          }
+        ]
+      },
+      "description": "Four built-in simulator cameras stream together. Real CLI commands change one camera's exposure, then restore it."
+    },
+    {
+      "file": "capture-workflow.mp4",
+      "poster": "capture-workflow.png",
+      "sha256": "8caa11a3ba4be0399167f0c46fa039e83621f2d9f95c0f7b3149e332a0a29345",
+      "poster_sha256": "3227278d0a76ebd235fd7855d5ae46d6723e08da3c2d2382a66e1ef5a6408d64",
+      "size_bytes": 292578,
+      "width": 1100,
+      "height": 700,
+      "duration_seconds": 8.0,
+      "fps": 24,
+      "codec": "h264",
+      "pixel_format": "yuv420p",
+      "audio": false,
+      "preview_frame_differences": [
+        {
+          "mean_pixel_difference": 37.771,
+          "changed_fraction": 0.9936
+        },
+        {
+          "mean_pixel_difference": 38.156,
+          "changed_fraction": 0.994
+        }
+      ],
+      "source": {
+        "method": "Built-in renderer screenshot sequence with real simulator acquisition and session CLI commands",
+        "scene": "dark,capture,nosidebar,noscopes",
+        "cameras": 1,
+        "frames": 64,
+        "duration_seconds": 26.708,
+        "maximum_fps": 12,
+        "observed_fps": 2.359,
+        "playback_excerpt": {
+          "start_seconds": 0,
+          "end_seconds": 8,
+          "speed": 1
+        },
+        "first_frame_sha256": "b8ad257ff63122edc1a9cf709f569e7db72ef07461b2d96e6286ae19faaa254b",
+        "last_frame_sha256": "733d02bb8cf2519c2a93ef6f965a5d793f100787518c65d2ee3dfb76ff0b0e0a",
+        "actions": [
+          {
+            "after_seconds": 2.531,
+            "arguments": [
+              "--camera",
+              "sim:0",
+              "capture",
+              "-n",
+              "3",
+              "-o",
+              "{isolated-demo}/frames"
+            ],
+            "verified_saved_frames": 3
+          },
+          {
+            "after_seconds": 5.434,
+            "arguments": [
+              "--camera",
+              "sim:0",
+              "capture",
+              "-o",
+              "{isolated-demo}/capture.png"
+            ],
+            "verified_saved_frames": 1
+          }
+        ]
+      },
+      "description": "The Capture panel stays visible while real session CLI commands save three simulator frames, then one PNG. The app shows the saved result."
+    }
+  ]
+}

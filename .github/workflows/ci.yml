@@ -138,4 +138,5 @@ jobs:
       - run: node --check web/app.js
       - run: node --check web/docs.js
       - run: node scripts/test-docs-search.js
+      - run: node scripts/test-site-ui.js
       - run: python3 -m unittest discover -s scripts -v

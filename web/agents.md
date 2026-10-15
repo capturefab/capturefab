@@ -1,6 +1,6 @@
 # Capturefab for agents and shell scripts
 
-Capturefab opens its iced GUI when invoked without a subcommand. Use explicit subcommands for automation. The installed binary's `schema` and `--help` output are authoritative for its supported commands.
+Capturefab opens its desktop app without a subcommand. Use explicit subcommands for automation. The installed binary's `schema` and `--help` output define its supported commands.
 
 ```sh
 capturefab schema --json
@@ -8,15 +8,17 @@ capturefab doctor --json
 capturefab --help
 ```
 
-Successful structured output goes to stdout; diagnostics go to stderr. Check the process exit code before using a result. Every `--json` data command, including `schema`, returns `{"version":1,"ok":true,"result":...}` or `{"version":1,"ok":false,"error":{"code":"...","message":"..."}}`. Read the automation contract from `schema --json`'s `result`; plain `schema` prints that contract directly. Its `cli` command tree lists subcommands, options, defaults and accepted values. Keep credentials out of logs, command transcripts, and generated configuration files whenever possible.
+Successful structured output goes to stdout; diagnostics go to stderr. Read the process exit code before you use a result. Every `--json` data command, including `schema`, returns `{"version":1,"ok":true,"result":...}` or `{"version":1,"ok":false,"error":{"code":"...","message":"..."}}`. Read the automation contract from the `result` field of `schema --json`. Plain `schema` prints that contract directly. Its `cli` command tree lists subcommands, options, defaults and accepted values. Keep credentials out of logs, command transcripts and generated configuration files where possible.
 
-Exit codes are 1 `operation_failed`, 2 `usage`, 3 `unavailable`, 4 `timeout`, 5 `unsupported`, and 6 `storage_full`. `--timeout-ms` is a per-frame/transport deadline (1–60000 ms); `--request-timeout 5m` is a session request deadline. The default request deadline adapts to capture count. A client timeout does not cancel an already accepted session command; inspect `status` before retrying writes.
+Exit codes are 1 `operation_failed`, 2 `usage`, 3 `unavailable`, 4 `timeout`, 5 `unsupported`, and 6 `storage_full`. `--timeout-ms` sets a per-frame or transport timeout of 1–60000 ms. `--request-timeout 5m` sets a session request deadline. Its default depends on the capture count. A client timeout does not cancel an accepted session command. Examine `status` before you retry a write.
 
-Malformed supplied field values return `usage` (exit 2) before connecting or applying capture/forward `--set` and `--auto`. Live camera, missing destination/drive, storage and I/O failures retain their operation categories. Session commands and RPC envelopes reject unknown fields; use `schema` rather than guessing field names. Rejected writes to auto-managed features leave auto mode enabled. Multiple valid assignments still execute sequentially, so a later live failure does not undo earlier successful writes.
+Malformed supplied field values return `usage` (exit 2) before connection or capture/forward `--set` and `--auto` changes. Live camera, absent destination/drive, storage and I/O failures keep their operation categories. Session commands and RPC envelopes reject unknown fields. Use `schema` to find the field names. Rejected writes to Auto-managed features keep Auto enabled. Valid assignments run in order; a later live failure does not reverse earlier successful writes.
 
-Durations and timestamp fractions must resolve to whole milliseconds (`1.001s` is valid, `1.1ms` is rejected); `--max-age` requires whole seconds, at least `1s`, with delete-oldest. All scheduled frames must fall within 10 years; a past timestamp starts immediately and a zero RPC interval captures consecutive frames. A camera rejects overlapping future output files in its active jobs. Capture paths support only `{frame}` and do not accept network URLs. Recording reservations must fit the requested budget; Capturefab does not silently reduce `--max-file-size`. `record`/`forward --duration 30s` works with both temporary workers and persistent sessions. It keeps the CLI alive and stops the encoder at the deadline or Ctrl-C. Without a duration, session forwarding returns immediately and requires `stop-forward`; direct forwarding stays in the foreground.
+Durations and timestamp fractions must resolve to whole milliseconds. `1.001s` is valid; Capturefab rejects `1.1ms`. With delete-oldest, `--max-age` must use whole seconds, with a minimum of `1s`. All scheduled frames must occur within 10 years. A past timestamp starts capture immediately; a zero RPC interval captures consecutive frames. Active jobs on one camera cannot target the same future output file.
 
-Explicit `CAPTUREFAB_MAX_CAMERAS` must be an integer in 1–64. `CAPTUREFAB_FRAME_BYTES` must be 4096–268435456 bytes and a multiple of 64. Malformed overrides fail before worker startup; they do not fall back to defaults.
+Capture paths support only `{frame}` and do not accept network URLs. Recording reservations must stay within the requested budget. Capturefab does not reduce `--max-file-size` automatically. `record`/`forward --duration 30s` works with temporary workers and persistent sessions. It keeps the CLI active and stops the encoder at the deadline or Ctrl-C. Without a duration, session forwarding returns immediately and runs until `stop-forward`; direct forwarding stays in the foreground.
+
+An explicit `CAPTUREFAB_MAX_CAMERAS` must be an integer from 1 to 64. `CAPTUREFAB_FRAME_BYTES` must be 4096–268435456 bytes and a multiple of 64. Malformed overrides fail before worker startup. They do not select the default values.
 
 ## Use an existing visible session
 

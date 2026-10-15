@@ -23,6 +23,8 @@ class Page(HTMLParser):
         self.links = []
         self.scripts = []
         self.images = []
+        self.videos = []
+        self.current_video = None
         self.errors = []
         self.lang = False
         self.main = False
@@ -43,6 +45,13 @@ class Page(HTMLParser):
             self.images.append((attrs.get("src", ""), attrs.get("width"), attrs.get("height")))
         if tag == "script":
             self.scripts.append(attrs.get("src", ""))
+        if tag == "video":
+            self.current_video = {"attrs": attrs, "sources": []}
+            self.videos.append(self.current_video)
+            if attrs.get("src"):
+                self.current_video["sources"].append(attrs["src"])
+        if tag == "source" and self.current_video is not None and attrs.get("src"):
+            self.current_video["sources"].append(attrs["src"])
         runtime_url = None
         if tag in {"img", "script", "iframe", "audio", "video", "source"}:
             runtime_url = attrs.get("src")
@@ -50,11 +59,19 @@ class Page(HTMLParser):
             runtime_url = attrs.get("href")
         if runtime_url and (urlsplit(runtime_url).scheme or urlsplit(runtime_url).netloc):
             self.errors.append(f"remote runtime dependency: {runtime_url}")
-        for name in ("href", "src"):
+        if tag == "video" and attrs.get("poster"):
+            poster_url = urlsplit(attrs["poster"])
+            if poster_url.scheme or poster_url.netloc:
+                self.errors.append(f"remote video poster: {attrs['poster']}")
+        for name in ("href", "src", "poster"):
             if attrs.get(name):
                 self.links.append(attrs[name])
         if any(key.startswith("on") for key in attrs):
             self.errors.append("inline event handler")
+
+    def handle_endtag(self, tag):
+        if tag == "video":
+            self.current_video = None
 
 
 def image_size(path):
@@ -100,6 +117,158 @@ def check_pages(root, errors):
                     errors.append(f"{name}: {src} is {size[0]}x{size[1]}, not {width}x{height}")
             except (ValueError, ET.ParseError, struct.error) as error:
                 errors.append(f"{name}: cannot validate {src}: {error}")
+        for video in page.videos:
+            attrs = video["attrs"]
+            label = attrs.get("id") or attrs.get("poster") or "video"
+            prefix = f"{name}: {label}"
+            for attribute in ("muted", "loop", "playsinline", "controls"):
+                if attribute not in attrs:
+                    errors.append(f"{prefix}: video needs {attribute}")
+            if "autoplay" in attrs:
+                errors.append(f"{prefix}: HTML autoplay bypasses motion and data preferences")
+            dimensions = tuple(attrs.get(key) or "" for key in ("width", "height"))
+            if any(not re.fullmatch(r"[1-9][0-9]*", value) for value in dimensions):
+                errors.append(f"{prefix}: video needs positive width and height")
+            if not attrs.get("poster"):
+                errors.append(f"{prefix}: video needs a local poster")
+            if not video["sources"]:
+                errors.append(f"{prefix}: video has no media source")
+            labelled_by = (attrs.get("aria-labelledby") or "").split()
+            if not (attrs.get("aria-label") or "").strip() and not labelled_by:
+                errors.append(f"{prefix}: video needs an accessible name")
+            described_by = (attrs.get("aria-describedby") or "").split()
+            if not described_by:
+                errors.append(f"{prefix}: video needs an accessible description")
+            for reference in labelled_by + described_by:
+                if reference not in page.ids:
+                    errors.append(f"{prefix}: missing accessible text: #{reference}")
+    return pages
+
+
+def mp4_boxes(path):
+    """Read top-level ISO BMFF boxes without a platform media dependency."""
+    data = path.read_bytes()
+    boxes = []
+    offset = 0
+    while offset < len(data):
+        if len(data) - offset < 8:
+            raise ValueError("incomplete MP4 box header")
+        size, kind = struct.unpack_from(">I4s", data, offset)
+        header = 8
+        if size == 1:
+            if len(data) - offset < 16:
+                raise ValueError("incomplete extended MP4 box header")
+            size = struct.unpack_from(">Q", data, offset + 8)[0]
+            header = 16
+        elif size == 0:
+            size = len(data) - offset
+        if size < header or offset + size > len(data):
+            raise ValueError("invalid MP4 box size")
+        boxes.append(kind)
+        offset += size
+    return boxes
+
+
+def check_media(root, pages, errors):
+    """Anchor recorded-media metadata to checked-in files and accessible embeds."""
+    directory = root / "media"
+    manifest_path = directory / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        errors.append(f"media/manifest.json: cannot read recording provenance: {error}")
+        return
+    if not isinstance(manifest, dict):
+        errors.append("media/manifest.json: expected a recording manifest object")
+        return
+    for key in ("method", "source_note", "demo"):
+        if not isinstance(manifest.get(key), str) or not manifest[key].strip():
+            errors.append(f"media/manifest.json: missing recording provenance: {key}")
+    binary_digest = manifest.get("binary_sha256")
+    if not isinstance(binary_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", binary_digest):
+        errors.append("media/manifest.json: missing recording binary SHA-256")
+    clips = manifest.get("clips")
+    if not isinstance(clips, list) or len(clips) < 2:
+        errors.append("media/manifest.json: expected at least two software demonstration clips")
+        return
+
+    recorded = {}
+    for clip in clips:
+        if not isinstance(clip, dict):
+            errors.append("media/manifest.json: invalid clip entry")
+            continue
+        filename = clip.get("file", "")
+        prefix = f"media/{filename or 'manifest.json'}"
+        if not isinstance(filename, str) or Path(filename).name != filename or Path(filename).suffix != ".mp4":
+            errors.append(f"{prefix}: expected a local MP4 filename")
+            continue
+        if filename in recorded:
+            errors.append(f"{prefix}: duplicate recorded clip")
+        recorded[filename] = clip
+        for key, hash_key, suffix in (("file", "sha256", ".mp4"), ("poster", "poster_sha256", ".png")):
+            value = clip.get(key, "")
+            if not isinstance(value, str) or Path(value).name != value or Path(value).suffix != suffix:
+                errors.append(f"{prefix}: {key} must name a local {suffix} file")
+                continue
+            path = directory / value
+            digest = clip.get(hash_key, "")
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                errors.append(f"{prefix}: invalid {hash_key}")
+            elif not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                errors.append(f"{prefix}: missing or modified {key}: {value}")
+        dimensions = (clip.get("width"), clip.get("height"))
+        if any(type(value) is not int or value <= 0 for value in dimensions):
+            errors.append(f"{prefix}: invalid video dimensions")
+        poster = directory / str(clip.get("poster") or "")
+        if poster.is_file():
+            try:
+                if image_size(poster) != dimensions:
+                    errors.append(f"{prefix}: poster dimensions differ from recorded video")
+            except (ValueError, struct.error) as error:
+                errors.append(f"{prefix}: cannot validate poster: {error}")
+        duration = clip.get("duration_seconds")
+        if type(duration) not in (int, float) or not 3 <= duration <= 12:
+            errors.append(f"{prefix}: demonstration must be 3–12 seconds long")
+        if type(clip.get("fps")) not in (int, float) or not 1 <= clip["fps"] <= 60:
+            errors.append(f"{prefix}: invalid recorded frame rate")
+        if clip.get("codec") != "h264" or clip.get("pixel_format") != "yuv420p" or clip.get("audio") is not False:
+            errors.append(f"{prefix}: expected silent H.264 video with yuv420p pixels")
+        if not isinstance(clip.get("description"), str) or not clip["description"].strip():
+            errors.append(f"{prefix}: missing clip description")
+        source = clip.get("source", {})
+        if not isinstance(source, dict) or any(not source.get(key) for key in ("method", "scene")):
+            errors.append(f"{prefix}: missing native recording source details")
+        path = directory / filename
+        if path.is_file():
+            try:
+                boxes = mp4_boxes(path)
+                if not boxes or boxes[0] != b"ftyp" or b"moov" not in boxes or b"mdat" not in boxes:
+                    errors.append(f"{prefix}: invalid MP4 container")
+                elif boxes.index(b"moov") > boxes.index(b"mdat"):
+                    errors.append(f"{prefix}: MP4 metadata must precede media for progressive playback")
+            except (ValueError, struct.error) as error:
+                errors.append(f"{prefix}: cannot validate MP4 container: {error}")
+
+    embedded = set()
+    for name, page in pages.items():
+        for video in page.videos:
+            attrs = video["attrs"]
+            for src in video["sources"]:
+                url = urlsplit(src)
+                path = (root / Path(name).parent / unquote(url.path)).resolve()
+                filename = path.name
+                if url.scheme or url.netloc or path.parent != directory.resolve() or filename not in recorded:
+                    errors.append(f"{name}: video source lacks local recording provenance: {src}")
+                    continue
+                clip = recorded[filename]
+                embedded.add(filename)
+                if (attrs.get("width"), attrs.get("height")) != (str(clip.get("width")), str(clip.get("height"))):
+                    errors.append(f"{name}: {src}: HTML dimensions differ from recording")
+                poster = (root / Path(name).parent / unquote(urlsplit(attrs.get("poster") or "").path)).resolve()
+                if poster != (directory / str(clip.get("poster") or "")).resolve():
+                    errors.append(f"{name}: {src}: poster differs from recording manifest")
+    for filename in recorded.keys() - embedded:
+        errors.append(f"media/{filename}: recorded demonstration is not embedded in a page")
 
 
 def check_svgs(root, errors):
@@ -227,7 +396,8 @@ def check_theme_contrast(root, errors):
 
 def validate(root=ROOT):
     errors = []
-    check_pages(root, errors)
+    pages = check_pages(root, errors)
+    check_media(root, pages, errors)
     check_svgs(root, errors)
     for path in sorted(root.rglob("*.css")):
         css = path.read_text(encoding="utf-8")
@@ -247,7 +417,7 @@ def main():
     errors, versions = validate()
     if errors:
         sys.exit("\n".join(errors))
-    print(f"Static site validated; light/dark color contrast, current documentation search, {len(versions)} releases, downloads page and Atom feed, no remote runtime dependencies.")
+    print(f"Static site validated; accessible recorded videos and posters, light/dark color contrast, current documentation search, {len(versions)} releases, downloads page and Atom feed, no remote runtime dependencies.")
 
 
 if __name__ == "__main__":

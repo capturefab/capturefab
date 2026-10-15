@@ -38,6 +38,7 @@
     $('verify-box').hidden = true;
     $('asset-detail').hidden = true;
     $('verify-links').replaceChildren();
+    if ($('install-hint')) $('install-hint').hidden = true;
   };
   const renderSelection = () => {
     clearDownload();
@@ -45,19 +46,19 @@
     document.querySelector('.download-result').removeAttribute('data-state');
     if (!release || !assets.some(isPublished)) {
       text('download-label', 'No published binaries yet');
-      text('download-description', 'Use the source checkout and build guide, or follow the release feed for new downloads.');
+      text('download-description', 'Use the source build guide. Read the release feed for new downloads.');
       return;
     }
     if (!os.value || !arch.value) {
       text('download-label', `capturefab ${release.version}`);
-      text('download-description', 'Choose an operating system and processor to select the matching binary.');
+      text('download-description', 'Select your operating system and processor to find the applicable build.');
       return;
     }
     const matching = assets.filter((asset) => asset.os === os.value && asset.arch === arch.value && asset.variant === variant.value);
     const selected = matching.find(isPublished);
     text('download-label', `${osNames[os.value]} / ${archNames[arch.value]} / ${variant.value}`);
     if (!selected) {
-      text('download-description', 'This build is not published yet. Check all published builds or follow the release feed.');
+      text('download-description', 'This build is not available. Open all downloads or read the release feed.');
       return;
     }
     text('download-description', `capturefab ${release.version}${release.date ? ` · ${release.date}` : ''}`);
@@ -68,6 +69,16 @@
     download.setAttribute('download', selected.name);
     download.setAttribute('aria-label', `Download capturefab ${release.version} for ${osNames[os.value]} ${archNames[arch.value]} (${variant.value})`);
     download.hidden = false;
+    download.textContent = `Download for ${osNames[os.value]}`;
+    if ($('install-hint')) {
+      const instructions = {
+        macos: selected.variant === 'desktop' ? 'Extract the ZIP file. Move Capturefab.app to Applications. Open Capturefab.app.' : 'Extract the ZIP file. In a terminal, run capturefab --help from the extracted folder.',
+        windows: 'Extract all files from the ZIP archive.' + (selected.variant === 'headless' ? ' In PowerShell, run .\\capturefab.exe --help from the extracted folder.' : ' Open capturefab.exe from the extracted folder.'),
+        linux: 'Extract the .tar.gz archive. From the extracted folder, use ./capturefab for the desktop or ./capturefab --help for CLI options.'
+      };
+      text('install-hint', instructions[os.value]);
+      $('install-hint').hidden = false;
+    }
     text('checksum-text', `SHA-256: ${selected.sha256}`);
     const filename = /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(selected.name || '') ? selected.name : 'DOWNLOADED_FILE';
     text('verify-command', os.value === 'macos' ? `shasum -a 256 ${filename}` : os.value === 'windows' ? `Get-FileHash ${filename} -Algorithm SHA256` : `sha256sum ${filename}`);
@@ -79,47 +90,17 @@
     if (release.url) links.append(makeLink('Release notes', release.url));
     $('verify-box').hidden = false;
   };
-  const tableNotice = (message) => {
-    const row = document.createElement('tr');
-    const cell = document.createElement('td');
-    cell.colSpan = 5; cell.textContent = message;
-    row.append(cell); $('asset-table').replaceChildren(row);
-  };
-  const renderTable = () => {
-    const body = $('asset-table');
-    body.replaceChildren();
-    if (!assets.length) {
-      tableNotice('No releases have been published.');
-      return;
-    }
-    for (const asset of assets) {
-      const row = document.createElement('tr');
-      for (const value of [osNames[asset.os] || asset.os, archNames[asset.arch] || asset.arch, asset.variant]) {
-        const cell = document.createElement('td'); cell.textContent = value; row.append(cell);
-      }
-      const file = document.createElement('td');
-      const verify = document.createElement('td');
-      if (isPublished(asset)) {
-        file.append(makeLink(asset.name, asset.url));
-        verify.append(makeLink('Manifest / SHA-256', 'releases.json'));
-        if (asset.signature_url) { verify.append(document.createElement('br'), makeLink('Signature', asset.signature_url)); }
-      } else {
-        file.textContent = 'Not published'; file.className = 'unavailable'; verify.textContent = '—';
-      }
-      row.append(file, verify); body.append(row);
-    }
-  };
   const updateHint = () => {
     const hints = {
-      macos: 'Apple Silicon (M1 and later) uses ARM64. Intel Macs use x64. If unsure, check Apple menu → About This Mac.',
-      windows: 'Most Intel and AMD PCs use x64. Windows on ARM uses ARM64. Check Settings → System → About → System type.',
-      linux: 'Run uname -m: x86_64 means x64; aarch64 means ARM64; armv7l means ARMv7. Pi and Jetson downloads must match the installed OS architecture.'
+      macos: 'Apple silicon (M1 and later) uses ARM64. Intel Macs use x64. Read Apple menu → About This Mac to identify the processor.',
+      windows: 'Intel and AMD PCs usually use x64. Windows on ARM uses ARM64. Read Settings → System → About → System type.',
+      linux: 'Run uname -m. x86_64 means x64; aarch64 means ARM64; armv7l means ARMv7. Select the processor architecture of the installed OS.'
     };
-    text('platform-hint', hints[os.value] || 'Choose the computer running capturefab. Architecture selection is required when the browser cannot identify it reliably.');
+    text('platform-hint', hints[os.value] || 'Select the computer that runs Capturefab. If the browser cannot identify the processor architecture, select it.');
   };
   const hasDownloadPanel = Boolean(os && arch && variant);
   if (hasDownloadPanel) {
-    for (const control of [os, arch, variant]) control.addEventListener('change', () => { if (control === arch) processorChosen = true; updateHint(); renderSelection(); });
+    for (const control of [os, arch, variant]) control.addEventListener('change', () => { if (control === arch || control === os) processorChosen = true; updateHint(); renderSelection(); });
     document.querySelector('.platform-form').addEventListener('submit', (event) => event.preventDefault());
   }
   const detectPlatform = async () => {
@@ -150,17 +131,64 @@
       if (release && typeof release.version !== 'string') throw new Error('invalid release');
       assets = Array.isArray(release?.assets) ? release.assets.filter((item) => item && typeof item.name === 'string').map((asset) => ({ ...asset, os: osAliases[asset.os] || asset.os, arch: archAliases[asset.arch] || asset.arch })) : [];
       text('release-version', release ? `v${release.version}` : 'none published yet');
-      renderTable(); renderSelection();
+      renderSelection();
     })
     .catch(() => {
+      manifest = null;
+      release = null;
+      assets = [];
       text('release-version', 'see the manifest');
-      text('download-label', 'Open the release manifest');
-      text('download-description', 'Automatic selection is unavailable. The manifest contains published download URLs and checksums.');
+      text('download-label', 'Use the full download list');
+      text('download-description', 'Automatic selection is unavailable. Open all downloads below to select a file and read its checksum.');
       clearDownload();
       document.querySelector('.download-result').dataset.state = 'warning';
-      tableNotice('Open all downloads or releases.json to inspect the available builds.');
     });
   if (hasDownloadPanel) detectPlatform();
+
+  // The native controls always work. Automatic playback is limited to visible
+  // clips and respects the viewer's motion and data preferences.
+  const clips = [...document.querySelectorAll('.product-video')];
+  const motion = window.matchMedia('(prefers-reduced-motion: reduce)');
+  const connection = navigator.connection;
+  const canObserve = 'IntersectionObserver' in window;
+  const playback = new Map(clips.map((video) => [video, { visible: !canObserve, userPaused: false, autoPaused: false, autoStarting: false, automatic: false }]));
+  const syncPlayback = (video) => {
+    const state = playback.get(video);
+    const allowAutomatic = canObserve && !motion.matches && !connection?.saveData;
+    if (!state.visible || document.hidden || (!allowAutomatic && (state.automatic || state.autoStarting))) {
+      state.autoPaused = true;
+      state.autoStarting = false;
+      state.automatic = false;
+      video.pause();
+    } else if (allowAutomatic && !state.userPaused && video.paused) {
+      state.autoPaused = false;
+      state.autoStarting = true;
+      video.play().catch(() => { state.autoStarting = false; /* Native controls remain available. */ });
+    }
+  };
+  clips.forEach((video) => {
+    video.addEventListener('pause', () => {
+      if (!playback.get(video).autoPaused) playback.get(video).userPaused = true;
+    });
+    video.addEventListener('play', () => {
+      if (video.paused) return; // A canceled play request can leave a queued event.
+      const state = playback.get(video);
+      state.userPaused = false;
+      state.autoPaused = false;
+      state.automatic = state.autoStarting;
+      state.autoStarting = false;
+    });
+  });
+  if (clips.length && canObserve) {
+    const observer = new IntersectionObserver((entries) => entries.forEach(({ target, isIntersecting, intersectionRatio }) => {
+      playback.get(target).visible = isIntersecting && intersectionRatio >= 0.4;
+      syncPlayback(target);
+    }), { threshold: [0, 0.4] });
+    clips.forEach((video) => observer.observe(video));
+  }
+  document.addEventListener('visibilitychange', () => clips.forEach(syncPlayback));
+  motion.addEventListener?.('change', () => clips.forEach(syncPlayback));
+  connection?.addEventListener?.('change', () => clips.forEach(syncPlayback));
   const copy = async (value) => {
     if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(value);
     const area = document.createElement('textarea'); area.value = value; area.style.position = 'fixed'; area.style.opacity = '0';

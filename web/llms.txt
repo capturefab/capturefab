@@ -1,48 +1,217 @@
 # Capturefab
 
-> A camera workbench with an iced desktop GUI, cross-platform CLI, local automation sessions, and one self-contained executable per platform.
+> A desktop app and command-line interface for camera control, image capture and video recording.
+
+Capturefab runs on macOS, Windows and Linux.
+Persons and scripts can use the same local camera session.
+Use the built-in simulator to try commands without camera hardware.
 
 ## Canonical resources
 
-- [Agent instructions](agents.md): CLI conventions, sessions, and acquisition workflow.
-- [Workflow guide](https://github.com/capturefab/capturefab/blob/main/docs/cli-workflows.md): Repeatable JSON plans, paths, partial failures and PowerShell examples.
-- [Workflow examples](https://github.com/capturefab/capturefab/tree/main/examples/workflows): Multi-camera timelapse, scanner feeder and bounded local recording.
-- [Release manifest](releases.json): Versioned JSON with real published assets, architectures, SHA-256 checksums, and signatures when available. An empty releases array means no binaries are published.
-- [Atom releases](feed.xml): Release announcements.
-- [Source and build guide](https://github.com/capturefab/capturefab): Source code, MIT license, CLI reference, and build instructions.
-- [FFmpeg build notes](https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md): Bundled media dependencies and source/build provenance.
+- [Documentation](docs.html): Task guides, app screenshots, installation and CLI reference.
+- [Agent instructions](agents.md): Detailed automation contract, session behavior and recovery rules.
+- [Camera compatibility](https://github.com/capturefab/capturefab/blob/main/docs/camera-compatibility.md): Transport requirements, camera profiles and unsupported paths.
+- [Workflow guide](https://github.com/capturefab/capturefab/blob/main/docs/cli-workflows.md): JSON plans, path resolution and partial failures.
+- [Workflow examples](https://github.com/capturefab/capturefab/tree/main/examples/workflows): Multi-camera timelapse, scanner feeder and local recording.
+- [Release manifest](releases.json): Published files, architectures, SHA-256 checksums and available signatures.
+- [Release feed](feed.xml): Atom release announcements.
+- [Source and build guide](https://github.com/capturefab/capturefab): Rust source, build instructions and MIT license.
+- [FFmpeg build notes](https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md): Media dependencies, corresponding source and build provenance.
+- [Remote control](https://github.com/capturefab/capturefab/blob/main/docs/remote-control.md): Local browser interface and HTTP activity observation.
 
-## Start here
+## Examine the installed version
 
-Run `capturefab schema --json` for the installed binary's automation contract, `capturefab doctor --json` for capabilities, and `capturefab sessions --json` to find an existing user session. Camera/session commands, discovery and network scans attach to the only authenticated active GUI/serve session. Multiple active sessions require `--session NAME`; no session falls back to temporary workers for supported camera operations. `--direct --camera ID` bypasses automatic attachment and overrides CAPTUREFAB_SESSION; it conflicts only with explicit --session. CAPTUREFAB_SESSION supplies a camera/session command default; CAPTUREFAB_CAMERA supplies the default source. --hwaccel configures new direct/GUI/serve workers; existing sessions keep their decoding setting.
+The installed binary's schema and help output define its supported commands.
 
-Capturefab starts its GUI with no subcommand. Scripts should use explicit subcommands and `--json`. All JSON data commands, including schema, use {version:1,ok:true,result:...} or {version:1,ok:false,error:{code,message,...}}. Read schema's contract and dynamic CLI tree under result; plain schema prints the contract directly. Data goes to stdout and diagnostics go to stderr. Exit codes: 1 operation_failed, 2 usage, 3 unavailable, 4 timeout, 5 unsupported, 6 storage_full. --timeout-ms bounds each frame/transport operation; --request-timeout 5m bounds a session request. A timed-out command can still finish in the session: inspect status before retrying writes.
+```sh
+capturefab schema --json
+capturefab doctor --json
+capturefab sessions --json
+capturefab --help
+```
 
-Inspection, feature writes, captures, recording, XML and memory commands connect a missing --camera source to the selected session. Desktop windows/browser tabs keep their own camera selection and drafts; select ID sets the session default for CLI calls without --camera. Humans and AI agents share cameras: same-camera commands run in order, independent cameras run concurrently, overlapping scheduled jobs share acquisition. Use --actor NAME --actor-kind agent (CAPTUREFAB_ACTOR/CAPTUREFAB_ACTOR_KIND) for recognizable agent attribution; human is the default kind. Activity immediately shows other actors, target cameras, queued/running/succeeded/failed states, errors and saved paths. status.result.activity and activity_revision include global history even for targeted busy-camera status. Entry.actor contains id/name/kind; entry.job tracks scheduled id/worker_pid/status/count/captured/last_file/error after acknowledgment. Last 200 completed entries plus active commands/jobs survive selection/disconnect. Read-only observations and probes do not add activity. Private local IPC: activity --json returns {revision,activity}; repeat activity --after REV --wait 20s --json for immediate changes without HTTP. RPC {op:activity,after:REV,timeout_ms:20000} is read-only and bypasses camera queues. HTTP GET /api/activity returns {revision,activity}; keep watching with ?after=REV&timeout_ms=20000 (max25000) for immediate command/job changes visible to every watcher. POST /api/command supports optional actor:{id,name,kind} display attribution, not authentication.
+Capturefab opens its desktop app without a subcommand.
+Use explicit subcommands for automation.
+Every JSON data command uses a versioned envelope:
 
-Journal strings/path previews are capped: captures retain first eight paths in files with file_count giving the actual total; command results still return the complete file list. Schedule previews advance with acquired frames. Targeted --camera ID status retains full coordinator context (cameras, devices, network_scan, logs, activity) with queried-camera fields at top level. target_camera identifies the canonical queried ID; active_camera retains the session default for untargeted CLI calls, independently of desktop/browser local selection.
+```json
+{"version":1,"ok":true,"result":{}}
+{"version":1,"ok":false,"error":{"code":"unavailable","message":"..."}}
+```
 
-Use workflow validate FILE --json, workflow apply FILE --dry-run --json, then --session NAME workflow apply FILE --json. Validation/dry-run are offline. Documents are {version:1,steps:[{camera?:ID,command:SessionCommand}]}, use the strict RPC command fields, reject unknown/duplicate fields, and permit 1–256 steps in at most 1 MiB. Connect/select use command.camera and omit the outer camera; discover/network_scan also omit it. All steps validate before execution; live device and destination checks remain. Apply requires a persistent session, uses each step's camera, rejects global --camera, and stops on first failure with prior effects intact. error.details.completed/completed_steps/failed_step describe partial execution. Jobs and encoders keep running in the session after apply exits; inspect jobs/status before retrying.
+Read the automation contract and CLI command tree from schema's `result`.
+Plain `schema` prints the contract directly.
+Data goes to stdout; diagnostics go to stderr.
+Read the process exit code before you use the result.
+Binary image stdout, raw XML, completions, help and version output use their command-specific formats.
 
-Raw logs keep time/level/message and may add timestamp:{unix_ms,utc_offset_seconds}. unix_ms is signed Unix milliseconds for the absolute event; utc_offset_seconds is the producer clock's offset east of UTC (-86399..86399). Legacy time has no date/zone: do not parse it as an instant. Missing/malformed optional metadata remains unknown without hiding the diagnostic. Desktop/browser render valid instants in the viewer's local zone; copied desktop logs include a dated numeric offset. This is an additive version-1 output field; existing fields/envelopes remain unchanged.
+Exit codes are 1 `operation_failed`, 2 `usage`, 3 `unavailable`, 4 `timeout`, 5 `unsupported` and 6 `storage_full`.
+Capturefab rejects malformed supplied fields before connection and before capture/forward `--set` or `--auto` changes.
+RPC and workflow commands reject unknown fields.
+Valid feature writes run in order; a later live failure does not reverse earlier writes.
 
-CLI/RPC local sources and outputs use the caller directory; workflow sources/outputs use the file's directory (stdin uses caller directory). file:relative.mkv and sim:replay:relative-folder sources resolve in connect/select and outer camera targets; bare existing filenames are file sources. Prefer file: for local-source names that could also be camera IDs. Network/device locators, stream URLs and destination-relative names stay unchanged. Workflow captures cannot write binary stdout. Single capture/template extensions infer png/jpeg/raw/pgm/ppm; directory sequences default png; --format overrides. record/forward --duration 30s works for temporary workers and sessions, keeps the CLI alive and stops the encoder at deadline or Ctrl-C. Without duration, sessions return immediately and need stop-forward; direct commands run until Ctrl-C. Workflow protocol has no duration/wait field: use separate start/stop files or timed CLI recording. PowerShell can pass workflow files directly or Get-Content -Raw workflow.json | capturefab workflow validate - --json.
+## Use an existing session
 
-Persistent camera sessions expose `history`, `undo` and `redo`: use `--session NAME [--camera ID] history --json` for the next labels. GUI, CLI and RPC reversible camera changes share this bounded per-camera history, which lasts for the connection. Replay detects conflicts and retains failed entries. Captures, uploads, recordings, schedules, connection changes, arbitrary commands and raw memory writes are outside camera history; stopping with active schedules or forwarding is also excluded. The desktop uses ⌘Z/⇧⌘Z on macOS and Ctrl+Z/Ctrl+Shift+Z (also Ctrl+Y redo) elsewhere.
-Scanner settings are reversible. Scanner acquisition, including Start and Stop, may move or consume physical pages and cannot be undone or replayed.
+Camera commands, discovery and network scans automatically use the only active authenticated desktop or `serve` session.
+With several sessions, specify `--session NAME`.
+With no session, supported camera commands use a temporary worker.
+Use `--direct --camera ID` to select a temporary worker explicitly.
+`--direct` overrides `CAPTUREFAB_SESSION` and conflicts with an explicit `--session` option.
 
-Use `capturefab --session NAME network-scan --json` to inspect IPv4 adapters, rediscover/probe GigE cameras and tune connected cameras within a shared per-interface budget. RPC is `{"op":"network_scan","timeout_ms":1000}`; result/status.network_scan contains interfaces, cameras, warnings and scanned_at_ms. Health values: unreachable, limited, unverified, ready, unstable. Discovery does not prove reachability or stability. The scan briefly pauses previews to retest packet sizes, uses supported camera throughput/pacing controls, and keeps auto within the budget; active recordings, forwarding and schedules skip tuning with guidance. It does not change host IPs, routes or MTUs. Per-camera `{"op":"optimize_network","bytes_per_second":100000000}` applies a supplied budget; prefer the session scan for shared-link accounting. Network defaults are outside undo history.
+```sh
+capturefab gui --name bench
+# In another terminal:
+capturefab --session bench connect sim:0
+capturefab --session bench --camera sim:0 get Width Height --json
+capturefab --session bench --camera sim:0 capture -o first.png --json
+capturefab --session bench status --json
+```
 
-Captures, schedules and recordings accept `--destination NAME` for a saved folder (including external and network drives) or S3-compatible bucket; `capturefab destination list --json`, `volumes --json` and `uploads --json` describe them and the upload queue. Credentials stay in the OS credential store or standard AWS sources. Use `capturefab storage --json` to inspect the saved global storage ceiling and live reservations. Captures and local video recordings share that budget across processes using the same session directory. A storage-full failure has exit code 6. Retention deletion and raising a global budget require explicit user authorization.
+`CAPTUREFAB_CAMERA` supplies a default source; `CAPTUREFAB_SESSION` supplies a default session.
+`--camera ID` targets a camera and keeps each desktop or browser participant's local selection.
+`select ID` sets the default for CLI calls without `--camera`.
+Persistent `start` and `auto` controls act on a connected camera; use `connect ID` first.
+Binary stdout captures use a temporary worker and cannot use `--session`.
+Camera control can be exclusive, so use the existing session for an open camera.
 
-Auto mode is opt-in per camera: `capturefab --session NAME auto [--balance 0..1]` (0 favors image quality, 1 frame rate) and `manual [--revert]`. `status --json` reports `auto` (null in manual mode) with its recent changes. Ask before enabling it on cameras other software uses.
+`--timeout-ms` limits each frame or transport operation to 1–60000 ms.
+`--request-timeout 5m` limits the full session request.
+Its default depends on the capture count.
+A client timeout does not cancel an accepted session command.
+Read status and Activity before you retry a write.
 
-CameraInfo includes `profile: {kind, source, evidence, capabilities}` in discovery devices, info.camera and status.connected/status.cameras[].info. Kinds: unknown, area_scan, line_scan, depth, microscope, thermal, document_scanner. Sources: unknown, transport, identity, features, device_metadata. Evidence is a string array; capabilities lists advertised control families, not guaranteed writable controls. Discovery can be provisional; connection refines metadata from readable features. Detection prioritizes scanner transport, explicit device class metadata, explicit Linescan geometry, specialty features, remaining scan geometry, model identity, then image dimensions/frame timing. A one-row ROI, high bit depth or vendor name alone is not type evidence. Inspect features and selector-dependent limits; see schema --json's result.camera_profiles.
+## Observe shared work
 
-The GUI prioritizes line geometry/timing and triggers/encoders, depth components/range/calibration, microscope optics/illumination/stage, thermal temperature/calibration, or scanner controls. Microscope previews retain focus and sharpness tools. Line history shows recent received display rows with gaps for skipped blocks and may downsample; captures save individual blocks, not a complete reconstructed scan. Scalar depth/thermal previews color an automatic raw-value range without applying device calibration; Sensor pixels returns to the ordinary preview. For quantitative samples use capture --format raw and retain device component, unit, scale, offset and calibration features separately. Raw preserves bytes and precision; PNG/JPEG/PGM/PPM and forwarded video are 8-bit visualizations; forwarding carries no GUI color map or measurement calibration. Transports acquire single rasters; depth must provide a compatible single-component stream. Multipart, GenDC, point-cloud payloads and vendor SDK-only depth access remain unsupported. Detection implies no physical camera compatibility. Generic auto exposure is unsupported for line scan, depth, thermal and document scanner sources; image cameras including microscopes retain support when suitable controls are advertised.
+Commands for one camera run in order.
+Separate cameras operate independently; overlapping schedules share acquisition.
+Use `--actor NAME --actor-kind agent` for an automation agent.
+`CAPTUREFAB_ACTOR` and `CAPTUREFAB_ACTOR_KIND` provide defaults; the default kind is `human`.
+Actor metadata is display attribution, not authentication.
 
-Typed synthetic sources are sim:line[:name], sim:depth[:name], sim:microscope[:name] and sim:thermal[:name]; sim:0 and arbitrary other names remain area scan. Examples: `capturefab --camera sim:line capture --set Height=1 --set AcquisitionLineRate=2000 --set ExposureTime=100 -o line.png`; `capturefab --camera sim:depth capture --format raw -o depth.raw`; `capturefab --camera sim:microscope capture --set FocusPosition=50 --set Magnification=4 --set IlluminationIntensity=70 -o micrograph.png`; `capturefab --camera sim:thermal get TemperatureLinearResolution TemperatureUnit --json` and `capturefab --camera sim:thermal capture --format raw -o thermal.raw`. Synthetic sources exercise controls and transport behavior, not hardware compatibility.
+`status --json` includes global `result.activity` and `result.activity_revision`, even for a busy target camera.
+Activity retains the latest 200 completed entries plus active commands and schedules.
+Sequences include `file_count` and at most eight path previews; capture results still return the full file list.
+`target_camera` identifies the requested camera; `active_camera` identifies the session default.
+A successful schedule command confirms job creation; inspect its `job` for completion or failure.
+A successful forwarding command confirms encoder startup; inspect camera status for continued forwarding.
 
-Release data is authoritative for available downloads. Select the target matching the installed operating system and architecture. Do not infer Apple Silicon versus Intel from a Macintosh browser user-agent string.
+```sh
+capturefab --session bench activity --json
+capturefab --session bench activity --after 12 --wait 20s --json
+```
 
-Document scanners are listed by `scanners --json` and included in `discover` with transport `scanner`. Select the full `scanner:sane:DEVICE`, `scanner:wia:ID`, or `scanner:ica:UUID` ID. Linux needs SANE scanimage/backends, Windows uses WIA drivers and Windows PowerShell, and macOS uses a bundled ImageCaptureCore helper. The default `scanner` feature and runtime availability appear in `doctor`. Use `--timeout-ms 60000 capture -o document.png`; set ScanResolution (75–600 dpi, default 150), ScanMode (Color/Gray/Lineart) and ScanSource (Default/Flatbed/Feeder) with capture --set. Each capture requests one page and count saves successive pages as separate images; connecting/start never scans. GUI scanner timeout defaults to 60 seconds. Driver support varies and has not been physically validated. Existing capture image formats, schedules, destinations and quotas apply; no PDF/OCR, scanner forwarding or auto exposure. Samples normalize to 8-bit RGB/grayscale with a 128 MiB page bound.
+Activity responses contain `{revision,activity}` inside the versioned result.
+These read-only calls bypass camera queues and create no Activity entries.
+RPC supports `{"op":"activity","after":12,"timeout_ms":20000}`.
+HTTP observers use `/api/activity?after=REV&timeout_ms=20000`; the maximum timeout is 25000 ms.
+All observers wake on shared command and scheduled-job changes.
+See the agent instructions for actor fields, log timestamps and HTTP command envelopes.
+
+## Capture, save and record
+
+Local CLI/RPC paths use the directory of the terminal that sends the command.
+Saved destination output names are relative to that destination.
+Existing output files are not overwritten.
+Single-file and `{frame}` template extensions select PNG, JPEG, raw, PGM or PPM.
+Directory sequences default to PNG; `--format` overrides format selection.
+Capture paths accept only `{frame}` templates and do not accept network URLs.
+
+Durations and timestamp fractions must resolve to whole milliseconds.
+`1.001s` is valid; `1.1ms` fails.
+All scheduled frames must occur within 10 years.
+Keep the GUI, headless session or direct command active for the schedule lifetime.
+
+`record` is an alias for `forward`.
+`record --duration 30s` keeps the CLI active and stops the encoder at the deadline or Ctrl-C.
+This works with temporary workers and persistent sessions.
+Without a duration, a session command returns immediately and records until `stop-forward`.
+A direct recording command stays active until Ctrl-C.
+
+Saved destinations include folders, external drives, network folders and S3-compatible buckets.
+Use `destination list --json`, `volumes --json` and `uploads --json` to inspect them.
+Credentials use the operating system keychain, AWS profiles or process environment.
+Persistent sessions return local capture results before upload completion; inspect the upload queue.
+
+Captures and recordings share a storage budget across processes with the same `CAPTUREFAB_SESSION_DIR`.
+Defaults are 10 GiB and 10,000 files; each recording defaults to a 512 MiB file limit.
+Use `storage --json` to inspect usage and reservations.
+A storage-full error has exit code 6.
+You must have explicit user authorization for retention deletion or an increased global budget.
+
+## Apply workflow files
+
+```sh
+capturefab workflow validate workflow.json --json
+capturefab workflow apply workflow.json --dry-run --json
+capturefab --session bench workflow apply workflow.json --json
+```
+
+Validation and dry runs are offline.
+Documents use `{version:1,steps:[{camera?:ID,command:SessionCommand}]}`.
+They accept 1–256 steps and a maximum size of 1 MiB.
+Connect/select use `command.camera`; omit their outer camera target.
+Discovery and network scans also omit the outer target.
+All steps pass offline validation before execution; device and destination availability remain execution checks.
+Apply must use a persistent session and cannot use global `--camera`.
+
+Workflow paths use the JSON file's directory; stdin input uses the calling terminal's directory.
+Local `file:`, `sim:replay:` and existing media inputs use those directories too.
+Steps stop at the first failure and keep earlier effects.
+Read `error.details.completed`, `completed_steps` and `failed_step` before recovery.
+Schedules and encoders continue in the session after Apply exits.
+Workflow commands have no duration or wait field; use timed CLI recording or separate start/stop files.
+
+## Change camera settings
+
+Read the current feature list, choices, access permissions and limits before a write.
+Read back important values after a write.
+Auto exposure is optional for each camera.
+Use `auto --balance 0..1` and `manual [--revert]` in a session.
+A balance of 0 favors image quality; 1 favors frame rate.
+Ask before you enable Auto on a camera that other software uses.
+
+`history`, `undo` and `redo` expose reversible settings for each connected camera.
+GUI, CLI and RPC clients share this limited history.
+Captures, uploads, recordings, schedules, connections, arbitrary commands and raw memory writes cannot use camera Undo.
+Scanner settings are reversible; scanner acquisition can move physical pages and cannot use Undo.
+
+`network-scan --json` inspects IPv4 interfaces and GigE cameras, then tunes available connected cameras within a shared interface budget.
+The scan can briefly pause previews for packet probes.
+Active recordings, forwarding or schedules prevent tuning.
+It does not change host IP addresses, routes or MTUs.
+See the agent instructions for network health values and RPC fields.
+
+## Camera types and limits
+
+Identity JSON includes `profile:{kind,source,evidence,capabilities}`.
+Profile kinds are unknown, area scan, line scan, depth, microscope, thermal and document scanner.
+Detection does not certify physical compatibility or writable controls.
+The interface uses advertised features to adapt its control groups and previews.
+
+Typed simulators are `sim:line`, `sim:depth`, `sim:microscope` and `sim:thermal`, with optional `:name` suffixes.
+`sim:0` and other ordinary names supply area-scan images.
+Simulators exercise software behavior; they do not prove hardware compatibility.
+
+Line-scan captures save individual blocks; the preview history is not a full reconstructed scan.
+Depth and thermal preview colors show raw sample ranges without measurement calibration.
+For measurements, use `capture --format raw` and retain dimensions, pixel format, component, units, scale, offset and calibration metadata separately.
+Raw files do not embed that metadata.
+PNG, JPEG, PGM, PPM and forwarded video are 8-bit display outputs.
+Depth sources must supply a compatible single-component image stream.
+Multipart, GenDC, point-cloud payloads and vendor SDK-only access are unsupported.
+Generic auto exposure is unsupported for line scan, depth, thermal and document scanners.
+
+Scanners use full `scanner:sane:DEVICE`, `scanner:wia:ID` or `scanner:ica:UUID` identifiers.
+Linux must have SANE scanimage/backends; Windows uses WIA and Windows PowerShell; macOS uses an included ImageCaptureCore helper.
+Use `--timeout-ms 60000` for CLI page captures.
+Each capture requests one page; successive pages save as separate images.
+Driver compatibility has not been physically validated.
+Scanner sources do not provide PDF assembly, OCR, forwarding or auto exposure.
+
+## Choose a release
+
+Release data determines the available downloads.
+An empty release array means that no binary downloads are published.
+Match the installed operating system and architecture.
+A Macintosh browser user-agent string does not identify Apple silicon or Intel reliably.
+See the installation guide for extraction steps and operating system minimums.

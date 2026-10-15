@@ -46,11 +46,12 @@ PAGE = '''<!doctype html>
     <main id="main">
       <section class="page-head" aria-labelledby="downloads-title">
         <h1 id="downloads-title">All downloads</h1>
-        <p class="lead">Every published build with its SHA-256 checksum. Desktop builds include the app and the CLI; headless builds are the CLI alone, for servers and devices without a display. Latest release: {status}.</p>
+        <p class="lead">Select a desktop build for the app and CLI. Select a headless build for the CLI only. Latest release: {status}.</p>
+        <p>Extract the archive before you open the app. Read the <a href="docs.html#installation">installation instructions and system requirements</a>.</p>
       </section>
 {body}    </main>
     <footer class="site-footer">
-      <div class="brand"><p><img class="logo" src="favicon.svg" width="128" height="128" alt="" aria-hidden="true">Capturefab</p><small>MIT licensed. The bundled FFmpeg is GPLv3 and ships with its source. This site sets no cookies and loads nothing from third parties.</small></div>
+      <div class="brand"><p><img class="logo" src="favicon.svg" width="128" height="128" alt="" aria-hidden="true">Capturefab</p><small>Capturefab uses the MIT license. The included FFmpeg uses GPLv3. Releases include its source. This site sets no cookies and loads nothing from third parties.</small></div>
       <div><h4>Project</h4><ul><li><a href="https://github.com/capturefab/capturefab">Source</a></li><li><a href="https://github.com/capturefab/capturefab/issues">Issues</a></li><li><a href="downloads.html">All downloads</a></li><li><a href="feed.xml">Releases feed</a></li></ul></div>
       <div><h4>Documentation</h4><ul><li><a href="docs.html">Documentation hub</a></li><li><a href="docs.html#getting-started">Getting started</a></li><li><a href="docs.html#cli-reference">CLI reference</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md">FFmpeg build and licensing</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/release.md">Release process</a></li></ul></div>
       <div><h4>For agents</h4><ul><li><a href="agents.md">Agent instructions</a></li><li><a href="llms.txt">llms.txt</a></li><li><a href="releases.json">Release manifest</a></li></ul></div>
@@ -60,9 +61,9 @@ PAGE = '''<!doctype html>
 </html>
 '''
 EMPTY = '''      <section class="section" aria-labelledby="none-title">
-        <div class="section-heading"><h2 id="none-title">No published binaries yet.</h2><p>No release has been published, so the <a href="releases.json">release manifest</a> is empty and the <a href="feed.xml">Atom release feed</a> has no entries. Until then, build from source.</p></div>
+        <div class="section-heading"><h2 id="none-title">No published binaries yet.</h2><p>No release is available. The <a href="releases.json">release manifest</a> is empty. The <a href="feed.xml">Atom release feed</a> has no entries. Use the source build below.</p></div>
         <div class="source-build">
-          <div><h3>Build it yourself</h3><p>Builds need a stable Rust toolchain, a C compiler and CMake, plus NASM on x86, because the JPEG encoder compiles libjpeg-turbo from source. Industrial cameras work without FFmpeg; webcams, streams and recording need a bundled or <code>CAPTUREFAB_FFMPEG</code>-supplied binary. The <a href="https://github.com/capturefab/capturefab#build-test-and-release">build guide</a> covers both.</p></div>
+          <div><h3>Build it yourself</h3><p>Use a stable Rust toolchain, a C compiler and CMake. For x86 builds, NASM is necessary for libjpeg-turbo. GigE Vision and USB3 Vision capture work without FFmpeg. FFmpeg is necessary for webcams, streams and recording. A build can include FFmpeg or select it with <code>CAPTUREFAB_FFMPEG</code>. Read the <a href="https://github.com/capturefab/capturefab#build-test-and-release">build guide</a> for configuration.</p></div>
           <div class="code-wrap"><pre><code>git clone https://github.com/capturefab/capturefab
 cd capturefab
 # desktop app and CLI
@@ -117,14 +118,36 @@ def section(release, latest):
     version = html.escape(release['version'])
     links = [(release.get(k), label) for k, label in (('url', 'Release notes'), ('checksums_url', 'SHA256SUMS'), ('checksums_signature_url', 'Signature'), ('source_url', 'Corresponding source'), ('sbom_url', 'SBOM'))]
     rows = '\n'.join(f'          {row(asset)}' for asset in release['assets'])
+    cards = download_cards(release)
     return f'''      <section class="section" id="v{version}" aria-labelledby="v{version}-title">
         <div class="section-heading"><p class="eyebrow">{html.escape(release['date'])}{' / latest' if latest else ''}</p><h2 id="v{version}-title">capturefab {version}</h2></div>
         <p class="section-intro">{' · '.join(f'<a href="{href(url)}">{label}</a>' for url, label in links if url)}</p>
-        <div class="table-scroll"><table class="release-assets"><caption>capturefab {version} release assets</caption><thead><tr><th scope="col">System</th><th scope="col">Processor</th><th scope="col">Build</th><th scope="col">File</th><th scope="col">SHA-256</th><th scope="col">Notes</th></tr></thead><tbody>
+{cards}
+        <details class="all-builds"><summary>File details and SHA-256 checksums</summary><div class="table-scroll"><table class="release-assets"><caption>capturefab {version} release assets</caption><thead><tr><th scope="col">System</th><th scope="col">Processor</th><th scope="col">Build</th><th scope="col">File</th><th scope="col">SHA-256</th><th scope="col">Notes</th></tr></thead><tbody>
 {rows}
-        </tbody></table></div>
+        </tbody></table></div></details>
       </section>
 '''
+
+def download_cards(release):
+    """Keep direct downloads readable on narrow screens without JavaScript."""
+    cards = []
+    for system, label in OS.items():
+        builds = [asset for asset in release['assets'] if asset['os'] == system and asset.get('available')]
+        if not builds:
+            continue
+        lists = {}
+        for variant in ('desktop', 'headless'):
+            items = []
+            for asset in builds:
+                if asset['variant'] != variant:
+                    continue
+                processor = ARCH.get(asset['arch'], asset['arch'])
+                detail = ' · '.join(filter(None, (size(asset['size']), NOTES.get(asset.get('platform_signature'), ''))))
+                items.append(f'<li><div><strong>{html.escape(processor)}</strong><small>{html.escape(detail)}</small></div><a class="button {"primary" if variant == "desktop" else ""}" href="{href(asset["url"])}" aria-label="Download Capturefab {html.escape(release["version"])} for {label} {html.escape(processor)} {variant}">Download {html.escape(processor)} <span aria-hidden="true">↓</span></a></li>')
+            lists[variant] = '<ul class="static-build-list">' + ''.join(items) + '</ul>' if items else '<p>No published build.</p>'
+        cards.append(f'<article class="platform-download-card"><h3>{label}</h3><p>Desktop app and CLI</p>{lists["desktop"]}<details><summary>Headless CLI builds</summary>{lists["headless"]}</details></article>')
+    return '<div class="platform-download-grid">' + ''.join(cards) + '</div>' if cards else ''
 
 def downloads(manifest, site):
     releases = ordered(manifest)
