@@ -31,6 +31,7 @@ jobs:
       build: ${{ steps.version.outputs.build }}
       # Draft, attest and publish (false for a dry run from a branch).
       release: ${{ steps.version.outputs.release }}
+      azure-signing: ${{ steps.version.outputs.release == 'true' && vars.CAPTUREFAB_WINDOWS_SIGNING == 'azure' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -79,6 +80,37 @@ jobs:
           # Unsigned or unnotarized macOS downloads are blocked by Gatekeeper.
           if [ "$MACOS_SIGNING" != true ] || [ "$MACOS_NOTARIZING" != true ]; then
             echo "::error::Releases need the MACOS_CERTIFICATE_* and MACOS_NOTARY_* secrets (docs/release.md). Set the repository variable CAPTUREFAB_ALLOW_UNSIGNED_MACOS=true to release unsigned macOS builds anyway."
+            exit 1
+          fi
+      - name: Check Windows signing configuration
+        if: steps.version.outputs.build == 'true'
+        env:
+          PROVIDER: ${{ vars.CAPTUREFAB_WINDOWS_SIGNING }}
+          RELEASE: ${{ steps.version.outputs.release }}
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
+        run: |
+          case "$PROVIDER" in
+            '') exit 0 ;; # Preserve the optional PFX signing path.
+            azure) ;;
+            *) echo '::error::CAPTUREFAB_WINDOWS_SIGNING must be azure or unset (docs/release.md).'; exit 1 ;;
+          esac
+          # Branch dry runs build unsigned Windows packages without Azure access.
+          if [ "$RELEASE" != true ]; then exit 0; fi
+          missing=false
+          for name in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_ARTIFACT_SIGNING_ENDPOINT AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Azure signing requires the repository variable $name (docs/release.md)."
+              missing=true
+            fi
+          done
+          if [ "$missing" = true ]; then exit 1; fi
+          if ! [[ "$AZURE_ARTIFACT_SIGNING_ENDPOINT" == https://* ]]; then
+            echo '::error::AZURE_ARTIFACT_SIGNING_ENDPOINT must use HTTPS.'
             exit 1
           fi
 
@@ -141,7 +173,7 @@ jobs:
       RELEASE_ARCH: ${{ matrix.arch }}
       MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos }}
       MACOS_SIGNING: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' }}
-      WINDOWS_SIGNING: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' }}
+      WINDOWS_SIGNING: ${{ vars.CAPTUREFAB_WINDOWS_SIGNING != 'azure' && secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' }}
     defaults:
       run:
         shell: bash
@@ -300,15 +332,80 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
-          name: build-${{ matrix.os }}-${{ matrix.arch }}
+          # Original Windows packages never reach assembly when Azure is required.
+          name: ${{ needs.version.outputs.azure-signing == 'true' && matrix.os == 'windows' && 'unsigned' || 'build' }}-${{ matrix.os }}-${{ matrix.arch }}
           path: dist
           if-no-files-found: ignore
           retention-days: 7
 
+  sign-windows:
+    name: Azure sign Windows x64 and ARM64
+    needs: [version, build]
+    if: ${{ !cancelled() && needs.version.outputs.azure-signing == 'true' && needs.build.result == 'success' }}
+    # The Azure action supports x64 runners, and can sign either PE architecture.
+    # Native smoke tests already ran in build; no application or compiler runs here.
+    runs-on: windows-2025
+    environment: windows-signing
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      AZURE_CORE_OUTPUT: none
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: unsigned-windows-*
+          path: dist/windows-builds
+      - name: Prepare verified native Windows executables
+        run: |
+          python scripts/sign-windows.py prepare --version "$env:VERSION" --input dist/windows-builds --output dist/windows-signing
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1
+          if (-not $signtool) { throw 'Windows SDK signtool.exe was not found' }
+          "WINDOWS_SIGNTOOL=$($signtool.FullName)" >> $env:GITHUB_ENV
+      - name: Log in to Azure with GitHub OIDC
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Sign and timestamp Windows executables
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
+          files-folder: ${{ github.workspace }}\dist\windows-signing
+          files-folder-filter: exe
+          files-folder-recurse: false
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: Capturefab
+          description-url: https://capturefab.com
+          exclude-environment-credential: true
+          exclude-azure-cli-credential: false
+      - name: Verify signatures and repackage without rebuilding
+        run: python scripts/sign-windows.py finish --version "$env:VERSION" --input dist/windows-builds --signed dist/windows-signing --output dist/signed-windows
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-windows-signed
+          path: dist/signed-windows
+          if-no-files-found: error
+          retention-days: 7
+
   assemble:
     name: Assemble release
-    needs: [version, build]
-    if: ${{ !cancelled() && needs.version.result == 'success' && needs.version.outputs.build == 'true' }}
+    needs: [version, build, sign-windows]
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.version.outputs.build == 'true' && (needs.sign-windows.result == 'success' || (needs.version.outputs.azure-signing != 'true' && needs.sign-windows.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -445,8 +542,8 @@ jobs:
 
   publish:
     name: Promote successful release candidate
-    needs: [version, candidate, validate, build, assemble, attest, draft]
-    if: ${{ !cancelled() && needs.candidate.result == 'success' && needs.validate.result == 'success' && needs.build.result == 'success' && needs.assemble.result == 'success' && needs.draft.result == 'success' && (needs.attest.result == 'success' || (vars.CAPTUREFAB_ATTEST == 'false' && needs.attest.result == 'skipped')) }}
+    needs: [version, candidate, validate, build, sign-windows, assemble, attest, draft]
+    if: ${{ !cancelled() && needs.candidate.result == 'success' && needs.validate.result == 'success' && needs.build.result == 'success' && (needs.sign-windows.result == 'success' || (needs.version.outputs.azure-signing != 'true' && needs.sign-windows.result == 'skipped')) && needs.assemble.result == 'success' && needs.draft.result == 'success' && (needs.attest.result == 'success' || (vars.CAPTUREFAB_ATTEST == 'false' && needs.attest.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
