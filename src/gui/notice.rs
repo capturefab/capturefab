@@ -336,6 +336,10 @@ fn outcome(job: &Job, value: &Value) -> Option<(String, Option<String>, Level)> 
     let done = |text: String| Some((text, None, Level::Done));
     match job {
         Job::Capture => Some(saved(value)),
+        Job::CaptureSessionOpen => done("Capture session opened".into()),
+        Job::CaptureSessionClose => done("Capture session saved and closed".into()),
+        Job::CaptureExample => done("Capture saved · example learned".into()),
+        Job::AutoCapture | Job::CaptureReview | Job::ReviewCapture => None,
         Job::Discover => Some(discovered(value)),
         Job::NetworkScan => Some(network_scanned(value)),
         Job::Connect => done(match value["connected"]["model"].as_str() {
@@ -396,6 +400,12 @@ fn outcome(job: &Job, value: &Value) -> Option<(String, Option<String>, Level)> 
 fn failure(job: &Job) -> String {
     let text = match job {
         Job::Capture => "Capture failed",
+        Job::CaptureSessionOpen => "Could not open the capture session",
+        Job::CaptureSessionClose => "Could not close the capture session",
+        Job::AutoCapture => "Could not update automatic capture",
+        Job::CaptureExample => "Could not learn from the capture",
+        Job::CaptureReview => "Could not load the capture for review",
+        Job::ReviewCapture => "Could not save the review",
         Job::Discover => "Discovery failed",
         Job::NetworkScan => "Network scan failed",
         Job::Connect => "Could not connect",

@@ -100,7 +100,7 @@ Use the IDs returned by `review`; `--id ID` retrieves a particular pending sugge
 
 The database stores sensor frames, descriptors, settings, feedback and pending reviews. Close it before copying the file. Discarded captures release sensor pixels and retain their negative training descriptor and decision. Automatic capture pauses suggestions at 200 pending reviews or a 2 GiB stored-pixel limit; review or begin another session to continue. Reopening restores saved capture settings and restarts acquisition if auto capture was enabled; reconnect the same camera first.
 
-The built-in learner uses small spatial color/edge descriptors, nearest-example preference scoring and background novelty on the CPU. It needs no model download or cloud service. It is a lightweight baseline, with limited semantic understanding and sensitivity to camera and lighting changes. The [model research and evaluation plan](docs/auto-capture-models.md) compares DINOv2/DINOv3, AnomalyDINO, PatchCore, EfficientAD and WinCLIP as pretrained alternatives; these neural backends are not included in the initial implementation.
+The built-in learner uses small spatial color/edge descriptors, nearest-example preference scoring and background novelty on the CPU. It samples at most four frames per second, so very brief events can be missed. It needs no model download or cloud service. It is a lightweight baseline, with limited semantic understanding and sensitivity to camera and lighting changes. The [model research and evaluation plan](docs/auto-capture-models.md) compares DINOv2/DINOv3, AnomalyDINO, PatchCore, EfficientAD and WinCLIP as pretrained alternatives; these neural backends are not included in the initial implementation.
 
 ## Repeatable workflows
 

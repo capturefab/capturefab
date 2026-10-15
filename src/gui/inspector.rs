@@ -2064,6 +2064,7 @@ impl Workbench {
             }
         }
         column![
+            self.auto_capture_settings(p),
             save,
             self.storage_settings(p),
             self.jobs(p),

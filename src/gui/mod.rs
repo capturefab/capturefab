@@ -1,6 +1,7 @@
 //! The native workbench. Camera I/O lives on the session worker, never the UI thread.
 mod accessibility;
 mod analytics;
+mod autocapture;
 mod brand;
 mod button;
 mod camera_history;
@@ -406,6 +407,12 @@ impl Pending {
             Job::Stop if self.batch => "Stopping streams",
             Job::Stop => "Stopping stream",
             Job::Capture => "Saving capture",
+            Job::CaptureSessionOpen => "Opening capture session",
+            Job::CaptureSessionClose => "Closing capture session",
+            Job::AutoCapture => "Updating automatic capture",
+            Job::CaptureExample => "Learning from capture",
+            Job::CaptureReview => "Loading capture for review",
+            Job::ReviewCapture => "Saving review",
             Job::AutoOn => "Enabling auto mode",
             Job::AutoOff => "Switching to manual",
             Job::Balance => "Updating auto balance",
@@ -439,6 +446,12 @@ enum Job {
     /// Stop a camera's stream; with `Pending::batch`, part of Stop all.
     Stop,
     Capture,
+    CaptureSessionOpen,
+    CaptureSessionClose,
+    AutoCapture,
+    CaptureExample,
+    CaptureReview,
+    ReviewCapture,
     AutoOn,
     AutoOff,
     /// A new balance for auto mode.
@@ -674,6 +687,7 @@ enum Message {
     StartForward,
     StopForward,
     CapturePicker(destinations::Message),
+    AutoCapture(autocapture::Input),
     RecordPicker(destinations::Message),
     Screenshot(window::Screenshot),
     ToggleSidebar,
@@ -868,6 +882,7 @@ struct Workbench {
     side: sidebar::SideState,
     stage_ui: stage::StageState,
     inspect: inspector::InspectorState,
+    auto_capture: autocapture::State,
     sheets: help::SheetState,
 }
 
@@ -1056,6 +1071,7 @@ impl Workbench {
             side: Default::default(),
             stage_ui: Default::default(),
             inspect: Default::default(),
+            auto_capture: Default::default(),
             sheets: Default::default(),
         }
     }
@@ -1536,6 +1552,7 @@ impl Workbench {
         self.result_side(pending, result);
         self.result_stage(pending, result);
         self.result_inspector(pending, result);
+        self.result_autocapture(pending, result);
         let notice = if pending.batch {
             self.batch_result(&pending.job, result)
         } else {
@@ -1676,6 +1693,7 @@ impl Workbench {
         self.tick_stage();
         self.tick_inspector();
         self.tick_analytics();
+        self.tick_autocapture();
         self.save_prefs();
         Task::batch([
             pages,
@@ -2517,6 +2535,9 @@ impl Workbench {
             Message::SystemTheme(mode) => self.system_dark = mode == theme::Mode::Dark,
             Message::Key { chord, captured } => {
                 self.desktop_menu.cancel_alt();
+                if self.review_shortcut(chord, captured) {
+                    return Task::none();
+                }
                 return self.shortcut(chord, !captured);
             }
             Message::FocusNext(back) => {
@@ -2840,6 +2861,7 @@ impl Workbench {
                 self.send(Job::StopForward { recording }, SessionCommand::StopForward);
             }
             Message::CapturePicker(message) => return self.picker(false, message),
+            Message::AutoCapture(input) => return self.update_autocapture(input),
             Message::RecordPicker(message) => return self.picker(true, message),
             Message::ToggleSidebar => {
                 self.image_mode = false;
@@ -2971,6 +2993,7 @@ impl Workbench {
             Action::Overview if self.help_open => self.help_open = false,
             Action::Overview if self.network_open => self.network_open = false,
             Action::Overview if self.analytics.open => self.analytics.open = false,
+            Action::Overview if self.auto_capture.open => self.auto_capture.open = false,
             Action::Overview if self.settings_open && self.settings_window.is_none() => {
                 self.settings_open = false
             }

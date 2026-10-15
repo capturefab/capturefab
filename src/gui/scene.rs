@@ -184,6 +184,7 @@ impl Workbench {
             || self.scene_side(word, late)
             || self.scene_stage(word, late)
             || self.scene_inspector(word, late)
+            || self.scene_autocapture(word, late)
             || self.scene_sheets(word, late)
     }
 

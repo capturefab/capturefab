@@ -116,6 +116,11 @@ capture examples and review labels; it does not train a neural network, run
 PatchCore or EfficientAD, download DINO weights, or require a cloud service.
 
 This baseline makes feedback immediate and keeps the feature usable offline.
+It analyzes a preview of at most 64 × 64 pixels at up to four samples per second,
+with bounded banks of 256 positive and 256 negative examples and 64 background
+prototypes. Events shorter than the sampling interval and tiny image defects
+can be missed. The saved captures retain the original sensor resolution and
+sample bytes; the small preview is only the learning representation.
 It is most useful with a reasonably stable camera view and visually consistent
 capture targets. It can miss small defects, confuse semantically different but
 visually similar frames, and react to illumination or viewpoint changes. A model
