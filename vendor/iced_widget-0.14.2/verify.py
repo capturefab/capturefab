@@ -25,6 +25,7 @@ with tarfile.open(archive) as upstream:
                 original.decode().splitlines(keepends=True),
                 current.decode().splitlines(keepends=True),
                 fromfile=f"a/{SOURCE}", tofile=f"b/{SOURCE}",
+                n=0,
             ))
 assert changed == [SOURCE], changed
 assert patch == (root / "UPSTREAM.patch").read_text()

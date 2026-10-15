@@ -469,11 +469,12 @@ pub(super) fn code_block<'a>(
 /// numbers at rest, fractions while sliding. Labels keep one weight, so
 /// nothing reflows, and brighten as the thumb passes under them.
 pub(super) fn segmented<'a, M: Clone + 'static>(
+    name: &'a str,
     items: Vec<(&'a str, Option<M>, String)>,
     selected: usize,
     thumb: f32,
 ) -> Element<'a, M> {
-    segments(items, selected, thumb, false)
+    segments(name, items, selected, thumb, false)
 }
 
 /// Inspector panes are tabs. Selection describes the current pane immediately;
@@ -483,10 +484,11 @@ pub(super) fn inspector_tabs<'a, M: Clone + 'static>(
     selected: usize,
     thumb: f32,
 ) -> Element<'a, M> {
-    segments(items, selected, thumb, true)
+    segments("Inspector panels", items, selected, thumb, true)
 }
 
 fn segments<'a, M: Clone + 'static>(
+    name: &'a str,
     items: Vec<(&'a str, Option<M>, String)>,
     selected: usize,
     thumb: f32,
@@ -554,7 +556,7 @@ fn segments<'a, M: Clone + 'static>(
         .padding(2)
         .style(style::segment_track)
         .into();
-    radio_group::wrap(group, choices, tabs)
+    radio_group::wrap(group, choices, tabs, name)
 }
 
 pub(super) fn icon_button<'a>(

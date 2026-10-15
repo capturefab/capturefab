@@ -13,6 +13,11 @@ use std::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+#[cfg(feature = "ai")]
+mod measurements;
+#[cfg(feature = "ai")]
+pub use measurements::{MAX_MEASUREMENT_SAMPLES, MeasurementSample, render_measurement_svg};
+
 pub const RETENTION_SECONDS: u64 = 24 * 60 * 60;
 pub const SAMPLE_INTERVAL_SECONDS: u64 = 1;
 pub const MAX_SAMPLES: usize = 250_000;
@@ -375,6 +380,8 @@ fn open_database() -> Result<Connection> {
         rate_frames UBIGINT NOT NULL, rate_dropped UBIGINT NOT NULL
     )",
     )?;
+    #[cfg(feature = "ai")]
+    measurements::initialize_database(&db)?;
     Ok(db)
 }
 
@@ -574,6 +581,8 @@ impl Store {
             let removed = db.execute("DELETE FROM samples WHERE sequence IN (SELECT sequence FROM samples ORDER BY sequence LIMIT ?)", params![rows - MAX_SAMPLES as u64])?;
             self.truncated |= removed > 0;
         }
+        #[cfg(feature = "ai")]
+        measurements::prune_measurements(db, now)?;
         Ok(())
     }
 

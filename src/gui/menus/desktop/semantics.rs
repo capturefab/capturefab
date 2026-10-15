@@ -381,20 +381,34 @@ mod tests {
             routes.0[1].2,
             Some(Message::DesktopMenu(Input::Open(1)))
         ));
-        assert_eq!(
-            bridge
-                .dispatch(accessibility::Request {
-                    window,
-                    replay: None,
-                    action: accesskit::ActionRequest {
-                        action: accesskit::Action::Focus,
-                        target: header_ids[1],
-                        data: None
-                    },
-                })
-                .units(),
-            3,
-            "native menu focus restores and activates its window, then routes logical focus without clearing the document editor"
+        use iced::futures::StreamExt;
+        use iced_runtime::{Action as RuntimeAction, window::Action as WindowAction};
+        let mut actions =
+            iced_runtime::task::into_stream(bridge.dispatch(accessibility::Request {
+                window,
+                replay: None,
+                action: accesskit::ActionRequest {
+                    action: accesskit::Action::Focus,
+                    target: header_ids[1],
+                    data: None,
+                },
+            }))
+            .unwrap();
+        let Some(RuntimeAction::Window(WindowAction::GetMode(id, reply))) =
+            iced::futures::executor::block_on(actions.next())
+        else {
+            panic!("native menu focus must query its owning window");
+        };
+        assert_eq!(id, window);
+        reply.send(iced::window::Mode::Windowed).unwrap();
+        let outputs = iced::futures::executor::block_on(actions.collect::<Vec<_>>());
+        assert!(
+            matches!(outputs.as_slice(), [
+            RuntimeAction::Window(WindowAction::Minimize(id, false)),
+            RuntimeAction::Window(WindowAction::GainFocus(focused)),
+            RuntimeAction::Output(Message::DesktopMenu(Input::FocusHeader(1)))
+        ] if *id == window && *focused == window),
+            "native menu focus restores and activates its owner before routing logical focus"
         );
         let mut state = DesktopState::default();
         assert!(

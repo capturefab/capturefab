@@ -2335,6 +2335,22 @@ fn schema() -> Value {
         json!("--session NAME [--camera ID] targets an existing visible GUI or headless worker");
     contract["limits"]["active_jobs_per_camera"] = json!(32);
     contract["limits"]["camera_workers_default"] = json!(16);
+    #[cfg(feature = "ai")]
+    {
+        contract["remote"]["routes"]["GET, HEAD /api/measurements"] =
+            json!("Retained prompt-defined numeric measurements; no API keys or frames");
+        contract["remote"]["routes"]["GET, HEAD /api/measurements.svg"] =
+            json!("Plotters visualization of prompt measurements");
+        contract["video_analytics"] = json!({
+            "desktop":"Settings configures provider API keys in the OS native credential store; Analytics configures prompts and explicitly starts collection on a live camera.",
+            "providers":["openai","gemini","claude"],
+            "environment":{"openai":["OPENAI_API_KEY"],"gemini":["GOOGLE_API_KEY","GEMINI_API_KEY"],"claude":["ANTHROPIC_API_KEY"]},
+            "credentials":"First nonempty environment variable takes precedence over the saved native-keyring credential. Keys are never included in preferences or measurement history.",
+            "measurements":"Up to 16 named prompts with expected units; structured nullable value, confidence and note per measurement.",
+            "sampling":"5..3600 seconds; one request at a time; starts paused and stops on errors.",
+            "retention":"In-memory DuckDB; at most 24 hours and 10000 measurement rows; history resets with the process."
+        });
+    }
     contract["limits"]["shared_memory_slots_per_camera"] = json!(3);
     contract["camera_profiles"] = json!({
         "location":"CameraInfo.profile: discover.devices[], info.camera, status.connected and status.cameras[].info",

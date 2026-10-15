@@ -33,7 +33,48 @@ impl Workbench {
         if let Some(settings) = self.settings_window {
             self.accessibility.invalidate(settings);
         }
-        window::gain_focus(id).chain(operation::focus("close-retry"))
+        // Quit can interrupt a hidden window's ordinary Opened/Attached
+        // completion. Recover that initialization before presenting its alert,
+        // while preserving the mode of an already displayed/fullscreen window.
+        Task::batch([
+            self.accessibility
+                .attach(id)
+                .map(move |_| Message::AccessibilityRecoveryAttached(id)),
+            window::scale_factor(id).map(move |scale| Message::WindowScale(id, scale)),
+        ])
+    }
+
+    pub(super) fn recovery_attached(&self, id: window::Id) -> Task<Message> {
+        if self.closing.is_none()
+            && self.known_window(id)
+            && self
+                .close_error
+                .as_ref()
+                .is_some_and(|error| error.window == id)
+        {
+            return window::mode(id).map(move |mode| Message::CloseErrorMode(id, mode));
+        }
+        Task::none()
+    }
+
+    pub(super) fn present_close_error(&self, id: window::Id, mode: window::Mode) -> Task<Message> {
+        // Return through the model again before presentation. Cancel/close/
+        // reopen must not revive the old alert.
+        if self.closing.is_some()
+            || !self.known_window(id)
+            || !self
+                .close_error
+                .as_ref()
+                .is_some_and(|error| error.window == id)
+        {
+            return Task::none();
+        }
+        let reveal = if mode == window::Mode::Hidden {
+            self.present_window(id)
+        } else {
+            window::gain_focus(id)
+        };
+        reveal.chain(operation::focus("close-retry"))
     }
 
     pub(super) fn dismiss_close_error(&mut self) {

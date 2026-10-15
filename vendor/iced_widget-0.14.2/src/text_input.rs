@@ -108,6 +108,7 @@ pub struct TextInput<
     value: Value,
     is_secure: bool,
     show_unfocused_selection: bool,
+    visual_geometry: Option<VisualGeometryFn<Renderer::Paragraph>>,
     font: Option<Renderer::Font>,
     width: Length,
     padding: Padding,
@@ -121,6 +122,262 @@ pub struct TextInput<
     class: Theme::Class<'a>,
     last_status: Option<Status>,
 }
+
+/// Paragraph-local selection advances and the logical focus endpoint.
+///
+/// Ranges are `(x, width)` pairs; callers must not join separated visual ranges
+/// into a bounding rectangle. These coordinates precede field alignment/scroll.
+#[derive(Debug, Clone)]
+pub struct VisualGeometry {
+    /// Selected visual advance intervals, from left to right.
+    pub ranges: Vec<(f32, f32)>,
+    /// Visual X coordinate of the logical cursor/selection focus.
+    pub focus_x: f32,
+    /// Logical grapheme advance cells used for the same pointer geometry.
+    pub cells: Vec<VisualCell>,
+    /// Resolved base direction of this single-line paragraph.
+    pub base_rtl: bool,
+}
+
+/// Which visual position to retain at a split bidirectional insertion point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaretAffinity {
+    /// Insertion in the paragraph's base direction.
+    Strong,
+    /// Insertion opposite to the paragraph's base direction.
+    Weak,
+}
+
+/// A logical extended-grapheme boundary and its retained visual affinity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisualCaret {
+    /// Logical extended-grapheme boundary.
+    pub index: usize,
+    /// Retained strong/weak position at a bidirectional boundary.
+    pub affinity: CaretAffinity,
+}
+
+/// Retained visual endpoints of the editor's logical selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisualSelection {
+    /// Fixed endpoint while extending a selection.
+    pub anchor: VisualCaret,
+    /// Moving endpoint, used for the caret, scrolling and input methods.
+    pub focus: VisualCaret,
+}
+
+/// One logical extended grapheme's paragraph-local advance cell.
+#[derive(Debug, Clone)]
+pub struct VisualCell {
+    /// Logical extended-grapheme index.
+    pub index: usize,
+    /// Left edge of the visual advance cell.
+    pub x: f32,
+    /// Width of the visual advance cell.
+    pub width: f32,
+    /// Whether its logical leading edge is on the right.
+    pub rtl: bool,
+    /// Resolved bidi embedding level of the cached shaping cluster.
+    pub level: u8,
+}
+
+impl VisualGeometry {
+    /// Hits the nearest grapheme cell using the same logical/visual mapping
+    /// as selection paint. Bidi boundary affinity remains the caller's model.
+    pub fn hit_test(&self, x: f32) -> Option<usize> {
+        self.hit_test_caret(x).map(|caret| caret.index)
+    }
+
+    /// Hits a grapheme edge without losing its strong/weak visual position.
+    pub fn hit_test_caret(&self, x: f32) -> Option<VisualCaret> {
+        if !x.is_finite() {
+            return None;
+        }
+        let distance = |cell: &VisualCell| {
+            (cell.x - x).max(0.0) + (x - cell.x - cell.width).max(0.0)
+        };
+        let cell = self
+            .cells
+            .iter()
+            .filter(|cell| {
+                cell.x.is_finite() && cell.width.is_finite() && cell.width > 0.0
+            })
+            .min_by(|a, b| distance(a).total_cmp(&distance(b)))?;
+        let after = (x >= cell.x + cell.width / 2.0) != cell.rtl;
+        let index = cell.index + usize::from(after);
+        let edge = if after != cell.rtl {
+            cell.x + cell.width
+        } else {
+            cell.x
+        };
+        self.caret_near(index, edge)
+    }
+
+    /// Strong and weak X positions, derived from adjacent shaped advances and
+    /// embedding levels. Paragraph edges act as base-direction boundaries.
+    pub fn caret_positions(&self, index: usize) -> Option<(f32, f32)> {
+        let left = self
+            .cells
+            .iter()
+            .map(|cell| cell.x)
+            .reduce(f32::min)
+            .unwrap_or(0.0);
+        let right = self
+            .cells
+            .iter()
+            .map(|cell| cell.x + cell.width)
+            .reduce(f32::max)
+            .unwrap_or(0.0);
+        self.caret_positions_with_edges(index, left, right)
+    }
+
+    fn caret_positions_with_edges(
+        &self,
+        index: usize,
+        left: f32,
+        right: f32,
+    ) -> Option<(f32, f32)> {
+        if index > self.cells.len() {
+            return None;
+        }
+        let base_level = u8::from(self.base_rtl);
+        let (before_x, before_rtl, before_level) = index
+            .checked_sub(1)
+            .and_then(|index| self.cells.get(index))
+            .map_or(
+                (
+                    if self.base_rtl { right } else { left },
+                    self.base_rtl,
+                    base_level,
+                ),
+                |cell| {
+                    (
+                        if cell.rtl {
+                            cell.x
+                        } else {
+                            cell.x + cell.width
+                        },
+                        cell.rtl,
+                        cell.level,
+                    )
+                },
+            );
+        let (after_x, after_rtl, after_level) = self.cells.get(index).map_or(
+            (
+                if self.base_rtl { left } else { right },
+                self.base_rtl,
+                base_level,
+            ),
+            |cell| {
+                (
+                    if cell.rtl {
+                        cell.x + cell.width
+                    } else {
+                        cell.x
+                    },
+                    cell.rtl,
+                    cell.level,
+                )
+            },
+        );
+        let before_is_strong = before_rtl == self.base_rtl
+            && (after_rtl != before_rtl || before_level < after_level);
+        Some(if before_is_strong {
+            (before_x, after_x)
+        } else {
+            (after_x, before_x)
+        })
+    }
+
+    /// X position shared by drawing, horizontal scrolling and input methods.
+    pub fn caret_x(&self, caret: VisualCaret) -> Option<f32> {
+        self.caret_positions(caret.index).map(|(strong, weak)| {
+            match caret.affinity {
+                CaretAffinity::Strong => strong,
+                CaretAffinity::Weak => weak,
+            }
+        })
+    }
+
+    fn caret_near(&self, index: usize, x: f32) -> Option<VisualCaret> {
+        let (strong, weak) = self.caret_positions(index)?;
+        Some(VisualCaret {
+            index,
+            affinity: if (weak - x).abs() + 0.001 < (strong - x).abs() {
+                CaretAffinity::Weak
+            } else {
+                CaretAffinity::Strong
+            },
+        })
+    }
+
+    fn adjacent_caret(
+        &self,
+        caret: VisualCaret,
+        right: bool,
+    ) -> Option<VisualCaret> {
+        let x = self.caret_x(caret)?;
+        let left = self
+            .cells
+            .iter()
+            .map(|cell| cell.x)
+            .reduce(f32::min)
+            .unwrap_or(0.0);
+        let right_edge = self
+            .cells
+            .iter()
+            .map(|cell| cell.x + cell.width)
+            .reduce(f32::max)
+            .unwrap_or(0.0);
+        let next = (0..=self.cells.len())
+            .filter_map(|index| {
+                let candidate = VisualCaret { index, ..caret };
+                let (strong, weak) =
+                    self.caret_positions_with_edges(index, left, right_edge)?;
+                let candidate_x = match candidate.affinity {
+                    CaretAffinity::Strong => strong,
+                    CaretAffinity::Weak => weak,
+                };
+                ((right && candidate_x > x + 0.001)
+                    || (!right && candidate_x < x - 0.001))
+                    .then_some((candidate, candidate_x))
+            })
+            .min_by(|(a, ax), (b, bx)| {
+                if right {
+                    ax.total_cmp(bx).then(a.index.cmp(&b.index))
+                } else {
+                    bx.total_cmp(ax).then(b.index.cmp(&a.index))
+                }
+            });
+        Some(next.map_or(caret, |(caret, _)| caret))
+    }
+
+    fn selection_edge(
+        &self,
+        start: usize,
+        end: usize,
+        right: bool,
+    ) -> Option<VisualCaret> {
+        let cell = self
+            .cells
+            .iter()
+            .filter(|cell| {
+                (start.min(end)..start.max(end)).contains(&cell.index)
+            })
+            .min_by(|a, b| {
+                if right {
+                    (b.x + b.width).total_cmp(&(a.x + a.width))
+                } else {
+                    a.x.total_cmp(&b.x)
+                }
+            })?;
+        let index = cell.index + usize::from(right != cell.rtl);
+        self.caret_near(index, cell.x + if right { cell.width } else { 0.0 })
+    }
+}
+
+/// An optional adapter to geometry from the paragraph's existing shaping.
+pub type VisualGeometryFn<P> = fn(&P, cursor::State) -> Option<VisualGeometry>;
 
 /// The default [`Padding`] of a [`TextInput`].
 pub const DEFAULT_PADDING: Padding = Padding::new(5.0);
@@ -140,6 +397,7 @@ where
             value: Value::new(value),
             is_secure: false,
             show_unfocused_selection: false,
+            visual_geometry: None,
             font: None,
             width: Length::Fill,
             padding: DEFAULT_PADDING,
@@ -175,6 +433,49 @@ where
     pub fn show_unfocused_selection(mut self, show: bool) -> Self {
         self.show_unfocused_selection = show;
         self
+    }
+
+    /// Uses the cached paragraph's visual selection geometry. Defaults to none,
+    /// preserving the renderer-independent upstream geometry for other callers.
+    /// The adapter must use logical extended-grapheme indices and must not shape
+    /// a second paragraph. Returning `None` keeps the existing fallback.
+    pub fn visual_geometry(
+        mut self,
+        geometry: VisualGeometryFn<Renderer::Paragraph>,
+    ) -> Self {
+        self.visual_geometry = Some(geometry);
+        self
+    }
+
+    /// Returns the unclipped logical origin used to draw the cached value.
+    /// Alignment and horizontal scroll are applied once, as in drawing.
+    pub fn text_origin(&self, tree: &Tree, layout: Layout<'_>) -> Point {
+        let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
+        let bounds = layout.children().next().unwrap().bounds();
+        let secure = self.is_secure.then(|| self.value.secure());
+        let value = secure.as_ref().unwrap_or(&self.value);
+        let paragraph = state.value.raw();
+        let offset = if state.show_cursor_or_selection(
+            value,
+            self.on_input.is_none(),
+            self.show_unfocused_selection,
+        ) {
+            offset(bounds, value, state, self.visual_geometry)
+        } else {
+            0.0
+        };
+        bounds.anchor(
+            paragraph.min_bounds(),
+            Alignment::Start,
+            Alignment::Center,
+        ) + Vector::new(
+            alignment_offset(
+                bounds.width,
+                paragraph.min_width(),
+                self.alignment,
+            ) - offset,
+            0.0,
+        )
     }
 
     /// Sets the message that should be produced when some text is typed into
@@ -427,8 +728,14 @@ where
         };
 
         let text = state.value.raw();
-        let (cursor_x, scroll_offset) =
-            measure_cursor_and_scroll_offset(text, text_bounds, caret_index);
+        let (cursor_x, scroll_offset) = measure_cursor_and_scroll_offset(
+            text,
+            text_bounds,
+            caret_index,
+            state.cursor.state(value),
+            self.visual_geometry,
+            state.visual_caret(),
+        );
 
         let alignment_offset = alignment_offset(
             text_bounds.width,
@@ -510,36 +817,33 @@ where
 
         let text = value.to_string();
 
-        let (cursor, offset, is_selecting) = if let Some(focus) =
-            state.is_focused.as_ref().filter(|focus| {
-                focus.is_window_focused
-                    || (self.show_unfocused_selection
-                        && !is_disabled
-                        && matches!(
-                            state.cursor.state(value),
-                            cursor::State::Selection { .. }
-                        ))
+        let (quads, offset, is_selecting) = if let Some(focus) =
+            state.is_focused.as_ref().filter(|_| {
+                state.show_cursor_or_selection(
+                    value,
+                    is_disabled,
+                    self.show_unfocused_selection,
+                )
             }) {
             match state.cursor.state(value) {
                 cursor::State::Index(position) => {
-                    let (text_value_width, offset) =
-                        measure_cursor_and_scroll_offset(
-                            state.value.raw(),
-                            text_bounds,
-                            position,
-                        );
-
-                    let is_cursor_visible = !is_disabled
+                    let (x, offset) = measure_cursor_and_scroll_offset(
+                        state.value.raw(),
+                        text_bounds,
+                        position,
+                        cursor::State::Index(position),
+                        self.visual_geometry,
+                        state.visual_caret(),
+                    );
+                    let visible = !is_disabled
                         && ((focus.now - focus.updated_at).as_millis()
                             / CURSOR_BLINK_INTERVAL_MILLIS)
                             .is_multiple_of(2);
-
-                    let cursor = if is_cursor_visible {
-                        Some((
+                    let quads = if visible {
+                        vec![(
                             renderer::Quad {
                                 bounds: Rectangle {
-                                    x: (text_bounds.x + text_value_width)
-                                        .floor(),
+                                    x: (text_bounds.x + x).floor(),
                                     y: text_bounds.y,
                                     width: 1.0,
                                     height: text_bounds.height,
@@ -547,57 +851,74 @@ where
                                 ..renderer::Quad::default()
                             },
                             style.value,
-                        ))
+                        )]
                     } else {
-                        None
+                        Vec::new()
                     };
-
-                    (cursor, offset, false)
+                    (quads, offset, false)
                 }
                 cursor::State::Selection { start, end } => {
-                    let left = start.min(end);
-                    let right = end.max(start);
-
-                    let (left_position, left_offset) =
-                        measure_cursor_and_scroll_offset(
-                            state.value.raw(),
-                            text_bounds,
-                            left,
-                        );
-
-                    let (right_position, right_offset) =
-                        measure_cursor_and_scroll_offset(
-                            state.value.raw(),
-                            text_bounds,
-                            right,
-                        );
-
-                    let width = right_position - left_position;
-
-                    (
-                        Some((
-                            renderer::Quad {
-                                bounds: Rectangle {
-                                    x: text_bounds.x + left_position,
-                                    y: text_bounds.y,
-                                    width,
-                                    height: text_bounds.height,
-                                },
-                                ..renderer::Quad::default()
+                    let visual = resolved_visual_geometry(
+                        state.value.raw(),
+                        cursor::State::Selection { start, end },
+                        self.visual_geometry,
+                        state.visual_caret(),
+                    );
+                    let (ranges, offset) = if let Some(visual) = visual {
+                        (
+                            visual.ranges,
+                            scroll_offset(visual.focus_x, text_bounds),
+                        )
+                    } else {
+                        let (left, left_offset) =
+                            measure_cursor_and_scroll_offset(
+                                state.value.raw(),
+                                text_bounds,
+                                start.min(end),
+                                cursor::State::Index(start.min(end)),
+                                None,
+                                None,
+                            );
+                        let (right, right_offset) =
+                            measure_cursor_and_scroll_offset(
+                                state.value.raw(),
+                                text_bounds,
+                                start.max(end),
+                                cursor::State::Index(start.max(end)),
+                                None,
+                                None,
+                            );
+                        (
+                            vec![(left, right - left)],
+                            if end >= start {
+                                right_offset
+                            } else {
+                                left_offset
                             },
-                            style.selection,
-                        )),
-                        if end == right {
-                            right_offset
-                        } else {
-                            left_offset
-                        },
-                        true,
-                    )
+                        )
+                    };
+                    let quads = ranges
+                        .into_iter()
+                        .map(|(x, width)| {
+                            (
+                                renderer::Quad {
+                                    bounds: Rectangle {
+                                        x: text_bounds.x + x,
+                                        y: text_bounds.y,
+                                        width,
+                                        height: text_bounds.height,
+                                    },
+                                    ..renderer::Quad::default()
+                                },
+                                style.selection,
+                            )
+                        })
+                        .collect();
+                    (quads, offset, true)
                 }
             }
         } else {
-            (None, 0.0, false)
+            (Vec::new(), 0.0, false)
         };
 
         let draw = |renderer: &mut Renderer, viewport| {
@@ -619,16 +940,14 @@ where
                 self.alignment,
             );
 
-            if let Some((cursor, color)) = cursor {
-                renderer.with_translation(
-                    Vector::new(alignment_offset - offset, 0.0),
-                    |renderer| {
-                        renderer.fill_quad(cursor, color);
-                    },
-                );
-            } else {
-                renderer.with_translation(Vector::ZERO, |_| {});
-            }
+            renderer.with_translation(
+                Vector::new(alignment_offset - offset, 0.0),
+                |renderer| {
+                    for (quad, color) in &quads {
+                        renderer.fill_quad(*quad, *color);
+                    }
+                },
+            );
 
             renderer.fill_paragraph(
                 paragraph,
@@ -739,6 +1058,7 @@ where
             | Event::Touch(touch::Event::FingerPressed { .. }) => {
                 let state = state::<Renderer>(tree);
                 let cursor_before = state.cursor;
+                let visual_before = state.visual_selection();
 
                 let click_position = cursor.position_over(layout.bounds());
 
@@ -777,7 +1097,23 @@ where
 
                     match click.kind() {
                         click::Kind::Single => {
-                            let position = if target > 0.0 {
+                            let anchor = state
+                                .visual_selection()
+                                .map(|visual| visual.anchor)
+                                .unwrap_or(VisualCaret {
+                                    index: state.cursor.start(&self.value),
+                                    affinity: CaretAffinity::Strong,
+                                });
+                            let (position, visual) = if target > 0.0
+                                || self.visual_geometry.is_some_and(
+                                    |geometry| {
+                                        geometry(
+                                            state.value.raw(),
+                                            state.cursor.state(&self.value),
+                                        )
+                                        .is_some()
+                                    },
+                                ) {
                                 let value = if self.is_secure {
                                     self.value.secure()
                                 } else {
@@ -789,11 +1125,12 @@ where
                                     &value,
                                     state,
                                     target,
+                                    self.visual_geometry,
                                 )
                             } else {
                                 None
                             }
-                            .unwrap_or(0);
+                            .unwrap_or((0, None));
 
                             if state.keyboard_modifiers.shift() {
                                 state.cursor.select_range(
@@ -803,10 +1140,25 @@ where
                             } else {
                                 state.cursor.move_to(position);
                             }
+                            if let Some(visual) =
+                                visual.filter(|_| !self.is_secure)
+                            {
+                                state.remember_visual_selection(
+                                    if state.keyboard_modifiers.shift() {
+                                        anchor
+                                    } else {
+                                        visual
+                                    },
+                                    visual,
+                                );
+                            } else {
+                                state.visual_selection = None;
+                            }
 
                             state.is_dragging = Some(Drag::Select);
                         }
                         click::Kind::Double => {
+                            state.visual_selection = None;
                             if self.is_secure {
                                 state.cursor.select_all(&self.value);
 
@@ -817,7 +1169,9 @@ where
                                     &self.value,
                                     state,
                                     target,
+                                    self.visual_geometry,
                                 )
+                                .map(|(index, _)| index)
                                 .unwrap_or(0);
 
                                 state.cursor.select_range(
@@ -831,6 +1185,7 @@ where
                             }
                         }
                         click::Kind::Triple => {
+                            state.visual_selection = None;
                             state.cursor.select_all(&self.value);
                             state.is_dragging = None;
                         }
@@ -838,7 +1193,9 @@ where
 
                     state.last_click = Some(click);
 
-                    if cursor_before != state.cursor {
+                    if cursor_before != state.cursor
+                        || visual_before != state.visual_selection()
+                    {
                         shell.request_redraw();
                     }
 
@@ -875,15 +1232,17 @@ where
                         self.value.clone()
                     };
 
-                    let position = find_cursor_position(
+                    let (position, visual) = find_cursor_position(
                         text_layout.bounds(),
                         &value,
                         state,
                         target,
+                        self.visual_geometry,
                     )
-                    .unwrap_or(0);
+                    .unwrap_or((0, None));
 
                     let selection_before = state.cursor.selection(&value);
+                    let visual_before = state.visual_selection();
 
                     match is_dragging {
                         Drag::Select => {
@@ -891,8 +1250,22 @@ where
                                 state.cursor.start(&value),
                                 position,
                             );
+                            if let Some(visual) =
+                                visual.filter(|_| !self.is_secure)
+                            {
+                                let anchor = visual_before
+                                    .map(|selection| selection.anchor)
+                                    .unwrap_or(VisualCaret {
+                                        index: state.cursor.start(&value),
+                                        affinity: CaretAffinity::Strong,
+                                    });
+                                state.remember_visual_selection(anchor, visual);
+                            } else {
+                                state.visual_selection = None;
+                            }
                         }
                         Drag::SelectWords { anchor } => {
+                            state.visual_selection = None;
                             if position < *anchor {
                                 state.cursor.select_range(
                                     self.value.previous_start_of_word(position),
@@ -911,7 +1284,9 @@ where
                         focus.updated_at = Instant::now();
                     }
 
-                    if selection_before != state.cursor.selection(&value) {
+                    if selection_before != state.cursor.selection(&value)
+                        || visual_before != state.visual_selection()
+                    {
                         shell.request_redraw();
                     }
 
@@ -1017,10 +1392,14 @@ where
                         }
                         Some('a') if state.keyboard_modifiers.command() => {
                             let cursor_before = state.cursor;
+                            let had_visual_selection =
+                                state.visual_selection.take().is_some();
 
                             state.cursor.select_all(&self.value);
 
-                            if cursor_before != state.cursor {
+                            if cursor_before != state.cursor
+                                || had_visual_selection
+                            {
                                 focus.updated_at = Instant::now();
 
                                 shell.request_redraw();
@@ -1075,6 +1454,7 @@ where
                             }
                         }
                         keyboard::Key::Named(key::Named::Backspace) => {
+                            state.visual_selection = None;
                             let Some(on_input) = &self.on_input else {
                                 return;
                             };
@@ -1106,6 +1486,7 @@ where
                             update_cache(state, &self.value);
                         }
                         keyboard::Key::Named(key::Named::Delete) => {
+                            state.visual_selection = None;
                             let Some(on_input) = &self.on_input else {
                                 return;
                             };
@@ -1138,6 +1519,8 @@ where
                         }
                         keyboard::Key::Named(key::Named::Home) => {
                             let cursor_before = state.cursor;
+                            let had_visual_selection =
+                                state.visual_selection.take().is_some();
 
                             if modifiers.shift() {
                                 state.cursor.select_range(
@@ -1148,7 +1531,9 @@ where
                                 state.cursor.move_to(0);
                             }
 
-                            if cursor_before != state.cursor {
+                            if cursor_before != state.cursor
+                                || had_visual_selection
+                            {
                                 focus.updated_at = Instant::now();
 
                                 shell.request_redraw();
@@ -1158,6 +1543,8 @@ where
                         }
                         keyboard::Key::Named(key::Named::End) => {
                             let cursor_before = state.cursor;
+                            let had_visual_selection =
+                                state.visual_selection.take().is_some();
 
                             if modifiers.shift() {
                                 state.cursor.select_range(
@@ -1168,7 +1555,9 @@ where
                                 state.cursor.move_to(self.value.len());
                             }
 
-                            if cursor_before != state.cursor {
+                            if cursor_before != state.cursor
+                                || had_visual_selection
+                            {
                                 focus.updated_at = Instant::now();
 
                                 shell.request_redraw();
@@ -1178,35 +1567,63 @@ where
                         }
                         keyboard::Key::Named(key::Named::ArrowLeft) => {
                             let cursor_before = state.cursor;
+                            let visual_before = state
+                                .visual_selection
+                                .as_ref()
+                                .map(|visual| visual.selection);
+                            let visual = !self.is_secure
+                                && state.preedit.as_ref().is_none_or(
+                                    |preedit| preedit.content.is_empty(),
+                                )
+                                && !modifiers.control()
+                                && !modifiers.alt()
+                                && !modifiers.logo()
+                                && move_visually(
+                                    &state.value,
+                                    &self.value,
+                                    &mut state.cursor,
+                                    &mut state.visual_selection,
+                                    self.visual_geometry,
+                                    false,
+                                    modifiers.shift(),
+                                );
 
-                            if (self.is_secure && modifiers.jump())
-                                || modifiers.macos_command()
-                            {
-                                if modifiers.shift() {
-                                    state.cursor.select_range(
-                                        state.cursor.start(&self.value),
-                                        0,
-                                    );
+                            if !visual {
+                                state.visual_selection = None;
+                                if (self.is_secure && modifiers.jump())
+                                    || modifiers.macos_command()
+                                {
+                                    if modifiers.shift() {
+                                        state.cursor.select_range(
+                                            state.cursor.start(&self.value),
+                                            0,
+                                        );
+                                    } else {
+                                        state.cursor.move_to(0);
+                                    }
+                                } else if modifiers.jump() {
+                                    if modifiers.shift() {
+                                        state
+                                            .cursor
+                                            .select_left_by_words(&self.value);
+                                    } else {
+                                        state
+                                            .cursor
+                                            .move_left_by_words(&self.value);
+                                    }
+                                } else if modifiers.shift() {
+                                    state.cursor.select_left(&self.value);
                                 } else {
-                                    state.cursor.move_to(0);
+                                    state.cursor.move_left(&self.value);
                                 }
-                            } else if modifiers.jump() {
-                                if modifiers.shift() {
-                                    state
-                                        .cursor
-                                        .select_left_by_words(&self.value);
-                                } else {
-                                    state
-                                        .cursor
-                                        .move_left_by_words(&self.value);
-                                }
-                            } else if modifiers.shift() {
-                                state.cursor.select_left(&self.value);
-                            } else {
-                                state.cursor.move_left(&self.value);
                             }
-
-                            if cursor_before != state.cursor {
+                            if cursor_before != state.cursor
+                                || visual_before
+                                    != state
+                                        .visual_selection
+                                        .as_ref()
+                                        .map(|visual| visual.selection)
+                            {
                                 focus.updated_at = Instant::now();
 
                                 shell.request_redraw();
@@ -1216,35 +1633,63 @@ where
                         }
                         keyboard::Key::Named(key::Named::ArrowRight) => {
                             let cursor_before = state.cursor;
+                            let visual_before = state
+                                .visual_selection
+                                .as_ref()
+                                .map(|visual| visual.selection);
+                            let visual = !self.is_secure
+                                && state.preedit.as_ref().is_none_or(
+                                    |preedit| preedit.content.is_empty(),
+                                )
+                                && !modifiers.control()
+                                && !modifiers.alt()
+                                && !modifiers.logo()
+                                && move_visually(
+                                    &state.value,
+                                    &self.value,
+                                    &mut state.cursor,
+                                    &mut state.visual_selection,
+                                    self.visual_geometry,
+                                    true,
+                                    modifiers.shift(),
+                                );
 
-                            if (self.is_secure && modifiers.jump())
-                                || modifiers.macos_command()
-                            {
-                                if modifiers.shift() {
-                                    state.cursor.select_range(
-                                        state.cursor.start(&self.value),
-                                        self.value.len(),
-                                    );
+                            if !visual {
+                                state.visual_selection = None;
+                                if (self.is_secure && modifiers.jump())
+                                    || modifiers.macos_command()
+                                {
+                                    if modifiers.shift() {
+                                        state.cursor.select_range(
+                                            state.cursor.start(&self.value),
+                                            self.value.len(),
+                                        );
+                                    } else {
+                                        state.cursor.move_to(self.value.len());
+                                    }
+                                } else if modifiers.jump() {
+                                    if modifiers.shift() {
+                                        state
+                                            .cursor
+                                            .select_right_by_words(&self.value);
+                                    } else {
+                                        state
+                                            .cursor
+                                            .move_right_by_words(&self.value);
+                                    }
+                                } else if modifiers.shift() {
+                                    state.cursor.select_right(&self.value);
                                 } else {
-                                    state.cursor.move_to(self.value.len());
+                                    state.cursor.move_right(&self.value);
                                 }
-                            } else if modifiers.jump() {
-                                if modifiers.shift() {
-                                    state
-                                        .cursor
-                                        .select_right_by_words(&self.value);
-                                } else {
-                                    state
-                                        .cursor
-                                        .move_right_by_words(&self.value);
-                                }
-                            } else if modifiers.shift() {
-                                state.cursor.select_right(&self.value);
-                            } else {
-                                state.cursor.move_right(&self.value);
                             }
-
-                            if cursor_before != state.cursor {
+                            if cursor_before != state.cursor
+                                || visual_before
+                                    != state
+                                        .visual_selection
+                                        .as_ref()
+                                        .map(|visual| visual.selection)
+                            {
                                 focus.updated_at = Instant::now();
 
                                 shell.request_redraw();
@@ -1296,6 +1741,9 @@ where
                 }
                 input_method::Event::Preedit(content, selection) => {
                     let state = state::<Renderer>(tree);
+                    if !content.is_empty() {
+                        state.visual_selection = None;
+                    }
 
                     if state.is_focused.is_some() {
                         state.preedit = Some(input_method::Preedit {
@@ -1488,8 +1936,16 @@ pub struct State<P: text::Paragraph> {
     preedit: Option<input_method::Preedit>,
     last_click: Option<mouse::Click>,
     cursor: Cursor,
+    visual_selection: Option<RetainedVisualSelection>,
     keyboard_modifiers: keyboard::Modifiers,
     // TODO: Add stateful horizontal scrolling offset
+}
+
+#[derive(Debug, Clone)]
+struct RetainedVisualSelection {
+    selection: VisualSelection,
+    cursor: Cursor,
+    text: String,
 }
 
 fn state<Renderer: text::Renderer>(
@@ -1515,6 +1971,62 @@ impl<P: text::Paragraph> State<P> {
     /// Creates a new [`State`], representing an unfocused [`TextInput`].
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The actual cached shaped value, including secure masking when enabled.
+    pub fn paragraph(&self) -> &P {
+        self.value.raw()
+    }
+
+    /// Exact text corresponding to [`Self::paragraph`].
+    pub fn paragraph_text(&self) -> &str {
+        self.value.content()
+    }
+
+    /// The retained affinities, if they still describe this cursor and cached
+    /// paragraph. Resolve their X positions with [`VisualGeometry::caret_x`].
+    pub fn visual_selection(&self) -> Option<VisualSelection> {
+        self.visual_selection
+            .as_ref()
+            .filter(|visual| {
+                visual.cursor == self.cursor
+                    && visual.text == self.value.content()
+            })
+            .map(|visual| visual.selection)
+    }
+
+    /// Retained focus affinity for the actual cached paragraph.
+    pub fn visual_caret(&self) -> Option<VisualCaret> {
+        self.visual_selection().map(|visual| visual.focus)
+    }
+
+    fn remember_visual_selection(
+        &mut self,
+        anchor: VisualCaret,
+        focus: VisualCaret,
+    ) {
+        self.visual_selection = Some(RetainedVisualSelection {
+            selection: VisualSelection { anchor, focus },
+            cursor: self.cursor,
+            text: self.value.content().to_owned(),
+        });
+    }
+
+    fn show_cursor_or_selection(
+        &self,
+        value: &Value,
+        disabled: bool,
+        retained: bool,
+    ) -> bool {
+        self.is_focused.as_ref().is_some_and(|focus| {
+            focus.is_window_focused
+                || (retained
+                    && !disabled
+                    && matches!(
+                        self.cursor.state(value),
+                        cursor::State::Selection { .. }
+                    ))
+        })
     }
 
     /// Returns whether the [`TextInput`] is currently focused or not.
@@ -1547,26 +2059,31 @@ impl<P: text::Paragraph> State<P> {
 
     /// Moves the [`Cursor`] of the [`TextInput`] to the front of the input text.
     pub fn move_cursor_to_front(&mut self) {
+        self.visual_selection = None;
         self.cursor.move_to(0);
     }
 
     /// Moves the [`Cursor`] of the [`TextInput`] to the end of the input text.
     pub fn move_cursor_to_end(&mut self) {
+        self.visual_selection = None;
         self.cursor.move_to(usize::MAX);
     }
 
     /// Moves the [`Cursor`] of the [`TextInput`] to an arbitrary location.
     pub fn move_cursor_to(&mut self, position: usize) {
+        self.visual_selection = None;
         self.cursor.move_to(position);
     }
 
     /// Selects all the content of the [`TextInput`].
     pub fn select_all(&mut self) {
+        self.visual_selection = None;
         self.cursor.select_range(0, usize::MAX);
     }
 
     /// Selects the given range of the content of the [`TextInput`].
     pub fn select_range(&mut self, start: usize, end: usize) {
+        self.visual_selection = None;
         self.cursor.select_range(start, end);
     }
 }
@@ -1615,43 +2132,125 @@ impl<P: text::Paragraph> operation::TextInput for State<P> {
     }
 }
 
+fn move_visually<P: text::Paragraph>(
+    paragraph: &paragraph::Plain<P>,
+    value: &Value,
+    cursor: &mut Cursor,
+    retained: &mut Option<RetainedVisualSelection>,
+    geometry: Option<VisualGeometryFn<P>>,
+    right: bool,
+    extend: bool,
+) -> bool {
+    let Some(visual) = geometry
+        .and_then(|geometry| geometry(paragraph.raw(), cursor.state(value)))
+    else {
+        return false;
+    };
+    let (anchor, focus) = match cursor.state(value) {
+        cursor::State::Index(index) => (index, index),
+        cursor::State::Selection { start, end } => (start, end),
+    };
+    let saved = retained
+        .as_ref()
+        .filter(|saved| {
+            saved.cursor == *cursor && saved.text == paragraph.content()
+        })
+        .map(|saved| saved.selection);
+    let anchor = saved.map(|saved| saved.anchor).unwrap_or(VisualCaret {
+        index: anchor,
+        affinity: CaretAffinity::Strong,
+    });
+    let focus = saved
+        .map(|saved| saved.focus)
+        .or_else(|| visual.caret_near(focus, visual.focus_x));
+    let next = if !extend
+        && anchor.index != focus.map_or(anchor.index, |focus| focus.index)
+    {
+        visual.selection_edge(anchor.index, cursor.end(value), right)
+    } else {
+        focus.and_then(|focus| visual.adjacent_caret(focus, right))
+    };
+    let Some(next) = next else {
+        return false;
+    };
+    let anchor = if extend {
+        cursor.select_range(anchor.index, next.index);
+        anchor
+    } else {
+        cursor.move_to(next.index);
+        next
+    };
+    *retained = Some(RetainedVisualSelection {
+        selection: VisualSelection {
+            anchor,
+            focus: next,
+        },
+        cursor: *cursor,
+        text: paragraph.content().to_owned(),
+    });
+    true
+}
+
 fn offset<P: text::Paragraph>(
     text_bounds: Rectangle,
     value: &Value,
     state: &State<P>,
+    geometry: Option<VisualGeometryFn<P>>,
 ) -> f32 {
     if state.is_focused() {
-        let cursor = state.cursor();
-
-        let focus_position = match cursor.state(value) {
+        let cursor = state.cursor.state(value);
+        let focus = match cursor {
             cursor::State::Index(i) => i,
             cursor::State::Selection { end, .. } => end,
         };
-
-        let (_, offset) = measure_cursor_and_scroll_offset(
+        measure_cursor_and_scroll_offset(
             state.value.raw(),
             text_bounds,
-            focus_position,
-        );
-
-        offset
+            focus,
+            cursor,
+            geometry,
+            state.visual_caret(),
+        )
+        .1
     } else {
         0.0
     }
 }
 
-fn measure_cursor_and_scroll_offset(
-    paragraph: &impl text::Paragraph,
+fn scroll_offset(x: f32, text_bounds: Rectangle) -> f32 {
+    ((x + 5.0) - text_bounds.width).max(0.0)
+}
+
+fn measure_cursor_and_scroll_offset<P: text::Paragraph>(
+    paragraph: &P,
     text_bounds: Rectangle,
-    cursor_index: usize,
+    legacy_index: usize,
+    cursor: cursor::State,
+    geometry: Option<VisualGeometryFn<P>>,
+    caret: Option<VisualCaret>,
 ) -> (f32, f32) {
-    let grapheme_position = paragraph
-        .grapheme_position(0, cursor_index)
-        .unwrap_or(Point::ORIGIN);
+    let x = resolved_visual_geometry(paragraph, cursor, geometry, caret)
+        .map(|geometry| geometry.focus_x)
+        .unwrap_or_else(|| {
+            paragraph
+                .grapheme_position(0, legacy_index)
+                .unwrap_or(Point::ORIGIN)
+                .x
+        });
+    (x, scroll_offset(x, text_bounds))
+}
 
-    let offset = ((grapheme_position.x + 5.0) - text_bounds.width).max(0.0);
-
-    (grapheme_position.x, offset)
+fn resolved_visual_geometry<P: text::Paragraph>(
+    paragraph: &P,
+    cursor: cursor::State,
+    geometry: Option<VisualGeometryFn<P>>,
+    caret: Option<VisualCaret>,
+) -> Option<VisualGeometry> {
+    let mut visual = geometry?(paragraph, cursor)?;
+    if let Some(x) = caret.and_then(|caret| visual.caret_x(caret)) {
+        visual.focus_x = x;
+    }
+    Some(visual)
 }
 
 /// Computes the position of the text cursor at the given X coordinate of
@@ -1661,8 +2260,25 @@ fn find_cursor_position<P: text::Paragraph>(
     value: &Value,
     state: &State<P>,
     x: f32,
-) -> Option<usize> {
-    let offset = offset(text_bounds, value, state);
+    geometry: Option<VisualGeometryFn<P>>,
+) -> Option<(usize, Option<VisualCaret>)> {
+    let visual = resolved_visual_geometry(
+        state.value.raw(),
+        state.cursor.state(value),
+        geometry,
+        state.visual_caret(),
+    );
+    let offset =
+        if let Some(visual) = visual.as_ref().filter(|_| state.is_focused()) {
+            scroll_offset(visual.focus_x, text_bounds)
+        } else {
+            offset(text_bounds, value, state, None)
+        };
+    if let Some(caret) =
+        visual.and_then(|visual| visual.hit_test_caret(x + offset))
+    {
+        return Some((caret.index.min(value.len()), Some(caret)));
+    }
     let value = value.to_string();
 
     let char_offset = state
@@ -1671,13 +2287,14 @@ fn find_cursor_position<P: text::Paragraph>(
         .hit_test(Point::new(x + offset, text_bounds.height / 2.0))
         .map(text::Hit::cursor)?;
 
-    Some(
+    Some((
         unicode_segmentation::UnicodeSegmentation::graphemes(
             &value[..char_offset.min(value.len())],
             true,
         )
         .count(),
-    )
+        None,
+    ))
 }
 
 fn replace_paragraph<Renderer>(
@@ -1691,6 +2308,7 @@ fn replace_paragraph<Renderer>(
 ) where
     Renderer: text::Renderer,
 {
+    state.visual_selection = None;
     let font = font.unwrap_or_else(|| renderer.default_font());
     let text_size = text_size.unwrap_or_else(|| renderer.default_size());
 

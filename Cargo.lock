@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "capturefab"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -933,6 +933,7 @@ dependencies = [
  "windows 0.61.3",
  "windows-sys 0.61.2",
  "x11-dl",
+ "zeroize",
  "zip 2.4.2",
 ]
 

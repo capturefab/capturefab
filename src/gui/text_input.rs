@@ -1,7 +1,9 @@
 //! Editable fields retain iced's editor and clipboard while exposing names,
 //! current drafts, invalid state, secure values and native text selection.
 use super::accessibility::{Control, Node, Role, ValueHandler};
-use accesskit::{Action, ActionData, Invalid, TextPosition, TextSelection};
+use accesskit::{Action, ActionData, Invalid};
+#[cfg(test)]
+use accesskit::{TextPosition, TextSelection};
 use iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, overlay, renderer, text,
     widget::{Id, Operation, Tree, tree},
@@ -16,6 +18,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+mod native_geometry;
+mod selection;
+
 pub(super) struct TextInput<'a, M, R: text::Renderer = iced::Renderer> {
     inner: text_input::TextInput<'a, M, Theme, R>,
     id: Id,
@@ -25,7 +30,6 @@ pub(super) struct TextInput<'a, M, R: text::Renderer = iced::Renderer> {
     value: String,
     secure: bool,
     on_input: Option<ValueHandler<M>>,
-    on_submit: Option<M>,
 }
 
 pub(super) fn text_input<'a, M: Clone + 'static>(
@@ -36,12 +40,16 @@ pub(super) fn text_input<'a, M: Clone + 'static>(
 }
 
 impl<'a, M: Clone + 'static, R: text::Renderer + 'a> TextInput<'a, M, R> {
-    pub(super) fn new(placeholder: &str, value: &str) -> Self {
+    pub(super) fn new(placeholder: &str, value: &str) -> Self
+    where
+        R::Paragraph: selection::ParagraphGeometry,
+    {
         let id = Id::unique();
         Self {
             inner: text_input::TextInput::new(placeholder, value)
                 .id(id.clone())
-                .show_unfocused_selection(true),
+                .show_unfocused_selection(true)
+                .visual_geometry(selection::geometry::<R::Paragraph>),
             id,
             name: placeholder.to_owned(),
             description: None,
@@ -49,7 +57,6 @@ impl<'a, M: Clone + 'static, R: text::Renderer + 'a> TextInput<'a, M, R> {
             value: value.to_owned(),
             secure: false,
             on_input: None,
-            on_submit: None,
         }
     }
     pub(super) fn id(mut self, id: impl Into<Id>) -> Self {
@@ -92,7 +99,6 @@ impl<'a, M: Clone + 'static, R: text::Renderer + 'a> TextInput<'a, M, R> {
         self.on_submit_maybe(Some(message))
     }
     pub(super) fn on_submit_maybe(mut self, message: Option<M>) -> Self {
-        self.on_submit = message.clone();
         self.inner = self.inner.on_submit_maybe(message);
         self
     }
@@ -126,6 +132,7 @@ struct State<M> {
     control: Control<M>,
     text_id: accesskit::NodeId,
     native_input: NativeInput,
+    geometry: native_geometry::State,
     focus_return: super::keyboard_history::FocusReturn,
     ime: ImeMarker,
 }
@@ -143,6 +150,7 @@ impl<M> Default for State<M> {
             control,
             text_id: Control::<()>::new(Role::TextRun).id,
             native_input: NativeInput::default(),
+            geometry: native_geometry::State::default(),
             focus_return,
             ime: ImeMarker::default(),
         }
@@ -358,7 +366,10 @@ fn replacement_edit(value: &Value, selection: cursor::State, replacement: &str) 
     (expected, caret)
 }
 
-impl<'a, M: Clone + 'static, R: text::Renderer + 'a> Widget<M, Theme, R> for TextInput<'a, M, R> {
+impl<'a, M: Clone + 'static, R: text::Renderer + 'a> Widget<M, Theme, R> for TextInput<'a, M, R>
+where
+    R::Paragraph: selection::ParagraphGeometry,
+{
     fn size(&self) -> Size<Length> {
         Widget::size(&self.inner)
     }
@@ -419,6 +430,8 @@ impl<'a, M: Clone + 'static, R: text::Renderer + 'a> Widget<M, Theme, R> for Tex
         renderer: &R,
         operation: &mut dyn Operation,
     ) {
+        let origin = self.inner.text_origin(&tree.children[0], layout);
+        let viewport = layout.children().next().unwrap().bounds();
         let state = tree.state.downcast_mut::<State<M>>();
         let editor = tree.children[0]
             .state
@@ -460,7 +473,9 @@ impl<'a, M: Clone + 'static, R: text::Renderer + 'a> Widget<M, Theme, R> for Tex
         control.focus_id = self.id.clone();
         control.focusable = self.on_input.is_some();
         control.focused = editor.is_focused();
-        control.activate = self.on_submit.clone();
+        // Native text-field focus/selection must not become AXPress, which
+        // submits a form. Keyboard Return remains the inner editor's action.
+        control.activate = None;
         control.native_input = self.on_input.as_ref().map(|_| state.native_input.clone());
         control.set_value = self.on_input.as_ref().map(|handler| {
             let handler = handler.clone();
@@ -472,33 +487,29 @@ impl<'a, M: Clone + 'static, R: text::Renderer + 'a> Widget<M, Theme, R> for Tex
             let input = state.native_input.clone();
             Arc::new(move |text: String| handler(input.prepare(text, true))) as ValueHandler<M>
         });
-        let mut text = Node::new(Role::TextRun);
-        text.set_value(visible.to_string());
-        let lengths: Option<Vec<u8>> = (0..visible.len())
-            .map(|index| u8::try_from(visible.select(index, index + 1).to_string().len()).ok())
-            .collect();
-        if let Some(lengths) = lengths {
-            text.set_character_lengths(lengths);
-            let (anchor, focus) = match selection {
-                cursor::State::Index(at) => (at, at),
-                cursor::State::Selection { start, end } => (start, end),
-            };
-            control.node.set_text_selection(TextSelection {
-                anchor: TextPosition {
-                    node: state.text_id,
-                    character_index: anchor,
-                },
-                focus: TextPosition {
-                    node: state.text_id,
-                    character_index: focus,
-                },
-            });
+        let geometry = state.geometry.update(
+            editor.paragraph(),
+            editor.paragraph_text(),
+            &visible,
+            selection,
+            origin,
+            viewport,
+            state.text_id,
+        );
+        if let Some(selection) = geometry.selection {
+            control.node.set_text_selection(selection);
             if self.on_input.is_some() {
                 control.node.add_action(Action::SetTextSelection);
             }
         }
-        control.node.set_children([state.text_id]);
-        control.children = vec![(state.text_id, text)];
+        control.node.set_children(
+            geometry
+                .children
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+        );
+        control.children = geometry.children;
         state.focus_return.id = self.id.clone();
         state.focus_return.available = self.on_input.is_some();
         operation.custom(Some(&self.id), layout.bounds(), &mut state.focus_return);
@@ -512,14 +523,10 @@ impl<'a, M: Clone + 'static, R: text::Renderer + 'a> Widget<M, Theme, R> for Tex
         {
             if self.on_input.is_some()
                 && let Some(ActionData::SetTextSelection(selection)) = request.data
-                && selection.anchor.node == state.text_id
-                && selection.focus.node == state.text_id
+                && let Some((anchor, focus)) = state.geometry.selection_indices(&selection)
             {
                 editor.focus();
-                editor.select_range(
-                    selection.anchor.character_index.min(value.len()),
-                    selection.focus.character_index.min(value.len()),
-                );
+                editor.select_range(anchor.min(value.len()), focus.min(value.len()));
             }
             // Selection Tasks are applied after model messages drain. A
             // queued replacement must wait for this actual editor mutation,
@@ -609,6 +616,8 @@ impl<'a, M: Clone + 'static, R: text::Renderer + 'a> Widget<M, Theme, R> for Tex
 
 impl<'a, M: Clone + 'static, R: text::Renderer + 'a> From<TextInput<'a, M, R>>
     for Element<'a, M, Theme, R>
+where
+    R::Paragraph: selection::ParagraphGeometry,
 {
     fn from(input: TextInput<'a, M, R>) -> Self {
         Self::new(input)

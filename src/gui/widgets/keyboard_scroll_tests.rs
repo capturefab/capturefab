@@ -265,7 +265,7 @@ fn sheet_scroll_preserves_editor_popup_and_radio_keyboard_priority() {
             Message::UiScale
         )
         .id("scroll-choice"),
-        segmented(choices, 0, 0.0),
+        segmented("Test choices", choices, 0, 0.0),
     ]
     .spacing(12);
     for _ in 0..20 {

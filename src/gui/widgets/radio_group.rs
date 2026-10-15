@@ -11,11 +11,13 @@ pub(super) fn wrap<'a, M: Clone + 'static>(
     content: Element<'a, M>,
     choices: Vec<M>,
     tabs: bool,
+    name: &'a str,
 ) -> Element<'a, M> {
     Element::new(Group {
         content,
         choices,
         tabs,
+        name,
     })
 }
 
@@ -23,6 +25,7 @@ struct Group<'a, M, R = iced::Renderer> {
     content: Element<'a, M, Theme, R>,
     choices: Vec<M>,
     tabs: bool,
+    name: &'a str,
 }
 
 struct State<M> {
@@ -88,22 +91,32 @@ impl<'a, M: Clone + 'static, R: renderer::Renderer + 'a> Widget<M, Theme, R> for
         renderer: &R,
         operation: &mut dyn Operation,
     ) {
-        if self.tabs {
-            let mut children = TabChildren::<M>::default();
-            self.content.as_widget_mut().operate(
-                &mut tree.children[0],
-                layout,
-                renderer,
-                &mut children,
-            );
-            let control = &mut tree.state.downcast_mut::<State<M>>().control;
-            control.node = accessibility::Node::new(accessibility::Role::TabList);
-            control.node.set_label("Inspector panels");
-            control.node.set_children(children.ids);
-            control.focusable = false;
-            let id = control.focus_id.clone();
-            operation.custom(Some(&id), layout.bounds(), control);
-        }
+        let mut children = ChoiceChildren::<M> {
+            ids: Vec::new(),
+            role: if self.tabs {
+                accessibility::Role::Tab
+            } else {
+                accessibility::Role::RadioButton
+            },
+            marker: std::marker::PhantomData,
+        };
+        self.content.as_widget_mut().operate(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            &mut children,
+        );
+        let control = &mut tree.state.downcast_mut::<State<M>>().control;
+        control.node = accessibility::Node::new(if self.tabs {
+            accessibility::Role::TabList
+        } else {
+            accessibility::Role::RadioGroup
+        });
+        control.node.set_label(self.name);
+        control.node.set_children(children.ids);
+        control.focusable = false;
+        let id = control.focus_id.clone();
+        operation.custom(Some(&id), layout.bounds(), control);
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
@@ -238,31 +251,26 @@ impl<'a, M: Clone + 'static, R: renderer::Renderer + 'a> Widget<M, Theme, R> for
     }
 }
 
-struct TabChildren<M> {
+struct ChoiceChildren<M> {
     ids: Vec<accesskit::NodeId>,
+    role: accessibility::Role,
     marker: std::marker::PhantomData<fn() -> M>,
 }
-impl<M> Default for TabChildren<M> {
-    fn default() -> Self {
-        Self {
-            ids: Vec::new(),
-            marker: std::marker::PhantomData,
-        }
-    }
-}
-impl<M: 'static> Operation for TabChildren<M> {
+impl<M: 'static> Operation for ChoiceChildren<M> {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
         operate(self);
     }
     fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
         if let Some(control) = state.downcast_ref::<accessibility::Control<M>>()
-            && control.node.role() == accessibility::Role::Tab
+            && control.node.role() == self.role
         {
             self.ids.push(control.id);
         }
     }
 }
 
+#[cfg(test)]
+mod semantics_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +311,7 @@ mod tests {
             content: Element::new(content),
             choices: vec!["features", "capture"],
             tabs: true,
+            name: "Inspector panels",
         };
         let mut tree = Tree::new(&group as &dyn Widget<&str, Theme, ()>);
         let node = group.layout(
@@ -368,6 +377,7 @@ mod tests {
             let mut group = Group {
                 content: Element::new(content),
                 tabs: false,
+                name: "Test choices",
                 choices: if disabled {
                     vec!["first", "third"]
                 } else {

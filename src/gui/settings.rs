@@ -45,6 +45,7 @@ impl Workbench {
         let appearance = column![
             heading("Appearance", p),
             segmented(
+                "Appearance",
                 APPEARANCES
                     .into_iter()
                     .map(|appearance| (
@@ -73,6 +74,7 @@ impl Workbench {
         let interface = column![
             heading("Interface size", p),
             segmented(
+                "Interface size",
                 UiScale::ALL
                     .into_iter()
                     .map(|scale| (
@@ -115,7 +117,9 @@ impl Workbench {
             rule::horizontal(1).style(style::line),
             interface,
             rule::horizontal(1).style(style::line),
-            discovery
+            discovery,
+            rule::horizontal(1).style(style::line),
+            self.api_credentials_content(p),
         ]
         .spacing(20)
         .into()
@@ -127,7 +131,7 @@ impl Workbench {
                 scrollable(self.settings_content(p))
                     .height(Fill)
                     .style(style::scroll),
-                text("Changes apply automatically.")
+                text("Preferences apply automatically. API keys require Save key.")
                     .size(style::SMALL)
                     .color(p.secondary),
             ]
@@ -152,7 +156,7 @@ impl Workbench {
         // There is one action: changes already apply. Keep it at the trailing
         // edge on each desktop platform, with no misleading Save/Cancel pair.
         let footer = row![
-            text("Changes apply automatically.")
+            text("Preferences apply automatically. API keys require Save key.")
                 .size(style::SMALL)
                 .color(p.secondary)
                 .width(Fill),

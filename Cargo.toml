@@ -1,6 +1,6 @@
 [package]
 name = "capturefab"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Rust camera workbench for GenICam GigE Vision and USB3 Vision"
@@ -9,7 +9,7 @@ repository = "https://github.com/capturefab/capturefab"
 
 [features]
 default = ["gui", "usb", "scanner", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "s3"]
-gui = ["dep:iced", "dep:bytemuck", "dep:rfd", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:mundy", "dep:accesskit", "dep:accesskit_macos", "dep:accesskit_windows", "dep:accesskit_unix", "dep:raw-window-handle", "dep:windows", "dep:x11-dl", "dep:libloading", "dep:libc"]
+gui = ["ai", "dep:iced", "dep:bytemuck", "dep:rfd", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:mundy", "dep:accesskit", "dep:accesskit_macos", "dep:accesskit_windows", "dep:accesskit_unix", "dep:raw-window-handle", "dep:windows", "dep:x11-dl", "dep:libloading", "dep:libc"]
 usb = ["dep:nusb"]
 # Document scanners: SANE scanimage, Windows WIA and macOS ImageCaptureCore.
 # Drivers run in disposable helper processes, never in the UI.
@@ -24,6 +24,9 @@ vaapi = ["dep:libloading", "jpeg"]
 # S3-compatible upload destinations: a pure-Rust HTTPS client (rustls, trusting
 # the OS certificate store) and the OS credential store for keys.
 s3 = ["dep:ureq", "dep:keyring"]
+# Prompt measurements use HTTPS with the OS certificate store and native
+# Keychain / Credential Manager / Secret Service credentials.
+ai = ["dep:ureq", "dep:keyring", "dep:zeroize"]
 # Apple's hardware JPEG engine through VideoToolbox (system frameworks; no-op off macOS).
 videotoolbox = []
 # The GUI always renders with wgpu (falling back to tiny-skia without a GPU);
@@ -63,6 +66,7 @@ turbojpeg = { version = "1.5", optional = true, default-features = false, featur
 libloading = { version = "0.8", optional = true }
 ureq = { version = "3.4", optional = true, default-features = false, features = ["rustls", "platform-verifier"] }
 keyring = { version = "4.2", optional = true }
+zeroize = { version = "1", optional = true }
 rfd = { version = "0.17", optional = true }
 
 # The refresh rate of the GUI window's screen, and the Reduce Motion and Reduce

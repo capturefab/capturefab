@@ -21,10 +21,14 @@ use std::{
 };
 
 mod decorate;
+mod focus;
+#[cfg(test)]
+mod focus_tests;
 mod group;
 mod label;
 mod native;
 mod scroll;
+mod text_geometry;
 pub(super) use decorate::{mapped, named};
 pub(super) use group::{group, group_with_id, modal_group, scope};
 pub(super) use label::{label, label_description};
@@ -162,9 +166,15 @@ impl Bridge {
     /// Chain this task before closing the native window. This restores the
     /// original native view/window class on the same UI thread that installed it.
     pub fn detach(&self, id: window::Id) -> Task<bool> {
+        self.detach_in_window(id, id)
+    }
+
+    /// A late attach may finish after its window has retired. Schedule its
+    /// adapter cleanup on a live window so iced still runs the UI callback.
+    pub fn detach_in_window(&self, id: window::Id, live: window::Id) -> Task<bool> {
         self.invalidate(id);
         self.0.snapshots.lock().unwrap().remove(&id);
-        window::run(id, move |_| native::detach(id))
+        window::run(live, move |_| native::detach(id))
     }
 
     pub fn subscription(&self) -> Subscription<Request> {
@@ -223,6 +233,7 @@ impl Bridge {
                 if !route.focusable && !route.widget_focus && route.on_focus.is_none() {
                     return Task::none();
                 }
+                let target = request.action.target;
                 let focus = if route.focusable || route.widget_focus {
                     // Explicit widget IDs can be reused in separate native
                     // windows. Locate scopes both focus and scroll reveal to
@@ -250,9 +261,7 @@ impl Bridge {
                 };
                 // AccessKit forwards native focus requests; it does not make
                 // the owning NSWindow/HWND the active keyboard window.
-                window::minimize(request.window, false)
-                    .chain(window::gain_focus(request.window))
-                    .chain(focus)
+                focus::prepare(self.clone(), request.window, target, focus)
             }
             Action::Click if route.activate.is_some() => {
                 Task::done(route.activate.clone().unwrap())
@@ -534,7 +543,14 @@ impl Operation for Collector {
             }
             for (id, child) in &control.children {
                 let mut child = child.clone();
-                if child.bounds().is_none() {
+                if child.role() == Role::TextRun && child.bounds().is_some() {
+                    text_geometry::transform(
+                        &mut child,
+                        &self.viewport,
+                        control.window_coordinates,
+                        self.scale,
+                    );
+                } else if child.bounds().is_none() {
                     child.set_bounds(rect(visible, self.scale));
                 }
                 self.nodes.push((*id, child));

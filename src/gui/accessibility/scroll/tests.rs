@@ -641,12 +641,14 @@ fn native_focus_scopes_duplicate_explicit_ids_and_only_activates_current_enabled
         .0;
         let window = surfaces[requested].id;
         let task = bridge.dispatch(request(window, target));
-        assert_eq!(
-            task.units(),
-            if requested == 0 { 4 } else { 3 },
-            "an accepted focus route restores its window, activates it, scopes real widget focus, then runs its optional callback"
-        );
         let mut actions = iced_runtime::task::into_stream(task).unwrap();
+        let Some(iced_runtime::Action::Window(iced_runtime::window::Action::GetMode(id, reply))) =
+            iced::futures::executor::block_on(actions.next())
+        else {
+            panic!("native Focus must inspect its owning window before restoring it");
+        };
+        assert_eq!(id, window);
+        reply.send(window::Mode::Windowed).unwrap();
         assert!(
             matches!(
                 iced::futures::executor::block_on(actions.next()),

@@ -422,6 +422,22 @@ impl Service {
                     Ok(svg) => Response::new(200, "image/svg+xml; charset=utf-8", svg.into_bytes()),
                     Err(err) => error(503, format!("analytics unavailable: {err:#}")),
                 },
+                #[cfg(feature = "ai")]
+                ("GET" | "HEAD", "/api/measurements") => {
+                    match self.handle.analytics().measurement_history() {
+                        Ok(samples) => success(samples),
+                        Err(err) => error(503, format!("measurements unavailable: {err:#}")),
+                    }
+                }
+                #[cfg(feature = "ai")]
+                ("GET" | "HEAD", "/api/measurements.svg") => {
+                    match self.handle.analytics().measurement_svg() {
+                        Ok(svg) => {
+                            Response::new(200, "image/svg+xml; charset=utf-8", svg.into_bytes())
+                        }
+                        Err(err) => error(503, format!("measurements unavailable: {err:#}")),
+                    }
+                }
                 ("GET", "/api/destinations") => match crate::destination::list() {
                     Ok(destinations) => success(json!({
                         "destinations": destinations.iter().map(|destination| json!({
@@ -438,6 +454,10 @@ impl Service {
                 ("GET", "/api/preview") => self.preview(query),
                 ("POST", "/api/command") => self.command(&request),
                 (_, "/api/analytics" | "/api/analytics.svg") => method_not_allowed("GET, HEAD"),
+                #[cfg(feature = "ai")]
+                (_, "/api/measurements" | "/api/measurements.svg") => {
+                    method_not_allowed("GET, HEAD")
+                }
                 (
                     _,
                     "/api/session" | "/api/activity" | "/api/destinations" | "/api/storage"
@@ -928,6 +948,67 @@ mod tests {
             serde_json::from_slice::<Value>(&stopped.body).unwrap()["status"],
             "unavailable"
         );
+    }
+
+    #[cfg(feature = "ai")]
+    #[test]
+    fn measurement_routes_expose_structured_history_and_enforce_origin() {
+        let root = WebRoot::new();
+        let handle = SessionHandle::new();
+        let service = Service {
+            handle: handle.clone(),
+            web_root: root.0.clone(),
+            quitting: Arc::new(AtomicBool::new(false)),
+            activity_waits: Arc::new(AtomicUsize::new(0)),
+        };
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        handle
+            .analytics()
+            .record_measurements(&[crate::analytics::MeasurementSample {
+                timestamp_ms,
+                camera_id: "sim:0".into(),
+                frame_id: 1,
+                definition: crate::ai::MeasurementDefinition {
+                    id: "ribbon".into(),
+                    label: "Ribbon length".into(),
+                    prompt: "Estimate the length of ribbon in meters".into(),
+                    unit: "m".into(),
+                },
+                provider: crate::ai::Provider::OpenAi,
+                model: crate::ai::Provider::OpenAi.default_model().into(),
+                result: crate::ai::MeasurementOutput {
+                    id: "ribbon".into(),
+                    value: None,
+                    confidence: None,
+                    note: "No scale reference".into(),
+                },
+            }])
+            .unwrap();
+        let request = parse_headers("GET /api/measurements HTTP/1.1\r\nHost: camera:7878").unwrap();
+        let response = service.respond(request);
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["result"][0]["result"]["value"], Value::Null);
+        assert_eq!(
+            body["result"][0]["definition"]["prompt"],
+            "Estimate the length of ribbon in meters"
+        );
+        for path in ["/api/measurements", "/api/measurements.svg"] {
+            let get = parse_headers(&format!("GET {path} HTTP/1.1\r\nHost: camera:7878")).unwrap();
+            assert_eq!(service.respond(get).status, 200);
+            let cross_origin = parse_headers(&format!(
+                "GET {path} HTTP/1.1\r\nHost: camera:7878\r\nOrigin: https://evil.test"
+            ))
+            .unwrap();
+            assert_eq!(service.respond(cross_origin).status, 403);
+            let post =
+                parse_headers(&format!("POST {path} HTTP/1.1\r\nHost: camera:7878")).unwrap();
+            assert_eq!(service.respond(post).status, 405);
+        }
+        handle.shutdown();
     }
 
     #[test]

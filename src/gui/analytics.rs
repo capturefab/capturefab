@@ -7,6 +7,10 @@ mod chart;
 mod history;
 pub(super) use history::Input as HistoryInput;
 
+pub(super) fn measurement_timestamp(value: u64) -> String {
+    history::timestamp(value)
+}
+
 type Report = std::result::Result<(Arc<AnalyticsSnapshot>, chart::Graphic, chart::Profile), String>;
 const REFRESH: Duration = Duration::from_secs(5);
 
@@ -167,7 +171,13 @@ impl Workbench {
         }
         // Keep asynchronous errors inside the introduction so existing report
         // widgets retain their native identities when a refresh fails.
-        let mut body = column![introduction].spacing(14);
+        let mut body = column![
+            introduction,
+            self.video_analytics_content(p),
+            rule::horizontal(1).style(style::line),
+            heading("Acquisition activity", p),
+        ]
+        .spacing(14);
         if let Some(report) = &self.analytics.report {
             let attempted = report.totals.frames.saturating_add(report.totals.dropped);
             let loss = if attempted == 0 {

@@ -154,15 +154,24 @@ editor consumes them, so a following replacement uses the new selection. Each
 internal replay has a distinct token; invalidation cancels pending and queued
 callbacks. Disabled fields remain readable and leave focus traversal. Password fields expose
 masked values in both the field and text run, without publishing the secret.
+Text fields expose native focus and editing actions without an AXPress submit
+action; focusing or selecting a draft must not apply it. Keyboard Return keeps
+the actual editor's normal submit callback.
 
-The exact published `iced_widget` 0.14.2 source is vendored with a small,
-default-off `show_unfocused_selection` opt-in. Capturefab enables it to retain
-the real editor's selected range while its window is inactive. It uses the
-cached shaped paragraph and existing horizontal offset, without activating
-input, caret or IME. Selection layers intersect the caller's viewport, including
-when scrolled. The upstream diff, license and archive verification are in
-`vendor/iced_widget-0.14.2/PATCH.md`. Existing single-rectangle mixed-direction
-selection geometry is unchanged.
+The exact published `iced_widget` 0.14.2 source is vendored with additive,
+default-off selection options. Capturefab retains the real editor's selected
+range while its window is inactive and derives disconnected visual selection
+ranges from the existing shaped paragraph's grapheme clusters and bidi levels.
+The same visual endpoint supplies horizontal scrolling, pointer coordinates and
+the IME anchor. Selection layers intersect the caller's viewport without
+reshaping the text or activating an inactive caret or IME. Native TextRuns share
+these cells, split at direction changes or visual discontinuities, and publish
+clipped character positions, widths and direction. Ancestor scroll and display
+scale apply once to their native range bounds and hit targets. The upstream diff,
+license and archive verification are in `vendor/iced_widget-0.14.2/PATCH.md`.
+The editor still moves Left/Right by logical grapheme index and does not retain
+cursor affinity. Positions within a ligature use proportional cluster advances;
+font-provided GDEF caret positions are not implemented.
 
 Network report cards group their visible details beneath concise adapter or
 camera identities. The report indicator keeps a stable short name; changing
@@ -207,6 +216,10 @@ show Date unavailable. Entries retain their source order and copied contents.
 Permanent heading slots preserve row and timestamp identities and focus when a
 command completes across midnight. Bounded heading-ID caches are pruned even
 while Activity is closed.
+macOS caches date captions by local calendar day and revalidates copied formatter
+time zones before reusing clock/date strings. Native cache entries with another
+viewer offset are rejected, so a time-zone change cannot mix an old native clock
+with a newly dated copy.
 
 Linux reads the [GNOME global 12/24-hour clock-format preference](https://raw.githubusercontent.com/GNOME/gsettings-desktop-schemas/master/schemas/org.gnome.desktop.interface.gschema.xml.in)
 through optional installed GIO/GSettings and uses KDE's global
@@ -222,6 +235,19 @@ desktop preferences use the locale's format. Unavailable locales, cache misses
 or cached values with a different viewer UTC offset use numeric fallback,
 keeping dates and clocks coherent with the current local instant until refreshed.
 Native GNOME/KDE preference behavior has not been executed or inspected.
+
+Automatic-capture review exposes its actual preview as a passive Image belonging
+to the named modal Dialog, with the capture identity and decision instructions.
+One persistent body region provides polite loading/saving/ready/caught-up status
+or an assertive failure Alert, including the native text value used for
+announcements. Full errors wrap and scroll in that body; Keep, Discard and Close
+retain their identities and pinned layout. Pointer movement and counter updates
+do not change the live outcome. Decision entry points reject keyboard, button
+and swipe actions while a settings-save alert covers review or shutdown is in
+progress. Actual shared-sheet regressions cover seven outcome phases, preview
+ownership, retained Close focus and Retry routing, long errors at compact sizes,
+and the normal key-message path under the covering alert. These tests establish
+semantics and routing, rather than spoken screen-reader behavior.
 
 Each window is created hidden. The root `WindowOpened` branch attaches the native
 adapter through `window::run`, then shows and focuses the window. Adapters are
@@ -358,9 +384,11 @@ Focused coverage includes:
   correct recording/forwarding labels and a single live command announcement
   containing both outcome and details.
 
-The latest full suite passed 789 library tests, with 11 ignored (800 total), plus
-12 CLI, nine remote and three simulation integration tests. One CLI test and one
-doctest were ignored.
+The latest UI validation snapshot, based on `d834c3f` plus the UI changes, passed
+847 library tests, with 11 ignored (858 total), plus 12 CLI, nine remote and three
+simulation integration tests: 871 passing tests. One CLI test and one doctest
+were ignored. Concurrent video-analytics changes remained in the shared checkout
+and were excluded from this isolated snapshot.
 It includes focus recovery, panel-opening, search-field
 identity, tab selection, menu semantics, native editing, save-busy forms, compact
 geometry, scroll reveal, sheet keyboard navigation/native Close, per-window
@@ -369,6 +397,35 @@ all-target Clippy passed with warnings treated as errors; formatting and
 diff-whitespace checks passed. The suite includes the actual
 restore→activate→scoped-focus task stream, native live-value consumer behavior,
 stable command-group identities, chart profiles and Activity wrapping.
+
+Window-lifecycle regressions deliver focus, geometry, close and accessibility
+completion events after Settings has retired. These events preserve the main
+editor and menus, cannot start daemon shutdown, and clean up a late adapter
+through the live main UI callback. Separate task tests reproduce a failed Quit
+while Settings is still hidden: recovery initializes and presents the alert
+before focusing Retry, while an already fullscreen window retains its mode.
+Late recovery completions also check current window ownership before cleanup.
+These are model/task checks, supplemented by the native ordinary Settings and
+failed-save workflows recorded below.
+
+Nine actual-editor rendering regressions cover disconnected LTR/RTL selection,
+reverse selection, inactive shape retention, clipping, scale, pointer placement
+and the IME anchor. An actual Arabic Lam-Alef ligature checks proportional
+grapheme-cell hit order. Multiline or partially wrapped paragraphs retain the
+toolkit fallback. Five shaped-editor/native-action tests and three Collector
+tests check consumer range boxes, hit positions, secure values, cross-run edits,
+scrolling, scale and completely clipped text. Native text focus and selection
+publish no submission; one keyboard Return still submits once.
+
+The dated Activity regression renders 36 actual panels: three interface sizes,
+three widths (360, 480 and 900 native pixels) and four explicit appearance
+palettes. It verifies shaped date captions, row spacing, scrollbar clearance,
+source order, stable identities and exactly one native Heading per caption.
+Ordinary scrolling reveals the complete date while Copy remains pinned; software
+pixels verify both date glyphs and the inherited title color. Representative
+light and dark artifacts under `/private/tmp/capturefab-activity-dates` were
+visually inspected. These are software-rendering checks with installed macOS
+fonts and current locale, rather than native desktop or spoken AT verification.
 
 The storage crash-recovery test allows up to five seconds for a fork-inherited
 lease descriptor to close before checking the same exact reclaimed-byte and
@@ -520,11 +577,13 @@ inserting a newer-report caption replaced pager identities. The final fix keeps
 that caption inside a persistent context child, and actual widget regressions
 now preserve Page/Previous/Next identities and focus through refresh, explicit
 Update history and truncation transitions. The inspected process (PID 65366)
-quit normally. The rebuilt application's final native pager retest remains
-unverified: computer use returned `cgWindowNotFound`, followed by a timeout while
-checking the Dock. A direct process check showed the rebuilt process running,
-but did not establish why its window was unavailable. VoiceOver was unchanged;
-this run used only the simulator and retained the earlier capture files.
+quit normally. An initial rebuilt-app retest was blocked by `cgWindowNotFound`
+and a subsequent computer-use timeout. A later fresh isolated launch resolved
+that testing limitation: Page/Previous/Next retained their native identities
+when Update history became available; the retained Next action opened page two
+of the fixed snapshot, Shift-Tab reached Previous, and Return returned to page
+one with focus on Page. VoiceOver was unchanged; these runs used only the
+simulator and retained the earlier capture files.
 
 After the raw-log and shared scrollbar-gutter fixes, another fresh build at the
 same size and interface scale showed the complete scanner error wrapping before
@@ -619,6 +678,31 @@ notice contained the save outcome and full path. Native Quit ended the descripto
 actual PID 92301, confirmed by its absence from `ps`, removed `gui.json` and left
 the preferences intact.
 
+A subsequent isolated 900×620/Larger run inspected the dated Activity headings
+and confirmed that raw worker and command clocks described the same local date
+and time. A newly created temporary DuckDB session supplied the native Review
+auto captures sheet: its named preview Image and persistent status belonged to
+the sheet, Close retained focus, and Right kept the displayed suggestion. The
+same status node then reported the saved decision and next capture while the
+Keep/Discard action identities remained stable. The temporary database was saved
+and closed, automatic capture and the simulator stream were stopped, and native
+Quit ended PID 879. VoiceOver and real camera devices were left unchanged.
+
+The refreshed bidi/window-lifecycle build at 900×620/Larger displayed separate
+selection intervals for `é אב` in a mixed Latin/Hebrew/Arabic/emoji address draft.
+Keyboard replacement changed precisely that logical range and retained its
+surroundings. This check exposed and removed an AXPress-to-submit mapping on text
+fields. The final rebuilt app repeated native selection and replacement without
+adding a Connect command; entering `sim:0` and pressing Return added exactly one
+successful Connect command. An ordinary Settings open/close retained the draft
+and address focus. With the isolated preferences file temporarily replaced by
+a directory, Quit presented its named alert in Settings with Retry
+focused. Restoring the preferences file and pressing Return saved and quit.
+The two inspected processes, PIDs 35232 and 52827, exited and removed `gui.json`;
+the preferences file remained intact. VoiceOver was unchanged. Hidden-window
+races and fullscreen preservation have task evidence, rather than native timing
+or fullscreen evidence from this smoke test.
+
 An app-switch attempt did not yield an inactive-window capture. These native runs
 therefore establish the recorded editing, sheet, capture and exit behavior, while
 inactive appearance remains source/widget evidence.
@@ -672,7 +756,9 @@ Charts expose measured history, axes and mark values through native groups;
 Audio Graphs are not implemented, and spoken chart navigation remains unverified.
 Native camera names have representative glyph and pixel evidence, rather than
 universal coverage for every installed font or writing system. Mixed-direction
-editor selection retains the toolkit's single-rectangle geometry.
+selection and native range geometry have shaped-widget and consumer coverage;
+native bidi editing still needs inspection, and logical arrow navigation,
+cursor affinity and exact ligature caret placement remain limitations.
 Widget/rendering/task/consumer tests establish the implemented behavior and
 routing; these platform interactions still require native checks.
 

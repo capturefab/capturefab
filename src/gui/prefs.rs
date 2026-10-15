@@ -501,6 +501,7 @@ pub struct Prefs {
     pub recent: Vec<Recent>,
     pub window: Option<[f32; 2]>,
     pub logs_open: bool,
+    pub video_analytics: super::video_analytics::Preferences,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Recent {
@@ -544,6 +545,7 @@ impl Default for Prefs {
             recent: Vec::new(),
             window: None,
             logs_open: false,
+            video_analytics: Default::default(),
         }
     }
 }

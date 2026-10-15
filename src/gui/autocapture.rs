@@ -398,6 +398,8 @@ impl Workbench {
 
     fn decide_capture(&mut self, keep: bool) {
         if !self.auto_capture.open
+            || self.close_error.is_some()
+            || self.closing.is_some()
             || self.capture_session_busy()
             || self.auto_capture.review_context != self.capture_session_context()
         {
@@ -413,7 +415,11 @@ impl Workbench {
 
     /// Plain review keys never take cursor movement from an editor or popup.
     pub(super) fn review_shortcut(&mut self, chord: Chord, captured: bool) -> bool {
-        if !self.auto_capture.open || self.focused_window != self.main_window || self.popup_open {
+        if !self.auto_capture.open
+            || self.close_error.is_some()
+            || self.focused_window != self.main_window
+            || self.popup_open
+        {
             return false;
         }
         if let Some(keep) = key_decision(chord, captured, self.menu_editor) {
@@ -620,8 +626,8 @@ impl Workbench {
                 )
                 .push(
                     text(format!(
-                        "{} examples · {} kept · {} discarded",
-                        grouped(status.manual_count),
+                        "{} · {} kept · {} discarded",
+                        super::format::plural(status.manual_count, "example", "examples"),
                         grouped(status.kept_count),
                         grouped(status.discarded_count),
                     ))
@@ -694,6 +700,43 @@ impl Workbench {
             .map_or(0, |status| status.pending_count);
         let busy = self.pending(Job::ReviewCapture);
         let ready = state.card.is_some() && !self.capture_session_busy();
+        // This fixed body slot owns the review's live outcome. The toolbar
+        // is excluded behind the modal, so its notices cannot announce errors
+        // or completions here. Counts and drag movement are deliberately not
+        // part of this value: only review transitions change it.
+        let (outcome, outcome_role) = if let Some(error) = &state.error {
+            (
+                format!("Capture review failed: {error}"),
+                accessibility::Role::Alert,
+            )
+        } else if busy {
+            ("Saving your decision…".into(), accessibility::Role::Status)
+        } else if self.pending(Job::CaptureReview) {
+            ("Loading next capture…".into(), accessibility::Role::Status)
+        } else if let Some(card) = &state.card {
+            (
+                format!(
+                    "{}Capture {} ready. Swipe or use ← / →.",
+                    if state.reviewed > 0 {
+                        "Decision saved. "
+                    } else {
+                        ""
+                    },
+                    card.id,
+                ),
+                accessibility::Role::Status,
+            )
+        } else {
+            (
+                if state.reviewed > 0 {
+                    "Decision saved. You're caught up."
+                } else {
+                    "You're caught up."
+                }
+                .into(),
+                accessibility::Role::Status,
+            )
+        };
         let footer = column![
             row![
                 button(
@@ -749,6 +792,20 @@ impl Workbench {
             ))
             .size(style::BODY)
             .color(p.secondary),
+            accessibility::label(
+                text(outcome.clone())
+                    .size(style::SMALL)
+                    .color(if state.error.is_some() {
+                        p.ink(p.danger)
+                    } else {
+                        p.secondary
+                    })
+                    .width(Fill)
+                    .wrapping(text::Wrapping::WordOrGlyph)
+                    .into(),
+                outcome,
+                outcome_role,
+            ),
         ]
         .spacing(14);
         if let Some(card) = &state.card {
@@ -764,12 +821,17 @@ impl Workbench {
             body = body
                 .push(
                     mouse_area(
-                        container(
+                        container(accessibility::label_description(
                             image(card.image.clone())
                                 .content_fit(ContentFit::Contain)
                                 .width(Fill)
-                                .height((height - 370.0).clamp(130.0, 480.0)),
-                        )
+                                .height((height - 370.0).clamp(130.0, 480.0))
+                                .into(),
+                            format!("Suggested capture {} preview", card.id),
+                            "Preview of the capture being reviewed. Use Keep or Discard, or the right or left arrow keys, to record your decision.".into(),
+                            accessibility::Role::Image,
+                            None,
+                        ))
                         .id("capture-review-image")
                         .padding(6)
                         .width(Fill)
@@ -801,23 +863,25 @@ impl Workbench {
                 .push(text(&card.reason).size(style::SMALL).color(p.secondary));
         } else {
             body = body.push(container(column![
-                icon(if self.pending(Job::CaptureReview) { Icon::Recent } else { Icon::Check }, 42.0, p.accent_text),
-                text(if self.pending(Job::CaptureReview) { "Loading next capture…" } else { "You're caught up" })
+                icon(if state.error.is_some() { Icon::Close } else if self.pending(Job::CaptureReview) { Icon::Recent } else { Icon::Check }, 42.0, p.accent_text),
+                text(if state.error.is_some() { "Review unavailable" } else if self.pending(Job::CaptureReview) { "Loading next capture…" } else { "You're caught up" })
                     .size(style::DISPLAY).font(style::BOLD),
-                text("Leave auto capture streaming, then come back to review more suggestions.")
+                text(if state.error.is_some() { "Try again to load this session's pending captures." } else { "Leave auto capture streaming, then come back to review more suggestions." })
                     .size(style::BODY).color(p.secondary),
             ].spacing(14)).width(Fill).padding([32, 16]));
         }
-        if let Some(error) = &state.error {
-            body = body
-                .push(text(error).size(style::SMALL).color(p.ink(p.danger)))
-                .push(
-                    button(text("Try again").size(style::BODY))
-                        .padding([6, 12])
-                        .style(style::secondary)
-                        .on_press(input(Input::Retry)),
-                );
+        // Keep the optional retry inside its own slot, rather than adding or
+        // removing siblings that can replace other widgets' native state.
+        let mut retry = column![].width(Fill);
+        if state.error.is_some() {
+            retry = retry.push(
+                button(text("Try again").size(style::BODY))
+                    .padding([6, 12])
+                    .style(style::secondary)
+                    .on_press(input(Input::Retry)),
+            );
         }
+        body = body.push(retry);
         sheet_frame("Review auto captures", input(Input::Review(false)), body, p)
             .mark(Icon::Camera)
             .footer(footer)
@@ -825,6 +889,10 @@ impl Workbench {
             .into()
     }
 }
+
+#[cfg(test)]
+#[path = "autocapture/accessibility_tests.rs"]
+mod accessibility_tests;
 
 #[cfg(test)]
 mod tests {

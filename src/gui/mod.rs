@@ -41,8 +41,11 @@ mod text_input;
 mod time_format;
 mod titlebar;
 mod toolbar;
+mod video_analytics;
 mod welcome;
 mod widgets;
+#[cfg(test)]
+mod window_lifecycle_tests;
 
 use crate::{
     auto::{AutoChange, AutoStatus},
@@ -609,6 +612,8 @@ enum Message {
         acknowledgement: text_input::Acknowledgement,
     },
     AccessibilityAttached(window::Id, bool),
+    AccessibilityRecoveryAttached(window::Id),
+    CloseErrorMode(window::Id, window::Mode),
     AccessibilityChanged(window::Id),
     WindowScale(window::Id, f32),
     Quit,
@@ -624,6 +629,7 @@ enum Message {
     Analytics(bool),
     AnalyticsScrolled(bool),
     AnalyticsHistory(analytics::HistoryInput),
+    VideoAnalytics(video_analytics::Input),
     IncludeSimulator(bool),
     TrySimulator,
     EnterAddress,
@@ -794,6 +800,7 @@ struct Workbench {
     network_error: Option<String>,
     network_scrolled: bool,
     analytics: analytics::State,
+    video_analytics: video_analytics::State,
     settings_open: bool,
     menu_editor: bool,
     popup_open: bool,
@@ -900,6 +907,8 @@ impl Workbench {
         let shown = |open: bool| if open { 1.0 } else { 0.0 };
         let main_window = window::Id::unique();
         let client_activity = client_activity::State::from_snapshot(&handle.snapshot());
+        let video_analytics =
+            video_analytics::State::new(handle.clone(), prefs.video_analytics.clone());
         Self {
             main_window,
             focused_window: main_window,
@@ -975,6 +984,7 @@ impl Workbench {
             network_error: None,
             network_scrolled: false,
             analytics: Default::default(),
+            video_analytics,
             settings_open: false,
             menu_editor: false,
             popup_open: false,
@@ -1109,6 +1119,7 @@ impl Workbench {
             recent: self.recent.clone(),
             window: self.window,
             logs_open: self.logs_open,
+            video_analytics: self.video_analytics.preferences.clone(),
         }
     }
 
@@ -1167,6 +1178,30 @@ impl Workbench {
 
     fn window_palette(&self, id: window::Id) -> &'static Palette {
         Palette::for_window(self.dark(), self.key_window == Some(id))
+    }
+
+    fn known_window(&self, id: window::Id) -> bool {
+        id == self.main_window || self.settings_window == Some(id)
+    }
+
+    fn present_window(&self, id: window::Id) -> Task<Message> {
+        let fit = if self.settings_window == Some(id) {
+            prefs::fit_aux_window(id, settings::window_settings().size, self.ui_scale)
+        } else {
+            Task::none()
+        };
+        // EWMH frame extents are supplied after the window manager maps/
+        // reparents the client; query them after requesting show.
+        let mapped_fit =
+            if cfg!(target_os = "linux") && id == self.main_window && self.screenshot.is_none() {
+                let [width, height] = self.window.unwrap_or([1280.0, 840.0]);
+                prefs::fit_main_window(id, Size::new(width, height), self.ui_scale)
+            } else {
+                Task::none()
+            };
+        fit.chain(window::set_mode(id, window::Mode::Windowed))
+            .chain(mapped_fit)
+            .chain(window::gain_focus(id))
     }
 
     fn window_theme(&self, id: window::Id) -> Theme {
@@ -1693,6 +1728,7 @@ impl Workbench {
         self.tick_stage();
         self.tick_inspector();
         self.tick_analytics();
+        self.tick_video_analytics();
         self.tick_autocapture();
         self.save_prefs();
         Task::batch([
@@ -2234,14 +2270,27 @@ impl Workbench {
                 Message::PrefsFlushed(_) | Message::StoragePolicy(_)
             )
         {
+            // Cleanup still matters while a preference flush is pending: it
+            // can fail and keep the daemon alive after the window has retired.
+            if matches!(&message,
+                Message::WindowOpened(id)
+                    | Message::AccessibilityAttached(id, _)
+                    | Message::AccessibilityRecoveryAttached(id)
+                    if !self.known_window(*id)
+            ) {
+                return self.handle_message(message);
+            }
             return Task::none();
         }
         let message = match message {
             Message::InWindow(id, message) => {
+                // Settings leaves the model before its asynchronous native
+                // close finishes. Ignore queued widget/geometry reports from
+                // that retired window, after acknowledging native edit work.
+                if !self.known_window(id) {
+                    return Task::none();
+                }
                 if let Message::EditorFocused(value) = *message {
-                    if id != self.main_window && self.settings_window != Some(id) {
-                        return Task::none();
-                    }
                     self.window_editor_focus.insert(id, value);
                 }
                 match *message {
@@ -2323,6 +2372,33 @@ impl Workbench {
             Message::InWindow(_, _) | Message::NativeInput { .. } => {
                 unreachable!("window and native edit messages are unwrapped before update")
             }
+            Message::WindowOpened(id)
+            | Message::AccessibilityAttached(id, _)
+            | Message::AccessibilityRecoveryAttached(id)
+                if !self.known_window(id) =>
+            {
+                // An earlier attach may finish after Settings(false) has
+                // already detached/closed its native window. Run cleanup on
+                // the live main UI callback: iced drops Run callbacks whose
+                // target window no longer exists. Never show/focus this ID.
+                return self
+                    .accessibility
+                    .detach_in_window(id, self.main_window)
+                    .discard()
+                    .chain(window::close(id));
+            }
+            Message::AccessibilityChanged(id)
+            | Message::WindowScale(id, _)
+            | Message::WindowFocused(id)
+            | Message::WindowUnfocused(id)
+            | Message::CloseRequested(id)
+                if !self.known_window(id) =>
+            {
+                return Task::none();
+            }
+            Message::AccessibilityRequest(request) if !self.known_window(request.window) => {
+                return Task::none();
+            }
             Message::WindowOpened(id) => {
                 return Task::batch([
                     self.accessibility
@@ -2335,27 +2411,10 @@ impl Workbench {
                 if !attached {
                     self.set_notice("Accessibility connection unavailable", None, Level::Error);
                 }
-                let fit = if self.settings_window == Some(id) {
-                    prefs::fit_aux_window(id, settings::window_settings().size, self.ui_scale)
-                } else {
-                    Task::none()
-                };
-                // EWMH frame extents are supplied after the window manager
-                // maps/reparents the client; query them after requesting show.
-                let mapped_fit = if cfg!(target_os = "linux")
-                    && id == self.main_window
-                    && self.screenshot.is_none()
-                {
-                    let [width, height] = self.window.unwrap_or([1280.0, 840.0]);
-                    prefs::fit_main_window(id, Size::new(width, height), self.ui_scale)
-                } else {
-                    Task::none()
-                };
-                return fit
-                    .chain(window::set_mode(id, window::Mode::Windowed))
-                    .chain(mapped_fit)
-                    .chain(window::gain_focus(id));
+                return self.present_window(id);
             }
+            Message::AccessibilityRecoveryAttached(id) => return self.recovery_attached(id),
+            Message::CloseErrorMode(id, mode) => return self.present_close_error(id, mode),
             Message::AccessibilityChanged(id) => return self.accessibility.sync(id).discard(),
             Message::AccessibilityRequest(request) => {
                 let id = request.window;
@@ -2444,6 +2503,11 @@ impl Workbench {
             Message::ContentFocused(area) => self.content_focus = area,
             Message::PopupOpen(value) => self.popup_open = value,
             Message::Settings(open) => {
+                if open {
+                    self.video_analytics.refresh_credentials();
+                } else {
+                    self.video_analytics.clear_secret();
+                }
                 #[cfg(target_os = "macos")]
                 if self.screenshot.is_none() {
                     if !open {
@@ -2603,6 +2667,7 @@ impl Workbench {
             Message::Analytics(open) => return self.show_analytics(open),
             Message::AnalyticsScrolled(scrolled) => self.analytics.scrolled = scrolled,
             Message::AnalyticsHistory(input) => return self.analytics_history(input),
+            Message::VideoAnalytics(input) => self.video_analytics_input(input),
             Message::IncludeSimulator(value) => {
                 self.include_simulator = value;
                 self.discover();

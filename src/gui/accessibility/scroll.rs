@@ -288,7 +288,11 @@ impl Operation<Message> for Reveal {
             && let Some(target) = &self.focus
         {
             if id == Some(target) {
-                state.focus();
+                // TextInput::focus moves its cursor to the end. Retain a
+                // logically focused editor's selection when its window returns.
+                if !state.is_focused() {
+                    state.focus();
+                }
             } else {
                 state.unfocus();
             }

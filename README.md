@@ -124,6 +124,8 @@ Build the WebAssembly client with `./web-client/build.sh`, then run a headless s
 
 The desktop toolbar's **Analytics** button and the browser's **Session analytics** panel show acquired frames, payload throughput, missed frames and camera contributions for the current session. DuckDB collects one-second samples in memory, retaining at most 24 hours and 250,000 rows; totals continue across camera reconnects. The HTTP listener exposes JSON readiness at `/health`, Prometheus counters and gauges at `/metrics`, and the Plotters chart at `/api/analytics.svg`. See [analytics and monitoring](docs/remote-control.md#analytics-and-monitoring) for the endpoint contract and retention limits.
 
+The desktop also collects numeric video measurements from short prompts using OpenAI (ChatGPT), Gemini or Claude. Configure API keys in **Settings** using the OS credential store, or launch with `OPENAI_API_KEY`, `GEMINI_API_KEY` / `GOOGLE_API_KEY`, or `ANTHROPIC_API_KEY`. In **Analytics**, choose a model, add prompts such as “count the number of tubes” or “estimate the length of ribbon in meters,” and explicitly start collection on a live camera. Structured results feed DuckDB history and per-measurement charts. See [prompt-driven video analytics](docs/video-analytics.md) for setup, sampling and retention.
+
 ## GigE network setup
 
 Use **Scan network** in the camera sidebar to check GigE interfaces, camera reachability, link speed and MTU, then apply network defaults to connected cameras. The report distinguishes discovery from a working control connection and from observed stream stability. Slow Ethernet, Wi-Fi, routed paths and unknown link speeds stay visibly flagged. Live camera badges show waiting traffic, retries and lost frames.

@@ -426,8 +426,30 @@ fn empty_single_truncated_and_large_histories_are_honest_and_bounded() {
     let (last, _, _) = collect(&bench, &mut Tree::empty(), &renderer);
     assert_eq!(bench.analytics.history.page, 179);
     assert_eq!(rows(&last).len(), PAGE_SIZE);
+    // Bound the expanded history itself. Other sheet sections can add
+    // controls without changing how many native history rows are published.
+    let history = last
+        .nodes
+        .iter()
+        .find(|(_, node)| {
+            node.role() == accessibility::Role::Group && node.label() == Some("History snapshot")
+        })
+        .expect("expanded history has its own native group")
+        .0;
+    let nodes: HashMap<_, _> = last.nodes.iter().map(|(id, node)| (*id, node)).collect();
+    let mut pending = vec![history];
+    let mut history_nodes = std::collections::HashSet::new();
+    while let Some(id) = pending.pop() {
+        assert!(history_nodes.insert(id), "history nodes have one parent");
+        pending.extend(
+            nodes
+                .get(&id)
+                .expect("history child exists in the native tree")
+                .children(),
+        );
+    }
     assert!(
-        last.nodes.len() < 100,
+        history_nodes.len() < 100,
         "1440 measurements must not create 1440 native rows"
     );
     assert!(last.nodes.iter().any(|(_, node)| {

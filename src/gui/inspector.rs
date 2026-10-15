@@ -1522,6 +1522,7 @@ impl Workbench {
             );
         }
         let modes = segmented(
+            "Exposure mode",
             vec![
                 (
                     "Manual",

@@ -1,5 +1,7 @@
 #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
 pub mod accel;
+#[cfg(feature = "ai")]
+pub mod ai;
 pub mod analytics;
 pub mod auto;
 pub mod autocapture;
@@ -35,6 +37,8 @@ pub mod types;
 pub mod upload;
 #[cfg(feature = "vaapi")]
 pub mod vajpeg;
+#[cfg(feature = "ai")]
+pub mod video_analytics;
 pub mod volumes;
 #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
 pub mod vtjpeg;
