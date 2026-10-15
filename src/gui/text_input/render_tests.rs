@@ -1273,14 +1273,19 @@ fn multiline_values_keep_the_full_cursor_and_exact_upstream_geometry_fallback() 
 fn clipped_wrapped_paragraphs_reject_incomplete_visible_grapheme_coverage() {
     use super::selection::ParagraphGeometry;
     use unicode_segmentation::UnicodeSegmentation;
-    let renderer = Recorder::new();
-    let value = "abc אבג def ghi jkl";
+    iced::advanced::graphics::text::font_system()
+        .write()
+        .unwrap()
+        .load_font(std::borrow::Cow::Borrowed(include_bytes!(
+            "../../../tests/fonts/DejaVuSans.ttf"
+        )));
+    let value = "abc אבג def ghi jkl mno pqr stu vwx yz אבג abc def";
     let paragraph = Paragraph::with_text(text::Text {
         content: value,
-        bounds: Size::new(32.0, 1.0),
+        bounds: Size::new(32.0, 20.0),
         size: Pixels(16.0),
         line_height: text::LineHeight::Absolute(Pixels(20.0)),
-        font: text::Renderer::default_font(&renderer),
+        font: Font::with_name("DejaVu Sans"),
         align_x: text::Alignment::Left,
         align_y: iced::alignment::Vertical::Top,
         shaping: text::Shaping::Advanced,

@@ -185,6 +185,14 @@ fn analytics_and_network_cancel_from_actual_compact_window_views_preserves_draft
                 for message in messages {
                     let _ = app.update(message);
                 }
+                if cancel == "close-window" && Os::CURRENT == Os::Windows {
+                    // Ctrl+W is deliberately unbound on Windows. Alt+F4 is
+                    // delivered by the OS as CloseRequested, never a chord.
+                    assert_eq!(app.analytics.open, analytics);
+                    assert_eq!(app.network_open, !analytics);
+                    assert!(app.closing.is_none());
+                    let _ = app.update(Message::CloseRequested(main));
+                }
                 assert!(!app.analytics.open && !app.network_open);
                 assert!(
                     app.closing.is_none(),
