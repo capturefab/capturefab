@@ -32,7 +32,9 @@ const SCPS_FIRE: u32 = 0x8000_0000;
 const SCPS_NO_FRAGMENT: u32 = 0x4000_0000;
 const SCPS_BIG_ENDIAN: u32 = 0x2000_0000;
 const PACKET_SIZE_MAX: u32 = 9000;
-const TEST_WAIT: Duration = Duration::from_millis(10);
+// Permit scheduler and network jitter while still requiring three consecutive
+// correctly sized packets before accepting a path.
+const TEST_WAIT: Duration = Duration::from_millis(100);
 const MEMORY_CHUNK: usize = 512;
 const MAX_XML: usize = 16 * 1024 * 1024;
 const MAX_PAYLOAD: usize = 128 * 1024 * 1024;
@@ -1884,6 +1886,7 @@ mod tests {
         clamp: Option<u32>,
         reject_above: Option<u32>,
         test_packet_budget: Option<usize>,
+        test_packet_delay: Duration,
         rejected_packet_sizes: Vec<u32>,
         register_reads: Vec<u32>,
         register_writes: Vec<(u32, u32)>,
@@ -1932,7 +1935,18 @@ mod tests {
                     (&stale, self.stale),
                 ] {
                     if send {
-                        let _ = stream.send_to(packet, self.destination());
+                        if self.test_packet_delay.is_zero() {
+                            let _ = stream.send_to(packet, self.destination());
+                        } else {
+                            let stream = stream.try_clone().unwrap();
+                            let destination = self.destination();
+                            let packet = packet.clone();
+                            let delay = self.test_packet_delay;
+                            thread::spawn(move || {
+                                thread::sleep(delay);
+                                let _ = stream.send_to(&packet, destination);
+                            });
+                        }
                     }
                 }
             }
@@ -2694,6 +2708,21 @@ mod tests {
         };
         assert!(negotiate(stale, 1500, true).is_some_and(|size| (1350..=1400).contains(&size)));
     }
+    #[test]
+    fn packet_size_probe_accepts_three_packets_delayed_by_scheduler_jitter() {
+        assert_eq!(
+            negotiate(
+                |camera| {
+                    camera.path_mtu = 1500;
+                    camera.test_packet_delay = Duration::from_millis(30);
+                },
+                1500,
+                true
+            ),
+            Some(1500)
+        );
+    }
+
     #[test]
     fn network_probe_requires_three_read_only_unicast_responses() {
         let fake = Fake::new(|_| {});

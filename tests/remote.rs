@@ -216,7 +216,7 @@ fn multiplayer_capture_broadcasts_actors_and_queued_work_without_blocking_observ
             scope.spawn(|| fixture.cli(&["activity", "--after", &local_revision, "--wait", "3s"]));
         let agent = scope.spawn(|| fixture.command_as(
             Some("sim:0"),
-            json!({"op":"capture","output":"agent-frames","count":4,"timeout_ms":2000,"format":"png"}),
+            json!({"op":"capture","output":"agent-frames","count":8,"timeout_ms":2000,"format":"png"}),
             Some(json!({"id":"focus-agent","name":"Focus agent","kind":"agent"})),
         ));
         for observer in [first, second] {
@@ -230,28 +230,15 @@ fn multiplayer_capture_broadcasts_actors_and_queued_work_without_blocking_observ
                 "observers must see an actor while its capture is still active: {update}"
             );
         }
-        let local_update = local.join().unwrap();
-        assert!(local_update["revision"].as_u64().unwrap() > revision);
-        assert!(
-            local_update["activity"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| {
-                    entry["actor"]["id"] == "focus-agent" && entry["operation"] == "capture"
-                }),
-            "private IPC observer did not receive shared work: {local_update}"
-        );
+        // Submit the second actor over the already-ready HTTP endpoint.
+        // Starting a new CLI process here can outlast the first capture on a
+        // loaded runner; the private IPC observer is joined after queuing.
         let human = scope.spawn(|| {
-            fixture.cli(&[
-                "--actor",
-                "Camera operator",
-                "--camera",
-                "sim:0",
-                "capture",
-                "-o",
-                "human.png",
-            ])
+            fixture.command_as(
+            Some("sim:0"),
+            json!({"op":"capture","output":"human.png","count":1,"timeout_ms":2000,"format":"png"}),
+            Some(json!({"id":"camera-operator","name":"Camera operator","kind":"human"})),
+        )
         });
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -268,7 +255,8 @@ fn multiplayer_capture_broadcasts_actors_and_queued_work_without_blocking_observ
             std::thread::sleep(Duration::from_millis(10));
         }
         let started = Instant::now();
-        let status = fixture.cli(&["--camera", "sim:0", "status"]);
+        // Measure command responsiveness, rather than CLI process startup.
+        let status = fixture.command(Some("sim:0"), json!({"op":"status"}));
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "targeted status waited behind capture"
@@ -280,6 +268,18 @@ fn multiplayer_capture_broadcasts_actors_and_queued_work_without_blocking_observ
                 .iter()
                 .any(|entry| entry["actor"]["id"] == "focus-agent")
         );
+        let local_update = local.join().unwrap();
+        assert!(local_update["revision"].as_u64().unwrap() > revision);
+        assert!(
+            local_update["activity"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| {
+                    entry["actor"]["id"] == "focus-agent" && entry["operation"] == "capture"
+                }),
+            "private IPC observer did not receive shared work: {local_update}"
+        );
         agent.join().unwrap();
         human.join().unwrap();
     });
@@ -287,7 +287,7 @@ fn multiplayer_capture_broadcasts_actors_and_queued_work_without_blocking_observ
         fs::read_dir(fixture.root.join("agent-frames"))
             .unwrap()
             .count(),
-        4
+        8
     );
     assert!(
         fs::read(fixture.root.join("human.png"))
