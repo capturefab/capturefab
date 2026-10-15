@@ -3731,6 +3731,7 @@ mod tests {
 
     #[test]
     fn the_advanced_chevron_turns_and_settles() {
+        let _motion = motion::test_reduce_motion(false);
         let mut picker = Picker::new(false, false);
         let mut output = String::new();
         let start = Instant::now();

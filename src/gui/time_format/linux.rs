@@ -203,7 +203,7 @@ fn locale_name<'a>(all: &'a str, time: &'a str, language: &'a str, kde: &'a Regi
 }
 
 #[cfg(target_os = "linux")]
-mod native {
+mod locale {
     use super::*;
     use chrono::{DateTime, Datelike, Local, Timelike, Utc};
     use std::{
@@ -524,11 +524,11 @@ mod native {
 
 #[cfg(target_os = "linux")]
 pub(super) fn format(unix_ms: i64, utc_offset_seconds: i32) -> Option<(String, String)> {
-    native::lookup(unix_ms, utc_offset_seconds).map(|value| (value.compact, value.full))
+    locale::lookup(unix_ms, utc_offset_seconds).map(|value| (value.compact, value.full))
 }
 #[cfg(target_os = "linux")]
 pub(super) fn date(unix_ms: i64, utc_offset_seconds: i32) -> Option<String> {
-    native::lookup(unix_ms, utc_offset_seconds).map(|value| value.date)
+    locale::lookup(unix_ms, utc_offset_seconds).map(|value| value.date)
 }
 
 #[cfg(test)]

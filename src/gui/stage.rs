@@ -1119,6 +1119,7 @@ mod tests {
 
     #[test]
     fn zoom_eases_between_scales_and_settles_where_it_rests() {
+        let _motion = motion::test_reduce_motion(false);
         let mut bench = bench();
         bench.shown = Some(shown(800.0, 600.0));
         bench.stage.set(Size::new(400.0, 300.0));

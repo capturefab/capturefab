@@ -3479,6 +3479,7 @@ mod tests {
 
     #[test]
     fn thumbs_jump_into_place_then_slide() {
+        let _motion = motion::test_reduce_motion(false);
         let mut bench = bench();
         bench.tab = Tab::Forward;
         bench.sync_animations();
@@ -3540,6 +3541,7 @@ mod tests {
 
     #[test]
     fn disclosures_turn_open_and_settle() {
+        let _motion = motion::test_reduce_motion(false);
         let mut bench = bench();
         bench.sync_animations();
         let start = bench.now;

@@ -117,8 +117,34 @@ pub(super) fn accessibility_subscription() -> Subscription<Message> {
     }
 }
 
+// Animation tests must choose a preference independently of the host desktop
+// and of parallel tests that refresh native accessibility settings.
+#[cfg(test)]
+thread_local! {
+    static TEST_REDUCE_MOTION: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) struct TestMotion(Option<bool>);
+
+#[cfg(test)]
+impl Drop for TestMotion {
+    fn drop(&mut self) {
+        TEST_REDUCE_MOTION.set(self.0);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_reduce_motion(reduce: bool) -> TestMotion {
+    TestMotion(TEST_REDUCE_MOTION.replace(Some(reduce)))
+}
+
 /// Whether to replace movement with fades: `Kind::Move` motions snap.
 pub(super) fn reduce_motion() -> bool {
+    #[cfg(test)]
+    if let Some(reduce) = TEST_REDUCE_MOTION.get() {
+        return reduce;
+    }
     REDUCE_MOTION.load(Ordering::Relaxed)
 }
 

@@ -1370,8 +1370,8 @@ mod tests {
         };
         use std::process::{ExitStatus, Stdio};
         unsafe extern "C" {
-            fn read(fd: i32, buffer: *mut u8, count: usize) -> isize;
-            fn write(fd: i32, buffer: *const u8, count: usize) -> isize;
+            fn read(fd: i32, buffer: *mut std::ffi::c_void, count: usize) -> isize;
+            fn write(fd: i32, buffer: *const std::ffi::c_void, count: usize) -> isize;
         }
         struct Forked {
             channel: UnixStream,
@@ -1426,7 +1426,9 @@ mod tests {
             unsafe {
                 command.pre_exec(move || {
                     let mut byte = b'R';
-                    if write(fd, &byte, 1) != 1 || read(fd, &mut byte, 1) != 1 {
+                    if write(fd, std::ptr::from_ref(&byte).cast(), 1) != 1
+                        || read(fd, std::ptr::from_mut(&mut byte).cast(), 1) != 1
+                    {
                         return Err(io::Error::last_os_error());
                     }
                     Ok(())

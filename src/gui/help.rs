@@ -464,6 +464,7 @@ mod tests {
 
     #[test]
     fn the_notes_chevron_turns_and_settles() {
+        let _motion = motion::test_reduce_motion(false);
         let mut bench = bench();
         let _ = bench.handle_message(Message::Help(true));
         bench.sync_animations();

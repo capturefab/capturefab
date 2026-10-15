@@ -665,13 +665,21 @@ impl Writer {
         prefs: Prefs,
         completed: Option<oneshot::Sender<std::result::Result<(), String>>>,
     ) -> std::result::Result<u64, String> {
-        let generation = self
-            .next_generation
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
-                generation.checked_add(1)
-            })
-            .map_err(|_| "The settings save generation is exhausted.".to_owned())?
-            + 1;
+        let mut previous = self.next_generation.load(Ordering::Relaxed);
+        let generation = loop {
+            let next = previous
+                .checked_add(1)
+                .ok_or_else(|| "The settings save generation is exhausted.".to_owned())?;
+            match self.next_generation.compare_exchange_weak(
+                previous,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break next,
+                Err(current) => previous = current,
+            }
+        };
         self.snapshots
             .send(Snapshot {
                 path,
