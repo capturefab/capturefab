@@ -3,6 +3,8 @@ use super::*;
 use iced::widget::column;
 use std::collections::HashSet;
 #[cfg(test)]
+mod date_layout_tests;
+#[cfg(test)]
 mod raw_log_tests;
 
 /// The widest the status at the right of the toolbar grows.

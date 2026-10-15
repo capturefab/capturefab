@@ -211,8 +211,10 @@ fn local_date_boundaries_preserve_source_order_row_identity_and_the_pinned_copy_
         command(11, first as u64, Some(next as u64)),
         command(12, u64::MAX, None),
     ];
-    let date = time_format::log_day(&app.snapshot.logs[0]).label;
-    let next_date = time_format::log_day(&app.snapshot.logs[2]).label;
+    assert_ne!(
+        time_format::log_day(&app.snapshot.logs[0]).key,
+        time_format::log_day(&app.snapshot.logs[2]).key
+    );
     let mut tree = Tree::empty();
     let collect = |app: &Workbench, tree: &mut Tree, focus: bool| {
         let mut view = app.activity(Palette::of(false));
@@ -244,17 +246,32 @@ fn local_date_boundaries_preserve_source_order_row_identity_and_the_pinned_copy_
             .map(|(_, node)| node.label().unwrap().to_owned())
             .collect::<Vec<_>>()
     };
+    let initial_headings = headings(&initial);
+    // The background Linux formatter can publish a localized date between
+    // frames. Boundary order and ownership do not depend on that caption.
     assert_eq!(
-        headings(&initial),
+        initial_headings
+            .iter()
+            .map(|label| label.split_once(" · ").unwrap().0)
+            .collect::<Vec<_>>(),
         [
-            format!("Diagnostics · {date}"),
-            format!("Diagnostics · {next_date}"),
-            "Diagnostics · Date unavailable".into(),
-            format!("Diagnostics · {date}"),
-            format!("Command updates · {date}"),
-            format!("Command updates · {next_date}"),
-            "Command updates · Date unavailable".into(),
+            "Diagnostics",
+            "Diagnostics",
+            "Diagnostics",
+            "Diagnostics",
+            "Command updates",
+            "Command updates",
+            "Command updates"
         ]
+    );
+    assert_eq!(initial_headings[2], "Diagnostics · Date unavailable");
+    assert_eq!(initial_headings[6], "Command updates · Date unavailable");
+    assert_eq!(
+        initial_headings
+            .iter()
+            .filter(|label| label.ends_with("Date unavailable"))
+            .count(),
+        2
     );
     let named = |snapshot: &accesskit::TreeUpdate, name: &str| {
         snapshot
@@ -267,18 +284,31 @@ fn local_date_boundaries_preserve_source_order_row_identity_and_the_pinned_copy_
     let copy = named(&initial, "Copy activity log");
     assert_eq!(initial.focus, copy);
     let command_id = named(&initial, "Command 10");
-    let command_heading = named(&initial, &format!("Command updates · {date}"));
+    let command_heading = named(&initial, &initial_headings[4]);
+    let initial_time = initial
+        .nodes
+        .iter()
+        .find(|(id, _)| *id == command_id)
+        .unwrap()
+        .1
+        .children()[0];
     let retained_times: Vec<_> = app.snapshot.logs[1..]
         .iter()
         .map(|entry| {
-            let full = time_format::log(entry).full;
+            let signature = entry
+                .timestamp
+                .map(|stamp| format!(" · Recorded {}", stamp.rfc3339()))
+                .unwrap_or_else(|| time_format::log(entry).full);
             let id = initial
                 .nodes
                 .iter()
-                .find(|(_, node)| node.description() == Some(full.as_str()))
+                .find(|(_, node)| {
+                    node.description()
+                        .is_some_and(|description| description.ends_with(&signature))
+                })
                 .unwrap()
                 .0;
-            (full, id)
+            (signature, id)
         })
         .collect();
     let copy_before = app.activity_text();
@@ -299,9 +329,25 @@ fn local_date_boundaries_preserve_source_order_row_identity_and_the_pinned_copy_
     assert_eq!(updated.focus, copy);
     assert_eq!(named(&updated, "Copy activity log"), copy);
     assert_eq!(named(&updated, "Command 10"), command_id);
+    let updated_heading = updated
+        .nodes
+        .iter()
+        .find(|(id, _)| *id == command_heading)
+        .unwrap()
+        .1
+        .label()
+        .unwrap();
+    assert!(updated_heading.starts_with("Command updates · "));
+    assert_ne!(updated_heading, initial_headings[4]);
+    let updated_command = updated
+        .nodes
+        .iter()
+        .find(|(id, _)| *id == command_id)
+        .unwrap();
+    assert_eq!(updated_command.1.children()[0], initial_time);
     assert_eq!(
-        named(&updated, &format!("Command updates · {next_date}")),
-        command_heading
+        time_format::activity_day(&app.snapshot.activity[0]).key,
+        time_format::activity_day(&app.snapshot.activity[1]).key
     );
     assert_eq!(
         headings(&updated)
@@ -310,13 +356,13 @@ fn local_date_boundaries_preserve_source_order_row_identity_and_the_pinned_copy_
             .count(),
         2
     );
-    for (full, id) in retained_times {
-        assert!(
-            updated
-                .nodes
-                .iter()
-                .any(|(now, node)| *now == id && node.description() == Some(full.as_str()))
-        );
+    for (signature, id) in retained_times {
+        assert!(updated.nodes.iter().any(|(now, node)| {
+            *now == id
+                && node
+                    .description()
+                    .is_some_and(|description| description.ends_with(&signature))
+        }));
     }
     for (_, node) in updated
         .nodes

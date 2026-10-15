@@ -32,7 +32,10 @@ pub(super) fn format(unix_ms: i64, utc_offset_seconds: i32) -> Option<(String, S
 
 fn system_time(unix_ms: i64, utc_offset_seconds: i32) -> Option<SYSTEMTIME> {
     let zone = FixedOffset::east_opt(utc_offset_seconds)?;
-    let local = DateTime::<Utc>::from_timestamp_millis(unix_ms)?.with_timezone(&zone);
+    let utc = DateTime::<Utc>::from_timestamp_millis(unix_ms)?;
+    utc.naive_utc()
+        .checked_add_signed(chrono::Duration::seconds(i64::from(utc_offset_seconds)))?;
+    let local = utc.with_timezone(&zone);
     Some(SYSTEMTIME {
         wYear: local.year().try_into().ok()?,
         wMonth: local.month() as u16,

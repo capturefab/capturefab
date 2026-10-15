@@ -18,9 +18,24 @@ fn worker_coordinator_and_activity_show_the_same_instant_and_copy_a_dated_zone()
     worker.timestamp = LogTimestamp::new(time, 0);
     let mut coordinator = LogEntry::legacy("10:30:00.123", "error", "coordinator");
     coordinator.timestamp = LogTimestamp::new(time, -4 * 3600);
-    let a = log(&worker);
-    let b = log(&coordinator);
-    let c = activity(&activity_at(time as u64));
+    // Linux publishes native locale results asynchronously; compare one settled
+    // presentation rather than the instant when its first cache miss completes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let (a, b, c) = loop {
+        let labels = (
+            log(&worker),
+            log(&coordinator),
+            activity(&activity_at(time as u64)),
+        );
+        if labels.0.compact == labels.1.compact && labels.1.compact == labels.2.compact {
+            break labels;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the same instant must settle on one clock format"
+        );
+        std::thread::yield_now();
+    };
     assert_eq!(a.compact, b.compact);
     assert_eq!(a.compact, c.compact);
     assert_eq!(a.copy, b.copy);
@@ -185,17 +200,20 @@ fn raw_timestamp_identity_survives_front_eviction_and_prunes_when_closed_or_empt
             .nodes
             .into_iter()
             .filter_map(|(id, node)| {
-                node.description()
-                    .map(|description| (description.to_owned(), id))
+                node.description().and_then(|description| {
+                    description
+                        .rsplit_once(" · Recorded ")
+                        .map(|(_, recorded)| (recorded.to_owned(), id))
+                })
             })
             .collect::<std::collections::HashMap<_, _>>()
     };
     let original = collect(&app, &mut tree);
     let retained: Vec<_> = app.snapshot.logs[1..]
         .iter()
-        .map(|entry| log(entry).full)
+        .map(|entry| entry.timestamp.unwrap().rfc3339())
         .collect();
-    let removed = original[&log(&app.snapshot.logs[0]).full];
+    let removed = original[&app.snapshot.logs[0].timestamp.unwrap().rfc3339()];
     app.snapshot.logs.remove(0);
     app.snapshot.logs.push(entry(3));
     app.sync_client_activity();

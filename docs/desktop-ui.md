@@ -199,6 +199,30 @@ native text. Copies include a dated numeric offset. Timestamp identities survive
 command reordering and bounded-log eviction; closed panels also prune the ID
 caches. Locale changes do not create a new error announcement identity.
 
+Activity now shows date headings for contiguous runs in each recorded source:
+Diagnostics for raw logs and Command updates for structured commands. Each row's
+clock, copied value and calendar-day identity use the same viewer-local instant;
+localized day captions do not determine identity. Legacy logs and invalid times
+show Date unavailable. Entries retain their source order and copied contents.
+Permanent heading slots preserve row and timestamp identities and focus when a
+command completes across midnight. Bounded heading-ID caches are pruned even
+while Activity is closed.
+
+Linux reads the [GNOME global 12/24-hour clock-format preference](https://raw.githubusercontent.com/GNOME/gsettings-desktop-schemas/master/schemas/org.gnome.desktop.interface.gschema.xml.in)
+through optional installed GIO/GSettings and uses KDE's global
+[regional LC_TIME locale](https://raw.githubusercontent.com/KDE/plasma-workspace/master/kcms/region_language/regionandlangsettingsbase.kcfg)
+from plasma-localerc. The implementation preserves explicit Inherit Language and
+follows the live KDE language choice rather than stale launch LC_TIME; its
+precedence policy retains LC_ALL as an explicit override.
+Individual Plasma clock-widget overrides are not global application settings.
+One background worker reads preferences and locale files and formats clock/date
+values using separate POSIX locale objects. The UI uses nonblocking cache access
+and request submission, bounded to 512 entries with a two-second refresh. Absent
+desktop preferences use the locale's format. Unavailable locales, cache misses
+or cached values with a different viewer UTC offset use numeric fallback,
+keeping dates and clocks coherent with the current local instant until refreshed.
+Native GNOME/KDE preference behavior has not been executed or inspected.
+
 Each window is created hidden. The root `WindowOpened` branch attaches the native
 adapter through `window::run`, then shows and focuses the window. Adapters are
 stored, updated and dropped on that window's UI thread. macOS uses
@@ -440,8 +464,8 @@ or replaced with stubs. Native Windows execution, Narrator and the other native
 screen-reader workflows remain unverified. These compile/source results do not
 establish runtime usability or full HIG completion.
 
-The new Windows time formatter was checked separately against the genuine MSVC
-target with `build-std`, using the actual `gui/time_format/windows.rs` source,
+The updated Windows clock/date formatter was checked separately against the
+genuine MSVC target with `build-std`, using the actual `gui/time_format/windows.rs` source,
 chrono 0.4.45 and windows 0.61.3. The isolated harness is retained under
 `/private/tmp/capturefab-time-windows-check`. This verifies the formatter's Windows
 types and API calls, without bypassing the full application's missing C++ headers
@@ -449,6 +473,18 @@ or establishing Windows execution. The browser timestamp changes also passed a
 genuine `wasm32-unknown-unknown` library check using the installed Rust source and
 cached dependencies, with artifacts under `/private/tmp/capturefab-wasm-check-target`.
 No target libraries or SDK were downloaded. Browser execution remains unverified.
+
+The actual Linux clock/date source and its test targets passed a genuine
+`x86_64-unknown-linux-gnu` check and strict Clippy with warnings treated as errors,
+using `build-std`, the installed Rust source and cached chrono 0.4.45, libc 0.2.190
+and libloading 0.8.9. The isolated harness under
+`/private/tmp/capturefab-time-linux-check` includes `gui/time_format/linux.rs`
+directly. Portable tests exercise preference precedence, live inheritance,
+nonblocking bounded work, paired clock/date refresh and stale-offset rejection.
+The Linux-only POSIX locale test was compiled, not executed. These checks do not
+establish GIO/GSettings runtime behavior, live GNOME/KDE preference changes or
+Linux desktop usability; no Docker, target downloads or OS-setting changes were
+used for this verification.
 
 ## Verified macOS runtime behavior
 
@@ -628,9 +664,10 @@ cover these platform branches, including disabled defaults and preserved drafts.
 Remaining focused checks include finer per-pane focus and inactive text-selection
 appearance on native desktops, spoken network-card hierarchy and descriptions,
 announcements, and native focus from background or minimized windows.
-Linux Activity currently uses a local 24-hour fallback; GNOME/KDE clock preferences
-remain to be implemented and checked. Visible date grouping across multi-day
-Activity also needs work, despite complete date/zone descriptions and dated copies.
+Linux GNOME/KDE clock and date preferences require native runtime verification,
+including live changes and fallback behavior. Visible multi-day Activity grouping
+also needs native inspection across midnight, completion and time-zone changes;
+source/widget coverage does not establish the spoken or visual desktop behavior.
 Charts expose measured history, axes and mark values through native groups;
 Audio Graphs are not implemented, and spoken chart navigation remains unverified.
 Native camera names have representative glyph and pixel evidence, rather than
