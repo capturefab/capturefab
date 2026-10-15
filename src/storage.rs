@@ -1295,7 +1295,26 @@ mod tests {
         crashed.file.take();
         crashed.lease.take();
         drop(crashed);
-        let locked = manager.lock().unwrap();
+        // Another test can be between fork and exec, temporarily retaining
+        // this close-on-exec lease. Reclaim only after that reference closes.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let locked = loop {
+            let locked = manager.lock().unwrap();
+            if locked
+                .ledger
+                .entries
+                .iter()
+                .all(|entry| entry.lease.is_none())
+            {
+                break locked;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dropped writer lease did not close"
+            );
+            drop(locked);
+            thread::sleep(Duration::from_millis(10));
+        };
         assert_eq!(locked.allocated().unwrap(), 5);
         assert_eq!(
             locked
@@ -1317,6 +1336,140 @@ mod tests {
         );
         drop(locked);
         completed(&manager, &temp.path("next"), &policy, b"45678");
+    }
+    #[test]
+    #[cfg(unix)]
+    fn inherited_lease_keeps_the_reservation_until_exec_releases_it() {
+        const HELPER: &str = "CAPTUREFAB_TEST_STORAGE_INHERITED_LEASE";
+        const COMPLETE: &str = "inherited lease proof completed";
+        if std::env::var_os(HELPER).is_none() {
+            // Run the deliberate fork hold after exec has closed unrelated
+            // parallel tests' close-on-exec leases in the original process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "storage::tests::inherited_lease_keeps_the_reservation_until_exec_releases_it",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stdout.contains(COMPLETE),
+                "isolated inherited lease proof failed: {}\n{stdout}{stderr}",
+                output.status
+            );
+            return;
+        }
+        use std::net::Shutdown;
+        use std::os::{
+            fd::AsRawFd,
+            unix::{net::UnixStream, process::CommandExt},
+        };
+        use std::process::{ExitStatus, Stdio};
+        unsafe extern "C" {
+            fn read(fd: i32, buffer: *mut u8, count: usize) -> isize;
+            fn write(fd: i32, buffer: *const u8, count: usize) -> isize;
+        }
+        struct Forked {
+            channel: UnixStream,
+            thread: Option<thread::JoinHandle<io::Result<ExitStatus>>>,
+        }
+        impl Forked {
+            fn finish(&mut self) -> ExitStatus {
+                self.channel.write_all(b"E").unwrap();
+                self.thread.take().unwrap().join().unwrap().unwrap()
+            }
+        }
+        impl Drop for Forked {
+            fn drop(&mut self) {
+                // Release a child even if readiness, accounting or an assertion
+                // fails. The socket timeout also bounds its pre-exec wait.
+                let _ = self.channel.shutdown(Shutdown::Both);
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+            }
+        }
+        let temp = Temp::new();
+        let manager = temp.manager();
+        let policy = policy(10, 4, "stop");
+        completed(&manager, &temp.path("finished"), &policy, b"ab");
+        let mut crashed = manager.writer(&temp.path("crashed"), &policy, 8).unwrap();
+        crashed.write_all(b"123").unwrap();
+        let (parent, child) = UnixStream::pair().unwrap();
+        parent
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        parent
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        child
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        child
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let forked = thread::spawn(move || {
+            let fd = child.as_raw_fd();
+            let mut command = std::process::Command::new(executable);
+            command
+                .arg("--help")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            // SAFETY: after fork this callback uses only async-signal-safe
+            // read/write and errno access, with a pre-existing socket.
+            unsafe {
+                command.pre_exec(move || {
+                    let mut byte = b'R';
+                    if write(fd, &byte, 1) != 1 || read(fd, &mut byte, 1) != 1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let result = command.status();
+            drop(child);
+            result
+        });
+        let mut forked = Forked {
+            channel: parent,
+            thread: Some(forked),
+        };
+        let mut ready = [0];
+        forked.channel.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, [b'R']);
+        crashed.finalized = true;
+        crashed.file.take();
+        crashed.lease.take();
+        drop(crashed);
+        let retained = manager.lock().unwrap();
+        assert_eq!(retained.allocated().unwrap(), 10);
+        assert_eq!(
+            retained
+                .ledger
+                .entries
+                .iter()
+                .filter(|entry| entry.lease.is_some())
+                .count(),
+            1
+        );
+        drop(retained);
+        assert!(forked.finish().success());
+        let reclaimed = manager.lock().unwrap();
+        assert_eq!(reclaimed.allocated().unwrap(), 5);
+        assert!(
+            reclaimed
+                .ledger
+                .entries
+                .iter()
+                .all(|entry| entry.lease.is_none())
+        );
+        println!("{COMPLETE}");
     }
     #[test]
     fn live_recording_growth_is_tracked_without_rewriting_the_ledger() {

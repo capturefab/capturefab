@@ -10,6 +10,24 @@ pub(in crate::gui) fn label<'a, M: 'static>(
     Element::new(Label {
         content,
         name,
+        description: None,
+        id: None,
+        role,
+    })
+}
+
+pub(in crate::gui) fn label_description<'a, M: 'static>(
+    content: Element<'a, M>,
+    name: String,
+    description: String,
+    role: Role,
+    id: Option<NodeId>,
+) -> Element<'a, M> {
+    Element::new(Label {
+        content,
+        name,
+        description: Some(description),
+        id,
         role,
     })
 }
@@ -17,6 +35,8 @@ pub(in crate::gui) fn label<'a, M: 'static>(
 struct Label<'a, M, R: renderer::Renderer = iced::Renderer> {
     content: Element<'a, M, Theme, R>,
     name: String,
+    description: Option<String>,
+    id: Option<NodeId>,
     role: Role,
 }
 
@@ -72,8 +92,15 @@ impl<M: 'static, R: renderer::Renderer> Widget<M, Theme, R> for Label<'_, M, R> 
         operation: &mut dyn Operation,
     ) {
         let control = tree.state.downcast_mut::<Control<M>>();
+        let original_id = control.id;
+        if let Some(id) = self.id {
+            control.id = id;
+        }
         control.node = Node::new(self.role);
         control.node.set_label(self.name.as_str());
+        if let Some(description) = &self.description {
+            control.node.set_description(description.as_str());
+        }
         control.focusable = false;
         match self.role {
             Role::Alert => {
@@ -92,6 +119,7 @@ impl<M: 'static, R: renderer::Renderer> Widget<M, Theme, R> for Label<'_, M, R> 
             _ => {}
         }
         operation.custom(None, layout.bounds(), control);
+        control.id = original_id;
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
@@ -157,8 +185,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_label_identity_does_not_leak_when_its_widget_state_is_reused() {
+        let first = new_node_id();
+        let second = new_node_id();
+        let mut label = Label {
+            description: Some("Full measurement context".into()),
+            id: Some(first),
+            content: iced::widget::Text::<Theme, ()>::new("Measurement").into(),
+            name: "Measurement".into(),
+            role: Role::Label,
+        };
+        let mut tree = Tree::new(&label as &dyn Widget<Message, Theme, ()>);
+        let original = tree.state.downcast_ref::<Control<Message>>().id;
+        for (provided, expected) in [
+            (Some(first), first),
+            (Some(second), second),
+            (None, original),
+        ] {
+            label.id = provided;
+            label.diff(&mut tree);
+            let node = label.layout(
+                &mut tree,
+                &(),
+                &layout::Limits::new(Size::ZERO, Size::new(300.0, 50.0)),
+            );
+            let mut collector = Collector::new(1.0);
+            label.operate(&mut tree, Layout::new(&node), &(), &mut collector);
+            assert_eq!(collector.nodes.len(), 1);
+            assert_eq!(collector.nodes[0].0, expected);
+            assert_eq!(tree.state.downcast_ref::<Control<Message>>().id, original);
+        }
+    }
+
+    #[test]
     fn error_live_regions_keep_their_identity_without_duplicate_text_or_focus() {
         let mut label = Label {
+            description: None,
+            id: None,
             content: iced::widget::Text::<Theme, ()>::new("Connection failed").into(),
             name: "Connection failed".into(),
             role: Role::Alert,

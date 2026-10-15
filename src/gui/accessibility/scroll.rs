@@ -106,9 +106,9 @@ pub(super) struct WindowMarker {
     pub begin: bool,
 }
 
-#[derive(Clone, Copy)]
 enum Target {
     Node(NodeId),
+    Widget(Id),
     Focused,
 }
 
@@ -128,6 +128,9 @@ impl Locate {
     }
     pub fn focused(window: window::Id) -> Self {
         Self::new(Target::Focused, window, false)
+    }
+    pub fn widget(id: Id, window: window::Id) -> Self {
+        Self::new(Target::Widget(id), window, true)
     }
     fn new(target: Target, window: window::Id, focus: bool) -> Self {
         Self {
@@ -169,8 +172,9 @@ impl Operation<Message> for Locate {
             && self.found.is_none()
             && let Some(control) = state.downcast_ref::<Control<Message>>()
             && !control.node.is_disabled()
-            && match self.target {
-                Target::Node(id) => control.id == id,
+            && match &self.target {
+                Target::Node(id) => control.id == *id,
+                Target::Widget(id) => control.focusable && &control.focus_id == id,
                 Target::Focused => control.focused,
             }
         {

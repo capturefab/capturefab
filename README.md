@@ -59,6 +59,8 @@ Journal strings and saved-path previews are capped: completed captures keep at m
 
 Give automation a recognizable name with `--actor NAME --actor-kind agent`; people use `--actor NAME` (human is the default). `CAPTUREFAB_ACTOR` and `CAPTUREFAB_ACTOR_KIND` supply these defaults. Names are display attribution, not authentication. Browser tabs have their own participant identity and editable name. HTTP automation can include an `actor` object and watch `/api/activity`; see [remote control](docs/remote-control.md).
 
+Raw `logs` retain `time`, `level` and `message`. New entries also include optional `timestamp: {unix_ms, utc_offset_seconds}`: signed Unix milliseconds identify the absolute event, and the offset records the producer clock's seconds east of UTC. The legacy `time` string has no date/zone and must not be parsed as an instant. Old entries omit metadata; malformed optional metadata leaves the diagnostic readable. Desktop and browser displays convert valid instants to the viewer's local zone, and copied desktop logs include a full date and numeric offset. The version-1 JSON envelope is unchanged.
+
 ```sh
 capturefab --session bench --camera sim:0 --actor focus-agent --actor-kind agent capture -o agent.png
 capturefab --session bench --camera sim:0 --actor Alice capture -o alice.png

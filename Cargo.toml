@@ -9,7 +9,7 @@ repository = "https://github.com/capturefab/capturefab"
 
 [features]
 default = ["gui", "usb", "scanner", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "s3"]
-gui = ["dep:iced", "dep:bytemuck", "dep:rfd", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:mundy", "dep:accesskit", "dep:accesskit_macos", "dep:accesskit_windows", "dep:accesskit_unix", "dep:raw-window-handle", "dep:windows", "dep:x11-dl"]
+gui = ["dep:iced", "dep:bytemuck", "dep:rfd", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:mundy", "dep:accesskit", "dep:accesskit_macos", "dep:accesskit_windows", "dep:accesskit_unix", "dep:raw-window-handle", "dep:windows", "dep:x11-dl", "dep:libloading", "dep:libc"]
 usb = ["dep:nusb"]
 # Document scanners: SANE scanimage, Windows WIA and macOS ImageCaptureCore.
 # Drivers run in disposable helper processes, never in the UI.
@@ -44,6 +44,7 @@ socket2 = "0.6"
 ctrlc = "3.4"
 getrandom = "0.3"
 iced = { version = "0.14", optional = true, default-features = false, features = ["wgpu", "tiny-skia", "crisp", "web-colors", "smol", "linux-theme-detection", "x11", "wayland", "image-without-codecs", "svg", "canvas", "advanced"] }
+unicode-segmentation = "1"
 accesskit = { version = "0.21.1", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
 bytemuck = { version = "1", optional = true, features = ["derive"] }
@@ -70,7 +71,7 @@ rfd = { version = "0.17", optional = true }
 accesskit_macos = { version = "0.22.2", optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "NSAccessibility", "NSApplication", "NSCell", "NSEvent", "NSImage", "NSMenu", "NSMenuItem", "NSResponder", "NSScreen", "NSScroller", "NSView", "NSWindow", "NSWorkspace"] }
-objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSData", "NSUserDefaults"] }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSData", "NSUserDefaults", "NSDate", "NSDateFormatter", "NSFormatter", "NSLocale", "NSTimeZone", "NSString"] }
 
 # Native accessibility preferences. iced already uses mundy for Linux theme
 # detection; its stream keeps portal/WinRT reads off the UI thread.
@@ -82,12 +83,13 @@ mundy = { version = "0.2.3", optional = true, default-features = false, features
 # Drive types and labels for the capture destination's volume list.
 [target.'cfg(windows)'.dependencies]
 accesskit_windows = { version = "0.29.2", optional = true }
-windows = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 accesskit_unix = { version = "0.17.2", optional = true }
 x11-dl = { version = "2.21", optional = true }
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }

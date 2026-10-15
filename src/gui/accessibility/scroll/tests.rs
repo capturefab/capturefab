@@ -769,3 +769,179 @@ fn native_focus_scopes_duplicate_explicit_ids_and_only_activates_current_enabled
         "closed-window routes cannot activate a replacement window"
     );
 }
+
+#[test]
+fn widget_focus_and_reveal_only_change_the_requested_window_with_duplicate_ids() {
+    use iced::futures::StreamExt;
+    let renderer = renderer();
+    struct Surface {
+        id: window::Id,
+        view: Element<'static, Message>,
+        tree: Tree,
+        node: layout::Node,
+    }
+    let mut surfaces: Vec<_> = [true, false]
+        .into_iter()
+        .map(|main| {
+            let id = window::Id::unique();
+            let content: Element<'static, Message> = if main {
+                iced::widget::column![
+                    crate::gui::text_input::text_input("Main editor", "abcdef")
+                        .name("Main editor")
+                        .id("main-editor")
+                        .on_input(Message::Address),
+                    space().height(400),
+                    crate::gui::button::button(iced::widget::text("History data"))
+                        .name("History data")
+                        .id("history-target")
+                        .on_press(Message::Help(false)),
+                ]
+                .into()
+            } else {
+                crate::gui::text_input::text_input("Settings editor", "a🇨🇦e\u{301}z")
+                    .name("Settings editor")
+                    .id("history-target")
+                    .on_input(Message::Address)
+                    .into()
+            };
+            let mut view = super::super::wrap(
+                scrollable(content).height(120).into(),
+                Bridge::default(),
+                id,
+                if main { "Main" } else { "Settings" }.into(),
+                1.0,
+                Message::AccessibilityChanged,
+            );
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(300.0, 120.0)),
+            );
+            let native = snapshot(&mut view, &mut tree, &node, &renderer);
+            let editor = named(
+                &native,
+                if main {
+                    "Main editor"
+                } else {
+                    "Settings editor"
+                },
+                Role::TextInput,
+            )
+            .0;
+            apply(
+                &mut view,
+                &mut tree,
+                &node,
+                &renderer,
+                Locate::node(editor, id, true),
+            );
+            apply(
+                &mut view,
+                &mut tree,
+                &node,
+                &renderer,
+                operation::text_input::select_range(
+                    Id::new(if main {
+                        "main-editor"
+                    } else {
+                        "history-target"
+                    }),
+                    1,
+                    3,
+                ),
+            );
+            Surface {
+                id,
+                view,
+                tree,
+                node,
+            }
+        })
+        .collect();
+    let settings = &mut surfaces[1];
+    let before = snapshot(
+        &mut settings.view,
+        &mut settings.tree,
+        &settings.node,
+        &renderer,
+    );
+    let (settings_editor, editor) = named(&before, "Settings editor", Role::TextInput);
+    let selection = editor.text_selection().cloned();
+    assert!(selection.is_some());
+    let main = surfaces[0].id;
+    let task = super::super::focus_in_window("history-target", main);
+    let mut actions = iced_runtime::task::into_stream(task).unwrap();
+    let mut widgets = 0;
+    while let Some(action) = iced::futures::executor::block_on(actions.next()) {
+        match action {
+            iced_runtime::Action::Widget(mut operation) => {
+                widgets += 1;
+                loop {
+                    for surface in &mut surfaces {
+                        surface.view.as_widget_mut().operate(
+                            &mut surface.tree,
+                            Layout::new(&surface.node),
+                            &renderer,
+                            operation.as_mut(),
+                        );
+                    }
+                    match operation.finish() {
+                        Outcome::Chain(next) => operation = next,
+                        _ => break,
+                    }
+                }
+            }
+            iced_runtime::Action::Output(Message::AccessibilityChanged(window)) => {
+                assert_eq!(window, main)
+            }
+            _ => panic!("local history focus must not activate, restore, or mutate another window"),
+        }
+    }
+    assert_eq!(widgets, 1);
+    let surface = &mut surfaces[0];
+    let focused = snapshot(
+        &mut surface.view,
+        &mut surface.tree,
+        &surface.node,
+        &renderer,
+    );
+    assert_eq!(
+        focused.focus,
+        named(&focused, "History data", Role::Button).0
+    );
+    assert!(
+        raw(
+            &mut surface.view,
+            &mut surface.tree,
+            &surface.node,
+            &renderer
+        )
+        .scrolls[0]
+            .1
+            .y
+            > 0.0
+    );
+    let settings = &mut surfaces[1];
+    let after = snapshot(
+        &mut settings.view,
+        &mut settings.tree,
+        &settings.node,
+        &renderer,
+    );
+    assert_eq!(after.focus, settings_editor);
+    let (_, editor) = named(&after, "Settings editor", Role::TextInput);
+    assert_eq!(editor.text_selection(), selection.as_ref());
+    assert_eq!(editor.value(), Some("a🇨🇦e\u{301}z"));
+    assert_eq!(
+        raw(
+            &mut settings.view,
+            &mut settings.tree,
+            &settings.node,
+            &renderer
+        )
+        .scrolls[0]
+            .1,
+        Vector::ZERO
+    );
+}

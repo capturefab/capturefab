@@ -10,6 +10,10 @@ pub(super) struct State {
     seen_jobs: HashMap<u64, ActivityJob>,
     job_frames: HashMap<(String, u32, u64), u32>,
     row_ids: RefCell<HashMap<u64, accessibility::NodeId>>,
+    time_ids: RefCell<HashMap<u64, accessibility::NodeId>>,
+    date_ids: RefCell<HashMap<u64, accessibility::NodeId>>,
+    pub(super) raw_time_ids: RefCell<HashMap<time_format::RawKey, accessibility::NodeId>>,
+    pub(super) raw_date_ids: RefCell<HashMap<time_format::RawKey, accessibility::NodeId>>,
     pub(super) unread: bool,
     pub(super) latest_changed: Option<u64>,
 }
@@ -39,6 +43,10 @@ impl State {
                 })
                 .collect(),
             row_ids: RefCell::default(),
+            time_ids: RefCell::default(),
+            date_ids: RefCell::default(),
+            raw_time_ids: RefCell::default(),
+            raw_date_ids: RefCell::default(),
             unread: false,
             latest_changed: None,
         }
@@ -57,10 +65,25 @@ impl Workbench {
             .collect();
         let mut row_ids = self.client_activity.row_ids.borrow_mut();
         row_ids.retain(|id, _| current.contains(id));
+        let mut time_ids = self.client_activity.time_ids.borrow_mut();
+        time_ids.retain(|id, _| current.contains(id));
+        let mut date_ids = self.client_activity.date_ids.borrow_mut();
+        date_ids.retain(|id, _| current.contains(id));
+        let mut previous_day = None;
         iced::widget::keyed_column(self.snapshot.activity.iter().map(|entry| {
             let row_id = *row_ids
                 .entry(entry.id)
                 .or_insert_with(accessibility::new_node_id);
+            let time_id = *time_ids
+                .entry(entry.id)
+                .or_insert_with(accessibility::new_node_id);
+            let date_id = *date_ids
+                .entry(entry.id)
+                .or_insert_with(accessibility::new_node_id);
+            let labels = time_format::activity(entry);
+            let day = labels.day.clone();
+            let boundary = previous_day != Some(day.key);
+            previous_day = Some(day.key);
             let (mark, ink): (Element<'_, Message>, _) = match effective_state(entry) {
                 ActivityState::Failed => (Level::Error.mark(11.0, p), Level::Error.color(p)),
                 ActivityState::Succeeded => (Level::Done.mark(11.0, p), p.text),
@@ -82,39 +105,52 @@ impl Workbench {
                 target,
                 entry.label
             );
-            let mut body =
-                iced::widget::column![text(label).size(style::CAPTION).color(ink)].spacing(2);
+            let mut body = iced::widget::column![
+                text(label)
+                    .size(style::CAPTION)
+                    .color(ink)
+                    .width(Fill)
+                    .wrapping(text::Wrapping::WordOrGlyph)
+            ]
+            .spacing(2)
+            .width(Fill);
             if let Some(detail) = activity_detail(entry) {
                 body = body.push(
                     text(detail)
                         .size(style::CAPTION)
                         .font(style::MONO)
-                        .color(p.secondary),
+                        .color(p.secondary)
+                        .width(Fill)
+                        .wrapping(text::Wrapping::WordOrGlyph),
                 );
             }
             (
                 entry.id,
-                accessibility::group_with_id(
-                    row![
-                        text(activity_time(entry))
-                            .size(style::CAPTION)
-                            .font(style::MONO)
-                            .color(p.secondary)
-                            .width(86),
-                        container(mark)
-                            .width(11)
-                            .height(style::line_height(style::CAPTION))
-                            .align_y(Alignment::Center),
-                        body,
-                    ]
-                    .spacing(6)
-                    .into(),
-                    format!("Command {}", entry.id),
-                    row_id,
+                time_format::dated_row(
+                    accessibility::group_with_id(
+                        row![
+                            time_format::view_with_id(labels, p, Some(time_id)),
+                            container(mark)
+                                .width(11)
+                                .height(style::line_height(style::CAPTION))
+                                .align_y(Alignment::Center),
+                            body,
+                        ]
+                        .spacing(6)
+                        .width(Fill)
+                        .into(),
+                        format!("Command {}", entry.id),
+                        row_id,
+                    ),
+                    boundary.then_some(day),
+                    "Command updates",
+                    date_id,
+                    p,
                 ),
             )
         }))
         .spacing(3)
+        .width(Fill)
         .into()
     }
 
@@ -255,6 +291,25 @@ impl Workbench {
             .row_ids
             .get_mut()
             .retain(|id, _| kept.contains(id));
+        self.client_activity
+            .time_ids
+            .get_mut()
+            .retain(|id, _| kept.contains(id));
+        self.client_activity
+            .date_ids
+            .get_mut()
+            .retain(|id, _| kept.contains(id));
+        let raw: HashSet<_> = time_format::log_keys(&self.snapshot.logs)
+            .into_iter()
+            .collect();
+        self.client_activity
+            .raw_time_ids
+            .get_mut()
+            .retain(|key, _| raw.contains(key));
+        self.client_activity
+            .raw_date_ids
+            .get_mut()
+            .retain(|key, _| raw.contains(key));
         if new_work {
             // Keep background work visible without moving a human's focus or
             // opening a panel while they are editing camera settings.
@@ -385,7 +440,7 @@ impl Workbench {
                 .unwrap_or_default();
             format!(
                 "{} [{} / {}]{} {}{}",
-                activity_time(entry),
+                time_format::activity(entry).copy,
                 actor_text(entry),
                 activity_state(entry),
                 target,
@@ -396,7 +451,14 @@ impl Workbench {
         self.snapshot
             .logs
             .iter()
-            .map(|entry| format!("{} [{}] {}", entry.time, entry.level, entry.message))
+            .map(|entry| {
+                format!(
+                    "{} [{}] {}",
+                    time_format::log(entry).copy,
+                    entry.level,
+                    entry.message
+                )
+            })
             .chain(commands)
             .collect::<Vec<_>>()
             .join("\n")
@@ -492,16 +554,9 @@ pub(super) fn activity_state(entry: &SessionActivity) -> String {
     )
 }
 
+#[cfg(test)]
 pub(super) fn activity_time(entry: &SessionActivity) -> String {
-    chrono::DateTime::from_timestamp_millis(
-        entry.finished_at_ms.unwrap_or(entry.submitted_at_ms) as i64
-    )
-    .map(|time| {
-        time.with_timezone(&chrono::Local)
-            .format("%H:%M:%S")
-            .to_string()
-    })
-    .unwrap_or_else(|| "—".into())
+    time_format::activity(entry).compact
 }
 
 fn matches_job(entry: &SessionActivity, job: &Job) -> bool {
@@ -685,6 +740,7 @@ mod tests {
             let reading_order: Vec<_> = root
                 .children()
                 .iter()
+                .filter(|id| nodes[id].role() == accessibility::Role::Group)
                 .map(|id| nodes[id].label().unwrap())
                 .collect();
             let expected: Vec<_> = bench
@@ -801,17 +857,29 @@ mod tests {
         bench.snapshot.activity = vec![first, second.clone()];
         drop(bench.client_activity_rows(Palette::of(false)));
         let retained = bench.client_activity.row_ids.borrow()[&2];
+        let retained_time = bench.client_activity.time_ids.borrow()[&2];
+        let retained_date = bench.client_activity.date_ids.borrow()[&2];
         assert_eq!(bench.client_activity.row_ids.borrow().len(), 2);
         assert!(!bench.logs_open);
         bench.snapshot.activity = vec![second];
         bench.sync_client_activity();
         assert_eq!(
+            *bench.client_activity.time_ids.borrow(),
+            HashMap::from([(2, retained_time)])
+        );
+        assert_eq!(
             *bench.client_activity.row_ids.borrow(),
             HashMap::from([(2, retained)])
+        );
+        assert_eq!(
+            *bench.client_activity.date_ids.borrow(),
+            HashMap::from([(2, retained_date)])
         );
         bench.snapshot.activity.clear();
         bench.sync_client_activity();
         assert!(bench.client_activity.row_ids.borrow().is_empty());
+        assert!(bench.client_activity.time_ids.borrow().is_empty());
+        assert!(bench.client_activity.date_ids.borrow().is_empty());
     }
 
     #[test]
@@ -866,6 +934,148 @@ mod tests {
             Some(iced_runtime::Action::Output(Message::CopyLog))
         ));
         assert!(iced::futures::executor::block_on(actions.next()).is_none());
+    }
+
+    #[test]
+    fn activity_actor_outcomes_and_unbroken_paths_wrap_inside_the_remaining_row_width() {
+        use iced::advanced::{Layout, layout, text::Paragraph, widget::Tree};
+        type TextState = iced::widget::text::State<
+            <iced::Renderer as iced::advanced::text::Renderer>::Paragraph,
+        >;
+        let mut renderer = super::super::destinations::layout_tests::renderer();
+        let mut bench = Workbench::new(SessionHandle::new(), "activity-wrap".into(), true, None);
+        let mut desktop = entry(1, ActivityState::Succeeded);
+        desktop.actor = Some(
+            crate::session::SessionActor::new(
+                "desktop:27591",
+                "Desktop 27591",
+                crate::session::ActorKind::Human,
+            )
+            .unwrap(),
+        );
+        desktop.operation = "start".into();
+        desktop.label = "Start acquisition".into();
+        desktop.detail = None;
+        let mut long = entry(2, ActivityState::Failed);
+        long.actor = Some(
+            crate::session::SessionActor::new(
+                "a".repeat(128),
+                "Workflow agent",
+                crate::session::ActorKind::Agent,
+            )
+            .unwrap(),
+        );
+        long.label = "Capture failed: output folder is read-only".into();
+        long.detail = Some(format!("/isolated/{}/capture.png", "unbroken".repeat(48)));
+        bench.snapshot.activity = vec![desktop, long];
+        let mut tree = Tree::empty();
+        let mut group_ids = HashMap::new();
+        for scale in [1.0, 1.15, 1.3] {
+            for native_width in [480.0, 640.0, 900.0] {
+                let size = Size::new(native_width / scale, 1100.0);
+                let mut view = bench.client_activity_rows(Palette::of(false));
+                tree.diff(view.as_widget());
+                let node = view.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, size),
+                );
+                let (snapshot, _, _) = accessibility::snapshot_widget(
+                    view.as_widget_mut(),
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                );
+                for (index, entry) in bench.snapshot.activity.iter().enumerate() {
+                    // The keyed row keeps date-caption and command slots;
+                    // Group delegates its layout to the Row → body Column.
+                    let row = &node.children()[index].children()[1];
+                    let body = &row.children()[2];
+                    let body_tree = &tree.children[index].children[1].children[0].children[2];
+                    let body_left = row.bounds().x + body.bounds().x;
+                    let room = size.width - body_left;
+                    assert!(
+                        body.bounds().width <= room + 0.01,
+                        "the activity body exceeds the remaining row width at {native_width}/{scale}: {:?}, room {room}",
+                        body.bounds()
+                    );
+                    for (text_node, text_tree) in body.children().iter().zip(&body_tree.children) {
+                        let state = text_tree.state.downcast_ref::<TextState>();
+                        let measured = state.raw().min_bounds();
+                        assert!(
+                            measured.width <= room + 0.01,
+                            "rendered activity text overflows at {native_width}/{scale}: {measured:?}, room {room}"
+                        );
+                        assert!(
+                            text_node.bounds().x + measured.width <= body.bounds().width + 0.01
+                        );
+                        assert!(
+                            measured.height <= text_node.bounds().height + 0.01,
+                            "the real paragraph must retain every wrapped line"
+                        );
+                    }
+                    if index == 1 {
+                        assert!(
+                            body.children()[0].bounds().height
+                                > style::line_height(style::CAPTION) * 1.5,
+                            "the full unbroken actor ID retains its readable wrapped lines"
+                        );
+                        assert!(
+                            body.children()[1].bounds().height
+                                > style::line_height(style::CAPTION) * 2.0,
+                            "the full unbroken output path needs several readable lines"
+                        );
+                    }
+                    let name = format!("Command {}", entry.id);
+                    let (id, group) = snapshot
+                        .nodes
+                        .iter()
+                        .find(|(_, node)| node.label() == Some(name.as_str()))
+                        .unwrap();
+                    if let Some(previous) = group_ids.insert(entry.id, *id) {
+                        assert_eq!(
+                            *id, previous,
+                            "wrapping and viewport changes retain the command's native identity"
+                        );
+                    }
+                    let target = entry
+                        .camera
+                        .as_ref()
+                        .map(|id| format!(" · {id}"))
+                        .unwrap_or_default();
+                    let expected = format!(
+                        "{} · {}{target} · {}",
+                        actor_text(entry),
+                        activity_state(entry),
+                        entry.label
+                    );
+                    assert!(
+                        group.children().iter().any(|id| snapshot
+                            .nodes
+                            .iter()
+                            .any(|(node_id, node)| node_id == id
+                                && node.label() == Some(expected.as_str()))),
+                        "native text retains the full actor and outcome"
+                    );
+                    if let Some(detail) = activity_detail(entry) {
+                        assert!(group.children().iter().any(|id| {
+                            snapshot.nodes.iter().any(|(node_id, node)| {
+                                node_id == id && node.label() == Some(detail)
+                            })
+                        }));
+                    }
+                }
+                super::super::destinations::layout_tests::render_artifact_scaled(
+                    &format!("activity-wrap-{native_width}-{scale}"),
+                    &view,
+                    &tree,
+                    &node,
+                    &mut renderer,
+                    size,
+                    scale,
+                );
+            }
+        }
     }
     #[test]
     fn activity_avoids_duplicate_paths_and_preserves_resolved_or_multi_file_details() {

@@ -1,5 +1,6 @@
 //! Multi-camera coordinator: one isolated process per camera, shared-memory pixels.
 mod activity;
+mod log;
 use crate::{
     genicam::FeatureInfo,
     shared_memory::{DEFAULT_CAPACITY, SharedRing},
@@ -10,6 +11,7 @@ pub use activity::{
     SessionActor,
 };
 use anyhow::{Context, Result, ensure};
+pub use log::{LogEntry, LogTimestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -440,19 +442,15 @@ fn frame_capacity(scanner: bool) -> Result<usize> {
     );
     Ok(capacity)
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LogEntry {
-    pub time: String,
-    pub level: String,
-    pub message: String,
-}
 fn append_log(logs: &mut Vec<LogEntry>, entry: LogEntry) {
-    if !logs.iter().any(|existing| {
-        existing.time == entry.time
-            && existing.level == entry.level
-            && existing.message == entry.message
-    }) {
+    if !logs.iter().any(|existing| existing.same_event(&entry)) {
         logs.push(entry);
+    }
+}
+fn camera_log(entry: &LogEntry, camera: &str) -> LogEntry {
+    LogEntry {
+        message: activity::redact(&format!("[{camera}] {}", entry.message)),
+        ..entry.clone()
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -971,17 +969,7 @@ impl SessionHandle {
                     // Preserve diagnostics from every camera, including those
                     // that are not selected and cameras later disconnected.
                     for entry in &s.logs {
-                        append_log(
-                            &mut state.logs,
-                            LogEntry {
-                                time: entry.time.clone(),
-                                level: entry.level.clone(),
-                                message: activity::redact(&format!(
-                                    "[{}] {}",
-                                    info.id, entry.message
-                                )),
-                            },
-                        );
+                        append_log(&mut state.logs, camera_log(entry, &info.id));
                     }
                     let ring_dropped = u64::from(locked(&p.feed).ring.dropped());
                     let camera = CameraSnapshot {
@@ -1267,11 +1255,7 @@ impl SessionHandle {
                     s.last_error = Some(message.clone());
                     drop(s);
                     let mut logs = locked(&h.inner.discovery_logs);
-                    logs.push(LogEntry {
-                        time: chrono::Local::now().format("%H:%M:%S%.3f").to_string(),
-                        level: "error".into(),
-                        message,
-                    });
+                    logs.push(LogEntry::now_local_millis("error", message));
                     if logs.len() > 200 {
                         logs.remove(0);
                     }
@@ -1577,11 +1561,7 @@ impl SessionHandle {
                     state.devices = devices.clone();
                     let mut logs = locked(&self.inner.discovery_logs);
                     for warning in &warnings {
-                        logs.push(LogEntry {
-                            time: chrono::Local::now().format("%H:%M:%S").to_string(),
-                            level: "warn".into(),
-                            message: warning.clone(),
-                        });
+                        logs.push(LogEntry::now_local("warn", warning.clone()));
                     }
                     let excess = logs.len().saturating_sub(200);
                     logs.drain(..excess);
@@ -1916,6 +1896,7 @@ mod tests {
             active_camera: Some("sim:1".into()),
             devices: vec![crate::transport::simulator::info_named("sim:2")],
             logs: vec![LogEntry {
+                timestamp: None,
                 time: "12:00:01".into(),
                 level: "error".into(),
                 message: "client failure".into(),
@@ -1927,6 +1908,37 @@ mod tests {
         assert_eq!(in_flight.connected.as_ref().unwrap().id, "sim:1");
         assert_eq!(in_flight.devices[0].id, "sim:2");
         assert_eq!(in_flight.logs[0].message, "client failure");
+    }
+    #[test]
+    fn log_timestamps_survive_redaction_snapshot_merge_and_same_clock_events() {
+        let first = LogEntry {
+            timestamp: LogTimestamp::new(1_792_017_000_123, 0),
+            ..LogEntry::legacy("12:30:00", "error", "rtsp://user:secret@example.test/live")
+        };
+        let tagged = camera_log(&first, "camera-a");
+        assert_eq!(tagged.timestamp, first.timestamp);
+        assert!(tagged.message.starts_with("[camera-a]"));
+        assert!(!tagged.message.contains("secret"));
+        let later = LogEntry {
+            timestamp: LogTimestamp::new(first.timestamp.unwrap().unix_ms() + 86_400_000, 0),
+            ..tagged.clone()
+        };
+        let mut current = SessionSnapshot::default();
+        append_log(&mut current.logs, tagged.clone());
+        append_log(&mut current.logs, tagged.clone());
+        append_log(&mut current.logs, later.clone());
+        assert_eq!(
+            current.logs.len(),
+            2,
+            "same display clocks on different dates remain distinct"
+        );
+        let mut in_flight = SessionSnapshot {
+            logs: vec![tagged],
+            ..Default::default()
+        };
+        merge_session_metadata(&mut in_flight, &current);
+        assert_eq!(in_flight.logs.len(), 2);
+        assert_eq!(in_flight.logs[1].timestamp, later.timestamp);
     }
     #[test]
     fn addressed_status_preserves_camera_fields_and_includes_actual_session_selection() {

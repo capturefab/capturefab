@@ -9,6 +9,7 @@ use web_sys::{
     RequestCache, RequestCredentials, RequestInit, RequestMode, Response, Url, Window,
 };
 mod activity;
+mod log_time;
 use activity::{apply_activity, render_activity};
 
 #[derive(Default)]
@@ -334,6 +335,21 @@ fn date_label(timestamp: u64) -> String {
         .to_locale_string("default", &JsValue::UNDEFINED)
         .into()
 }
+fn log_date_label(log: &Value) -> String {
+    if let Some(unix_ms) = log_time::unix_ms(log) {
+        let date = js_sys::Date::new(&JsValue::from_f64(unix_ms as f64));
+        if date.get_time().is_finite() {
+            let local: String = date.to_locale_string("default", &JsValue::UNDEFINED).into();
+            let iso: String = date.to_iso_string().into();
+            return format!("{local} [{iso}]");
+        }
+    }
+    let time = text(log, "time");
+    format!(
+        "{} (date and time zone unavailable)",
+        if time.is_empty() { "—" } else { time }
+    )
+}
 
 fn sync_feature_camera(app: &mut App) {
     if app.feature_camera != app.selected {
@@ -566,7 +582,7 @@ fn render(app: &mut App) {
         .map(|log| {
             format!(
                 "{} [{}] {}",
-                text(log, "time"),
+                log_date_label(log),
                 text(log, "level"),
                 text(log, "message")
             )

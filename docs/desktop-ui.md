@@ -34,6 +34,11 @@ actions remain pinned. Native window-close requests first dismiss the current
 sheet or return from its editor, using the same cancellation path as Close Window.
 Quit retains its explicit save-and-exit path.
 
+Activity accepts scrolling keys only while a control inside that pane has focus.
+Its bottom-anchored history moves toward older entries with Up/Page Up/Home and
+newer entries with Down/Page Down/End, while Copy log remains pinned. Other
+panes, inactive windows and obscured content retain their own keyboard context.
+
 ## Requirements and current evidence
 
 | Requirement | Implemented source evidence | Runtime gate or remaining gap |
@@ -119,9 +124,15 @@ controls. Headings, live regions and preview images use stable wrapper state.
 Pick-list options and text runs retain parent relationships instead of also
 appearing as unrelated root children.
 
-`gui/accessibility/group.rs` preserves native MenuBar/Menu and AlertDialog
-parent relationships, including actual controls and static labels. The close
-error publishes the modal state. Desktop menu headers expose popup/expanded
+`gui/accessibility/group.rs` preserves MenuBar/Menu, Dialog and AlertDialog
+parent relationships, including actual controls and static labels. Each shared
+SheetFrame publishes a named Dialog owning its header, scrolling body and
+footer, with AccessKit's modal flag. The close error retains its independent
+modal AlertDialog. The pinned macOS adapter maps Dialog to AXGroup with the
+AXDialog subrole, but does not consume AccessKit's modal flag. The native
+inspection below establishes the named parent and its children, rather than
+verification of an OS AXModal attribute or spoken modality.
+Desktop menu headers expose popup/expanded
 states; items expose checked/radio states, shortcuts and access keys. Native
 focus updates menu selection through its own message route, so F10/arrow and
 assistive-technology focus agree while document editor focus remains intact.
@@ -158,6 +169,35 @@ camera identities. The report indicator keeps a stable short name; changing
 loss and resend counters are in its description. Software semantic-tree tests
 verify child ownership, full detail exactly once, stable identity and native
 Click routing. Spoken reading order still requires native assistive technology.
+
+Analytics publishes a Session totals group owning the current measurements,
+with Loading represented as Status. Loading/error changes preserve the totals,
+chart and Close identities. A visible measurement overview describes first and
+last values, minima and peaks. Show history data opens a fixed snapshot with
+axis meanings and ranges, aggregation context and eight chronological points per
+page. The page chooser reaches every retained page. Refreshes leave these rows
+fixed until Update history is selected. The chart and history describe the same
+accepted report, including while a newer report awaits rendering. Page changes,
+updates and hiding the history restore focus inside the main window without
+clearing an editor's focus or selection in Settings.
+Activity groups each command's timestamp, actor,
+outcome and details beneath its command identity. A bounded ID cache preserves
+that identity across reordering; static-text identity is scoped to its containing
+group so duplicate paths in another command do not disturb it. Actor/outcome
+labels and unbroken paths wrap within the row's remaining width, retaining their
+complete native text. Raw worker/coordinator messages wrap the same way, and a
+shared content gutter keeps both kinds of entries clear of the overlay scrollbar.
+
+Raw log entries retain their original clock text and add optional validated Unix
+milliseconds and producer UTC offset. Old entries and malformed optional metadata
+remain readable without inventing an instant. The desktop formats raw and
+structured Activity timestamps through one local-time path. macOS uses cached
+NSDateFormatter instances and current user preferences; Windows uses
+GetTimeFormatEx/GetDateFormatEx with user overrides. Visible clock labels have a
+full date/zone description and tooltip, without an extra focus stop or duplicate
+native text. Copies include a dated numeric offset. Timestamp identities survive
+command reordering and bounded-log eviction; closed panels also prune the ID
+caches. Locale changes do not create a new error announcement identity.
 
 Each window is created hidden. The root `WindowOpened` branch attaches the native
 adapter through `window::run`, then shows and focuses the window. Adapters are
@@ -220,6 +260,27 @@ tooltip, so an asynchronous outcome neither pushes actions out of the sheet nor
 replaces an active field's widget state. Compact inspector layouts preserve their
 scroll region and selected camera identity beside long model names.
 
+Analytics charts use the sheet's actual logical width and current appearance
+profile, with 12-point labels and 16-point captions. Narrow charts stack panels;
+wider charts use two columns. The three numeric plots use SVG; the camera-volume
+panel uses native app text and bars, with full names, canonical identities and
+exact byte values. Its height follows its content. Native text avoids the pinned
+SVG shaper's mixed-script LastResort replacement and joined-emoji failure. Actual
+cached paragraphs and software pixels verify representative CJK, combining,
+Arabic/ZWJ, flag and joined-emoji clusters using installed system fonts. This does
+not establish coverage for every font or writing system.
+Cached measurements rerender off the UI thread
+after resizing or appearance changes. An outdated reply retains its measurements
+without installing an obsolete graphic. During a pending resize, current-width
+placeholders preserve all three Image identities instead of scaling old text or
+collapsing a column. Native camera values and history remain available. A
+newer-report or truncation notice occupies a fixed context slot, preserving all
+pager identities and keyboard focus through automatic refresh and explicit
+Update history actions. Interface chart font fallbacks correct
+blank text observed with installed DejaVu fonts on Linux, where a generic font
+alias selected an absent family. The default CLI/HTTP SVG export retains its
+original rendering profile.
+
 ## Source and build verification
 
 Tests establish individual behavior and routing rather than platform usability.
@@ -273,7 +334,7 @@ Focused coverage includes:
   correct recording/forwarding labels and a single live command announcement
   containing both outcome and details.
 
-The latest full suite passed 743 library tests, with 11 ignored (754 total), plus
+The latest full suite passed 789 library tests, with 11 ignored (800 total), plus
 12 CLI, nine remote and three simulation integration tests. One CLI test and one
 doctest were ignored.
 It includes focus recovery, panel-opening, search-field
@@ -281,9 +342,16 @@ identity, tab selection, menu semantics, native editing, save-busy forms, compac
 geometry, scroll reveal, sheet keyboard navigation/native Close, per-window
 focus/style, dialog defaults and X11 work-area regressions. Strict all-feature,
 all-target Clippy passed with warnings treated as errors; formatting and
-diff-whitespace checks passed. Focused accessibility and desktop-menu runs passed
-16 and six tests respectively, including the actual restore→activate→scoped-focus
-task stream and native live-value consumer behavior.
+diff-whitespace checks passed. The suite includes the actual
+restore→activate→scoped-focus task stream, native live-value consumer behavior,
+stable command-group identities, chart profiles and Activity wrapping.
+
+The storage crash-recovery test allows up to five seconds for a fork-inherited
+lease descriptor to close before checking the same exact reclaimed-byte and
+lease-state assertions. An isolated self-reexec regression deterministically
+holds that inherited descriptor before exec, verifies the reservation remains
+active, then verifies exact reclamation after exec closes it. This is a test-only
+correction; production storage behavior is unchanged.
 
 The focused keyboard-history suite passed 24 tests, including actual pane focus,
 visible pointer targeting, modal preservation and delayed window activation.
@@ -298,6 +366,18 @@ checks and the focused accessibility suite also passed. All 20 style tests passe
 on the host and in a genuine Linux build, including platform-specific inactive
 selection/control behavior and contrast. These are source/widget checks, without
 native inactive-window visual evidence.
+An earlier responsive chart snapshot passed 20 analytics tests and nine
+shared-widget tests on genuine Linux, using the software renderer with installed
+DejaVu fonts. These check actual caption/camera-row pixels, intrinsic image
+dimensions and ancestor clipping across appearances and interface sizes. That
+Linux evidence predates the final native camera-panel and Activity timestamp
+changes and does not verify those later changes.
+The final Activity wrapping regression passed on macOS; its separate Linux rerun
+was not started because the Docker responsiveness probe stalled. No fonts,
+toolchain components or display server were downloaded for these checks.
+The default SVG fixture was regenerated after the font fallback fix and compared
+byte for byte with the retained original; the files were identical. The native
+camera-panel change repeated this comparison with the same result.
 The actual Linux GUI preference tests passed 31 of 31, including X11 CARDINAL32
 property decoding, desktop selection, monitor intersection, native frame fitting
 and DPI/interface-scale conversions. The seven compact-layout and focus-reveal
@@ -360,6 +440,16 @@ or replaced with stubs. Native Windows execution, Narrator and the other native
 screen-reader workflows remain unverified. These compile/source results do not
 establish runtime usability or full HIG completion.
 
+The new Windows time formatter was checked separately against the genuine MSVC
+target with `build-std`, using the actual `gui/time_format/windows.rs` source,
+chrono 0.4.45 and windows 0.61.3. The isolated harness is retained under
+`/private/tmp/capturefab-time-windows-check`. This verifies the formatter's Windows
+types and API calls, without bypassing the full application's missing C++ headers
+or establishing Windows execution. The browser timestamp changes also passed a
+genuine `wasm32-unknown-unknown` library check using the installed Rust source and
+cached dependencies, with artifacts under `/private/tmp/capturefab-wasm-check-target`.
+No target libraries or SDK were downloaded. Browser execution remains unverified.
+
 ## Verified macOS runtime behavior
 
 The running app's sidebar has no brand/logo block. Its top row contains Cameras,
@@ -370,6 +460,42 @@ branding-only space appeared in the sidebar; the top area contained Cameras,
 refresh and the functional Scan network/Results row. The isolated app then quit
 normally, and its descriptor's PID 14952 was absent from `ps`. VoiceOver was left
 unchanged.
+
+The refreshed isolated build also verified the sidebar and new Activity wrapping
+at 900×620/Larger in Light appearance. Connecting and starting `sim:0` kept the
+camera button's concise identity while its description changed from connected
+to streaming. Command labels wrapped onto readable lines rather than extending
+past the pane. Analytics exposed its named parent, totals group, chart Image and
+camera summary; its labels were readable in the native screenshot. End reached
+the last chart panel with Close still focused and pinned, and Command-W dismissed
+only the sheet. With Copy activity log reached through Tab, Up revealed older
+events and End returned to the latest events while the action stayed focused and
+pinned. Quit ended the descriptor's PID 54785, confirmed absent from `ps`.
+VoiceOver was left unchanged.
+
+A later isolated macOS run verified that raw worker events and structured
+Activity commands displayed the same local clock for reconnecting and starting
+`sim:0`, with full date/zone descriptions. Analytics exposed three numeric Image
+nodes, native camera names and exact byte values, measured summaries and the
+history disclosure. Opening history exposed eight chronological measurements
+per page, the frozen snapshot time, axis context and a working second page;
+Shift-Tab moved focus from Next to Previous within the sheet. This run found that
+inserting a newer-report caption replaced pager identities. The final fix keeps
+that caption inside a persistent context child, and actual widget regressions
+now preserve Page/Previous/Next identities and focus through refresh, explicit
+Update history and truncation transitions. The inspected process (PID 65366)
+quit normally. The rebuilt application's final native pager retest remains
+unverified: computer use returned `cgWindowNotFound`, followed by a timeout while
+checking the Dock. A direct process check showed the rebuilt process running,
+but did not establish why its window was unavailable. VoiceOver was unchanged;
+this run used only the simulator and retained the earlier capture files.
+
+After the raw-log and shared scrollbar-gutter fixes, another fresh build at the
+same size and interface scale showed the complete scanner error wrapping before
+the scrollbar and the command labels fitting beside it. Up and End retained
+focus on Copy activity log and moved between older and newest entries. Native
+Quit ended the descriptor's PID 58377 and removed `gui.json`. This check used only
+the simulator and left the previous capture/recording files intact.
 
 The built application's native accessibility tree was inspected and operated
 during this pass. It exposes meaningful control labels and the preview Image.
@@ -502,6 +628,14 @@ cover these platform branches, including disabled defaults and preserved drafts.
 Remaining focused checks include finer per-pane focus and inactive text-selection
 appearance on native desktops, spoken network-card hierarchy and descriptions,
 announcements, and native focus from background or minimized windows.
+Linux Activity currently uses a local 24-hour fallback; GNOME/KDE clock preferences
+remain to be implemented and checked. Visible date grouping across multi-day
+Activity also needs work, despite complete date/zone descriptions and dated copies.
+Charts expose measured history, axes and mark values through native groups;
+Audio Graphs are not implemented, and spoken chart navigation remains unverified.
+Native camera names have representative glyph and pixel evidence, rather than
+universal coverage for every installed font or writing system. Mixed-direction
+editor selection retains the toolkit's single-rectangle geometry.
 Widget/rendering/task/consumer tests establish the implemented behavior and
 routing; these platform interactions still require native checks.
 

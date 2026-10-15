@@ -37,6 +37,7 @@ mod stage;
 mod storage_policy;
 mod style;
 mod text_input;
+mod time_format;
 mod titlebar;
 mod toolbar;
 mod welcome;
@@ -609,6 +610,7 @@ enum Message {
     NetworkScrolled(bool),
     Analytics(bool),
     AnalyticsScrolled(bool),
+    AnalyticsHistory(analytics::HistoryInput),
     IncludeSimulator(bool),
     TrySimulator,
     EnterAddress,
@@ -2579,6 +2581,7 @@ impl Workbench {
             Message::NetworkScrolled(scrolled) => self.network_scrolled = scrolled,
             Message::Analytics(open) => return self.show_analytics(open),
             Message::AnalyticsScrolled(scrolled) => self.analytics.scrolled = scrolled,
+            Message::AnalyticsHistory(input) => return self.analytics_history(input),
             Message::IncludeSimulator(value) => {
                 self.include_simulator = value;
                 self.discover();

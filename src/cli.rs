@@ -2170,6 +2170,13 @@ fn schema() -> Value {
     contract["writes"] = json!(
         "Camera operations are ordered per camera across GUI, browser and IPC participants; different cameras run independently. Concurrent scheduled jobs on the same camera share acquisition. Multiple set assignments apply sequentially; failures may leave earlier assignments applied."
     );
+    contract["logs"] = json!({
+        "snapshot":"status.logs; GET /api/session result.logs",
+        "legacy_fields":["time","level","message"],
+        "time":"Retained producer clock text without a date/zone. Do not parse it as an absolute timestamp.",
+        "timestamp":{"optional":true,"unix_ms":"signed Unix milliseconds (absolute UTC instant)","utc_offset_seconds":"producer offset used for the legacy time string, seconds east of UTC (-86399..86399)"},
+        "compatibility":"Old entries omit timestamp. Unknown or malformed optional timestamp metadata is treated as unavailable; legacy diagnostics remain readable. Desktop/browser format valid instants in the viewer's local zone; copied desktop logs include a dated numeric offset. The original three fields and version-1 envelope remain unchanged."
+    });
     contract["forwarding"] = json!({"cli":"record|forward -o OUTPUT [--duration 30s]","duration":"Works with direct workers and persistent sessions. A duration keeps the CLI alive and stops the encoder at the deadline or Ctrl-C. Without duration, persistent session forwarding returns immediately; direct forwarding runs until Ctrl-C.","request_timeout":"--request-timeout controls a session request deadline, not recording duration; a timed-out request may still complete in the session. Inspect status before retrying writes."});
     contract["remote"] = json!({
         "start":"serve --listen HOST:PORT [--web-dir web-client/dist]",

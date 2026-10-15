@@ -1,6 +1,9 @@
 //! The bottom bar and the activity log above it.
 use super::*;
 use iced::widget::column;
+use std::collections::HashSet;
+#[cfg(test)]
+mod raw_log_tests;
 
 /// The widest the status at the right of the toolbar grows.
 const STATUS: f32 = 420.0;
@@ -471,7 +474,12 @@ impl Workbench {
     }
 
     pub(super) fn activity(&self, p: &'static Palette) -> Element<'_, Message> {
-        let mut lines = column![].spacing(3);
+        // The Activity scrollbar overlays its content. Reserve its gutter for
+        // both raw worker logs and structured client commands.
+        let mut lines = column![].spacing(3).width(Fill).padding(iced::Padding {
+            right: 12.0,
+            ..iced::Padding::ZERO
+        });
         if self.snapshot.logs.is_empty() && self.snapshot.activity.is_empty() {
             lines = lines.push(
                 text("CLI, API and GUI actions will appear here, with their progress and results.")
@@ -479,40 +487,58 @@ impl Workbench {
                     .color(p.secondary),
             );
         }
-        for entry in &self.snapshot.logs {
+        let raw_keys = time_format::log_keys(&self.snapshot.logs);
+        let current: HashSet<_> = raw_keys.iter().collect();
+        let mut time_ids = self.client_activity.raw_time_ids.borrow_mut();
+        time_ids.retain(|key, _| current.contains(key));
+        let mut date_ids = self.client_activity.raw_date_ids.borrow_mut();
+        date_ids.retain(|key, _| current.contains(key));
+        let mut diagnostics = iced::widget::keyed_column([]).width(Fill).spacing(3);
+        let mut previous_day = None;
+        for (entry, key) in self.snapshot.logs.iter().zip(raw_keys) {
+            let time_id = *time_ids
+                .entry(key.clone())
+                .or_insert_with(accessibility::new_node_id);
+            let date_id = *date_ids
+                .entry(key)
+                .or_insert_with(accessibility::new_node_id);
+            let labels = time_format::log(entry);
+            let day = labels.day.clone();
+            let boundary = previous_day != Some(day.key);
+            previous_day = Some(day.key);
             // Errors and warnings read by shape as well as color, as notices do.
             let (mark, ink): (Element<'_, Message>, _) = match Level::from_log(&entry.level) {
                 Some(level) => (level.mark(11.0, p), level.color(p)),
                 None => (space().into(), p.text),
             };
-            lines = lines.push(
-                row![
-                    // Failed commands are logged without a time.
-                    text(if entry.time.is_empty() {
-                        "—"
-                    } else {
-                        entry.time.as_str()
-                    })
-                    .size(style::CAPTION)
-                    .font(style::MONO)
-                    .color(p.secondary)
-                    .width(Length::Fixed(86.0)),
-                    container(mark)
-                        .width(Length::Fixed(11.0))
-                        // Centered on the first line, should the message wrap.
-                        .height(Length::Fixed(style::line_height(style::CAPTION)))
-                        .align_y(Alignment::Center),
-                    text(entry.message.as_str())
-                        .size(style::CAPTION)
-                        .font(style::MONO)
-                        .color(ink),
-                ]
-                .spacing(6),
+            diagnostics = diagnostics.push(
+                time_id,
+                time_format::dated_row(
+                    row![
+                        time_format::view_with_id(labels, p, Some(time_id)),
+                        container(mark)
+                            .width(Length::Fixed(11.0))
+                            // Centered on the first line, should the message wrap.
+                            .height(Length::Fixed(style::line_height(style::CAPTION)))
+                            .align_y(Alignment::Center),
+                        text(entry.message.as_str())
+                            .size(style::CAPTION)
+                            .font(style::MONO)
+                            .color(ink)
+                            .width(Fill)
+                            .wrapping(text::Wrapping::WordOrGlyph),
+                    ]
+                    .spacing(6)
+                    .width(Fill)
+                    .into(),
+                    boundary.then_some(day),
+                    "Diagnostics",
+                    date_id,
+                    p,
+                ),
             );
         }
-        if !self.snapshot.activity.is_empty() {
-            lines = lines.push(self.client_activity_rows(p));
-        }
+        lines = lines.push(diagnostics).push(self.client_activity_rows(p));
         activity_scroll(
             column![
                 rule::horizontal(1).style(style::line),

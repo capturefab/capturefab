@@ -2,10 +2,12 @@
 //! Queries and chart construction run off the UI thread, even while capturing.
 use super::*;
 use crate::analytics::AnalyticsSnapshot;
-use iced::widget::{column, svg};
+use iced::widget::column;
 mod chart;
+mod history;
+pub(super) use history::Input as HistoryInput;
 
-type Report = std::result::Result<(Arc<AnalyticsSnapshot>, svg::Handle, chart::Profile), String>;
+type Report = std::result::Result<(Arc<AnalyticsSnapshot>, chart::Graphic, chart::Profile), String>;
 const REFRESH: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
@@ -15,10 +17,13 @@ pub(super) struct State {
     pending: Option<Receiver<Report>>,
     refreshed: Option<Instant>,
     report: Option<Arc<AnalyticsSnapshot>>,
-    chart: Option<svg::Handle>,
+    chart: Option<chart::Graphic>,
+    chart_view: chart::ViewState,
+    chart_report: Option<Arc<AnalyticsSnapshot>>,
     chart_profile: Option<chart::Profile>,
     requested_profile: Option<chart::Profile>,
     error: Option<String>,
+    history: history::State,
 }
 
 impl State {
@@ -31,6 +36,7 @@ impl State {
                 if profile == current {
                     self.chart = Some(chart);
                     self.chart_profile = Some(profile);
+                    self.chart_report = self.report.clone();
                 }
                 self.error = None;
             }
@@ -66,6 +72,7 @@ impl Workbench {
         let opening = open && !self.analytics.open;
         self.analytics.open = open;
         if opening {
+            self.analytics.history.reset();
             self.analytics.scrolled = false;
             self.analytics.refreshed = None;
             self.tick_analytics();
@@ -76,6 +83,19 @@ impl Workbench {
         } else {
             Task::none()
         }
+    }
+
+    pub(super) fn analytics_history(&mut self, input: HistoryInput) -> Task<Message> {
+        if !self.analytics.open {
+            return Task::none();
+        }
+        let report = self
+            .analytics
+            .chart_report
+            .as_ref()
+            .or(self.analytics.report.as_ref());
+        let focus = self.analytics.history.input(input, report);
+        accessibility::focus_in_window(focus, self.main_window)
     }
 
     pub(super) fn tick_analytics(&mut self) {
@@ -123,13 +143,8 @@ impl Workbench {
                         Some(report) => report,
                         None => Arc::new(handle.analytics().snapshot()?),
                     };
-                    let chart =
-                        crate::analytics::render_svg_with_options(&report, profile.options)?;
-                    Ok((
-                        report,
-                        svg::Handle::from_memory(chart.into_bytes()),
-                        profile,
-                    ))
+                    let chart = chart::render(&report, profile)?;
+                    Ok((report, chart, profile))
                 })()
                 .map_err(|error| format!("{error:#}"));
                 let _ = sender.send(report);
@@ -209,17 +224,58 @@ impl Workbench {
                 );
             }
             body = body.push(summary);
-            if let Some(chart) = &self.analytics.chart {
+            let chart_report = self.analytics.chart_report.as_ref().unwrap_or(report);
+            let context: Element<'_, Message> =
+                if self.analytics.chart.is_some() && !Arc::ptr_eq(chart_report, report) {
+                    container(
+                        text(format!(
+                            "Chart is updating. Showing measurements from {}.",
+                            history::timestamp(chart_report.collected_at_ms)
+                        ))
+                        .size(style::SMALL)
+                        .color(p.secondary)
+                        .width(Fill)
+                        .wrapping(text::Wrapping::WordOrGlyph),
+                    )
+                    .padding(iced::Padding {
+                        bottom: 14.0,
+                        ..iced::Padding::ZERO
+                    })
+                    .into()
+                } else {
+                    space().into()
+                };
+            let image: Element<'_, Message> = if let Some(chart) = &self.analytics.chart {
                 let profile = self
                     .analytics
                     .chart_profile
                     .unwrap_or_else(|| self.analytics_chart_profile());
-                body = body.push(accessibility::label(
-                    svg(chart.clone()).width(profile.width as f32).height(profile.height as f32).into(),
-                    "Session acquisition history: frame rate, payload throughput and missed frames over elapsed session time. Text totals and camera summaries follow the same measurements.".into(),
-                    accessibility::Role::Image,
-                ));
-            }
+                chart::view(
+                    chart_report,
+                    chart,
+                    profile,
+                    self.analytics_chart_profile(),
+                    p,
+                    &self.analytics.chart_view,
+                )
+            } else {
+                space().into()
+            };
+            // Fixed slots preserve the chart and disclosure widget state while
+            // a stale render is retained or its explanatory caption changes.
+            body = body.push(
+                column![
+                    container(context),
+                    container(image),
+                    container(self.analytics.history.view(chart_report, p)).padding(
+                        iced::Padding {
+                            top: 14.0,
+                            ..iced::Padding::ZERO
+                        }
+                    ),
+                ]
+                .width(Fill),
+            );
             for camera in &report.cameras {
                 body = body.push(
                     text(format!(
@@ -258,6 +314,17 @@ impl Workbench {
             .scrolled(self.analytics.scrolled)
             .on_scroll(Message::AnalyticsScrolled)
             .into()
+    }
+}
+
+#[cfg(test)]
+fn chart_fixture() -> chart::Graphic {
+    chart::Graphic {
+        plots: std::array::from_fn(|_| {
+            iced::widget::svg::Handle::from_memory(
+                br#"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360"></svg>"#,
+            )
+        }),
     }
 }
 
@@ -317,9 +384,7 @@ mod tests {
         let mut bench = Workbench::new(SessionHandle::new(), "analytics-tree".into(), true, None);
         bench.width = 900.0;
         bench.analytics.report = Some(Arc::new(report()));
-        bench.analytics.chart = Some(svg::Handle::from_memory(
-            br#"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360"></svg>"#,
-        ));
+        bench.analytics.chart = Some(chart_fixture());
         let mut tree = Tree::empty();
         let mut previous = None;
         for error in [None, Some("Session database could not be read"), None] {
@@ -370,10 +435,19 @@ mod tests {
             }
             assert!(!totals.supports_action(accesskit::Action::Focus));
             assert!(!totals.supports_action(accesskit::Action::Click));
-            let image_id = snapshot
+            let image_ids: Vec<_> = snapshot
                 .nodes
                 .iter()
-                .find(|(_, node)| node.role() == accessibility::Role::Image)
+                .filter(|(_, node)| node.role() == accessibility::Role::Image)
+                .map(|(id, _)| *id)
+                .collect();
+            assert_eq!(image_ids.len(), 3);
+            let camera_id = snapshot
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.label() == Some("Camera data volume: Workshop camera (sim:0)")
+                })
                 .unwrap()
                 .0;
             let (close_id, close) = snapshot
@@ -384,12 +458,12 @@ mod tests {
             assert!(close.supports_action(accesskit::Action::Click));
             if let Some(previous) = previous {
                 assert_eq!(
-                    (*totals_id, image_id, *close_id),
+                    (*totals_id, image_ids.clone(), camera_id, *close_id),
                     previous,
                     "a failed refresh preserves existing report and Close identities"
                 );
             }
-            previous = Some((*totals_id, image_id, *close_id));
+            previous = Some((*totals_id, image_ids, camera_id, *close_id));
             let alerts: Vec<_> = snapshot
                 .nodes
                 .iter()
@@ -475,13 +549,7 @@ mod tests {
         let report = Arc::new(report());
         let (sender, receiver) = mpsc::channel();
         sender
-            .send(Ok((
-                report.clone(),
-                svg::Handle::from_memory(
-                    br#"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360"></svg>"#,
-                ),
-                old_profile,
-            )))
+            .send(Ok((report.clone(), chart_fixture(), old_profile)))
             .unwrap();
         bench.analytics.pending = Some(receiver);
         bench.analytics.requested_profile = Some(old_profile);
@@ -545,14 +613,11 @@ mod tests {
                 bench.width = native_width / scale.factor();
                 bench.ui_scale = scale;
                 bench.analytics.open = true;
-                let profile = bench.analytics_chart_profile();
+                let base = bench.analytics_chart_profile();
                 let report = Arc::new(report());
-                let svg =
-                    crate::analytics::render_svg_with_options(&report, profile.options).unwrap();
-                bench.analytics.accept(
-                    Ok((report, svg::Handle::from_memory(svg.into_bytes()), profile)),
-                    profile,
-                );
+                let profile = base;
+                let graphic = chart::render(&report, profile).unwrap();
+                bench.analytics.accept(Ok((report, graphic, profile)), base);
                 let mut view = bench.window_view(bench.main_window);
                 let mut tree = Tree::new(view.as_widget());
                 let size = Size::new(bench.width, 620.0 / scale.factor());
@@ -576,9 +641,9 @@ mod tests {
                     .bounds()
                     .unwrap();
                 assert!(
-                    (image.width() - f64::from(profile.width)).abs() < 0.5,
+                    (image.width() - f64::from(profile.panel_width)).abs() < 0.5,
                     "native width {native_width}, {scale:?}: chart shrank from {} to {} logical units",
-                    profile.width,
+                    profile.panel_width,
                     image.width()
                 );
                 let close = snapshot
@@ -596,6 +661,46 @@ mod tests {
                         && close.y1 <= f64::from(size.height) + 0.5
                 );
             }
+        }
+    }
+
+    #[test]
+    fn changed_camera_count_keeps_the_base_profile_without_repeating_a_render() {
+        let mut bench = Workbench::new(
+            SessionHandle::new(),
+            "chart-camera-count".into(),
+            true,
+            None,
+        );
+        bench.width = 480.0;
+        bench.analytics.open = true;
+        let base = bench.analytics_chart_profile();
+        let first = Arc::new(report());
+        let mut expanded = (*first).clone();
+        let template = expanded.cameras[0].clone();
+        for index in 1..6 {
+            let mut camera = template.clone();
+            camera.id = format!("sim:{index}");
+            expanded.cameras.push(camera);
+        }
+        let expanded = Arc::new(expanded);
+        for report in [first, expanded] {
+            let profile = base;
+            bench
+                .analytics
+                .accept(Ok((report.clone(), chart_fixture(), profile)), base);
+            assert_eq!(bench.analytics.chart_profile, Some(profile));
+            assert!(Arc::ptr_eq(
+                bench.analytics.report.as_ref().unwrap(),
+                &report
+            ));
+            bench.analytics.refreshed = Some(bench.now);
+            bench.analytics.requested_profile = Some(base);
+            bench.tick_analytics();
+            assert!(
+                bench.analytics.pending.is_none(),
+                "report-derived height must not cause a repeated render against the base profile"
+            );
         }
     }
 }

@@ -139,11 +139,7 @@ impl WorkerHandle {
         if level == "error" {
             s.last_error = Some(message.clone());
         }
-        s.logs.push(LogEntry {
-            time: crate::auto::clock(),
-            level: level.into(),
-            message,
-        });
+        s.logs.push(LogEntry::now_utc(level, message));
         if s.logs.len() > 200 {
             s.logs.remove(0);
         }

@@ -121,10 +121,16 @@ fn focused_activity_action_scrolls_history_in_visual_order_and_keeps_actions_pin
     );
     let before = history(&mut view, &mut tree, &node, &renderer);
     assert!(before.content.height > before.viewport.height * 2.0);
-    let max = before.content.height - before.viewport.height;
+    // Scrollable rounds its final translation to a logical pixel. Date
+    // captions can give the content a fractional height; compare the actual
+    // snapped end position rather than an unreachable fractional offset.
+    let max = (before.content.height - before.viewport.height).round();
     assert!(
         (before.offset.y - max).abs() < 0.01,
-        "new Activity views show the latest entries"
+        "new Activity views show the latest entries: offset {:?}, content {:?}, viewport {:?}",
+        before.offset,
+        before.content,
+        before.viewport
     );
     view.as_widget_mut().operate(
         &mut tree,

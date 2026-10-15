@@ -141,6 +141,7 @@ impl Workbench {
         if self.chrome.scene_log && !snapshot.logs.iter().any(|entry| entry.level == "warn") {
             for (time, level, message) in SCENE_LOG {
                 snapshot.logs.push(LogEntry {
+                    timestamp: None,
                     time: time.into(),
                     level: level.into(),
                     message: message.into(),
@@ -376,7 +377,12 @@ fn alert_keys(logs: &[LogEntry]) -> impl Iterator<Item = (u64, Level)> + '_ {
     logs.iter().filter_map(move |entry| {
         let level = Level::from_log(&entry.level)?;
         let mut hasher = DefaultHasher::new();
-        (&entry.time, &entry.level, &entry.message).hash(&mut hasher);
+        if let Some(timestamp) = entry.timestamp {
+            timestamp.unix_ms().hash(&mut hasher);
+        } else {
+            entry.time.hash(&mut hasher);
+        }
+        (&entry.level, &entry.message).hash(&mut hasher);
         let copy = copies.entry(hasher.finish()).or_default();
         *copy += 1;
         copy.hash(&mut hasher);
@@ -1118,10 +1124,25 @@ mod tests {
 
     fn log(time: &str, level: &str, message: &str) -> LogEntry {
         LogEntry {
+            timestamp: None,
             time: time.into(),
             level: level.into(),
             message: message.into(),
         }
+    }
+    #[test]
+    fn absolute_log_identity_ignores_legacy_clock_presentation_and_distinguishes_dates() {
+        let mut first = log("14:30:00", "error", "failure");
+        first.timestamp = crate::session::LogTimestamp::new(1_792_017_000_123, 0);
+        let mut other_clock = first.clone();
+        other_clock.time = "10:30:00.123".into();
+        other_clock.timestamp =
+            crate::session::LogTimestamp::new(first.timestamp.unwrap().unix_ms(), -4 * 3600);
+        let key = |entry| alert_keys(&[entry]).collect::<Vec<_>>();
+        assert_eq!(key(first.clone()), key(other_clock.clone()));
+        other_clock.timestamp =
+            crate::session::LogTimestamp::new(first.timestamp.unwrap().unix_ms() + 86_400_000, 0);
+        assert_ne!(key(first), key(other_clock));
     }
 
     #[test]

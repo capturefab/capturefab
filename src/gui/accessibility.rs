@@ -27,7 +27,7 @@ mod native;
 mod scroll;
 pub(super) use decorate::{mapped, named};
 pub(super) use group::{group, group_with_id, modal_group, scope};
-pub(super) use label::label;
+pub(super) use label::{label, label_description};
 
 const ROOT: NodeId = NodeId(0);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -564,6 +564,7 @@ impl Operation for Collector {
             matches!(
                 node.role(),
                 Role::Button
+                    | Role::DisclosureTriangle
                     | Role::DefaultButton
                     | Role::CheckBox
                     | Role::RadioButton
@@ -573,6 +574,7 @@ impl Operation for Collector {
                     | Role::MenuItemCheckBox
                     | Role::MenuItemRadio
                     | Role::Heading
+                    | Role::Label
                     | Role::Alert
                     | Role::Status
                     | Role::Image
@@ -641,6 +643,10 @@ impl Operation<Message> for WidgetAction {
 /// scrolls its ancestors, and preserves its caret and selection.
 pub(super) fn reveal_focus(id: window::Id) -> Task<Message> {
     iced::advanced::widget::operate(focus_reveal_operation(id))
+}
+
+pub(super) fn focus_in_window(id: impl Into<Id>, window: window::Id) -> Task<Message> {
+    iced::advanced::widget::operate(scroll::Locate::widget(id.into(), window))
 }
 
 pub(super) fn focus_reveal_operation(id: window::Id) -> impl Operation<Message> {

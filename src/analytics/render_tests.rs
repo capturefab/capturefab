@@ -1,6 +1,20 @@
 //! Pure chart fixtures avoid database initialization and exercise actual SVG.
 use super::*;
 
+#[test]
+fn interface_camera_elision_keeps_combining_flags_and_joined_emoji_whole() {
+    for (name, budget, expected) in [
+        ("e\u{301} label", 3, "e\u{301}…"),
+        ("e\u{301} label", 2, "…"),
+        ("🇨🇦 camera", 3, "🇨🇦…"),
+        ("👩‍🚀 camera", 4, "👩‍🚀…"),
+        ("👩‍🚀 camera", 3, "…"),
+        ("Camera 镜头", 100, "Camera 镜头"),
+    ] {
+        assert_eq!(interface_camera_name(name, budget), expected);
+    }
+}
+
 fn fixture() -> AnalyticsSnapshot {
     AnalyticsSnapshot {
         retention_seconds: RETENTION_SECONDS,

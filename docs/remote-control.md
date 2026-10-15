@@ -113,9 +113,18 @@ Local agents can observe the same immediate changes without enabling HTTP: `capt
 
 ## Analytics and monitoring
 
+Raw `logs` in session snapshots retain `time`, `level` and `message` and may add
+`timestamp:{unix_ms,utc_offset_seconds}`. Signed Unix milliseconds identify the
+absolute event, while the offset describes the producer clock's seconds east of
+UTC. The legacy `time` string has no recoverable date/zone. Older entries omit
+metadata, and malformed optional metadata leaves the diagnostic readable.
+Desktop/browser displays use the viewer's local zone; browser log labels also
+include ISO UTC, and copied desktop logs include a dated numeric offset. This
+additive metadata preserves the version-1 envelope and original fields.
+
 Analytics collection runs with the session, including when no browser is open and no metrics scraper is connected. DuckDB stores the time series in memory, sampling once per second and retaining at most 24 hours or 250,000 rows. Its engine memory limit is 128 MB, with disk spilling and external access disabled. Camera metadata is capped at 256 entries, and inactive entries expire within 24 hours. Session counters accumulate across stop/start and camera disconnects as constant-size lifetime totals; time-series history expires independently. A new server process starts with fresh analytics. Frame and received-byte totals describe acquisition, while missed-frame metrics expose transport or shared-ring losses; they do not count files written by capture jobs.
 
-Open `/api/analytics.svg` to view or save the dashboard for the current session. The native desktop window also has an **Analytics** button in its bottom toolbar, showing the same Plotters dashboard. The dark SVG includes an empty state before the first frame and scales its plots to the collected history. The JSON report includes `retention_seconds`, `sample_interval_seconds`, sample counts, session totals, camera summaries and time-series points. Its API and SVG routes enforce the same browser-origin checks as other `/api/` routes.
+Open `/api/analytics.svg` to view or save the dashboard for the current session. The native desktop window's **Analytics** button shows the same measurements with charts that follow the app's appearance, readable camera names and browsable history data. **Show history data** opens a fixed snapshot; **Update history** loads the latest charted report while preserving the page when possible. The dark exported SVG includes an empty state before the first frame and scales its plots to the collected history. The JSON report includes `retention_seconds`, `sample_interval_seconds`, sample counts, session totals, camera summaries and time-series points. Its API and SVG routes enforce the same browser-origin checks as other `/api/` routes.
 
 Monitoring tools can fetch `/health` and `/metrics` directly without a browser origin. `/health` returns a plain JSON object with `status`, `ready`, `version`, `uptime_seconds`, `cameras` and `analytics`. An idle session with no connected cameras is ready. A previous camera command error stays in diagnostics without making readiness fail. `/metrics` uses Prometheus text format with session counters such as `capturefab_session_frames_total` and per-camera counters labeled by `camera_id` and `name`. `HEAD` returns the same status and headers as `GET` with no body; unsupported methods on these four routes return HTTP 405 with `Allow: GET, HEAD`.
 

@@ -11,6 +11,7 @@ use std::{
     sync::Mutex,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 pub const RETENTION_SECONDS: u64 = 24 * 60 * 60;
 pub const SAMPLE_INTERVAL_SECONDS: u64 = 1;
@@ -766,6 +767,17 @@ impl SvgOptions {
     fn caption_size(self) -> f64 {
         if self.interface { 16.0 * 1.24 } else { 19.0 }
     }
+
+    fn font_family(self) -> &'static str {
+        if self.interface {
+            // fontdb 0.23 uses fontconfig's first generic preference even
+            // when that face is absent. Keep the user's generic choice first,
+            // then offer installed desktop families to SVG text resolution.
+            "sans-serif, DejaVu Sans, Liberation Sans, Noto Sans, Ubuntu, Cantarell, Fira Sans, Roboto, Arial"
+        } else {
+            "sans-serif"
+        }
+    }
 }
 
 fn rgb([r, g, b]: [u8; 3]) -> RGBColor {
@@ -888,6 +900,42 @@ fn draw_panels(
     draw_camera_chart(&panels[3], report, options)
 }
 
+/// Numeric GUI plots use the same measurements and drawing as exports. User
+/// camera identities are rendered by native GUI text, outside the SVG shaper.
+#[cfg(feature = "gui")]
+pub(crate) fn render_interface_time_plots(
+    report: &AnalyticsSnapshot,
+    width: u32,
+    colors: SvgColors,
+) -> Result<[String; 3]> {
+    let options = SvgOptions::interface(width, colors);
+    let mut plots = [String::new(), String::new(), String::new()];
+    for (index, output) in plots.iter_mut().enumerate() {
+        let root = SVGBackend::with_string(output, (options.width, 260)).into_drawing_area();
+        root.fill(&rgb(colors.background)).map_err(plot_error)?;
+        let (caption, unit, color) = match index {
+            0 => ("Frame rate", "frames / s", colors.frame_rate),
+            1 => ("Throughput", "MiB / s", colors.throughput),
+            _ => ("Missed frame rate", "% missed", colors.missed_frames),
+        };
+        draw_time_chart(
+            &root,
+            report,
+            caption,
+            unit,
+            rgb(color),
+            |point| match index {
+                0 => point.fps,
+                1 => point.bytes_per_second / 1_048_576.0,
+                _ => point.drop_percent,
+            },
+            options,
+        )?;
+        root.present().map_err(plot_error)?;
+    }
+    Ok(plots)
+}
+
 fn plot_error<E: std::fmt::Debug>(error: E) -> anyhow::Error {
     anyhow!("render analytics SVG: {error:?}")
 }
@@ -922,7 +970,7 @@ fn draw_time_chart<F: Fn(&AnalyticsPoint) -> f64>(
         .margin(if options.interface { 12 } else { 18 })
         .caption(
             caption,
-            ("sans-serif", options.caption_size())
+            (options.font_family(), options.caption_size())
                 .into_font()
                 .color(&rgb(options.colors.text)),
         )
@@ -948,7 +996,7 @@ fn draw_time_chart<F: Fn(&AnalyticsPoint) -> f64>(
         )
         .axis_style(rgb(options.colors.axis).mix(if options.interface { 1.0 } else { 0.4 }))
         .label_style(
-            ("sans-serif", options.label_size())
+            (options.font_family(), options.label_size())
                 .into_font()
                 .color(&rgb(options.colors.secondary)),
         )
@@ -968,7 +1016,7 @@ fn draw_time_chart<F: Fn(&AnalyticsPoint) -> f64>(
         })
         .y_desc(unit)
         .axis_desc_style(
-            ("sans-serif", options.label_size())
+            (options.font_family(), options.label_size())
                 .into_font()
                 .color(&rgb(options.colors.secondary)),
         );
@@ -1019,7 +1067,7 @@ fn draw_interface_cameras(
     area.draw(&Text::new(
         "Camera data volume",
         (width as i32 / 2, 17),
-        ("sans-serif", options.caption_size())
+        (options.font_family(), options.caption_size())
             .into_font()
             .color(&rgb(options.colors.text))
             .pos(Pos::new(HPos::Center, VPos::Top)),
@@ -1045,7 +1093,7 @@ fn draw_interface_cameras(
         area.draw(&Text::new(
             name,
             (inset as i32, y),
-            ("sans-serif", options.label_size())
+            (options.font_family(), options.label_size())
                 .into_font()
                 .color(&rgb(options.colors.secondary)),
         ))
@@ -1054,7 +1102,7 @@ fn draw_interface_cameras(
         area.draw(&Text::new(
             human_bytes(camera.bytes),
             (width as i32 - inset as i32, y + 15),
-            ("sans-serif", options.label_size())
+            (options.font_family(), options.label_size())
                 .into_font()
                 .color(&rgb(options.colors.text))
                 .pos(Pos::new(HPos::Right, VPos::Top)),
@@ -1082,7 +1130,7 @@ fn draw_interface_cameras(
         area.draw(&Text::new(
             "No retained cameras",
             (width as i32 / 2, height as i32 / 2),
-            ("sans-serif", options.label_size())
+            (options.font_family(), options.label_size())
                 .into_font()
                 .color(&rgb(options.colors.secondary))
                 .pos(Pos::new(HPos::Center, VPos::Center)),
@@ -1097,7 +1145,16 @@ fn interface_camera_name(name: &str, budget: u32) -> String {
     if name.chars().count() <= budget {
         return name.to_owned();
     }
-    let mut shortened: String = name.chars().take(budget.saturating_sub(1)).collect();
+    let mut shortened = String::new();
+    let mut used = 0;
+    for grapheme in name.graphemes(true) {
+        let next = used + grapheme.chars().count();
+        if next > budget.saturating_sub(1) {
+            break;
+        }
+        shortened.push_str(grapheme);
+        used = next;
+    }
     shortened.push('…');
     shortened
 }
@@ -1123,9 +1180,7 @@ fn draw_camera_chart(
     report: &AnalyticsSnapshot,
     options: SvgOptions,
 ) -> Result<()> {
-    let mut cameras: Vec<_> = report.cameras.iter().collect();
-    cameras.sort_by_key(|camera| std::cmp::Reverse(camera.bytes));
-    cameras.truncate(5);
+    let cameras = chart_cameras(report);
     if options.interface {
         return draw_interface_cameras(area, &cameras, options);
     }
@@ -1216,7 +1271,14 @@ fn compact(value: u64) -> String {
         value.to_string()
     }
 }
-fn human_bytes(value: u64) -> String {
+pub(crate) fn chart_cameras(report: &AnalyticsSnapshot) -> Vec<&CameraAnalytics> {
+    let mut cameras: Vec<_> = report.cameras.iter().collect();
+    cameras.sort_by_key(|camera| std::cmp::Reverse(camera.bytes));
+    cameras.truncate(5);
+    cameras
+}
+
+pub(crate) fn human_bytes(value: u64) -> String {
     if value >= 1_073_741_824 {
         format!("{:.2} GiB", value as f64 / 1_073_741_824.0)
     } else if value >= 1_048_576 {
