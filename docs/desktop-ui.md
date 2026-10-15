@@ -39,6 +39,61 @@ Its bottom-anchored history moves toward older entries with Up/Page Up/Home and
 newer entries with Down/Page Down/End, while Copy log remains pinned. Other
 panes, inactive windows and obscured content retain their own keyboard context.
 
+## Everyday controls and progressive disclosure
+
+The October 15, 2026 interface pass puts live adjustments and saving ahead of
+setup and diagnostics. Features starts with search, exposure mode and Quick
+controls appropriate to the advertised camera type. Image geometry, acquisition
+setup, device information, transport and vendor controls remain in named
+expandable groups with feature counts. Search reveals matching controls across
+all groups without changing their expanded state. Edited groups retain their
+drafts and report an edited count; failed writes reveal their group. Camera
+classification guidance and detection evidence are in Camera details.
+
+Ordinary capture puts destination, count, format and Capture & save first. Timeout,
+inactive automatic-capture setup and shell access use named disclosures.
+Scheduled jobs appear when scheduling is enabled or jobs exist. Active automatic
+sessions lead with their state, capacity guidance, counts and Review; their
+position stays stable as suggestions arrive. Sensitivity,
+minimum gap and model details are in Suggestion settings. Pending suggestions
+make Review the primary action. The Video tab exposes both local recording and
+stream forwarding; its persisted tab identifier and shortcut remain unchanged.
+Encoder selection and per-file limits follow the start action in a disclosure.
+Invalid timeout, encoder and file-limit drafts reveal their editor.
+
+The toolbar reserves space for Capture and its destination shortcut. At smaller
+widths, destination, analytics and activity use labeled accessible icons; visible
+labels return as room permits, followed by the duplicate Undo/Redo controls.
+Edit menus and shortcuts retain undo and redo at every width. Disclosures expose
+their summaries as accessible descriptions, and retained widget slots preserve
+native command identities during resizing and group expansion.
+
+The browser puts preview and Save captures first, with summaries on collapsed
+capture options, schedules, jobs, camera settings, insights, session activity and
+server logs. The latest session action remains visible. Stream controls follow
+the current state, and optional form validation reveals invalid hidden fields.
+
+Verification for this pass includes 517 desktop GUI tests, strict all-target
+Clippy, formatting and a rebuilt native app. Actual-widget tests cover all seven
+camera kinds without losing or duplicating advertised features, search discovery,
+retained drafts/editor identities, invalid advanced-field recovery, keyboard
+focus reveal, and toolbar pointer access across 24 window/scale/layout cases.
+An isolated macOS native run connected only the built-in simulator, started its
+stream, expanded Image, found Device Scan Type through search, saved and decoded
+a 640×480 PNG, recovered an invalid timeout, and exposed local recording and
+encoder options. A second native run at 900×620 with Larger interface size kept
+the complete Capture & save action visible. Both sessions quit normally. These
+checks operated the native accessibility tree; they do not establish a complete
+VoiceOver workflow or runtime behavior on Windows and Linux.
+
+The browser passes 12 Rust tests, strict Clippy for WebAssembly and its release
+build. Live desktop and 390-pixel-wide browser checks saved direct, multi-frame
+and timed simulator captures, recovered invalid fields inside closed disclosures,
+found features with ordinary search terms, and retained focus after stream/save
+commands and polling. Documentation screenshots use isolated simulator sessions;
+the explicit `inspector-storage-default` scene demonstrates the default policy
+without reading or changing a user's storage ledger.
+
 ## Requirements and current evidence
 
 | Requirement | Implemented source evidence | Runtime gate or remaining gap |

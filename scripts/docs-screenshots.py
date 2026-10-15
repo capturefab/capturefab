@@ -20,11 +20,11 @@ ROOT = Path(__file__).resolve().parents[1]
 SCENES = {
     "workspace": (4, "dark,features,focus,exposure"),
     "features": (1, "dark,features,noscopes"),
-    "capture": (1, "dark,capture,noscopes,inspector-storage"),
-    "schedule": (1, "dark,capture,noscopes,inspector-widest,scheduled"),
+    "capture": (1, "dark,capture,noscopes,inspector-storage-default"),
+    "schedule": (1, "dark,capture,noscopes,inspector-widest,inspector-storage-default,scheduled"),
     "destinations": (1, "dark,destinations-list,noscopes"),
     "scopes": (1, "dark,noinspector,nosidebar,focus,exposure"),
-    "forwarding": (1, "dark,forward,noscopes"),
+    "forwarding": (1, "dark,forward,noscopes,inspector-storage-default"),
 }
 
 # Crop boxes are in logical desktop pixels at the fixed 1100 x 700 window.
@@ -32,13 +32,13 @@ SCENES = {
 CROPS = {
     "workspace": ("workspace", (0, 0, 1100, 700), "Four simulator cameras in the live workbench, with camera list and the selected camera's inspector."),
     "cameras": ("workspace", (0, 0, 240, 700), "Connected simulator camera list and controls for finding or adding a source."),
-    "features": ("features", (784, 0, 1100, 652), "The selected camera's Features inspector with GenICam names, bounds and editable values."),
-    "capture": ("capture", (784, 0, 1100, 652), "Save frames form, output format, timeout and global storage limits."),
+    "features": ("features", (784, 0, 1100, 652), "Quick controls for the selected camera, with search and collapsed feature groups for less common settings."),
+    "capture": ("capture", (784, 0, 1100, 700), "Ordinary capture controls first, followed by Capture options, scheduling, Automatic capture, Storage and retention, and Shell and agents disclosures; no automatic capture session is open in this scene."),
     "schedule": ("schedule", (800, 427, 1085, 606), "The capture scheduling form with start delay and frame interval."),
     "destinations": ("destinations", (264, 174, 836, 526), "Destination manager showing example folder and S3-compatible bucket destinations."),
     "scopes": ("scopes", (438, 40, 1096, 442), "Live focus metric and exposure histogram alongside the focus region on a simulator image."),
-    "forwarding": ("forwarding", (784, 0, 1100, 600), "Forward and record form with codec, bitrate, frame rate and encoder settings."),
-    "history": ("destinations", (288, 436, 464, 475), "Undo and Redo controls in the destination manager; macOS keyboard shortcuts are shown."),
+    "forwarding": ("forwarding", (784, 0, 1100, 600), "Video panel with destination, codec, frame rate, bitrate and a start action, followed by the Encoder and limits disclosure."),
+    "history": ("destinations", (288, 238, 464, 277), "Undo and Redo controls in the destination manager; macOS keyboard shortcuts are shown."),
 }
 
 
@@ -55,6 +55,7 @@ def main():
     parser.add_argument("--source-note", default="Current development desktop build from the workspace source.")
     args = parser.parse_args()
     binary = args.binary.resolve()
+    binary_digest = sha256(binary)
     output = args.output.resolve()
     originals = output / "source"
     originals.mkdir(parents=True, exist_ok=True)
@@ -71,15 +72,17 @@ def main():
                 subprocess.run([str(binary), "gui", "--name", "docs", "--screenshot",
                                 str(originals / f"{name}.png"), "--screenshot-cameras", str(cameras)],
                                env=env, check=True, timeout=60)
+                if sha256(binary) != binary_digest:
+                    raise ValueError("The desktop binary changed during capture; finish the build, then recapture all scenes.")
                 with Image.open(originals / f"{name}.png") as rendered:
                     rendered.save(originals / f"{name}.png", optimize=True)
                 print(f"Captured {name}", flush=True)
     manifest = {
         "method": "Actual iced desktop renderer screenshots; crop only, no generated or reconstructed interface.",
         "source_note": args.source_note,
-        "binary_sha256": sha256(binary),
+        "binary_sha256": binary_digest,
         "logical_window": [1100, 700],
-        "demo": "Built-in simulator cameras. Destination names, paths and scheduled jobs are built-in demonstration scenes.",
+        "demo": "Built-in simulator cameras. Destination names, paths and scheduled jobs are built-in demonstration scenes. Capture, scheduling and Video scenes use the validated default storage policy as a read-only display fixture without accessing a storage ledger.",
         "images": [],
     }
     for name, (source, box, description) in CROPS.items():

@@ -5,8 +5,8 @@ use std::{cell::RefCell, collections::BTreeMap};
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    Document, Element, Event, HtmlImageElement, HtmlInputElement, HtmlSelectElement, Request,
-    RequestCache, RequestCredentials, RequestInit, RequestMode, Response, Url, Window,
+    Document, Element, Event, HtmlElement, HtmlImageElement, HtmlInputElement, HtmlSelectElement,
+    Request, RequestCache, RequestCredentials, RequestInit, RequestMode, Response, Url, Window,
 };
 mod activity;
 mod log_time;
@@ -35,8 +35,11 @@ struct App {
     feature_names: Vec<String>,
     feature_drafts: BTreeMap<String, String>,
     camera_drafts: BTreeMap<String, BTreeMap<String, String>>,
+    camera_markup: String,
+    job_markup: String,
     destinations: Value,
     command_busy: bool,
+    command_focus: Option<Element>,
     snapshot_busy: bool,
     preview_busy: bool,
     preview_url: Option<String>,
@@ -259,7 +262,40 @@ async fn request(path: &str, body: Option<&Value>) -> Result<Value, String> {
     Ok(data.get("result").cloned().unwrap_or(Value::Null))
 }
 
-fn render_cameras(app: &App) {
+// Snapshot polling must not remove keyboard focus from a camera or job action.
+fn replace_action_markup(id: &str, markup: &str) {
+    let container = element(id);
+    let focused = document()
+        .active_element()
+        .filter(|active| active.tag_name() == "BUTTON" && container.contains(Some(active)));
+    container.set_inner_html(markup);
+    if let Some(focused) = focused {
+        let attributes = ["data-action", "data-camera", "data-job"];
+        if let Ok(buttons) = container.query_selector_all("button") {
+            for i in 0..buttons.length() {
+                let Some(button) = buttons
+                    .item(i)
+                    .and_then(|n| n.dyn_into::<HtmlElement>().ok())
+                else {
+                    continue;
+                };
+                if attributes
+                    .iter()
+                    .all(|name| button.get_attribute(name) == focused.get_attribute(name))
+                {
+                    let _ = button.focus();
+                    return;
+                }
+            }
+        }
+        if id == "job-list"
+            && let Ok(Some(summary)) = element("capture-jobs").query_selector("summary")
+        {
+            let _ = summary.unchecked_into::<HtmlElement>().focus();
+        }
+    }
+}
+fn render_cameras(app: &mut App) {
     let mut html = String::new();
     let mut devices = list(&app.session, "devices").to_vec();
     for connected in list(&app.session, "cameras") {
@@ -297,10 +333,13 @@ fn render_cameras(app: &App) {
     if html.is_empty() {
         html = "<p class=\"empty-state\">No cameras found.<br>Discover cameras or connect by address.</p>".into();
     }
-    element("camera-list").set_inner_html(&html);
+    if app.camera_markup != html {
+        replace_action_markup("camera-list", &html);
+        app.camera_markup = html;
+    }
 }
 
-fn render_jobs(app: &App) {
+fn render_jobs(app: &mut App) {
     let jobs = camera(app).map(|c| list(c, "jobs")).unwrap_or(&[]);
     let mut html = String::new();
     for job in jobs.iter().rev() {
@@ -328,7 +367,28 @@ fn render_jobs(app: &App) {
     if html.is_empty() {
         html = "<p class=\"empty-state\">No capture jobs for this camera.<br>Set an interval and schedule a timelapse.</p>".into();
     }
-    element("job-list").set_inner_html(&html);
+    let active = jobs
+        .iter()
+        .filter(|job| matches!(text(job, "status"), "pending" | "running"))
+        .count();
+    set_text(
+        "job-summary",
+        &if active > 0 {
+            format!("{active} active · {} total", jobs.len())
+        } else if jobs.is_empty() {
+            "No jobs yet".into()
+        } else {
+            format!(
+                "{} job{} · none active",
+                jobs.len(),
+                if jobs.len() == 1 { "" } else { "s" }
+            )
+        },
+    );
+    if app.job_markup != html {
+        replace_action_markup("job-list", &html);
+        app.job_markup = html;
+    }
 }
 fn date_label(timestamp: u64) -> String {
     js_sys::Date::new(&JsValue::from_f64(timestamp as f64))
@@ -369,6 +429,14 @@ fn render_features(app: &mut App) {
     let features = camera(app)
         .map(|c| list(c, "features").to_vec())
         .unwrap_or_default();
+    set_text(
+        "feature-summary",
+        &if camera(app).is_none() {
+            "Connect a camera".into()
+        } else {
+            format!("{} features", features.len())
+        },
+    );
     // Snapshot polling updates the reported value independently of the draft.
     // Never replace an operator's partially edited feature value every second.
     let schema = features
@@ -444,7 +512,7 @@ fn render_features(app: &mut App) {
                 )
             };
             let description = format!("{} {}", text(feature, "description"), bounds.join(" · "));
-            let search = format!("{name} {display} {description}").to_lowercase();
+            let search = feature_search_text(name, display, &description);
             html.push_str(&format!("<div class=\"feature\" data-search=\"{}\"><div class=\"feature-label\"><strong>{}</strong><span class=\"muted\" title=\"{}\">{} · {}</span></div><span id=\"feature-value-{index}\" class=\"feature-value\"></span><div class=\"feature-editor\">{editor}</div></div>",
                 escape(&search), escape(if display.is_empty() { name } else { display }), escape(&description), escape(name), escape(&bounds.join(" · "))));
         }
@@ -475,23 +543,52 @@ fn render_features(app: &mut App) {
         });
     }
 }
+fn feature_search_text(name: &str, display: &str, description: &str) -> String {
+    let aliases = match name {
+        "Width" | "Height" => "image size dimensions resolution",
+        "AcquisitionFrameRate" | "AcquisitionFrameRateAbs" => "fps frame rate",
+        "ExposureTime" | "ExposureTimeAbs" => "exposure duration shutter",
+        "PixelFormat" => "pixel format colour color",
+        _ => "",
+    };
+    format!("{name} {display} {description} {aliases}").to_lowercase()
+}
+fn feature_search_matches(search: &str, query: &str) -> bool {
+    query.split_whitespace().all(|term| search.contains(term))
+}
 fn filter_features() {
-    let filter = input("feature-filter").to_lowercase();
+    let filter = input("feature-filter").trim().to_lowercase();
     if let Ok(rows) = element("feature-list").query_selector_all("[data-search]") {
+        let mut matches = 0;
         for i in 0..rows.length() {
             let Some(row) = rows.item(i).and_then(|n| n.dyn_into::<Element>().ok()) else {
                 continue;
             };
-            if row
-                .get_attribute("data-search")
-                .unwrap_or_default()
-                .contains(&filter)
-            {
+            if feature_search_matches(
+                &row.get_attribute("data-search").unwrap_or_default(),
+                &filter,
+            ) {
+                matches += 1;
                 let _ = row.remove_attribute("hidden");
             } else {
                 let _ = row.set_attribute("hidden", "");
             }
         }
+        set_text(
+            "feature-search-status",
+            &if rows.length() == 0 {
+                String::new()
+            } else if filter.is_empty() {
+                format!(
+                    "{} camera features. Search by name or description.",
+                    rows.length()
+                )
+            } else if matches == 0 {
+                "No matching features. Try exposure, gain, width or pixel format.".into()
+            } else {
+                format!("{matches} of {} features match", rows.length())
+            },
+        );
     }
 }
 fn reconcile_camera_selection(app: &mut App) {
@@ -503,6 +600,63 @@ fn reconcile_camera_selection(app: &mut App) {
     }
 }
 
+fn update_stream_controls(streaming: bool) {
+    let focused = document().active_element().map(|active| active.id());
+    visible("stream-start", !streaming);
+    visible("stream-stop", streaming);
+    if focused.as_deref()
+        == Some(if streaming {
+            "stream-start"
+        } else {
+            "stream-stop"
+        })
+    {
+        let _ = element(if streaming {
+            "stream-stop"
+        } else {
+            "stream-start"
+        })
+        .unchecked_into::<HtmlElement>()
+        .focus();
+    }
+}
+fn restore_command_focus(app: &mut App) {
+    if app.command_busy {
+        return;
+    }
+    let Some(previous) = app.command_focus.take() else {
+        return;
+    };
+    // Disabling a busy button blurs it. Restore the operator's place only if
+    // they have not deliberately moved to another control during the request.
+    if document()
+        .active_element()
+        .is_some_and(|active| active.tag_name() != "BODY")
+    {
+        return;
+    }
+    let target = if matches!(previous.id().as_str(), "stream-start" | "stream-stop") {
+        element(
+            if camera(app).is_some_and(|camera| flag(camera, "streaming")) {
+                "stream-stop"
+            } else {
+                "stream-start"
+            },
+        )
+    } else if previous.is_connected() {
+        previous
+    } else if previous.has_attribute("data-job") {
+        let Ok(Some(summary)) = element("capture-jobs").query_selector("summary") else {
+            return;
+        };
+        summary
+    } else {
+        return;
+    };
+    if !target.has_attribute("disabled") {
+        let _ = target.unchecked_into::<HtmlElement>().focus();
+    }
+}
 fn render(app: &mut App) {
     reconcile_camera_selection(app);
     render_cameras(app);
@@ -520,6 +674,24 @@ fn render(app: &mut App) {
                 text(info, "transport"),
                 text(info, "serial")
             ),
+        );
+        let streaming = flag(camera, "streaming");
+        update_stream_controls(streaming);
+        set_text(
+            "preview-empty-title",
+            if streaming {
+                "Waiting for a frame"
+            } else {
+                "Ready when you are"
+            },
+        );
+        set_text(
+            "preview-empty-description",
+            if streaming {
+                "The live preview will appear here automatically."
+            } else {
+                "Start the stream for a live preview, or save a frame directly."
+            },
         );
         let fps = camera.get("fps").and_then(Value::as_f64).unwrap_or(0.0);
         set_text(
@@ -567,6 +739,12 @@ fn render(app: &mut App) {
             },
         );
         set_text("stream-status", "No camera connected");
+        update_stream_controls(false);
+        set_text("preview-empty-title", "Your camera, live");
+        set_text(
+            "preview-empty-description",
+            "Choose a camera in the camera list, or discover one to get started.",
+        );
         set_text("frame-stats", "0 frames · 0 dropped");
         clear_preview(app);
     }
@@ -591,6 +769,7 @@ fn render(app: &mut App) {
         .join("\n");
     set_text("logs", &lines);
     update_disabled(app);
+    restore_command_focus(app);
 }
 
 fn clear_preview(app: &mut App) {
@@ -636,6 +815,7 @@ fn connection_failed(app: &mut App, error: &str) {
         app.activity_subscribed = false;
         app.activity_next_at = 0.0;
         app.command_busy = false;
+        app.command_focus = None;
         clear_preview(app);
     }
     app.connection_error = true;
@@ -1166,6 +1346,9 @@ fn command(command: Value, camera_id: Option<String>, success: &str, reload_feat
         if !app.connected || app.command_busy {
             return None;
         }
+        app.command_focus = document()
+            .active_element()
+            .filter(|active| active.tag_name() == "BUTTON");
         app.command_busy = true;
         app.revision = app.revision.wrapping_add(1);
         update_disabled(&app);
@@ -1269,12 +1452,48 @@ fn command(command: Value, camera_id: Option<String>, success: &str, reload_feat
     });
 }
 
+fn reveal_field(id: &str) {
+    let mut parent = element(id).parent_element();
+    while let Some(ancestor) = parent {
+        if ancestor.tag_name() == "DETAILS" {
+            let _ = ancestor.set_attribute("open", "");
+        }
+        parent = ancestor.parent_element();
+    }
+}
+fn update_capture_summary() {
+    let count = input("count").parse::<u64>().unwrap_or(0);
+    let format = input("format").to_uppercase();
+    set_text(
+        "capture-submit",
+        if count == 1 {
+            "Save frame"
+        } else {
+            "Save frames"
+        },
+    );
+    set_text(
+        "capture-summary",
+        &if count == 0 {
+            "Choose a frame count".into()
+        } else {
+            format!(
+                "{} frame{} · {format}",
+                grouped_number(count),
+                if count == 1 { "" } else { "s" }
+            )
+        },
+    );
+}
 fn integer_input(id: &str, min: u64, max: u64, label: &str) -> Result<u64, String> {
     input(id)
         .parse::<u64>()
         .ok()
         .filter(|n| (min..=max).contains(n))
-        .ok_or_else(|| format!("{label} must be a whole number from {min} to {max}."))
+        .ok_or_else(|| {
+            reveal_field(id);
+            format!("{label} must be a whole number from {min} to {max}.")
+        })
 }
 fn capture_command(schedule: bool) -> Result<Value, String> {
     let output = input("output").trim().to_string();
@@ -1377,6 +1596,7 @@ fn dispatch(action: &str, source: &Element) {
             Ok(body) => {
                 if let Some(camera) = selected_camera() {
                     let success = if text(&body, "op") == "schedule" {
+                        let _ = element("capture-jobs").set_attribute("open", "");
                         "Capture job scheduled on the server."
                     } else {
                         "Capture complete."
@@ -1485,6 +1705,9 @@ pub fn start() -> Result<(), JsValue> {
         if target.id() == "feature-filter" {
             filter_features();
         }
+        if matches!(target.id().as_str(), "count" | "format") {
+            update_capture_summary();
+        }
         if target.id() == "destination" {
             APP.with(|state| destination_description(&state.borrow()));
         }
@@ -1517,6 +1740,19 @@ pub fn start() -> Result<(), JsValue> {
     document().add_event_listener_with_callback("input", inputs.as_ref().unchecked_ref())?;
     document().add_event_listener_with_callback("change", inputs.as_ref().unchecked_ref())?;
     inputs.forget();
+    // Native validation must be able to reveal and focus an invalid control
+    // even when its optional settings disclosure has been closed.
+    let invalid = Closure::<dyn FnMut(Event)>::new(|event: Event| {
+        if let Some(target) = event.target().and_then(|t| t.dyn_into::<Element>().ok()) {
+            reveal_field(&target.id());
+        }
+    });
+    document().add_event_listener_with_callback_and_bool(
+        "invalid",
+        invalid.as_ref().unchecked_ref(),
+        true,
+    )?;
+    invalid.forget();
     let snapshots = Closure::<dyn FnMut()>::new(refresh);
     window().set_interval_with_callback_and_timeout_and_arguments_0(
         snapshots.as_ref().unchecked_ref(),
@@ -1554,6 +1790,7 @@ pub fn start() -> Result<(), JsValue> {
     resumed.forget();
 
     notice("", false);
+    update_capture_summary();
     APP.with(|state| {
         let mut app = state.borrow_mut();
         // Each loaded tab is a distinct participant, including duplicate tabs.
@@ -1577,6 +1814,17 @@ pub fn start() -> Result<(), JsValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ordinary_feature_queries_find_camera_terminology() {
+        let dimensions = feature_search_text("Width", "", "Image width in pixels");
+        assert!(feature_search_matches(&dimensions, "image size"));
+        assert!(feature_search_matches(&dimensions, "resolution"));
+        assert!(!feature_search_matches(&dimensions, "exposure"));
+        let pixel_format = feature_search_text("PixelFormat", "", "");
+        assert!(feature_search_matches(&pixel_format, "pixel format"));
+        assert!(feature_search_matches(&pixel_format, "color"));
+        assert!(feature_search_matches(&pixel_format, ""));
+    }
     #[test]
     fn server_strings_are_escaped_before_markup() {
         assert_eq!(

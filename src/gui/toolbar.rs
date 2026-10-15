@@ -6,11 +6,23 @@ use std::collections::HashSet;
 mod date_layout_tests;
 #[cfg(test)]
 mod raw_log_tests;
+#[cfg(test)]
+mod responsive_layout_tests;
 
 /// The widest the status at the right of the toolbar grows.
 const STATUS: f32 = 420.0;
-/// Room the Capture button and the output name keep at the left.
-const CAPTURE_ROOM: f32 = 230.0;
+/// Keep the widest Capture label readable, including in the overview.
+const CAPTURE_ROOM: f32 = 160.0;
+/// A compact notice still keeps its details and dismiss actions visible.
+const MIN_STATUS: f32 = 128.0;
+
+struct ToolbarFit {
+    history: bool,
+    activity_label: bool,
+    analytics_label: bool,
+    destination_label: bool,
+    status: f32,
+}
 /// Room a notice's glyph and the gap after it take.
 const NOTICE_GLYPH: f32 = 13.0 + 6.0;
 /// Room a notice's "Details" link and the gap before it take.
@@ -40,24 +52,36 @@ impl Workbench {
         let os = Os::CURRENT;
         // Nothing to capture from until a camera connects.
         let capture = snapshot.connected.is_some() || self.overview();
-        let width = self.status_width(capture);
+        let fit = self.toolbar_fit(capture);
+        let width = fit.status;
         let mut left = row![].spacing(8).align_y(Alignment::Center);
         if capture {
-            left = left.push(self.capture_button(p)).push(tip_above(
-                button(clipped(
+            let destination: Element<'_, Message> = if fit.destination_label {
+                clipped(
                     text(self.capture_to.label(&self.output))
                         .size(style::SMALL)
                         .color(p.secondary)
                         .wrapping(text::Wrapping::None),
-                ))
-                .name(format!(
-                    "Capture destination: {}",
-                    self.capture_to.label(&self.output)
-                ))
-                .padding([4, 6])
-                .style(style::plain)
-                .on_press(Message::ShowTab(Tab::Capture)),
-                Action::CaptureTab.hint("Where captures are saved", os),
+                )
+            } else {
+                icon(Icon::Folder, 16.0, p.secondary)
+            };
+            left = left.push(self.capture_button(p)).push(tip_above(
+                button(destination)
+                    .name(format!(
+                        "Capture destination: {}",
+                        self.capture_to.label(&self.output)
+                    ))
+                    .padding([4, 6])
+                    .style(style::plain)
+                    .on_press(Message::ShowTab(Tab::Capture)),
+                Action::CaptureTab.hint(
+                    &format!(
+                        "Where captures are saved: {}",
+                        self.capture_to.label(&self.output)
+                    ),
+                    os,
+                ),
             ));
         }
         let unseen = self.chrome.unseen.filter(|_| !self.logs_open);
@@ -83,27 +107,37 @@ impl Workbench {
                 action.hint(&about, os),
             )
         };
+        let mut activity_content = row![icon(
+            Icon::Activity,
+            16.0,
+            if self.logs_open {
+                p.accent_text
+            } else {
+                p.secondary
+            },
+        )]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        if fit.activity_label {
+            activity_content = activity_content.push(text("Activity").size(style::SMALL));
+        }
+        let activity_about = match unseen {
+            Some(Level::Error) => "Session activity: new errors",
+            Some(_) => "Session activity: new warnings",
+            None if self.client_activity.unread => {
+                "Session activity: new actions from other participants"
+            }
+            None => "Session activity",
+        };
         let mut activity = stack![tip_above(
-            icon_button(
-                Icon::Activity,
-                16.0,
-                if self.logs_open {
-                    p.accent_text
-                } else {
-                    p.secondary
-                },
-                Message::ToggleActivity,
-            ),
-            Action::ToggleActivity.hint(
-                match unseen {
-                    Some(Level::Error) => "Session activity: new errors",
-                    Some(_) => "Session activity: new warnings",
-                    None if self.client_activity.unread =>
-                        "Session activity: new actions from other participants",
-                    None => "Session activity",
-                },
-                os
-            ),
+            button(activity_content)
+                .name("Session activity")
+                .description(activity_about)
+                .expanded(self.logs_open)
+                .padding(6)
+                .style(style::plain)
+                .on_press(Message::ToggleActivity),
+            Action::ToggleActivity.hint(activity_about, os),
         )];
         if let Some(level) = unseen {
             // A mark over the glyph's corner; it takes no input.
@@ -126,43 +160,82 @@ impl Workbench {
                     .padding([5, 5]),
             );
         }
+        let analytics: Element<'_, Message> = if fit.analytics_label {
+            text("Analytics").size(style::SMALL).into()
+        } else {
+            icon(Icon::Chart, 16.0, p.secondary)
+        };
+        // Edit retains both actions and their shortcuts when the toolbar gives
+        // its room to capture and session feedback. Keep the group in its own
+        // slot so resizing does not transfer its focus to a different action.
+        let history = if fit.history {
+            row![
+                history_button(true),
+                history_button(false),
+                space().width(8),
+            ]
+            .spacing(2)
+        } else {
+            row![]
+        };
+        let session_actions = row![
+            history,
+            tip_above(
+                button(analytics)
+                    .name("Session analytics for all cameras")
+                    .padding([4, 6])
+                    .style(style::plain)
+                    .on_press(Message::Analytics(true)),
+                "Session analytics: frame rate, payload throughput and missed frames",
+            ),
+            space().width(10),
+            activity,
+        ]
+        .align_y(Alignment::Center);
+        let controls = row![
+            container(left).width(Fill).clip(true),
+            container(self.status(width, p)).max_width(width).clip(true),
+            session_actions,
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
         column![
             rule::horizontal(1).style(style::line),
-            container(
-                row![
-                    container(left).width(Fill).clip(true),
-                    container(self.status(width, p)).max_width(width).clip(true),
-                    row![history_button(true), history_button(false)].spacing(2),
-                    tip_above(
-                        button(text("Analytics").size(style::SMALL))
-                            .name("Session analytics for all cameras")
-                            .padding([4, 6])
-                            .style(style::plain)
-                            .on_press(Message::Analytics(true)),
-                        "Frame rate, payload throughput and missed frames for this session",
-                    ),
-                    activity,
-                ]
-                .spacing(10)
-                .align_y(Alignment::Center),
-            )
-            .height(TOOLBAR - 1.0)
-            .align_y(Alignment::Center)
-            .padding([0.0, GUTTER - 6.0])
-            .clip(true),
+            container(controls)
+                .height(TOOLBAR - 1.0)
+                .align_y(Alignment::Center)
+                .padding([0.0, GUTTER - 6.0])
+                .clip(true),
         ]
         .into()
     }
 
-    /// How wide the status may grow: `STATUS`, less what a narrow main area
-    /// must keep for the capture controls when they show.
-    fn status_width(&self, capture: bool) -> f32 {
-        // Padding, gaps and the Activity button.
-        let mut room = self.main_width() - 2.0 * (GUTTER - 6.0) - 4.0 * 10.0 - 198.0;
-        if capture {
-            room -= CAPTURE_ROOM;
+    /// Give the capture and status controls priority as panes reduce the main
+    /// area. Labels return before the duplicated Edit controls do.
+    fn toolbar_fit(&self, capture: bool) -> ToolbarFit {
+        let main = self.main_width();
+        let history = main >= 900.0;
+        let activity_label = main >= 620.0;
+        let analytics_label = main >= 520.0;
+        let destination_label = main >= 700.0;
+        let capture_room = if capture {
+            CAPTURE_ROOM + 8.0 + if destination_label { 120.0 } else { 28.0 }
+        } else {
+            0.0
+        };
+        let actions = if analytics_label { 76.0 } else { 28.0 }
+            + if activity_label { 80.0 } else { 28.0 }
+            + if history { 104.0 } else { 0.0 };
+        let gaps = if history { 4.0 } else { 3.0 } * 10.0;
+        let status =
+            (main - 2.0 * (GUTTER - 6.0) - gaps - actions - capture_room).clamp(MIN_STATUS, STATUS);
+        ToolbarFit {
+            history,
+            activity_label,
+            analytics_label,
+            destination_label,
+            status,
         }
-        room.clamp(160.0, STATUS)
     }
 
     /// Capture for the selected camera. While saving, the spinner takes the

@@ -362,7 +362,7 @@ impl Action {
             Action::SearchFeatures => "Search camera features",
             Action::FeaturesTab => "Features panel",
             Action::CaptureTab => "Capture panel",
-            Action::ForwardTab => "Forward panel",
+            Action::ForwardTab => "Video panel",
             Action::ZoomIn => "Zoom in",
             Action::ZoomOut => "Zoom out",
             Action::ZoomFit => "Zoom to fit",

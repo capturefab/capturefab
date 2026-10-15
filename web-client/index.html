@@ -9,40 +9,75 @@
   <script type="module" src="/bootstrap.js"></script>
 </head>
 <body>
+  <a class="skip-link" href="#camera-workspace">Skip to camera workspace</a>
   <div id="app">
     <header class="topbar">
-      <div class="wordmark"><span class="brand-mark">c</span> capturefab <span class="pill">remote</span></div>
-      <div class="server-connection"><span id="connection-dot" class="dot offline"></span><span id="server-status">Connecting…</span></div>
+      <div class="wordmark"><span class="brand-mark" aria-hidden="true">c</span> capturefab <span class="pill">remote</span></div>
+      <div class="server-connection"><span id="connection-dot" class="dot offline" aria-hidden="true"></span><span id="server-status">Connecting…</span></div>
     </header>
     <div class="workspace">
-      <aside class="sidebar">
+      <aside class="sidebar" aria-label="Camera connections">
         <div class="section-heading"><h2>Cameras</h2><button data-action="discover" class="small" disabled>Discover</button></div>
-        <label class="check-label"><input id="simulated" type="checkbox"> Include simulated cameras</label>
-        <div id="camera-list" class="camera-list"></div>
-        <form data-action="connect-manual" class="manual-connect">
-          <label for="camera-selector">Connect by IP, serial or ID</label>
-          <div class="input-row"><input id="camera-selector" placeholder="192.168.1.10" required><button type="submit" class="small" disabled>Connect</button></div>
-        </form>
+        <p class="muted sidebar-intro">Choose a camera to preview and save frames.</p>
+        <div id="camera-list" class="camera-list"><p class="empty-state">Looking for cameras…</p></div>
+        <details class="connection-options">
+          <summary>More connection options</summary>
+          <form data-action="connect-manual" class="manual-connect">
+            <label for="camera-selector">Connect by IP, serial or ID</label>
+            <div class="input-row"><input id="camera-selector" placeholder="192.168.1.10" required><button type="submit" class="small" disabled>Connect</button></div>
+          </form>
+          <label class="check-label"><input id="simulated" type="checkbox"> Include simulated cameras in discovery</label>
+          <p class="field-hint">Select Discover after changing this option.</p>
+        </details>
         <div class="sidebar-footer"><span class="eyebrow">Server storage</span><p id="storage-summary">Loading…</p><p class="muted">Files stay on the server or go to its saved destination.</p></div>
       </aside>
 
-      <main>
-        <div class="page-heading"><div><span class="eyebrow">Camera workspace</span><h1 id="camera-title">Select a camera</h1><p id="camera-subtitle" class="muted">Discover or connect a camera to get started.</p></div><div class="button-row"><button data-action="disconnect" class="danger camera-control" disabled>Disconnect</button><button data-action="refresh">Refresh</button></div></div>
+      <main id="camera-workspace" tabindex="-1">
+        <div class="page-heading"><div><span class="eyebrow">Camera workspace</span><h1 id="camera-title">Select a camera</h1><p id="camera-subtitle" class="muted">Discover or connect a camera to get started.</p></div><details class="camera-actions"><summary>Camera actions</summary><div class="button-row"><button data-action="refresh">Refresh session</button><button data-action="disconnect" class="danger camera-control" disabled>Disconnect camera</button></div></details></div>
         <div id="notice" class="message" role="status" aria-live="polite">Loading WASM client…</div>
-        <section class="panel activity-panel" aria-labelledby="activity-title">
-          <div class="section-heading"><div><span class="eyebrow">Shared with every person and AI agent</span><h2 id="activity-title">Session activity</h2></div><span id="activity-status" class="analytics-status">Connecting…</span></div>
-          <div class="activity-identity"><label for="actor-name">Your name</label><input id="actor-name" maxlength="32" autocomplete="nickname" aria-describedby="your-identity"><span id="your-identity" class="muted"></span></div>
+        <section class="activity-strip" aria-label="Shared session activity">
+          <div class="activity-strip-heading"><span class="activity-caption">Shared session</span><span id="activity-status" class="analytics-status">Connecting…</span></div>
           <p id="latest-activity" class="latest-activity" role="status" aria-live="polite" aria-atomic="true"></p>
-          <div id="activity-list" class="activity-list" tabindex="0" aria-label="Active and recent actions by every session participant"><p class="activity-empty muted">Actions from every person and AI agent appear here as they happen.</p></div>
-        </section>
-        <section class="preview-card">
-          <div class="preview-toolbar"><span id="stream-status" class="status-label">No camera connected</span><div class="button-row"><button data-action="start" class="primary camera-control" disabled>Start stream</button><button data-action="stop" class="camera-control" disabled>Stop</button></div></div>
-          <div class="preview-stage"><img id="preview" alt="Latest frame from the selected server camera" hidden><div id="preview-empty"><span class="preview-icon" aria-hidden="true">◉</span><p>Live camera preview</p><span>Start streaming to see the latest frame.</span></div></div>
-          <div class="preview-footer"><span id="frame-stats">0 frames · 0 dropped</span><span id="preview-status">Preview updates up to 4 times per second</span></div>
         </section>
 
-        <section class="panel analytics-panel" aria-labelledby="analytics-title">
-          <div class="section-heading"><div><span class="eyebrow">All cameras · current server session</span><h2 id="analytics-title">Capture insights</h2></div><span id="analytics-status" class="analytics-status" role="status" aria-live="polite">Waiting for the server…</span></div>
+        <div class="capture-workspace">
+          <section class="preview-card" aria-labelledby="preview-title">
+            <div class="preview-toolbar"><div><h2 id="preview-title">Live preview</h2><span id="stream-status" class="status-label">No camera connected</span></div><div class="button-row"><button id="stream-start" data-action="start" class="primary camera-control" disabled>Start stream</button><button id="stream-stop" data-action="stop" class="camera-control" disabled hidden>Stop stream</button></div></div>
+            <div class="preview-stage"><img id="preview" alt="Latest frame from the selected server camera" hidden><div id="preview-empty"><span class="preview-icon" aria-hidden="true">◉</span><p id="preview-empty-title">Your camera, live</p><span id="preview-empty-description">Connect a camera, then start its stream.</span></div></div>
+            <div class="preview-footer"><span id="frame-stats">0 frames · 0 dropped</span><span id="preview-status">Preview up to 4 fps</span></div>
+          </section>
+
+          <section class="panel capture-panel" aria-labelledby="capture-title">
+            <div class="section-heading"><h2 id="capture-title">Save captures</h2><span class="pill">On the server</span></div>
+            <p class="muted">Save a frame from the selected camera.</p>
+            <form id="capture-form" data-action="capture">
+              <label for="destination">Destination</label><select id="destination"><option value="">Server filesystem</option></select>
+              <p id="destination-description" class="field-hint">Use a path on the server. The server must be able to write to it.</p>
+              <label for="output">Output path / filename</label><input id="output" value="captures/frame-{frame}.png" required spellcheck="false" aria-describedby="output-hint">
+              <p id="output-hint" class="field-hint">Files are never overwritten. Use <code>{frame}</code> for a numbered sequence.</p>
+              <div class="capture-actions"><button id="capture-submit" type="submit" class="primary camera-control" disabled>Save frame</button><span id="capture-summary" class="muted">1 frame · PNG</span></div>
+              <details class="advanced" id="capture-options"><summary>Capture options <span class="disclosure-hint">Format, frame count &amp; limits</span></summary>
+                <div class="form-grid"><div><label for="format">Format</label><select id="format"><option value="png">PNG</option><option value="jpeg">JPEG</option><option value="pgm">PGM</option><option value="ppm">PPM</option><option value="raw">Raw pixels</option></select></div><div><label for="count">Frame count</label><input id="count" type="number" value="1" min="1" max="100000" step="1" required></div></div>
+                <p class="field-hint">Multiple frames run as a background job. Use a folder or a path containing <code>{frame}</code>.</p>
+                <div class="form-grid"><div><label for="max-mib">Storage limit (MiB)</label><input id="max-mib" type="number" value="10240" min="1" step="1" required></div><div><label for="max-files">Maximum files</label><input id="max-files" type="number" value="10000" min="1" max="100000" step="1" required></div></div>
+                <p class="field-hint">Captures stop when storage is full. Server limits also apply.</p>
+              </details>
+            </form>
+            <details class="advanced" id="schedule-options"><summary>Timelapse schedule <span class="disclosure-hint">Interval &amp; start time</span></summary>
+                <p class="field-hint">Uses the destination, format, frame count and limits above.</p>
+                <div class="form-grid"><div><label for="interval">Interval (seconds)</label><input id="interval" type="number" value="10" min="0.001" step="0.001" required></div><div><label for="first-at">Start time (local)</label><input id="first-at" type="datetime-local" step="1"></div></div>
+                <p class="field-hint">Leave the start time empty to start now. Jobs continue while the server is running.</p>
+                <button data-action="schedule" type="button" class="camera-control schedule-button" disabled>Schedule timelapse</button>
+            </details>
+          </section>
+        </div>
+
+        <details class="panel jobs-panel disclosure-panel" id="capture-jobs"><summary><span><span class="disclosure-title">Capture jobs</span><span class="disclosure-hint">Scheduled and multi-frame captures</span></span><span id="job-summary" class="summary-status">No jobs yet</span></summary><div class="disclosure-content"><div class="section-heading"><p class="muted">Jobs run on the server, even when this tab closes.</p><button data-action="jobs" class="small camera-control" disabled>Refresh jobs</button></div><div id="job-list"><p class="empty-state">No capture jobs yet.</p></div></div></details>
+
+        <details class="panel features-panel disclosure-panel" id="camera-settings"><summary><span><span class="disclosure-title">Camera settings</span><span class="disclosure-hint">Exposure, image size, pixel format &amp; more</span></span><span id="feature-summary" class="summary-status">Connect a camera</span></summary><div class="disclosure-content"><div class="section-heading"><p class="muted">Live settings from the selected camera.</p><div class="button-row"><button data-action="auto" class="small camera-control" disabled>Auto exposure</button><button data-action="manual" class="small camera-control" disabled>Manual exposure</button><button data-action="features" class="small camera-control" disabled>Reload</button></div></div><label class="sr-only" for="feature-filter">Search camera features</label><input id="feature-filter" type="search" placeholder="Search exposure, gain, image size…" aria-describedby="feature-search-status"><p id="feature-search-status" class="field-hint" role="status" aria-live="polite"></p><div id="feature-list" class="feature-list"><p class="empty-state">Connect a camera to inspect its features.</p></div></div></details>
+
+        <details class="panel analytics-panel disclosure-panel"><summary><span><span id="analytics-title" class="disclosure-title">Capture insights</span><span class="disclosure-hint">Frame rates, throughput &amp; missed frames</span></span><span id="analytics-status" class="analytics-status" role="status" aria-live="polite">Waiting for the server…</span></summary><div class="disclosure-content">
+          <p class="muted">All cameras · current server session</p>
           <dl class="analytics-summary">
             <div><dt>Frames acquired</dt><dd id="analytics-frames">—</dd></div>
             <div><dt>Missed frames</dt><dd id="analytics-dropped">—</dd><span id="analytics-drop-detail" class="muted">of all acquired + missed frames</span></div>
@@ -56,32 +91,13 @@
           </figure>
           <div id="analytics-cameras" class="analytics-cameras" hidden></div>
           <p id="analytics-warning" class="analytics-warning" role="status" aria-live="polite" hidden></p>
-        </section>
+        </div></details>
 
-        <div class="panel-grid">
-          <section class="panel">
-            <div class="section-heading"><h2>Save captures</h2><span class="pill">On the server</span></div>
-            <p class="muted">Capture now or schedule a timelapse. Each frame is saved as a separate file.</p>
-            <form id="capture-form" data-action="capture">
-              <label for="destination">Destination</label><select id="destination"><option value="">Server filesystem</option></select>
-              <p id="destination-description" class="field-hint">Use a path on the server. The server must be able to write to it.</p>
-              <label for="output">Output path / filename</label><input id="output" value="captures/frame-{frame}.png" required spellcheck="false">
-              <p class="field-hint">For multiple frames, use a folder or include <code>{frame}</code>. Multiple frames run as a capture job. Files are never overwritten.</p>
-              <div class="form-grid"><div><label for="format">Format</label><select id="format"><option value="png">PNG</option><option value="jpeg">JPEG</option><option value="pgm">PGM</option><option value="ppm">PPM</option><option value="raw">Raw pixels</option></select></div><div><label for="count">Frame count</label><input id="count" type="number" value="1" min="1" max="100000" step="1" required></div></div>
-              <details class="advanced"><summary>Schedule &amp; storage limits</summary>
-                <div class="form-grid"><div><label for="interval">Interval (seconds)</label><input id="interval" type="number" value="10" min="0.001" step="0.001" required></div><div><label for="first-at">Start time (local)</label><input id="first-at" type="datetime-local" step="1"></div></div>
-                <p class="field-hint">Leave the start time empty to start now. Schedules run while the server is running.</p>
-                <div class="form-grid"><div><label for="max-mib">Storage limit (MiB)</label><input id="max-mib" type="number" value="10240" min="1" step="1" required></div><div><label for="max-files">Maximum files</label><input id="max-files" type="number" value="10000" min="1" max="100000" step="1" required></div></div>
-                <p class="field-hint">Captures stop when storage is full. Server limits also apply.</p>
-              </details>
-              <div class="button-row capture-actions"><button type="submit" class="primary camera-control" disabled>Capture now</button><button data-action="schedule" type="button" class="camera-control" disabled>Schedule timelapse</button></div>
-            </form>
-          </section>
-          <section class="panel jobs-panel"><div class="section-heading"><h2>Capture jobs</h2><button data-action="jobs" class="small camera-control" disabled>Refresh</button></div><div id="job-list"><p class="empty-state">No capture jobs yet.</p></div></section>
-        </div>
-
-        <section class="panel features-panel"><div class="section-heading"><h2>Camera features</h2><div class="button-row"><button data-action="auto" class="small camera-control" disabled>Auto exposure</button><button data-action="manual" class="small camera-control" disabled>Manual</button><button data-action="features" class="small camera-control" disabled>Reload</button></div></div><p class="muted">Edit live GenICam settings on the selected camera.</p><label class="sr-only" for="feature-filter">Search camera features</label><input id="feature-filter" type="search" placeholder="Search features, e.g. ExposureTime, Width, PixelFormat"><div id="feature-list" class="feature-list"><p class="empty-state">Connect a camera to inspect its features.</p></div></section>
-        <details class="panel logs-panel"><summary>Server activity <span id="log-count" class="muted"></span></summary><pre id="logs"></pre></details>
+        <details class="panel activity-panel disclosure-panel"><summary><span><span id="activity-title" class="disclosure-title">Session activity</span><span class="disclosure-hint">People, AI agents &amp; recent actions</span></span></summary><div class="disclosure-content">
+          <div class="activity-identity"><label for="actor-name">Your name</label><input id="actor-name" maxlength="32" autocomplete="nickname" aria-describedby="your-identity"><span id="your-identity" class="muted"></span></div>
+          <div id="activity-list" class="activity-list" tabindex="0" aria-label="Active and recent actions by every session participant"><p class="activity-empty muted">Actions from every person and AI agent appear here as they happen.</p></div>
+        </div></details>
+        <details class="panel logs-panel disclosure-panel"><summary><span><span class="disclosure-title">Server log</span><span class="disclosure-hint">Connection &amp; diagnostic messages</span></span><span id="log-count" class="summary-status"></span></summary><pre id="logs"></pre></details>
       </main>
     </div>
   </div>

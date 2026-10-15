@@ -44,11 +44,11 @@ On the laptop, open `http://100.101.102.103:8787/` to control the session direct
 
 ## Set up captures from the browser
 
-Connect a discovered camera or enter a camera ID, IP address or supported stream URL. Use `sim:0` to try the workflow without hardware. Select the camera, inspect its advertised features and edit settings, then start acquisition to see a live preview.
+Connect a discovered camera, or expand **More connection options** to enter a camera ID, IP address or supported stream URL. Use `sim:0` to try the workflow without hardware. Select the camera and start its stream to see a live preview. Expand **Camera settings** to inspect or edit its advertised controls.
 
 Capture output paths refer to the server's filesystem. A relative path resolves from the server's working directory. A saved destination refers to a folder or bucket configured on the server, and its output is a name inside that destination. The server enforces the same file ownership, never-overwrite, quota and retention rules as native Capturefab.
 
-Capture immediately, or configure a delayed/scheduled sequence with a count and interval. A multi-frame **Capture now** starts a background job with consecutive frames. Jobs continue when the browser tab closes or the laptop disconnects. Reopen the page to inspect progress or cancel a job. Stopping the server ends its camera connections and jobs; schedules do not survive a server restart.
+Use **Save frame** beside the live preview for an immediate capture. Expand **Capture options** to choose a format, frame count and storage limits; **Save frames** starts a background job when the count exceeds one. Expand **Timelapse schedule** to set an interval and optional start time. **Capture jobs** opens when you schedule a sequence. Jobs continue when the browser tab closes or the laptop disconnects. Reopen the page to inspect progress or cancel a job. Stopping the server ends its camera connections and jobs; schedules do not survive a server restart.
 
 Local scripts can keep using the same session:
 
@@ -58,7 +58,7 @@ capturefab --session remote --camera sim:0 set ExposureTime=5000
 capturefab --session remote --camera sim:0 jobs --json
 ```
 
-Several browser users and AI agents can drive the same cameras at once. Each tab keeps its own camera selection and drafts. **Session activity** stays visible above the preview and receives shared command changes immediately, including who submitted a command, its camera, queued/running/succeeded/failed state, saved files and scheduled job progress. Closing or reconnecting a tab does not erase the session history. Change the participant name in the browser to make your work recognizable; CLI agents can use `--actor focus-agent --actor-kind agent`. Same-camera commands run in order, while cameras operate independently and overlapping scheduled jobs share frames.
+Several browser users and AI agents can drive the same cameras at once. Each tab keeps its own camera selection and drafts. The latest shared action stays visible above the preview. Expand **Session activity** for the history, including who submitted each command, its camera, queued/running/succeeded/failed state, saved files and scheduled job progress. Closing or reconnecting a tab does not erase the session history. Change your participant name inside that section to make your work recognizable; CLI agents can use `--actor focus-agent --actor-kind agent`. Same-camera commands run in order, while cameras operate independently and overlapping scheduled jobs share frames.
 
 ## Optional HTTPS with Tailscale Serve
 

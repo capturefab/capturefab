@@ -9,6 +9,16 @@ use std::hash::{Hash, Hasher};
 /// The width of every control in the panel's forms and feature rows, so
 /// their edges line up.
 const CONTROL: f32 = 136.0;
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Section {
+    Features(&'static str),
+    CameraDetails,
+    CaptureOptions,
+    Automation,
+    EncoderOptions,
+}
+#[cfg(test)]
+mod disclosure_tests;
 #[cfg(test)]
 mod layout_tests;
 /// Room between the panel's sections.
@@ -426,6 +436,89 @@ fn offers_auto(profile: &CameraProfile) -> bool {
     .any(|capability| profile.supports(capability))
 }
 
+/// Live adjustments come before geometry, identification and transport setup.
+/// Match advertised names explicitly so vendor extensions remain in their groups.
+fn quick_feature_rank(name: &str, kind: CameraKind) -> Option<usize> {
+    let names: &[&str] = match kind {
+        CameraKind::LineScan => &[
+            "ExposureTime",
+            "ExposureTimeAbs",
+            "Gain",
+            "GainRaw",
+            "GainAbs",
+            "AcquisitionLineRateEnable",
+            "AcquisitionLineRate",
+            "AcquisitionLineRateAbs",
+            "LineRate",
+            "Height",
+            "BlockHeight",
+            "AcquisitionFrameHeight",
+        ],
+        CameraKind::Depth => &[
+            "ComponentSelector",
+            "ComponentEnable",
+            "Scan3dOutputMode",
+            "DepthMode",
+            "DepthMin",
+            "DepthMax",
+            "DistanceMin",
+            "DistanceMax",
+            "ConfidenceThreshold",
+        ],
+        CameraKind::Microscope => &[
+            "ObjectiveSelector",
+            "Objective",
+            "Magnification",
+            "FocusMode",
+            "FocusAuto",
+            "AutoFocus",
+            "Autofocus",
+            "FocusPosition",
+            "Focus",
+            "IlluminationMode",
+            "IlluminationEnable",
+            "IlluminationIntensity",
+            "Illumination",
+            "ExposureTime",
+            "ExposureTimeAbs",
+            "Gain",
+            "GainRaw",
+            "GainAbs",
+        ],
+        CameraKind::Thermal => &[
+            "TemperatureSelector",
+            "TemperatureLinearMode",
+            "TemperatureUnit",
+            "TemperatureRange",
+            "Emissivity",
+        ],
+        CameraKind::DocumentScanner => &["ScanSource", "ScanResolution", "ScanMode"],
+        CameraKind::AreaScan | CameraKind::Unknown => &[
+            "ExposureAuto",
+            "ExposureTime",
+            "ExposureTimeAbs",
+            "GainAuto",
+            "Gain",
+            "GainRaw",
+            "GainAbs",
+            "AcquisitionFrameRateEnable",
+            "AcquisitionFrameRate",
+            "AcquisitionFrameRateAbs",
+        ],
+    };
+    names.iter().position(|candidate| *candidate == name)
+}
+
+fn feature_search_aliases(name: &str) -> &'static str {
+    match name {
+        "Width" | "Height" => "image size dimensions resolution",
+        "AcquisitionFrameRate" | "AcquisitionFrameRateAbs" => "fps frame rate",
+        "ExposureTime" | "ExposureTimeAbs" => "exposure duration shutter",
+        "PixelFormat" => "pixel format colour color",
+        _ => "",
+    }
+}
+
 fn camera_guidance(kind: CameraKind) -> &'static str {
     match kind {
         CameraKind::AreaScan => "Set the image size, exposure and frame rate for each full image.",
@@ -490,6 +583,13 @@ fn forward_guidance(kind: CameraKind) -> Option<&'static str> {
 
 /// State for the settings panel.
 pub(super) struct InspectorState {
+    /// Disclosures are view preferences; searching temporarily reveals matches
+    /// without changing them or discarding camera drafts.
+    feature_groups_open: HashSet<&'static str>,
+    camera_details_open: bool,
+    capture_options_open: bool,
+    automation_open: bool,
+    encoder_options_open: bool,
     /// The last write or command that failed on each of the shown camera's
     /// features, as the whole error; show its first line at the row. Kept by
     /// `failed()` and cleared by the feature's next success, a new draft, a
@@ -535,6 +635,11 @@ pub(super) struct InspectorState {
 impl Default for InspectorState {
     fn default() -> Self {
         Self {
+            feature_groups_open: HashSet::new(),
+            camera_details_open: false,
+            capture_options_open: false,
+            automation_open: false,
+            encoder_options_open: false,
             write_errors: HashMap::new(),
             accepted: Flashes::new(ACCEPTED),
             capture_failed: None,
@@ -574,6 +679,7 @@ struct FeatureIndex {
     len: usize,
     /// Each group with its features' indices, in display order.
     groups: Vec<(&'static str, Vec<usize>)>,
+    quick: Vec<usize>,
     /// Each feature's label and tooltip.
     labels: Vec<String>,
     tips: Vec<String>,
@@ -651,14 +757,26 @@ impl FeatureIndex {
             .iter()
             .zip(&labels)
             .map(|(f, label)| {
-                format!("{}\n{}\n{label}\n{}", f.name, f.display_name, f.description).to_lowercase()
+                format!(
+                    "{}\n{}\n{label}\n{}\n{}",
+                    f.name,
+                    f.display_name,
+                    f.description,
+                    feature_search_aliases(&f.name)
+                )
+                .to_lowercase()
             })
             .collect();
+        let mut quick: Vec<_> = (0..features.len())
+            .filter(|&i| quick_feature_rank(&features[i].name, kind).is_some())
+            .collect();
+        quick.sort_by_key(|&i| quick_feature_rank(&features[i].name, kind));
         Self {
             key: Self::key(features, kind),
             kind,
             len: features.len(),
             groups,
+            quick,
             labels,
             tips,
             words,
@@ -680,6 +798,26 @@ enum Edit {
 
 /// The settings panel's hooks into the shared update cycle.
 impl Workbench {
+    pub(super) fn toggle_inspector_section(&mut self, section: Section) {
+        match section {
+            Section::Features(group) => {
+                if !self.inspect.feature_groups_open.remove(group) {
+                    self.inspect.feature_groups_open.insert(group);
+                }
+            }
+            Section::CameraDetails => {
+                self.inspect.camera_details_open = !self.inspect.camera_details_open
+            }
+            Section::CaptureOptions => {
+                self.inspect.capture_options_open = !self.inspect.capture_options_open
+            }
+            Section::Automation => self.inspect.automation_open = !self.inspect.automation_open,
+            Section::EncoderOptions => {
+                self.inspect.encoder_options_open = !self.inspect.encoder_options_open
+            }
+        }
+    }
+
     /// Point the settings panel's motions at what they show; from
     /// `sync_animations`.
     pub(super) fn sync_inspector(&mut self) {
@@ -911,6 +1049,12 @@ impl Workbench {
             ("inspector-search", _) => self.search = "gain".into(),
             ("inspector-nomatch", _) => self.search = "white balance".into(),
             ("inspector-storage", _) => self.storage_open = true,
+            // Documentation scenes use an isolated session and explicitly
+            // demonstrate its default policy, without touching the ledger.
+            ("inspector-storage-default", _) => self.storage_status.update(
+                storage_policy::Policy::try_from(StoragePolicy::default()),
+                self.now,
+            ),
             ("inspector-noforward", _) => self.forward_output.clear(),
             ("inspector-nocapture", _) => self.output.clear(),
             ("inspector-widest", _) => {
@@ -1070,6 +1214,16 @@ fn reason<'a>(why: &'a str, p: &'static Palette) -> Element<'a, Message> {
     text(why).size(style::SMALL).color(p.secondary).into()
 }
 
+/// Retain the slot even when empty so session changes cannot replace the next
+/// section's editor state. Empty slots reserve no vertical space.
+fn section_slot(content: Option<Element<'_, Message>>) -> Element<'_, Message> {
+    let gap = if content.is_some() { SECTION_GAP } else { 0.0 };
+    container(content.unwrap_or_else(|| space().width(Fill).height(0).into()))
+        .width(Fill)
+        .padding(iced::Padding::ZERO.bottom(gap))
+        .into()
+}
+
 /// Field captions and the toolbar own live announcements. Keep an action's
 /// explanation readable without announcing it again; quiet it during a retry.
 fn error_caption<'a>(message: String, quiet: bool, p: &'static Palette) -> Element<'a, Message> {
@@ -1136,9 +1290,9 @@ impl Workbench {
                     Action::CaptureTab.hint("Capture panel", os),
                 ),
                 (
-                    "Forward",
+                    "Video",
                     Some(Message::Tab(Tab::Forward)),
-                    Action::ForwardTab.hint("Forward panel", os),
+                    Action::ForwardTab.hint("Video recording and forwarding", os),
                 ),
             ],
             self.tab as usize,
@@ -1278,7 +1432,7 @@ impl Workbench {
                     .align_x(Alignment::Center),
                 row![
                     link("Set up capture", Some(Message::Tab(Tab::Capture))),
-                    link("Set up forwarding", Some(Message::Tab(Tab::Forward))),
+                    link("Record or stream video", Some(Message::Tab(Tab::Forward))),
                 ]
                 .spacing(4),
             ]
@@ -1301,37 +1455,79 @@ impl Workbench {
         let index = &self.inspect.index;
         let kind = self.camera_kind();
         let query = self.search.trim().to_lowercase();
-        let mut groups = column![].spacing(SECTION_GAP);
+        let searching = !query.is_empty();
+        let mut groups = iced::widget::keyed_column([]).spacing(SECTION_GAP);
+        if !searching && !index.quick.is_empty() {
+            groups = groups.push(
+                "quick",
+                column![
+                    section("Quick controls", None, p),
+                    self.feature_rows(&index.quick, p),
+                ]
+                .spacing(10),
+            );
+        }
         let mut matched = 0;
         for (group, members) in &index.groups {
-            let mut rows = column![].spacing(ROW_GAP);
-            let mut shown = false;
-            let mut locked = false;
-            for &i in members {
-                let Some(feature) = snapshot.features.get(i) else {
-                    continue;
+            let members: Vec<_> = members
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    snapshot.features.get(i).is_some()
+                        && if searching {
+                            query
+                                .split_whitespace()
+                                .all(|term| index.words[i].contains(term))
+                        } else {
+                            !index.quick.contains(&i)
+                        }
+                })
+                .collect();
+            matched += members.len();
+            if !members.is_empty() {
+                let failed = members.iter().any(|&i| {
+                    self.inspect
+                        .write_errors
+                        .contains_key(&snapshot.features[i].name)
+                });
+                let edited = members
+                    .iter()
+                    .filter(|&&i| self.edits.contains_key(&snapshot.features[i].name))
+                    .count();
+                let open = searching || failed || self.inspect.feature_groups_open.contains(group);
+                let mut summary = plural(members.len() as u64, "feature", "features");
+                if edited > 0 {
+                    summary.push_str(&format!(" · {edited} edited"));
+                }
+                let header = if searching {
+                    section(group, None, p)
+                } else {
+                    disclosure(
+                        *group,
+                        Some(summary),
+                        if open { 1.0 } else { 0.0 },
+                        Message::InspectorDisclosure(Section::Features(group)),
+                        p,
+                    )
                 };
-                if !query.is_empty() && !index.words[i].contains(&query) {
-                    continue;
+                let mut content = column![header].spacing(10);
+                if open {
+                    if let Some(guidance) = group_guidance(group, kind) {
+                        content = content.push(reason(guidance, p));
+                    }
+                    content = content.push(self.feature_rows(&members, p));
                 }
-                shown = true;
-                matched += 1;
-                locked |= self.stream_locks(feature);
-                rows = rows.push(self.feature(feature, &index.labels[i], &index.tips[i], p));
-            }
-            if shown {
-                let banner = locked.then(|| self.locked_banner(p));
-                let mut content = column![section(group, banner, p)].spacing(10);
-                if let Some(guidance) = group_guidance(group, kind) {
-                    content = content.push(reason(guidance, p));
-                }
-                groups = groups.push(content.push(rows));
+                groups = groups.push(*group, content);
             }
         }
         let refreshing = self.pending(Job::RefreshFeatures);
         let total = index.listed;
         let count = if query.is_empty() {
-            plural(total as u64, "feature", "features")
+            format!(
+                "{} quick · {} total",
+                index.quick.len(),
+                grouped(total as u64)
+            )
         } else {
             format!(
                 "{} of {} features",
@@ -1367,22 +1563,47 @@ impl Workbench {
         } else {
             groups.into()
         };
-        let mut content = column![].spacing(SECTION_GAP);
-        if let Some(profile) = snapshot.connected.as_ref().map(|camera| &camera.profile) {
-            content = content.push(self.camera_type_card(profile, p));
-        }
-        if snapshot.auto.is_some()
-            || snapshot
-                .connected
-                .as_ref()
-                .is_some_and(|camera| offers_auto(&camera.profile))
+        let mut content =
+            column![column![self.search_field(p), count].spacing(6)].spacing(SECTION_GAP);
+        if !searching
+            && (snapshot.auto.is_some()
+                || snapshot
+                    .connected
+                    .as_ref()
+                    .is_some_and(|camera| offers_auto(&camera.profile)))
         {
             content = content.push(self.auto_card(p));
         }
-        content
-            .push(column![self.search_field(p), count].spacing(6))
-            .push(list)
-            .into()
+        content = content.push(list);
+        if !searching
+            && let Some(profile) = snapshot.connected.as_ref().map(|camera| &camera.profile)
+        {
+            content = content.push(self.camera_type_card(profile, p));
+        }
+        content.into()
+    }
+
+    fn feature_rows<'a>(&'a self, members: &[usize], p: &'static Palette) -> Element<'a, Message> {
+        let mut rows = iced::widget::keyed_column([]).spacing(ROW_GAP);
+        if members
+            .iter()
+            .any(|&i| self.stream_locks(&self.snapshot.features[i]))
+        {
+            rows = rows.push(usize::MAX, self.locked_banner(p));
+        }
+        for &i in members {
+            let feature = &self.snapshot.features[i];
+            rows = rows.push(
+                i,
+                self.feature(
+                    feature,
+                    &self.inspect.index.labels[i],
+                    &self.inspect.index.tips[i],
+                    p,
+                ),
+            );
+        }
+        rows.into()
     }
 
     /// Camera type and the acquisition model it implies. Detection evidence
@@ -1404,26 +1625,21 @@ impl Workbench {
                 profile.evidence.join("\n")
             )
         };
-        let head = row![
-            tip(
-                text("Camera type").size(style::SMALL).color(p.secondary),
-                about
-            ),
-            space::horizontal(),
-            text(if profile.kind == CameraKind::Unknown {
-                "Unidentified".into()
-            } else {
-                profile.kind.to_string()
-            })
-            .size(style::BODY)
-            .font(style::SEMIBOLD),
-        ]
-        .align_y(Alignment::Center);
-        container(column![head, reason(camera_guidance(profile.kind), p)].spacing(8))
-            .padding(14)
-            .width(Fill)
-            .style(style::well)
-            .into()
+        let open = self.inspect.camera_details_open;
+        let mut content = column![disclosure(
+            "Camera details",
+            Some(profile.kind.to_string()),
+            if open { 1.0 } else { 0.0 },
+            Message::InspectorDisclosure(Section::CameraDetails),
+            p
+        )]
+        .spacing(8);
+        if open {
+            content = content
+                .push(reason(camera_guidance(profile.kind), p))
+                .push(text(about).size(style::SMALL).color(p.secondary));
+        }
+        content.into()
     }
 
     /// The feature search, with a button that clears it once it holds text.
@@ -1980,6 +2196,22 @@ impl Workbench {
         if let Some(guidance) = capture_guidance(kind) {
             head = head.push(reason(guidance, p));
         }
+        let options_open =
+            self.inspect.capture_options_open || self.drafts.contains_key(&Num::Timeout);
+        let mut options = column![disclosure(
+            "Capture options",
+            Some(format!(
+                "{} ms timeout",
+                grouped(self.capture_timeout(None))
+            )),
+            if options_open { 1.0 } else { 0.0 },
+            Message::InspectorDisclosure(Section::CaptureOptions),
+            p,
+        )]
+        .spacing(ROW_GAP);
+        if options_open {
+            options = options.push(form_row("Timeout", self.num(Num::Timeout), "ms", p));
+        }
         let mut save = column![
             head,
             accessibility::mapped(
@@ -2019,8 +2251,8 @@ impl Workbench {
                 "",
                 p,
             ),
-            form_row("Timeout", self.num(Num::Timeout), "ms", p),
             action,
+            options,
             checkbox(
                 "Capture on a schedule",
                 self.schedule_enabled,
@@ -2064,23 +2296,37 @@ impl Workbench {
                 save = save.push(error_caption(problem.to_string(), false, p));
             }
         }
+        let automation_open = self.inspect.automation_open;
+        let mut automation = column![disclosure(
+            "Shell & agents",
+            Some("CLI access".into()),
+            if automation_open { 1.0 } else { 0.0 },
+            Message::InspectorDisclosure(Section::Automation),
+            p
+        )]
+        .spacing(ROW_GAP);
+        if automation_open {
+            automation = automation
+                .push(reason(
+                    "Control this camera from a shell or coding agent while this window keeps it.",
+                    p,
+                ))
+                .push(self.copyable(self.session_command(), p));
+        }
+        // Session lifecycle changes the workflow; incoming suggestions do not
+        // move controls under the pointer. Stable slots preserve the editors
+        // when the session opens or closes.
+        let automatic_first = self.snapshot.capture_session.is_some();
         column![
-            self.auto_capture_settings(p),
-            save,
-            self.storage_settings(p),
-            self.jobs(p),
-            column![
-                section("Automation", None, p),
-                text(
-                    "Control this camera from a shell or coding agent while this window keeps it."
-                )
-                .size(style::SMALL)
-                .color(p.secondary),
-                self.copyable(self.session_command(), p),
-            ]
-            .spacing(ROW_GAP),
+            section_slot(automatic_first.then(|| self.auto_capture_settings(p))),
+            section_slot(Some(save.into())),
+            section_slot(
+                (self.schedule_enabled || !self.snapshot.jobs.is_empty()).then(|| self.jobs(p))
+            ),
+            section_slot((!automatic_first).then(|| self.auto_capture_settings(p))),
+            section_slot(Some(self.storage_settings(p))),
+            automation,
         ]
-        .spacing(SECTION_GAP)
         .into()
     }
 
@@ -2192,21 +2438,7 @@ impl Workbench {
         if let Some(guidance) = forward_guidance(self.camera_kind()) {
             content = content.push(reason(guidance, p));
         }
-        content.push(first)
-            .push(
-            self.storage_settings(p),
-            )
-            .push(
-            column![
-                section("Encoder availability", None, p),
-                text("Auto picks an available hardware or software encoder. To list what this computer has, run:")
-                    .size(style::SMALL)
-                    .color(p.secondary),
-                self.copyable("capturefab doctor".into(), p),
-            ]
-            .spacing(ROW_GAP),
-            )
-        .into()
+        content.push(first).push(self.storage_settings(p)).into()
     }
 
     fn forward_form(&self, p: &'static Palette) -> Element<'_, Message> {
@@ -2251,34 +2483,25 @@ impl Workbench {
         } else if let Some(problem) = problem {
             action = action.push(error_caption(problem.to_string(), false, p));
         }
-        column![
-            section(if recording { "Record to a file" } else { "Forward to a recorder" }, None, p),
-            text(if recording { "Save this camera's video to a recording file." } else { "Publish this camera to MediaMTX or an NVR." })
-                .size(style::SMALL)
-                .color(p.secondary),
-            accessibility::mapped(
-                self.record_to.view(&self.forward_output, "Stream URL or file", p,
-                    crate::destination::validate_output(self.record_to.selected.as_deref(), &self.forward_output)
-                        .and_then(|_| crate::media::validate_forward_output(&self.forward_output))
-                        .err().map(|error| error.to_string())),
-                Message::RecordPicker,
-            ),
-            form_row(
-                "Codec",
-                pick_list(
-                    &CODECS[..],
-                    find(&CODECS, self.forward_codec),
-                    Message::Codec
-                )
-                .name("Video codec")
-                .width(Fill)
-                .text_size(style::BODY)
-                .padding([5, 8])
-                .style(style::pick)
-                .menu_style(style::menu),
-                "",
-                p,
-            ),
+        let options_open = self.inspect.encoder_options_open
+            || crate::media::validate_encoder(self.forward_codec, self.forward_encoder.trim())
+                .is_err()
+            || self.drafts.contains_key(&Num::FileMib);
+        let encoder = if self.forward_encoder.trim() == "auto" {
+            "Automatic encoder"
+        } else {
+            self.forward_encoder.trim()
+        };
+        let mut options = column![disclosure(
+            "Encoder & limits",
+            Some(encoder.into()),
+            if options_open { 1.0 } else { 0.0 },
+            Message::InspectorDisclosure(Section::EncoderOptions),
+            p
+        )]
+        .spacing(ROW_GAP);
+        if options_open {
+            options = options.push(column![
             form_row(
                 "Encoder",
                 column![tip(
@@ -2297,23 +2520,6 @@ impl Workbench {
                 "",
                 p,
             ),
-            form_row("Frame rate", self.num(Num::Fps), "fps", p),
-            form_row(
-                "Bitrate",
-                column![text_input("4M", &self.forward_bitrate)
-                    .name("Recording bitrate")
-                    .description("An FFmpeg bitrate, such as 4M for four megabits per second.")
-                    .invalid(crate::media::validate_bitrate(self.forward_bitrate.trim()).err().map(|error| error.to_string()))
-                    .id("forward-bitrate")
-                    .on_input(Message::Bitrate)
-                    .size(style::BODY)
-                    .padding([5, 8])
-                    .width(Fill)
-                    .style(if crate::media::validate_bitrate(self.forward_bitrate.trim()).is_ok() { style::input } else { style::input_invalid }),
-                    self.forward_field_error(false, p)].spacing(4),
-                "",
-                p,
-            ),
             form_row(
                 "Maximum file",
                 tip(
@@ -2323,7 +2529,91 @@ impl Workbench {
                 "MiB",
                 p,
             ),
+                text("Auto chooses an available encoder. Check this computer's encoders with:")
+                    .size(style::SMALL).color(p.secondary),
+                self.copyable("capturefab doctor".into(), p),
+            ].spacing(ROW_GAP));
+        }
+        column![
+            section(
+                if recording {
+                    "Record to a file"
+                } else {
+                    "Record or stream video"
+                },
+                None,
+                p
+            ),
+            text(if recording {
+                "Save this camera's video to a recording file."
+            } else {
+                "Enter a video file path to record, or a stream URL to forward to a recorder."
+            })
+            .size(style::SMALL)
+            .color(p.secondary),
+            accessibility::mapped(
+                self.record_to.view(
+                    &self.forward_output,
+                    "Stream URL or file",
+                    p,
+                    crate::destination::validate_output(
+                        self.record_to.selected.as_deref(),
+                        &self.forward_output
+                    )
+                    .and_then(|_| crate::media::validate_forward_output(&self.forward_output))
+                    .err()
+                    .map(|error| error.to_string())
+                ),
+                Message::RecordPicker,
+            ),
+            form_row(
+                "Codec",
+                pick_list(
+                    &CODECS[..],
+                    find(&CODECS, self.forward_codec),
+                    Message::Codec
+                )
+                .name("Video codec")
+                .width(Fill)
+                .text_size(style::BODY)
+                .padding([5, 8])
+                .style(style::pick)
+                .menu_style(style::menu),
+                "",
+                p,
+            ),
+            form_row("Frame rate", self.num(Num::Fps), "fps", p),
+            form_row(
+                "Bitrate",
+                column![
+                    text_input("4M", &self.forward_bitrate)
+                        .name("Recording bitrate")
+                        .description("An FFmpeg bitrate, such as 4M for four megabits per second.")
+                        .invalid(
+                            crate::media::validate_bitrate(self.forward_bitrate.trim())
+                                .err()
+                                .map(|error| error.to_string())
+                        )
+                        .id("forward-bitrate")
+                        .on_input(Message::Bitrate)
+                        .size(style::BODY)
+                        .padding([5, 8])
+                        .width(Fill)
+                        .style(
+                            if crate::media::validate_bitrate(self.forward_bitrate.trim()).is_ok() {
+                                style::input
+                            } else {
+                                style::input_invalid
+                            }
+                        ),
+                    self.forward_field_error(false, p)
+                ]
+                .spacing(4),
+                "",
+                p,
+            ),
             action,
+            options,
         ]
         .spacing(ROW_GAP)
         .into()

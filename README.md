@@ -122,7 +122,7 @@ Build the WebAssembly client with `./web-client/build.sh`, then run a headless s
 
 ## Session analytics
 
-The desktop toolbar's **Analytics** button and the browser's **Session analytics** panel show acquired frames, payload throughput, missed frames and camera contributions for the current session. DuckDB collects one-second samples in memory, retaining at most 24 hours and 250,000 rows; totals continue across camera reconnects. The HTTP listener exposes JSON readiness at `/health`, Prometheus counters and gauges at `/metrics`, and the Plotters chart at `/api/analytics.svg`. See [analytics and monitoring](docs/remote-control.md#analytics-and-monitoring) for the endpoint contract and retention limits.
+The desktop toolbar's **Analytics** button and the browser's **Capture insights** section show acquired frames, payload throughput, missed frames and camera contributions for the current session. DuckDB collects one-second samples in memory, retaining at most 24 hours and 250,000 rows; totals continue across camera reconnects. The HTTP listener exposes JSON readiness at `/health`, Prometheus counters and gauges at `/metrics`, and the Plotters chart at `/api/analytics.svg`. See [analytics and monitoring](docs/remote-control.md#analytics-and-monitoring) for the endpoint contract and retention limits.
 
 The desktop also collects numeric video measurements from short prompts using OpenAI (ChatGPT), Gemini or Claude. Configure API keys in **Settings** using the OS credential store, or launch with `OPENAI_API_KEY`, `GEMINI_API_KEY` / `GOOGLE_API_KEY`, or `ANTHROPIC_API_KEY`. In **Analytics**, choose a model, add prompts such as “count the number of tubes” or “estimate the length of ribbon in meters,” and explicitly start collection on a live camera. Structured results feed DuckDB history and per-measurement charts. See [prompt-driven video analytics](docs/video-analytics.md) for setup, sampling and retention.
 
@@ -257,7 +257,7 @@ The budget covers capture/recording data, not unrelated files on the disk. Runti
 
 ## Save to external drives, folders or S3
 
-Captures, schedules and local recordings can go to a saved **destination**: a folder (on an external, removable or network drive, or anywhere on disk) or an S3-compatible bucket (AWS S3, Cloudflare R2, Backblaze B2, MinIO, Wasabi). In the GUI, **Save to** in the Capture and Forward panels lists destinations and connected external drives (one click saves to a `Capturefab` folder on the drive); **Manage…** adds folders with the system folder picker and buckets with provider presets, then tests them.
+Captures, schedules and local recordings can go to a saved **destination**: a folder (on an external, removable or network drive, or anywhere on disk) or an S3-compatible bucket (AWS S3, Cloudflare R2, Backblaze B2, MinIO, Wasabi). In the GUI, **Save to** in the Capture and Video panels lists destinations and connected external drives (one click saves to a `Capturefab` folder on the drive); **Manage…** adds folders with the system folder picker and buckets with provider presets, then tests them.
 
 ```sh
 capturefab volumes --json                                   # external, removable and network volumes

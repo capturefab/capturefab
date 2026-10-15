@@ -19,6 +19,8 @@ const COOLDOWN: [Choice; 4] = [
 
 #[derive(Clone, Debug)]
 pub(super) enum Input {
+    Setup(bool),
+    Options(bool),
     New,
     Resume,
     Chosen {
@@ -43,6 +45,8 @@ pub(super) enum Input {
 #[derive(Default)]
 pub(super) struct State {
     pub open: bool,
+    setup_open: bool,
+    options_open: bool,
     dialog_busy: bool,
     last_directory: Option<PathBuf>,
     session: Option<(String, String)>,
@@ -222,6 +226,8 @@ impl Workbench {
 
     pub(super) fn update_autocapture(&mut self, event: Input) -> Task<Message> {
         match event {
+            Input::Setup(open) => self.auto_capture.setup_open = open,
+            Input::Options(open) => self.auto_capture.options_open = open,
             Input::New | Input::Resume => {
                 if self.capture_session_busy()
                     || self.snapshot.connected.is_none()
@@ -457,6 +463,8 @@ impl Workbench {
                     .map(std::path::Path::to_owned);
             }
             self.auto_capture.session = context;
+            self.auto_capture.setup_open = false;
+            self.auto_capture.options_open = false;
             self.auto_capture.card = None;
             self.auto_capture.error = None;
             self.auto_capture.open = false;
@@ -522,6 +530,7 @@ impl Workbench {
         let busy = self.capture_session_busy();
         let can_open = self.snapshot.capture_session.is_none();
         let connected = self.snapshot.connected.is_some() && !self.scanner_selected();
+        let expanded = !can_open || self.auto_capture.setup_open;
         let action = |label: String, event, enabled: bool| {
             button(center(text(label).size(style::BODY)).height(Length::Shrink))
                 .width(Fill)
@@ -529,15 +538,28 @@ impl Workbench {
                 .style(style::secondary)
                 .on_press_maybe(enabled.then_some(input(event)))
         };
-        let mut content = column![
+        let header: Element<'_, Message> = if can_open {
+            disclosure(
+                "Automatic capture",
+                (!expanded).then(|| "Teach & review".into()),
+                if expanded { 1.0 } else { 0.0 },
+                input(Input::Setup(!expanded)),
+                p,
+            )
+        } else {
             text("Automatic capture")
                 .size(style::BODY)
-                .font(style::BOLD),
-            text("Teach with captures you want. Review suggestions to improve this session.")
-                .size(style::SMALL)
-                .color(p.secondary),
-        ]
-        .spacing(9);
+                .font(style::BOLD)
+                .into()
+        };
+        let mut content = column![header].spacing(9);
+        if !expanded {
+            return container(content)
+                .padding(12)
+                .width(Fill)
+                .style(style::well)
+                .into();
+        }
         if let Some(status) = &self.snapshot.capture_session {
             let name = std::path::Path::new(&status.path)
                 .file_name()
@@ -560,7 +582,40 @@ impl Workbench {
                 .push(
                     text(state_guidance(&status.state))
                         .size(style::SMALL)
-                        .color(p.secondary),
+                        .color(
+                            if status.blocked_storage
+                                || matches!(
+                                    status.state.as_str(),
+                                    "storage_full" | "review_queue_full"
+                                )
+                            {
+                                p.ink(p.warn)
+                            } else {
+                                p.secondary
+                            },
+                        ),
+                )
+                .push(
+                    text(format!(
+                        "{} · {} kept · {} discarded",
+                        super::format::plural(status.manual_count, "example", "examples"),
+                        grouped(status.kept_count),
+                        grouped(status.discarded_count),
+                    ))
+                    .size(style::SMALL)
+                    .color(p.secondary),
+                )
+                .push(
+                    action(
+                        format!("Review suggestions ({})", grouped(status.pending_count)),
+                        Input::Review(true),
+                        !busy,
+                    )
+                    .style(if status.pending_count > 0 {
+                        style::primary
+                    } else {
+                        style::secondary
+                    }),
                 )
                 .push(
                     action(
@@ -573,25 +628,53 @@ impl Workbench {
                         Input::Teach,
                         connected && !busy,
                     )
-                    .style(style::primary),
+                    .style(if status.pending_count == 0 {
+                        style::primary
+                    } else {
+                        style::secondary
+                    }),
                 )
                 .push(
                     text("Saves the frame in this database. Capture & save also teaches it.")
                         .size(style::SMALL)
                         .color(p.secondary),
-                )
-                .push(
+                );
+            let sensitivity = if status.sensitivity < 0.4 {
+                SENSITIVITY[0]
+            } else if status.sensitivity > 0.65 {
+                SENSITIVITY[2]
+            } else {
+                SENSITIVITY[1]
+            };
+            let gap = if status.cooldown_ms.is_multiple_of(1000) {
+                format!("{} s", grouped(status.cooldown_ms / 1000))
+            } else {
+                format!("{} ms", grouped(status.cooldown_ms))
+            };
+            let summary = format!(
+                "{} · {gap}",
+                match sensitivity.value {
+                    "0.25" => "Fewer",
+                    "0.8" => "More",
+                    _ => "Balanced",
+                },
+            );
+            let open = self.auto_capture.options_open;
+            let mut options = column![disclosure(
+                "Suggestion settings",
+                (!open).then_some(summary),
+                if open { 1.0 } else { 0.0 },
+                input(Input::Options(!open)),
+                p,
+            )]
+            .spacing(9);
+            if open {
+                options = options.push(
                     row![
                         text("Suggestions").size(style::SMALL).width(85),
                         pick_list(
                             &SENSITIVITY[..],
-                            Some(if status.sensitivity < 0.4 {
-                                SENSITIVITY[0]
-                            } else if status.sensitivity > 0.65 {
-                                SENSITIVITY[2]
-                            } else {
-                                SENSITIVITY[1]
-                            }),
+                            Some(sensitivity),
                             |choice| input(Input::Sensitivity(choice)),
                         )
                         .name("Auto capture sensitivity")
@@ -624,48 +707,32 @@ impl Workbench {
                     .spacing(8)
                     .align_y(Alignment::Center),
                 )
-                .push(
-                    text(format!(
-                        "{} · {} kept · {} discarded",
-                        super::format::plural(status.manual_count, "example", "examples"),
-                        grouped(status.kept_count),
-                        grouped(status.discarded_count),
-                    ))
-                    .size(style::SMALL)
-                    .color(p.secondary),
-                )
-                .push(action(
-                    format!("Review suggestions ({})", grouped(status.pending_count)),
-                    Input::Review(true),
-                    !busy,
-                ))
                 .push(tip(
                     text(&status.model).size(style::CAPTION).color(p.secondary),
                     "The model learns from examples and keep/discard feedback in this database.",
                 ));
+            }
+            content = content.push(options);
         } else {
-            content = content.push(text(if connected {
+            content = content.push(
+                text("Teach with captures you want. Review suggestions to improve this session.")
+                    .size(style::SMALL)
+                    .color(p.secondary),
+            ).push(text(if connected {
                 "Create a session or resume a .duckdb file. Frames, examples and reviews stay together."
             } else {
                 "Connect a streaming camera, then create or resume a capture session."
             }).size(style::SMALL).color(p.secondary));
         }
-        content = content.push(
-            row![
-                action(
-                    "New session".into(),
-                    Input::New,
-                    connected && !busy && can_open
-                ),
-                action(
-                    "Resume…".into(),
-                    Input::Resume,
-                    connected && !busy && can_open
-                ),
-            ]
-            .spacing(8),
-        );
-        if self.snapshot.capture_session.is_some() {
+        if can_open {
+            content = content.push(
+                row![
+                    action("New session".into(), Input::New, connected && !busy),
+                    action("Resume…".into(), Input::Resume, connected && !busy),
+                ]
+                .spacing(8),
+            );
+        } else {
             content = content
                 .push(
                     button(text("Save & close session").size(style::SMALL))
@@ -683,7 +750,7 @@ impl Workbench {
         container(content)
             .padding(12)
             .width(Fill)
-            .style(style::code)
+            .style(style::well)
             .into()
     }
 

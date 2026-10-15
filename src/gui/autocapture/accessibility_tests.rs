@@ -79,6 +79,150 @@ fn named<'a>(
         .unwrap_or_else(|| panic!("missing native node {name}"))
 }
 
+fn settings_snapshot(
+    app: &Workbench,
+    renderer: &iced::Renderer,
+) -> (accesskit::TreeUpdate, accessibility::Bridge, window::Id) {
+    let mut view = app.auto_capture_settings(Palette::of(false));
+    let mut tree = Tree::new(view.as_widget());
+    let node = view.as_widget_mut().layout(
+        &mut tree,
+        renderer,
+        &layout::Limits::new(Size::ZERO, Size::new(INSPECTOR - 38.0, 1600.0)),
+    );
+    accessibility::snapshot_widget(
+        view.as_widget_mut(),
+        &mut tree,
+        Layout::new(&node),
+        renderer,
+    )
+}
+
+#[test]
+fn inactive_automatic_capture_reveals_setup_through_a_native_disclosure() {
+    let renderer = crate::gui::destinations::layout_tests::renderer();
+    let mut app = Workbench::new(SessionHandle::new(), "capture-setup".into(), true, None);
+    let (snapshot, bridge, window) = settings_snapshot(&app, &renderer);
+    let (id, disclosure) = named(&snapshot, "Automatic capture");
+    assert_eq!(disclosure.role(), accessibility::Role::DisclosureTriangle);
+    assert_eq!(disclosure.is_expanded(), Some(false));
+    assert_eq!(disclosure.description(), Some("Teach & review"));
+    assert!(
+        !snapshot
+            .nodes
+            .iter()
+            .any(|(_, node)| node.label() == Some("New session"))
+    );
+    let bounds = disclosure.bounds().unwrap();
+    assert!(bounds.x0 >= 0.0 && bounds.x1 <= f64::from(INSPECTOR - 38.0));
+
+    let mut actions = iced_runtime::task::into_stream(bridge.dispatch(accessibility::Request {
+        window,
+        replay: None,
+        action: accesskit::ActionRequest {
+            action: accesskit::Action::Click,
+            target: id,
+            data: None,
+        },
+    }))
+    .unwrap();
+    let event = match iced::futures::executor::block_on(actions.next()) {
+        Some(iced_runtime::Action::Output(Message::AutoCapture(event @ Input::Setup(true)))) => {
+            event
+        }
+        _ => panic!("disclosure opens automatic capture setup"),
+    };
+    drop(app.update_autocapture(event));
+    let (snapshot, _, _) = settings_snapshot(&app, &renderer);
+    assert_eq!(
+        named(&snapshot, "Automatic capture").1.is_expanded(),
+        Some(true)
+    );
+    for label in ["New session", "Resume…"] {
+        assert_eq!(
+            named(&snapshot, label).1.role(),
+            accessibility::Role::Button
+        );
+    }
+    drop(app.update_autocapture(Input::Setup(false)));
+    let (snapshot, _, _) = settings_snapshot(&app, &renderer);
+    assert!(
+        !snapshot
+            .nodes
+            .iter()
+            .any(|(_, node)| node.label() == Some("New session"))
+    );
+    assert!(
+        app.pending.is_empty(),
+        "disclosure has no camera side effects"
+    );
+}
+
+#[test]
+fn active_capture_sessions_keep_reviews_counts_and_capacity_guidance_visible() {
+    let renderer = crate::gui::destinations::layout_tests::renderer();
+    let mut app = app();
+    app.auto_capture.setup_open = false;
+    app.snapshot.capture_session.as_mut().unwrap().state = "review_queue_full".into();
+    let (snapshot, bridge, window) = settings_snapshot(&app, &renderer);
+    for label in [
+        "Capture example",
+        "Review suggestions (3)",
+        "1 example · 0 kept · 0 discarded",
+        state_guidance("review_queue_full"),
+        "Save & close session",
+    ] {
+        named(&snapshot, label);
+    }
+    assert!(!snapshot.nodes.iter().any(|(_, node)| {
+        node.role() == accessibility::Role::DisclosureTriangle
+            && node.label() == Some("Automatic capture")
+    }));
+    let (_, review) = named(&snapshot, "Review suggestions (3)");
+    let (_, teach) = named(&snapshot, "Capture example");
+    let (options_id, options) = named(&snapshot, "Suggestion settings");
+    assert_eq!(options.is_expanded(), Some(false));
+    assert_eq!(options.description(), Some("Balanced · 2 s"));
+    assert!(review.bounds().unwrap().y1 <= teach.bounds().unwrap().y0);
+    assert!(teach.bounds().unwrap().y1 <= options.bounds().unwrap().y0);
+    assert!(
+        !snapshot
+            .nodes
+            .iter()
+            .any(|(_, node)| node.label() == Some("Auto capture sensitivity"))
+    );
+    let mut actions = iced_runtime::task::into_stream(bridge.dispatch(accessibility::Request {
+        window,
+        replay: None,
+        action: accesskit::ActionRequest {
+            action: accesskit::Action::Click,
+            target: options_id,
+            data: None,
+        },
+    }))
+    .unwrap();
+    match iced::futures::executor::block_on(actions.next()) {
+        Some(iced_runtime::Action::Output(Message::AutoCapture(event @ Input::Options(true)))) => {
+            drop(app.update_autocapture(event));
+        }
+        _ => panic!("suggestion settings opens through the native disclosure"),
+    }
+    let (snapshot, _, _) = settings_snapshot(&app, &renderer);
+    for label in [
+        "Auto capture sensitivity",
+        "Minimum gap between auto captures",
+        state_guidance("review_queue_full"),
+    ] {
+        named(&snapshot, label);
+    }
+    assert!(
+        !snapshot
+            .nodes
+            .iter()
+            .any(|(_, node)| node.label() == Some("New session"))
+    );
+}
+
 #[test]
 fn review_image_and_live_outcomes_belong_to_the_dialog_and_preserve_controls() {
     let renderer = crate::gui::destinations::layout_tests::renderer();

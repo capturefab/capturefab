@@ -673,6 +673,7 @@ enum Message {
     /// Show the inspector on `Tab`, from anywhere.
     ShowTab(Tab),
     Search(String),
+    InspectorDisclosure(inspector::Section),
     RefreshFeatures,
     Auto(bool),
     Balance(f64),
@@ -2820,6 +2821,7 @@ impl Workbench {
                 return operation::focus(format!("inspector-tab-{}", tab as usize));
             }
             Message::Search(value) => self.search = value,
+            Message::InspectorDisclosure(section) => self.toggle_inspector_section(section),
             Message::RefreshFeatures => {
                 self.edits.clear();
                 self.edit_sources.clear();

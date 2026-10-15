@@ -1,17 +1,17 @@
 {
   "method": "Actual iced desktop renderer screenshots; crop only, no generated or reconstructed interface.",
-  "source_note": "Current development desktop build with semantic light/dark colors and contrast-checked text, controls and image overlays.",
-  "binary_sha256": "758e390e527f4559c7d4d6dd8e7bd67b480e7be1dba02d21b96fee24fa253831",
+  "source_note": "Current development desktop build with Quick controls, capture and review controls ordered for the current task, the Video tab and progressive disclosures for less common settings.",
+  "binary_sha256": "6a203776cf1fa41f8394d4cd94bbd17e30e1d9daa69a47b0bbdbdc909d7f0f29",
   "logical_window": [
     1100,
     700
   ],
-  "demo": "Built-in simulator cameras. Destination names, paths and scheduled jobs are built-in demonstration scenes.",
+  "demo": "Built-in simulator cameras. Destination names, paths and scheduled jobs are built-in demonstration scenes. Capture, scheduling and Video scenes use the validated default storage policy as a read-only display fixture without accessing a storage ledger.",
   "images": [
     {
       "file": "workspace.png",
       "source": "source/workspace.png",
-      "source_sha256": "ffaa6bb8a472b4b71835aa62f17b2c3030e4a789cc8d422bd687a4a140c05e88",
+      "source_sha256": "6afae7aa82e8d4aed40a30982f9e8269d055511e45312ad94f8f24ecdb6613dc",
       "source_size": [
         2200,
         1400
@@ -26,14 +26,14 @@
         2200,
         1400
       ],
-      "sha256": "ffaa6bb8a472b4b71835aa62f17b2c3030e4a789cc8d422bd687a4a140c05e88",
+      "sha256": "6afae7aa82e8d4aed40a30982f9e8269d055511e45312ad94f8f24ecdb6613dc",
       "scene": "dark,features,focus,exposure",
       "description": "Four simulator cameras in the live workbench, with camera list and the selected camera's inspector."
     },
     {
       "file": "cameras.png",
       "source": "source/workspace.png",
-      "source_sha256": "ffaa6bb8a472b4b71835aa62f17b2c3030e4a789cc8d422bd687a4a140c05e88",
+      "source_sha256": "6afae7aa82e8d4aed40a30982f9e8269d055511e45312ad94f8f24ecdb6613dc",
       "source_size": [
         2200,
         1400
@@ -48,14 +48,14 @@
         480,
         1400
       ],
-      "sha256": "cf76d26dcf49e457a407c931d33e8bd32eb5cc625d2b5c0368c172928d7de9a3",
+      "sha256": "0a57d7827d43be644b15bfb8d52da0bdafa4fdffcf0968ef735b578dac654122",
       "scene": "dark,features,focus,exposure",
       "description": "Connected simulator camera list and controls for finding or adding a source."
     },
     {
       "file": "features.png",
       "source": "source/features.png",
-      "source_sha256": "92a39e71fc52b632b14ef65d1f0f735f37438abbe3fb63eeadfb13f62f7bac00",
+      "source_sha256": "06111af33287f157fa5db2670c1b77b3e3af9b59c73acb852a3c4e61af5c7e67",
       "source_size": [
         2200,
         1400
@@ -70,14 +70,14 @@
         632,
         1304
       ],
-      "sha256": "26557439ba06a3147491bb4a7bf5153398ef73d5d6aa7e8fcea044b0bc4bf1e5",
+      "sha256": "564d9acc11887b436a762f6c5c9958cb7fa25b1be5c96f41bc564fe824b22e8f",
       "scene": "dark,features,noscopes",
-      "description": "The selected camera's Features inspector with GenICam names, bounds and editable values."
+      "description": "Quick controls for the selected camera, with search and collapsed feature groups for less common settings."
     },
     {
       "file": "capture.png",
       "source": "source/capture.png",
-      "source_sha256": "91a1f9274433bb37478f3b026de2b24242bb564a5bef54f3b1de6eaa1402894a",
+      "source_sha256": "9a4dd0c8094e5f1cfc58c22fe033cbe78f40881ff5067a8176c0fe0faf34c2b6",
       "source_size": [
         2200,
         1400
@@ -86,20 +86,20 @@
         1568,
         0,
         2200,
-        1304
+        1400
       ],
       "size": [
         632,
-        1304
+        1400
       ],
-      "sha256": "df7ec40d557e5294e939d11152805b2702fca60de1d6b392a7409624f3b8d3ed",
-      "scene": "dark,capture,noscopes,inspector-storage",
-      "description": "Save frames form, output format, timeout and global storage limits."
+      "sha256": "e4e7c6d8dbd806fd7d3f2853becca7ebc3c85d3156120b8a2806917fbbd61464",
+      "scene": "dark,capture,noscopes,inspector-storage-default",
+      "description": "Ordinary capture controls first, followed by Capture options, scheduling, Automatic capture, Storage and retention, and Shell and agents disclosures; no automatic capture session is open in this scene."
     },
     {
       "file": "schedule.png",
       "source": "source/schedule.png",
-      "source_sha256": "96faafd122e3071af0d38de61fbd072be6c40e573a23113f9aebdc8115136eb3",
+      "source_sha256": "f31d486ab55230679a766f044197bedc28951b1e42ae609bcf7c9bde29c57a29",
       "source_size": [
         2200,
         1400
@@ -114,14 +114,14 @@
         570,
         358
       ],
-      "sha256": "a6e89f0c023a713de15ae61f8a31918240236ab451985f00340ae535f1c6577b",
-      "scene": "dark,capture,noscopes,inspector-widest,scheduled",
+      "sha256": "f52d11f1bce916c6f873b063b3080d7713ca03fb4403bdb5fff656bab2a02cee",
+      "scene": "dark,capture,noscopes,inspector-widest,inspector-storage-default,scheduled",
       "description": "The capture scheduling form with start delay and frame interval."
     },
     {
       "file": "destinations.png",
       "source": "source/destinations.png",
-      "source_sha256": "8c1f11df3c6c09a8ab97a8234076fd8a4e6b964d7d9c5d046c3690f12ca0e2ab",
+      "source_sha256": "999a0d65f242d64051086309e7934ef1b639584d8556768a4ebca5ab7890b9e4",
       "source_size": [
         2200,
         1400
@@ -136,14 +136,14 @@
         1144,
         704
       ],
-      "sha256": "bdd1b2283a63bd4dcba9b8726f50e8a35a4f34f6c90e6883e0005aecf2da0871",
+      "sha256": "a223bf2a66403a38f9859be339592f6b720f66fd84728132c564765f98c7583c",
       "scene": "dark,destinations-list,noscopes",
       "description": "Destination manager showing example folder and S3-compatible bucket destinations."
     },
     {
       "file": "scopes.png",
       "source": "source/scopes.png",
-      "source_sha256": "3a95dc953886c129ce04475bd3a24dedb19567964389baaef3a9c377561b15bd",
+      "source_sha256": "258db24f6985d41e45895c94d554071c806b1933a0c10e1f98c07a4449c38587",
       "source_size": [
         2200,
         1400
@@ -158,14 +158,14 @@
         1316,
         804
       ],
-      "sha256": "8c5e108f41248442f4a3b13b0d05fe731d23ada816b0c2fa77e49c076d4533ba",
+      "sha256": "40b6138fa0ef63f0eb0a06d79f2574d70a19193bad82db86cdb8e1fcf57744ed",
       "scene": "dark,noinspector,nosidebar,focus,exposure",
       "description": "Live focus metric and exposure histogram alongside the focus region on a simulator image."
     },
     {
       "file": "forwarding.png",
       "source": "source/forwarding.png",
-      "source_sha256": "ee6805dbbded043468e5933a7f54006158adeb7d5fa8df6115789f1da82cd02b",
+      "source_sha256": "aac14d67e3f80aeb29ac72aa28f507c5a179e0478c30568071a5054bfcc59368",
       "source_size": [
         2200,
         1400
@@ -180,29 +180,29 @@
         632,
         1200
       ],
-      "sha256": "8e6937f795b24531295621f70bd1b94b5b10af5cfbbc4d3c6b54d0a6928daeb1",
-      "scene": "dark,forward,noscopes",
-      "description": "Forward and record form with codec, bitrate, frame rate and encoder settings."
+      "sha256": "8c4d97cf44c2e3a09dd5be78d768df98516b1e1147153fa382f7b0424259adc8",
+      "scene": "dark,forward,noscopes,inspector-storage-default",
+      "description": "Video panel with destination, codec, frame rate, bitrate and a start action, followed by the Encoder and limits disclosure."
     },
     {
       "file": "history.png",
       "source": "source/destinations.png",
-      "source_sha256": "8c1f11df3c6c09a8ab97a8234076fd8a4e6b964d7d9c5d046c3690f12ca0e2ab",
+      "source_sha256": "999a0d65f242d64051086309e7934ef1b639584d8556768a4ebca5ab7890b9e4",
       "source_size": [
         2200,
         1400
       ],
       "crop_pixels": [
         576,
-        872,
+        476,
         928,
-        950
+        554
       ],
       "size": [
         352,
         78
       ],
-      "sha256": "4bafd332f99011ea2b2adb532fbc2256b7724f5fd047c1c0878947afe6596748",
+      "sha256": "2358c94db1c5f5c78c3fbcbfc6ae4404d3ab7d021ac54d440aae356b30ccc772",
       "scene": "dark,destinations-list,noscopes",
       "description": "Undo and Redo controls in the destination manager; macOS keyboard shortcuts are shown."
     }

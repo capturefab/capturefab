@@ -285,6 +285,7 @@ pub(super) fn disclosure<'a, M: Clone + 'static>(
 ) -> Element<'a, M> {
     let title = title.into_fragment();
     let name = title.to_string();
+    let description = summary.clone().unwrap_or_default();
     // The font's chevrons at rest, like every other; drawn only mid-turn.
     let chevron = if turn <= 0.0 || turn >= 1.0 {
         icon(
@@ -325,6 +326,7 @@ pub(super) fn disclosure<'a, M: Clone + 'static>(
     // Flush with the content's edge; the hover fill still has room on the right.
     button(header)
         .name(name)
+        .description(description)
         .role(accessibility::Role::DisclosureTriangle)
         .expanded(turn > 0.5)
         .width(Fill)
