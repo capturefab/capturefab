@@ -69,6 +69,7 @@ impl Fixture {
                 .as_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         let executable = dir.join("scanimage-fixture");
         fs::write(&executable, FAKE_SCANIMAGE).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -87,7 +88,8 @@ impl Fixture {
             .unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&line).unwrap()["result"]["ready"],
-            true
+            true,
+            "{line}"
         );
         Self {
             child,

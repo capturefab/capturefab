@@ -3081,7 +3081,11 @@ mod tests {
     #[test]
     fn pending_save_blocks_edits_and_only_success_creates_global_history() {
         let mut picker = Picker::new(false, false);
-        let mut output = "/tmp/capture.png".to_string();
+        let initial = std::env::temp_dir()
+            .join("capture.png")
+            .to_string_lossy()
+            .into_owned();
+        let mut output = initial.clone();
         let mut editor = bucket(|e| e.source = Source::Environment);
         let (sender, receiver) = channel();
         editor.saving = Some((editor.destination().unwrap(), receiver));
@@ -3103,7 +3107,7 @@ mod tests {
         let changes = picker.take_changes();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].label(), "Add destination line-1");
-        assert_eq!(changes[0].before_selection.output, "/tmp/capture.png");
+        assert_eq!(changes[0].before_selection.output, initial);
         assert_eq!(changes[0].after_selection.output, "capture.png");
         assert!(!picker.mutation_busy());
         assert!(picker.take_changes().is_empty(), "delivered once");
@@ -3459,12 +3463,13 @@ mod tests {
 
     #[test]
     fn destination_paths_preserve_meaningful_whitespace() {
-        let editor = Editor::new_folder("archive".into(), "/tmp/archive ".into());
+        let folder = std::env::temp_dir().join("archive ");
+        let editor = Editor::new_folder("archive".into(), folder.clone());
         let destination = editor.destination().unwrap();
         let Target::Folder { path } = destination.target else {
             panic!("expected folder destination");
         };
-        assert_eq!(path, PathBuf::from("/tmp/archive "));
+        assert_eq!(path, folder);
 
         let editor = bucket(|e| e.prefix = " images ".into());
         let destination = editor.destination().unwrap();

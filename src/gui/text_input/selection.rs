@@ -26,6 +26,7 @@ pub(in crate::gui) trait ParagraphGeometry: text::Paragraph {
     }
 }
 
+#[cfg(debug_assertions)]
 impl ParagraphGeometry for () {
     fn visual_geometry(&self, _: cursor::State) -> Option<text_input::VisualGeometry> {
         None

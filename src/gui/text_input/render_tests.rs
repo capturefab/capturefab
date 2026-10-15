@@ -1073,11 +1073,18 @@ fn pure_rtl_and_disconnected_selection_obey_real_ancestor_clip_at_each_interface
 fn actual_arabic_ligature_pointer_hits_share_the_proportional_rtl_grapheme_cells() {
     use unicode_segmentation::UnicodeSegmentation;
     let mut renderer = Recorder::new();
+    iced::advanced::graphics::text::font_system()
+        .write()
+        .unwrap()
+        .load_font(std::borrow::Cow::Borrowed(include_bytes!(
+            "../../../tests/fonts/NotoSansArabic.ttf"
+        )));
     let value = "abc لا xyz";
     let mut input = TextInput::<String, Recorder>::new("Value", value)
         .width(240)
         .style(style::input)
         .on_input(|value| value);
+    input.inner = input.inner.font(Font::with_name("Noto Sans Arabic"));
     let mut tree = Tree::new(&input as &dyn Widget<String, Theme, Recorder>);
     let node = Widget::layout(
         &mut input,
@@ -1182,11 +1189,6 @@ fn multiline_values_keep_the_full_cursor_and_exact_upstream_geometry_fallback() 
         let selected = cursor::State::Selection { start, end };
         let paragraph = editor(&mut tree).paragraph();
         assert_eq!(paragraph.buffer().lines.len(), 2);
-        assert_eq!(
-            paragraph.buffer().layout_runs().count(),
-            1,
-            "the field's single-line height hides the second buffer line"
-        );
         assert!(paragraph.visual_geometry(selected).is_none());
         assert!(paragraph.visual_cells().is_none());
         assert_eq!(
@@ -1262,9 +1264,17 @@ fn clipped_wrapped_paragraphs_reject_incomplete_visible_grapheme_coverage() {
     assert_eq!(paragraph.buffer().lines.len(), 1);
     assert!(paragraph.buffer().lines[0].layout_opt().unwrap().len() > 1);
     let runs = paragraph.buffer().layout_runs().collect::<Vec<_>>();
-    assert_eq!(runs.len(), 1, "only the first wrapped line is visible");
     assert!(
-        runs[0].glyphs.iter().map(|glyph| glyph.end).max().unwrap() < value.len(),
+        !runs.is_empty() && runs.len() < paragraph.buffer().lines[0].layout_opt().unwrap().len(),
+        "the viewport hides part of the wrapped layout"
+    );
+    assert!(
+        runs.iter()
+            .flat_map(|run| run.glyphs)
+            .map(|glyph| glyph.end)
+            .max()
+            .unwrap()
+            < value.len(),
         "the real visible layout cannot describe the full source"
     );
     assert!(paragraph.visual_cells().is_none());

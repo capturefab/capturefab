@@ -873,7 +873,11 @@ mod tests {
         widget
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut native);
-        let requested = native.replace.as_ref().unwrap()("/tmp/🇨🇦.png".into());
+        let absolute = std::env::temp_dir()
+            .join("🇨🇦.png")
+            .to_string_lossy()
+            .into_owned();
+        let requested = native.replace.as_ref().unwrap()(absolute);
         let acknowledgement = native.input.as_ref().unwrap().acknowledgement().unwrap();
         // An ordinary diff before the callback must not accept a speculative
         // draft; the mapped message uses the application's real update hook.

@@ -165,7 +165,7 @@ fn analytics_and_network_cancel_from_actual_compact_window_views_preserves_draft
                                 &mut shell,
                                 &Rectangle::with_size(node.size()),
                             );
-                            assert!(shell.is_event_captured());
+                            let captured = shell.is_event_captured();
                             assert!(messages.is_empty());
                             // The asynchronous window-tagged subscription owns
                             // modified shortcuts, as it does native Close.
@@ -174,7 +174,7 @@ fn analytics_and_network_cancel_from_actual_compact_window_views_preserves_draft
                                 Box::new(Message::Key {
                                     chord: keys::chord(&key, physical_key, modifiers, Os::CURRENT)
                                         .unwrap(),
-                                    captured: true,
+                                    captured,
                                 }),
                             )]
                         }

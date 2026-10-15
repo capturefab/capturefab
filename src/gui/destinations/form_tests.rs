@@ -5,7 +5,7 @@ use iced::Size;
 
 fn editor(source: Option<Source>) -> Editor {
     let mut editor = match source {
-        None => Editor::new_folder("line-1".into(), PathBuf::from("/tmp/captures")),
+        None => Editor::new_folder("line-1".into(), std::env::temp_dir().join("captures")),
         Some(source) => {
             let mut editor = Editor::new_bucket();
             editor.source = source;
