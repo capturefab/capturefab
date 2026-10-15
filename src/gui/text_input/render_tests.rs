@@ -1072,19 +1072,39 @@ fn pure_rtl_and_disconnected_selection_obey_real_ancestor_clip_at_each_interface
 #[test]
 fn actual_arabic_ligature_pointer_hits_share_the_proportional_rtl_grapheme_cells() {
     use unicode_segmentation::UnicodeSegmentation;
+    const ISOLATED: &str = "CAPTUREFAB_TEST_ISOLATED_LIGATURE_FONT";
+    if std::env::var_os(ISOLATED).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "gui::text_input::render_tests::actual_arabic_ligature_pointer_hits_share_the_proportional_rtl_grapheme_cells", "--nocapture"])
+            .env(ISOLATED, "1")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "isolated ligature test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    // No host fallback font or parallel renderer can supply the ligature.
+    *iced::advanced::graphics::text::font_system()
+        .write()
+        .unwrap()
+        .raw()
+        .db_mut() = Default::default();
     let mut renderer = Recorder::new();
     iced::advanced::graphics::text::font_system()
         .write()
         .unwrap()
         .load_font(std::borrow::Cow::Borrowed(include_bytes!(
-            "../../../tests/fonts/NotoSansArabic.ttf"
+            "../../../tests/fonts/DejaVuSans.ttf"
         )));
     let value = "abc لا xyz";
     let mut input = TextInput::<String, Recorder>::new("Value", value)
         .width(240)
         .style(style::input)
         .on_input(|value| value);
-    input.inner = input.inner.font(Font::with_name("Noto Sans Arabic"));
+    input.inner = input.inner.font(Font::with_name("DejaVu Sans"));
     let mut tree = Tree::new(&input as &dyn Widget<String, Theme, Recorder>);
     let node = Widget::layout(
         &mut input,
@@ -1111,7 +1131,12 @@ fn actual_arabic_ligature_pointer_hits_share_the_proportional_rtl_grapheme_cells
                 && glyph.width > 0.0
                 && value[glyph.start..glyph.end].graphemes(true).count() >= 2
         })
-        .expect("the installed Arabic fallback font shapes a real multi-grapheme Lam-Alef ligature")
+        .unwrap_or_else(|| {
+            panic!(
+                "real multi-grapheme Lam-Alef ligature missing: {:?}",
+                renderer.text[0].glyphs
+            )
+        })
         .clone();
     assert_ne!(glyph.id, 0);
     let origin = renderer.text[0].position;

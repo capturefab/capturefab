@@ -1,6 +1,6 @@
-NotoSansArabic.ttf is the Noto Sans Arabic variable font from Google Fonts,
-retrieved 2026-10-15 from:
-https://github.com/google/fonts/tree/main/ofl/notosansarabic
+DejaVuSans.ttf is the DejaVu Sans font distributed by Matplotlib, retrieved
+2026-10-15 from:
+https://github.com/matplotlib/matplotlib/tree/main/lib/matplotlib/mpl-data/fonts/ttf
 
-It is used only by the real Arabic ligature shaping test so it does not depend
-on installed fallback fonts. The SIL Open Font License is included alongside it.
+The isolated Arabic ligature test uses only this font, independently of installed
+fallback fonts. Its Bitstream Vera / DejaVu license is included alongside it.
