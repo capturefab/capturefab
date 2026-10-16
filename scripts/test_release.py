@@ -313,25 +313,57 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual((info['CFBundleShortVersionString'], info['CFBundlePackageType']), ('1.2.3', 'APPL'))
 
     def test_gatekeeper_retries_only_cloudkit_connection_loss(self):
-        lost = SimpleNamespace(returncode=68, stdout='NSURLErrorDomain Code=-1005 network connection lost\n')
+        lost = SimpleNamespace(returncode=68, stdout='NSURLErrorDomain Code=-1005 network connection lost\n'
+                               'NSErrorFailingURLStringKey=https://api.apple-cloudkit.com/database/1/'
+                               'com.apple.gk.ticket-delivery/production/public/records/lookup\n')
         good = SimpleNamespace(returncode=0, stdout='validated\n')
-        with mock.patch.object(release.subprocess, 'run', side_effect=[lost, good, good]) as run, \
-                mock.patch.object(release.time, 'sleep') as sleep, contextlib.redirect_stdout(io.StringIO()):
-            release.gatekeeper(Path('Capturefab.app'))
-            self.assertEqual([c.args[0][:3] for c in run.call_args_list],
-                             [['xcrun', 'stapler', 'validate'], ['xcrun', 'stapler', 'validate'],
-                              ['spctl', '--assess', '--type']])
-            sleep.assert_called_once_with(5)
-        for replies, expected_calls in [([lost] * 3, 3),
-                                        ([SimpleNamespace(returncode=68, stdout='invalid ticket')], 1)]:
-            with self.subTest(replies=replies), \
+        staple = ['xcrun', 'stapler', 'staple']
+        validate = ['xcrun', 'stapler', 'validate']
+        assess = ['spctl', '--assess', '--type']
+        for replies, expected in [([good] * 3, [staple, validate, assess]),
+                                  ([lost, good, good, good], [staple, staple, validate, assess]),
+                                  ([good, lost, good, good], [staple, validate, validate, assess]),
+                                  ([lost, lost, good, lost, lost, good, good],
+                                   [staple] * 3 + [validate] * 3 + [assess])]:
+            with self.subTest(expected=expected), \
                     mock.patch.object(release.subprocess, 'run', side_effect=replies) as run, \
-                    mock.patch.object(release.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
-                with self.assertRaisesRegex(RuntimeError, 'stapler validate'):
-                    release.gatekeeper(Path('Capturefab.app'))
-                self.assertEqual(run.call_count, expected_calls)
-                self.assertTrue(all(c.args[0][:3] == ['xcrun', 'stapler', 'validate']
-                                    for c in run.call_args_list))
+                    mock.patch.object(release.time, 'sleep') as sleep, contextlib.redirect_stdout(io.StringIO()):
+                release.gatekeeper(Path('Capturefab.app'))
+                self.assertEqual([c.args[0][:3] for c in run.call_args_list], expected)
+                self.assertEqual(sleep.call_args_list, [mock.call(5)] * (len(replies) - 3))
+
+    def test_gatekeeper_stops_on_nontransient_stapler_errors_and_exhausted_retries(self):
+        cloudkit = 'https://api.apple-cloudkit.com/database/1/com.apple.gk.ticket-delivery/production/public/records/lookup'
+        lost = f'NSURLErrorDomain Code=-1005 network connection lost {cloudkit}\n'
+        good = SimpleNamespace(returncode=0, stdout='validated\n')
+        failures = [(68, lost, 3),
+                    (68, f'invalid ticket {cloudkit}', 1),
+                    (68, f'NSURLErrorDomain Code=-1009 {cloudkit}', 1),
+                    (68, 'NSURLErrorDomain Code=-1005 https://example.invalid/', 1),
+                    (65, lost, 1)]
+        for action in ['staple', 'validate']:
+            for code, output, attempts in failures:
+                prefix = [good] if action == 'validate' else []
+                replies = prefix + [SimpleNamespace(returncode=code, stdout=output)] * attempts
+                with self.subTest(action=action, code=code, output=output), \
+                        mock.patch.object(release.subprocess, 'run', side_effect=replies) as run, \
+                        mock.patch.object(release.time, 'sleep') as sleep, contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(RuntimeError, f'stapler {action} exited with status {code}'):
+                        release.gatekeeper(Path('Capturefab.app'))
+                    expected = ([['xcrun', 'stapler', 'staple']] if prefix else []) + \
+                        [['xcrun', 'stapler', action]] * attempts
+                    self.assertEqual([c.args[0][:3] for c in run.call_args_list], expected)
+                    self.assertEqual(sleep.call_args_list, [mock.call(5)] * (attempts - 1))
+
+    def test_gatekeeper_requires_final_assessment_without_retrying_rejection(self):
+        good = SimpleNamespace(returncode=0, stdout='validated\n')
+        rejected = SimpleNamespace(returncode=3, stdout='rejected\n')
+        with mock.patch.object(release.subprocess, 'run', side_effect=[good, good, rejected]) as run, \
+                mock.patch.object(release.time, 'sleep') as sleep, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, 'spctl exited with status 3'):
+                release.gatekeeper(Path('Capturefab.app'))
+            self.assertEqual(run.call_count, 3)
+            sleep.assert_not_called()
 
     def test_notarization_requires_an_accepted_submission(self):
         calls = []

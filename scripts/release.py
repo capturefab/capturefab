@@ -370,23 +370,27 @@ def notarize(path):
             subprocess.run(['xcrun', 'notarytool', 'log', result['id'], *profile])
         raise RuntimeError(f'notarization of {Path(path).name} ended with status {result.get("status")!r}')
 
-def gatekeeper(app):
-    # spctl accepts a Developer ID app only when it is notarized, so this is
-    # the check a downloaded copy will face; stapler proves offline validity.
+def stapler(action, app):
     for attempt in range(3):
-        result = subprocess.run(['xcrun', 'stapler', 'validate', str(app)],
+        result = subprocess.run(['xcrun', 'stapler', action, str(app)],
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         print(result.stdout, end='')
         if result.returncode == 0:
-            break
-        # Observed after successful notarization and stapling on both macOS
-        # runners. Retry only CloudKit's lost-connection error, never a bad
-        # signature/ticket, and always require a successful validation.
+            return
+        # Both staple and validate can lose the Apple ticket-service connection.
+        # Retry only the observed CloudKit transport error, never a bad ticket.
         if (result.returncode != 68 or 'NSURLErrorDomain Code=-1005' not in result.stdout
+                or 'https://api.apple-cloudkit.com/' not in result.stdout
                 or attempt == 2):
-            raise RuntimeError(f'stapler validate exited with status {result.returncode}')
+            raise RuntimeError(f'stapler {action} exited with status {result.returncode}')
+        print(f'Retrying stapler {action} after Apple CloudKit connection loss (attempt {attempt + 2}/3).')
         time.sleep(5)
 
+def gatekeeper(app):
+    # spctl accepts a Developer ID app only when it is notarized, so this is
+    # the check a downloaded copy will face; stapler proves offline validity.
+    stapler('staple', app)
+    stapler('validate', app)
     run(['spctl', '--assess', '--type', 'execute', '--verbose', app])
 
 def package(args, binary, variant):
@@ -466,7 +470,6 @@ def package(args, binary, variant):
             # Staple the app, then recreate the archive with its ticket included.
             # A headless executable cannot hold a ticket; Gatekeeper fetches it online.
             if variant == 'desktop':
-                run(['xcrun', 'stapler', 'staple', app.parent])
                 gatekeeper(app.parent)
                 archive_tree(stage, path, stem)
             signed = 'apple-notarized'
