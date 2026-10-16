@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import uuid
 import zipfile
 
@@ -372,7 +373,20 @@ def notarize(path):
 def gatekeeper(app):
     # spctl accepts a Developer ID app only when it is notarized, so this is
     # the check a downloaded copy will face; stapler proves offline validity.
-    run(['xcrun', 'stapler', 'validate', app])
+    for attempt in range(3):
+        result = subprocess.run(['xcrun', 'stapler', 'validate', str(app)],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        print(result.stdout, end='')
+        if result.returncode == 0:
+            break
+        # Observed after successful notarization and stapling on both macOS
+        # runners. Retry only CloudKit's lost-connection error, never a bad
+        # signature/ticket, and always require a successful validation.
+        if (result.returncode != 68 or 'NSURLErrorDomain Code=-1005' not in result.stdout
+                or attempt == 2):
+            raise RuntimeError(f'stapler validate exited with status {result.returncode}')
+        time.sleep(5)
+
     run(['spctl', '--assess', '--type', 'execute', '--verbose', app])
 
 def package(args, binary, variant):

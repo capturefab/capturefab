@@ -179,16 +179,36 @@ struct Helper {
     /// What the helper reported when it became ready.
     version: String,
 }
+// Linux can briefly refuse exec after a newly written helper was closed,
+// including while another process is completing a concurrent fork/exec. No
+// child was started on ETXTBSY, so retry only that error for a bounded time.
+fn spawn_helper(command: &mut Command) -> std::io::Result<Child> {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match command.spawn() {
+            Err(error)
+                if cfg!(target_os = "linux")
+                    && error.raw_os_error() == Some(26)
+                    && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
+
 impl Helper {
     fn start(kind: &Kind, executable: &std::path::Path) -> Result<Self> {
-        let mut child = Command::new(executable)
-            .arg(kind.argument)
-            .envs(kind.environment.iter().copied())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("launch {} helper", kind.name))?;
+        let mut child = spawn_helper(
+            Command::new(executable)
+                .arg(kind.argument)
+                .envs(kind.environment.iter().copied())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit()),
+        )
+        .with_context(|| format!("launch {} helper", kind.name))?;
         let mut input = child.stdin.take().context("helper stdin")?;
         let mut output = BufReader::new(child.stdout.take().context("helper stdout")?);
         let ready = (|| -> Result<String> {
@@ -588,6 +608,23 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_launch_recovers_after_a_writer_closes() {
+        let path = script("busy", "exit 0");
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let mut command = Command::new(&path);
+        assert_eq!(command.spawn().unwrap_err().raw_os_error(), Some(26));
+        let closer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            drop(writer);
+        });
+        let mut child = spawn_helper(&mut command).unwrap();
+        assert!(child.wait().unwrap().success());
+        closer.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn hung_helper_is_abandoned_at_the_deadline() {
         // Reports ready, then never answers: the driver-hang case.

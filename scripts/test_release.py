@@ -312,6 +312,27 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(info['CFBundleIdentifier'], source['CFBundleIdentifier'])
             self.assertEqual((info['CFBundleShortVersionString'], info['CFBundlePackageType']), ('1.2.3', 'APPL'))
 
+    def test_gatekeeper_retries_only_cloudkit_connection_loss(self):
+        lost = SimpleNamespace(returncode=68, stdout='NSURLErrorDomain Code=-1005 network connection lost\n')
+        good = SimpleNamespace(returncode=0, stdout='validated\n')
+        with mock.patch.object(release.subprocess, 'run', side_effect=[lost, good, good]) as run, \
+                mock.patch.object(release.time, 'sleep') as sleep, contextlib.redirect_stdout(io.StringIO()):
+            release.gatekeeper(Path('Capturefab.app'))
+            self.assertEqual([c.args[0][:3] for c in run.call_args_list],
+                             [['xcrun', 'stapler', 'validate'], ['xcrun', 'stapler', 'validate'],
+                              ['spctl', '--assess', '--type']])
+            sleep.assert_called_once_with(5)
+        for replies, expected_calls in [([lost] * 3, 3),
+                                        ([SimpleNamespace(returncode=68, stdout='invalid ticket')], 1)]:
+            with self.subTest(replies=replies), \
+                    mock.patch.object(release.subprocess, 'run', side_effect=replies) as run, \
+                    mock.patch.object(release.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, 'stapler validate'):
+                    release.gatekeeper(Path('Capturefab.app'))
+                self.assertEqual(run.call_count, expected_calls)
+                self.assertTrue(all(c.args[0][:3] == ['xcrun', 'stapler', 'validate']
+                                    for c in run.call_args_list))
+
     def test_notarization_requires_an_accepted_submission(self):
         calls = []
 
