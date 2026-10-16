@@ -78,7 +78,8 @@ enum CredentialAction {
 }
 
 type CredentialReply = std::result::Result<(String, Option<&'static str>), &'static str>;
-type Report = std::result::Result<(Vec<MeasurementSample>, String), String>;
+type Report =
+    std::result::Result<(Vec<MeasurementSample>, String, crate::analytics::SvgOptions), String>;
 
 pub(super) struct State {
     pub preferences: Preferences,
@@ -94,6 +95,8 @@ pub(super) struct State {
     refreshed: Option<Instant>,
     samples: Vec<MeasurementSample>,
     chart: Option<svg::Handle>,
+    chart_options: Option<crate::analytics::SvgOptions>,
+    requested_options: Option<crate::analytics::SvgOptions>,
     error: Option<String>,
     history_error: Option<String>,
     paused_for_edit: bool,
@@ -118,6 +121,8 @@ impl State {
             refreshed: None,
             samples: Vec::new(),
             chart: None,
+            chart_options: None,
+            requested_options: None,
             error: None,
             history_error: None,
             paused_for_edit: false,
@@ -217,6 +222,84 @@ fn spawn_credentials(
 }
 
 impl Workbench {
+    /// Synthetic UI-review data. These fixtures never resolve/store a key,
+    /// contact a provider, start collection, or write a measurement database.
+    pub(super) fn scene_video_analytics(&mut self, word: &str, late: bool) -> bool {
+        let options = self.analytics_svg_options();
+        match word {
+            "settings-credentials" | "settings-credential-error" => {
+                self.settings_open = true;
+                if !late {
+                    return false;
+                }
+                let state = &mut self.video_analytics;
+                state.credential_provider = Provider::Gemini;
+                state.credential_pending = None;
+                state.credential_status =
+                    Some("No saved key. Enter an API key to enable prompt measurements.".into());
+                state.secret = SecretDraft(Zeroizing::new("example-ui-review-key".into()));
+                if word == "settings-credential-error" {
+                    state.credential_error =
+                        Some("The OS credential store could not save this key.");
+                }
+            }
+            "analytics-measurements" => {
+                self.analytics.open = true;
+                self.analytics.tab = analytics::Tab::Measurements;
+            }
+            "analytics-measurements-populated" | "analytics-invalid" => {
+                self.analytics.open = true;
+                self.analytics.tab = analytics::Tab::Measurements;
+                if !late {
+                    return false;
+                }
+                let state = &mut self.video_analytics;
+                state.preferences.measurements.push(MeasurementDefinition {
+                    id: "ribbon-length".into(),
+                    label: "Ribbon length at the inspection station".into(),
+                    prompt: "Estimate the visible ribbon length using the 10 cm calibration marker beside the conveyor.".into(),
+                    unit: "meters".into(),
+                });
+                state.samples = (0..6)
+                    .map(|index| MeasurementSample {
+                        timestamp_ms: 1_792_012_000_000 + index * 30_000,
+                        camera_id: "sim:0 / laboratory acquisition camera".into(),
+                        frame_id: index,
+                        definition: state.preferences.measurements[1].clone(),
+                        provider: state.preferences.model.provider,
+                        model: state.preferences.model.model.clone(),
+                        result: ai::MeasurementOutput {
+                            id: "ribbon-length".into(),
+                            value: (index != 2).then_some(0.45 + index as f64 * 0.03),
+                            confidence: (index != 2).then_some(0.92),
+                            note: if index == 2 {
+                                "The calibration marker is obscured; the image does not support a measurement."
+                            } else {
+                                "Estimated from the visible calibration marker. The ribbon curves slightly near the edge of the frame."
+                            }.into(),
+                        },
+                    })
+                    .collect();
+                if let Ok(chart) =
+                    crate::analytics::render_measurement_svg_with_options(&state.samples, options)
+                {
+                    state.chart = Some(svg::Handle::from_memory(chart.into_bytes()));
+                    state.chart_options = Some(options);
+                    state.requested_options = Some(options);
+                }
+                state.pending = None;
+                state.history_error = None;
+                if word == "analytics-invalid" {
+                    state.interval = "2".into();
+                    state.error =
+                        Some("Enter a whole sample interval from 5 to 3,600 seconds.".into());
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     pub(super) fn video_analytics_input(&mut self, input: Input) {
         let state = &mut self.video_analytics;
         match input {
@@ -319,6 +402,7 @@ impl Workbench {
     }
 
     pub(super) fn tick_video_analytics(&mut self) {
+        let options = self.analytics_svg_options();
         let state = &mut self.video_analytics;
         if let Some(pending) = &state.credential_pending {
             match pending.try_recv() {
@@ -345,9 +429,12 @@ impl Workbench {
                 Ok(result) => {
                     state.pending = None;
                     match result {
-                        Ok((samples, chart)) => {
+                        Ok((samples, chart, rendered_options)) => {
                             state.samples = samples;
-                            state.chart = Some(svg::Handle::from_memory(chart.into_bytes()));
+                            if rendered_options == options {
+                                state.chart = Some(svg::Handle::from_memory(chart.into_bytes()));
+                                state.chart_options = Some(rendered_options);
+                            }
                             state.history_error = None;
                         }
                         Err(error) => {
@@ -366,23 +453,33 @@ impl Workbench {
         if !self.analytics.open || state.pending.is_some() {
             return;
         }
-        if state
+        let query_due = !state
             .refreshed
-            .is_some_and(|at| self.now.saturating_duration_since(at) < REFRESH)
-        {
+            .is_some_and(|at| self.now.saturating_duration_since(at) < REFRESH);
+        let render_due = state.requested_options != Some(options) && !state.samples.is_empty();
+        if !query_due && !render_due {
             return;
         }
-        state.refreshed = Some(self.now);
+        let cached = if query_due {
+            state.refreshed = Some(self.now);
+            None
+        } else {
+            Some(state.samples.clone())
+        };
+        state.requested_options = Some(options);
         let handle = self.handle.clone();
         let (sender, receiver) = mpsc::channel();
         match std::thread::Builder::new()
             .name("capturefab-measurements-view".into())
             .spawn(move || {
                 let report = (|| -> Result<_> {
-                    let analytics = handle.analytics();
-                    let samples = analytics.measurement_history()?;
-                    let chart = crate::analytics::render_measurement_svg(&samples)?;
-                    Ok((samples, chart))
+                    let samples = match cached {
+                        Some(samples) => samples,
+                        None => handle.analytics().measurement_history()?,
+                    };
+                    let chart =
+                        crate::analytics::render_measurement_svg_with_options(&samples, options)?;
+                    Ok((samples, chart, options))
                 })()
                 .map_err(|error| format!("{error:#}"));
                 let _ = sender.send(report);
@@ -501,9 +598,12 @@ impl Workbench {
             });
         let mut content = column![
             heading("Prompt measurements", p),
-            text("Describe each number to track. Each sampled image produces structured numeric values, confidence and notes saved in the session database.")
+            text("Describe the numbers to track in sampled images. Results, confidence and notes are saved in this session.")
                 .size(style::SMALL).color(p.secondary),
-            row![provider, model].spacing(10),
+            row![
+                column![text("Provider").size(style::SMALL).color(p.secondary), provider].spacing(6).width(Length::FillPortion(1)),
+                column![text("Model").size(style::SMALL).color(p.secondary), model].spacing(6).width(Length::FillPortion(2)),
+            ].spacing(10),
             row![text("Sample every").size(style::BODY), interval, text("seconds").size(style::BODY)].spacing(10).align_y(Alignment::Center),
         ].spacing(12);
         for (index, measurement) in state.preferences.measurements.iter().enumerate() {
@@ -541,10 +641,19 @@ impl Workbench {
             content = content.push(
                 container(
                     column![
-                        row![label, unit, remove]
-                            .spacing(8)
-                            .align_y(Alignment::Center),
-                        prompt
+                        row![
+                            column![text("Name").size(style::SMALL).color(p.secondary), label]
+                                .spacing(6)
+                                .width(Length::FillPortion(2)),
+                            column![text("Unit").size(style::SMALL).color(p.secondary), unit]
+                                .spacing(6)
+                                .width(Length::FillPortion(1)),
+                            remove,
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::End),
+                        column![text("Prompt").size(style::SMALL).color(p.secondary), prompt]
+                            .spacing(6),
                     ]
                     .spacing(8),
                 )
@@ -562,7 +671,7 @@ impl Workbench {
                 .padding([6, 12])
                 .style(style::secondary),
         );
-        content = content.push(text("Examples: estimate the length of ribbon in meters; estimate the distance of the ball from the camera in meters. Include scale or calibration details in the prompt when needed. Values are estimates; an unknown value is recorded when the image does not support a measurement.")
+        content = content.push(text("For distances or lengths, include scale or calibration details in the prompt. Values are estimates; unsupported measurements are recorded as unknown.")
             .size(style::SMALL).color(p.secondary));
         let camera = self.snapshot.active_camera.as_deref();
         let target = if status.running {
@@ -573,7 +682,8 @@ impl Workbench {
         content = content.push(
             text(format!("Camera: {target}"))
                 .size(style::BODY)
-                .font(style::MEDIUM),
+                .font(style::MEDIUM)
+                .wrapping(text::Wrapping::WordOrGlyph),
         );
         content = content.push(text(format!("Starting collection sends sampled camera images and your prompts to {}. API usage may incur charges. Collection pauses when you edit the configuration and never starts automatically.", state.preferences.model.provider))
             .size(style::SMALL).color(p.secondary));
@@ -635,8 +745,16 @@ impl Workbench {
         }
         if !state.samples.is_empty() {
             content = content.push(heading("Measurement history", p));
-            if let Some(chart) = &state.chart {
+            if let Some(chart) = &state.chart
+                && state.chart_options == Some(self.analytics_svg_options())
+            {
                 content = content.push(svg(chart.clone()).width(Fill));
+            } else {
+                content = content.push(
+                    text("Updating measurement chart…")
+                        .size(style::SMALL)
+                        .color(p.secondary),
+                );
             }
             content = content.push(
                 text("Latest measurements across cameras · current session")
@@ -644,10 +762,14 @@ impl Workbench {
                     .color(p.secondary),
             );
             for sample in state.samples.iter().rev().take(12) {
-                let value = sample
-                    .result
-                    .value
-                    .map_or_else(|| "Unknown".into(), |value| format!("{value:.3}"));
+                let value = sample.result.value.map_or_else(
+                    || "Unknown".into(),
+                    |value| {
+                        format!("{value:.3} {}", sample.definition.unit)
+                            .trim_end()
+                            .to_owned()
+                    },
+                );
                 let confidence = sample
                     .result
                     .confidence
@@ -656,19 +778,34 @@ impl Workbench {
                     });
                 content = content.push(
                     column![
+                        row![
+                            text(sample.definition.label.clone())
+                                .size(style::BODY)
+                                .font(style::MEDIUM)
+                                .width(Fill)
+                                .wrapping(text::Wrapping::WordOrGlyph),
+                            text(value)
+                                .size(style::BODY)
+                                .font(style::MEDIUM)
+                                .wrapping(text::Wrapping::WordOrGlyph),
+                        ]
+                        .spacing(16)
+                        .align_y(Alignment::Start),
                         text(format!(
-                            "{} · {} · {}: {} {}{}",
+                            "{} · {} · {} / {}{}",
                             super::analytics::measurement_timestamp(sample.timestamp_ms),
                             sample.camera_id,
-                            sample.definition.label,
-                            value,
-                            sample.definition.unit,
+                            sample.provider,
+                            sample.model,
                             confidence
                         ))
-                        .size(style::SMALL),
+                        .size(style::SMALL)
+                        .color(p.secondary)
+                        .wrapping(text::Wrapping::WordOrGlyph),
                         text(sample.result.note.clone())
                             .size(style::SMALL)
-                            .color(p.secondary),
+                            .color(p.secondary)
+                            .wrapping(text::Wrapping::WordOrGlyph),
                     ]
                     .spacing(4),
                 );
@@ -685,8 +822,112 @@ impl Workbench {
 }
 
 #[cfg(test)]
+mod layout_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn measurement_chart_reflows_cached_history_when_width_or_appearance_changes() {
+        let mut bench = Workbench::new(
+            SessionHandle::new(),
+            "measurement-reflow".into(),
+            true,
+            None,
+        );
+        bench.width = 1100.0;
+        bench.scene_video_analytics("analytics-measurements-populated", true);
+        bench.video_analytics.refreshed = Some(bench.now);
+        let retained = bench.video_analytics.samples.len();
+        let previous = bench.video_analytics.chart_options.unwrap();
+        bench.width = 700.0;
+        bench.appearance = Appearance::Dark;
+        let current = bench.analytics_svg_options();
+        assert_ne!(previous, current);
+        // A reply rendered for the previous view must not overwrite this one.
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok((
+                bench.video_analytics.samples.clone(),
+                "old chart".into(),
+                previous,
+            )))
+            .unwrap();
+        bench.video_analytics.pending = Some(receiver);
+        bench.tick_video_analytics();
+        assert_ne!(bench.video_analytics.chart_options, Some(current));
+        assert!(
+            bench.video_analytics.pending.is_some(),
+            "the cached history is rerendered immediately"
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while bench.video_analytics.chart_options != Some(current) {
+            assert!(
+                Instant::now() < deadline,
+                "measurement chart worker finished"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+            bench.tick_video_analytics();
+        }
+        assert_eq!(bench.video_analytics.samples.len(), retained);
+        assert!(
+            bench
+                .handle
+                .analytics()
+                .measurement_history()
+                .unwrap()
+                .is_empty(),
+            "rerendering retains view history without writing the session database"
+        );
+        assert!(!bench.video_analytics.runner.status().running);
+    }
+
+    #[test]
+    fn ui_review_measurements_select_their_tab_without_starting_collection_or_storing_data() {
+        let mut bench = Workbench::new(SessionHandle::new(), "ui-review-test".into(), true, None);
+        assert!(bench.scene_video_analytics("analytics-measurements", false));
+        assert!(bench.analytics.open);
+        assert_eq!(bench.analytics.tab, analytics::Tab::Measurements);
+        assert_eq!(bench.video_analytics.preferences.measurements.len(), 1);
+        assert!(bench.video_analytics.samples.is_empty());
+        assert!(!bench.scene_video_analytics("analytics-measurements-populated", false));
+        assert!(bench.scene_video_analytics("analytics-measurements-populated", true));
+        assert_eq!(bench.video_analytics.preferences.measurements.len(), 2);
+        assert_eq!(bench.video_analytics.samples.len(), 6);
+        assert!(bench.video_analytics.chart.is_some());
+        assert!(!bench.video_analytics.runner.status().running);
+        assert!(!bench.video_analytics.runner.status().busy);
+        assert!(bench.video_analytics.pending.is_none());
+        assert!(
+            bench
+                .handle
+                .analytics()
+                .measurement_history()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(bench.handle.snapshot().cameras.is_empty());
+    }
+
+    #[test]
+    fn ui_review_credentials_remain_display_only_without_a_credential_worker() {
+        let mut bench = Workbench::new(SessionHandle::new(), "ui-review-test".into(), true, None);
+        assert!(!bench.scene_video_analytics("settings-credential-error", false));
+        assert!(bench.scene_video_analytics("settings-credential-error", true));
+        assert!(bench.settings_open);
+        assert_eq!(bench.video_analytics.credential_provider, Provider::Gemini);
+        assert!(bench.video_analytics.credential_pending.is_none());
+        assert_eq!(
+            bench.video_analytics.credential_error,
+            Some("The OS credential store could not save this key.")
+        );
+        assert_eq!(
+            bench.video_analytics.secret.0.as_str(),
+            "example-ui-review-key"
+        );
+        assert!(!bench.video_analytics.runner.status().running);
+    }
 
     #[test]
     fn secrets_are_redacted_from_messages_and_excluded_from_preferences() {

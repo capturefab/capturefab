@@ -50,16 +50,20 @@ pub(super) fn profile(logical_chart_width: f32, p: &'static Palette) -> Profile 
         width,
         height: PANEL_HEIGHT * if wide { 2 } else { 3 },
         panel_width: if wide { (width - GUTTER) / 2 } else { width },
-        colors: SvgColors {
-            background: rgb(p.base),
-            text: rgb(p.text),
-            secondary: rgb(p.secondary),
-            axis: rgb(p.control_border),
-            frame_rate: rgb(p.ink(p.live)),
-            throughput: rgb(p.ink(p.accent_text)),
-            missed_frames: rgb(p.ink(p.danger)),
-            increased_contrast: p.increased(),
-        },
+        colors: colors(p),
+    }
+}
+
+pub(super) fn colors(p: &'static Palette) -> SvgColors {
+    SvgColors {
+        background: rgb(p.base),
+        text: rgb(p.text),
+        secondary: rgb(p.secondary),
+        axis: rgb(p.control_border),
+        frame_rate: rgb(p.ink(p.live)),
+        throughput: rgb(p.ink(p.accent_text)),
+        missed_frames: rgb(p.ink(p.danger)),
+        increased_contrast: p.increased(),
     }
 }
 

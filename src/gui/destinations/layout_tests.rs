@@ -23,6 +23,16 @@ pub(crate) fn renderer() -> iced::Renderer {
     .expect("the compiled software renderer is available")
 }
 
+pub(crate) fn add_external_drive(picker: &mut Picker) {
+    picker.volumes = vec![Volume {
+        name: "Laboratory archive".into(),
+        path: "/Volumes/Laboratory Archive".into(),
+        kind: "removable",
+        total_bytes: 2_000_000_000_000,
+        free_bytes: 1_000_000_000_000,
+    }];
+}
+
 #[derive(Default)]
 struct BodyBounds(Option<Rectangle>);
 impl Operation for BodyBounds {

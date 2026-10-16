@@ -1049,6 +1049,7 @@ impl Workbench {
             ("inspector-search", _) => self.search = "gain".into(),
             ("inspector-nomatch", _) => self.search = "white balance".into(),
             ("inspector-storage", _) => self.storage_open = true,
+            ("inspector-details", _) => self.inspect.camera_details_open = true,
             // Documentation scenes use an isolated session and explicitly
             // demonstrate its default policy, without touching the ledger.
             ("inspector-storage-default", _) => self.storage_status.update(
@@ -2252,6 +2253,7 @@ impl Workbench {
                 p,
             ),
             action,
+            accessibility::mapped(self.capture_to.drive_shortcuts(p), Message::CapturePicker),
             options,
             checkbox(
                 "Capture on a schedule",
@@ -2566,6 +2568,11 @@ impl Workbench {
                 ),
                 Message::RecordPicker,
             ),
+            text(self.forward_summary())
+                .size(style::SMALL)
+                .color(p.secondary),
+            action,
+            accessibility::mapped(self.record_to.drive_shortcuts(p), Message::RecordPicker),
             form_row(
                 "Codec",
                 pick_list(
@@ -2612,7 +2619,6 @@ impl Workbench {
                 "",
                 p,
             ),
-            action,
             options,
         ]
         .spacing(ROW_GAP)

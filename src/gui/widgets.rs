@@ -486,7 +486,16 @@ pub(super) fn inspector_tabs<'a, M: Clone + 'static>(
     selected: usize,
     thumb: f32,
 ) -> Element<'a, M> {
-    segments("Inspector panels", items, selected, thumb, true)
+    panel_tabs("Inspector panels", items, selected, thumb)
+}
+
+pub(super) fn panel_tabs<'a, M: Clone + 'static>(
+    name: &'a str,
+    items: Vec<(&'a str, Option<M>, String)>,
+    selected: usize,
+    thumb: f32,
+) -> Element<'a, M> {
+    segments(name, items, selected, thumb, true)
 }
 
 fn segments<'a, M: Clone + 'static>(
@@ -534,13 +543,13 @@ fn segments<'a, M: Clone + 'static>(
         .style(style::segment_label(lit))
         .on_press_maybe(on);
         let segment = if tabs {
-            let id = match i {
-                0 => "inspector-tab-0",
-                1 => "inspector-tab-1",
-                _ => "inspector-tab-2",
+            let prefix = if name == "Inspector panels" {
+                "inspector"
+            } else {
+                name
             };
             segment
-                .id(id)
+                .id(format!("{prefix}-tab-{i}"))
                 .role(accessibility::Role::Tab)
                 .selected(i == selected)
         } else {
@@ -657,6 +666,7 @@ pub(super) struct SheetFrame<'a, M> {
     close: M,
     close_enabled: bool,
     body: Element<'a, M>,
+    controls: Option<Element<'a, M>>,
     footer: Option<Element<'a, M>>,
     default_action: Option<M>,
     width: f32,
@@ -682,6 +692,7 @@ pub(super) fn sheet_frame<'a, M: Clone + 'static>(
         close,
         close_enabled: true,
         body: body.into(),
+        controls: None,
         footer: None,
         default_action: None,
         width: 560.0,
@@ -726,6 +737,12 @@ impl<'a, M: Clone + 'a> SheetFrame<'a, M> {
         self
     }
 
+    /// Navigation pinned below the title while the body scrolls.
+    pub(super) fn controls(mut self, controls: impl Into<Element<'a, M>>) -> Self {
+        self.controls = Some(controls.into());
+        self
+    }
+
     /// Return activates this enabled primary action, with the platform's
     /// distinction between the default button and keyboard focus.
     pub(super) fn default_action(mut self, action: Option<M>) -> Self {
@@ -764,6 +781,7 @@ impl<'a, M: Clone + 'static> From<SheetFrame<'a, M>> for Element<'a, M> {
             close,
             close_enabled,
             body,
+            controls,
             footer,
             default_action,
             width,
@@ -838,13 +856,22 @@ impl<'a, M: Clone + 'static> From<SheetFrame<'a, M>> for Element<'a, M> {
         } else {
             space().height(1).into()
         };
-        let mut sheet = column![
-            container(head).padding(iced::Padding {
-                top: SHEET_INSET,
+        let mut header = column![container(head).padding(iced::Padding {
+            top: SHEET_INSET,
+            right: SHEET_INSET,
+            bottom: 13.0,
+            left: SHEET_INSET,
+        }),];
+        if let Some(controls) = controls {
+            header = header.push(container(controls).width(Fill).padding(iced::Padding {
+                top: 0.0,
                 right: SHEET_INSET,
-                bottom: 13.0,
+                bottom: 14.0,
                 left: SHEET_INSET,
-            }),
+            }));
+        }
+        let mut sheet = column![
+            header,
             edge,
             // Measure the actual header/footer first. The body uses only
             // what remains, while still shrinking for a short form.

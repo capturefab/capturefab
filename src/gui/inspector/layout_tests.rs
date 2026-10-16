@@ -90,6 +90,176 @@ fn compact_inspector_camera_context_retains_identity_beside_a_long_model_name() 
 }
 
 #[test]
+fn compact_video_keeps_its_start_action_visible_before_encoding_details() {
+    let mut renderer = renderer();
+    for scale in prefs::UiScale::ALL {
+        for output in ["recording.mkv", "rtsp://127.0.0.1:8554/capturefab"] {
+            let mut app = bench();
+            app.ui_scale = scale;
+            app.tab = Tab::Forward;
+            app.forward_output = output.into();
+            app.forward_codec = "h265";
+            app.inspect.tab_thumb.set(Tab::Forward as usize as f32);
+            let size = Size::new(INSPECTOR, 620.0 / scale.factor() - BAR - TOOLBAR);
+            let mut view = app.inspector(Palette::of(false));
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, size),
+            );
+            prepare_artifact_frame(&mut view, &mut tree, &node, &renderer, size);
+            let (snapshot, _, _) = accessibility::snapshot_widget(
+                view.as_widget_mut(),
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+            );
+            let label = if Output::of(output).recording() {
+                "Start recording"
+            } else {
+                "Start forwarding"
+            };
+            let action = snapshot
+                .nodes
+                .iter()
+                .find(|(_, control)| control.label() == Some(label))
+                .expect("the primary video action is visible before scrolling");
+            let bounds = action.1.bounds().unwrap();
+            assert!(action.1.supports_action(accesskit::Action::Click));
+            assert!(
+                bounds.height() >= 34.0
+                    && bounds.x0 >= 0.0
+                    && bounds.y0 >= 0.0
+                    && bounds.x1 <= f64::from(size.width) + 0.5
+                    && bounds.y1 <= f64::from(size.height) + 0.5,
+                "{label} is complete at {scale}: {bounds:?}, viewport {size:?}"
+            );
+            render_artifact_scaled(
+                &format!("video-start-{scale}-{}", Output::of(output).recording()),
+                &view,
+                &tree,
+                &node,
+                &mut renderer,
+                size,
+                scale.factor(),
+            );
+        }
+    }
+}
+
+#[test]
+fn compact_purpose_guidance_and_primary_actions_fit_before_external_drive_shortcuts() {
+    let mut renderer = renderer();
+    for kind in [
+        CameraKind::AreaScan,
+        CameraKind::LineScan,
+        CameraKind::Depth,
+        CameraKind::Microscope,
+        CameraKind::Thermal,
+        CameraKind::DocumentScanner,
+        CameraKind::Unknown,
+    ] {
+        for scale in prefs::UiScale::ALL {
+            let mut app = bench();
+            app.ui_scale = scale;
+            app.snapshot.cameras.truncate(1);
+            app.snapshot.connected.as_mut().unwrap().profile.kind = kind;
+            app.snapshot.cameras[0].info.profile.kind = kind;
+            if kind == CameraKind::DocumentScanner {
+                app.snapshot.connected.as_mut().unwrap().transport =
+                    crate::types::Transport::Scanner;
+                app.snapshot.cameras[0].info.transport = crate::types::Transport::Scanner;
+            }
+            app.forward_output = "rtsp://127.0.0.1:8554/capturefab".into();
+            destinations::layout_tests::add_external_drive(&mut app.capture_to);
+            destinations::layout_tests::add_external_drive(&mut app.record_to);
+            let size = Size::new(INSPECTOR, 620.0 / scale.factor() - BAR - TOOLBAR);
+            for tab in [Tab::Capture, Tab::Forward] {
+                if kind == CameraKind::DocumentScanner && tab == Tab::Forward {
+                    continue;
+                }
+                app.tab = tab;
+                app.inspect.tab_thumb.set(tab as usize as f32);
+                let mut view = app.inspector(Palette::of(false));
+                let mut tree = Tree::new(view.as_widget());
+                let node = view.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, size),
+                );
+                prepare_artifact_frame(&mut view, &mut tree, &node, &renderer, size);
+                let (snapshot, _, _) = accessibility::snapshot_widget(
+                    view.as_widget_mut(),
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                );
+                let label = if tab == Tab::Forward {
+                    "Start forwarding"
+                } else {
+                    "Capture and save · ⌘S"
+                };
+                let action = snapshot
+                    .nodes
+                    .iter()
+                    .find(|(_, control)| {
+                        control.role() == accessibility::Role::Button
+                            && if tab == Tab::Forward {
+                                control.label() == Some(label)
+                            } else {
+                                control.label()
+                                    == Some(
+                                        Action::Capture
+                                            .hint("Capture and save", Os::CURRENT)
+                                            .as_str(),
+                                    )
+                            }
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("primary action missing at {kind:?}/{tab:?}/{scale}")
+                    });
+                let bounds = action.1.bounds().unwrap();
+                assert!(
+                    bounds.height() >= 34.0
+                        && bounds.x0 >= 0.0
+                        && bounds.y0 >= 0.0
+                        && bounds.x1 <= f64::from(size.width) + 0.5
+                        && bounds.y1 <= f64::from(size.height) + 0.5,
+                    "primary action clipped at {kind:?}/{tab:?}/{scale}: {bounds:?}, viewport {size:?}"
+                );
+                let guidance = if tab == Tab::Capture {
+                    capture_guidance(kind)
+                } else {
+                    forward_guidance(kind)
+                };
+                if let Some(guidance) = guidance {
+                    let warning = snapshot
+                        .nodes
+                        .iter()
+                        .find(|(_, control)| control.label() == Some(guidance))
+                        .expect("purpose-specific guidance remains visible");
+                    let warning_bounds = warning.1.bounds().unwrap();
+                    assert!(
+                        warning_bounds.y0 >= 0.0 && warning_bounds.y1 < bounds.y0,
+                        "guidance precedes the visible action at {kind:?}/{tab:?}/{scale}"
+                    );
+                }
+                render_artifact_scaled(
+                    &format!("purpose-{kind:?}-{tab:?}-{scale}"),
+                    &view,
+                    &tree,
+                    &node,
+                    &mut renderer,
+                    size,
+                    scale.factor(),
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn compact_inspector_tab_and_shift_tab_reveal_the_actual_workflow_controls() {
     let renderer = renderer();
     for scale in prefs::UiScale::ALL {

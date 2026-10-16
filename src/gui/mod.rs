@@ -219,9 +219,6 @@ pub fn run_capture(
                 demo_cameras.clamp(1, 16)
             };
             app.apply_scene(&scene);
-            if welcome && !scene.contains(&"searching") {
-                app.discover();
-            }
             app.screenshot = Some(ScreenshotRequest {
                 path: path.clone(),
                 cameras: count,
@@ -632,6 +629,7 @@ enum Message {
     NetworkReport(bool),
     NetworkScrolled(bool),
     Analytics(bool),
+    AnalyticsTab(analytics::Tab),
     AnalyticsScrolled(bool),
     AnalyticsHistory(analytics::HistoryInput),
     VideoAnalytics(video_analytics::Input),
@@ -2671,6 +2669,7 @@ impl Workbench {
             Message::NetworkReport(open) => return self.show_network(open),
             Message::NetworkScrolled(scrolled) => self.network_scrolled = scrolled,
             Message::Analytics(open) => return self.show_analytics(open),
+            Message::AnalyticsTab(tab) => return self.analytics_tab(tab),
             Message::AnalyticsScrolled(scrolled) => self.analytics.scrolled = scrolled,
             Message::AnalyticsHistory(input) => return self.analytics_history(input),
             Message::VideoAnalytics(input) => self.video_analytics_input(input),

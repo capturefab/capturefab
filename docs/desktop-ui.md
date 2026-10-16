@@ -94,6 +94,55 @@ commands and polling. Documentation screenshots use isolated simulator sessions;
 the explicit `inspector-storage-default` scene demonstrates the default policy
 without reading or changing a user's storage ledger.
 
+## October 16, 2026 visual review
+
+Session analytics now keeps Acquisition and Prompt measurements tabs pinned
+above the scrolling body. Measurement fields have explicit labels, and result
+rows separate values from explanatory notes. Measurement charts use the actual
+available width and current palette; appearance and size changes refresh their
+rendering. Compact welcome content scrolls while keeping onboarding actions
+visible. Video places its start action before the optional encoding editors.
+
+The combined native renderer matrix contains 95 views: baseline screen families
+in both appearances, 900×620 compact views at Larger interface size, explicit
+scrolled and error fixtures, and purpose-specific camera views. These cover
+area-scan, line-scan, depth, microscope, thermal, scanner and unknown profiles;
+scanner and unknown profiles use synthetic display fixtures over an isolated
+simulator. Additional states include active recording and forwarding, empty
+destinations, pending discovery and destination tests, failed connections,
+unapplied feature drafts and automatic exposure. An actual-widget Settings test
+checks the body, credential actions and pinned footer at Standard, Large and
+Larger interface sizes. The current library run reports 919 passed and 11 ignored.
+
+With the desktop binary built and Pillow available, reproduce the review with:
+
+```sh
+python3 scripts/ui-screenshots.py --all \
+  --binary target/debug/capturefab --output target/ui-review
+```
+
+The script writes an `index.html` gallery, contact sheets and `manifest.json` to
+the output directory. The manifest records the binary and image SHA-256 values,
+appearance, interface size, logical window size, scene and fixture isolation.
+Use `--all --list` to inspect the full matrix, or repeat `--only NAME` alongside
+`--all` for selected views. The default matrix retains its 61 views.
+
+Headless browser review covered the public site's three pages, 25 documentation
+sections and key dialogs, plus the browser client at seven widths from 320 to
+1440 pixels. Fixes contain expanded download and schedule forms, preserve feature
+field readability, size charts to their available width, close search on Escape
+and clear stale documentation navigation highlights. The browser client discards
+chart responses from a superseded layout and immediately requests the new size;
+a delayed-response check covers resizing from desktop to mobile during a fetch.
+Height-only viewport changes preserve the chart without an extra request.
+
+The native macOS main window and its accessibility tree were captured after
+desktop access returned. Computer Use then lost its native connection before
+the separate Settings window could be inspected. Settings evidence here covers
+the rendered fixture and actual-widget body geometry only; OS window behavior
+and native Windows and Linux execution remain unverified. This review does not
+establish full HIG completion.
+
 ## Requirements and current evidence
 
 | Requirement | Implemented source evidence | Runtime gate or remaining gap |

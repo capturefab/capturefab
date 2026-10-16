@@ -103,29 +103,40 @@ impl Workbench {
     pub(super) fn welcome(&self, p: &'static Palette) -> Element<'_, Message> {
         let t = self.welcome.get(self.now);
         let block = responsive(move |size| {
-            let (content, extra) = self.welcome_content(p);
+            let compact = size.height < 600.0;
+            let (content, extra) = self.welcome_content_for(p, compact);
             // Centered with one card; taller content grows downward until
             // it would run off the bottom, then rises just enough.
             let room = size.height - 2.0 * RISE;
             let top = ((size.height - ANCHORED) / 2.0)
                 .min(room - ANCHORED - extra)
                 .max(RISE);
-            container(content)
-                .center_x(Fill)
-                .padding(iced::Padding {
-                    top: top + motion::rise(RISE, t),
-                    right: RISE,
-                    bottom: 0.0,
-                    left: RISE,
-                })
-                .into()
+            scrollable(container(content).center_x(Fill).padding(iced::Padding {
+                top: top + motion::rise(RISE, t),
+                right: RISE,
+                bottom: 24.0,
+                left: RISE,
+            }))
+            .id("welcome")
+            .height(Fill)
+            .style(style::scroll)
+            .into()
         });
         veil(container(block).clip(true), p.base, 0.0, t)
     }
 
     /// The welcome screen's column, and roughly how much taller than
     /// `ANCHORED` it is.
+    #[cfg(test)]
     pub(super) fn welcome_content(&self, p: &'static Palette) -> (Element<'_, Message>, f32) {
+        self.welcome_content_for(p, false)
+    }
+
+    fn welcome_content_for(
+        &self,
+        p: &'static Palette,
+        compact: bool,
+    ) -> (Element<'_, Message>, f32) {
         let now = self.now;
         let discovering = self.pending(Job::Discover);
         let spin = self.spin();
@@ -140,11 +151,14 @@ impl Workbench {
                     .iter()
                     .any(|camera| camera.info.id == device.id)
             })
-            .take(4)
+            // The sidebar retains every discovered and recent source. Avoid
+            // duplicating a long source list above compact onboarding actions.
+            .take(if compact && self.sidebar_open { 2 } else { 4 })
             .collect();
         let recent: Vec<_> = self
             .recent
             .iter()
+            .filter(|_| !compact || !self.sidebar_open)
             .filter(|recent| {
                 !self.snapshot.devices.iter().any(|device| {
                     device.id == recent.target
@@ -166,8 +180,8 @@ impl Workbench {
         };
         let mut extra = 0.0;
         let mut content = column![
-            icon(Icon::Mark, 44.0, p.accent),
-            space().height(10),
+            icon(Icon::Mark, if compact { 32.0 } else { 44.0 }, p.accent),
+            space().height(if compact { 6 } else { 10 }),
             text("Connect a camera")
                 .size(style::DISPLAY)
                 .font(style::BOLD)
@@ -221,7 +235,9 @@ impl Workbench {
             issues = grow(callout.into(), CALLOUT + 10.0, arrival);
             extra += CALLOUT + 10.0;
         }
-        content = content.push(issues).push(space().height(10));
+        content = content
+            .push(issues)
+            .push(space().height(if compact { 6 } else { 10 }));
         let mut cards = column![].spacing(8).width(Fill);
         if found.is_empty() {
             // One slot, the height of a card, that says what discovery is
@@ -358,9 +374,9 @@ impl Workbench {
         .align_y(Alignment::Center);
         let content = content
             .push(cards)
-            .push(space().height(14))
+            .push(space().height(if compact { 8 } else { 14 }))
             .push(actions)
-            .push(space().height(14))
+            .push(space().height(if compact { 8 } else { 14 }))
             .push(guide);
         (content.into(), extra)
     }
@@ -494,6 +510,114 @@ fn not_found<'a>(p: &'static Palette) -> Element<'a, Message> {
 mod tests {
     use super::*;
     use crate::types::Transport;
+
+    #[test]
+    fn compact_welcome_keeps_onboarding_actions_visible_and_lower_content_scrollable() {
+        use crate::gui::destinations::layout_tests::{
+            apply, prepare_artifact_frame, render_artifact_scaled, renderer,
+        };
+        use iced::advanced::{Layout, layout, widget::Tree, widget::operation};
+        let mut renderer = renderer();
+        for scale in prefs::UiScale::ALL {
+            let mut app = bench();
+            app.ui_scale = scale;
+            app.apply_scene(&["welcome", "side-recent"]);
+            app.scene.patch(&mut app.snapshot);
+            app.tick_side();
+            app.now += Duration::from_secs(3);
+            app.welcome.set(1.0);
+            let size = Size::new(
+                900.0 / scale.factor() - SIDEBAR,
+                620.0 / scale.factor() - BAR - TOOLBAR,
+            );
+            let mut view = app.welcome(Palette::of(false));
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, size),
+            );
+            prepare_artifact_frame(&mut view, &mut tree, &node, &renderer, size);
+            let (snapshot, _, _) = accessibility::snapshot_widget(
+                view.as_widget_mut(),
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+            );
+            for label in [
+                Action::Discover.hint(DISCOVERS, Os::CURRENT),
+                "Try a simulated camera".into(),
+                Action::ConnectAddress.hint(ADDRESSES, Os::CURRENT),
+                "Quick guide".into(),
+            ] {
+                let action = snapshot
+                    .nodes
+                    .iter()
+                    .find(|(_, control)| {
+                        control.role() == accessibility::Role::Button
+                            && control.label() == Some(label.as_str())
+                    })
+                    .unwrap_or_else(|| panic!("{label} is visible in compact welcome at {scale}"));
+                let bounds = action.1.bounds().unwrap();
+                assert!(
+                    bounds.height() >= 18.0
+                        && bounds.x0 >= 0.0
+                        && bounds.y0 >= 0.0
+                        && bounds.x1 <= f64::from(size.width) + 0.5
+                        && bounds.y1 <= f64::from(size.height) + 0.5,
+                    "{label} fits at {scale}: {bounds:?}, viewport {size:?}"
+                );
+            }
+            render_artifact_scaled(
+                &format!("welcome-onboarding-{scale}"),
+                &view,
+                &tree,
+                &node,
+                &mut renderer,
+                size,
+                scale.factor(),
+            );
+            drop(view);
+
+            // With the sidebar closed, every source remains in the welcome
+            // body. A genuinely short viewport can still reveal its actions.
+            app.sidebar_open = false;
+            let short = Size::new(400.0, 220.0);
+            let mut view = app.welcome(Palette::of(false));
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, short),
+            );
+            prepare_artifact_frame(&mut view, &mut tree, &node, &renderer, short);
+            apply(
+                &mut view,
+                &mut tree,
+                &node,
+                &renderer,
+                operation::scrollable::snap_to(
+                    "welcome".into(),
+                    operation::scrollable::RelativeOffset {
+                        x: None,
+                        y: Some(1.0),
+                    },
+                ),
+            );
+            let (after, _, _) = accessibility::snapshot_widget(
+                view.as_widget_mut(),
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+            );
+            let guide = after
+                .nodes
+                .iter()
+                .find(|(_, control)| control.label() == Some("Quick guide"))
+                .expect("real scrolling reaches the last onboarding action");
+            assert!(guide.1.bounds().unwrap().y1 <= f64::from(short.height) + 0.5);
+        }
+    }
 
     fn bench() -> Workbench {
         Workbench::new(SessionHandle::new(), "test".into(), true, None)

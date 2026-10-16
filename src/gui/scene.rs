@@ -117,12 +117,27 @@ pub(super) struct Scene {
     stopped: bool,
     /// Turn on auto mode on every camera as the streams start.
     pub(super) auto: bool,
+    /// Scroll a normal widget after its first staged layout, before capturing.
+    scroll_end: Option<&'static str>,
+    /// Welcome discovery is display-only and never enumerates real devices.
+    welcome: bool,
+    searching: bool,
 }
 
 impl Scene {
     /// Make the snapshot say what the scene holds in place; from `tick()`
     /// after every refresh, so it never reverts.
     pub(super) fn patch(&self, snapshot: &mut SessionSnapshot) {
+        if self.welcome {
+            snapshot.devices = if self.searching {
+                Vec::new()
+            } else {
+                ["sim:0", "sim:line", "sim:thermal"]
+                    .into_iter()
+                    .map(crate::transport::simulator::info_named)
+                    .collect()
+            };
+        }
         if self.forwarding.is_none() && !self.stopped {
             return;
         }
@@ -165,6 +180,12 @@ impl Workbench {
     ///   selected camera's frames stopped arriving), `auto` (every camera in
     ///   auto mode), `forwarding` (the selected camera forwards to a URL),
     ///   `recording` (the selected camera records to a file)
+    /// - review fixtures: `network`, `network-empty`, `network-error`,
+    ///   `destinations-remove`, `bucket-editor-advanced`, `settings-credentials`,
+    ///   `settings-credential-error`, `analytics-measurements`,
+    ///   `analytics-measurements-populated`, `analytics-invalid`,
+    ///   `close-error`;
+    ///   `sheet-bottom` and `inspector-bottom` expose their lower content
     /// - failures: `write-error` (setting the selected camera's exposure
     ///   time was refused) and `connect-failed` (connecting to a typed
     ///   address failed), each with its error notice; `editor` (the S3
@@ -175,8 +196,9 @@ impl Workbench {
     pub(super) fn apply_scene(&mut self, scene: &[&str]) {
         for word in scene {
             match *word {
-                // Taken by `run_capture`, which then connects no cameras.
-                "welcome" => {}
+                // run_capture connects no cameras. The snapshot supplies only
+                // built-in simulator cards, without real device discovery.
+                "welcome" => self.scene.welcome = true,
                 "help" => self.help_open = true,
                 "analytics" => self.analytics.open = true,
                 "capture" => self.tab = Tab::Capture,
@@ -198,6 +220,16 @@ impl Workbench {
                 "peek" => self.inspector_peek = true,
                 "light" => self.appearance = Appearance::Light,
                 "dark" => self.appearance = Appearance::Dark,
+                "sheet-bottom" => self.scene.scroll_end = Some(SHEET_BODY),
+                "inspector-bottom" => self.scene.scroll_end = Some(inspector::SCROLL),
+                "close-error" => {
+                    // A display fixture only: no failed write, close request,
+                    // preference destination or native credential is involved.
+                    let _ = self.show_close_error(
+                        CloseTarget::Quit,
+                        "Could not save settings: Permission denied while replacing the preferences file. Check that the session folder is writable, then retry.".into(),
+                    );
+                }
                 "notice" => self.scene_notice(command_notice(
                     &Job::Capture,
                     &Ok(json!({"files": ["capture-0001.png"], "count": 1})),
@@ -221,7 +253,10 @@ impl Workbench {
                     &Job::Connect,
                     &Err(anyhow::anyhow!(LONG_ERROR)),
                 )),
-                "searching" => self.hold(Job::Discover, None),
+                "searching" => {
+                    self.scene.searching = true;
+                    self.hold(Job::Discover, None);
+                }
                 "stalled" => self.scene.stalled = true,
                 "auto" => self.scene.auto = true,
                 "forwarding" => {
@@ -250,9 +285,8 @@ impl Workbench {
                     self.capture_to
                         .update(destinations::Message::Save, &mut self.output);
                 }
-                "saved" | "copied" | "pending" | "starting" | "write-error" => {
-                    self.scene.late.push((*word).into())
-                }
+                "saved" | "copied" | "pending" | "starting" | "write-error" | "kind-scanner"
+                | "kind-unknown" => self.scene.late.push((*word).into()),
                 word if self.area_scene(word, false) => {}
                 word => self.scene.late.push(word.into()),
             }
@@ -266,6 +300,8 @@ impl Workbench {
             || self.scene_stage(word, late)
             || self.scene_inspector(word, late)
             || self.scene_autocapture(word, late)
+            || self.scene_network(word, late)
+            || self.scene_video_analytics(word, late)
             || self.scene_sheets(word, late)
     }
 
@@ -285,6 +321,7 @@ impl Workbench {
         let camera = self.snapshot.active_camera.clone();
         for word in std::mem::take(&mut self.scene.late) {
             match word.as_str() {
+                "kind-scanner" | "kind-unknown" => self.scene_display_profile(&word),
                 "saved" => {
                     let result = json!({"files": ["capture-0001.png"], "count": 1});
                     self.last_saved = Saved::from_result(camera.clone(), &result, self.now);
@@ -334,6 +371,109 @@ impl Workbench {
             );
             self.scene.frozen = Some(id);
         }
+    }
+
+    /// The simulator has no scanner or unclassified backend. Supply those
+    /// display profiles only after acquisition has completed, without changing
+    /// the session, opening a scanner or submitting any camera operation.
+    fn scene_display_profile(&mut self, word: &str) {
+        use crate::camera_profile::{CameraCapability, CameraKind, DetectionSource};
+        let Some(id) = self.snapshot.active_camera.clone() else {
+            return;
+        };
+        let Some(mut info) = self
+            .snapshot
+            .cameras
+            .iter()
+            .find(|camera| camera.info.id == id)
+            .map(|camera| camera.info.clone())
+        else {
+            return;
+        };
+        let scanner = word == "kind-scanner";
+        info.vendor = "Example Imaging".into();
+        info.model = if scanner {
+            "Document scanner (display fixture)"
+        } else {
+            "Unclassified camera (display fixture)"
+        }
+        .into();
+        info.profile.kind = if scanner {
+            CameraKind::DocumentScanner
+        } else {
+            CameraKind::Unknown
+        };
+        info.profile.source = if scanner {
+            DetectionSource::Transport
+        } else {
+            DetectionSource::Unknown
+        };
+        info.profile.evidence = vec![
+            "Synthetic display profile for UI review; no device of this kind was opened.".into(),
+        ];
+        if scanner {
+            info.transport = crate::types::Transport::Scanner;
+            info.profile.capabilities = vec![
+                CameraCapability::ScanResolution,
+                CameraCapability::ScanSource,
+            ];
+            let feature = |name: &str,
+                           kind: &str,
+                           value: serde_json::Value,
+                           choices: &[&str],
+                           unit: Option<&str>| FeatureInfo {
+                name: name.into(),
+                display_name: name.into(),
+                kind: kind.into(),
+                value: Some(value),
+                writable: true,
+                description: "Display-only scanner control; no scanner operation is performed."
+                    .into(),
+                unit: unit.map(str::to_owned),
+                min: (name == "ScanResolution").then_some(75.0),
+                max: (name == "ScanResolution").then_some(600.0),
+                inc: (name == "ScanResolution").then_some(1.0),
+                choices: choices.iter().map(|value| (*value).into()).collect(),
+                error: None,
+            };
+            self.snapshot.features = vec![
+                feature(
+                    "ScanSource",
+                    "Enumeration",
+                    json!("Flatbed"),
+                    &["Default", "Flatbed", "Feeder"],
+                    None,
+                ),
+                feature("ScanResolution", "Integer", json!(300), &[], Some("dpi")),
+                feature(
+                    "ScanMode",
+                    "Enumeration",
+                    json!("Color"),
+                    &["Color", "Gray", "Lineart"],
+                    None,
+                ),
+            ];
+            self.snapshot.streaming = false;
+            self.previews.remove(&id);
+            // A scanner starts without a document image. Drop the simulator's
+            // single-view frame as well as its tile preview so this fixture
+            // exercises the actual Ready to scan guidance.
+            self.shown = None;
+        }
+        for camera in self
+            .snapshot
+            .cameras
+            .iter_mut()
+            .filter(|camera| camera.info.id == id)
+        {
+            camera.info = info.clone();
+            if scanner {
+                camera.streaming = false;
+                camera.features = self.snapshot.features.clone();
+            }
+        }
+        self.snapshot.connected = Some(info);
+        self.tick_inspector();
     }
 
     /// Show a notice that stays for the whole scene, fully faded in.
@@ -408,6 +548,10 @@ impl Workbench {
                 }
                 Err(TryRecvError::Empty) => {}
             }
+        } else if request.staged && self.scene.scroll_end.is_some() {
+            // The first staged frame establishes the scrollable's real
+            // extent. Give the operation another paint before the screenshot.
+            task = operation::snap_to_end(self.scene.scroll_end.take().unwrap());
         } else if request.staged && !request.requested {
             // One tick after staging, so the staged state is what gets drawn.
             task = window::latest()
@@ -487,6 +631,125 @@ pub(super) fn save_screenshot(shot: &window::Screenshot, path: &std::path::Path)
 mod tests {
     use super::*;
     use liveness::streaming_camera;
+
+    #[test]
+    fn camera_kind_review_fixtures_change_only_the_display_snapshot() {
+        for (word, kind) in [
+            (
+                "kind-scanner",
+                crate::camera_profile::CameraKind::DocumentScanner,
+            ),
+            ("kind-unknown", crate::camera_profile::CameraKind::Unknown),
+        ] {
+            let mut app = bench();
+            app.shown = Some(Shown::Gpu {
+                key: MAIN_VIEW.into(),
+                size: Size::new(8.0, 8.0),
+            });
+            app.apply_scene(&[word]);
+            assert!(app.pending.is_empty());
+            app.stage_scene();
+            assert_eq!(app.camera_kind(), kind);
+            assert!(app.pending.is_empty());
+            assert!(app.handle.snapshot().cameras.is_empty());
+            if word == "kind-scanner" {
+                assert!(app.scanner_selected());
+                assert!(!app.snapshot.streaming);
+                assert!(
+                    app.shown.is_none(),
+                    "scanner readiness replaces the simulator frame"
+                );
+                assert_eq!(
+                    app.snapshot
+                        .features
+                        .iter()
+                        .map(|feature| feature.name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["ScanSource", "ScanResolution", "ScanMode"]
+                );
+            } else {
+                assert!(
+                    app.shown.is_some(),
+                    "the unknown profile retains its simulator image"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scanner_review_fixture_routes_the_actual_stage_to_document_ready_guidance() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let renderer = destinations::layout_tests::renderer();
+        let mut app = bench();
+        app.shown = Some(Shown::Gpu {
+            key: MAIN_VIEW.into(),
+            size: Size::new(8.0, 8.0),
+        });
+        app.apply_scene(&["kind-scanner"]);
+        app.stage_scene();
+        let size = Size::new(600.0, 560.0);
+        let mut view = app.single_view(Palette::of(false));
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        destinations::layout_tests::prepare_artifact_frame(
+            &mut view, &mut tree, &node, &renderer, size,
+        );
+        let (snapshot, _, _) = accessibility::snapshot_widget(
+            view.as_widget_mut(),
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+        );
+        assert!(
+            snapshot
+                .nodes
+                .iter()
+                .any(|(_, control)| { control.label() == Some("Ready to scan a document") })
+        );
+        assert!(app.pending.is_empty());
+        assert!(app.handle.snapshot().cameras.is_empty());
+    }
+
+    #[test]
+    fn ui_review_welcome_discovery_uses_only_synthetic_simulator_cards() {
+        let mut bench = Workbench::new(SessionHandle::new(), "ui-review-test".into(), true, None);
+        bench.apply_scene(&["welcome"]);
+        bench.scene.patch(&mut bench.snapshot);
+        assert_eq!(bench.snapshot.devices.len(), 3);
+        assert!(
+            bench
+                .snapshot
+                .devices
+                .iter()
+                .all(|camera| camera.id.starts_with("sim:"))
+        );
+        assert!(!bench.pending(Job::Discover));
+        assert!(bench.handle.snapshot().devices.is_empty());
+        bench.apply_scene(&["searching"]);
+        bench.scene.patch(&mut bench.snapshot);
+        assert!(bench.snapshot.devices.is_empty());
+        assert!(bench.pending(Job::Discover));
+        assert_eq!(bench.pending.len(), bench.scene.held.len());
+    }
+
+    #[test]
+    fn ui_review_scene_routes_tabs_and_scroll_without_submitting_camera_commands() {
+        let mut bench = Workbench::new(SessionHandle::new(), "ui-review-test".into(), true, None);
+        bench.apply_scene(&["analytics-measurements", "sheet-bottom"]);
+        assert!(bench.analytics.open);
+        assert_eq!(bench.analytics.tab, analytics::Tab::Measurements);
+        assert_eq!(bench.scene.scroll_end, Some(SHEET_BODY));
+        assert!(bench.scene.late.is_empty());
+        assert!(bench.pending.is_empty());
+        bench.apply_scene(&["close-error"]);
+        assert!(bench.close_error.is_some());
+        assert!(bench.closing.is_none());
+        assert!(bench.pending.is_empty());
+    }
 
     #[test]
     fn screenshot_sequence_preserves_single_shot_and_bounds_work() {

@@ -269,7 +269,7 @@ h3{letter-spacing:-.03em;font-size:18px}
 .hero-facts{list-style:none;padding:0;margin:28px 0 0;color:var(--muted);font-size:14px;display:grid;gap:7px}
 .hero-facts li{display:flex;gap:10px;align-items:baseline}
 .hero-facts li::before{content:"✓";color:var(--success)}
-.hero-download{padding:24px;align-self:center;box-shadow:var(--shadow);scroll-margin-top:18px}
+.hero-download{min-width:0;padding:24px;align-self:center;box-shadow:var(--shadow);scroll-margin-top:18px}
 .download-heading .eyebrow{margin:0 0 8px}
 .download-heading h2{font-size:25px;letter-spacing:-.03em;margin:0 0 6px;text-wrap:initial}
 .download-heading>p:last-child{font-size:13px;color:var(--muted);margin:0 0 20px}

@@ -45,6 +45,8 @@ struct App {
     preview_url: Option<String>,
     preview_frame: String,
     analytics_busy: bool,
+    analytics_layout_dirty: bool,
+    analytics_layout_width: Option<i32>,
     analytics: Value,
     analytics_url: Option<String>,
     revision: u32,
@@ -953,8 +955,18 @@ fn clear_analytics_chart(app: &mut App) {
     let _ = element("analytics-chart").remove_attribute("src");
     visible("analytics-chart", false);
 }
+fn analytics_chart_width() -> i32 {
+    element("analytics-chart")
+        .parent_element()
+        .map(|figure| figure.client_width())
+        .filter(|width| *width > 0)
+        .unwrap_or(1200)
+        .clamp(180, 2048)
+}
 async fn analytics_chart_url() -> Result<String, String> {
-    let response = fetch("/api/analytics.svg", None).await?;
+    let width = analytics_chart_width();
+    APP.with(|state| state.borrow_mut().analytics_layout_width = Some(width));
+    let response = fetch(&format!("/api/analytics.svg?width={width}"), None).await?;
     if !response.ok() {
         return Err(
             "The capture timeline could not be loaded. It will retry automatically.".into(),
@@ -978,6 +990,28 @@ async fn analytics_chart_url() -> Result<String, String> {
     }
     Ok(url)
 }
+fn refresh_analytics_layout() {
+    let width = analytics_chart_width();
+    let connected = APP.with(|state| {
+        let mut app = state.borrow_mut();
+        if !app.connected || app.analytics_layout_width == Some(width) {
+            return false;
+        }
+        // Coalesce layout changes while a request is in flight. Its response
+        // belongs to the previous layout and must not replace the current view.
+        app.analytics_layout_dirty = app.analytics_busy;
+        visible("analytics-chart", false);
+        visible("analytics-empty", true);
+        set_text(
+            "analytics-empty-description",
+            "Updating the timeline for this view…",
+        );
+        true
+    });
+    if connected {
+        refresh_analytics();
+    }
+}
 fn refresh_analytics() {
     let generation = APP.with(|state| {
         let mut app = state.borrow_mut();
@@ -997,16 +1031,20 @@ fn refresh_analytics() {
         } else {
             None
         };
-        APP.with(|state| {
+        let repeat_layout = APP.with(|state| {
             let mut app = state.borrow_mut();
             app.analytics_busy = false;
             if app.generation != generation {
                 if let Some(Ok(url)) = chart { let _ = Url::revoke_object_url(&url); }
-                return;
+                return false;
+            }
+            if std::mem::take(&mut app.analytics_layout_dirty) {
+                if let Some(Ok(url)) = chart { let _ = Url::revoke_object_url(&url); }
+                return true;
             }
             let Ok(snapshot) = snapshot else {
                 analytics_unavailable(&app, "Analytics could not refresh. Any values shown are from the last available snapshot; retrying automatically.");
-                return;
+                return false;
             };
             // Session totals may reset when the server restarts. Do not show a
             // chart from that previous process beside the new session totals.
@@ -1028,7 +1066,11 @@ fn refresh_analytics() {
             if let Some(error) = chart_error {
                 set_text("analytics-warning", &format!("{error} Any timeline shown is from the last successful refresh."));
             }
+            false
         });
+        if repeat_layout {
+            refresh_analytics();
+        }
     });
 }
 
@@ -1771,6 +1813,17 @@ pub fn start() -> Result<(), JsValue> {
         5000,
     )?;
     analytics.forget();
+
+    // Recheck the available space when the chart opens or the viewport changes.
+    let chart_layout = Closure::<dyn FnMut(Event)>::new(|_: Event| {
+        if element("capture-insights").has_attribute("open") {
+            refresh_analytics_layout();
+        }
+    });
+    element("capture-insights")
+        .add_event_listener_with_callback("toggle", chart_layout.as_ref().unchecked_ref())?;
+    window().add_event_listener_with_callback("resize", chart_layout.as_ref().unchecked_ref())?;
+    chart_layout.forget();
 
     let activity = Closure::<dyn FnMut()>::new(refresh_activity);
     window().set_interval_with_callback_and_timeout_and_arguments_0(

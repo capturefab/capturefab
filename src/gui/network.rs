@@ -97,6 +97,61 @@ fn live_status(camera: &CameraSnapshot, stalled: bool) -> LinkStatus {
 }
 
 impl Workbench {
+    /// Synthetic read-only reports for the real-renderer UI review. Apply late
+    /// so ordinary snapshot refresh cannot replace the report before capture.
+    pub(super) fn scene_network(&mut self, word: &str, late: bool) -> bool {
+        if !matches!(word, "network" | "network-empty" | "network-error") {
+            return false;
+        }
+        self.network_open = true;
+        if !late {
+            return false;
+        }
+        if word == "network-empty" {
+            return true;
+        }
+        use crate::network::{NetworkInterface, NetworkScan, NetworkTuning};
+        let mut camera = crate::transport::simulator::info();
+        camera.id = "gige:demo-laboratory-camera".into();
+        camera.vendor = "Example Imaging".into();
+        camera.model = "Laboratory acquisition camera".into();
+        camera.transport = Transport::GigE;
+        camera.address = Some("192.168.10.50".into());
+        self.snapshot.network_scan = Some(NetworkScan {
+            interfaces: vec![NetworkInterface {
+                name: "Ethernet adapter".into(),
+                address: "192.168.10.1".parse().unwrap(),
+                netmask: "255.255.255.0".parse().unwrap(),
+                mtu: Some(1500),
+                speed_mbps: Some(1000),
+                kind: InterfaceKind::Wired,
+                up: Some(true),
+            }],
+            cameras: vec![NetworkCamera {
+                camera,
+                active: false,
+                interface: Some("Ethernet adapter".into()),
+                host_address: Some("192.168.10.1".parse().unwrap()),
+                reachable: false,
+                health: NetworkHealth::Unreachable,
+                summary: "Discovery found this camera, but it did not answer control requests. Check its subnet and Ethernet cable.".into(),
+                details: vec!["A discovery reply does not verify that an image stream can reach this computer.".into()],
+                tuning: Some(NetworkTuning {
+                    packet_size: Some(1500),
+                    throughput_limit_bps: Some(100_000_000),
+                    changes: vec!["Packet size kept within adapter MTU.".into()],
+                    warnings: vec!["Could not apply settings because the camera is unreachable.".into()],
+                }),
+            }],
+            warnings: vec!["One discovered camera is unreachable.".into()],
+            scanned_at_ms: 1_792_012_000_000,
+        });
+        if word == "network-error" {
+            self.network_error = Some("The network scan worker stopped before every camera answered. Check the adapter connection and scan again.".into());
+        }
+        true
+    }
+
     pub(super) fn network_camera(&self, camera: &CameraInfo) -> Option<&NetworkCamera> {
         self.snapshot
             .network_scan
@@ -458,6 +513,23 @@ impl Workbench {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_review_network_report_does_not_scan_or_change_session_data() {
+        let mut bench = Workbench::new(SessionHandle::new(), "ui-review-test".into(), true, None);
+        assert!(!bench.scene_network("network-error", false));
+        assert!(bench.scene_network("network-error", true));
+        assert!(bench.network_open);
+        let report = bench.snapshot.network_scan.as_ref().unwrap();
+        assert_eq!(report.interfaces.len(), 1);
+        assert_eq!(report.cameras.len(), 1);
+        assert_eq!(report.cameras[0].health, NetworkHealth::Unreachable);
+        assert!(bench.network_error.is_some());
+        assert!(!bench.pending(Job::NetworkScan));
+        let actual = bench.handle.snapshot();
+        assert!(actual.network_scan.is_none());
+        assert!(actual.cameras.is_empty());
+    }
 
     fn camera() -> CameraSnapshot {
         let mut info = crate::transport::simulator::info();

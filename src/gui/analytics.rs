@@ -14,10 +14,18 @@ pub(super) fn measurement_timestamp(value: u64) -> String {
 type Report = std::result::Result<(Arc<AnalyticsSnapshot>, chart::Graphic, chart::Profile), String>;
 const REFRESH: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum Tab {
+    #[default]
+    Acquisition,
+    Measurements,
+}
+
 #[derive(Default)]
 pub(super) struct State {
     pub open: bool,
     pub scrolled: bool,
+    pub tab: Tab,
     pending: Option<Receiver<Report>>,
     refreshed: Option<Instant>,
     report: Option<Arc<AnalyticsSnapshot>>,
@@ -50,8 +58,24 @@ impl State {
 }
 
 impl Workbench {
+    pub(super) fn analytics_tab(&mut self, tab: Tab) -> Task<Message> {
+        if self.analytics.tab == tab || !self.analytics.open {
+            return Task::none();
+        }
+        self.analytics.tab = tab;
+        self.analytics.scrolled = false;
+        operation::snap_to(SHEET_BODY, operation::RelativeOffset::START)
+    }
+
     fn analytics_sheet_width(&self) -> f32 {
         (self.width - 48.0).clamp(0.0, 1060.0)
+    }
+
+    pub(super) fn analytics_svg_options(&self) -> crate::analytics::SvgOptions {
+        crate::analytics::SvgOptions::interface(
+            (self.analytics_sheet_width() - 48.0).floor() as u32,
+            chart::colors(Palette::of(self.dark())),
+        )
     }
 
     fn analytics_chart_profile(&self) -> chart::Profile {
@@ -160,6 +184,39 @@ impl Workbench {
 
     pub(super) fn analytics_sheet(&self, p: &'static Palette, height: f32) -> Element<'_, Message> {
         let width = self.analytics_sheet_width();
+        let tab = self.analytics.tab;
+        let selected = usize::from(tab == Tab::Measurements);
+        let tabs = panel_tabs(
+            "Session analytics views",
+            vec![
+                (
+                    "Acquisition",
+                    Some(Message::AnalyticsTab(Tab::Acquisition)),
+                    "Frame rate, payload, missed frames and session history".into(),
+                ),
+                (
+                    "Prompt measurements",
+                    Some(Message::AnalyticsTab(Tab::Measurements)),
+                    "Configure measurements and review collected values".into(),
+                ),
+            ],
+            selected,
+            selected as f32,
+        );
+        let body = match tab {
+            Tab::Acquisition => self.acquisition_content(p),
+            Tab::Measurements => self.video_analytics_content(p),
+        };
+        sheet_frame("Session analytics", Message::Analytics(false), body, p)
+            .mark(Icon::Activity)
+            .controls(tabs)
+            .size(width, height)
+            .scrolled(self.analytics.scrolled)
+            .on_scroll(Message::AnalyticsScrolled)
+            .into()
+    }
+
+    fn acquisition_content(&self, p: &'static Palette) -> Element<'_, Message> {
         let mut introduction = column![
             text("All cameras · current capture session").size(style::BODY).font(style::MEDIUM),
             text("History covers at most the last 24 hours. Session totals include earlier activity and reconnects. Updates every 5 seconds.")
@@ -171,13 +228,7 @@ impl Workbench {
         }
         // Keep asynchronous errors inside the introduction so existing report
         // widgets retain their native identities when a refresh fails.
-        let mut body = column![
-            introduction,
-            self.video_analytics_content(p),
-            rule::horizontal(1).style(style::line),
-            heading("Acquisition activity", p),
-        ]
-        .spacing(14);
+        let mut body = column![introduction,].spacing(14);
         if let Some(report) = &self.analytics.report {
             let attempted = report.totals.frames.saturating_add(report.totals.dropped);
             let loss = if attempted == 0 {
@@ -318,12 +369,7 @@ impl Workbench {
             ));
         }
         body = body.push(text("Missed frames include acquisition failures and preview frames replaced before the workbench read them. Payload is acquired image data before encoding.").size(style::SMALL).color(p.secondary));
-        sheet_frame("Session analytics", Message::Analytics(false), body, p)
-            .mark(Icon::Activity)
-            .size(width, height)
-            .scrolled(self.analytics.scrolled)
-            .on_scroll(Message::AnalyticsScrolled)
-            .into()
+        body.into()
     }
 }
 
@@ -342,6 +388,145 @@ fn chart_fixture() -> chart::Graphic {
 mod tests {
     use super::*;
     use iced::advanced::{Layout, layout, widget::Tree};
+
+    #[test]
+    fn analytics_tabs_remain_visible_when_scrolled_and_preserve_measurement_drafts() {
+        use super::super::destinations::layout_tests::{apply, render_artifact_scaled};
+        use iced::futures::StreamExt;
+        let mut renderer = super::super::destinations::layout_tests::renderer();
+        for scale in [1.0, 1.15, 1.3] {
+            let size = Size::new(900.0 / scale, 620.0 / scale);
+            let height = size.height - 80.0;
+            let mut bench =
+                Workbench::new(SessionHandle::new(), "analytics-tabs".into(), true, None);
+            bench.width = size.width;
+            bench.analytics.open = true;
+            bench.analytics.report = Some(Arc::new(report()));
+            bench.analytics.chart = Some(chart_fixture());
+            bench.video_analytics.preferences.measurements[0].label = "Retained draft".into();
+            let mut tree = Tree::empty();
+            let mut previous = None;
+            for tab in [Tab::Acquisition, Tab::Measurements, Tab::Acquisition] {
+                let _ = bench.analytics_tab(tab);
+                let mut view = bench.analytics_sheet(Palette::of(false), height);
+                tree.diff(view.as_widget());
+                let node = view.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, size),
+                );
+                let snapshot = accessibility::snapshot_widget(
+                    view.as_widget_mut(),
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                )
+                .0;
+                let tabs: Vec<_> = snapshot
+                    .nodes
+                    .iter()
+                    .filter(|(_, node)| node.role() == accessibility::Role::Tab)
+                    .collect();
+                assert_eq!(tabs.len(), 2);
+                let identity: Vec<_> = tabs
+                    .iter()
+                    .map(|(id, node)| (*id, node.bounds().unwrap()))
+                    .collect();
+                if let Some(previous) = &previous {
+                    assert_eq!(
+                        &identity, previous,
+                        "tab controls retain native identities and geometry"
+                    );
+                }
+                previous = Some(identity.clone());
+                for (index, (_, node)) in tabs.iter().enumerate() {
+                    assert_eq!(
+                        node.is_selected(),
+                        Some(index == usize::from(tab == Tab::Measurements))
+                    );
+                    let bounds = node.bounds().unwrap();
+                    assert!(bounds.y0 >= 0.0 && bounds.y1 < f64::from(height));
+                    assert!(bounds.x0 >= 0.0 && bounds.x1 <= f64::from(size.width));
+                }
+                if tab == Tab::Acquisition {
+                    let totals = snapshot
+                        .nodes
+                        .iter()
+                        .find(|(_, node)| {
+                            node.label() == Some("989 frames acquired · 1.0 MiB payload")
+                        })
+                        .unwrap()
+                        .1
+                        .bounds()
+                        .unwrap();
+                    assert!(
+                        totals.y0 >= identity[0].1.y1 && totals.y1 <= f64::from(height),
+                        "session totals are immediately visible"
+                    );
+                }
+                apply(
+                    &mut view,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    iced::advanced::widget::operation::scrollable::snap_to(
+                        SHEET_BODY.into(),
+                        operation::RelativeOffset::END.into(),
+                    ),
+                );
+                let (scrolled, bridge, window) = accessibility::snapshot_widget(
+                    view.as_widget_mut(),
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                );
+                for (id, bounds) in &identity {
+                    assert_eq!(
+                        scrolled
+                            .nodes
+                            .iter()
+                            .find(|(node_id, _)| node_id == id)
+                            .unwrap()
+                            .1
+                            .bounds(),
+                        Some(*bounds),
+                        "navigation stays pinned when content scrolls"
+                    );
+                }
+                render_artifact_scaled(
+                    &format!("analytics-{tab:?}-{scale}"),
+                    &view,
+                    &tree,
+                    &node,
+                    &mut renderer,
+                    size,
+                    scale,
+                );
+                let target = tabs[usize::from(tab == Tab::Acquisition)].0;
+                let task = bridge.dispatch(accessibility::Request {
+                    window,
+                    replay: None,
+                    action: accesskit::ActionRequest {
+                        action: accesskit::Action::Click,
+                        target,
+                        data: None,
+                    },
+                });
+                let mut stream = iced_runtime::task::into_stream(task).unwrap();
+                let Some(iced_runtime::Action::Output(Message::AnalyticsTab(next))) =
+                    iced::futures::executor::block_on(stream.next())
+                else {
+                    panic!("tabs route through the native command path")
+                };
+                drop(view);
+                let _ = bench.handle_message(Message::AnalyticsTab(next));
+                assert_eq!(
+                    bench.video_analytics.preferences.measurements[0].label,
+                    "Retained draft"
+                );
+            }
+        }
+    }
 
     fn report() -> AnalyticsSnapshot {
         AnalyticsSnapshot {

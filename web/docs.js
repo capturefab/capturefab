@@ -245,6 +245,11 @@
         }
       });
       searchDialog.addEventListener('close', () => searchOpener?.focus({ preventScroll: true }));
+      searchDialog.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          event.preventDefault(); searchDialog.close();
+        }
+      });
       searchDialog.addEventListener('click', (event) => {
         if (event.target !== searchDialog) return;
         const bounds = searchDialog.getBoundingClientRect();
@@ -284,7 +289,7 @@
     const observer = new IntersectionObserver((entries) => {
       entries.forEach((entry) => entry.isIntersecting ? visible.add(entry.target) : visible.delete(entry.target));
       const active = [...visible].sort((a, b) => Math.abs(a.getBoundingClientRect().top - 110) - Math.abs(b.getBoundingClientRect().top - 110))[0];
-      if (active) activateSection(active.id);
+      activateSection(active?.id);
     }, { rootMargin: '-95px 0px -55% 0px', threshold: 0 });
     sections.forEach((section) => observer.observe(section));
     sidebar.forEach((link) => link.addEventListener('click', () => activateSection(link.hash.slice(1))));

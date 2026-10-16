@@ -1,5 +1,214 @@
 use super::*;
 
+#[test]
+fn interface_measurement_charts_keep_readable_labels_palette_and_visible_series_limits() {
+    for width in [180, 254, 596, 1012] {
+        for colors in [
+            SvgColors::default(),
+            SvgColors {
+                background: [255, 255, 255],
+                text: [29, 29, 31],
+                secondary: [94, 94, 101],
+                axis: [135, 135, 142],
+                frame_rate: [36, 138, 61],
+                ..SvgColors::default()
+            },
+        ] {
+            for unknown in [false, true] {
+                let observations = [
+                    sample(1000, (!unknown).then_some(1.0)),
+                    sample(2000, (!unknown).then_some(2.0)),
+                ];
+                let svg = render_measurement_svg_with_options(
+                    &observations,
+                    SvgOptions::interface(width, colors),
+                )
+                .unwrap();
+                let doc = roxmltree::Document::parse(&svg).unwrap();
+                assert_eq!(
+                    doc.root_element()
+                        .attribute("width")
+                        .unwrap()
+                        .parse::<u32>()
+                        .unwrap(),
+                    width
+                );
+                assert_eq!(doc.root_element().attribute("height"), Some("280"));
+                let background = doc
+                    .descendants()
+                    .find(|node| node.has_tag_name("rect"))
+                    .unwrap()
+                    .attribute("fill")
+                    .unwrap();
+                assert_eq!(
+                    background.to_lowercase(),
+                    format!(
+                        "#{:02x}{:02x}{:02x}",
+                        colors.background[0], colors.background[1], colors.background[2]
+                    )
+                );
+                for node in doc.descendants().filter(|node| node.has_tag_name("text")) {
+                    let x = node.attribute("x").unwrap().parse::<f32>().unwrap();
+                    let y = node.attribute("y").unwrap().parse::<f32>().unwrap();
+                    let font = node.attribute("font-size").unwrap().parse::<f32>().unwrap();
+                    assert!(
+                        (0.0..=width as f32).contains(&x) && (0.0..=280.0).contains(&y),
+                        "text stays inside {width}px canvas: {node:?}"
+                    );
+                    assert!(
+                        font >= 12.0,
+                        "interface labels are never scaled down to export font sizes"
+                    );
+                }
+                if let Some(directory) = std::env::var_os("CAPTUREFAB_CHART_ARTIFACTS") {
+                    std::fs::create_dir_all(&directory).unwrap();
+                    std::fs::write(
+                        std::path::Path::new(&directory).join(format!(
+                            "measurement-{width}-{}-{unknown}.svg",
+                            colors.background[0]
+                        )),
+                        svg,
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    }
+    let observations: Vec<_> = (0..MAX_MEASUREMENT_PANELS + 3)
+        .map(|index| MeasurementSample {
+            camera_id: format!("camera-{index}"),
+            ..sample(1000 + index as u64, Some(1.0))
+        })
+        .collect();
+    let svg = render_measurement_svg_with_options(
+        &observations,
+        SvgOptions::interface(254, SvgColors::default()),
+    )
+    .unwrap();
+    let doc = roxmltree::Document::parse(&svg).unwrap();
+    let visible = doc
+        .descendants()
+        .filter(|node| node.has_tag_name("text"))
+        .filter_map(|node| node.text())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let visible = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        visible.contains("3 more remain"),
+        "interface charts disclose the retained series limit: {visible}"
+    );
+    assert!(
+        svg.contains("ChatGPT / OpenAI / test-vision-model"),
+        "series retain their provider and model identity"
+    );
+}
+
+#[test]
+fn interface_measurement_headers_fit_wide_text_and_retain_complete_identities() {
+    for (kind, label, camera, model, unit) in [
+        (
+            "wide",
+            "W".repeat(100),
+            "W".repeat(100),
+            "W".repeat(100),
+            "W".repeat(60),
+        ),
+        (
+            "cjk",
+            "測定数量".repeat(10),
+            "撮影装置".repeat(10),
+            // Model identifiers intentionally accept ASCII only.
+            "W".repeat(100),
+            "測定単位".repeat(5),
+        ),
+    ] {
+        for width in [180, 254, 596] {
+            let observations = [1000, 2000].map(|timestamp| {
+                let mut observation = sample(timestamp, Some(1.0));
+                observation.definition.label = label.clone();
+                observation.camera_id = camera.clone();
+                observation.model = model.clone();
+                observation.definition.unit = unit.clone();
+                observation
+            });
+            let svg = render_measurement_svg_with_options(
+                &observations,
+                SvgOptions::interface(width, SvgColors::default()),
+            )
+            .unwrap();
+            let document = roxmltree::Document::parse(&svg).unwrap();
+            let description = document
+                .descendants()
+                .find(|node| node.has_tag_name("desc"))
+                .unwrap()
+                .text()
+                .unwrap();
+            for identity in [&label, &camera, &model, &unit] {
+                assert!(
+                    description.contains(identity.as_str()),
+                    "truncating a visible heading must retain the complete identity"
+                );
+            }
+            assert!(description.contains("OpenAI"));
+            for heading in document
+                .descendants()
+                .filter(|node| node.has_tag_name("text"))
+                .take(2)
+            {
+                let visible = heading.text().unwrap().trim();
+                let font: f32 = heading.attribute("font-size").unwrap().parse().unwrap();
+                // These wide fixture glyphs need at least a full em of room.
+                // The old average-letter budget fails this bound. Inspect the
+                // emitted artifacts for actual platform fallback-font bounds.
+                assert!(
+                    visible.graphemes(true).count() as f32 * font <= (width - 32) as f32,
+                    "wide {kind} heading needs room at {width}px: {visible:?}"
+                );
+                assert!(visible.ends_with('…'));
+            }
+            if let Some(directory) = std::env::var_os("CAPTUREFAB_CHART_ARTIFACTS") {
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(
+                    std::path::Path::new(&directory).join(format!("stress-{kind}-{width}.svg")),
+                    svg,
+                )
+                .unwrap();
+            }
+        }
+    }
+    let rendered_heading = |label: &str| {
+        let mut observation = sample(1000, Some(1.0));
+        observation.definition.label = label.into();
+        let svg = render_measurement_svg_with_options(
+            &[observation],
+            SvgOptions::interface(180, SvgColors::default()),
+        )
+        .unwrap();
+        let document = roxmltree::Document::parse(&svg).unwrap();
+        document
+            .descendants()
+            .find(|node| node.has_tag_name("text"))
+            .unwrap()
+            .text()
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    assert_eq!(rendered_heading("Tube count"), "Tube count");
+    for original in ["e\u{301}".repeat(30), "👩🏽‍🔬".repeat(8)] {
+        let shortened = rendered_heading(&original);
+        let prefix = shortened.strip_suffix('…').unwrap();
+        assert!(!prefix.is_empty());
+        assert!(original.starts_with(prefix));
+        assert!(
+            original
+                .grapheme_indices(true)
+                .any(|(boundary, _)| boundary == prefix.len()),
+            "ellipsis must follow a complete combining or emoji grapheme"
+        );
+    }
+}
+
 fn sample(timestamp_ms: u64, value: Option<f64>) -> MeasurementSample {
     MeasurementSample {
         timestamp_ms,

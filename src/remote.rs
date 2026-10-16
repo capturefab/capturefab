@@ -418,10 +418,7 @@ impl Service {
                     Ok(snapshot) => success(snapshot),
                     Err(err) => error(503, format!("analytics unavailable: {err:#}")),
                 },
-                ("GET" | "HEAD", "/api/analytics.svg") => match self.handle.analytics().svg() {
-                    Ok(svg) => Response::new(200, "image/svg+xml; charset=utf-8", svg.into_bytes()),
-                    Err(err) => error(503, format!("analytics unavailable: {err:#}")),
-                },
+                ("GET" | "HEAD", "/api/analytics.svg") => self.analytics_svg(query),
                 #[cfg(feature = "ai")]
                 ("GET" | "HEAD", "/api/measurements") => {
                     match self.handle.analytics().measurement_history() {
@@ -572,6 +569,30 @@ impl Service {
         }
     }
 
+    fn analytics_svg(&self, query: &str) -> Response {
+        let width = match analytics_width(query) {
+            Ok(width) => width,
+            Err(message) => return error(400, message),
+        };
+        let analytics = self.handle.analytics();
+        let rendered = match width {
+            Some(width) => analytics.snapshot().and_then(|snapshot| {
+                crate::analytics::render_svg_with_options(
+                    &snapshot,
+                    crate::analytics::SvgOptions::interface(
+                        width,
+                        crate::analytics::SvgColors::default(),
+                    ),
+                )
+            }),
+            None => analytics.svg(),
+        };
+        match rendered {
+            Ok(svg) => Response::new(200, "image/svg+xml; charset=utf-8", svg.into_bytes()),
+            Err(err) => error(503, format!("analytics unavailable: {err:#}")),
+        }
+    }
+
     fn activity(&self, query: &str) -> Response {
         let (after, timeout) = match activity_query(query) {
             Ok(query) => query,
@@ -691,6 +712,20 @@ fn percent_decode(value: &str) -> std::result::Result<String, String> {
         return Err("URL must not contain control characters".into());
     }
     Ok(result)
+}
+
+fn analytics_width(query: &str) -> std::result::Result<Option<u32>, String> {
+    if query.is_empty() {
+        return Ok(None);
+    }
+    let value = query
+        .strip_prefix("width=")
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or("analytics query accepts one unsigned width")?;
+    value
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| "analytics width is too large".into())
 }
 
 fn camera_query(query: &str) -> std::result::Result<Option<String>, String> {
@@ -1009,6 +1044,60 @@ mod tests {
             assert_eq!(service.respond(post).status, 405);
         }
         handle.shutdown();
+    }
+
+    #[test]
+    fn analytics_chart_route_adapts_to_the_requested_width_and_rejects_ambiguous_queries() {
+        let root = WebRoot::new();
+        let service = Service {
+            handle: SessionHandle::new(),
+            web_root: root.0.clone(),
+            quitting: Arc::new(AtomicBool::new(false)),
+            activity_waits: Arc::new(AtomicUsize::new(0)),
+        };
+        for (query, width, height) in [
+            ("width=320", 320, 1040),
+            ("width=0", 180, 1040),
+            ("width=4294967295", 2048, 520),
+        ] {
+            let request = parse_headers(&format!(
+                "GET /api/analytics.svg?{query} HTTP/1.1\r\nHost: camera:7878"
+            ))
+            .unwrap();
+            let response = service.respond(request);
+            assert_eq!(response.status, 200);
+            let svg = std::str::from_utf8(&response.body).unwrap();
+            let doc = roxmltree::Document::parse(svg).unwrap();
+            assert_eq!(
+                doc.root_element().attribute("width"),
+                Some(width.to_string().as_str())
+            );
+            assert_eq!(
+                doc.root_element().attribute("height"),
+                Some(height.to_string().as_str())
+            );
+        }
+        let original = service.handle.analytics().svg().unwrap();
+        let response = service.respond(
+            parse_headers("HEAD /api/analytics.svg HTTP/1.1\r\nHost: camera:7878").unwrap(),
+        );
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, original.as_bytes());
+        for query in [
+            "width=",
+            "width=-1",
+            "width=2.5",
+            "width=320&width=640",
+            "width=320&",
+            "other=320",
+            "width=4294967296",
+        ] {
+            let request = parse_headers(&format!(
+                "GET /api/analytics.svg?{query} HTTP/1.1\r\nHost: camera:7878"
+            ))
+            .unwrap();
+            assert_eq!(service.respond(request).status, 400, "{query}");
+        }
     }
 
     #[test]

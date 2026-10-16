@@ -187,6 +187,14 @@ fn series_identity(sample: &MeasurementSample) -> Result<String> {
 /// and changed definitions are never combined on an axis. Null results break
 /// line segments rather than appearing as zero or interpolated estimates.
 pub fn render_measurement_svg(samples: &[MeasurementSample]) -> Result<String> {
+    render_measurement_svg_with_options(samples, SvgOptions::default())
+}
+
+/// Use the interface's logical width and palette without scaling down labels.
+pub fn render_measurement_svg_with_options(
+    samples: &[MeasurementSample],
+    options: SvgOptions,
+) -> Result<String> {
     anyhow::ensure!(
         samples.len() <= MAX_MEASUREMENT_SAMPLES,
         "measurement chart exceeds the session row limit"
@@ -206,41 +214,112 @@ pub fn render_measurement_svg(samples: &[MeasurementSample]) -> Result<String> {
     series.sort_by_key(|series| std::cmp::Reverse(series.last().unwrap().timestamp_ms));
     let omitted = series.len().saturating_sub(MAX_MEASUREMENT_PANELS);
     series.truncate(MAX_MEASUREMENT_PANELS);
-    let height = 96 + 280 * series.len().max(1) as u32;
+    let series_description = series
+        .iter()
+        .map(|series| {
+            let sample = series[0];
+            format!(
+                "{}; camera: {}; {} / {}; unit: {}.",
+                sample.definition.label,
+                sample.camera_id,
+                sample.provider,
+                sample.model,
+                sample.definition.unit
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let series_description = if options.interface {
+        chart_label(&series_description, u32::MAX)
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    } else {
+        String::new()
+    };
+    let notice = if options.interface && omitted > 0 {
+        let message = format!(
+            "Showing {MAX_MEASUREMENT_PANELS} latest series; {omitted} more remain in session history."
+        );
+        let budget = options.width.saturating_sub(32) as usize / 7;
+        let mut lines = vec![String::new()];
+        for word in message.split_whitespace() {
+            let line = lines.last_mut().unwrap();
+            if !line.is_empty() && line.len() + word.len() + 1 > budget {
+                lines.push(word.into());
+            } else {
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(word);
+            }
+        }
+        lines
+    } else {
+        Vec::new()
+    };
+    let notice_height = if notice.is_empty() {
+        0
+    } else {
+        notice.len() as u32 * 18 + 16
+    };
+    let height =
+        if options.interface { notice_height } else { 96 } + 280 * series.len().max(1) as u32;
+    let width = options.width;
     let mut svg = String::with_capacity(30_000);
     {
-        let root = SVGBackend::with_string(&mut svg, (1200, height)).into_drawing_area();
-        root.fill(&BACKGROUND).map_err(plot_error)?;
-        root.draw(&Text::new(
-            "Prompt measurements",
-            (28, 33),
-            ("sans-serif", 24).into_font().color(&TEXT),
-        ))
-        .map_err(plot_error)?;
-        let subtitle = if omitted > 0 {
-            format!(
-                "Showing the {MAX_MEASUREMENT_PANELS} most recently observed series; {omitted} more remain in the session history."
-            )
-        } else {
-            "Model estimates for this session. Unknown values remain gaps; units and camera identities stay separate.".to_owned()
-        };
-        root.draw(&Text::new(
-            subtitle,
-            (28, 61),
-            ("sans-serif", 14).into_font().color(&MUTED),
-        ))
-        .map_err(plot_error)?;
+        let root = SVGBackend::with_string(&mut svg, (width, height)).into_drawing_area();
+        root.fill(&rgb(options.colors.background))
+            .map_err(plot_error)?;
+        for (index, line) in notice.iter().enumerate() {
+            root.draw(&Text::new(
+                line.as_str(),
+                (16, 16 + index as i32 * 18),
+                (options.font_family(), options.label_size())
+                    .into_font()
+                    .color(&rgb(options.colors.secondary)),
+            ))
+            .map_err(plot_error)?;
+        }
+        if !options.interface {
+            root.draw(&Text::new(
+                "Prompt measurements",
+                (28, 33),
+                ("sans-serif", 24).into_font().color(&TEXT),
+            ))
+            .map_err(plot_error)?;
+            let subtitle = if omitted > 0 {
+                format!(
+                    "Showing the {MAX_MEASUREMENT_PANELS} most recently observed series; {omitted} more remain in the session history."
+                )
+            } else {
+                "Model estimates for this session. Unknown values remain gaps; units and camera identities stay separate.".to_owned()
+            };
+            root.draw(&Text::new(
+                subtitle,
+                (28, 61),
+                ("sans-serif", 14).into_font().color(&MUTED),
+            ))
+            .map_err(plot_error)?;
+        }
         if series.is_empty() {
             root.draw(&Text::new(
-                "Add a measurement prompt and analyze a camera frame to start collecting values.",
-                (140, 210),
-                ("sans-serif", 20).into_font().color(&TEXT),
+                if options.interface { "No measurements yet" } else { "Add a measurement prompt and analyze a camera frame to start collecting values." },
+                if options.interface { (20, 140) } else { (140, 210) },
+                (options.font_family(), if options.interface { options.caption_size() } else { 20.0 }).into_font().color(&rgb(options.colors.text)),
             ))
             .map_err(plot_error)?;
         } else {
-            let panels = root.margin(78, 18, 10, 10).split_evenly((series.len(), 1));
+            let panels = root
+                .margin(
+                    if options.interface { notice_height } else { 78 },
+                    if options.interface { 0 } else { 18 },
+                    if options.interface { 0 } else { 10 },
+                    if options.interface { 0 } else { 10 },
+                )
+                .split_evenly((series.len(), 1));
             for (area, series) in panels.iter().zip(&series) {
-                draw_measurement_series(area, series)?;
+                draw_measurement_series(area, series, options)?;
             }
         }
         root.present().map_err(plot_error)?;
@@ -251,7 +330,7 @@ pub fn render_measurement_svg(samples: &[MeasurementSample]) -> Result<String> {
         1,
     );
     if let Some(position) = svg.find('>') {
-        svg.insert_str(position + 1, "<title id=\"measurements-title\">Prompt-defined video measurements</title><desc id=\"measurements-description\">Each panel contains one camera, measurement definition, provider and model. Unknown values are gaps. Data is retained in memory for at most twenty-four hours.</desc>");
+        svg.insert_str(position + 1, &format!("<title id=\"measurements-title\">Prompt-defined video measurements</title><desc id=\"measurements-description\">Each panel contains one camera, measurement definition, provider and model. Unknown values are gaps. Data is retained in memory for at most twenty-four hours. {series_description}</desc>"));
     }
     Ok(svg)
 }
@@ -259,6 +338,7 @@ pub fn render_measurement_svg(samples: &[MeasurementSample]) -> Result<String> {
 fn draw_measurement_series(
     area: &DrawingArea<SVGBackend<'_>, Shift>,
     samples: &[&MeasurementSample],
+    options: SvgOptions,
 ) -> Result<()> {
     let first = samples[0];
     let label = chart_label(&first.definition.label, 54);
@@ -288,7 +368,10 @@ fn draw_measurement_series(
         0
     };
     let scale = 10_f64.powi(exponent);
-    let unit = chart_label(&first.definition.unit, 24);
+    let unit = chart_label(
+        &first.definition.unit,
+        if options.interface { 14 } else { 24 },
+    );
     let unit = if exponent == 0 {
         if unit.is_empty() {
             "value".to_owned()
@@ -307,48 +390,143 @@ fn draw_measurement_series(
         });
     let spread = high - low;
     let padding = if spread > 0.0 { spread * 0.12 } else { 0.12 };
-    let mut chart = ChartBuilder::on(area)
+    let (heading, plot) = area.split_vertically(if options.interface { 54 } else { 0 });
+    if options.interface {
+        heading
+            .draw(&Text::new(
+                interface_measurement_label(
+                    &first.definition.label,
+                    options.width.saturating_sub(32),
+                    16.0,
+                ),
+                (16, 20),
+                (options.font_family(), options.caption_size())
+                    .into_font()
+                    .color(&rgb(options.colors.text)),
+            ))
+            .map_err(plot_error)?;
+        heading
+            .draw(&Text::new(
+                interface_measurement_label(
+                    &format!("{} · {provider} / {}", first.camera_id, first.model),
+                    options.width.saturating_sub(32),
+                    12.0,
+                ),
+                (16, 43),
+                (options.font_family(), options.label_size())
+                    .into_font()
+                    .color(&rgb(options.colors.secondary)),
+            ))
+            .map_err(plot_error)?;
+    }
+    let mut builder = ChartBuilder::on(&plot);
+    builder
         .margin(16)
-        .caption(caption, ("sans-serif", 18).into_font().color(&TEXT))
         .x_label_area_size(42)
-        .y_label_area_size(86)
+        .y_label_area_size(86);
+    if !options.interface {
+        builder.caption(
+            caption,
+            (options.font_family(), 18)
+                .into_font()
+                .color(&rgb(options.colors.text)),
+        );
+    }
+    let mut chart = builder
         .build_cartesian_2d(0.0..span, low - padding..high + padding)
         .map_err(plot_error)?;
     chart
         .configure_mesh()
         .disable_x_mesh()
-        .light_line_style(MUTED.mix(0.12))
-        .bold_line_style(MUTED.mix(0.2))
-        .axis_style(MUTED.mix(0.6))
-        .label_style(("sans-serif", 12).into_font().color(&MUTED))
-        .x_labels(5)
+        .light_line_style(
+            rgb(options.colors.axis).mix(if options.colors.increased_contrast {
+                0.35
+            } else {
+                0.12
+            }),
+        )
+        .bold_line_style(
+            rgb(options.colors.axis).mix(if options.colors.increased_contrast {
+                0.5
+            } else {
+                0.2
+            }),
+        )
+        .axis_style(rgb(options.colors.axis).mix(if options.interface { 1.0 } else { 0.6 }))
+        .label_style(
+            (options.font_family(), options.label_size())
+                .into_font()
+                .color(&rgb(options.colors.secondary)),
+        )
+        .x_labels(if options.interface && options.width < 420 {
+            3
+        } else {
+            5
+        })
         .y_labels(4)
         .x_label_formatter(&|seconds| duration_label(*seconds))
-        .x_desc("Time in this series")
+        .x_desc(if options.interface && options.width < 420 {
+            "Elapsed time"
+        } else {
+            "Time in this series"
+        })
         .y_desc(&unit)
-        .axis_desc_style(("sans-serif", 12).into_font().color(&MUTED))
+        .axis_desc_style(
+            (options.font_family(), options.label_size())
+                .into_font()
+                .color(&rgb(options.colors.secondary)),
+        )
         .draw()
         .map_err(plot_error)?;
     for segment in numeric_segments(samples, start, scale) {
         if segment.len() > 1 {
             chart
-                .draw_series(LineSeries::new(segment.clone(), ACCENT.stroke_width(2)))
+                .draw_series(LineSeries::new(
+                    segment.clone(),
+                    rgb(options.colors.frame_rate).stroke_width(2),
+                ))
                 .map_err(plot_error)?;
         }
         chart
             .draw_series(
                 segment
                     .into_iter()
-                    .map(|point| Circle::new(point, 3, ACCENT.filled())),
+                    .map(|point| Circle::new(point, 3, rgb(options.colors.frame_rate).filled())),
             )
             .map_err(plot_error)?;
     }
     if samples.iter().all(|sample| sample.result.value.is_none()) {
         chart
             .draw_series(std::iter::once(Text::new(
-                "No numeric value available",
-                (span * 0.35, (low + high) * 0.5),
-                ("sans-serif", 15).into_font().color(&MUTED),
+                if options.interface && options.width < 420 {
+                    "Unknown"
+                } else {
+                    "No numeric value available"
+                },
+                (
+                    span * if options.interface { 0.5 } else { 0.35 },
+                    (low + high) * 0.5,
+                ),
+                TextStyle::from(
+                    (
+                        options.font_family(),
+                        if options.interface {
+                            options.label_size()
+                        } else {
+                            15.0
+                        },
+                    )
+                        .into_font(),
+                )
+                .color(&rgb(options.colors.secondary))
+                .pos(plotters::style::text_anchor::Pos::new(
+                    if options.interface {
+                        plotters::style::text_anchor::HPos::Center
+                    } else {
+                        plotters::style::text_anchor::HPos::Left
+                    },
+                    plotters::style::text_anchor::VPos::Center,
+                )),
             )))
             .map_err(plot_error)?;
     }
@@ -376,6 +554,41 @@ fn numeric_segments(
         segments.push(current);
     }
     segments
+}
+
+fn interface_measurement_label(value: &str, width: u32, em: f32) -> String {
+    let printable = chart_label(value, u32::MAX);
+    // SVG resolves the platform's fallback fonts after export. Reserve a
+    // conservative advance for wide Latin and non-Latin glyphs rather than
+    // treating every character as an average narrow Latin letter.
+    let advance = |grapheme: &str| -> f32 {
+        grapheme
+            .chars()
+            .map(|character| match character {
+                ' ' => 0.4,
+                'a'..='z' if !matches!(character, 'm' | 'w') => 0.7,
+                '0'..='9' => 0.7,
+                character if character.is_ascii() => 1.1,
+                _ => 2.0,
+            })
+            .sum::<f32>()
+            * em
+    };
+    if printable.graphemes(true).map(advance).sum::<f32>() <= width as f32 {
+        return printable;
+    }
+    let mut shortened = String::new();
+    let mut used = 0.0;
+    for grapheme in printable.graphemes(true) {
+        let next = used + advance(grapheme);
+        if next + em > width as f32 {
+            break;
+        }
+        shortened.push_str(grapheme);
+        used = next;
+    }
+    shortened.push('…');
+    shortened
 }
 
 fn chart_label(value: &str, budget: u32) -> String {

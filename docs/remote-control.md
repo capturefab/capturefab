@@ -90,7 +90,7 @@ The client uses same-origin HTTP endpoints without authentication headers. Reque
 | `GET`, `HEAD /health` | JSON readiness, uptime, camera counts and analytics health; HTTP 503 when stopping or analytics is unavailable |
 | `GET`, `HEAD /metrics` | Prometheus text metrics for session and camera acquisition |
 | `GET`, `HEAD /api/analytics` | Current session totals, camera summaries and bounded time series |
-| `GET`, `HEAD /api/analytics.svg` | Rust Plotters dashboard with frame rate, throughput, missed frames and camera data volume comparisons |
+| `GET`, `HEAD /api/analytics.svg` | Rust Plotters dashboard with frame rate, throughput, missed frames and camera data volume comparisons; optional `width=<logical pixels>` adapts charts to an interface |
 
 Command requests wrap an existing `SessionCommand`:
 
@@ -125,6 +125,11 @@ additive metadata preserves the version-1 envelope and original fields.
 Analytics collection runs with the session, including when no browser is open and no metrics scraper is connected. DuckDB stores the time series in memory, sampling once per second and retaining at most 24 hours or 250,000 rows. Its engine memory limit is 128 MB, with disk spilling and external access disabled. Camera metadata is capped at 256 entries, and inactive entries expire within 24 hours. Session counters accumulate across stop/start and camera disconnects as constant-size lifetime totals; time-series history expires independently. A new server process starts with fresh analytics. Frame and received-byte totals describe acquisition, while missed-frame metrics expose transport or shared-ring losses; they do not count files written by capture jobs.
 
 Open `/api/analytics.svg` to view or save the dashboard for the current session. The native desktop window's **Analytics** button shows the same measurements with charts that follow the app's appearance, readable camera names and browsable history data. **Show history data** opens a fixed snapshot; **Update history** loads the latest charted report while preserving the page when possible. The dark exported SVG includes an empty state before the first frame and scales its plots to the collected history. The JSON report includes `retention_seconds`, `sample_interval_seconds`, sample counts, session totals, camera summaries and time-series points. Its API and SVG routes enforce the same browser-origin checks as other `/api/` routes.
+
+The browser requests `/api/analytics.svg?width=N` using the available chart width.
+Widths are clamped to 180–2048 logical pixels; below 840 pixels the four panels
+stack vertically with readable labels. Omit `width` for the original 1200×700
+export. Invalid or duplicate query parameters return HTTP 400.
 
 Monitoring tools can fetch `/health` and `/metrics` directly without a browser origin. `/health` returns a plain JSON object with `status`, `ready`, `version`, `uptime_seconds`, `cameras` and `analytics`. An idle session with no connected cameras is ready. A previous camera command error stays in diagnostics without making readiness fail. `/metrics` uses Prometheus text format with session counters such as `capturefab_session_frames_total` and per-camera counters labeled by `camera_id` and `name`. `HEAD` returns the same status and headers as `GET` with no body; unsupported methods on these four routes return HTTP 405 with `Allow: GET, HEAD`.
 

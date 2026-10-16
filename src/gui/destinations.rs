@@ -1877,7 +1877,8 @@ impl Picker {
         self.manager_open = true;
     }
 
-    /// The "Save to" row, the output field and the drive shortcuts. `output`
+    /// The "Save to" row and output field. Drive shortcuts are a separate
+    /// section so the parent can keep its primary action ahead of them. `output`
     /// is the path on this computer, or a name inside the destination.
     pub fn view<'a>(
         &'a self,
@@ -2005,6 +2006,11 @@ impl Picker {
         if let Some(error) = output_error {
             content = content.push(field_error(error, p));
         }
+        content.into()
+    }
+
+    pub fn drive_shortcuts(&self, p: &'static Palette) -> Element<'_, Message> {
+        let mut content = column![].spacing(6);
         if !self.volumes.is_empty() {
             let drives = self
                 .volumes
@@ -2751,7 +2757,7 @@ impl Picker {
     /// checked) and `testing` (after an editor word: its check never ends).
     pub(super) fn scene(&mut self, word: &str) -> bool {
         match word {
-            "destinations-list" => {
+            "destinations-list" | "destinations-remove" => {
                 for (name, target) in [
                     (
                         "archive",
@@ -2781,18 +2787,23 @@ impl Picker {
                 }
                 self.saved = destination::list().unwrap_or_default();
                 self.notice = Some(("Saved line-1".into(), false));
+                if word == "destinations-remove" {
+                    self.removing = Some("archive".into());
+                    self.notice = None;
+                }
             }
             "folder-editor" => self.open_editor(Editor::new_folder(
                 "archive".into(),
                 "/Volumes/Archive/Capturefab".into(),
             )),
-            "bucket-editor" => {
+            "bucket-editor" | "bucket-editor-advanced" => {
                 let mut editor = Editor::new_bucket();
                 editor.bucket = "line-1-captures".into();
                 editor.name = safe_name(&editor.bucket);
                 editor.access_key_id = "AKIAIOSFODNN7EXAMPLE".into();
                 editor.stored_secret = true;
                 editor.message = Some(("Connected to line-1-captures".into(), false));
+                editor.advanced = word == "bucket-editor-advanced";
                 self.open_editor(editor);
             }
             "testing" => {
