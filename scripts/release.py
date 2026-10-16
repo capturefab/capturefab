@@ -413,7 +413,18 @@ def package(args, binary, variant):
             app = stage / 'Capturefab.app' / 'Contents'
             (app / 'MacOS').mkdir(parents=True)
             (app / 'Resources').mkdir()
-            shutil.copy2(executable, app / 'MacOS' / 'capturefab')
+            # Store the signed Mach-O once. A tiny launcher keeps ./capturefab
+            # available for CLI use while Finder opens the same app executable.
+            executable.rename(app / 'MacOS' / 'capturefab')
+            executable.write_text(
+                '#!/bin/sh\n'
+                'directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1\n'
+                'exec "$directory/Capturefab.app/Contents/MacOS/capturefab" "$@"\n',
+                encoding='utf-8',
+            )
+            executable.chmod(0o755)
+            with (stage / 'README.txt').open('a', encoding='utf-8') as readme:
+                readme.write('macOS CLI: ./capturefab --help launches the executable inside Capturefab.app.\nKeep the launcher beside the app, or run /Applications/Capturefab.app/Contents/MacOS/capturefab directly after installing.\n')
             shutil.copy2(ROOT / 'assets/icons/capturefab.icns', app / 'Resources/capturefab.icns')
             info = plistlib.loads((ROOT / 'assets' / 'Info.plist').read_bytes())
             short = '.'.join(SEMVER.fullmatch(args.version).groups()[:3])
@@ -439,7 +450,7 @@ def package(args, binary, variant):
         if args.os == 'macos' and signed == 'apple-developer-id' and os.environ.get('MACOS_NOTARY_PROFILE'):
             notarize(path)
             # Staple the app, then recreate the archive with its ticket included.
-            # The bare executable cannot hold a ticket; Gatekeeper fetches it online.
+            # A headless executable cannot hold a ticket; Gatekeeper fetches it online.
             if variant == 'desktop':
                 run(['xcrun', 'stapler', 'staple', app.parent])
                 gatekeeper(app.parent)
@@ -504,7 +515,12 @@ def repackage(args, variant):
         binary = Path(temp) / name
         if archive_path.suffix == '.zip':
             with zipfile.ZipFile(archive_path) as archive:
-                binary.write_bytes(archive.read(f'{stem}/{name}'))
+                member = f'{stem}/{name}'
+                if args.os == 'macos' and variant == 'desktop':
+                    app_binary = f'{stem}/Capturefab.app/Contents/MacOS/capturefab'
+                    if app_binary in archive.namelist():
+                        member = app_binary
+                binary.write_bytes(archive.read(member))
         else:
             with tarfile.open(archive_path) as archive:
                 with archive.extractfile(f'{stem}/{name}') as stream:

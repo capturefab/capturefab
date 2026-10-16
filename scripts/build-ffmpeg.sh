@@ -190,7 +190,28 @@ ffmpeg_flags=(--prefix="$OUTPUT_DIR" --arch="$TARGET_ARCH" --target-os="$TARGET_
     --cc="$CC" --cxx="$CXX" --ar="$AR" --ranlib="$RANLIB" --strip="$STRIP"
     --disable-autodetect --disable-shared --enable-static --enable-gpl --enable-version3
     --enable-libx264 --enable-libsrt --enable-openssl --pkg-config-flags=--static
-    --disable-ffplay --disable-ffprobe --disable-doc --disable-debug)
+    --disable-ffplay --disable-ffprobe --disable-doc --disable-debug
+    # Keep all native decoders, demuxers, parsers, bitstream filters and network
+    # protocols: unusual webcams/IP cameras and existing recordings need them.
+    # Keep raw/PPM frames, lossless FFV1 and H.264/HEVC/AV1 video. Other
+    # still-image, audio, subtitle and legacy-video encoders are unused.
+    # FFV1 remains for lossless media fixtures and explicit lossless encoding.
+    --disable-encoders
+    "--enable-encoder=rawvideo,ppm,wrapped_avframe,ffv1,libx264"
+    "--enable-encoder=h264_nvenc,hevc_nvenc,av1_nvenc"
+    "--enable-encoder=h264_amf,hevc_amf,av1_amf"
+    "--enable-encoder=h264_qsv,hevc_qsv,av1_qsv"
+    "--enable-encoder=h264_vulkan,hevc_vulkan,av1_vulkan"
+    "--enable-encoder=h264_mf,hevc_mf,av1_mf"
+    "--enable-encoder=h264_videotoolbox,hevc_videotoolbox"
+    "--enable-encoder=h264_v4l2m2m,hevc_v4l2m2m"
+    # Retain the exact conversion/probe graph used by src/media.rs, including
+    # automatic pixel-format conversion and hardware frame transfers.
+    --disable-filters
+    "--enable-filter=scale,pad,fps,format,null"
+    "--enable-filter=hwupload,hwdownload,hwmap,color,testsrc,testsrc2"
+    # Camera capture only; no audio capture, screen grabbers or device playback.
+    --disable-indevs --disable-outdevs --enable-indev=lavfi)
 if [[ $ENABLE_NVENC == 1 ]]; then ffmpeg_flags+=(--enable-ffnvcodec --enable-nvenc --enable-nvdec --enable-cuvid); fi
 if [[ $ENABLE_AMF == 1 ]]; then ffmpeg_flags+=(--enable-amf); fi
 # mfenc.c uses D3D11 types without declaring the dependency; QSV enabled it on x64.
@@ -207,11 +228,11 @@ case $TARGET_OS:$TARGET_ARCH in
     darwin:aarch64)
         OPENSSL_TARGET=${OPENSSL_TARGET:-darwin64-arm64-cc}
         export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-11.0}
-        ffmpeg_flags+=(--enable-videotoolbox --enable-avfoundation) ;;
+        ffmpeg_flags+=(--enable-videotoolbox --enable-avfoundation --enable-indev=avfoundation) ;;
     darwin:x86_64)
         OPENSSL_TARGET=${OPENSSL_TARGET:-darwin64-x86_64-cc}
         export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-10.15}
-        ffmpeg_flags+=(--enable-videotoolbox --enable-avfoundation) ;;
+        ffmpeg_flags+=(--enable-videotoolbox --enable-avfoundation --enable-indev=avfoundation) ;;
     linux:aarch64) OPENSSL_TARGET=${OPENSSL_TARGET:-linux-aarch64} ;;
     linux:x86_64) OPENSSL_TARGET=${OPENSSL_TARGET:-linux-x86_64} ;;
     linux:arm) OPENSSL_TARGET=${OPENSSL_TARGET:-linux-armv4} ;;
@@ -222,9 +243,6 @@ case $TARGET_OS:$TARGET_ARCH in
         cmake_flags+=(-DENABLE_STDCXX_SYNC=ON)
         if [[ $TARGET_ARCH == aarch64 ]]; then
             openssl_flags+=(no-asm)
-            # The WinRT screen-capture filter's <version> include finds FFmpeg's
-            # VERSION file on case-insensitive NTFS under LLVM's libc++.
-            ffmpeg_flags+=(--disable-filter=gfxcapture)
         fi ;;
     *) die 'unsupported OS/architecture pair' ;;
 esac
@@ -350,6 +368,51 @@ if [[ $run_checks == 1 ]]; then
     "$binary" -hide_banner -encoders > "$OUTPUT_DIR/logs/encoders.txt" 2>&1
     grep -q 'libx264' "$OUTPUT_DIR/logs/encoders.txt" || die 'libx264 encoder missing'
     "$binary" -hide_banner -loglevel error -f lavfi -i testsrc2=size=64x64:rate=2 -frames:v 2 -c:v libx264 -f null -
+    # Check actual capabilities rather than trusting configure arguments: FFmpeg
+    # can silently disable a requested component when a dependency is missing.
+    for category in decoders demuxers muxers filters devices; do
+        "$binary" -hide_banner -"$category" > "$OUTPUT_DIR/logs/$category.txt" 2>&1
+    done
+    require_component() {
+        local category=$1 component=$2
+        grep -Eq "^[[:space:]]*[^[:space:]]+[[:space:]]+([^[:space:]]*,)?${component}(,|[[:space:]])" "$OUTPUT_DIR/logs/$category.txt" || die "$category: $component missing"
+    }
+    for component in rawvideo mjpeg h264 hevc av1 mpeg4 mpeg2video vp8 vp9 tiff; do
+        require_component decoders "$component"
+    done
+    for component in rawvideo image2 concat mov matroska mpegts rtsp sdp mjpeg; do
+        require_component demuxers "$component"
+    done
+    for component in rawvideo image2pipe null mp4 matroska webm mpegts rtsp flv; do
+        require_component muxers "$component"
+    done
+    for component in rawvideo ppm ffv1 libx264; do
+        require_component encoders "$component"
+    done
+    for component in scale pad fps format hwupload color testsrc2; do
+        require_component filters "$component"
+    done
+    case $TARGET_OS in
+        darwin) require_component devices avfoundation ;;
+        linux) require_component devices video4linux2 ;;
+        mingw32) require_component devices dshow ;;
+    esac
+    # Exercise file muxing, decoding, aspect preservation, padding and FPS
+    # conversion, then the PPM image pipe used by camera preview.
+    smoke_dir=$(mktemp -d "$OUTPUT_DIR/logs/media-smoke.XXXXXX")
+    for container in mp4 matroska mpegts flv; do
+        "$binary" -hide_banner -loglevel error -f lavfi -i testsrc2=size=64x48:rate=2 \
+            -frames:v 2 -an -c:v libx264 -pix_fmt yuv420p -f "$container" "$smoke_dir/$container"
+        "$binary" -hide_banner -loglevel error -i "$smoke_dir/$container" -an \
+            -vf 'scale=80:80:force_original_aspect_ratio=decrease:eval=frame,pad=80:80:(ow-iw)/2:(oh-ih)/2:eval=frame,fps=2' \
+            -frames:v 2 -c:v rawvideo -pix_fmt rgb24 -f rawvideo "$smoke_dir/$container.rgb"
+        [[ $(wc -c < "$smoke_dir/$container.rgb") -eq $((2 * 80 * 80 * 3)) ]] || die "$container raw conversion failed"
+        "$binary" -hide_banner -loglevel error -i "$smoke_dir/$container" -an \
+            -frames:v 2 -c:v ppm -pix_fmt rgb24 -f image2pipe "$smoke_dir/$container.ppm"
+        # Two RGB frames, each with a 13-byte P6/64x48/255 header.
+        [[ $(wc -c < "$smoke_dir/$container.ppm") -eq $((2 * (64 * 48 * 3 + 13))) ]] || die "$container PPM preview failed"
+    done
+    rm -r "$smoke_dir"
     case $TARGET_OS in
         darwin)
             otool -L "$binary" > "$OUTPUT_DIR/logs/linked-libraries.txt"

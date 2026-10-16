@@ -6,6 +6,42 @@ Capturefab's camera control, GenICam interpreter, GigE transport, and USB3 Visio
 
 The build enables GPLv3, H.264 encoding with libx264, SRT with OpenSSL encryption, HTTPS, RTSP, UDP/RTP, FFmpeg's native decoders, and its native format support. It enables AVFoundation and VideoToolbox on macOS, V4L2 and V4L2 mem2mem on Linux, and DirectShow/Media Foundation on Windows. External library autodetection is disabled and pkg-config is isolated to the freshly built static libraries, preventing an installed package from silently becoming a runtime dependency. macOS retains its operating system libraries/frameworks; Linux normally retains libc and its related operating system libraries; Windows retains operating system DLLs. SRT, x264, and OpenSSL are linked statically.
 
+## Camera-focused component policy
+
+The payload retains all native decoders, demuxers, parsers, bitstream filters,
+network protocols and hardware decoding backends. This deliberately preserves
+unusual webcam formats, older IP cameras, image sequences and existing media
+files rather than limiting inputs to H.264/H.265/MJPEG. Native camera inputs
+remain AVFoundation, V4L2 and DirectShow, plus the synthetic lavfi input.
+
+Only output-side encoders and processing are narrowed: raw video, PPM preview
+frames, lossless FFV1, the null-test frame wrapper, software H.264 (libx264),
+and the platform's H.264/HEVC/AV1 hardware
+encoders remain. Audio/subtitle encoders, legacy video and non-preview still-image
+encoders, audio capture, screen capture and device playback are omitted. Capturefab's
+stills use its own JPEG/PNG paths. All container muxers remain available.
+Filters are limited to scaling, padding, frame rate and pixel format conversion,
+hardware frame transfers, pass-through and synthetic test/probe sources.
+Unavailable platform encoders remain governed by their existing hardware switches
+and FFmpeg's dependency checks. No new software HEVC/AV1 encoder is introduced.
+
+Native builds check essential decoder, format, filter and camera-device listings,
+then encode H.264 into MP4, Matroska, MPEG-TS and FLV and decode each back through
+the scaling/padding/FPS pipeline to raw RGB and the PPM preview pipe. These checks
+complement the existing SRT and encoder checks; physical cameras and GPU drivers still need
+validation on their target systems. Cross builds must run these checks natively.
+
+On 2026-10-16, a macOS ARM64 comparison using the same pinned sources, static
+libraries and Apple compiler measured 29,917,032 → 24,455,464 bytes for the
+stripped executable (18.3% smaller). Gzip-compressing each executable measured
+14,172,812 → 11,672,268 bytes (17.6% smaller); these are payload measurements,
+not complete Capturefab download sizes. Decoder, demuxer, muxer, protocol and
+hardware-acceleration listings matched the previous configuration. The reduced
+payload passed the eight existing ignored FFmpeg integration tests, including
+raw sensor conversion, file recording/replay, ONVIF fallback and simulated RTSP
+TCP/UDP decoding, plus Capturefab → MediaMTX → Capturefab RTSP and SRT round trips.
+Other targets still require their native release builds and device validation.
+
 `ENABLE_NVENC=1` enables NVIDIA NVENC/NVDEC/CUVID using pinned FFmpeg `nv-codec-headers` 12.0.16.2. It defaults to 1 on Linux/Windows x86_64 and ARM64, and 0 elsewhere. These are build-only MIT-licensed headers; FFmpeg loads the installed GPU driver's libraries when that backend is used. The 12.0 API adds AV1 NVENC (`av1_nvenc`, Ada and newer GPUs) and requires NVIDIA driver 520 or newer; older drivers fall back to the next encoder candidate. A build that lists an encoder still needs matching hardware and a working driver. Jetson Orin's video encoder is not reachable through NVENC (its `libnvidia-encode` needs `libnvcuvid`, shipped only for OpenRM GPUs such as Jetson Thor); Capturefab drives it through NVIDIA's GStreamer elements instead. [Header release requirements](https://github.com/FFmpeg/nv-codec-headers/blob/n12.0.16.2/README).
 
 `ENABLE_VULKAN=1` (default on Linux and Windows) enables Vulkan Video encoders (`h264_vulkan`, `hevc_vulkan`, `av1_vulkan`) using pinned Khronos Vulkan-Headers 1.4.363.0. Only headers are used at build time; FFmpeg loads the system Vulkan loader at run time, so no Vulkan library is linked. NVIDIA, AMD (RADV) and Intel (ANV) drivers implement Vulkan Video encode on supporting GPUs, which covers Linux AMD/Intel hardware without linking libva. `ENABLE_QSV=1` (default on Windows x86_64) builds Intel's MIT-licensed libvpl 2.17.0 dispatcher statically (the build script narrows one MSVC-only preprocessor check so it compiles against mingw-w64 14 headers, and adds the C++ runtime its `vpl.pc` omits so static linking works) and enables D3D11VA/DXVA2 for Intel Quick Sync (`*_qsv`); the dispatcher loads the GPU driver's runtime. Linux QSV and VAAPI would require linking system libva/libdrm, so they are not built; Capturefab still uses them with a user-supplied FFmpeg (`CAPTUREFAB_FFMPEG`). JPEG stills do not depend on this: Capturefab's own `__vajpeg` helper loads libva at run time for VA-API JPEG encoding.
@@ -25,7 +61,7 @@ CAPTUREFAB_FFMPEG_LICENSE="$PWD/target/ffmpeg-bundle/licenses/NOTICE.txt" \
 
 Without `CAPTUREFAB_FFMPEG_BINARY`, release-profile builds embed `target/ffmpeg/<target>/bin/ffmpeg[.exe]` when it exists. Dev and test builds never embed that file; they run it in place, so debug binaries stay small and relink quickly. Set `CAPTUREFAB_FFMPEG_BINARY` to embed FFmpeg in any profile.
 
-On Windows, run from an MSYS2 MinGW/UCRT shell with the matching target compiler and CMake available, using `CC=gcc CXX=g++`. The output is `bin/ffmpeg.exe`; use that filename for `CAPTUREFAB_FFMPEG_BINARY`. Do not use the MSYS compiler, which adds a dependency on `msys-2.0.dll`. Native Windows ARM64 needs an ARM64 MinGW toolchain: MSYS2 has no ARM64 GCC, so use its CLANGARM64 environment with `TARGET_ARCH=aarch64 CC=clang CXX=clang++ AR=llvm-ar RANLIB=llvm-ranlib STRIP=llvm-strip OBJDUMP=llvm-objdump`. Pass `TARGET_ARCH` explicitly there, because the MSYS2 shell itself runs as x86_64 under emulation and `uname -m` reports x86_64; the script also passes the host triple to x264's configure for the same reason, and uses OpenSSL's `mingwarm64` target. Under LLVM's libc++ it adds winpthreads to SRT's static link flags and leaves out FFmpeg's `gfxcapture` screen-capture filter, whose C++ `<version>` include finds FFmpeg's `VERSION` file on case-insensitive NTFS; Capturefab does not use that filter. Media Foundation builds also enable D3D11VA, which FFmpeg's `mfenc` needs. The recipe does not use MSVC.
+On Windows, run from an MSYS2 MinGW/UCRT shell with the matching target compiler and CMake available, using `CC=gcc CXX=g++`. The output is `bin/ffmpeg.exe`; use that filename for `CAPTUREFAB_FFMPEG_BINARY`. Do not use the MSYS compiler, which adds a dependency on `msys-2.0.dll`. Native Windows ARM64 needs an ARM64 MinGW toolchain: MSYS2 has no ARM64 GCC, so use its CLANGARM64 environment with `TARGET_ARCH=aarch64 CC=clang CXX=clang++ AR=llvm-ar RANLIB=llvm-ranlib STRIP=llvm-strip OBJDUMP=llvm-objdump`. Pass `TARGET_ARCH` explicitly there, because the MSYS2 shell itself runs as x86_64 under emulation and `uname -m` reports x86_64; the script also passes the host triple to x264's configure for the same reason, and uses OpenSSL's `mingwarm64` target. Under LLVM's libc++ it adds winpthreads to SRT's static link flags and omits screen-capture filters as part of the camera-focused component policy. Media Foundation builds also enable D3D11VA, which FFmpeg's `mfenc` needs. The recipe does not use MSVC.
 
 The script recognizes macOS Intel/ARM64, Linux x86_64/ARM64/ARMv7 (including Raspberry Pi and Jetson), and MinGW x86_64/ARM64. A native build on the oldest supported deployment system gives the clearest libc/SDK compatibility baseline. macOS defaults to deployment target 11.0 on ARM64 and 10.15 on Intel. Raspberry Pi 32-bit builds use ARMv7; 64-bit Raspberry Pi and Jetson builds use ARM64. Hardware encoder availability still depends on the operating system and device driver. Jetson-specific NVIDIA encoder support is not asserted by this portable recipe.
 

@@ -33,6 +33,13 @@ Not built by the workflow, so the manifest lists it as unavailable:
 
 - **Linux ARMv7.** GitHub has no ARMv7 runner. A cross build would be unexecuted; build natively on the device, or cross-compile and package with `--skip-smoke`, which labels the result `cross-compiled`.
 
+macOS desktop ZIPs store the executable once inside `Capturefab.app`. The small
+`capturefab` shell launcher beside the app forwards CLI arguments to that same
+executable; keep the two together when using the launcher. After moving the app
+to Applications, run `/Applications/Capturefab.app/Contents/MacOS/capturefab`
+for CLI access. Headless ZIPs contain the standalone executable. Repackaging for
+signing reads the executable from the app bundle.
+
 ## One-time repository setup
 
 1. Promotion is automatic after validation. The workflow no longer uses the `release` environment or `CAPTUREFAB_AUTO_PUBLISH`; existing environment reviewers do not gate future releases.

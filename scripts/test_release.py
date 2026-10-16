@@ -288,6 +288,25 @@ class ReleaseTests(unittest.TestCase):
                                  (release.ROOT / 'assets/icons/capturefab.icns').read_bytes())
                 self.assertEqual(archive.read(f'{stem}/THIRD-PARTY-LICENSES.txt'), b'crate licenses')
                 self.assertTrue(archive.getinfo(f'{stem}/capturefab').external_attr >> 16 & 0o100)
+                app_binary = f'{stem}/Capturefab.app/Contents/MacOS/capturefab'
+                self.assertEqual(archive.read(app_binary), binary.read_bytes())
+                self.assertTrue(archive.getinfo(app_binary).external_attr >> 16 & 0o100)
+                launcher = archive.read(f'{stem}/capturefab')
+                self.assertTrue(launcher.startswith(b'#!/bin/sh\n'))
+                self.assertLess(len(launcher), 512)
+                self.assertEqual(sum(archive.read(n).count(ffmpeg) for n in archive.namelist()), 1)
+                if os.name != 'nt':
+                    extracted = temp / 'directory with spaces'
+                    archive.extractall(extracted)
+                    installed = extracted / app_binary
+                    installed.write_text('#!/bin/sh\nprintf "%s\\n" "$PWD" "$@"\nexit 23\n')
+                    installed.chmod(0o755)
+                    cli = extracted / stem / 'capturefab'
+                    cli.chmod(0o755)
+                    result = subprocess.run([str(cli), '--help', 'argument with spaces', '*'],
+                                            cwd=temp, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 23)
+                    self.assertEqual(result.stdout.splitlines(), [str(temp.resolve()), '--help', 'argument with spaces', '*'])
                 self.assertIn(f'{stem}/media-licenses/NOTICE.txt', archive.namelist())
             source = plistlib.loads((release.ROOT / 'assets' / 'Info.plist').read_bytes())
             self.assertEqual(info['CFBundleIdentifier'], source['CFBundleIdentifier'])
@@ -412,7 +431,9 @@ class ReleaseTests(unittest.TestCase):
                 stem = f'capturefab-1.2.3-macos-aarch64-{variant}'
                 archive_path = output / f'{stem}.zip'
                 with zipfile.ZipFile(archive_path, 'w') as archive:
-                    archive.writestr(f'{stem}/capturefab', variant.encode())
+                    archive.writestr(f'{stem}/capturefab', b'CLI launcher' if variant == 'desktop' else variant.encode())
+                    if variant == 'desktop':
+                        archive.writestr(f'{stem}/Capturefab.app/Contents/MacOS/capturefab', variant.encode())
                 items.append(release.record(archive_path, 'macos', 'aarch64', variant))
             report_path = output / 'build-macos-aarch64.json'
             report_path.write_text(json.dumps(dict(version='1.2.3', assets=items)))
