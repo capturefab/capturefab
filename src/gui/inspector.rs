@@ -2213,7 +2213,7 @@ impl Workbench {
         if options_open {
             options = options.push(form_row("Timeout", self.num(Num::Timeout), "ms", p));
         }
-        let mut save = column![
+        let essentials = column![
             head,
             accessibility::mapped(
                 self.capture_to.view(
@@ -2253,6 +2253,10 @@ impl Workbench {
                 p,
             ),
             action,
+        ]
+        .spacing(8);
+        let mut save = column![
+            essentials,
             accessibility::mapped(self.capture_to.drive_shortcuts(p), Message::CapturePicker),
             options,
             checkbox(
