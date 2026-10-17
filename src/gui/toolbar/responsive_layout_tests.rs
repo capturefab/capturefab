@@ -96,11 +96,18 @@ fn responsive_toolbar_keeps_capture_and_session_actions_visible_and_clickable() 
                         "{label} clips at native width {native_width}, {scale}, overview={overview}: {bounds:?}, viewport={viewport:?}",
                     );
                 }
-                let capture = if overview {
-                    "Capture selected"
+                // The overview names the selected camera: a twin here, so
+                // by its plain serial.
+                let connected = app.snapshot.connected.clone().unwrap();
+                let (capture, capture_text) = if overview {
+                    (
+                        format!("Capture from {} {}", connected.model, identity(&connected)),
+                        format!("Capture {}", connected.serial),
+                    )
                 } else {
-                    "Capture"
+                    ("Capture".to_owned(), "Capture".to_owned())
                 };
+                let capture = capture.as_str();
                 let destination =
                     format!("Capture destination: {}", app.capture_to.label(&app.output));
                 for action in [
@@ -132,7 +139,7 @@ fn responsive_toolbar_keeps_capture_and_session_actions_visible_and_clickable() 
                     }
                     assert!(
                         messages.iter().any(|message| match action {
-                            "Capture" | "Capture selected" => matches!(message, Message::Capture),
+                            _ if action == capture => matches!(message, Message::Capture),
                             "Session analytics for all cameras" =>
                                 matches!(message, Message::Analytics(true)),
                             "Session activity" => matches!(message, Message::ToggleActivity),
@@ -154,8 +161,8 @@ fn responsive_toolbar_keeps_capture_and_session_actions_visible_and_clickable() 
                 let (_, capture_text) = geometry
                     .labels
                     .iter()
-                    .find(|(label, _)| label == capture)
-                    .unwrap();
+                    .find(|(label, _)| *label == capture_text)
+                    .unwrap_or_else(|| panic!("{capture_text} is whole at {native_width}, {scale}, overview={overview}"));
                 assert!(
                     inside(*capture_text, *capture_bounds),
                     "the complete Capture label remains readable"

@@ -199,11 +199,7 @@ impl Workbench {
                             ),
                             glass(
                                 Icon::CornersOut,
-                                format!(
-                                    "Open · {} · worker PID {}",
-                                    identity(&camera.info),
-                                    camera.worker_pid
-                                ),
+                                open_hint(&camera.info),
                                 Message::FocusTile(id.clone()),
                             ),
                         ]
@@ -338,6 +334,12 @@ impl Workbench {
     }
 }
 
+/// The tile's Open button's tooltip: which camera it opens, and the
+/// other way there.
+fn open_hint(camera: &CameraInfo) -> String {
+    format!("Open {} (or double-click the tile)", identity(camera))
+}
+
 /// A small mark in a tile's caption, such as forwarding or auto mode,
 /// explained on hover.
 fn chip<'a>(content: impl Into<Element<'a, Message>>, about: String) -> Element<'a, Message> {
@@ -402,6 +404,18 @@ impl canvas::Program<Message> for Corners {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_open_button_says_which_camera_in_plain_words() {
+        let mut camera = liveness::streaming_camera(0, 0, 0.0);
+        camera.worker_pid = 4242;
+        let hint = open_hint(&camera.info);
+        assert_eq!(
+            hint,
+            format!("Open {} (or double-click the tile)", identity(&camera.info))
+        );
+        assert!(!hint.contains("PID") && !hint.contains("4242"));
+    }
 
     #[test]
     fn grid_layout_makes_tiles_as_large_as_possible() {

@@ -330,13 +330,128 @@ impl Phase {
 }
 
 /// The overview's Auto label for `on` of `total` cameras in auto mode, and
-/// whether it reads as on: all of them.
-fn auto_all(on: usize, total: usize) -> (String, bool) {
-    if on == 0 || on == total {
-        ("Auto all".into(), on == total && total > 0)
-    } else {
-        (format!("Auto {on} of {total}"), false)
+/// whether it reads as on: all of them. `long` keeps the scope, "Auto
+/// all", so the batch toggle never reads as the selected camera's; a
+/// crowded bar says just "Auto". The single-camera bar's "Auto exposure"
+/// would read as the selected camera's.
+fn auto_all(on: usize, total: usize, long: bool) -> (String, bool) {
+    let all_on = on == total && total > 0;
+    match (on == 0 || on == total, long) {
+        (true, true) => (OVERVIEW_AUTO.into(), all_on),
+        (true, false) => (AUTO_SHORT.into(), all_on),
+        (false, _) => (format!("{AUTO_SHORT} {on} of {total}"), false),
     }
+}
+
+/// The overview Auto button's accessible name, however it is drawn: what
+/// it tunes and that it is for every camera.
+fn auto_all_name(on: usize, total: usize) -> String {
+    if on == 0 || on == total {
+        "Auto exposure for all cameras".into()
+    } else {
+        format!("Auto exposure for all cameras, {on} of {total} on")
+    }
+}
+
+/// The overview Auto button's label with room to say its scope.
+const OVERVIEW_AUTO: &str = "Auto all";
+
+/// The Auto button's label with room to say what it tunes, and without.
+const AUTO_LONG: &str = "Auto exposure";
+const AUTO_SHORT: &str = "Auto";
+
+/// How many of `cameras` record to a file now, and how many could record:
+/// cameras, not scanners. The overview's buttons and the Camera menu use
+/// it, so they always agree.
+pub(super) fn record_counts(cameras: &[crate::session::CameraSnapshot]) -> (usize, usize) {
+    let recordings = cameras
+        .iter()
+        .filter(|c| {
+            c.forwarding
+                .as_deref()
+                .is_some_and(|o| Output::of(o).recording())
+        })
+        .count();
+    let recorders = cameras
+        .iter()
+        .filter(|c| {
+            c.info.transport != crate::types::Transport::Scanner
+                && c.info.profile.kind != CameraKind::DocumentScanner
+        })
+        .count();
+    (recordings, recorders)
+}
+
+/// What the overview's title bar keeps; see `overview_keep`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OverviewFit {
+    /// Auto says "Auto all" rather than "Auto".
+    auto_label: bool,
+    /// The status pill keeps its "n of m" figure.
+    figure: bool,
+    /// Record all (or Stop recordings) keeps its words; else it shows its
+    /// glyph, with the same name and tooltip.
+    record_label: bool,
+    /// Capture all keeps its words, likewise. It goes last, as its bare
+    /// glyph would look like the status bar's Capture for one camera.
+    capture_label: bool,
+}
+
+impl OverviewFit {
+    const fn new(auto_label: bool, figure: bool, record_label: bool, capture_label: bool) -> Self {
+        Self {
+            auto_label,
+            figure,
+            record_label,
+            capture_label,
+        }
+    }
+}
+
+/// What a crowded overview bar keeps, from the most to the least: "Auto
+/// all" shortens to "Auto" first, then the pill's count goes, then Record
+/// all's words and last Capture all's. The heading, the pill's word and
+/// Start/Stop all always stay.
+const OVERVIEW_KEEP: [OverviewFit; 5] = [
+    OverviewFit::new(true, true, true, true),
+    OverviewFit::new(false, true, true, true),
+    OverviewFit::new(false, false, true, true),
+    OverviewFit::new(false, false, false, true),
+    OverviewFit::new(false, false, false, false),
+];
+
+/// Rough widths of the overview bar's parts; see `Workbench::overview_fit`.
+#[derive(Clone, Copy, Debug)]
+struct OverviewWidths {
+    /// Everything at its most compact, the heading at its full width.
+    base: f32,
+    /// What the long Auto label adds.
+    auto_label: f32,
+    /// What Record all's words add.
+    record_label: f32,
+    /// What Capture all's words add.
+    capture_label: f32,
+    /// What the pill's count adds.
+    figure: f32,
+}
+
+impl OverviewWidths {
+    fn need(&self, keep: OverviewFit) -> f32 {
+        let add = |on: bool, width: f32| if on { width } else { 0.0 };
+        self.base
+            + add(keep.auto_label, self.auto_label)
+            + add(keep.record_label, self.record_label)
+            + add(keep.capture_label, self.capture_label)
+            + add(keep.figure, self.figure)
+    }
+}
+
+/// The most of the overview bar that fits in `room`; see `OVERVIEW_KEEP`.
+fn overview_keep(room: f32, widths: OverviewWidths) -> OverviewFit {
+    OVERVIEW_KEEP
+        .into_iter()
+        .find(|&keep| widths.need(keep) <= room)
+        .unwrap_or(OVERVIEW_KEEP[OVERVIEW_KEEP.len() - 1])
 }
 
 /// The color of the dot in a running Auto button: settled, limited, or
@@ -437,7 +552,7 @@ fn tag_style(color: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
 /// wide, by classes of characters as the system font's semibold sets them,
 /// so a title the bar makes room for is never cut short: model names and
 /// serials run to capitals and digits, which take well over half an em.
-fn rough(text: &str, size: f32) -> f32 {
+pub(super) fn rough(text: &str, size: f32) -> f32 {
     let ems: f32 = text
         .chars()
         .map(|c| match c {
@@ -466,6 +581,8 @@ struct Fit {
     figure: bool,
     /// What tells twin cameras apart shows beside the title.
     serial: bool,
+    /// Auto says "Auto exposure" rather than "Auto".
+    auto_label: bool,
     /// The most room the title may take; it ends in "…" beyond it.
     title: f32,
 }
@@ -699,7 +816,7 @@ impl Workbench {
             // label it was pressed with.
             let streaming = stopping.unwrap_or(snapshot.streaming);
             if self.camera_kind().supports_auto() || snapshot.auto.is_some() {
-                actions = actions.push(self.auto_button(p));
+                actions = actions.push(self.auto_button(fit.auto_label, p));
             }
             actions = actions.push(tip(
                 stream_button(
@@ -742,8 +859,9 @@ impl Workbench {
         // are as rendered, give or take a pixel.
         let mut actions = 28.0 + 2.0 * 8.0;
         if label.is_some() {
-            // Auto, a gap, and Start or Stop.
-            actions += 50.0 + 8.0 + 76.0;
+            // A gap after Auto, and Start or Stop; Auto itself, by its
+            // label, is budgeted below.
+            actions += 8.0 + 76.0;
             if self.auto_busy_here() {
                 actions += 18.0;
             } else if snapshot.auto.is_some() {
@@ -782,18 +900,29 @@ impl Workbench {
                 .sum();
             pill + live + tags + if keep_serial { serial } else { 0.0 }
         };
+        // Auto's padding and label; its dot or spinner is budgeted above.
+        let auto = |long: bool| {
+            if label.is_some() {
+                24.0 + rough(if long { AUTO_LONG } else { AUTO_SHORT }, style::BODY)
+            } else {
+                0.0
+            }
+        };
+        let need = |(long, keep)| rest(keep) + auto(long);
         let whole = rough(title, style::TITLE);
-        let keep = KEEP
-            .into_iter()
-            .find(|&keep| rest(keep) + whole <= room)
-            .unwrap_or(KEEP[KEEP.len() - 1]);
+        // The long Auto label goes before anything in `KEEP`.
+        let (auto_label, keep) = std::iter::once((true, KEEP[0]))
+            .chain(KEEP.into_iter().map(|keep| (false, keep)))
+            .find(|&choice| need(choice) + whole <= room)
+            .unwrap_or((false, KEEP[KEEP.len() - 1]));
         let (labels, chart, figure, serial) = keep;
         Fit {
             labels,
             chart,
             figure,
             serial,
-            title: (room - rest(keep)).max(0.0),
+            auto_label,
+            title: (room - need((auto_label, keep))).max(0.0),
         }
     }
 
@@ -812,7 +941,8 @@ impl Workbench {
 
     /// Auto for the camera shown: tinted while on, with a dot for how auto
     /// is doing, and the spinner while it switches or takes a new balance.
-    fn auto_button(&self, p: &'static Palette) -> Element<'_, Message> {
+    /// `long` says what auto tunes, when the bar has room for it.
+    fn auto_button(&self, long: bool, p: &'static Palette) -> Element<'_, Message> {
         let os = Os::CURRENT;
         let status = self.snapshot.auto.as_ref();
         let on = status.is_some();
@@ -825,7 +955,12 @@ impl Workbench {
         } else if let Some(status) = status {
             label = label.push(dot(auto_color(&status.state, p), 6.0));
         }
-        label = label.push(text("Auto").size(style::BODY).font(style::MEDIUM));
+        label = label.push(
+            text(if long { AUTO_LONG } else { AUTO_SHORT })
+                .size(style::BODY)
+                .font(style::MEDIUM)
+                .wrapping(text::Wrapping::None),
+        );
         let about = if let Some(work) = work {
             work.to_owned()
         } else if let Some(status) = status {
@@ -835,7 +970,7 @@ impl Workbench {
         };
         tip(
             button(label)
-                .name("Automatic camera tuning")
+                .name(AUTO_LONG)
                 .checked(on)
                 .padding([5, 12])
                 // Ignoring presses would otherwise read as disabled.
@@ -856,9 +991,23 @@ impl Workbench {
         let (phase, waiting) = self.overview_phase();
         let (tint, reveal) = self.live_level();
         let on = phase.state().color(p);
+        let (recordings, recorders) = record_counts(&snapshot.cameras);
+        let record_label = if recordings > 0 {
+            "Stop recordings"
+        } else {
+            "Record all"
+        };
+        let auto_on = snapshot.cameras.iter().filter(|c| c.auto.is_some()).count();
+        let auto_total = snapshot
+            .cameras
+            .iter()
+            .filter(|c| c.info.profile.kind.supports_auto() || c.auto.is_some())
+            .count();
+        let auto_busy = self.auto_busy();
+        let fit = self.overview_fit(phase.label(), record_label, (auto_on, auto_total));
         let pill = status_pill(
             phase.label(),
-            (reveal > 0.001).then(|| match phase {
+            (reveal > 0.001 && fit.figure).then(|| match phase {
                 Phase::Waiting(_) => format!("{} of {streaming}", waiting.len()),
                 _ => format!("{streaming} of {total}"),
             }),
@@ -886,77 +1035,65 @@ impl Workbench {
                     .join("\n"),
             )
         };
-        let auto_on = snapshot.cameras.iter().filter(|c| c.auto.is_some()).count();
-        let auto_total = snapshot
-            .cameras
-            .iter()
-            .filter(|c| c.info.profile.kind.supports_auto() || c.auto.is_some())
-            .count();
-        let (auto_label, all_on) = auto_all(auto_on, auto_total);
-        let auto_busy = self.auto_busy();
+        let (auto_label, all_on) = auto_all(auto_on, auto_total, fit.auto_label);
+        // Named in full however it is drawn.
+        let auto_name = auto_all_name(auto_on, auto_total);
         let mut auto = row![].spacing(6).align_y(Alignment::Center);
         if auto_busy {
             let ink = if all_on { p.ink(p.accent) } else { p.secondary };
             auto = auto.push(icon::spinner(12.0, ink, self.spin()));
         }
         auto = auto.push(
-            text(auto_label.clone())
+            text(auto_label)
                 .size(style::BODY)
-                .font(style::MEDIUM),
+                .font(style::MEDIUM)
+                .wrapping(text::Wrapping::None),
         );
         let stopping = phase.pending();
         let stop = stopping.unwrap_or(snapshot.cameras.iter().all(|c| c.streaming));
         let batch = |job: Job| self.pending.iter().any(|p| p.batch && p.job == job);
         let capturing = batch(Job::Capture);
-        let recordings = snapshot
-            .cameras
-            .iter()
-            .filter(|c| {
-                c.forwarding
-                    .as_deref()
-                    .is_some_and(|o| Output::of(o).recording())
-            })
-            .count();
-        let recorders = snapshot
-            .cameras
-            .iter()
-            .filter(|c| {
-                c.info.transport != crate::types::Transport::Scanner
-                    && c.info.profile.kind != CameraKind::DocumentScanner
-            })
-            .count();
         let record_busy =
             batch(Job::Forward { recording: true }) || batch(Job::StopForward { recording: true });
-        let all_button =
-            |glyph: Icon, label: &'static str, busy: bool, message: Option<Message>| {
-                let glyph: Element<'_, Message> = if busy {
-                    icon::spinner(12.0, p.secondary, self.spin())
-                } else {
-                    icon(
-                        glyph,
-                        14.0,
-                        if message.is_some() {
-                            p.text
-                        } else {
-                            p.tertiary
-                        },
-                    )
-                };
-                button(
-                    row![glyph, text(label).size(style::BODY).font(style::MEDIUM)]
-                        .spacing(6)
-                        .align_y(Alignment::Center),
+        let all_button = |glyph: Icon,
+                          label: &'static str,
+                          labelled: bool,
+                          busy: bool,
+                          message: Option<Message>| {
+            let glyph: Element<'_, Message> = if busy {
+                icon::spinner(12.0, p.secondary, self.spin())
+            } else {
+                icon(
+                    glyph,
+                    14.0,
+                    if message.is_some() {
+                        p.text
+                    } else {
+                        p.tertiary
+                    },
                 )
+            };
+            let mut content = row![glyph].spacing(6).align_y(Alignment::Center);
+            if labelled {
+                content = content.push(
+                    text(label)
+                        .size(style::BODY)
+                        .font(style::MEDIUM)
+                        .wrapping(text::Wrapping::None),
+                );
+            }
+            button(content)
                 .name(label)
                 .padding([5, 12])
                 .style(style::secondary)
                 .on_press_maybe(message.filter(|_| !busy))
-            };
+        };
         let actions = row![
             tip(
                 all_button(
                     Icon::Camera,
                     "Capture all",
+                    fit.capture_label,
                     capturing,
                     (!snapshot.cameras.is_empty()).then_some(Message::AllCapture),
                 ),
@@ -973,11 +1110,8 @@ impl Workbench {
                     } else {
                         Icon::Video
                     },
-                    if recordings > 0 {
-                        "Stop recordings"
-                    } else {
-                        "Record all"
-                    },
+                    record_label,
+                    fit.record_label,
                     record_busy,
                     (recordings > 0 || recorders > 0)
                         .then_some(Message::AllRecord(recordings == 0)),
@@ -992,7 +1126,7 @@ impl Workbench {
             ),
             tip(
                 button(auto)
-                    .name(auto_label)
+                    .name(auto_name)
                     .checked(all_on)
                     .padding([5, 12])
                     .style(move |theme, status| {
@@ -1013,7 +1147,7 @@ impl Workbench {
                 } else if all_on {
                     "Switch every camera to manual"
                 } else {
-                    "Tune exposure, gain and frame rate on image cameras"
+                    "Auto exposure for all cameras: tune exposure, gain and frame rate on every image camera"
                 },
             ),
             tip(
@@ -1037,6 +1171,48 @@ impl Workbench {
         .align_y(Alignment::Center);
         let heading = one_line("All cameras", style::TITLE, style::BOLD, p.text);
         self.title_bar(Some(heading.into()), Some(status), actions.into(), p)
+    }
+
+    /// Rough widths of the overview bar's parts, for a pill saying `word`,
+    /// a record button saying `record`, and `auto` (on, total) cameras in
+    /// auto mode; widths are as rendered, erring wide like `rough`. The
+    /// pill's count is budgeted even while it is folded, so starting and
+    /// stopping never reflow the bar.
+    fn overview_widths(&self, word: &str, record: &str, auto: (usize, usize)) -> OverviewWidths {
+        let total = self.snapshot.cameras.len();
+        let (on, of) = auto;
+        // The batch buttons' padding and glyph, and their words.
+        let worded = |label: &str| 6.0 + rough(label, style::BODY);
+        let glyph_only = 12.0 + 14.0 + 12.0;
+        let auto_width = |long| 24.0 + rough(&auto_all(on, of, long).0, style::BODY);
+        let stream =
+            28.0 + 12.0 + 7.0 + rough("Start all", style::BODY).max(rough("Stop all", style::BODY));
+        let actions = 2.0 * glyph_only
+            + auto_width(false)
+            + if self.auto_busy() { 18.0 } else { 0.0 }
+            + stream
+            + 3.0 * 8.0;
+        // Toggles: the sidebar's, image mode's and the inspector's, with the
+        // gaps between the bar's parts and the left row's.
+        let chrome = 3.0 * 28.0 + 3.0 * 8.0 + 2.0 * 10.0;
+        let heading = rough("All cameras", style::TITLE);
+        let pill = 32.0 + rough(word, style::SMALL);
+        OverviewWidths {
+            base: chrome + heading + pill + actions,
+            auto_label: auto_width(true) - auto_width(false),
+            record_label: worded(record),
+            capture_label: worded("Capture all"),
+            figure: live_width(false, Some(&format!("{total} of {total}")), None),
+        }
+    }
+
+    /// What the overview bar keeps, from a rough budget of its width; see
+    /// `OVERVIEW_KEEP` for what gives way first.
+    fn overview_fit(&self, word: &str, record: &str, auto: (usize, usize)) -> OverviewFit {
+        let sidebar = self.sidebar_slide.lerp(0.0, SIDEBAR, self.now);
+        let padding = 20.0 + (self.lights() - sidebar).max(0.0);
+        let room = self.main_width() - padding;
+        overview_keep(room, self.overview_widths(word, record, auto))
     }
 
     /// The row above the main area: pane toggles, what is shown (its
@@ -1258,10 +1434,185 @@ mod tests {
 
     #[test]
     fn overview_auto_reads_as_on_only_when_all_are() {
-        assert_eq!(auto_all(0, 4), ("Auto all".into(), false));
-        assert_eq!(auto_all(2, 4), ("Auto 2 of 4".into(), false));
-        assert_eq!(auto_all(4, 4), ("Auto all".into(), true));
-        assert_eq!(auto_all(0, 0), ("Auto all".into(), false));
+        // The overview keeps its scope: never the single bar's "Auto
+        // exposure", which reads as the selected camera's.
+        assert_eq!(auto_all(0, 4, true), ("Auto all".into(), false));
+        assert_eq!(auto_all(2, 4, true), ("Auto 2 of 4".into(), false));
+        assert_eq!(auto_all(4, 4, true), ("Auto all".into(), true));
+        assert_eq!(auto_all(0, 0, true), ("Auto all".into(), false));
+        assert_eq!(auto_all_name(0, 4), "Auto exposure for all cameras");
+        assert_eq!(
+            auto_all_name(2, 4),
+            "Auto exposure for all cameras, 2 of 4 on"
+        );
+        // A crowded bar's short form.
+        assert_eq!(auto_all(0, 4, false), ("Auto".into(), false));
+        assert_eq!(auto_all(2, 4, false), ("Auto 2 of 4".into(), false));
+        assert_eq!(auto_all(4, 4, false), ("Auto".into(), true));
+    }
+
+    /// Three cameras, two of them twins, with both panes closed so the
+    /// main area is as wide as the window.
+    fn three() -> Workbench {
+        let mut bench = twins();
+        let mut other = streaming_camera(10, 0, 30.0);
+        other.info.id = "sim:2".into();
+        other.info.serial = "SIM2".into();
+        other.info.model = "Line camera".into();
+        bench.snapshot.cameras.push(other);
+        bench.sidebar_slide.set(0.0);
+        bench.inspector_slide.set(0.0);
+        bench
+    }
+
+    #[test]
+    fn crowded_overview_bars_give_way_in_order() {
+        let mut bench = three();
+        let fit_at = |bench: &mut Workbench, main: f32| {
+            bench.width = main;
+            // The docked inspector's seam, should it count.
+            bench.width += main - bench.main_width();
+            assert_eq!(bench.main_width(), main);
+            let widths = bench.overview_widths("Streaming", "Record all", (0, 3));
+            let sidebar = bench.sidebar_slide.lerp(0.0, SIDEBAR, bench.now);
+            let room = main - 20.0 - (bench.lights() - sidebar).max(0.0);
+            (
+                bench.overview_fit("Streaming", "Record all", (0, 3)),
+                room,
+                widths,
+            )
+        };
+        let all = OVERVIEW_KEEP[0];
+        let (wide, room, widths) = fit_at(&mut bench, 1200.0);
+        assert_eq!(wide, all, "room for everything");
+        assert!(widths.need(wide) <= room);
+        // Whatever the width, what goes goes in order: "Auto all" first,
+        // then the count, then Record all's words and Capture all's last.
+        let mut seen = Vec::new();
+        let mut last = 0;
+        for main in (500..=1600).rev().step_by(5) {
+            let (fit, room, widths) = fit_at(&mut bench, main as f32);
+            let at = OVERVIEW_KEEP.iter().position(|&keep| keep == fit).unwrap();
+            assert!(at >= last, "{main}: never comes back narrower: {fit:?}");
+            last = at;
+            if !seen.contains(&at) {
+                seen.push(at);
+            }
+            if at != OVERVIEW_KEEP.len() - 1 {
+                assert!(widths.need(fit) <= room, "{main}: {fit:?}");
+            }
+            assert!(!fit.record_label || fit.capture_label, "{main}: {fit:?}");
+            assert!(!fit.figure || fit.record_label, "{main}: {fit:?}");
+        }
+        assert_eq!(seen, (0..OVERVIEW_KEEP.len()).collect::<Vec<_>>());
+        // A pure budget: each part goes as its room does.
+        let widths = OverviewWidths {
+            base: 500.0,
+            auto_label: 20.0,
+            figure: 40.0,
+            record_label: 70.0,
+            capture_label: 80.0,
+        };
+        assert_eq!(overview_keep(710.0, widths), OVERVIEW_KEEP[0]);
+        assert_eq!(overview_keep(709.0, widths), OVERVIEW_KEEP[1]);
+        assert_eq!(overview_keep(689.0, widths), OVERVIEW_KEEP[2]);
+        assert_eq!(overview_keep(649.0, widths), OVERVIEW_KEEP[3]);
+        assert_eq!(overview_keep(579.0, widths), OVERVIEW_KEEP[4]);
+        assert_eq!(overview_keep(10.0, widths), OVERVIEW_KEEP[4]);
+    }
+
+    #[test]
+    fn the_shared_record_count_skips_scanners() {
+        let mut bench = three();
+        assert_eq!(record_counts(&bench.snapshot.cameras), (0, 3));
+        bench.snapshot.cameras[2].info.profile.kind = CameraKind::DocumentScanner;
+        bench.snapshot.cameras[1].info.transport = crate::types::Transport::Scanner;
+        bench.snapshot.cameras[0].forwarding = Some("/tmp/a.mp4".into());
+        assert_eq!(record_counts(&bench.snapshot.cameras), (1, 1));
+    }
+
+    #[test]
+    fn auto_says_what_it_tunes_until_the_bar_is_crowded() {
+        let mut bench = twins();
+        let title = "Pattern camera";
+        bench.width = 1800.0;
+        let roomy = bench.bar_fit(title, Some("Streaming"), &[]);
+        assert!(roomy.auto_label, "{roomy:?}");
+        // Below the threshold the label shortens, before any tag label.
+        let mut last = true;
+        for width in (900..=1800).rev().step_by(10) {
+            bench.width = width as f32;
+            let fit = bench.bar_fit(title, Some("Streaming"), &["Recording"]);
+            assert!(!fit.auto_label || fit.labels, "{width}: {fit:?}");
+            assert!(
+                last || !fit.auto_label,
+                "{width}: never comes back narrower"
+            );
+            last = fit.auto_label;
+        }
+        assert!(!last, "short at the narrowest");
+        // Named in full either way, in the single bar and the overview.
+        for (width, focus) in [
+            (1800.0, true),
+            (900.0, true),
+            (1800.0, false),
+            (700.0, false),
+        ] {
+            bench.width = width;
+            bench.focus_camera = focus;
+            let names = bar_names(&bench, width);
+            let full = if focus {
+                AUTO_LONG.to_owned()
+            } else {
+                auto_all_name(0, 2)
+            };
+            assert!(names.contains(&full), "{width} {focus}: {names:?}");
+        }
+    }
+
+    /// The accessible names in the title bar laid out `width` wide.
+    fn bar_names(bench: &Workbench, width: f32) -> Vec<String> {
+        use iced::advanced::{Layout, layout::Limits, widget::Tree};
+        let renderer = crate::gui::destinations::layout_tests::renderer();
+        let p = Palette::of(false);
+        let mut view = if bench.overview() {
+            bench.overview_bar(p)
+        } else {
+            bench.single_bar(p)
+        };
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &Limits::new(Size::ZERO, Size::new(width, BAR)),
+        );
+        let (native, _, _) = accessibility::snapshot_widget(
+            view.as_widget_mut(),
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+        );
+        native
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn icon_only_batch_buttons_keep_their_names() {
+        let mut bench = three();
+        bench.focus_camera = false;
+        for width in [1600.0, 700.0] {
+            bench.width = width;
+            let names = bar_names(&bench, width);
+            for name in ["Capture all", "Record all", "Stop all"] {
+                assert!(names.iter().any(|n| n == name), "{width}: {names:?}");
+            }
+        }
+        bench.snapshot.cameras[0].forwarding = Some("/tmp/a.mp4".into());
+        let names = bar_names(&bench, 700.0);
+        assert!(names.iter().any(|n| n == "Stop recordings"), "{names:?}");
     }
 
     #[test]

@@ -11,6 +11,10 @@ pub(super) enum Command {
     Disconnect,
     AllStreams(bool),
     AllAuto(bool),
+    AllCapture,
+    /// Starts or stops recording on every camera; which one is decided
+    /// when it runs, because AppKit keeps each slot's command fixed.
+    AllRecord,
     RefreshFeatures,
     Destinations,
     Record,
@@ -78,6 +82,8 @@ impl Workbench {
         let multiple = ready && self.snapshot.cameras.len() > 1;
         let auto = self.snapshot.auto.is_some();
         let busy = self.history_busy();
+        let (recordings, recorders) = titlebar::record_counts(&self.snapshot.cameras);
+        let batch = |job: Job| self.pending.iter().any(|p| p.batch && p.job == job);
         let history = |undo| {
             let name = if undo { "Undo" } else { "Redo" };
             let label = self.history_label(undo);
@@ -179,9 +185,8 @@ impl Workbench {
                             .checked(self.sidebar_open && !self.image_mode),
                     ),
                     Some(
-                        Item::action("Show Inspector", Action::ToggleInspector, ready).checked(
-                            (self.inspector_open || self.inspector_peek) && !self.image_mode,
-                        ),
+                        Item::action("Show Inspector", Action::ToggleInspector, ready)
+                            .checked(self.inspector_shown()),
                     ),
                     Some(
                         Item::action("Show Activity", Action::ToggleActivity, ready)
@@ -305,6 +310,23 @@ impl Workbench {
                         multiple && self.snapshot.cameras.iter().any(|camera| camera.streaming),
                     )),
                     Some(Item::command(
+                        "Capture From All Cameras",
+                        Command::AllCapture,
+                        multiple && !batch(Job::Capture),
+                    )),
+                    Some(Item::command(
+                        if recordings > 0 {
+                            "Stop All Recordings"
+                        } else {
+                            "Record All Cameras"
+                        },
+                        Command::AllRecord,
+                        multiple
+                            && (recordings > 0 || recorders > 0)
+                            && !batch(Job::Forward { recording: true })
+                            && !batch(Job::StopForward { recording: true }),
+                    )),
+                    Some(Item::command(
                         "Use Auto Exposure for All",
                         Command::AllAuto(true),
                         multiple
@@ -393,6 +415,11 @@ impl Workbench {
             }
             Command::AllStreams(value) => self.handle_message(Message::AllStreams(value)),
             Command::AllAuto(value) => self.handle_message(Message::AllAuto(value)),
+            Command::AllCapture => self.handle_message(Message::AllCapture),
+            Command::AllRecord => {
+                let (recordings, _) = titlebar::record_counts(&self.snapshot.cameras);
+                self.handle_message(Message::AllRecord(recordings == 0))
+            }
             Command::RefreshFeatures => self.handle_message(Message::RefreshFeatures),
             Command::Destinations => {
                 self.handle_message(Message::CapturePicker(destinations::Message::OpenManager))
@@ -506,6 +533,99 @@ mod tests {
         app.focused_window = app.main_window;
         assert!(enabled(&app, Action::Fullscreen));
         assert!(enabled(&app, Action::CopySessionCommand));
+    }
+
+    fn item(app: &Workbench, wanted: impl Fn(&Command) -> bool) -> Item {
+        app.command_menus()
+            .into_iter()
+            .flat_map(|menu| menu.items)
+            .flatten()
+            .find(|item| wanted(&item.command))
+            .unwrap()
+    }
+
+    #[test]
+    fn every_overview_batch_action_is_in_the_camera_menu() {
+        let mut app = bench();
+        let camera = liveness::streaming_camera(0, 0, 0.0);
+        app.snapshot.connected = Some(camera.info.clone());
+        app.snapshot.active_camera = Some(camera.info.id.clone());
+        app.snapshot.cameras = vec![camera.clone()];
+        let capture = |app: &Workbench| item(app, |c| *c == Command::AllCapture);
+        let record = |app: &Workbench| item(app, |c| *c == Command::AllRecord);
+        // One camera: its own commands do it.
+        assert!(!capture(&app).enabled);
+        assert!(!record(&app).enabled);
+        let mut other = camera.clone();
+        other.info.id = "sim:1".into();
+        app.snapshot.cameras.push(other);
+        let all = capture(&app);
+        assert_eq!(all.title, "Capture From All Cameras");
+        assert!(all.enabled);
+        let all = record(&app);
+        assert_eq!(
+            (all.title.as_str(), all.command),
+            ("Record All Cameras", Command::AllRecord)
+        );
+        assert!(all.enabled);
+        // Any recording turns it into the way to stop them all.
+        app.snapshot.cameras[1].forwarding = Some("/tmp/sim-1.mp4".into());
+        let all = record(&app);
+        assert_eq!(
+            (all.title.as_str(), all.command),
+            ("Stop All Recordings", Command::AllRecord)
+        );
+        assert!(all.enabled);
+        // A batch capture on its way holds the menu's.
+        app.send_batch(vec!["sim:0".into()], Job::Capture, |_| SessionCommand::Stop);
+        assert!(!capture(&app).enabled);
+    }
+
+    #[test]
+    fn menu_commands_stay_put_while_recordings_start_and_stop() {
+        // The native menu binds each slot's command once, at first sync,
+        // and later only retitles it. A command that changed with state
+        // would run the old one under the new title.
+        let commands = |app: &Workbench| -> Vec<Option<Command>> {
+            app.command_menus()
+                .into_iter()
+                .flat_map(|menu| menu.items)
+                .map(|item| item.map(|item| item.command))
+                .collect()
+        };
+        let mut app = bench();
+        let camera = liveness::streaming_camera(0, 0, 0.0);
+        app.snapshot.connected = Some(camera.info.clone());
+        app.snapshot.active_camera = Some(camera.info.id.clone());
+        let mut other = camera.clone();
+        other.info.id = "sim:1".into();
+        app.snapshot.cameras = vec![camera, other];
+        let idle = commands(&app);
+        app.snapshot.cameras[1].forwarding = Some("/tmp/sim-1.mp4".into());
+        assert_eq!(commands(&app), idle);
+    }
+
+    #[test]
+    fn the_inspector_check_follows_what_shows() {
+        let mut app = bench();
+        for (open, peek, image, width) in [
+            (true, false, false, 1600.0),
+            (false, true, false, 1600.0),
+            (true, false, true, 1600.0),
+            (false, true, false, 700.0),
+            (true, false, false, 700.0),
+        ] {
+            app.inspector_open = open;
+            app.inspector_peek = peek;
+            app.image_mode = image;
+            app.width = width;
+            let shown = item(&app, |c| *c == Command::Action(Action::ToggleInspector));
+            assert_eq!(
+                shown.checked,
+                app.inspector_shown(),
+                "{open} {peek} {image} {width}"
+            );
+        }
     }
 
     #[test]
