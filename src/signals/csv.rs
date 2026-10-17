@@ -6,7 +6,10 @@ use anyhow::{Context, Result};
 use std::{
     io::Write,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 pub const HEADER: &str = "ts_ms,source_ts_ms,source_id,tag,value,quality\n";
@@ -14,6 +17,9 @@ pub const HEADER: &str = "ts_ms,source_ts_ms,source_id,tag,value,quality\n";
 pub struct CsvSink {
     path: PathBuf,
     writer: Mutex<Option<StorageWriter>>,
+    rows: AtomicU64,
+    /// Remove the file at finish when it holds no rows.
+    discard_empty: AtomicBool,
 }
 
 impl CsvSink {
@@ -25,10 +31,17 @@ impl CsvSink {
         Ok(Self {
             path: path.to_path_buf(),
             writer: Mutex::new(Some(writer)),
+            rows: AtomicU64::new(0),
+            discard_empty: AtomicBool::new(false),
         })
     }
     pub fn path(&self) -> &Path {
         &self.path
+    }
+    /// A run that failed before logging anything leaves no header-only file
+    /// behind, so the same command can be run again.
+    pub fn discard_if_empty(&self) {
+        self.discard_empty.store(true, Ordering::SeqCst);
     }
 }
 
@@ -77,11 +90,18 @@ impl SampleSink for CsvSink {
         let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let writer = writer.as_mut().context("CSV file is already finished")?;
         writer.write_all(text.as_bytes())?;
+        self.rows.fetch_add(batch.len() as u64, Ordering::Relaxed);
         Ok(())
     }
     fn finish(&self) -> Result<()> {
         let writer = self.writer.lock().unwrap_or_else(|e| e.into_inner()).take();
         match writer {
+            Some(writer)
+                if self.discard_empty.load(Ordering::SeqCst)
+                    && self.rows.load(Ordering::Relaxed) == 0 =>
+            {
+                writer.abort()
+            }
             Some(mut writer) => {
                 writer.flush()?;
                 writer.finish()

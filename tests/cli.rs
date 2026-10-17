@@ -2918,8 +2918,30 @@ fn log_simulator_to_csv_and_dataset() {
             &csv_arg,
         ],
     );
-    assert_eq!(out.status.code(), Some(2));
+    // An existing output is an operation error, as for capture and export.
+    assert_eq!(out.status.code(), Some(1));
     assert_eq!(std::fs::read_to_string(&csv).unwrap(), text);
+    // A run that fails before logging anything leaves no header-only CSV,
+    // so the same command works once the source is reachable.
+    let failed = root.join("refused.csv");
+    let out = cmd(
+        &dir,
+        &[
+            "log",
+            "modbus-tcp://127.0.0.1:1/1/holding/0",
+            "--duration",
+            "1s",
+            "--csv",
+            failed.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!failed.exists());
     let _ = std::fs::remove_dir_all(root);
 }
 

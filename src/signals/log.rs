@@ -31,7 +31,8 @@ fn has_extension(path: &Path, extension: &str) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case(extension))
 }
 
-/// Check the arguments before anything starts (usage errors, exit 2).
+/// Check the arguments before anything starts (usage errors, exit 2). An
+/// existing `--csv` file is refused by `run` instead, as an operation error.
 pub fn validate(options: &LogOptions) -> Result<()> {
     ensure!(
         (1..=super::MAX_SOURCES).contains(&options.uris.len()),
@@ -52,11 +53,6 @@ pub fn validate(options: &LogOptions) -> Result<()> {
     );
     if let Some(csv) = &options.csv {
         ensure!(has_extension(csv, "csv"), "--csv file must end in .csv");
-        ensure!(
-            std::fs::symlink_metadata(csv).is_err(),
-            "{} already exists; choose a new file name",
-            csv.display()
-        );
     }
     if let Some(dataset) = &options.dataset {
         ensure!(
@@ -70,6 +66,15 @@ pub fn validate(options: &LogOptions) -> Result<()> {
 /// Run until the duration passes or `stop` is set, then stop the sources,
 /// flush and detach the sinks, and return the result.
 pub fn run(handle: &SessionHandle, options: &LogOptions, stop: &AtomicBool) -> Result<Json> {
+    // An existing output is refused like capture and export outputs are
+    // (operation_failed, exit 1), before anything starts.
+    if let Some(csv) = &options.csv {
+        ensure!(
+            std::fs::symlink_metadata(csv).is_err(),
+            "{} already exists; choose a new file name",
+            csv.display()
+        );
+    }
     let hub = handle.signals();
     let started = Instant::now();
     let mut sinks: Vec<Arc<dyn SampleSink>> = Vec::new();
@@ -84,6 +89,7 @@ pub fn run(handle: &SessionHandle, options: &LogOptions, stop: &AtomicBool) -> R
         }
         None => None,
     };
+    let mut csv_sink = None;
     let csv = match &options.csv {
         Some(path) => {
             let path = std::path::absolute(path)?;
@@ -93,7 +99,11 @@ pub fn run(handle: &SessionHandle, options: &LogOptions, stop: &AtomicBool) -> R
                 crate::media::default_recording_cap(),
             );
             match sink {
-                Ok(sink) => sinks.push(Arc::new(sink)),
+                Ok(sink) => {
+                    let sink = Arc::new(sink);
+                    csv_sink = Some(sink.clone());
+                    sinks.push(sink);
+                }
                 Err(error) => {
                     close_dataset(handle, dataset.is_some());
                     return Err(error);
@@ -110,6 +120,15 @@ pub fn run(handle: &SessionHandle, options: &LogOptions, stop: &AtomicBool) -> R
     };
     let finish = |result: Result<Json>| -> Result<Json> {
         let stopped = hub.stop("all", Duration::from_secs(5));
+        let result = result.and_then(|value| {
+            outcome(hub.sink_error(), stopped.as_deref().unwrap_or(&[]))?;
+            Ok(value)
+        });
+        if result.is_err()
+            && let Some(csv) = &csv_sink
+        {
+            csv.discard_if_empty();
+        }
         let flushed = hub
             .flush(Duration::from_secs(10))
             .and_then(|()| hub.set_sink(None, Duration::from_secs(10)));
@@ -124,6 +143,15 @@ pub fn run(handle: &SessionHandle, options: &LogOptions, stop: &AtomicBool) -> R
             value["samples"] = json!(samples);
             value["written"] = json!(written);
             value["dropped"] = json!(dropped);
+            if samples == 0 {
+                let warning = if options.tags.is_empty() {
+                    "no samples were logged; check that the sources publish values"
+                } else {
+                    "no samples were logged; check the --tag names against signals browse"
+                };
+                eprintln!("capturefab: {warning}");
+                value["warnings"] = json!([warning]);
+            }
             value
         })
     };
@@ -142,11 +170,9 @@ pub fn run(handle: &SessionHandle, options: &LogOptions, stop: &AtomicBool) -> R
         .duration_ms
         .map(|ms| started + Duration::from_millis(ms));
     let mut report = Instant::now();
-    let mut sink_error = None;
     while !stop.load(Ordering::Relaxed) && deadline.is_none_or(|d| Instant::now() < d) {
         std::thread::sleep(Duration::from_millis(100));
-        if let Some(error) = hub.sink_error() {
-            sink_error = Some(error);
+        if hub.sink_error().is_some() {
             break;
         }
         if options.progress && report.elapsed() >= Duration::from_secs(10) {
@@ -165,26 +191,26 @@ pub fn run(handle: &SessionHandle, options: &LogOptions, stop: &AtomicBool) -> R
         }
     }
     let duration_ms = started.elapsed().as_millis() as u64;
-    let value = finish(Ok(json!({
+    finish(Ok(json!({
         "dataset": dataset,
         "csv": csv,
         "duration_ms": duration_ms,
-    })))?;
-    if let Some(error) = sink_error.or_else(|| hub.sink_error()) {
+    })))
+}
+
+/// Fail a run whose sink failed or one of whose sources logged nothing.
+fn outcome(sink_error: Option<String>, sources: &[super::SourceStatus]) -> Result<()> {
+    if let Some(error) = sink_error {
         bail!("{error}");
     }
-    if let Some(source) = value["sources"].as_array().and_then(|sources| {
-        sources
-            .iter()
-            .find(|s| s["samples"].as_u64() == Some(0) && !s["error"].is_null())
-    }) {
+    if let Some(source) = sources.iter().find(|s| s.samples == 0 && s.error.is_some()) {
         bail!(
             "signal source {} logged no samples: {}",
-            source["uri"].as_str().unwrap_or(""),
-            source["error"].as_str().unwrap_or("")
+            source.uri,
+            source.error.as_deref().unwrap_or("")
         );
     }
-    Ok(value)
+    Ok(())
 }
 
 fn close_dataset(handle: &SessionHandle, opened: bool) {
