@@ -53,8 +53,29 @@ fn code(error: &FtpError) -> Option<u32> {
     }
 }
 
+/// The TLS failure behind a broken control or data channel, if it was one.
+/// rustls handshakes lazily, so an untrusted certificate surfaces as an I/O
+/// error on the first command after AUTH TLS (or on a data connection).
+fn tls_failure(error: &FtpError) -> Option<&rustls::Error> {
+    match error {
+        FtpError::ConnectionError(io) => io.get_ref()?.downcast_ref::<rustls::Error>(),
+        _ => None,
+    }
+}
+
 /// The server's reply text, or the client error.
 fn detail(error: &FtpError) -> String {
+    if let Some(tls) = tls_failure(error) {
+        return match tls {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Other(other)) => {
+                format!("TLS certificate rejected: {other}")
+            }
+            rustls::Error::InvalidCertificate(reason) => {
+                format!("TLS certificate rejected: {reason:?}")
+            }
+            other => format!("TLS failed: {other}"),
+        };
+    }
     match error {
         FtpError::UnexpectedResponse(response) => {
             let body = String::from_utf8_lossy(&response.body);
@@ -99,8 +120,23 @@ impl FtpUploader {
     /// settings change; connection trouble and 4xx replies are retried.
     fn fail(&self, what: &str, error: FtpError) -> anyhow::Error {
         let message = format!("{what} on {}: {}", self.server_name(), detail(&error));
+        if let Some(rustls::Error::InvalidCertificate(_)) = tls_failure(&error) {
+            // Retrying cannot fix trust; the operator has to act.
+            return Permanent(format!(
+                "{message}; trust the server's certificate (or the CA that signed it) in the OS certificate store, or use --plain only on a trusted network"
+            ))
+            .into();
+        }
         match (&error, code(&error)) {
             (FtpError::SecureError(_), _) => Permanent(message).into(),
+            (_, _)
+                if matches!(
+                    tls_failure(&error),
+                    Some(rustls::Error::PeerIncompatible(_) | rustls::Error::AlertReceived(_))
+                ) =>
+            {
+                Permanent(message).into()
+            }
             (_, Some(500..=599)) => Permanent(message).into(),
             _ => anyhow!(message),
         }
@@ -548,6 +584,42 @@ mod tests {
         );
         assert!(uploader.probe().unwrap().starts_with("wrote and removed"));
         assert_eq!(fake.state.lock().unwrap().files.len(), 2);
+    }
+
+    #[test]
+    fn untrusted_tls_certificate_is_permanent_and_readable() {
+        let uploader = FtpUploader::new(server(21), None).unwrap();
+        let untrusted = |reason| {
+            FtpError::ConnectionError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                rustls::Error::InvalidCertificate(reason),
+            ))
+        };
+        let error = uploader.fail(
+            "starting TLS",
+            untrusted(rustls::CertificateError::UnknownIssuer),
+        );
+        assert!(!retryable(&error), "{error:#}");
+        let message = error.to_string();
+        assert!(
+            message.contains("TLS certificate rejected: UnknownIssuer"),
+            "{message}"
+        );
+        assert!(message.contains("OS certificate store"), "{message}");
+        let platform = rustls::CertificateError::Other(rustls::OtherError(std::sync::Arc::new(
+            std::io::Error::other("“127.0.0.1” certificate is not trusted"),
+        )));
+        let message = uploader
+            .fail("starting TLS", untrusted(platform))
+            .to_string();
+        assert!(
+            message.contains("TLS certificate rejected: “127.0.0.1” certificate is not trusted"),
+            "{message}"
+        );
+        assert!(!message.contains("OtherError"), "{message}");
+        // A dropped connection is still retried.
+        let reset = FtpError::ConnectionError(std::io::ErrorKind::ConnectionReset.into());
+        assert!(retryable(&uploader.fail("storing the file", reset)));
     }
 
     #[test]
