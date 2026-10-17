@@ -29,6 +29,8 @@ pub(super) struct SignalsUi {
     /// Whether the inspector section was open at the last frame, so ticks
     /// fetch recent points only when sparklines are shown.
     shown: std::cell::Cell<bool>,
+    /// Screenshot scenes show these instead of the hub.
+    pub(super) fixture: Option<Vec<SourceStatus>>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +192,11 @@ impl Workbench {
 
     /// Read the hub; recent points only while the section is open.
     pub(super) fn tick_signals(&mut self) {
+        if let Some(fixture) = &self.signals.fixture {
+            self.signals.live = fixture.clone();
+            self.signals.persisting = true;
+            return;
+        }
         let hub = self.handle.signals();
         self.signals.live = hub.status(self.signals.shown.get());
         self.signals.persisting = hub.has_sink();
@@ -261,6 +268,82 @@ impl Workbench {
         }
         Some(list.into())
     }
+}
+
+/// Two running sources for screenshot scenes: a simulated line with a
+/// minute of history and a Modbus PLC that is reconnecting.
+pub(super) fn fixture() -> Vec<SourceStatus> {
+    use crate::signals::{Protocol, sim};
+    let now = crate::scheduling::now_ms();
+    let ticks = 60u64;
+    let history: Vec<Vec<crate::signals::Sample>> = (0..ticks)
+        .map(|tick| sim::values("line1", 6, tick * 3))
+        .collect();
+    let infos = sim::tags("line1", 6);
+    let tags = infos
+        .iter()
+        .enumerate()
+        .map(|(i, info)| {
+            let last = &history[ticks as usize - 1][i];
+            TagStatus {
+                tag: info.tag.clone(),
+                unit: info.unit.clone(),
+                value: last.value.clone(),
+                quality: last.quality,
+                ts_ms: now - 400,
+                source_ts_ms: None,
+                recent: Some(
+                    history
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(t, samples)| {
+                            Some((now - (ticks - t as u64) * 1000, samples[i].value.as_f64()?))
+                        })
+                        .collect(),
+                ),
+            }
+        })
+        .collect();
+    let source =
+        |uri: &str, protocol, state, samples, error: Option<&str>, tags: Vec<TagStatus>| {
+            SourceStatus {
+                id: crate::signals::source_id(uri),
+                protocol,
+                uri: uri.into(),
+                interval_ms: 1000,
+                state,
+                started_ms: now - 61_000,
+                last_sample_ms: Some(now - 400),
+                samples,
+                written: samples,
+                dropped: 0,
+                helper_dropped: 0,
+                restarts: 0,
+                error: error.map(str::to_string),
+                helper_pid: None,
+                tags_total: tags.len() as u64,
+                tags,
+                tags_truncated: false,
+            }
+        };
+    vec![
+        source(
+            "sim-signal://line1",
+            Protocol::SimSignal,
+            SourceState::Running,
+            360,
+            None,
+            tags,
+        ),
+        source(
+            "modbus-tcp://192.168.1.30/1/holding/0?count=2&type=f32",
+            Protocol::ModbusTcp,
+            SourceState::Reconnecting,
+            0,
+            Some("connect to Modbus server 192.168.1.30:502: Connection refused (os error 61)"),
+            Vec::new(),
+        ),
+    ]
 }
 
 /// The inspector's section, or `None` to leave it out.

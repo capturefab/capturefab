@@ -351,6 +351,13 @@ impl Workbench {
                     },
                 ]
             }
+            // Data sources with values and sparklines, and Live signals open.
+            "signals" => {
+                self.signals.fixture = Some(signals::fixture());
+                self.tick_signals();
+                let _ =
+                    self.handle_message(Message::InspectorDisclosure(inspector::Section::Signals));
+            }
             "side-address" => self.address = "192.168.1.20".into(),
             "side-unknown" => self.address = "line-7 camera".into(),
             _ => return false,
