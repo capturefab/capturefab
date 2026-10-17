@@ -254,10 +254,31 @@ pub struct DatasetArg {
 }
 impl DatasetArg {
     /// Open the dataset in the local or addressed session before the command runs.
-    fn apply(&self, _client: &Client) -> Result<()> {
-        if self.dataset.is_some() {
-            anyhow::bail!("--dataset is not implemented yet");
+    fn apply(&self, client: &Client) -> Result<()> {
+        let Some(path) = &self.dataset else {
+            return Ok(());
+        };
+        let path = input(absolute_dataset(path))?;
+        if client.local.is_none() {
+            // A session keeps the dataset it has; refuse to switch silently.
+            let status = client.call(SessionCommand::DatasetStatus)?;
+            if let Some(open) = status["path"].as_str() {
+                let same =
+                    canonical_dataset(&path).is_some_and(|p| p == std::path::Path::new(open));
+                ensure!(
+                    same,
+                    "session {} already records to {}; close it first",
+                    client.cli.session.as_deref().unwrap_or(""),
+                    open
+                );
+                return Ok(());
+            }
         }
+        client.call(SessionCommand::DatasetOpen {
+            path: path.to_string_lossy().into_owned(),
+            mode: crate::dataset::OpenMode::Auto,
+            max_bytes: None,
+        })?;
         Ok(())
     }
 }
@@ -1525,16 +1546,25 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 "use an explicit command with --session, such as status"
             );
             ensure!(!cli.json, "choose a CLI command when using --json");
-            let (name, screenshot, demo_cameras) = match &cli.command {
+            let (name, screenshot, demo_cameras, dataset) = match &cli.command {
                 Some(Command::Gui {
                     name,
                     screenshot,
                     screenshot_cameras,
-                    ..
-                }) => (name.as_str(), screenshot.clone(), *screenshot_cameras),
-                _ => ("gui", None, 1),
+                    dataset,
+                }) => (
+                    name.as_str(),
+                    screenshot.clone(),
+                    *screenshot_cameras,
+                    Some(dataset),
+                ),
+                _ => ("gui", None, 1, None),
             };
             let client = Client::new(&cli)?;
+            // --dataset wins over the GUI's remembered dataset.
+            if let Some(dataset) = dataset {
+                dataset.apply(&client)?;
+            }
             let handle = client.local.as_ref().unwrap().clone();
             #[cfg(feature = "gui")]
             crate::gui::migrate_prefs();
@@ -1700,6 +1730,19 @@ pub fn run(mut cli: Cli) -> Result<()> {
             return output(&cli, result);
         }
         Some(Command::Log { .. }) => return log_command(&cli),
+        Some(Command::Dataset {
+            command:
+                command @ (DatasetCommand::Status { file: Some(_) }
+                | DatasetCommand::Query { file: Some(_), .. }
+                | DatasetCommand::Export { file: Some(_), .. }),
+        }) => {
+            ensure!(
+                cli.session.is_none(),
+                "--file reads a dataset no session holds; omit --session"
+            );
+            let result = dataset_file(command, prepared.clone())?;
+            return output(&cli, result);
+        }
         Some(Command::Serve {
             name,
             stream,
@@ -2199,6 +2242,8 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
                 )?;
             }
         }
+    } else if let Some(Command::Dataset { command }) = &cli.command {
+        dataset_output(&mut out, command, &value)?;
     } else if matches!(&cli.command, Some(Command::Activity { .. })) {
         writeln!(out, "Session activity · revision {}", value["revision"])?;
         for entry in value["activity"].as_array().into_iter().flatten() {
@@ -2650,22 +2695,245 @@ fn schema() -> Value {
     contract
 }
 
-/// Arguments of `dataset` subcommands, checked before any session is touched.
-fn prepare_dataset(cli: &Cli) -> Result<Option<SessionCommand>> {
-    let Some(Command::Dataset { command: _ }) = &cli.command else {
-        return Ok(None);
-    };
-    Ok(None)
+/// A dataset path made absolute against the working directory.
+fn absolute_dataset(path: &std::path::Path) -> Result<PathBuf> {
+    ensure!(
+        !path.as_os_str().is_empty(),
+        "dataset path must be nonempty"
+    );
+    ensure!(
+        path.extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("duckdb")),
+        "dataset files use the .duckdb extension"
+    );
+    Ok(if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    })
+}
+/// The path a session reports for this dataset, when its folder exists.
+fn canonical_dataset(path: &std::path::Path) -> Option<PathBuf> {
+    Some(path.parent()?.canonicalize().ok()?.join(path.file_name()?))
 }
 
-/// `dataset` subcommands, in a session or on a --file no session holds.
+/// Arguments of `dataset` subcommands, checked before any session is touched.
+fn prepare_dataset(cli: &Cli) -> Result<Option<SessionCommand>> {
+    let Some(Command::Dataset { command }) = &cli.command else {
+        return Ok(None);
+    };
+    let command = match command {
+        DatasetCommand::Open {
+            path,
+            new,
+            existing,
+            max_bytes,
+        } => SessionCommand::DatasetOpen {
+            path: absolute_dataset(path)?.to_string_lossy().into_owned(),
+            mode: if *new {
+                crate::dataset::OpenMode::Create
+            } else if *existing {
+                crate::dataset::OpenMode::Open
+            } else {
+                crate::dataset::OpenMode::Auto
+            },
+            max_bytes: max_bytes
+                .as_deref()
+                .map(crate::storage::parse_bytes)
+                .transpose()?,
+        },
+        DatasetCommand::Close => SessionCommand::DatasetClose,
+        DatasetCommand::Status { file } => {
+            if let Some(file) = file {
+                absolute_dataset(file)?;
+            }
+            SessionCommand::DatasetStatus
+        }
+        DatasetCommand::Note { text, context } => SessionCommand::DatasetNote {
+            text: text.clone(),
+            context: crate::context::from_pairs(context)?,
+            camera: cli.camera.clone(),
+        },
+        DatasetCommand::Query { file, sql, limit } => {
+            if let Some(file) = file {
+                absolute_dataset(file)?;
+            }
+            SessionCommand::DatasetQuery {
+                sql: sql.clone(),
+                limit: *limit,
+                timeout_ms: 0,
+            }
+        }
+        DatasetCommand::Export {
+            file,
+            output,
+            format,
+            tables,
+            since,
+            until,
+            storage,
+        } => {
+            if let Some(file) = file {
+                absolute_dataset(file)?;
+            }
+            ensure!(
+                !output.as_os_str().is_empty(),
+                "export folder must be nonempty"
+            );
+            let output = if output.is_absolute() {
+                output.clone()
+            } else {
+                std::env::current_dir()?.join(output)
+            };
+            SessionCommand::DatasetExport {
+                output: output.to_string_lossy().into_owned(),
+                formats: crate::dataset::ExportFormat::or_default(format.clone()),
+                tables: tables.clone(),
+                since_ms: since
+                    .as_deref()
+                    .map(crate::scheduling::parse_at)
+                    .transpose()?,
+                until_ms: until
+                    .as_deref()
+                    .map(crate::scheduling::parse_at)
+                    .transpose()?,
+                storage: storage.policy()?,
+            }
+        }
+    };
+    command.validate()?;
+    Ok(Some(command))
+}
+
+/// `dataset status|query|export --file`: read a dataset no session holds.
+fn dataset_file(command: &DatasetCommand, prepared: Option<SessionCommand>) -> Result<Value> {
+    let (DatasetCommand::Status { file: Some(file) }
+    | DatasetCommand::Query {
+        file: Some(file), ..
+    }
+    | DatasetCommand::Export {
+        file: Some(file), ..
+    }) = command
+    else {
+        anyhow::bail!("dataset --file needs a file");
+    };
+    let dataset = crate::dataset::Dataset::open_read_only(&absolute_dataset(file)?)?;
+    let usage = |error: anyhow::Error| -> anyhow::Error {
+        if error.is::<crate::dataset::Usage>() {
+            InvalidInput(error.to_string()).into()
+        } else {
+            error
+        }
+    };
+    match prepared {
+        Some(SessionCommand::DatasetQuery { sql, limit, .. }) => {
+            dataset.reader()?.query(&sql, limit, 0).map_err(usage)
+        }
+        Some(SessionCommand::DatasetExport {
+            output,
+            formats,
+            tables,
+            since_ms,
+            until_ms,
+            storage,
+        }) => dataset
+            .reader()?
+            .export(&crate::dataset::export::ExportRequest {
+                output: output.into(),
+                formats,
+                tables,
+                since_ms,
+                until_ms,
+                storage,
+            }),
+        _ => Ok(serde_json::to_value(dataset.status())?),
+    }
+}
+
+/// `dataset` subcommands in a session.
 fn dataset_command(
-    _cli: &Cli,
-    _client: &Client,
+    cli: &Cli,
+    client: &Client,
     _command: &DatasetCommand,
-    _prepared: Option<SessionCommand>,
+    prepared: Option<SessionCommand>,
 ) -> Result<Value> {
-    anyhow::bail!("dataset commands are not implemented yet")
+    input((|| {
+        ensure!(
+            cli.session.is_some(),
+            "no session; pass --file FILE.duckdb, or --session NAME for a running session"
+        );
+        Ok(())
+    })())?;
+    client.call(prepared.context("dataset command")?)
+}
+
+/// Human-readable dataset results.
+fn dataset_output(out: &mut impl Write, command: &DatasetCommand, value: &Value) -> Result<()> {
+    let status_line = |status: &Value| {
+        let name = status["path"]
+            .as_str()
+            .map(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.to_owned())
+            })
+            .unwrap_or_default();
+        format!(
+            "{name}: {} captures, {} recordings, {} signals, {} samples, {} events",
+            status["captures"],
+            status["recordings"],
+            status["signals"],
+            status["samples"],
+            status["events"]
+        )
+    };
+    match command {
+        DatasetCommand::Close => match value.get("closed") {
+            Some(status) if !status.is_null() => writeln!(out, "Closed {}", status_line(status))?,
+            _ => writeln!(out, "No dataset was open.")?,
+        },
+        DatasetCommand::Note { .. } => writeln!(out, "Note #{} added.", value["id"])?,
+        DatasetCommand::Open { .. } | DatasetCommand::Status { .. } => {
+            if value.is_null() {
+                writeln!(out, "No dataset is open.")?;
+            } else {
+                writeln!(out, "{}", status_line(value))?;
+            }
+        }
+        DatasetCommand::Query { .. } => {
+            let cell = |v: &Value| match v {
+                Value::String(s) => s.replace(['\t', '\n'], " "),
+                Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            let names: Vec<String> = value["columns"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|c| cell(&c["name"]))
+                .collect();
+            writeln!(out, "{}", names.join("\t"))?;
+            for row in value["rows"].as_array().into_iter().flatten() {
+                let cells: Vec<String> = row.as_array().into_iter().flatten().map(cell).collect();
+                writeln!(out, "{}", cells.join("\t"))?;
+            }
+            if value["truncated"] == true {
+                eprintln!("capturefab: result truncated; raise --limit or narrow the query");
+            }
+        }
+        DatasetCommand::Export { .. } => {
+            for file in value["files"].as_array().into_iter().flatten() {
+                writeln!(out, "{}", file["path"].as_str().unwrap_or(""))?;
+            }
+            writeln!(
+                out,
+                "Exported to {}",
+                value["output"].as_str().unwrap_or("")
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Arguments of `signals` and `log`, checked before any session is touched.
