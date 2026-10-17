@@ -2536,23 +2536,7 @@ impl Workbench {
                 self.copyable("capturefab doctor".into(), p),
             ].spacing(ROW_GAP));
         }
-        column![
-            section(
-                if recording {
-                    "Record to a file"
-                } else {
-                    "Record or stream video"
-                },
-                None,
-                p
-            ),
-            text(if recording {
-                "Save this camera's video to a recording file."
-            } else {
-                "Enter a video file path to record, or a stream URL to forward to a recorder."
-            })
-            .size(style::SMALL)
-            .color(p.secondary),
+        let controls = column![
             accessibility::mapped(
                 self.record_to.view(
                     &self.forward_output,
@@ -2621,8 +2605,34 @@ impl Workbench {
             ),
             options,
         ]
-        .spacing(ROW_GAP)
-        .into()
+        .spacing(ROW_GAP);
+        // Purpose guidance already introduces this operation. Avoid stacking
+        // another heading and paragraph above its destination and start action.
+        if forward_guidance(self.camera_kind()).is_some() {
+            controls.into()
+        } else {
+            column![
+                section(
+                    if recording {
+                        "Record to a file"
+                    } else {
+                        "Record or stream video"
+                    },
+                    None,
+                    p
+                ),
+                text(if recording {
+                    "Save this camera's video to a recording file."
+                } else {
+                    "Enter a video file path to record, or a stream URL to forward to a recorder."
+                })
+                .size(style::SMALL)
+                .color(p.secondary),
+                controls,
+            ]
+            .spacing(ROW_GAP)
+            .into()
+        }
     }
 
     fn forward_field_error(&self, encoder: bool, p: &'static Palette) -> Element<'_, Message> {
