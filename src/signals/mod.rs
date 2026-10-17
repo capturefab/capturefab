@@ -583,7 +583,7 @@ pub fn schema_contract() -> Json {
             "signal_start": "SourceStatus",
             "signal_stop": {"stopped":"[SourceStatus]"},
             "signals": {"sources":"[SourceStatus]","persisting":"bool","dropped":"u64","sink_error":"string|null"},
-            "log": {"sources":"[SourceStatus]","dataset":"path|null","csv":"path|null","samples":"u64","written":"u64","dropped":"u64","duration_ms":"u64"}
+            "log": {"sources":"[SourceStatus]","dataset":"path|null","csv":"path|null","samples":"u64","written":"u64","dropped":"u64","duration_ms":"u64","warnings":"[string], only when nothing was logged"}
         },
         "source_status": "{id,protocol,uri,interval_ms,state:connecting|running|reconnecting|failed|stopped,started_ms,last_sample_ms,samples,written,dropped,helper_dropped,restarts,error,helper_pid,tags:[{tag,unit,value,quality,ts_ms,source_ts_ms,recent?}],tags_total,tags_truncated}",
         "errors": {"2":"bad URI or arguments","3":"connection refused or unknown source ID","4":"timed out","5":"protocol not compiled in, or browse on modbus-tcp","6":"storage full while writing CSV"},
