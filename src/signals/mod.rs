@@ -496,12 +496,25 @@ pub fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Parse a URI that reads values: an OPC UA source needs nodes to read
+/// (only browse goes without).
+pub fn parse_readable(uri: &str) -> Result<SignalUri> {
+    let parsed = parse(uri)?;
+    if let uri::Target::Opcua { nodes, .. } = &parsed.target {
+        ensure!(
+            !nodes.is_empty(),
+            "opc.tcp:// read, start and log need at least one ?node=NODE_ID; find node IDs with signals browse"
+        );
+    }
+    Ok(parsed)
+}
+
 /// Check the shape of a signal command's fields. Whether a protocol is
 /// compiled in is checked only when the command runs (exit code 5).
 pub fn validate_command(command: &SessionCommand) -> Result<()> {
     match command {
         SessionCommand::SignalRead { uri, timeout_ms } => {
-            parse(uri)?;
+            parse_readable(uri)?;
             crate::session::validate_timeout(*timeout_ms)?;
         }
         SessionCommand::SignalBrowse {
@@ -524,7 +537,7 @@ pub fn validate_command(command: &SessionCommand) -> Result<()> {
             interval_ms,
             tags,
         } => {
-            parse(uri)?;
+            parse_readable(uri)?;
             validate_interval(*interval_ms)?;
             validate_tags(tags)?;
         }
@@ -591,6 +604,22 @@ pub fn rpc_examples() -> Vec<Json> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opcua_reads_need_nodes_but_browse_does_not() {
+        let bare = "opc.tcp://plc:4840/";
+        assert!(parse(bare).is_ok());
+        let error = parse_readable(bare).unwrap_err();
+        assert!(error.to_string().contains("?node="), "{error}");
+        assert!(parse_readable("opc.tcp://plc:4840/?node=i=2258").is_ok());
+        assert!(
+            validate_command(&SessionCommand::SignalRead {
+                uri: bare.into(),
+                timeout_ms: 2000
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn ids_and_redaction_ignore_credentials() {

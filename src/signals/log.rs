@@ -1,6 +1,6 @@
 //! `capturefab log`: log signal sources in a local session into a dataset
 //! and/or a CSV file for a duration or until Ctrl-C.
-use super::{SampleSink, TeeSink, csv::CsvSink, parse};
+use super::{SampleSink, TeeSink, csv::CsvSink, parse_readable};
 use crate::{session::SessionHandle, storage::StoragePolicy};
 use anyhow::{Result, bail, ensure};
 use serde_json::{Value as Json, json};
@@ -40,7 +40,7 @@ pub fn validate(options: &LogOptions) -> Result<()> {
         super::MAX_SOURCES
     );
     for uri in &options.uris {
-        parse(uri)?;
+        parse_readable(uri)?;
     }
     super::validate_interval(options.interval_ms)?;
     super::validate_tags(&options.tags)?;
