@@ -1851,6 +1851,8 @@ struct EncoderProcess {
     stage: Option<Child>,
     stage_log: Option<JoinHandle<()>>,
     encoder: String,
+    /// When the recording file was reserved, UTC Unix milliseconds.
+    started_ms: u64,
 }
 struct EncodedOutput {
     storage: crate::storage::StorageWriter,
@@ -2666,6 +2668,7 @@ impl Forwarder {
                 )
             })
             .transpose()?;
+        let started_ms = crate::scheduling::now_ms();
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -2784,6 +2787,7 @@ impl Forwarder {
             stage,
             stage_log,
             encoder,
+            started_ms,
         });
         Ok(())
     }
@@ -2969,17 +2973,41 @@ impl Forwarder {
                 && error.is_none()
                 && output.storage.bytes_written() > 0;
             let path = output.storage.path().to_path_buf();
+            let (bytes, sha256) = (output.storage.bytes_written(), output.storage.sha256());
             let result = if valid {
-                output
-                    .storage
-                    .finish()
-                    .and_then(|()| match &self.destination {
+                output.storage.finish().and_then(|()| {
+                    // The file is complete and in the ledger even if queueing fails.
+                    let mut recorded = crate::dataset::RecordedFile {
+                        path: path.display().to_string(),
+                        bytes,
+                        sha256,
+                        started_ms: process.started_ms,
+                        ended_ms: crate::scheduling::now_ms(),
+                        codec: self.config.codec.clone(),
+                        encoder: process.encoder.clone(),
+                        fps: self.config.fps,
+                        destination: self
+                            .destination
+                            .as_ref()
+                            .and_then(|d| d.destination.clone()),
+                        object_key: None,
+                        remote_url: None,
+                        upload_id: None,
+                    };
+                    let queued = match &self.destination {
                         Some(destination) => destination
                             .finished(&path)
-                            .map(drop)
                             .context("recording saved but not queued for upload"),
-                        None => Ok(()),
-                    })
+                        None => Ok(None),
+                    };
+                    if let Ok(Some(queued)) = &queued {
+                        recorded.object_key = Some(queued.key.clone());
+                        recorded.remote_url = Some(queued.url.clone());
+                        recorded.upload_id = Some(queued.id.clone());
+                    }
+                    self.final_stats.recording = Some(recorded);
+                    queued.map(drop)
+                })
             } else {
                 output.storage.abort()
             };

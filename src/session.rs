@@ -897,15 +897,21 @@ struct ParentReply {
     #[serde(default)]
     snapshot: Option<Value>,
     #[serde(default)]
-    #[allow(dead_code)] // Collected into the dataset by the exchange (Slice B).
     saved: crate::dataset::SavedBatch,
 }
+/// Saved files a worker reported more than this many of are counted as lost.
+const SAVED_CAP: usize = 100_000;
 struct Process {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
     feed: Arc<Mutex<FrameFeed>>,
     snapshot: SessionSnapshot,
+    /// Saved files reported by the worker, not yet given to the dataset.
+    saved: Vec<crate::dataset::SavedFile>,
+    saved_camera: Option<crate::dataset::SavedCamera>,
+    saved_seq: u64,
+    saved_gaps: u64,
 }
 impl Process {
     fn spawn(scanner: bool) -> Result<Self> {
@@ -940,6 +946,10 @@ impl Process {
             output,
             feed: Arc::new(Mutex::new(FrameFeed { ring, latest: None })),
             snapshot: SessionSnapshot::default(),
+            saved: Vec::new(),
+            saved_camera: None,
+            saved_seq: 0,
+            saved_gaps: 0,
         })
     }
     fn call(&mut self, command: SessionCommand) -> Result<Value> {
@@ -969,7 +979,9 @@ impl Process {
             data.len() <= 16 * 1024 * 1024 && data.last() == Some(&b'\n'),
             "camera worker exited or sent an invalid response"
         );
-        let reply: ParentReply = serde_json::from_slice(&data)?;
+        let mut reply: ParentReply = serde_json::from_slice(&data)?;
+        // Before the ok check: a failed command may already have saved files.
+        self.keep_saved(std::mem::take(&mut reply.saved));
         if let Some(snapshot) = reply.snapshot {
             match serde_json::from_value(snapshot) {
                 Ok(snapshot) => self.snapshot = snapshot,
@@ -982,6 +994,34 @@ impl Process {
             reply.error.as_deref().unwrap_or("worker command failed")
         );
         Ok(reply.result)
+    }
+    fn keep_saved(&mut self, batch: crate::dataset::SavedBatch) {
+        if let Some(camera) = batch.camera {
+            self.saved_camera = Some(camera);
+        }
+        self.saved_gaps += batch.lost;
+        for item in batch.items {
+            // Sequence numbers increase by one; a jump means lost entries.
+            self.saved_gaps += item.seq.saturating_sub(self.saved_seq + 1);
+            self.saved_seq = self.saved_seq.max(item.seq);
+            if self.saved.len() >= SAVED_CAP {
+                self.saved_gaps += 1;
+            } else {
+                self.saved.push(item);
+            }
+        }
+    }
+    /// Saved files and missed-entry count collected since the last call.
+    fn take_saved(&mut self) -> (crate::dataset::SavedBatch, u64) {
+        let batch = crate::dataset::SavedBatch {
+            camera: self
+                .saved_camera
+                .clone()
+                .or_else(|| self.snapshot.connected.as_ref().map(Into::into)),
+            items: std::mem::take(&mut self.saved),
+            lost: 0,
+        };
+        (batch, std::mem::take(&mut self.saved_gaps))
     }
 }
 impl Drop for Process {
@@ -1160,8 +1200,8 @@ impl SessionHandle {
     /// Refresh every idle worker's snapshot; busy workers report on their reply.
     fn refresh_workers(&self) {
         for (id, w) in self.workers() {
-            if let Ok(mut p) = w.try_lock()
-                && p.exchange(SessionCommand::Status).is_err()
+            let Ok(mut p) = w.try_lock() else { continue };
+            if p.exchange(SessionCommand::Status).is_err()
                 && p.child.try_wait().ok().flatten().is_some()
             {
                 self.inner.activity.cancel_jobs(
@@ -1170,6 +1210,10 @@ impl SessionHandle {
                     "camera worker exited before schedule completed",
                 );
             }
+            let (batch, gaps) = p.take_saved();
+            // Never hold a worker lock across DuckDB.
+            drop(p);
+            self.inner.dataset.record_saved(batch, gaps);
         }
     }
     fn workers(&self) -> Vec<(String, Arc<Mutex<Process>>)> {
@@ -1909,7 +1953,16 @@ impl SessionHandle {
                 drop(p);
                 let mut final_snapshot = self.snapshot();
                 let mut p = w.lock().unwrap_or_else(|e| e.into_inner());
-                let result = p.call(SessionCommand::Disconnect)?;
+                let result = p.call(SessionCommand::Disconnect);
+                let (batch, gaps) = p.take_saved();
+                let result = match result {
+                    Ok(result) => result,
+                    Err(e) => {
+                        drop(p);
+                        self.inner.dataset.record_saved(batch, gaps);
+                        return Err(e);
+                    }
+                };
                 self.inner.activity.cancel_jobs(
                     Some(&id),
                     Some(p.child.id()),
@@ -1928,6 +1981,7 @@ impl SessionHandle {
                     camera.stale = false;
                 }
                 drop(p);
+                self.inner.dataset.record_saved(batch, gaps);
                 self.inner.analytics.observe_final(&final_snapshot);
                 self.inner
                     .feeds
@@ -1959,7 +2013,7 @@ impl SessionHandle {
             command => {
                 let w = self.target(target)?;
                 let schedule = matches!(command, SessionCommand::Schedule { .. });
-                let result = {
+                let (result, (batch, gaps)) = {
                     let mut worker = w.lock().unwrap_or_else(|e| e.into_inner());
                     let mut result = worker.call(command);
                     if schedule
@@ -1968,8 +2022,9 @@ impl SessionHandle {
                     {
                         fields.insert("worker_pid".into(), json!(worker.child.id()));
                     }
-                    result
+                    (result, worker.take_saved())
                 };
+                self.inner.dataset.record_saved(batch, gaps);
                 self.store_snapshot();
                 result
             }
@@ -1995,7 +2050,42 @@ impl SessionHandle {
     }
     /// Before workers are dropped: stop recordings cleanly and catalog the
     /// files every worker still holds.
-    fn finalize_workers(&self) {}
+    fn finalize_workers(&self) {
+        for (id, w) in self.workers() {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let guard = loop {
+                match w.try_lock() {
+                    Ok(p) => break Some(p),
+                    Err(std::sync::TryLockError::Poisoned(e)) => break Some(e.into_inner()),
+                    Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => break None,
+                }
+            };
+            let Some(mut p) = guard else {
+                eprintln!(
+                    "capturefab: camera {id} stayed busy; its last saved files may not be cataloged"
+                );
+                continue;
+            };
+            if p.snapshot.forwarding.is_some()
+                && let Err(e) = p.call(SessionCommand::StopForward)
+            {
+                eprintln!("capturefab: stop recording on {id}: {e:#}");
+            }
+            // Each reply drains a bounded number of entries; keep asking.
+            for _ in 0..64 {
+                let before = p.saved.len();
+                if p.exchange(SessionCommand::Status).is_err() || p.saved.len() == before {
+                    break;
+                }
+            }
+            let (batch, gaps) = p.take_saved();
+            drop(p);
+            self.inner.dataset.record_saved(batch, gaps);
+        }
+    }
     pub fn uptime_seconds(&self) -> f64 {
         self.inner.started.elapsed().as_secs_f64()
     }
