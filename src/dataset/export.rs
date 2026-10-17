@@ -447,6 +447,8 @@ struct Metadata {
     cameras: Vec<Value>,
     signals: Vec<Value>,
     notes: Vec<(u64, String)>,
+    /// Capture context key -> value -> captures.
+    contexts: BTreeMap<String, BTreeMap<String, u64>>,
     counts: BTreeMap<String, u64>,
     first_ms: Option<u64>,
     last_ms: Option<u64>,
@@ -518,6 +520,30 @@ impl Reader {
                 }))
             })?
             .collect::<duckdb::Result<_>>()?;
+        let mut statement = conn.prepare(&format!(
+            "SELECT context, count(*) FROM captures{} GROUP BY context ORDER BY 2 DESC LIMIT 1000",
+            self.filter("captures", request)
+        ))?;
+        let contexts: Vec<(Option<String>, u64)> = statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<duckdb::Result<_>>()?;
+        for (context, count) in contexts {
+            let Some(Value::Object(fields)) = context.and_then(|c| serde_json::from_str(&c).ok())
+            else {
+                continue;
+            };
+            for (key, value) in fields {
+                let value = value
+                    .as_str()
+                    .map_or_else(|| value.to_string(), str::to_owned);
+                *meta
+                    .contexts
+                    .entry(key)
+                    .or_default()
+                    .entry(value)
+                    .or_default() += count;
+            }
+        }
         let mut statement = conn.prepare(&format!(
             "SELECT wall_ms, text FROM (SELECT wall_ms, text FROM events{} {} kind = 'note'
                ORDER BY wall_ms DESC LIMIT 20) ORDER BY wall_ms",
@@ -678,13 +704,21 @@ impl Reader {
             .as_array()
             .is_some_and(|f| f.iter().any(|f| f == "parquet"));
         let ext = if parquet { "parquet" } else { "csv" };
+        let has_wide = manifest["tables"]
+            .as_array()
+            .is_some_and(|t| t.iter().any(|t| t["name"] == "captures_wide"));
+        let wide = if has_wide {
+            format!(
+                "# one row per capture, one column per tag\nwide = pd.read_{ext}('captures_wide.{ext}')\n"
+            )
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "\n## Loading\n\npandas:\n\n```python\nimport pandas as pd\ncaptures = pd.read_{}('captures.{ext}')\nwide = pd.read_{}('captures_with_signals.{ext}')\n```\n\n\
+            "\n## Loading\n\npandas:\n\n```python\nimport pandas as pd\ncaptures = pd.read_{ext}('captures.{ext}')\n\
+             # long format: one row per capture and tag\njoined = pd.read_{ext}('captures_with_signals.{ext}')\n{wide}```\n\n\
              DuckDB:\n\n```sql\nSELECT * FROM 'captures.{ext}';\nSELECT tag, avg(value_double) FROM 'samples.{ext}' GROUP BY tag;\n```\n\n\
-             polars:\n\n```python\nimport polars as pl\nsamples = pl.read_{}('samples.{ext}')\n```\n\n",
-            if parquet { "parquet" } else { "csv" },
-            if parquet { "parquet" } else { "csv" },
-            if parquet { "parquet" } else { "csv" },
+             polars:\n\n```python\nimport polars as pl\nsamples = pl.read_{ext}('samples.{ext}')\n```\n\n",
         ));
         out.push_str(
             "## Notes on paths\n\nMedia paths are absolute paths on the capturing computer. A non-null `object_key` means the \
@@ -715,6 +749,28 @@ impl Reader {
                 camera["vendor"].as_str().unwrap_or(""),
                 camera["model"].as_str().unwrap_or(""),
                 camera["captures"]
+            ));
+        }
+        for (key, values) in &meta.contexts {
+            let mut values: Vec<(&String, &u64)> = values.iter().collect();
+            values.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            let shown: Vec<String> = values
+                .iter()
+                .take(10)
+                .map(|(value, count)| {
+                    let value: String = value.chars().take(60).collect();
+                    format!("{} ({count})", value.replace(['\n', '\r'], " "))
+                })
+                .collect();
+            let more = values.len().saturating_sub(shown.len());
+            lines.push(format!(
+                "- context {key}: {}{}",
+                shown.join(", "),
+                if more > 0 {
+                    format!(", and {more} more")
+                } else {
+                    String::new()
+                }
             ));
         }
         for signal in &meta.signals {

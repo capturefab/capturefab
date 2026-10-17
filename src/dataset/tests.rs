@@ -564,6 +564,15 @@ fn export_bundle_writes_every_format_once_and_never_overwrites() {
     let readme = fs::read_to_string(output.join("README.md")).unwrap();
     let summary = &readme[readme.find("## Summary for AI tools").unwrap()..];
     assert!(summary.len() <= export::SUMMARY_BYTES && summary.contains("first 'note'"));
+    // Capture context (line, part, lot) is summarized for AI tools.
+    assert!(summary.contains("- context line: L1 (1)"), "{summary}");
+    // The long ASOF table is not loaded under the name `wide`.
+    assert!(
+        readme.contains("wide = pd.read_csv('captures_wide.csv')") || cfg!(feature = "parquet")
+    );
+    assert!(readme.contains("joined = pd.read_"), "{readme}");
+    assert!(!readme.contains("wide = pd.read_csv('captures_with_signals"));
+    assert!(!readme.contains("wide = pd.read_parquet('captures_with_signals"));
     if cfg!(feature = "parquet") {
         let check = Dataset::open_read_only(&dir.join("e.duckdb")).err();
         assert!(check.is_some(), "the session still holds the dataset");
