@@ -209,8 +209,8 @@ class ReleaseTests(unittest.TestCase):
                 return dict(id=name, name=name, version=version, license=license, license_file=None, manifest_path=str(folder / 'Cargo.toml'))
             normal, build = [dict(kind=None, target=None)], [dict(kind='build', target=None)]
             metadata = dict(
-                packages=[crate('app', '1.0.0', 'GPL-3.0-only'), crate('a', '1.0.0', 'MIT OR Apache-2.0', **{'LICENSE-MIT': 'MIT text', 'LICENSE-APACHE': 'Apache text'}), crate('b', '3.0.0', 'MIT', LICENSE='build-only text'), crate('c', '2.0.0', 'Apache-2.0', **{'LICENSE-APACHE': 'Apache text'}), crate('d', '4.0.0', 'MIT')],
-                resolve=dict(root='app', nodes=[dict(id='app', deps=[dict(pkg='a', dep_kinds=normal), dict(pkg='b', dep_kinds=build)]), dict(id='a', deps=[dict(pkg='c', dep_kinds=normal), dict(pkg='d', dep_kinds=normal)]), dict(id='b', deps=[]), dict(id='c', deps=[]), dict(id='d', deps=[])]),
+                packages=[crate('app', '1.0.0', 'GPL-3.0-only'), crate('a', '1.0.0', 'MIT OR Apache-2.0', **{'LICENSE-MIT': 'MIT text', 'LICENSE-APACHE': 'Apache text'}), crate('b', '3.0.0', 'MIT', LICENSE='build-only text'), crate('c', '2.0.0', 'Apache-2.0', **{'LICENSE-APACHE': 'Apache text'}), crate('d', '4.0.0', 'MIT'), dict(crate('e', '5.0.0', 'MPL-2.0', LICENSE='MPL text'), repository='https://example.com/e')],
+                resolve=dict(root='app', nodes=[dict(id='app', deps=[dict(pkg='a', dep_kinds=normal), dict(pkg='b', dep_kinds=build)]), dict(id='a', deps=[dict(pkg='c', dep_kinds=normal), dict(pkg='d', dep_kinds=normal), dict(pkg='e', dep_kinds=normal)]), dict(id='b', deps=[]), dict(id='c', deps=[]), dict(id='d', deps=[]), dict(id='e', deps=[])]),
             )
             text = release.license_notices(metadata)
         self.assertEqual(text.count('Apache text'), 1)
@@ -219,6 +219,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn('===== d 4.0.0 (MIT) =====\n\nThis crate includes no license file', text)
         self.assertNotIn('build-only text', text)
         self.assertNotIn('app 1.0.0', text)
+        self.assertIn('===== e 5.0.0 (MPL-2.0); source: https://example.com/e =====', text)
 
     @unittest.skipUnless(shutil.which('git'), 'git is required')
     def test_source_archive_is_the_committed_tree(self):

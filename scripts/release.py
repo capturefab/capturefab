@@ -311,7 +311,11 @@ def license_notices(metadata):
         files += [folder / package['license_file']] if package.get('license_file') else []
         found = dict.fromkeys(f.read_text(encoding='utf-8', errors='replace').strip() for f in files)
         for text in found or ['This crate includes no license file; its license expression is listed above.']:
-            texts.setdefault(text, []).append(f"{package['name']} {package['version']} ({package['license'] or 'see license file'})")
+            label = f"{package['name']} {package['version']} ({package['license'] or 'see license file'})"
+            # MPL-2.0 requires telling recipients where the covered source is.
+            if 'MPL-2.0' in (package.get('license') or ''):
+                label += f"; source: {package.get('repository') or 'https://crates.io/crates/' + package['name']}"
+            texts.setdefault(text, []).append(label)
     return 'Rust crates compiled into this Capturefab executable and their license texts.\n' + ''.join(f'\n===== {", ".join(names)} =====\n\n{text}\n' for text, names in texts.items())
 
 def notices(target, variant):
