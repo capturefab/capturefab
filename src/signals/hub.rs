@@ -4,8 +4,9 @@
 //! Each source has a reader thread for its helper's stdout. One writer
 //! thread owns the sink and receives batches, registrations, flushes and
 //! sink swaps through a single ordered queue, so a swap always follows the
-//! batches queued before it. Batches use `try_send`: a full queue counts
-//! drops instead of blocking a reader.
+//! batches queued before it. Batches and registrations use `try_send`: a full
+//! queue (or one holding `QUEUE_BYTES`) counts drops instead of blocking a
+//! reader, and registrations wait in the reader until there is room.
 use super::{
     Line, MAX_SOURCES, MAX_TAGS, Mode, Sample, SampleSink, SignalInfo, SignalSpec, SourceState,
     SourceStatus, TagInfo, TagStatus, parse,
@@ -30,12 +31,17 @@ use std::{
 pub const RECENT: usize = 120;
 /// Hub queue depth, in messages.
 const QUEUE: usize = 1024;
+/// Approximate memory the queued batches may hold before batches are
+/// dropped (and counted), so a stalled sink cannot hold hundreds of MiB.
+const QUEUE_BYTES: u64 = 64 << 20;
 /// Largest batch handed to the sink at once.
 const SINK_BATCH: usize = 5000;
 /// How long the writer coalesces a source's samples.
 const COALESCE: Duration = Duration::from_millis(500);
 /// Helper restarts per source before it is marked failed.
 const MAX_RESTARTS: u64 = 5;
+/// A helper that ran this long before exiting starts a fresh restart count.
+const STABLE_RUN: Duration = Duration::from_secs(600);
 /// Log entries kept.
 const MAX_LOGS: usize = 50;
 
@@ -44,7 +50,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 enum HubMsg {
-    Batch(Arc<Source>, Vec<Sample>),
+    /// Samples and their approximate size in memory.
+    Batch(Arc<Source>, Vec<Sample>, u64),
     Register(SignalInfo, Vec<TagInfo>),
     Event(&'static str, String, String),
     Flush(mpsc::Sender<Result<()>>),
@@ -204,6 +211,8 @@ struct HubInner {
     queue: OnceLock<SyncSender<HubMsg>>,
     has_sink: AtomicBool,
     dropped_total: AtomicU64,
+    /// Approximate bytes held by queued batches.
+    queued_bytes: AtomicU64,
     sink_error: Mutex<Option<String>>,
     logs: Mutex<VecDeque<LogEntry>>,
     quitting: AtomicBool,
@@ -363,7 +372,10 @@ fn writer(hub: Weak<HubInner>, receiver: mpsc::Receiver<HubMsg>) {
     };
     loop {
         match receiver.recv_timeout(writer.next_due()) {
-            Ok(HubMsg::Batch(source, samples)) => {
+            Ok(HubMsg::Batch(source, samples, bytes)) => {
+                if let Some(hub) = writer.hub.upgrade() {
+                    hub.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                }
                 if writer.sink.is_some() {
                     writer
                         .pending
@@ -407,12 +419,48 @@ fn writer(hub: Weak<HubInner>, receiver: mpsc::Receiver<HubMsg>) {
     }
 }
 
+/// Approximate memory a batch holds while queued.
+fn batch_bytes(samples: &[Sample]) -> u64 {
+    samples
+        .iter()
+        .map(|s| {
+            let text = match &s.value {
+                super::Value::Text(text) => text.len(),
+                _ => 0,
+            };
+            (std::mem::size_of::<Sample>() + s.tag.len() + text) as u64
+        })
+        .sum()
+}
+
+/// Queue tags waiting to be registered without blocking the reader. They
+/// stay pending while the queue is full.
+fn register(queue: &SyncSender<HubMsg>, source: &Source, pending: &mut Vec<TagInfo>) -> bool {
+    if pending.is_empty() {
+        return true;
+    }
+    match queue.try_send(HubMsg::Register(
+        source.info.clone(),
+        std::mem::take(pending),
+    )) {
+        Ok(()) => true,
+        Err(TrySendError::Full(HubMsg::Register(_, tags))) => {
+            *pending = tags;
+            false
+        }
+        Err(_) => true,
+    }
+}
+
 /// Follow one source's helper output; restart the helper after it exits
-/// unexpectedly, up to `MAX_RESTARTS` times.
+/// unexpectedly, up to `MAX_RESTARTS` times in a row.
 fn read_source(hub: Arc<HubInner>, source: Arc<Source>, mut reader: Box<dyn BufRead + Send>) {
     let queue = hub.queue();
+    let mut unregistered: Vec<TagInfo> = Vec::new();
+    let mut recent_restarts = 0u64;
     loop {
         let mut error: Option<String> = None;
+        let started = Instant::now();
         loop {
             match read_line(&mut reader) {
                 Ok(Some(Line::Samples { samples })) => {
@@ -424,9 +472,17 @@ fn read_source(hub: Arc<HubInner>, source: Arc<Source>, mut reader: Box<dyn BufR
                         continue;
                     }
                     let count = samples.len() as u64;
-                    if let Err(TrySendError::Full(_)) =
-                        queue.try_send(HubMsg::Batch(source.clone(), samples))
-                    {
+                    let bytes = batch_bytes(&samples);
+                    // New tags are registered before their samples, and a
+                    // full queue drops batches rather than blocking.
+                    let sent = register(&queue, &source, &mut unregistered)
+                        && hub.queued_bytes.load(Ordering::Relaxed) + bytes <= QUEUE_BYTES
+                        && queue
+                            .try_send(HubMsg::Batch(source.clone(), samples, bytes))
+                            .is_ok();
+                    if sent {
+                        hub.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+                    } else {
                         source.dropped.fetch_add(count, Ordering::Relaxed);
                         hub.dropped_total.fetch_add(count, Ordering::Relaxed);
                     }
@@ -436,7 +492,8 @@ fn read_source(hub: Arc<HubInner>, source: Arc<Source>, mut reader: Box<dyn BufR
                     if lock(&source.phase).state != SourceState::Running {
                         source.set_phase(SourceState::Running, None);
                     }
-                    let _ = queue.send(HubMsg::Register(source.info.clone(), tags));
+                    unregistered.extend(tags);
+                    register(&queue, &source, &mut unregistered);
                 }
                 Ok(Some(Line::State { state, error })) => {
                     if state == "connected" {
@@ -489,7 +546,13 @@ fn read_source(hub: Arc<HubInner>, source: Arc<Source>, mut reader: Box<dyn BufR
             source.info.id.clone(),
             error.clone(),
         ));
-        let restarts = source.restarts.fetch_add(1, Ordering::Relaxed) + 1;
+        source.restarts.fetch_add(1, Ordering::Relaxed);
+        // Rare exits weeks apart must not add up to a permanent failure.
+        if started.elapsed() >= STABLE_RUN {
+            recent_restarts = 0;
+        }
+        recent_restarts += 1;
+        let restarts = recent_restarts;
         if restarts > MAX_RESTARTS {
             hub.log(
                 "error",
@@ -566,6 +629,7 @@ impl SignalHub {
                 queue: OnceLock::new(),
                 has_sink: AtomicBool::new(false),
                 dropped_total: AtomicU64::new(0),
+                queued_bytes: AtomicU64::new(0),
                 sink_error: Mutex::default(),
                 logs: Mutex::default(),
                 quitting: AtomicBool::new(false),
