@@ -196,6 +196,16 @@ impl Reader {
             }
             other => other?,
         };
+        // Remove this export's staged files however it ends.
+        struct Cleanup<'a>(&'a [Staged]);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                for item in self.0 {
+                    let _ = fs::remove_file(&item.staged);
+                }
+            }
+        }
+        let _cleanup = Cleanup(&staged);
         let metadata = metadata.unwrap_or_else(|| Ok(Metadata::default()))?;
         self.preflight(&staged, &request.storage)?;
         fs::create_dir_all(output.parent().context("export folder needs a parent")?)?;
@@ -217,9 +227,6 @@ impl Reader {
                     "rows": item.rows, "bytes": bytes, "sha256": sha256,
                 })),
                 Err(e) => {
-                    for rest in &staged {
-                        let _ = fs::remove_file(&rest.staged);
-                    }
                     let written: Vec<_> = files.iter().map(|f| f["path"].clone()).collect();
                     return Err(e.context(format!(
                         "export stopped; files already written stay in {}: {}",
@@ -322,7 +329,26 @@ impl Reader {
                 .collect()
         };
         let mut staged = Vec::new();
+        let result = self.stage_into(request, formats, tables, &mut staged);
+        if result.is_err() {
+            for item in &staged {
+                let _ = fs::remove_file(&item.staged);
+            }
+        }
+        result.map(|()| staged)
+    }
+
+    fn stage_into(
+        &self,
+        request: &ExportRequest,
+        formats: &[ExportFormat],
+        tables: Vec<&str>,
+        staged: &mut Vec<Staged>,
+    ) -> Result<()> {
         let dir = self.staging.sql();
+        // Exports of one dataset share its staging folder and may overlap,
+        // so each export's files carry their own prefix.
+        let prefix = super::db::random_name()?;
         for table in tables {
             let select = if table == "captures_wide" {
                 match self.wide_select(request)? {
@@ -342,7 +368,7 @@ impl Reader {
                 )
             };
             for format in formats {
-                let file = format!("{table}.{}", format.extension());
+                let file = format!("{prefix}-{table}.{}", format.extension());
                 let target = format!("{dir}/{file}");
                 let rows = self
                     .conn
@@ -364,7 +390,7 @@ impl Reader {
                 });
             }
         }
-        Ok(staged)
+        Ok(())
     }
 
     /// Fail before writing anything when the storage budget cannot hold the

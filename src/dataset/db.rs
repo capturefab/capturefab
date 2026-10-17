@@ -7,6 +7,7 @@ use crate::{
 };
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use duckdb::{AccessMode, Config, Connection, OptionalExt, params};
+use fs2::FileExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -102,21 +103,38 @@ fn locked_message(path: &Path) -> String {
 #[derive(Debug)]
 pub(crate) struct Staging {
     pub dir: PathBuf,
+    _owner: fs::File,
+}
+const OWNER_LOCK: &str = "owner.lock";
+
+/// 16 random hex digits for private file and folder names.
+pub(crate) fn random_name() -> Result<String> {
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(|e| anyhow!("dataset staging name: {e}"))?;
+    Ok(random.iter().map(|b| format!("{b:02x}")).collect())
 }
 impl Staging {
     fn create() -> Result<Self> {
         let root = crate::ipc::session_dir().join("dataset-staging");
         crate::ipc::ensure_private_dir(&root)?;
         remove_stale(&root);
-        let mut random = [0u8; 8];
-        getrandom::fill(&mut random).map_err(|e| anyhow!("dataset staging name: {e}"))?;
-        let name: String = random.iter().map(|b| format!("{b:02x}")).collect();
-        let dir = root.join(name);
+        let dir = root.join(random_name()?);
         crate::ipc::ensure_private_dir(&dir)?;
+        // Held for the folder's life, so other processes never clean it up
+        // while it is in use, however long ago it last changed.
+        let owner = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(OWNER_LOCK))
+            .context("create dataset staging lock")?;
+        owner
+            .try_lock_exclusive()
+            .context("lock dataset staging folder")?;
         fs::create_dir(dir.join("spill")).context("create dataset spill folder")?;
         // allowed_directories compares paths lexically, so use the real path.
         let dir = dir.canonicalize()?;
-        Ok(Self { dir })
+        Ok(Self { dir, _owner: owner })
     }
     /// The folder as a quoted SQL string body, with forward slashes.
     pub fn sql(&self) -> String {
@@ -128,7 +146,8 @@ impl Drop for Staging {
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
-/// Staging folders left by crashed processes, after a day.
+/// Staging folders left by crashed processes, after a day. A folder whose
+/// owner still holds its lock is in use and is kept.
 fn remove_stale(root: &Path) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
@@ -139,10 +158,25 @@ fn remove_stale(root: &Path) {
             .metadata()
             .and_then(|m| m.modified())
             .is_ok_and(|modified| modified < cutoff)
+            && !in_use(&entry.path())
         {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
+}
+
+fn in_use(dir: &Path) -> bool {
+    let Ok(owner) = fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join(OWNER_LOCK))
+    else {
+        return false;
+    };
+    let busy = owner.try_lock_exclusive().is_err();
+    if !busy {
+        let _ = FileExt::unlock(&owner);
+    }
+    busy
 }
 
 /// Escape text for a single-quoted SQL literal.
@@ -746,4 +780,38 @@ pub(crate) fn wal_path(path: &Path) -> PathBuf {
     let mut wal = path.as_os_str().to_owned();
     wal.push(".wal");
     PathBuf::from(wal)
+}
+
+#[cfg(all(test, unix))]
+mod staging_tests {
+    use super::*;
+
+    #[test]
+    fn stale_cleanup_keeps_folders_still_in_use() {
+        let root = std::env::temp_dir().join(format!(
+            "capturefab-staging-stale-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let old = SystemTime::now() - Duration::from_secs(48 * 3600);
+        let mut held = Vec::new();
+        for (name, lock) in [("live", true), ("dead", false), ("legacy", false)] {
+            let dir = root.join(name);
+            fs::create_dir_all(dir.join("spill")).unwrap();
+            if name != "legacy" {
+                let owner = fs::File::create(dir.join(OWNER_LOCK)).unwrap();
+                if lock {
+                    owner.try_lock_exclusive().unwrap();
+                    held.push(owner);
+                }
+            }
+            fs::File::open(&dir).unwrap().set_modified(old).unwrap();
+        }
+        remove_stale(&root);
+        assert!(root.join("live").exists());
+        assert!(!root.join("dead").exists());
+        assert!(!root.join("legacy").exists());
+        drop(held);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
