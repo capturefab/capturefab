@@ -221,6 +221,24 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
                     continue;
                 }
             }
+            "RETR" => {
+                let Some(listener) = passive.take() else {
+                    write!(out, "425 Use PASV first\r\n")?;
+                    continue;
+                };
+                match st.files.get(&resolve(&cwd, arg)).cloned() {
+                    None => "550 No such file".into(),
+                    Some(bytes) => {
+                        drop(st);
+                        write!(out, "150 Opening data connection\r\n")?;
+                        let (mut data, _) = listener.accept()?;
+                        data.write_all(&bytes)?;
+                        drop(data);
+                        write!(out, "226 Transfer complete\r\n")?;
+                        continue;
+                    }
+                }
+            }
             "DELE" => {
                 if st.files.remove(&resolve(&cwd, arg)).is_some() {
                     "250 Deleted".into()

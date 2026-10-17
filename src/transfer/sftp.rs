@@ -6,9 +6,9 @@
 //! with SSH_FXP_RENAME, which refuses to replace an existing file.
 //!
 //! russh is asynchronous: each uploader owns a current-thread tokio runtime
-//! that only runs while a call is in progress. Its background tasks are idle
-//! between uploads, so a dropped connection is noticed and replaced before
-//! the next one.
+//! that only runs while a call is in progress. Its background tasks (and
+//! keepalives) are idle between uploads, so a session idle for a while is
+//! probed with a cheap request first and replaced if it does not answer.
 use super::{HashingReader, Permanent, Uploader, check_request};
 use crate::destination::{Remote, SftpServer};
 use anyhow::{Result, anyhow};
@@ -29,6 +29,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// A cached session idle this long is probed before it is reused.
+const IDLE_PROBE: Duration = Duration::from_secs(10);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const CHUNK: usize = 256 * 1024;
 
 /// Accepts only the pinned host key, and records the key it was shown.
@@ -62,6 +65,8 @@ pub struct SftpUploader {
     location: String,
     /// Declared before the runtime, so the session drops while it still runs.
     conn: Option<(client::Handle<Pin>, SftpSession)>,
+    /// When the cached session last finished a request.
+    used: std::time::Instant,
     runtime: tokio::runtime::Runtime,
 }
 
@@ -202,6 +207,7 @@ impl SftpUploader {
             secret,
             runtime: runtime()?,
             conn: None,
+            used: std::time::Instant::now(),
         })
     }
 
@@ -278,14 +284,20 @@ impl SftpUploader {
         Ok((handle, sftp))
     }
 
-    /// A live session: the cached one unless its connection closed.
+    /// A live session: the cached one unless its connection closed or, after
+    /// a pause, it no longer answers.
     fn ready(&mut self) -> Result<()> {
-        if self
-            .conn
-            .as_ref()
-            .is_some_and(|(handle, _)| handle.is_closed())
-        {
-            self.conn = None;
+        if let Some((handle, sftp)) = &self.conn {
+            let alive = !handle.is_closed()
+                && (self.used.elapsed() < IDLE_PROBE
+                    || self.runtime.block_on(async {
+                        tokio::time::timeout(PROBE_TIMEOUT, sftp.canonicalize("."))
+                            .await
+                            .is_ok_and(|answer| answer.is_ok())
+                    }));
+            if !alive {
+                self.conn = None;
+            }
         }
         if self.conn.is_none() {
             let (server, secret) = (&self.server, self.secret.as_deref());
@@ -304,18 +316,42 @@ impl SftpUploader {
                 continue;
             }
             if let Err(error) = sftp.create_dir(current.as_str()).await {
-                let is_dir = sftp
-                    .metadata(current.as_str())
-                    .await
-                    .is_ok_and(|m| m.is_dir());
-                if !is_dir {
-                    return Err(
-                        Permanent(format!("cannot create folder {current}: {error}")).into(),
-                    );
+                match sftp.metadata(current.as_str()).await {
+                    Ok(metadata) if metadata.is_dir() => {}
+                    // The server answered: the folder cannot be made.
+                    Ok(_) | Err(russh_sftp::client::error::Error::Status(_)) => {
+                        return Err(
+                            Permanent(format!("cannot create folder {current}: {error}")).into(),
+                        );
+                    }
+                    // The connection failed; a later attempt may work.
+                    Err(lost) => return Err(anyhow!("creating folder {current}: {lost}")),
                 }
             }
         }
         Ok(())
+    }
+
+    /// Whether `target` holds exactly `size` bytes hashing to `sha256`.
+    async fn holds(sftp: &SftpSession, target: &str, sha256: &str, size: u64) -> Result<bool> {
+        let stored = within(REQUEST_TIMEOUT, "checking a file", sftp.metadata(target))
+            .await?
+            .size;
+        if stored != Some(size) {
+            return Ok(false);
+        }
+        let mut file = within(REQUEST_TIMEOUT, "opening a file", sftp.open(target)).await?;
+        let mut hash = super::Sha256Writer::default();
+        let mut buffer = vec![0; CHUNK];
+        loop {
+            use tokio::io::AsyncReadExt;
+            let read = within(WRITE_TIMEOUT, "reading a file", file.read(&mut buffer)).await?;
+            if read == 0 {
+                break;
+            }
+            hash.update(&buffer[..read]);
+        }
+        Ok(hash.finish() == (sha256.to_string(), size))
     }
 
     async fn put(
@@ -343,6 +379,11 @@ impl SftpUploader {
             .await
         };
         if exists().await? {
+            // An earlier attempt whose rename went through but whose reply
+            // was lost left exactly these bytes: that upload is done.
+            if Self::holds(sftp, &target, sha256, size).await? {
+                return Ok(());
+            }
             return Err(Permanent(format!(
                 "uploading: {key} already exists on {location}; it was not replaced"
             ))
@@ -427,6 +468,7 @@ impl Uploader for SftpUploader {
                 .collect();
             Self::make_dirs(sftp, &parts).await
         });
+        self.used = std::time::Instant::now();
         if result.is_err() {
             self.conn = None;
         }
@@ -446,6 +488,7 @@ impl Uploader for SftpUploader {
             sha256,
             size,
         ));
+        self.used = std::time::Instant::now();
         if result.as_ref().is_err_and(super::retryable) {
             self.conn = None;
         }
@@ -583,6 +626,15 @@ mod tests {
             .upload(&changed, "changed.png", &"0".repeat(64), 3)
             .unwrap_err();
         assert!(!retryable(&error) && error.to_string().contains("changed after it was queued"));
+        assert_eq!(test.files().len(), 1);
+        // Exactly the queued bytes under the final name are an earlier
+        // attempt whose rename reply was lost: that upload is complete.
+        let (same, same_sha) = local("same.png", b"original");
+        SftpUploader::new(server(&test), Some("secret".into()))
+            .unwrap()
+            .upload(&same, "a.png", &same_sha, 8)
+            .unwrap();
+        assert_eq!(test.file("/home/cam/in/a.png").unwrap(), b"original");
         assert_eq!(test.files().len(), 1);
     }
 

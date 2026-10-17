@@ -6,7 +6,7 @@ use russh::keys::{HashAlg, PrivateKey};
 use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
 use russh::{Channel, ChannelId};
 use russh_sftp::protocol::{
-    Attrs, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
+    Attrs, Data, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -246,6 +246,27 @@ impl russh_sftp::server::Handler for Sftp {
         }
         file[offset as usize..end].copy_from_slice(&data);
         Ok(ok(id))
+    }
+
+    async fn read(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<Data, Self::Error> {
+        let path = self.open.get(&handle).ok_or(StatusCode::Failure)?;
+        let fs = self.fs.lock().unwrap();
+        let file = fs.files.get(path).ok_or(StatusCode::NoSuchFile)?;
+        let start = offset as usize;
+        if start >= file.len() {
+            return Err(StatusCode::Eof);
+        }
+        let end = file.len().min(start + len as usize);
+        Ok(Data {
+            id,
+            data: file[start..end].to_vec(),
+        })
     }
 
     async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {

@@ -243,6 +243,25 @@ impl<R: Read> Read for HashingReader<R> {
     }
 }
 
+/// Hashes bytes handed to it, for checking a remote file read back.
+#[derive(Default)]
+#[allow(dead_code)]
+pub(crate) struct Sha256Writer {
+    hash: Sha256,
+    bytes: u64,
+}
+#[allow(dead_code)]
+impl Sha256Writer {
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        self.hash.update(bytes);
+        self.bytes += bytes.len() as u64;
+    }
+    /// The lowercase hex SHA-256 and the number of bytes.
+    pub(crate) fn finish(self) -> (String, u64) {
+        (hex(&self.hash.finalize()), self.bytes)
+    }
+}
+
 pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes

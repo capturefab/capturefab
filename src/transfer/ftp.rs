@@ -307,6 +307,24 @@ impl FtpUploader {
         }
     }
 
+    /// Whether `name` already holds exactly these bytes: an earlier attempt
+    /// whose rename went through but whose reply was lost.
+    fn holds(&mut self, name: &str, sha256: &str, size: u64) -> Result<bool> {
+        if self.remote_size(name)? != Some(size) {
+            return Ok(false);
+        }
+        let stream = &mut self.conn.as_mut().expect("connected").0;
+        let read = stream.retr(name, |data| {
+            let mut reader = HashingReader::new(data.take(size.saturating_add(1)));
+            std::io::copy(&mut reader, &mut std::io::sink()).map_err(FtpError::ConnectionError)?;
+            Ok(reader.finish())
+        });
+        match read {
+            Ok((actual, bytes)) => Ok(actual == sha256 && bytes == size),
+            Err(error) => Err(self.fail("checking an existing file", error)),
+        }
+    }
+
     fn exists_error(&self, key: &str) -> anyhow::Error {
         Permanent(format!(
             "uploading: {key} already exists on {}; it was not replaced",
@@ -320,6 +338,9 @@ impl FtpUploader {
         let folders: Vec<&str> = folders.split('/').collect();
         self.enter(&folders)?;
         if self.exists(name)? {
+            if self.holds(name, sha256, size)? {
+                return Ok(());
+            }
             return Err(self.exists_error(key));
         }
         let temp = format!(".{name}.{}.part", &sha256[..16]);
@@ -486,8 +507,30 @@ mod tests {
         uploader.upload(&path, "m.png", &sha, 4).unwrap();
         assert!(fake.commands().iter().any(|c| c.starts_with("MLST")));
         assert_eq!(fake.file(&format!("{HOME}/in/m.png")).unwrap(), b"mlst");
-        let error = uploader.upload(&path, "m.png", &sha, 4).unwrap_err();
+        let (other, other_sha) = local("m2.png", b"mlsx");
+        let error = uploader.upload(&other, "m.png", &other_sha, 4).unwrap_err();
         assert!(!retryable(&error) && error.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn retry_after_a_lost_rename_reply_completes() {
+        // The first attempt's rename went through but its reply was lost:
+        // the identical file under the final name counts as uploaded.
+        let fake = FakeFtp::start(|_| {});
+        let (path, sha) = local("done.png", b"same bytes");
+        let mut uploader = uploader(&fake);
+        uploader.upload(&path, "done.png", &sha, 10).unwrap();
+        let stored = fake.commands().len();
+        uploader.upload(&path, "done.png", &sha, 10).unwrap();
+        assert!(
+            !fake.commands()[stored..]
+                .iter()
+                .any(|c| c.starts_with("STOR") || c.starts_with("RNTO"))
+        );
+        assert_eq!(
+            fake.file(&format!("{HOME}/in/done.png")).unwrap(),
+            b"same bytes"
+        );
     }
 
     #[test]
