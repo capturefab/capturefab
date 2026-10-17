@@ -1488,12 +1488,7 @@ fn prepare_outputs(cli: &Cli, command: &mut Option<SessionCommand>) -> Result<()
             && output != "-"
         {
             let resolved = crate::destination::resolve(destination.as_deref(), output)?;
-            crate::engine::preflight_capture_output(
-                &resolved.output,
-                *count,
-                format,
-                *on_exists,
-            )?;
+            crate::engine::preflight_capture_output(&resolved.output, *count, format, *on_exists)?;
         }
     }
     Ok(())
@@ -2826,6 +2821,7 @@ fn destination_command(command: &DestinationCommand) -> Result<Value> {
                     path_style: *path_style,
                     credentials,
                     keep_local: *keep_local,
+                    no_overwrite: Default::default(),
                 }),
             };
             input(saved.validate())?;
@@ -2911,6 +2907,21 @@ fn destination_command(command: &DestinationCommand) -> Result<Value> {
                     {
                         let _ = bucket;
                         anyhow::bail!("S3 destinations are unsupported in this build")
+                    }
+                }
+                Target::Ftp(_) | Target::Sftp(_) => {
+                    let remote = saved.target.remote().expect("network destination");
+                    #[cfg(feature = "uploads")]
+                    {
+                        let probe = crate::transfer::connect(&remote)?.probe()?;
+                        json!({"ok": true, "kind": remote.kind(), "probe": probe})
+                    }
+                    #[cfg(not(feature = "uploads"))]
+                    {
+                        anyhow::bail!(
+                            "{} destinations are unsupported in this build",
+                            remote.kind().to_uppercase()
+                        )
                     }
                 }
             }

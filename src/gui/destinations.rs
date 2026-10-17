@@ -15,7 +15,7 @@ use super::sparkline::History;
 use super::style::{self, Palette};
 use super::text_input::{self, text_input};
 use super::widgets::{SheetFrame, disclosure, fade, field_error, one_line, sheet_frame};
-use crate::destination::{self, Bucket, Credentials, Destination, Target};
+use crate::destination::{self, Bucket, Credentials, Destination, NoOverwrite, Target};
 use crate::volumes::{self, Volume};
 use iced::widget::{column, container, row, space, text};
 use iced::{Alignment, Element, Fill, Length, Theme};
@@ -109,7 +109,7 @@ const PROVIDERS: [(&str, &str, &str, bool); 5] = [
         true,
     ),
     (
-        "MinIO or self-hosted",
+        "MinIO, RustFS or self-hosted",
         "http://nas.local:9000",
         "us-east-1",
         true,
@@ -372,6 +372,9 @@ struct Editor {
     key_probe: Option<(String, Receiver<bool>)>,
     profile: String,
     keep_local: bool,
+    /// Kept from the saved bucket: `destination test --probe-writes` may have
+    /// switched it to check-first uploads.
+    no_overwrite: NoOverwrite,
     /// The key prefix and addressing style show.
     advanced: bool,
     /// Fields the last save or test refused, and why, in form order.
@@ -386,7 +389,13 @@ struct Editor {
     /// typed secret stored, answering whether a secret was.
     saving: Option<(Destination, Receiver<anyhow::Result<Option<SecretChange>>>)>,
     history: DraftHistory,
+    /// An FTP or SFTP destination, which this form cannot represent: it is
+    /// shown but never saved, so it cannot be replaced by a folder.
+    read_only: bool,
 }
+
+/// Where FTP and SFTP destinations are changed until the form supports them.
+const SERVER_EDIT_HINT: &str = "Edit with capturefab destination add-ftp/add-sftp";
 
 impl Editor {
     fn new_folder(name: String, folder: PathBuf) -> Self {
@@ -410,6 +419,7 @@ impl Editor {
             key_probe: None,
             profile: "default".into(),
             keep_local: false,
+            no_overwrite: NoOverwrite::IfNoneMatch,
             advanced: false,
             invalid: if folder.to_str().is_none() {
                 vec![(Field::Folder, folder_encoding_error().into())]
@@ -420,6 +430,7 @@ impl Editor {
             testing: None,
             saving: None,
             history: DraftHistory::default(),
+            read_only: false,
         }
     }
     /// A new bucket, named after the bucket until a name is typed.
@@ -441,6 +452,10 @@ impl Editor {
                     editor.invalid = vec![(Field::Folder, folder_encoding_error().into())];
                 }
             }
+            Target::Ftp(_) | Target::Sftp(_) => {
+                editor.read_only = true;
+                editor.message = Some((SERVER_EDIT_HINT.into(), true));
+            }
             Target::S3(bucket) => {
                 editor.s3 = true;
                 editor.endpoint = bucket.endpoint.clone();
@@ -449,6 +464,7 @@ impl Editor {
                 editor.prefix = bucket.prefix.clone();
                 editor.path_style = bucket.path_style;
                 editor.keep_local = bucket.keep_local;
+                editor.no_overwrite = bucket.no_overwrite;
                 editor.provider = provider_of(&bucket.endpoint);
                 editor.advanced = editor.custom_advanced();
                 match &bucket.credentials {
@@ -616,6 +632,7 @@ impl Editor {
                     Source::Environment => Credentials::Environment,
                 },
                 keep_local: self.keep_local,
+                no_overwrite: self.no_overwrite,
             })
         } else {
             Target::Folder {
@@ -633,6 +650,7 @@ impl Editor {
     }
 
     fn destination(&self) -> anyhow::Result<Destination> {
+        anyhow::ensure!(!self.read_only, "{SERVER_EDIT_HINT}");
         let destination = self.build(&[]);
         destination.validate()?;
         #[cfg(feature = "s3")]
@@ -737,7 +755,7 @@ impl Editor {
     ) -> impl FnOnce() -> anyhow::Result<Option<SecretChange>> + Send + 'static {
         let folder = match &destination.target {
             Target::Folder { path } => Some(path.clone()),
-            Target::S3(_) => None,
+            _ => None,
         };
         let destination = destination.clone();
         let secret = SecretWrite::queue(self.secret_to_store());
@@ -964,6 +982,28 @@ fn test(destination: Destination, secret: Option<String>) -> Result<String, Stri
             {
                 let _ = (bucket, secret);
                 Err("S3 support is not included in this build".into())
+            }
+        }
+        Target::Ftp(_) | Target::Sftp(_) => {
+            let remote = destination.target.remote().expect("network destination");
+            #[cfg(feature = "uploads")]
+            {
+                let location = remote.location();
+                match secret {
+                    Some(secret) => crate::transfer::connect_with_secret(&remote, secret),
+                    None => crate::transfer::connect(&remote),
+                }
+                .and_then(|mut uploader| uploader.probe())
+                .map(|_| format!("Connected to {location} and wrote a test file"))
+                .map_err(|e| format!("{e:#}"))
+            }
+            #[cfg(not(feature = "uploads"))]
+            {
+                let _ = secret;
+                Err(format!(
+                    "{} support is not included in this build",
+                    remote.kind().to_uppercase()
+                ))
             }
         }
     }
@@ -1194,7 +1234,7 @@ impl Picker {
             self.uploads = status;
             self.uploads_task = None;
         }
-        #[cfg(feature = "s3")]
+        #[cfg(feature = "uploads")]
         if self.uploads_task.is_none()
             && self
                 .uploads_at
@@ -1587,7 +1627,7 @@ impl Picker {
             }
             Message::Scrolled(scrolled) => self.scrolled = scrolled,
             Message::Retry => {
-                #[cfg(feature = "s3")]
+                #[cfg(feature = "uploads")]
                 {
                     let _ = crate::upload::retry(None);
                     self.uploads_at = None;
@@ -1595,7 +1635,10 @@ impl Picker {
             }
             Message::Edit(name) => {
                 self.removing = None;
-                if let Some(destination) = self.saved.iter().find(|d| d.name == name) {
+                // FTP and SFTP rows offer no Edit action; refuse it here too.
+                if let Some(destination) = self.saved.iter().find(|d| {
+                    d.name == name && !matches!(d.target, Target::Ftp(_) | Target::Sftp(_))
+                }) {
                     self.open_editor(Editor::edit(destination));
                 }
             }
@@ -1896,10 +1939,11 @@ impl Picker {
             label: format!(
                 "{} ({})",
                 d.name,
-                if matches!(d.target, Target::S3(_)) {
-                    "S3"
-                } else {
-                    "folder"
+                match d.target {
+                    Target::Folder { .. } => "folder",
+                    Target::S3(_) => "S3",
+                    Target::Ftp(_) => "FTP",
+                    Target::Sftp(_) => "SFTP",
                 }
             ),
         }))
@@ -2107,6 +2151,34 @@ impl Picker {
                     .push(self.upload_status(Some(&destination.name), p))
                     .into()
             }
+            Target::Ftp(_) | Target::Sftp(_) => {
+                let remote = destination.target.remote().expect("network destination");
+                let (user, keep_local) = match &destination.target {
+                    Target::Ftp(server) => (&server.user, server.keep_local),
+                    Target::Sftp(server) => (&server.user, server.keep_local),
+                    _ => unreachable!(),
+                };
+                let mut lines = column![
+                    text(format!(
+                        "{} as {user} · staged locally, then uploaded{}",
+                        remote.location(),
+                        if keep_local { " (local copy kept)" } else { "" }
+                    ))
+                    .size(style::CAPTION)
+                    .color(p.secondary)
+                ]
+                .spacing(4);
+                if remote.insecure() {
+                    lines = lines.push(
+                        text("Files and password travel unencrypted.")
+                            .size(style::CAPTION)
+                            .color(p.ink(p.warn)),
+                    );
+                }
+                lines
+                    .push(self.upload_status(Some(&destination.name), p))
+                    .into()
+            }
         }
     }
 
@@ -2163,7 +2235,7 @@ impl Picker {
         })]
         .spacing(8)
         .align_y(Alignment::Center);
-        if cfg!(feature = "s3") && failed > 0 {
+        if cfg!(feature = "uploads") && failed > 0 {
             head = head.push(
                 button(text("Retry").size(style::CAPTION))
                     .padding([2, 6])
@@ -2343,23 +2415,29 @@ impl Picker {
             } else {
                 remove
             };
-            (
+            let edit = if matches!(destination.target, Target::Ftp(_) | Target::Sftp(_)) {
+                // The form cannot represent a server yet; without a press
+                // action the button reads as a caption.
+                button(text("Edit with CLI").size(style::SMALL))
+                    .name(format!("{SERVER_EDIT_HINT} {name}"))
+                    .style(style::link)
+            } else {
                 button(text("Edit…").size(style::SMALL))
                     .name(format!("Edit destination {name}"))
                     .style(style::link)
-                    .on_press(Message::Edit(name)),
-                remove,
-            )
+                    .on_press(Message::Edit(name))
+            };
+            (edit, remove)
         };
         let description = destination.describe();
         let glow = self.saved_glow.level(destination.name.as_str(), now);
         container(
             row![
                 icon(
-                    if matches!(destination.target, Target::S3(_)) {
-                        Icon::CloudArrowUp
-                    } else {
-                        Icon::Folder
+                    match destination.target {
+                        Target::Folder { .. } => Icon::Folder,
+                        Target::S3(_) => Icon::CloudArrowUp,
+                        Target::Ftp(_) | Target::Sftp(_) => Icon::Network,
                     },
                     15.0,
                     p.accent,
@@ -2405,7 +2483,7 @@ impl Picker {
     ) -> SheetFrame<'a, Message> {
         let editable = !self.mutation_busy();
         let saving = editor.saving.is_some();
-        let can_save = editable && !editor.checking_secret();
+        let can_save = editable && !editor.checking_secret() && !editor.read_only;
         let field = |label: &'a str, control: Element<'a, Message>| -> Element<'a, Message> {
             row![
                 text(label)
@@ -2772,6 +2850,7 @@ impl Picker {
                                 access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
                             },
                             keep_local: false,
+                            no_overwrite: NoOverwrite::IfNoneMatch,
                         }),
                     ),
                 ] {

@@ -35,9 +35,11 @@ pub mod shared_memory;
 pub mod signals;
 pub mod simulation;
 pub mod storage;
+#[cfg(feature = "uploads")]
+pub mod transfer;
 pub mod transport;
 pub mod types;
-#[cfg(feature = "s3")]
+#[cfg(feature = "uploads")]
 pub mod upload;
 #[cfg(feature = "vaapi")]
 pub mod vajpeg;

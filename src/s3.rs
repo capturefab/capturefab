@@ -2,12 +2,13 @@
 //! Version 4 over a pure-Rust HTTPS stack that trusts the OS certificate
 //! store. Payloads are signed with their SHA-256, so the service rejects bytes
 //! that changed in transit, and writes are conditional (`If-None-Match: *`),
-//! so an existing object is never replaced.
+//! so an existing object is never replaced. Services that ignore conditional
+//! writes (found with `probe_conditional_writes`) use a HEAD check first.
 //!
 //! Credentials come from the OS credential store, an AWS shared-credentials
 //! profile, or the environment; secrets are never written to Capturefab files
 //! or sent over the wire.
-use crate::destination::{Bucket, Credentials};
+use crate::destination::{Bucket, Credentials, NoOverwrite};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::{
@@ -25,21 +26,7 @@ const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
 const PART_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RESPONSE: u64 = 1024 * 1024;
 
-/// An error that retrying will not fix: refused credentials, a missing
-/// bucket, or an object that already exists. Other errors are retried.
-#[derive(Debug)]
-pub struct Permanent(pub String);
-impl std::fmt::Display for Permanent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-impl std::error::Error for Permanent {}
-
-/// Whether an upload error should be retried later.
-pub fn retryable(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<Permanent>().is_none()
-}
+pub use crate::transfer::{Permanent, retryable};
 
 // ---------------------------------------------------------------------------
 // Credentials.
@@ -57,9 +44,7 @@ pub fn store_secret(access_key_id: &str, secret: &str) -> Result<()> {
     }
     .validate()?;
     validate_secret(secret)?;
-    keyring::Entry::new(KEYCHAIN_SERVICE, access_key_id)
-        .and_then(|entry| entry.set_password(secret))
-        .map_err(|e| anyhow!("cannot save the secret key in the OS credential store: {e}"))
+    crate::transfer::store_secret(KEYCHAIN_SERVICE, access_key_id, secret)
 }
 
 pub fn delete_secret(access_key_id: &str) -> Result<()> {
@@ -67,19 +52,12 @@ pub fn delete_secret(access_key_id: &str) -> Result<()> {
         access_key_id: access_key_id.into(),
     }
     .validate()?;
-    match keyring::Entry::new(KEYCHAIN_SERVICE, access_key_id)
-        .and_then(|entry| entry.inner.delete_credential())
-    {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => bail!("cannot remove the secret key from the OS credential store: {e}"),
-    }
+    crate::transfer::delete_secret(KEYCHAIN_SERVICE, access_key_id)
 }
 
 /// Whether the OS credential store holds a secret for this access key ID.
 pub fn has_secret(access_key_id: &str) -> bool {
-    keyring::Entry::new(KEYCHAIN_SERVICE, access_key_id)
-        .and_then(|entry| entry.get_password())
-        .is_ok()
+    crate::transfer::has_secret(KEYCHAIN_SERVICE, access_key_id)
 }
 
 /// Read a key for an in-memory undo transaction. Missing keys differ from a
@@ -90,13 +68,7 @@ pub(crate) fn read_secret(access_key_id: &str) -> Result<Option<String>> {
         access_key_id: access_key_id.into(),
     }
     .validate()?;
-    match keyring::Entry::new(KEYCHAIN_SERVICE, access_key_id)
-        .and_then(|entry| entry.get_password())
-    {
-        Ok(secret) => Ok(Some(secret)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => bail!("cannot read the secret key from the OS credential store: {e}"),
-    }
+    crate::transfer::read_secret(KEYCHAIN_SERVICE, access_key_id)
 }
 
 /// The `[profile]` section of an AWS shared credentials file.
@@ -561,6 +533,105 @@ impl Client {
         }
     }
 
+    /// A refused conditional write means the service does not implement
+    /// `If-None-Match` at all, rather than that the key exists.
+    fn conditional_unsupported(response: &Response) -> bool {
+        response.status == 501
+            || (response.status == 400 && error_text(&response.body).starts_with("NotImplemented"))
+    }
+
+    /// Classify a failed write; without conditional-write support, say how to
+    /// switch to check-first uploads instead of retrying forever.
+    fn write_failure(&self, what: &str, response: &Response) -> anyhow::Error {
+        if self.bucket.no_overwrite == NoOverwrite::IfNoneMatch
+            && Self::conditional_unsupported(response)
+        {
+            return Permanent(format!(
+                "{what}: the service does not support conditional writes (HTTP {}); run capturefab destination test NAME --probe-writes to switch to check-first uploads",
+                response.status
+            ))
+            .into();
+        }
+        self.failure(what, response)
+    }
+
+    /// For check-first uploads: confirm no object has this key yet.
+    fn ensure_free(&self, key: &str) -> Result<()> {
+        let empty = hex(&Sha256::digest([]));
+        let response = self.send("HEAD", key, &[], &[], &empty, None)?;
+        match response.status {
+            200 => Err(Permanent(format!(
+                "uploading: an object with this key already exists in s3://{}; it was not replaced",
+                self.bucket.bucket
+            ))
+            .into()),
+            404 => Ok(()),
+            403 => Err(Permanent(
+                "cannot confirm the key is free (HTTP 403 on HEAD); allow s3:GetObject or use a service with conditional writes".into(),
+            )
+            .into()),
+            _ => Err(self.failure("checking the key", &response)),
+        }
+    }
+
+    /// Headers that make a write conditional, when the service supports it.
+    fn condition(&self) -> Option<(&'static str, String)> {
+        (self.bucket.no_overwrite == NoOverwrite::IfNoneMatch)
+            .then(|| ("if-none-match", "*".into()))
+    }
+
+    /// Find out whether the service refuses to replace an object on
+    /// `If-None-Match: *`: write a one-byte probe twice, then delete it.
+    /// Returns the result and whether the probe object was removed.
+    pub fn probe_conditional_writes(&self) -> Result<(ConditionalWrites, bool)> {
+        let mut key = self.bucket.prefix.clone();
+        if !key.is_empty() && !key.ends_with('/') {
+            key.push('/');
+        }
+        key.push_str(&format!(".capturefab-probe-{}", crate::transfer::token()));
+        crate::destination::validate_object_key(&key)?;
+        let body = b"x";
+        let sha = hex(&Sha256::digest(body));
+        let put = || {
+            self.send(
+                "PUT",
+                &key,
+                &[],
+                &[
+                    ("content-length", "1".into()),
+                    ("if-none-match", "*".into()),
+                ],
+                &sha,
+                Some(&mut &body[..]),
+            )
+        };
+        let first = put()?;
+        let result = if Self::conditional_unsupported(&first) {
+            ConditionalWrites::Unsupported
+        } else if first.status != 200 {
+            return Err(self.failure("writing a probe object", &first));
+        } else {
+            let second = put()?;
+            match second.status {
+                412 => ConditionalWrites::Enforced,
+                200 => ConditionalWrites::Ignored,
+                _ if Self::conditional_unsupported(&second) => ConditionalWrites::Unsupported,
+                _ => {
+                    let _ = self.remove(&key);
+                    return Err(self.failure("writing a probe object", &second));
+                }
+            }
+        };
+        Ok((result, self.remove(&key)))
+    }
+
+    /// Delete an object, best effort; true when it is gone.
+    fn remove(&self, key: &str) -> bool {
+        let empty = hex(&Sha256::digest([]));
+        self.send("DELETE", key, &[], &[], &empty, None)
+            .is_ok_and(|r| matches!(r.status, 200 | 204 | 404))
+    }
+
     /// Confirm the bucket is reachable with these credentials.
     pub fn check(&self) -> Result<()> {
         let empty = hex(&Sha256::digest([]));
@@ -623,16 +694,19 @@ impl Client {
         );
         file.seek(SeekFrom::Start(0))?;
         let mut body = (&mut file).take(size);
-        let headers = [
+        let mut headers = vec![
             ("content-length", size.to_string()),
             ("content-type", content_type(path).to_string()),
-            ("if-none-match", "*".to_string()),
         ];
+        match self.condition() {
+            Some(condition) => headers.push(condition),
+            None => self.ensure_free(key)?,
+        }
         let response = self.send("PUT", key, &[], &headers, sha256, Some(&mut body))?;
         if response.status == 200 {
             Ok(())
         } else {
-            Err(self.failure("uploading", &response))
+            Err(self.write_failure("uploading", &response))
         }
     }
 
@@ -645,6 +719,9 @@ impl Client {
                 path.display()
             ))
         );
+        if self.condition().is_none() {
+            self.ensure_free(key)?;
+        }
         let empty = hex(&Sha256::digest([]));
         let response = self.send(
             "POST",
@@ -709,21 +786,26 @@ impl Client {
             }
             xml.push_str("</CompleteMultipartUpload>");
             let body_sha = hex(&Sha256::digest(xml.as_bytes()));
+            let mut headers = vec![
+                ("content-length", xml.len().to_string()),
+                ("content-type", "application/xml".into()),
+            ];
+            match self.condition() {
+                Some(condition) => headers.push(condition),
+                // Another writer may have finished the key while parts went up.
+                None => self.ensure_free(key)?,
+            }
             let response = self.send(
                 "POST",
                 key,
                 &[("uploadId", &upload_id)],
-                &[
-                    ("content-length", xml.len().to_string()),
-                    ("content-type", "application/xml".into()),
-                    ("if-none-match", "*".into()),
-                ],
+                &headers,
                 &body_sha,
                 Some(&mut xml.as_bytes()),
             )?;
             // Completion can fail inside a 200 response.
             if response.status != 200 || response.body.contains("<Error>") {
-                return Err(self.failure("completing a multipart upload", &response));
+                return Err(self.write_failure("completing a multipart upload", &response));
             }
             Ok(())
         })();
@@ -739,6 +821,48 @@ impl Client {
         }
         let _ = size;
         result
+    }
+}
+
+/// How a service treats `If-None-Match: *` on writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalWrites {
+    /// A second write to the same key is refused (412).
+    Enforced,
+    /// The header is accepted but the object is replaced.
+    Ignored,
+    /// The service rejects conditional writes (501 or NotImplemented).
+    Unsupported,
+}
+
+impl ConditionalWrites {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforced => "enforced",
+            Self::Ignored => "ignored",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+impl crate::transfer::Uploader for Client {
+    fn check(&mut self) -> Result<()> {
+        Client::check(self)
+    }
+    fn upload(&mut self, path: &Path, key: &str, sha256: &str, size: u64) -> Result<()> {
+        Client::upload(self, path, key, sha256, size)
+    }
+    fn probe(&mut self) -> Result<String> {
+        let (writes, removed) = self.probe_conditional_writes()?;
+        Ok(format!(
+            "conditional writes {}{}",
+            writes.as_str(),
+            if removed {
+                ""
+            } else {
+                "; the probe object could not be removed"
+            }
+        ))
     }
 }
 
@@ -811,6 +935,7 @@ mod tests {
             path_style: true,
             credentials: Credentials::Environment,
             keep_local: false,
+            no_overwrite: NoOverwrite::IfNoneMatch,
         };
         let client = Client::new(&bucket).unwrap();
         client.check().unwrap();
@@ -904,6 +1029,7 @@ mod tests {
             path_style: true,
             credentials: Credentials::Environment,
             keep_local: true,
+            no_overwrite: NoOverwrite::IfNoneMatch,
         };
         assert!(
             Client::new(&bucket)
@@ -930,6 +1056,7 @@ mod tests {
             path_style: true,
             credentials: Credentials::Environment,
             keep_local: true,
+            no_overwrite: NoOverwrite::IfNoneMatch,
         };
         let client = Client::with_keys(
             &bucket,
