@@ -449,8 +449,22 @@ impl Service {
                     Err(err) => error(500, format!("{err:#}")),
                 },
                 ("GET", "/api/preview") => self.preview(query),
+                ("GET" | "HEAD", "/api/signals") => match signals_query(query) {
+                    Ok(history) => {
+                        let signals = self.handle.signals();
+                        success(json!({
+                            "sources": signals.status(history),
+                            "persisting": signals.has_sink(),
+                            "dropped": signals.dropped_total(),
+                            "sink_error": signals.sink_error(),
+                        }))
+                    }
+                    Err(message) => error(400, message),
+                },
                 ("POST", "/api/command") => self.command(&request),
-                (_, "/api/analytics" | "/api/analytics.svg") => method_not_allowed("GET, HEAD"),
+                (_, "/api/analytics" | "/api/analytics.svg" | "/api/signals") => {
+                    method_not_allowed("GET, HEAD")
+                }
                 #[cfg(feature = "ai")]
                 (_, "/api/measurements" | "/api/measurements.svg") => {
                     method_not_allowed("GET, HEAD")
@@ -769,6 +783,15 @@ fn activity_query(query: &str) -> std::result::Result<(Option<u64>, Duration), S
         }
     }
     Ok((after, Duration::from_millis(timeout.unwrap_or(20_000))))
+}
+
+/// `/api/signals` accepts only an optional `history=0|1`.
+fn signals_query(query: &str) -> std::result::Result<bool, &'static str> {
+    match query {
+        "" | "history=0" => Ok(false),
+        "history=1" => Ok(true),
+        _ => Err("signals query accepts only history=0 or history=1"),
+    }
 }
 
 fn asset_path(root: &Path, encoded_path: &str) -> HttpResult<PathBuf> {
@@ -1158,6 +1181,15 @@ mod tests {
         assert!(camera_query("camera=a&camera=b").is_err());
     }
 }
+#[test]
+fn signals_query_accepts_only_history() {
+    assert_eq!(signals_query(""), Ok(false));
+    assert_eq!(signals_query("history=1"), Ok(true));
+    for query in ["history=2", "history=1&history=1", "x=1", "history"] {
+        assert!(signals_query(query).is_err(), "{query}");
+    }
+}
+
 #[test]
 fn activity_query_is_bounded_and_rejects_ambiguous_fields() {
     assert_eq!(activity_query("").unwrap().0, None);
