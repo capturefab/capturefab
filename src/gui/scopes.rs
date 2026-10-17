@@ -5,7 +5,7 @@ use super::*;
 use crate::frame::{Exposure, Sharpness};
 use iced::advanced::text::Alignment as TextAlign;
 use iced::widget::canvas::{self, Frame, Geometry, LineCap, LineDash, Path, Stroke, gradient};
-use iced::widget::{Row, column};
+use iced::widget::column;
 use iced::{Point, Rectangle, Renderer, Vector, alignment, mouse};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -51,6 +51,38 @@ pub enum Metric {
     Variance,
 }
 
+impl std::fmt::Display for Metric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// A compact pop-up control on a scope card's dark glass, faded by `shown`
+/// with its card: quiet at rest, lit like the card's buttons when hovered.
+fn glass_pick(shown: f32) -> impl Fn(&Theme, super::pick_list::Status) -> super::pick_list::Style {
+    move |_theme, status| {
+        let on = |color: Color, a: f32| Color {
+            a: color.a * a * shown,
+            ..color
+        };
+        let fill = match status {
+            super::pick_list::Status::Active => 0.06,
+            _ => 0.14,
+        };
+        super::pick_list::Style {
+            text_color: on(style::ON_STAGE, 1.0),
+            placeholder_color: on(style::ON_STAGE_SECONDARY, 1.0),
+            handle_color: on(style::ON_STAGE_SECONDARY, 1.0),
+            background: on(Color::WHITE, fill).into(),
+            border: iced::Border {
+                color: on(Color::WHITE, 0.16),
+                width: 1.0,
+                radius: style::RADIUS_SMALL.into(),
+            },
+        }
+    }
+}
+
 impl Metric {
     pub const ALL: [Metric; 4] = [
         Metric::Laplacian,
@@ -68,7 +100,7 @@ impl Metric {
         }
     }
 
-    fn hint(self) -> &'static str {
+    pub(super) fn hint(self) -> &'static str {
         match self {
             Metric::Laplacian => "Variance of the Laplacian: responds to fine edges",
             Metric::Tenengrad => "Squared Sobel gradient: steady on strong edges and in noise",
@@ -369,35 +401,25 @@ impl Workbench {
         let stage = style::STAGE;
         let share = meter.share();
         let sharp = meter.in_focus();
-        let metrics = Row::with_children(Metric::ALL.map(|metric| {
-            let selected = metric == meter.metric;
-            tip(
-                button(
-                    text(metric.label())
-                        .size(style::CAPTION)
-                        .font(if selected {
-                            style::SEMIBOLD
-                        } else {
-                            style::SANS
-                        })
-                        .width(Fill)
-                        .align_x(Alignment::Center)
-                        .wrapping(text::Wrapping::None),
-                )
-                .width(Fill)
-                .padding([3, if compact { 0 } else { 2 }])
-                .style(style::glass_segment(selected, shown))
-                .on_press(Message::FocusMetric(metric)),
-                metric.hint(),
-            )
-        }))
-        .spacing(2);
+        // One compact chooser rather than a row of four names: the measure
+        // is set once per setup, and the card stays about the score.
+        let metric = meter.metric;
+        let measure = tip(
+            super::pick_list::pick_list(&Metric::ALL[..], Some(metric), Message::FocusMetric)
+                .name("Focus measure")
+                .text_size(style::CAPTION)
+                .padding([2, 6])
+                .style(glass_pick(shown))
+                .menu_style(style::menu),
+            format!("Focus measure: {}", metric.hint()),
+        );
         let header = row![
             text("Focus")
                 .size(style::SMALL)
                 .font(style::SEMIBOLD)
                 .color(ink(stage.text)),
             space::horizontal(),
+            measure,
             tip(
                 button(icon(Icon::Reset, 12.0, ink(stage.secondary)))
                     .padding(3)
@@ -474,7 +496,7 @@ impl Workbench {
         })
         .width(Fill)
         .height(if compact { 26 } else { 40 });
-        container(column![header, metrics, reading, trace].spacing(if compact { 6 } else { 8 }))
+        container(column![header, reading, trace].spacing(if compact { 6 } else { 8 }))
             .padding(if compact { 10 } else { 12 })
             .width(Fill)
             .style(style::overlay(shown))
@@ -1220,6 +1242,119 @@ mod tests {
         assert_eq!(meter.locks(), 0, "a switch is no lock-on");
         record(&mut meter, 70.0);
         assert_eq!(meter.locks(), 0, "nor is the next frame");
+    }
+
+    #[test]
+    fn the_focus_card_chooses_its_measure_in_one_control() {
+        use iced::advanced::{Layout, layout::Limits, widget::Tree};
+        let renderer = crate::gui::destinations::layout_tests::renderer();
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        bench.focus.metric = Metric::Tenengrad;
+        let mut view = bench.focus_card(1.0, false);
+        let mut tree = Tree::new(view.as_widget());
+        let size = Size::new(WIDTH, 400.0);
+        let node =
+            view.as_widget_mut()
+                .layout(&mut tree, &renderer, &Limits::new(Size::ZERO, size));
+        let (native, _, _) = accessibility::snapshot_widget(
+            view.as_widget_mut(),
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+        );
+        let labels: Vec<_> = native
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| Some((node.role(), node.label()?.to_owned())))
+            .collect();
+        let (role, _) = labels
+            .iter()
+            .find(|(_, label)| label == "Focus measure")
+            .unwrap_or_else(|| panic!("a Focus measure control: {labels:?}"));
+        assert_ne!(*role, accessibility::Role::Button, "{labels:?}");
+        // No button per measure any more.
+        for metric in Metric::ALL {
+            assert!(
+                !labels
+                    .iter()
+                    .any(|(role, label)| *role == accessibility::Role::Button
+                        && label == metric.label()),
+                "{metric:?}: {labels:?}"
+            );
+        }
+        // Choosing Brenner from it sends the existing message.
+        let bounds = native
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Focus measure"))
+            .and_then(|(_, node)| node.bounds())
+            .unwrap();
+        let at = iced::Point::new(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        let viewport = Rectangle::with_size(Size::new(800.0, 800.0));
+        let mut messages = Vec::new();
+        let mut clipboard = iced::advanced::clipboard::Null;
+        view.as_widget_mut().update(
+            &mut tree,
+            &iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Layout::new(&node),
+            mouse::Cursor::Available(at),
+            &renderer,
+            &mut clipboard,
+            &mut iced::advanced::Shell::new(&mut messages),
+            &viewport,
+        );
+        let press = |key| {
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(key),
+                modified_key: iced::keyboard::Key::Named(key),
+                physical_key: iced::keyboard::key::Physical::Unidentified(
+                    iced::keyboard::key::NativeCode::Unidentified,
+                ),
+                location: iced::keyboard::Location::Standard,
+                modifiers: iced::keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            })
+        };
+        {
+            let mut overlay = view
+                .as_widget_mut()
+                .overlay(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &viewport,
+                    Vector::ZERO,
+                )
+                .expect("the measures pop up");
+            let popup = overlay.as_overlay_mut().layout(&renderer, viewport.size());
+            for key in [
+                iced::keyboard::key::Named::ArrowDown,
+                iced::keyboard::key::Named::Enter,
+            ] {
+                overlay.as_overlay_mut().update(
+                    &press(key),
+                    Layout::new(&popup),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard,
+                    &mut iced::advanced::Shell::new(&mut messages),
+                );
+            }
+        }
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, Message::FocusMetric(Metric::Brenner))),
+            "{messages:?}"
+        );
+        drop(view);
+        let _ = bench.update(Message::FocusMetric(Metric::Brenner));
+        assert_eq!(bench.focus.metric, Metric::Brenner);
+        assert_eq!(Metric::Brenner.to_string(), "Brenner");
     }
 
     #[test]
