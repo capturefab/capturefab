@@ -2478,3 +2478,220 @@ fn dataset_recordings_are_cataloged_on_duration_and_ctrl_c() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+fn signals_json(dir: &PathBuf, args: &[&str]) -> Value {
+    let mut all = vec!["--json"];
+    all.extend_from_slice(args);
+    json_env(dir, &[], &all)
+}
+
+#[test]
+fn signals_read_and_browse_simulator() {
+    let root = temp_root("signals-sim");
+    let dir = root.join("sessions");
+    let read = signals_json(&dir, &["signals", "read", "sim-signal://line1"]);
+    let samples = read["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 6, "{read}");
+    assert!(samples.iter().any(|s| s["tag"] == "line1/temp_c"));
+    assert!(read["id"].as_str().unwrap().starts_with("signal:"));
+    let browse = signals_json(
+        &dir,
+        &["signals", "browse", "sim-signal://line1", "--duration", "1s"],
+    );
+    assert_eq!(browse["items"].as_array().unwrap().len(), 6, "{browse}");
+    let limited = signals_json(
+        &dir,
+        &["signals", "browse", "sim-signal://line1?tags=9", "--limit", "4"],
+    );
+    assert_eq!(limited["items"].as_array().unwrap().len(), 4);
+    assert_eq!(limited["truncated"], true);
+    let doctor = signals_json(&dir, &["doctor"]);
+    for feature in ["modbus", "mqtt", "opcua", "mtconnect", "s3"] {
+        assert!(doctor["features"][feature].is_boolean(), "{feature}");
+    }
+    assert_eq!(doctor["signals"]["sim-signal"], true);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn signals_usage_errors_and_unsupported_browse() {
+    let root = temp_root("signals-usage");
+    let dir = root.join("sessions");
+    for args in [
+        &["signals", "read", "ftp://x"][..],
+        &["signals", "read", "modbus-tcp://h/1/holding/70000"],
+        &["signals", "browse", "sim-signal://a", "--duration", "61s"],
+        &["log", "sim-signal://a", "--duration", "1s"],
+        &["log", "sim-signal://a", "--csv", "out.txt"],
+    ] {
+        let out = cmd(&dir, args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+    }
+    let out = cmd(&dir, &["signals", "start", "sim-signal://a"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("needs a running session"));
+    let out = cmd(&dir, &["signals", "browse", "modbus-tcp://127.0.0.1/1/holding/0"]);
+    assert_eq!(out.status.code(), Some(5));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn signal_credentials_are_redacted() {
+    let root = temp_root("signals-redact");
+    let dir = root.join("sessions");
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let uri = format!("mqtt://user:secret@127.0.0.1:{port}/plant/#");
+    let out = cmd(&dir, &["--json", "signals", "read", &uri]);
+    assert!(matches!(out.status.code(), Some(3 | 4)), "{out:?}");
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!all.contains("secret"), "{all}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(feature = "modbus")]
+#[test]
+fn signals_read_modbus_from_loopback_fake() {
+    let root = temp_root("signals-modbus");
+    let dir = root.join("sessions");
+    let fake =
+        capturefab::signals::modbus::fake::serve(std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+    // 123.456 as f32 in cdab word order, then 1.5.
+    fake.set_registers(3, 0, &[0xE979, 0x42F6, 0x0000, 0x3FC0]);
+    let port = fake.address().port();
+    let read = signals_json(
+        &dir,
+        &[
+            "signals",
+            "read",
+            &format!("modbus-tcp://127.0.0.1:{port}/1/holding/0?count=2&type=f32&order=cdab&name=temp"),
+        ],
+    );
+    let samples = read["samples"].as_array().unwrap();
+    assert_eq!(samples[0]["tag"], "temp[0]");
+    assert!((samples[0]["value"].as_f64().unwrap() - 123.456).abs() < 1e-3);
+    assert_eq!(samples[1]["value"], 1.5);
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let out = cmd(
+        &dir,
+        &["signals", "read", &format!("modbus-tcp://127.0.0.1:{closed}/1/holding/0")],
+    );
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn signals_session_lifecycle() {
+    let root = temp_root("signals-session");
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let fixture = Fixture {
+        child: serve_at(&dir, &root, "sig"),
+        dir: root.clone(),
+    };
+    let session = ["--json", "--session", "sig"];
+    let run = |args: &[&str]| {
+        let mut all = session.to_vec();
+        all.extend_from_slice(args);
+        cmd(&dir, &all)
+    };
+    let out = run(&["signals", "start", "sim-signal://line1", "--interval", "100ms"]);
+    assert!(out.status.success(), "{out:?}");
+    let started: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = started["result"]["id"].as_str().unwrap().to_string();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let pid = loop {
+        let status: Value = serde_json::from_slice(&run(&["signals"]).stdout).unwrap();
+        let source = &status["result"]["sources"][0];
+        if source["samples"].as_u64().unwrap_or(0) >= 5 && source["state"] == "running" {
+            assert_eq!(status["result"]["persisting"], false);
+            break source["helper_pid"].as_u64().unwrap();
+        }
+        assert!(std::time::Instant::now() < deadline, "{status}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let snapshot: Value = serde_json::from_slice(&run(&["status"]).stdout).unwrap();
+    assert!(snapshot["result"]["signals"][0]["tags"].as_array().unwrap().len() <= 32);
+    assert_eq!(run(&["signals", "start", "sim-signal://line1"]).status.code(), Some(1));
+    assert_eq!(
+        run(&["signals", "stop", "signal:0000000000000000"]).status.code(),
+        Some(3)
+    );
+    let stopped: Value = serde_json::from_slice(&run(&["signals", "stop", &id]).stdout).unwrap();
+    assert_eq!(stopped["result"]["stopped"][0]["state"], "stopped");
+    let status: Value = serde_json::from_slice(&run(&["signals"]).stdout).unwrap();
+    assert!(status["result"]["sources"].as_array().unwrap().is_empty());
+    // A source still running when the session dies exits with it.
+    assert!(run(&["signals", "start", "sim-signal://line2"]).status.success());
+    let status: Value = serde_json::from_slice(&run(&["signals"]).stdout).unwrap();
+    let pid2 = status["result"]["sources"][0]["helper_pid"].as_u64().unwrap();
+    assert_ne!(pid, pid2);
+    drop(fixture);
+    #[cfg(unix)]
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while Command::new("kill")
+            .args(["-0", &pid2.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+        {
+            assert!(std::time::Instant::now() < deadline, "helper {pid2} outlived its session");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+#[test]
+fn log_simulator_to_csv_and_dataset() {
+    let root = temp_root("signals-log");
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let csv = root.join("out.csv");
+    let dataset = root.join("d.duckdb");
+    let csv_arg = csv.to_string_lossy().into_owned();
+    let dataset_arg = dataset.to_string_lossy().into_owned();
+    let log = signals_json(
+        &dir,
+        &[
+            "log",
+            "sim-signal://line1",
+            "--interval",
+            "100ms",
+            "--duration",
+            "1s",
+            "--csv",
+            &csv_arg,
+            "--dataset",
+            &dataset_arg,
+        ],
+    );
+    let written = log["written"].as_u64().unwrap();
+    assert!(written >= 30, "{log}");
+    assert_eq!(log["sources"][0]["state"], "stopped");
+    let text = std::fs::read_to_string(&csv).unwrap();
+    assert!(text.starts_with("ts_ms,source_ts_ms,source_id,tag,value,quality\n"));
+    assert_eq!(text.lines().count() as u64, written + 1);
+    let rows = signals_json(
+        &dir,
+        &["dataset", "query", "--file", &dataset_arg, "SELECT count(*) FROM samples"],
+    );
+    assert_eq!(rows["rows"][0][0].as_u64(), Some(written));
+    let out = cmd(
+        &dir,
+        &["log", "sim-signal://line1", "--duration", "1s", "--csv", &csv_arg],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(std::fs::read_to_string(&csv).unwrap(), text);
+    let _ = std::fs::remove_dir_all(root);
+}
