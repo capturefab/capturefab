@@ -50,9 +50,32 @@ fn short(count: u64) -> String {
     }
 }
 
-fn summary(status: Option<&DatasetStatus>) -> String {
+/// Whether the automatic dataset is waiting for the first save, or why it
+/// could not be opened.
+#[derive(Debug, Clone, PartialEq)]
+enum Auto {
+    Off,
+    Armed,
+    Failed(String),
+}
+impl Auto {
+    fn of(handle: &SessionHandle) -> Self {
+        let slot = handle.dataset();
+        match (slot.auto_path(), slot.auto_error()) {
+            (_, Some(error)) => Auto::Failed(error),
+            (Some(_), None) => Auto::Armed,
+            (None, None) => Auto::Off,
+        }
+    }
+}
+
+fn summary(status: Option<&DatasetStatus>, auto: &Auto) -> String {
     match status {
-        None => "Not cataloging captures".into(),
+        None => match auto {
+            Auto::Off => "Not cataloging captures".into(),
+            Auto::Armed => "Automatic · created on the first save".into(),
+            Auto::Failed(_) => "Automatic dataset unavailable".into(),
+        },
         Some(s) => {
             let mut parts = vec![
                 file_name(&s.path),
@@ -67,15 +90,32 @@ fn summary(status: Option<&DatasetStatus>) -> String {
 }
 
 /// Start or stop cataloging into the automatic dataset, for captures and
-/// signal samples alike, while no dataset is open.
+/// signal samples alike, while no dataset is open. The signal sink waits for
+/// the hub's writer (which may be writing or checkpointing), so it is
+/// swapped on a background thread, never on the GUI's update thread.
 fn auto_catalog(handle: &SessionHandle, on: bool) {
-    let slot = handle.dataset();
-    slot.set_auto_path(on.then(auto_path));
-    let sink: Option<Arc<dyn crate::signals::SampleSink>> = on.then(|| slot.clone() as _);
-    if on != handle.signals().has_sink()
-        && let Err(error) = handle.signals().set_sink(sink, Duration::from_secs(10))
+    static SWAP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    handle.dataset().set_auto_path(on.then(auto_path));
+    let handle = handle.clone();
+    let swap = move || {
+        let _turn = SWAP.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = handle.dataset();
+        // Act on the latest choice, however toggles were ordered.
+        let on = slot.auto_path().is_some() && slot.status_cached().is_none();
+        let sink: Option<Arc<dyn crate::signals::SampleSink>> = on.then(|| slot.clone() as _);
+        if on != handle.signals().has_sink()
+            && (on || slot.status_cached().is_none())
+            && let Err(error) = handle.signals().set_sink(sink, Duration::from_secs(10))
+        {
+            eprintln!("capturefab: signal samples will not reach the automatic dataset: {error:#}");
+        }
+    };
+    if std::thread::Builder::new()
+        .name("capturefab-dataset-auto".into())
+        .spawn(swap)
+        .is_err()
     {
-        eprintln!("capturefab: signal samples will not reach the automatic dataset: {error:#}");
+        eprintln!("capturefab: could not start the automatic dataset");
     }
 }
 
@@ -254,8 +294,17 @@ impl Workbench {
             }
             Msg::Auto(on) => {
                 self.dataset.auto = on;
-                if self.handle.dataset().status_cached().is_none() {
+                let open = self.handle.dataset().status_cached();
+                if open.is_none() {
                     auto_catalog(&self.handle, on);
+                } else if !on
+                    && open.is_some_and(|s| Path::new(&s.path) == auto_path())
+                    && self.dataset.path.is_none()
+                {
+                    // Unticking stops cataloging into the automatic dataset
+                    // it opened, rather than leaving it open and recording.
+                    self.dataset.error = None;
+                    self.send(Job::DatasetClose, SessionCommand::DatasetClose);
                 }
             }
         }
@@ -276,6 +325,11 @@ impl Workbench {
             (Job::DatasetClose, Ok(_)) => {
                 self.dataset.path = None;
                 self.dataset.error = None;
+                // Closing clears the automatic dataset; while the box stays
+                // ticked, arm it again so the checkbox tells the truth.
+                if self.dataset.auto {
+                    auto_catalog(&self.handle, true);
+                }
             }
             (Job::DatasetExport, Ok(result)) => {
                 if let Some(output) = result["output"].as_str() {
@@ -284,6 +338,13 @@ impl Workbench {
             }
             (Job::DatasetOpen | Job::DatasetClose | Job::DatasetExport, Err(error)) => {
                 self.dataset.error = Some(format!("{error:#}"));
+                // A failed open cleared the automatic dataset; re-arm it.
+                if matches!(pending.job, Job::DatasetOpen)
+                    && self.dataset.auto
+                    && self.handle.dataset().status_cached().is_none()
+                {
+                    auto_catalog(&self.handle, true);
+                }
             }
             _ => {}
         }
@@ -297,9 +358,10 @@ pub(super) fn view<'a>(
     p: &'static Palette,
 ) -> Option<Element<'a, Message>> {
     let status = bench.snapshot.dataset.as_ref();
+    let auto = Auto::of(&bench.handle);
     let mut section = column![widgets::disclosure(
         "Dataset",
-        Some(summary(status)),
+        Some(summary(status, &auto)),
         if open { 1.0 } else { 0.0 },
         Message::InspectorDisclosure(inspector::Section::Dataset),
         p,
@@ -400,15 +462,29 @@ pub(super) fn view<'a>(
         bench.dataset.auto,
         |on| Message::Dataset(Msg::Auto(on)),
     ));
-    if status.is_none() && bench.handle.dataset().auto_path().is_some() {
-        section = section.push(
-            text(format!(
-                "Creates {} on the first save.",
-                auto_path().display()
-            ))
-            .size(style::CAPTION)
-            .color(p.secondary),
-        );
+    match (status, &auto) {
+        (None, Auto::Armed) => {
+            section = section.push(
+                text(format!(
+                    "Creates {} on the first save.",
+                    auto_path().display()
+                ))
+                .size(style::CAPTION)
+                .color(p.secondary),
+            );
+        }
+        (None, Auto::Failed(error)) if bench.dataset.auto => {
+            section = section.push(
+                text(format!(
+                    "Captures are not being cataloged: {} could not be opened ({error}). \
+                     Untick and tick the box to retry, or choose New… or Open….",
+                    auto_path().display()
+                ))
+                .size(style::CAPTION)
+                .color(p.ink(p.danger)),
+            );
+        }
+        _ => {}
     }
     if let Some(error) = &bench.dataset.error {
         section = section.push(
@@ -426,7 +502,15 @@ mod tests {
 
     #[test]
     fn summary_reads_short() {
-        assert_eq!(summary(None), "Not cataloging captures");
+        assert_eq!(summary(None, &Auto::Off), "Not cataloging captures");
+        assert_eq!(
+            summary(None, &Auto::Armed),
+            "Automatic · created on the first save"
+        );
+        assert_eq!(
+            summary(None, &Auto::Failed("locked".into())),
+            "Automatic dataset unavailable"
+        );
         let status = DatasetStatus {
             path: "/d/plant.duckdb".into(),
             captures: 120,
@@ -434,7 +518,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            summary(Some(&status)),
+            summary(Some(&status), &Auto::Armed),
             "plant.duckdb · 120 captures · 86k samples"
         );
         assert_eq!(short(1_500_000), "1.5M");

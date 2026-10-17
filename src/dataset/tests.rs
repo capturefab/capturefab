@@ -215,6 +215,25 @@ fn auto_path_opens_lazily_on_first_saved_file() {
         .unwrap();
     assert_eq!(slot.status_cached().unwrap().samples, 1);
     slot.close().unwrap();
+    // Without a dataset, samples are refused (counted as dropped), not
+    // reported as written.
+    slot.set_auto_path(None);
+    let error = slot
+        .write("signal:0001", &[sample(2, "t", Signal::Number(1.0))])
+        .unwrap_err();
+    assert!(error.to_string().contains("no dataset is open"), "{error}");
+    // An automatic dataset that cannot be opened says why, and keeps saying
+    // so until it is armed again.
+    fs::write(dir.join("file"), b"x").unwrap();
+    slot.set_auto_path(Some(dir.join("file").join("capturefab.duckdb")));
+    slot.record_saved(batch(vec![capture("/x/b.png", 6)]), 0);
+    assert!(slot.auto_error().is_some());
+    let error = slot
+        .write("signal:0001", &[sample(3, "t", Signal::Number(1.0))])
+        .unwrap_err();
+    assert!(error.to_string().contains("automatic dataset"), "{error}");
+    slot.set_auto_path(None);
+    assert!(slot.auto_error().is_none());
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -375,9 +394,11 @@ fn samples_signals_notes_and_asof_view() {
         .unwrap();
     assert_eq!(signal["rows"][0], json!([100, 300, "sim-signal", "number"]));
     drop((reader, dataset));
+    // With nothing open the samples are refused, so the hub counts them as
+    // dropped rather than written.
     assert!(
         slot.write("x", &[sample(1, "t", Signal::Number(1.0))])
-            .is_ok()
+            .is_err()
     );
     let _ = fs::remove_dir_all(dir);
 }

@@ -23,9 +23,20 @@ pub fn run(slot: &Arc<Slot>, signals: &SignalHub, command: SessionCommand) -> Re
             max_bytes,
         } => {
             let path = absolute(&path, "dataset path")?;
+            let _lifecycle = slot.lifecycle();
             // An explicit dataset replaces the GUI's automatic one.
             slot.set_auto_path(None);
-            let status = slot.open(&path, mode, max_bytes)?;
+            let status = match slot.open(&path, mode, max_bytes) {
+                Ok(status) => status,
+                Err(error) => {
+                    // Nothing to write to: detach the automatic dataset's
+                    // sink so samples are not counted as stored.
+                    if slot.status_cached().is_none() && signals.has_sink() {
+                        let _ = signals.set_sink(None, SINK_TIMEOUT);
+                    }
+                    return Err(error);
+                }
+            };
             // Never hold a slot lock here: the hub's writer thread takes it.
             if !signals.has_sink() {
                 let sink: Arc<dyn crate::signals::SampleSink> = slot.clone();
@@ -36,6 +47,7 @@ pub fn run(slot: &Arc<Slot>, signals: &SignalHub, command: SessionCommand) -> Re
             Ok(serde_json::to_value(status)?)
         }
         SessionCommand::DatasetClose => {
+            let _lifecycle = slot.lifecycle();
             slot.set_auto_path(None);
             if signals.has_sink() {
                 signals.set_sink(None, SINK_TIMEOUT)?;

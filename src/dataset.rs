@@ -237,6 +237,10 @@ pub struct Slot {
     readers: Arc<query::Readers>,
     recent: Mutex<VecDeque<SavedFile>>,
     auto_path: Mutex<Option<PathBuf>>,
+    /// Why the automatic dataset could not be opened, until it is re-armed.
+    auto_error: Mutex<Option<String>>,
+    /// Serializes open and close, which check and change the signal sink.
+    lifecycle: Mutex<()>,
 }
 
 /// Saved files the slot remembers for "Reveal last save".
@@ -321,9 +325,10 @@ impl Slot {
             match Dataset::open(&path, OpenMode::Auto, None) {
                 Ok(dataset) => *writer = Some(dataset),
                 Err(e) => {
-                    // Stop retrying on every poll; the GUI shows nothing open.
+                    // Stop retrying on every poll; the GUI shows the reason.
                     eprintln!("capturefab: automatic dataset {}: {e:#}", path.display());
                     *lock(&self.auto_path) = None;
+                    *lock(&self.auto_error) = Some(format!("{e:#}"));
                     return None;
                 }
             }
@@ -382,6 +387,16 @@ impl Slot {
     /// Where the GUI's automatic dataset is created on the first saved file.
     pub fn set_auto_path(&self, path: Option<PathBuf>) {
         *lock(&self.auto_path) = path;
+        *lock(&self.auto_error) = None;
+    }
+    /// Why the automatic dataset could not be opened, if it failed.
+    pub fn auto_error(&self) -> Option<String> {
+        lock(&self.auto_error).clone()
+    }
+    /// Held while a session opens or closes the dataset and swaps the
+    /// signal sink, so the two cannot interleave.
+    pub fn lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
+        lock(&self.lifecycle)
     }
     pub fn auto_path(&self) -> Option<PathBuf> {
         lock(&self.auto_path).clone()
@@ -442,7 +457,14 @@ impl crate::signals::SampleSink for Slot {
             }
             written.map(drop)
         })
-        .unwrap_or(Ok(()))
+        .unwrap_or_else(|| {
+            // Count the samples as dropped rather than written.
+            match self.auto_error() {
+                Some(error) => bail!("the automatic dataset could not be opened: {error}"),
+                None if batch.is_empty() => Ok(()),
+                None => bail!("no dataset is open; samples were not stored"),
+            }
+        })
     }
     fn event(&self, kind: &str, source_id: &str, text: &str) -> Result<()> {
         self.record_event(kind, None, Some(source_id), text, &Context::new())
