@@ -127,10 +127,40 @@ impl Workbench {
             rule::horizontal(1).style(style::line),
             discovery,
             rule::horizontal(1).style(style::line),
-            self.api_credentials_content(p),
+            self.api_keys_section(p),
         ]
         .spacing(20)
         .into()
+    }
+
+    /// The API keys, folded by default: most people never need them, and
+    /// the fold says what is set. Shown open, without remembering it, while
+    /// it has an error to show.
+    fn api_keys_section(&self, p: &'static Palette) -> Element<'_, Message> {
+        let state = &self.video_analytics;
+        let open = state.keys_section_open();
+        let mut section = column![disclosure(
+            "AI provider API keys",
+            (!open).then(|| state.keys_summary()),
+            self.sheets.keys_turn.get(self.now),
+            Message::VideoAnalytics(video_analytics::Input::Keys(!open)),
+            p,
+        )]
+        .spacing(9);
+        if open {
+            section = section.push(self.api_credentials_content(p));
+        }
+        section.into()
+    }
+
+    /// The line under Settings: what applies at once, and while the keys
+    /// show, what does not.
+    fn settings_footer_text(&self) -> &'static str {
+        if self.video_analytics.keys_section_open() {
+            "Preferences apply automatically. API keys require Save key."
+        } else {
+            "Preferences apply automatically."
+        }
     }
 
     pub(super) fn settings_window(&self, p: &'static Palette) -> Element<'_, Message> {
@@ -139,7 +169,7 @@ impl Workbench {
                 scrollable(self.settings_content(p))
                     .height(Fill)
                     .style(style::scroll),
-                text("Preferences apply automatically. API keys require Save key.")
+                text(self.settings_footer_text())
                     .size(style::SMALL)
                     .color(p.secondary),
             ]
@@ -164,7 +194,7 @@ impl Workbench {
         // There is one action: changes already apply. Keep it at the trailing
         // edge on each desktop platform, with no misleading Save/Cancel pair.
         let footer = row![
-            text("Preferences apply automatically. API keys require Save key.")
+            text(self.settings_footer_text())
                 .size(style::SMALL)
                 .color(p.secondary)
                 .width(Fill),
@@ -187,6 +217,46 @@ impl Workbench {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_footer_mentions_saving_keys_only_while_they_show() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        assert_eq!(
+            bench.settings_footer_text(),
+            "Preferences apply automatically."
+        );
+        bench.video_analytics_input(video_analytics::Input::Keys(true));
+        assert_eq!(
+            bench.settings_footer_text(),
+            "Preferences apply automatically. API keys require Save key."
+        );
+        // Both presentations build either way.
+        for open in [true, false] {
+            bench.video_analytics_input(video_analytics::Input::Keys(open));
+            let _ = bench.settings_window(Palette::of(false));
+            let _ = bench.settings_sheet(Palette::of(true), 600.0);
+        }
+    }
+
+    #[test]
+    fn the_keys_chevron_rests_where_it_was_left_at_launch() {
+        let _motion = motion::test_reduce_motion(false);
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        bench.video_analytics.preferences.keys_open = true;
+        bench.sync_animations();
+        assert_eq!(
+            bench.sheets.keys_turn.get(bench.now),
+            1.0,
+            "no turn on launch"
+        );
+        bench.settings_open = true;
+        bench.video_analytics_input(video_analytics::Input::Keys(false));
+        bench.sync_animations();
+        assert!(
+            bench.sheets.keys_turn.animating(bench.now),
+            "turns while shown"
+        );
+    }
 
     #[test]
     fn preference_window_uses_native_chrome_and_app_owned_close() {
