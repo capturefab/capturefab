@@ -229,6 +229,13 @@ pub(crate) fn explain(error: duckdb::Error, path: &Path, op: &str) -> anyhow::Er
             text.replace("not found", "missing")
         ))
         .into()
+    } else if op == "query" && text.starts_with("Permission Error") {
+        // The sandbox refused a file or network read. DuckDB says
+        // "disabled", which `cli::error_code` would read as unsupported.
+        super::Usage(
+            "dataset query is invalid: it may read only the dataset's own tables and views, not files or other databases".into(),
+        )
+        .into()
     } else if text.contains("Out of Memory") {
         anyhow!("dataset {op} ran out of memory; narrow --since/--until or --tables")
     } else {

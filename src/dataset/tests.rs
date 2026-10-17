@@ -264,16 +264,18 @@ fn check_reader(dir: &std::path::Path, reader: &Reader) {
         .err()
         .unwrap();
     assert!(error.is::<Usage>(), "{error}");
-    assert_eq!(crate::cli::error_code(&error).1, 1, "{error}");
+    assert_eq!(crate::cli::error_code(&error).1, 2, "{error}");
     let outside = dir.join("outside.csv");
-    let error = reader
-        .query(
-            &format!("SELECT * FROM read_csv('{}')", outside.display()),
-            10,
-            0,
-        )
-        .err();
-    assert!(error.is_some() && !outside.exists());
+    fs::write(&outside, "a\n1\n").unwrap();
+    for sql in [
+        format!("SELECT * FROM read_csv('{}')", outside.display()),
+        "SELECT * FROM read_text('/etc/hosts')".into(),
+    ] {
+        // A sandbox refusal is the caller's mistake, not a missing feature.
+        let error = reader.query(&sql, 10, 0).err().unwrap();
+        assert_eq!(crate::cli::error_code(&error), ("usage", 2), "{error:#}");
+    }
+    fs::remove_file(&outside).unwrap();
     let result = reader
         .query(
             "SELECT range AS n, 9007199254740993::UBIGINT AS big FROM range(5)",

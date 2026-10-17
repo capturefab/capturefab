@@ -327,7 +327,15 @@ fn serve_client(
     })();
     let response = match result {
         Ok(v) => json!({"version":VERSION,"ok":true,"result":v}),
-        Err(e) => json!({"version":VERSION,"ok":false,"error":{"message":format!("{e:#}")}}),
+        Err(e) => {
+            let mut error = json!({"message":format!("{e:#}")});
+            // A request the caller must change keeps exit code 2 across the
+            // connection; its text alone may not say so.
+            if e.chain().any(|cause| cause.is::<crate::dataset::Usage>()) {
+                error["code"] = json!("usage");
+            }
+            json!({"version":VERSION,"ok":false,"error":error})
+        }
     };
     serde_json::to_writer(&mut stream, &response)?;
     stream.write_all(b"\n")?;
@@ -604,13 +612,16 @@ fn send_request_as(
         response["version"] == VERSION,
         "session protocol version mismatch"
     );
-    ensure!(
-        response["ok"] == true,
-        "{}",
-        response["error"]["message"]
+    if response["ok"] != true {
+        let message = response["error"]["message"]
             .as_str()
             .unwrap_or("session request failed")
-    );
+            .to_owned();
+        if response["error"]["code"] == "usage" {
+            return Err(crate::dataset::Usage(message).into());
+        }
+        anyhow::bail!("{message}");
+    }
     response
         .get("result")
         .cloned()

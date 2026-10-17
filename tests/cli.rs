@@ -2276,6 +2276,14 @@ fn dataset_records_schedule_and_session_notes_and_locks_the_file() {
         rows,
         serde_json::json!([["schedule", 3, 3, r#"{"line":"L1"}"#]])
     );
+    // Bad SQL is a usage error through a session too, not only with --file.
+    for sql in ["SELEC 1", "DELETE FROM captures", "SELECT * FROM nope"] {
+        let out = cmd(
+            &dir,
+            &["--json", "--session", "ds", "dataset", "query", sql],
+        );
+        assert_eq!(out.status.code(), Some(2), "{sql}");
+    }
     // The session holds the file: a direct read is refused and points to it.
     let out = cmd(
         &dir,

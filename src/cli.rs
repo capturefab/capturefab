@@ -3683,7 +3683,10 @@ fn uploads_command(command: Option<&UploadsCommand>) -> Result<Value> {
 }
 
 pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
-    if error.chain().any(|cause| cause.is::<InvalidInput>()) {
+    if error
+        .chain()
+        .any(|cause| cause.is::<InvalidInput>() || cause.is::<crate::dataset::Usage>())
+    {
         return ("usage", 2);
     }
     let s = format!("{error:#}").to_ascii_lowercase();
