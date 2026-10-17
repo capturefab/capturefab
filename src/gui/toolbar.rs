@@ -36,23 +36,44 @@ const NOTICE_DETAILS: f32 = 52.0 + 4.0;
 /// Room a notice's dismiss button and the gap before it take.
 const NOTICE_DISMISS: f32 = 21.0 + 2.0;
 
-/// The capture root as the toolbar shows it: the home folder folded to `~`,
-/// the way `Workbench::output_preview` folds it.
-fn shown_root() -> String {
-    let root = prefs::capture_root();
-    match root.parent().zip(root.file_name()) {
-        Some((home, name)) if !home.as_os_str().is_empty() => {
-            format!("~{}{}", std::path::MAIN_SEPARATOR, name.to_string_lossy())
-        }
-        _ => root.to_string_lossy().into_owned(),
+/// The folder a relative output name is written under: the process's
+/// working directory, which the worker inherits (nothing resolves a
+/// relative name against the capture root), with the home folder folded to
+/// `~` the way `Workbench::output_preview` folds it.
+fn shown_base() -> String {
+    let Ok(cwd) = std::env::current_dir() else {
+        return "the current folder".into();
+    };
+    fold_home(&cwd, prefs::capture_root().parent())
+}
+
+/// `path` with a leading `home` folded to `~`.
+fn fold_home(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    match home
+        .filter(|home| !home.as_os_str().is_empty())
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        None => path.display().to_string(),
     }
+}
+
+/// Whether a previewed output name is relative, so it lands under the
+/// working directory rather than where it reads.
+fn is_relative(preview: &str) -> bool {
+    let bytes = preview.as_bytes();
+    !(preview.starts_with(['~', '/', '\\'])
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'))
 }
 
 /// Where the next capture goes, in a few plain words, for the toolbar: the
 /// destination's name and the first folder of the file it writes, else
-/// the folder of `preview` (a path with home folded to `~`), else `root`
-/// for a bare file name. The full next file name is in its tooltip.
-fn save_summary(preview: &str, destination: Option<&str>, root: &str) -> String {
+/// the folder of `preview` (a path with home folded to `~`). A relative
+/// name is written under the working directory, so it reads as under
+/// `base`, never under a folder it does not go to. The full next file name
+/// is in its tooltip.
+fn save_summary(preview: &str, destination: Option<&str>, base: &str) -> String {
     let separators = ['/', '\\'];
     let parent = preview
         .rfind(separators)
@@ -67,7 +88,15 @@ fn save_summary(preview: &str, destination: Option<&str>, root: &str) -> String 
                 None => format!("Saves to {name}"),
             }
         }
-        None => format!("Saves to {}", parent.unwrap_or(root)),
+        None if is_relative(preview) => match parent {
+            Some(parent) => format!(
+                "Saves to {}{}{parent}",
+                base.trim_end_matches(separators),
+                std::path::MAIN_SEPARATOR
+            ),
+            None => format!("Saves to {base}"),
+        },
+        None => format!("Saves to {}", parent.unwrap_or(base)),
     }
 }
 
@@ -79,7 +108,8 @@ fn transport_inline(stats: &TransportStats) -> bool {
 }
 
 /// The overview Capture button's label: what it captures from, by the
-/// outlined camera's model, or what tells it from a twin of the same model.
+/// selected camera's model, or by its plain serial when a twin shares the
+/// model. "S/N" stays in the accessible name and tooltip.
 fn overview_capture_label(
     cameras: &[crate::session::CameraSnapshot],
     connected: Option<&CameraInfo>,
@@ -88,8 +118,30 @@ fn overview_capture_label(
     let Some(camera) = connected else {
         return "Capture selected".into();
     };
-    let short = twin_identity(cameras, camera).unwrap_or_else(|| camera.model.clone());
+    let short = match twin_identity(cameras, camera) {
+        Some(_) if !camera.serial.trim().is_empty() => camera.serial.trim().to_owned(),
+        Some(identity) => identity,
+        None => camera.model.clone(),
+    };
     format!("{} {short}", if scanner { "Scan" } else { "Capture" })
+}
+
+/// The overview Capture label's fixed slot: as wide as the widest label any
+/// connected camera, or saving, would give it, so selecting another tile
+/// never resizes the button or moves the folder beside it.
+fn overview_capture_slot(cameras: &[crate::session::CameraSnapshot]) -> f32 {
+    let size = style::BODY;
+    let mut widest = ["Capture selected", "Saving…", "Scanning…", "Saved"]
+        .iter()
+        .map(|label| titlebar::rough(label, size))
+        .fold(0.0, f32::max);
+    for camera in cameras {
+        for scanner in [false, true] {
+            let label = overview_capture_label(cameras, Some(&camera.info), scanner);
+            widest = widest.max(titlebar::rough(&label, size));
+        }
+    }
+    widest.min(CAPTURE_ROOM + CAPTURE_NAME_ROOM)
 }
 
 /// `style` with its text and fill faded by `alpha`, for controls that come
@@ -123,7 +175,7 @@ impl Workbench {
                 row![
                     icon(Icon::Folder, 14.0, p.secondary),
                     one_line(
-                        save_summary(&preview, self.capture_to.selected.as_deref(), &shown_root()),
+                        save_summary(&preview, self.capture_to.selected.as_deref(), &shown_base()),
                         style::SMALL,
                         style::SANS,
                         p.secondary,
@@ -338,7 +390,7 @@ impl Workbench {
         // This user's pending capture is per camera. Other participants can
         // keep capturing while this button queues the user's own request.
         let saved = !capturing && self.just_saved(self.snapshot.active_camera.as_deref());
-        // In the overview, an idle button names the outlined camera.
+        // In the overview, an idle button names the selected camera.
         let outlined = self
             .snapshot
             .connected
@@ -393,6 +445,11 @@ impl Workbench {
                             },
                         )
                     )
+                    .width(if self.overview() {
+                        Length::Fixed(overview_capture_slot(&self.snapshot.cameras))
+                    } else {
+                        Length::Shrink
+                    })
                     .max_width(CAPTURE_ROOM + CAPTURE_NAME_ROOM)
                 ]
                 .spacing(7)
@@ -420,7 +477,7 @@ impl Workbench {
                 problem.to_string()
             } else if outlined.is_some() {
                 Action::Capture.hint(
-                    "Save from the outlined camera using the settings in Capture",
+                    "Save from the selected camera using the settings in Capture",
                     os,
                 )
             } else {
@@ -1101,7 +1158,7 @@ mod tests {
 
     #[test]
     fn the_save_summary_says_where_in_plain_words() {
-        let root = "~/Capturefab";
+        let root = "~/work";
         // The default: a dated folder under the capture root, home folded.
         assert_eq!(
             save_summary("~/Capturefab/2026-10-17/cam-####.png", None, root),
@@ -1111,10 +1168,13 @@ mod tests {
             save_summary("/mnt/data/runs/cam-####.png", None, root),
             "Saves to /mnt/data/runs"
         );
-        // A bare file name goes to the capture root.
+        // A relative name goes under the working directory, not the
+        // capture root.
+        assert_eq!(save_summary("cam-####.png", None, root), "Saves to ~/work");
+        let sep = std::path::MAIN_SEPARATOR;
         assert_eq!(
-            save_summary("cam-####.png", None, root),
-            "Saves to ~/Capturefab"
+            save_summary("runs/cam-####.png", None, root),
+            format!("Saves to ~/work{sep}runs")
         );
         // A named destination, with the first folder of its relative name.
         assert_eq!(
@@ -1127,11 +1187,7 @@ mod tests {
         );
         // Windows separators.
         assert_eq!(
-            save_summary(
-                r"~\Capturefab\2026-10-17\cam-####.png",
-                None,
-                r"~\Capturefab"
-            ),
+            save_summary(r"~\Capturefab\2026-10-17\cam-####.png", None, r"~\work"),
             r"Saves to ~\Capturefab\2026-10-17"
         );
         assert_eq!(
@@ -1147,16 +1203,20 @@ mod tests {
     }
 
     #[test]
-    fn the_capture_root_is_shown_with_home_folded() {
-        let root = shown_root();
-        let real = prefs::capture_root();
-        if real
-            .parent()
-            .is_some_and(|home| !home.as_os_str().is_empty())
-        {
-            assert_eq!(root, format!("~{}Capturefab", std::path::MAIN_SEPARATOR));
-        } else {
-            assert_eq!(root, "Capturefab");
+    fn the_working_folder_is_shown_with_home_folded() {
+        use std::path::Path;
+        let home = Path::new("/Users/me");
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(fold_home(Path::new("/Users/me"), Some(home)), "~");
+        assert_eq!(
+            fold_home(&home.join("work"), Some(home)),
+            format!("~{sep}work")
+        );
+        assert_eq!(fold_home(Path::new("/srv/x"), Some(home)), "/srv/x");
+        assert_eq!(fold_home(Path::new("/srv/x"), None), "/srv/x");
+        assert!(is_relative("cam.png") && is_relative("runs/cam.png"));
+        for absolute in ["~/a.png", "/a.png", r"\\nas\a.png", r"C:\a.png", "c:/a.png"] {
+            assert!(!is_relative(absolute), "{absolute}");
         }
     }
 
@@ -1200,12 +1260,18 @@ mod tests {
         let cameras = vec![first.clone(), twin.clone()];
         assert_eq!(
             overview_capture_label(&cameras, Some(&twin.info), false),
-            "Capture S/N SIM1"
+            "Capture SIM1"
         );
         assert_eq!(
             overview_capture_label(&cameras, Some(&twin.info), true),
-            "Scan S/N SIM1"
+            "Scan SIM1"
         );
+        // One slot for whichever camera is selected, wide enough for each.
+        let slot = overview_capture_slot(&cameras);
+        for camera in &cameras {
+            let label = overview_capture_label(&cameras, Some(&camera.info), false);
+            assert!(titlebar::rough(&label, style::BODY) <= slot, "{label}");
+        }
         // Distinct models carry the model.
         let mut other = twin.clone();
         other.info.model = "Line camera".into();

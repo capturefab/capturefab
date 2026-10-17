@@ -96,13 +96,13 @@ fn responsive_toolbar_keeps_capture_and_session_actions_visible_and_clickable() 
                         "{label} clips at native width {native_width}, {scale}, overview={overview}: {bounds:?}, viewport={viewport:?}",
                     );
                 }
-                // The overview names the outlined camera: a twin here, so
-                // by what tells it apart.
+                // The overview names the selected camera: a twin here, so
+                // by its plain serial.
                 let connected = app.snapshot.connected.clone().unwrap();
                 let (capture, capture_text) = if overview {
                     (
                         format!("Capture from {} {}", connected.model, identity(&connected)),
-                        format!("Capture {}", identity(&connected)),
+                        format!("Capture {}", connected.serial),
                     )
                 } else {
                     ("Capture".to_owned(), "Capture".to_owned())
