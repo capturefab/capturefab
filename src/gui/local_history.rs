@@ -239,6 +239,7 @@ pub(super) fn gesture(message: &Message) -> Option<(String, Option<String>)> {
         ) => ("Choose recording destination".into(), None),
         Message::Format(_) => ("Change capture format".into(), None),
         Message::Codec(_) => ("Change video codec".into(), None),
+        Message::ForwardMode(_) => ("Change video output".into(), None),
         Message::ScheduleEnabled(_) => ("Change scheduling".into(), None),
         Message::RetentionEnabled(_) => ("Change retention".into(), None),
         Message::OnFull(_) => ("Change storage limit action".into(), None),

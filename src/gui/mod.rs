@@ -692,6 +692,8 @@ enum Message {
     ShowTab(Tab),
     Search(String),
     InspectorDisclosure(inspector::Section),
+    /// Open every feature group, or close them all.
+    ExpandFeatureGroups(bool),
     RefreshFeatures,
     Auto(bool),
     Balance(f64),
@@ -716,6 +718,8 @@ enum Message {
     Bitrate(String),
     StartForward,
     StopForward,
+    /// Switch the Video tab to streaming to a URL, or back to recording.
+    ForwardMode(bool),
     CapturePicker(destinations::Message),
     AutoCapture(autocapture::Input),
     RecordPicker(destinations::Message),
@@ -907,6 +911,16 @@ struct Workbench {
     inspector_open: bool,
     /// Whether the inspector floats over the stage in a narrow window.
     inspector_peek: bool,
+    /// The inspector was asked for before the first camera, which otherwise
+    /// keeps it out of the way; for this run only.
+    inspector_summoned: bool,
+    /// What the Video tab held on the side it last left, in memory only:
+    /// the recording template and its destination, and the stream URL.
+    stashed_record: Option<(String, Option<String>)>,
+    stashed_stream: String,
+    /// The Video tab was switched to streaming and its URL is not one yet:
+    /// empty, or a scheme being typed. Every other output tells its own mode.
+    stream_draft: bool,
     /// Only the image: no panes, title bar or toolbar.
     image_mode: bool,
     /// Window width at the last resize.
@@ -941,6 +955,10 @@ struct Workbench {
 impl Workbench {
     fn new(handle: SessionHandle, session: String, simulated: bool, saved: Option<Prefs>) -> Self {
         let prefs = saved.clone().unwrap_or_default();
+        let open_sections = prefs.open_sections.clone();
+        // A first run keeps the inspector out of the way until a camera
+        // comes; it must not slide away on launch.
+        let quiet = prefs.recent.is_empty();
         let defaults = Prefs::default();
         let pick = |choices: &[Choice], value: &str, fallback: &str| {
             find(choices, value)
@@ -956,7 +974,7 @@ impl Workbench {
         let client_activity = client_activity::State::from_snapshot(&handle.snapshot());
         let video_analytics =
             video_analytics::State::new(handle.clone(), prefs.video_analytics.clone());
-        Self {
+        let mut bench = Self {
             main_window,
             focused_window: main_window,
             window_editor_focus: HashMap::new(),
@@ -1104,6 +1122,10 @@ impl Workbench {
             sidebar_open: prefs.sidebar_open,
             inspector_open: prefs.inspector_open,
             inspector_peek: false,
+            inspector_summoned: false,
+            stashed_record: None,
+            stashed_stream: String::new(),
+            stream_draft: false,
             image_mode: false,
             width: 1280.0,
             height: 840.0,
@@ -1119,7 +1141,7 @@ impl Workbench {
                 Kind::Move,
             ),
             inspector_slide: Motion::new(
-                shown(prefs.inspector_open),
+                shown(prefs.inspector_open && !quiet),
                 motion::PANEL,
                 motion::PANEL_OUT,
                 Kind::Move,
@@ -1135,7 +1157,9 @@ impl Workbench {
             inspect: Default::default(),
             auto_capture: Default::default(),
             sheets: Default::default(),
-        }
+        };
+        bench.restore_open_sections(&open_sections);
+        bench
     }
 
     fn prefs(&self) -> Prefs {
@@ -1177,6 +1201,7 @@ impl Workbench {
             dataset_path: self.dataset.path.clone(),
             dataset_auto: self.dataset.auto,
             recent_signals: self.signals.recent.clone(),
+            open_sections: self.open_section_keys(),
             // Not yet mirrored on the workbench: keep what was loaded.
             ..self.saved.clone().unwrap_or_default()
         }
@@ -1486,6 +1511,12 @@ impl Workbench {
             ..Pending::unanswered(job)
         });
         Ok(self.pending.last_mut().expect("just pushed"))
+    }
+
+    /// A first run before any camera: nothing connected, connecting or
+    /// remembered. The docked inspector stays out of the way until then.
+    fn first_run_quiet(&self) -> bool {
+        self.recent.is_empty() && self.snapshot.cameras.is_empty() && !self.pending(Job::Connect)
     }
 
     /// Whether a command doing `job` is on its way, to any camera.
@@ -2186,12 +2217,23 @@ impl Workbench {
 
     /// What the capture output saves to next, `{seq}` shown as `####`.
     fn output_preview(&self) -> String {
+        self.preview_of(&self.output)
+    }
+
+    /// What `template` saves to next, `{seq}` shown as `####`, under `~`
+    /// when it is in the home folder.
+    fn preview_of(&self, template: &str) -> String {
+        self.preview_at(template, chrono::Local::now())
+    }
+
+    /// `preview_of` at the time `now`.
+    fn preview_at(&self, template: &str, now: chrono::DateTime<chrono::Local>) -> String {
         let camera = self
             .snapshot
             .connected
             .as_ref()
             .map_or_else(|| "camera".to_owned(), crate::naming::camera_label);
-        let preview = crate::naming::preview(&self.output, &camera, chrono::Local::now());
+        let preview = crate::naming::preview(template, &camera, now);
         let home = prefs::capture_root();
         match home
             .parent()
@@ -2969,6 +3011,7 @@ impl Workbench {
                 self.image_mode = false;
                 if self.inspector_docked() {
                     self.inspector_open = true;
+                    self.inspector_summoned = true;
                 } else {
                     self.inspector_peek = true;
                 }
@@ -2976,6 +3019,7 @@ impl Workbench {
             }
             Message::Search(value) => self.search = value,
             Message::InspectorDisclosure(section) => self.toggle_inspector_section(section),
+            Message::ExpandFeatureGroups(open) => self.expand_feature_groups(open),
             Message::RefreshFeatures => {
                 self.edits.clear();
                 self.edit_sources.clear();
@@ -3078,6 +3122,7 @@ impl Workbench {
                     );
                 }
             }
+            Message::ForwardMode(stream) => self.forward_mode(stream),
             Message::StopForward => {
                 let recording = self
                     .snapshot
@@ -3095,7 +3140,11 @@ impl Workbench {
             }
             Message::ToggleInspector => {
                 self.image_mode = false;
-                if self.inspector_docked() {
+                if self.inspector_docked() && self.first_run_quiet() && !self.inspector_summoned {
+                    // Hidden only for the quiet first run: show it.
+                    self.inspector_summoned = true;
+                    self.inspector_open = true;
+                } else if self.inspector_docked() {
                     self.inspector_open = !self.inspector_open;
                 } else {
                     self.inspector_peek = !self.inspector_peek;
@@ -3818,6 +3867,47 @@ mod tests {
         assert!(frames.next().now_or_never().is_none());
         std::thread::sleep(FRAME_POLL * 10);
         assert!(frames.next().now_or_never().is_none());
+    }
+
+    #[test]
+    fn a_first_run_keeps_the_inspector_quiet_until_a_camera_or_a_request() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        bench.width = 1280.0;
+        assert!(bench.inspector_open && bench.first_run_quiet());
+        assert!(!bench.inspector_shown(), "nothing to inspect yet");
+        assert_eq!(bench.inspector_slide.get(bench.now), 0.0, "no slide on launch");
+        // ⌘I shows it on the first press, leaving the preference as it was.
+        let _ = bench.handle_message(Message::ToggleInspector);
+        assert!(bench.inspector_open && bench.inspector_shown());
+        let _ = bench.handle_message(Message::ToggleInspector);
+        assert!(!bench.inspector_open && !bench.inspector_shown());
+
+        // A camera on its way shows it.
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        bench.width = 1280.0;
+        bench.send(
+            Job::Connect,
+            SessionCommand::Connect {
+                camera: "sim:0".into(),
+                timeout_ms: 2000,
+            },
+        );
+        assert!(bench.inspector_shown());
+
+        // A returning user sees it from the start.
+        let prefs = Prefs {
+            recent: vec![Recent {
+                target: "sim:0".into(),
+                label: "Pattern camera".into(),
+                detail: "Simulator".into(),
+                transport: crate::types::Transport::Simulator,
+            }],
+            ..Prefs::default()
+        };
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, Some(prefs));
+        bench.width = 1280.0;
+        assert!(bench.inspector_shown());
+        assert_eq!(bench.inspector_slide.get(bench.now), 1.0);
     }
 
     #[test]

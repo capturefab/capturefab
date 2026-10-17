@@ -515,6 +515,9 @@ pub struct Prefs {
     pub dataset_auto: bool,
     /// Recently added signal sources, never with credentials.
     pub recent_signals: Vec<String>,
+    /// The settings panel's disclosures the user left open, by stable key
+    /// ("features:Image", "storage"); unknown keys are ignored on load.
+    pub open_sections: Vec<String>,
 }
 /// Capture context fields; empty ones are not sent.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -575,6 +578,7 @@ impl Default for Prefs {
             dataset_path: None,
             dataset_auto: true,
             recent_signals: Vec::new(),
+            open_sections: Vec::new(),
         }
     }
 }
@@ -835,6 +839,19 @@ mod tests {
             std::env::temp_dir().join(format!("capturefab-prefs-{name}-{}", std::process::id()));
         crate::ipc::ensure_private_dir(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn prefs_without_open_sections_open_nothing() {
+        let prefs: Prefs = serde_json::from_str(r#"{"tab": "capture"}"#).unwrap();
+        assert!(prefs.open_sections.is_empty());
+        let prefs = Prefs {
+            open_sections: vec!["features:Image".into(), "storage".into()],
+            ..Prefs::default()
+        };
+        let json = serde_json::to_string(&prefs).unwrap();
+        let back: Prefs = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.open_sections, prefs.open_sections);
     }
 
     #[test]

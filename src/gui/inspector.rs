@@ -24,6 +24,8 @@ pub(super) enum Section {
     Dataset,
     #[allow(dead_code)]
     Signals,
+    /// The Video tab's destination and file name, behind its preview.
+    RecordLocation,
 }
 #[cfg(test)]
 mod disclosure_tests;
@@ -99,6 +101,24 @@ fn feature_groups(kind: CameraKind) -> &'static [&'static str] {
 
 /// Classify only features the camera supplies. Unknown names stay accessible
 /// in the ordinary feature groups and through search.
+/// The group named `name` among those of any camera type, as the static
+/// name the panel keys its disclosures by.
+fn known_feature_group(name: &str) -> Option<&'static str> {
+    [
+        CameraKind::AreaScan,
+        CameraKind::LineScan,
+        CameraKind::Depth,
+        CameraKind::Microscope,
+        CameraKind::Thermal,
+        CameraKind::DocumentScanner,
+        CameraKind::Unknown,
+    ]
+    .into_iter()
+    .flat_map(feature_groups)
+    .copied()
+    .find(|group| *group == name)
+}
+
 fn adaptive_feature_group(name: &str, kind: CameraKind) -> &'static str {
     let starts = |prefixes: &[&str]| prefixes.iter().any(|prefix| name.starts_with(prefix));
     match kind {
@@ -361,6 +381,21 @@ fn adaptive_feature_label(feature: &FeatureInfo, kind: CameraKind) -> String {
         (CameraKind::Thermal, "TemperatureRange") => Some("Measurement range"),
         (CameraKind::DocumentScanner, "ScanResolution") => Some("Resolution"),
         (CameraKind::DocumentScanner, "ScanSource") => Some("Page source"),
+        // Everyday names for the controls most cameras share; the GenICam
+        // name stays in the tooltip and the search.
+        (CameraKind::AreaScan | CameraKind::Unknown, "ExposureTime" | "ExposureTimeAbs") => {
+            Some("Exposure")
+        }
+        (
+            CameraKind::AreaScan | CameraKind::Unknown,
+            "AcquisitionFrameRate" | "AcquisitionFrameRateAbs",
+        ) => Some("Frame rate"),
+        (CameraKind::AreaScan | CameraKind::Unknown, "AcquisitionFrameRateEnable") => {
+            Some("Limit frame rate")
+        }
+        (CameraKind::AreaScan | CameraKind::Unknown, "Gain" | "GainRaw" | "GainAbs") => {
+            Some("Gain")
+        }
         _ => None,
     };
     label.map(str::to_owned).unwrap_or_else(|| {
@@ -601,6 +636,7 @@ pub(super) struct InspectorState {
     tags_open: bool,
     dataset_open: bool,
     signals_open: bool,
+    record_location_open: bool,
     /// The last write or command that failed on each of the shown camera's
     /// features, as the whole error; show its first line at the row. Kept by
     /// `failed()` and cleared by the feature's next success, a new draft, a
@@ -622,6 +658,8 @@ pub(super) struct InspectorState {
     /// The Manual/Auto thumb's place: 1 for auto. It moves as soon as a
     /// switch is asked for, and back should the camera refuse.
     mode_thumb: Motion,
+    /// The Video tab's Record/Stream thumb's place: 1 for streaming.
+    output_thumb: Motion,
     /// Whether the thumbs have been placed; until then they jump.
     placed: bool,
     /// The camera the panel last showed.
@@ -654,12 +692,14 @@ impl Default for InspectorState {
             tags_open: false,
             dataset_open: false,
             signals_open: false,
+            record_location_open: false,
             write_errors: HashMap::new(),
             accepted: Flashes::new(ACCEPTED),
             capture_failed: None,
             lockable: HashMap::new(),
             tab_thumb: Motion::new(0.0, THUMB, THUMB, Kind::Move),
             mode_thumb: Motion::new(0.0, THUMB, THUMB, Kind::Move),
+            output_thumb: Motion::new(0.0, THUMB, THUMB, Kind::Move),
             placed: false,
             shown_camera: None,
             context: Motion::new(0.0, CONTEXT, CONTEXT, Kind::Fade),
@@ -675,7 +715,7 @@ impl Default for InspectorState {
 
 impl InspectorState {
     super::motion::registry! {
-        motions: [tab_thumb, mode_thumb, context, storage_turn, changes_turn],
+        motions: [tab_thumb, mode_thumb, output_thumb, context, storage_turn, changes_turn],
         flashes: [accepted],
     }
 }
@@ -832,6 +872,81 @@ impl Workbench {
             Section::CaptureTags => self.inspect.tags_open = !self.inspect.tags_open,
             Section::Dataset => self.inspect.dataset_open = !self.inspect.dataset_open,
             Section::Signals => self.inspect.signals_open = !self.inspect.signals_open,
+            Section::RecordLocation => {
+                self.inspect.record_location_open = !self.inspect.record_location_open
+            }
+        }
+    }
+
+    /// The disclosures the user left open, as stable keys for the prefs:
+    /// sorted, without duplicates. Only what the user toggled is here; a
+    /// section shown open because its value is wrong or customised is not.
+    pub(super) fn open_section_keys(&self) -> Vec<String> {
+        let inspect = &self.inspect;
+        let mut keys: Vec<String> = inspect
+            .feature_groups_open
+            .iter()
+            .map(|group| format!("features:{group}"))
+            .collect();
+        for (open, key) in [
+            (inspect.camera_details_open, "camera-details"),
+            (inspect.capture_options_open, "capture-options"),
+            (inspect.tags_open, "capture-tags"),
+            (inspect.dataset_open, "dataset"),
+            (inspect.signals_open, "signals"),
+            (inspect.automation_open, "automatic-capture"),
+            (inspect.encoder_options_open, "video-settings"),
+            // Capture and Video share one storage section, so one key.
+            (self.storage_open, "storage"),
+            (inspect.record_location_open, "record-location"),
+        ] {
+            if open {
+                keys.push(key.to_owned());
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// Open the disclosures named by `keys`, from the prefs; unknown keys,
+    /// such as a group a later version dropped, are ignored.
+    pub(super) fn restore_open_sections(&mut self, keys: &[String]) {
+        for key in keys {
+            if let Some(group) = key.strip_prefix("features:") {
+                if let Some(group) = known_feature_group(group) {
+                    self.inspect.feature_groups_open.insert(group);
+                }
+                continue;
+            }
+            let inspect = &mut self.inspect;
+            match key.as_str() {
+                "camera-details" => inspect.camera_details_open = true,
+                "capture-options" => inspect.capture_options_open = true,
+                "capture-tags" => inspect.tags_open = true,
+                "dataset" => inspect.dataset_open = true,
+                "signals" => inspect.signals_open = true,
+                "automatic-capture" => inspect.automation_open = true,
+                "video-settings" => inspect.encoder_options_open = true,
+                "storage" => self.storage_open = true,
+                "record-location" => inspect.record_location_open = true,
+                _ => {}
+            }
+        }
+        // Remembered state shows at rest, never turning open on launch.
+        self.inspect
+            .storage_turn
+            .set(if self.storage_open { 1.0 } else { 0.0 });
+    }
+
+    /// Open every group the panel lists, or close them all.
+    pub(super) fn expand_feature_groups(&mut self, open: bool) {
+        for (group, _) in &self.inspect.index.groups {
+            if open {
+                self.inspect.feature_groups_open.insert(group);
+            } else {
+                self.inspect.feature_groups_open.remove(group);
+            }
         }
     }
 
@@ -847,6 +962,7 @@ impl Workbench {
         }
         let tab = self.tab as usize as f32;
         let mode = self.mode_target();
+        let output = if self.forward_streams() { 1.0 } else { 0.0 };
         let moved = self.inspect.shown_camera.as_deref() != self.snapshot.active_camera.as_deref();
         let inspect = &mut self.inspect;
         if moved {
@@ -865,8 +981,10 @@ impl Workbench {
         }
         if inspect.placed {
             inspect.tab_thumb.go(tab, now);
+            inspect.output_thumb.go(output, now);
         } else {
             inspect.tab_thumb.set(tab);
+            inspect.output_thumb.set(output);
             inspect.placed = true;
         }
         inspect.storage_turn.show(self.storage_open, now);
@@ -1057,7 +1175,8 @@ impl Workbench {
     /// (with `welcome`: a camera connecting), `inspector-deletes` (deleting
     /// the oldest files at capacity, storage closed),
     /// `inspector-capture-failed` (a capture refused) and
-    /// `inspector-capturing` (a capture on its way), `inspector-nocapture`
+    /// `inspector-capturing` (a capture on its way), `forward-stream` (the
+    /// Video tab streaming to a local URL), `inspector-nocapture`
     /// (no output name) and `inspector-noforward` (no forwarding destination).
     pub(super) fn scene_inspector(&mut self, word: &str, late: bool) -> bool {
         let camera = self.snapshot.active_camera.clone();
@@ -1074,6 +1193,7 @@ impl Workbench {
                 self.now,
             ),
             ("inspector-noforward", _) => self.forward_output.clear(),
+            ("forward-stream", _) => self.forward_output = "rtsp://127.0.0.1:8554/line-1".into(),
             ("inspector-nocapture", _) => self.output.clear(),
             ("inspector-widest", _) => {
                 self.format = "pgm";
@@ -1168,6 +1288,50 @@ impl Workbench {
             parts.push(encoder.to_owned());
         }
         parts.join(" · ")
+    }
+}
+
+/// A home-shortened path split into its file name and its folder, at the
+/// last `/` or `\`; the folder is empty for a bare name.
+fn split_preview(preview: &str) -> (String, String) {
+    match preview.rfind(['/', '\\']) {
+        Some(at) => {
+            let folder = &preview[..at];
+            let folder = if folder.is_empty() { &preview[..=at] } else { folder };
+            (preview[at + 1..].to_owned(), folder.to_owned())
+        }
+        None => (preview.to_owned(), String::new()),
+    }
+}
+
+/// What a file name template names its files by, in plain words: "Named
+/// by date, camera, time and number"; "Custom name" without placeholders.
+fn pattern_summary(template: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut add = |part| {
+        if !parts.contains(&part) {
+            parts.push(part);
+        }
+    };
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        let Some(end) = rest[start..].find('}') else {
+            break;
+        };
+        match &rest[start + 1..start + end] {
+            "date" => add("date"),
+            "camera" => add("camera"),
+            "datetime" | "time" => add("time"),
+            "seq" => add("number"),
+            "frame" => add("frame"),
+            _ => {}
+        }
+        rest = &rest[start + end + 1..];
+    }
+    match parts.as_slice() {
+        [] => "Custom name".into(),
+        [one] => format!("Named by {one}"),
+        [init @ .., last] => format!("Named by {} and {last}", init.join(", ")),
     }
 }
 
@@ -1558,11 +1722,7 @@ impl Workbench {
         let refreshing = self.pending(Job::RefreshFeatures);
         let total = index.listed;
         let count = if query.is_empty() {
-            format!(
-                "{} quick · {} total",
-                index.quick.len(),
-                grouped(total as u64)
-            )
+            plural(total as u64, "setting", "settings")
         } else {
             format!(
                 "{} of {} features",
@@ -1570,8 +1730,22 @@ impl Workbench {
                 grouped(total as u64)
             )
         };
+        // One link opens every group, or closes them once any is open.
+        let any_open = index
+            .groups
+            .iter()
+            .any(|(group, _)| self.inspect.feature_groups_open.contains(group));
+        let expand: Element<'_, Message> = if searching || index.groups.is_empty() {
+            space().into()
+        } else {
+            link(
+                if any_open { "Collapse all" } else { "Expand all" },
+                Some(Message::ExpandFeatureGroups(!any_open)),
+            )
+        };
         let count = row![
             text(count).size(style::SMALL).color(p.secondary),
+            expand,
             space::horizontal(),
             if refreshing {
                 Element::from(
@@ -1792,11 +1966,15 @@ impl Workbench {
         let mut card = column![head, modes].spacing(10);
         match auto {
             None => {
-                card = card.push(
-                    text("Auto tunes exposure, gain and frame rate for this camera.")
+                card = card
+                    .push(
+                        text(
+                            "Set exposure, gain and frame rate below, or choose Auto to have them tuned for you.",
+                        )
                         .size(style::SMALL)
                         .color(p.secondary),
-                );
+                    )
+                    .push(self.scope_links());
             }
             Some(status) => {
                 card = card
@@ -1815,7 +1993,8 @@ impl Workbench {
                         text(auto_summary(status))
                             .size(style::SMALL)
                             .color(p.secondary),
-                    );
+                    )
+                    .push(self.scope_links());
                 for note in &status.notes {
                     card = card.push(text(note.clone()).size(style::SMALL).color(p.ink(p.warn)));
                 }
@@ -1860,6 +2039,65 @@ impl Workbench {
             .into()
     }
 
+    /// The exposure card's ways to judge the image: the histogram and, where
+    /// the image has one, the focus aid. Each says what pressing it does.
+    fn scope_links(&self) -> Element<'_, Message> {
+        let os = Os::CURRENT;
+        let scoped = self.intensity_image() && self.camera_kind() != CameraKind::LineScan;
+        let small = |label: &'static str, on: Message, hint: String| -> Element<'_, Message> {
+            tip(
+                // Flush with the card's text; the room goes between them.
+                button(text(label).size(style::CAPTION))
+                    .padding(iced::Padding {
+                        top: 2.0,
+                        right: 14.0,
+                        bottom: 2.0,
+                        left: 0.0,
+                    })
+                    .style(style::link)
+                    .on_press(on),
+                hint,
+            )
+        };
+        let mut links = row![].align_y(Alignment::Center);
+        if scoped {
+            links = links
+                .push(small(
+                    if self.exposure_open {
+                        "Hide histogram"
+                    } else {
+                        "Histogram"
+                    },
+                    Message::ToggleExposure,
+                    Action::ToggleExposure.hint(
+                        if self.exposure_open {
+                            "Hide the histogram"
+                        } else {
+                            "Show the histogram"
+                        },
+                        os,
+                    ),
+                ))
+                .push(small(
+                    if self.focus.open {
+                        "Hide focus aid"
+                    } else {
+                        "Focus aid"
+                    },
+                    Message::ToggleFocusRegion,
+                    Action::ToggleFocusRegion.hint(
+                        if self.focus.open {
+                            "Hide the focus aid"
+                        } else {
+                            "Show the focus aid"
+                        },
+                        os,
+                    ),
+                ));
+        }
+        links.into()
+    }
+
     /// One feature: its label and control, and a caption under them with its
     /// range, where an edit stands, or why the camera refused it. Runs per
     /// row on every camera frame, so each check here is constant time and
@@ -1893,6 +2131,12 @@ impl Workbench {
             .and_then(|value| feature.validate_input(value).err())
             .map(|error| format!("{error:#}"));
         let refused = draft_error.as_ref().or_else(|| self.refusal(name, asked));
+        // An out-of-range draft reads plainly under the field; the field's
+        // description keeps the check's own words.
+        let shown_error = match (&draft_error, self.edits.get(name)) {
+            (Some(raw), Some(draft)) => Some(draft_error_text(feature, draft, raw)),
+            _ => refused.cloned(),
+        };
         let current = feature_value(feature);
         // The caption's left side, and whether this row holds a text field,
         // which keeps its caption line so nothing moves as an edit begins.
@@ -2056,11 +2300,24 @@ impl Workbench {
             ));
         }
         if writable && !command {
+            // What the field's microseconds come to, as typed.
+            let duration = match self
+                .edits
+                .get(name)
+                .and_then(|draft| draft.trim().parse::<f64>().ok())
+            {
+                Some(draft) => human_duration_of(feature, draft),
+                None => human_duration(feature),
+            };
+            if let Some(duration) = duration {
+                notes.push(note(duration, p.secondary));
+            }
             let range = range_text(feature);
             if !range.is_empty() {
                 notes.push(note(range, p.secondary));
             }
         }
+        let label_text = label;
         let label = text(label).size(style::BODY);
         let label = if read_only {
             tip(label, format!("{about}\nRead only"))
@@ -2070,10 +2327,16 @@ impl Workbench {
         let head = row![container(label).width(Fill), control,]
             .spacing(10)
             .align_y(Alignment::Center);
+        // A quick numeric control also slides across its range.
+        let slider = self.quick_slider(feature, label_text, writable && !command && !locked);
+        let head: Element<'_, Message> = match slider {
+            Some(slider) => column![head, slider].spacing(4).into(),
+            None => head.into(),
+        };
         // A refusal takes the notes' place; Apply stays beside it.
         let caption: Option<Element<'_, Message>> =
             if refused.is_some() || !notes.is_empty() || trailing.is_some() {
-                let line: Element<'_, Message> = match refused {
+                let line: Element<'_, Message> = match &shown_error {
                     Some(error) => field_error(capitalize(first_line(error)), p),
                     None => Row::with_children(notes).spacing(8).wrap().into(),
                 };
@@ -2087,8 +2350,64 @@ impl Workbench {
             };
         match caption {
             Some(caption) => column![head, caption].spacing(2).into(),
-            None => head.into(),
+            None => head,
         }
+    }
+
+    /// The slider under a quick control's field: a writable number with a
+    /// usable range, not locked by the stream. Rows set by auto keep theirs;
+    /// moving it switches to manual, as typing does.
+    fn quick_slider<'a>(
+        &self,
+        feature: &'a FeatureInfo,
+        label: &str,
+        editable: bool,
+    ) -> Option<Element<'a, Message>> {
+        if !editable || !feature.choices.is_empty() || feature.error.is_some() {
+            return None;
+        }
+        let index = &self.inspect.index;
+        let position = self
+            .snapshot
+            .features
+            .iter()
+            .position(|f| std::ptr::eq(f, feature))?;
+        if !index.quick.contains(&position) {
+            return None;
+        }
+        let scale = widgets::FeatureScale::new(
+            &feature.name,
+            &feature.kind,
+            feature.min,
+            feature.max,
+            feature.inc,
+        )?;
+        let name = feature.name.as_str();
+        // What the field shows: a draft that parses, else what a write on
+        // its way asked for, else the camera's value.
+        let value = self
+            .edits
+            .get(name)
+            .or_else(|| {
+                self.asked(name)
+                    .filter(|pending| matches!(pending.job, Job::Set(_)))
+                    .and_then(|pending| pending.value.as_ref())
+            })
+            .and_then(|text| text.trim().parse::<f64>().ok())
+            .or_else(|| feature.value.as_ref().and_then(|v| v.as_f64()))
+            .filter(|v| v.is_finite())?;
+        let on_press = if self.edits.contains_key(name) {
+            Message::Commit(feature.name.clone())
+        } else {
+            Message::Draft(feature.name.clone(), feature_value(feature))
+        };
+        Some(widgets::feature_slider(
+            name,
+            label,
+            value,
+            scale,
+            on_press,
+        ))
     }
 
     /// The Stream row: starts or stops the selected camera, with a spinner
@@ -2227,14 +2546,30 @@ impl Workbench {
         if let Some(status) = self.capture_status(connected, capturing, p) {
             action = action.push(status);
         }
+        let (file, folder) = split_preview(&self.output_preview());
+        let mut next = column![
+            row![
+                text("Next file:").size(style::SMALL).color(p.secondary),
+                one_line(file, style::SMALL, style::SANS, p.secondary)
+                    .keep_end()
+                    .width(Fill),
+            ]
+            .spacing(4)
+        ]
+        .spacing(2);
+        if !folder.is_empty() {
+            next = next.push(
+                row![
+                    text("in").size(style::SMALL).color(p.secondary),
+                    one_line(folder, style::SMALL, style::SANS, p.secondary)
+                        .keep_end()
+                        .width(Fill),
+                ]
+                .spacing(4),
+            );
+        }
         action = action.push(tip(
-            one_line(
-                format!("Next: {}", self.output_preview()),
-                style::SMALL,
-                style::SANS,
-                p.secondary,
-            )
-            .width(Fill),
+            next,
             "{camera}, {date}, {time}, {datetime} and {frame} fill in when saving; {seq} becomes the next free number",
         ));
         let mut head = column![section(capture_title(kind), None, p)].spacing(8);
@@ -2398,6 +2733,17 @@ impl Workbench {
             return Some(reason("Connect a camera to capture.", p));
         }
         if let Err(error) = self.validate_input(&self.capture_command(false)) {
+            // The output field already says what is wrong with itself.
+            let field = crate::destination::validate_output(
+                self.capture_to.selected.as_deref(),
+                &self.output,
+            )
+            .and_then(|_| crate::engine::validate_capture_output(&self.output))
+            .err()
+            .map(|error| error.to_string());
+            if field.as_deref() == Some(error.to_string().as_str()) {
+                return None;
+            }
             return Some(error_caption(error.to_string(), false, p));
         }
         let here =
@@ -2501,15 +2847,39 @@ impl Workbench {
         if let Some(guidance) = forward_guidance(self.camera_kind()) {
             content = content.push(reason(guidance, p));
         }
-        content.push(first).push(self.storage_settings(p)).into()
+        // Storage limits apply to recordings, not to a stream.
+        let records = match &self.snapshot.forwarding {
+            Some(destination) => Output::of(destination).recording(),
+            None => !self.forward_streams(),
+        };
+        content = content.push(first);
+        if records {
+            content = content.push(self.storage_settings(p));
+        }
+        content.into()
     }
 
     fn forward_form(&self, p: &'static Palette) -> Element<'_, Message> {
         let connected = self.snapshot.connected.is_some();
-        let recording = Output::of(&self.forward_output).recording();
+        let streams = self.forward_streams();
         let starting = self.forward_pending() == Some(false);
+        let empty = self.forward_output.trim().is_empty()
+            || (streams && Output::of(&self.forward_output).recording());
         let problem = self.validate_input(&self.forward_command()).err();
-        let ready = connected && problem.is_none();
+        let ready = connected && problem.is_none() && !empty;
+        // The output's own check, for its field: none while it is empty,
+        // which the line under the action asks for instead.
+        let output_error = (!empty)
+            .then(|| {
+                crate::destination::validate_output(
+                    self.record_to.selected.as_deref(),
+                    &self.forward_output,
+                )
+                .and_then(|_| crate::media::validate_forward_output(&self.forward_output))
+                .err()
+                .map(|error| error.to_string())
+            })
+            .flatten();
         let action_ink = if ready || starting {
             Color::WHITE
         } else {
@@ -2517,33 +2887,72 @@ impl Workbench {
         };
         let glyph = if starting {
             icon::spinner(15.0, action_ink, self.spin())
-        } else {
+        } else if streams {
             icon(Icon::Broadcast, 15.0, action_ink)
+        } else {
+            dot(
+                if ready { Color::WHITE } else { p.ink(p.danger) },
+                8.0,
+            )
         };
         let mut action = column![wide_button(
             glyph,
             if starting {
                 "Starting…"
-            } else if recording {
-                "Start recording"
-            } else {
+            } else if streams {
                 "Start forwarding"
+            } else {
+                "Start recording"
             },
             style::primary,
             ready.then_some(Message::StartForward),
             starting,
         )]
         .spacing(8);
+        // Errors the form already shows at their fields.
+        let shown: Vec<String> = [
+            output_error.clone(),
+            crate::media::validate_bitrate(self.forward_bitrate.trim())
+                .err()
+                .map(|error| error.to_string()),
+            crate::media::validate_encoder(self.forward_codec, self.forward_encoder.trim())
+                .err()
+                .map(|error| error.to_string()),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(
+            [Num::Fps, Num::FileMib]
+                .into_iter()
+                .filter(|key| {
+                    self.drafts
+                        .get(key)
+                        .is_some_and(|value| !num_valid(*key, value))
+                })
+                .map(|key| num_requirement(key).to_owned()),
+        )
+        .collect();
         if !connected {
             action = action.push(reason(
-                if recording {
-                    "Connect a camera to record."
-                } else {
+                if streams {
                     "Connect a camera to forward it."
+                } else {
+                    "Connect a camera to record."
                 },
                 p,
             ));
-        } else if let Some(problem) = problem {
+        } else if empty {
+            action = action.push(reason(
+                if streams {
+                    "Enter a stream URL to forward to."
+                } else {
+                    "Enter a file name to record."
+                },
+                p,
+            ));
+        } else if let Some(problem) = problem
+            && !shown.contains(&problem.to_string())
+        {
             action = action.push(error_caption(problem.to_string(), false, p));
         }
         // How the video is encoded, folded behind its summary, opened while
@@ -2553,7 +2962,7 @@ impl Workbench {
                 .is_err()
             || crate::media::validate_bitrate(self.forward_bitrate.trim()).is_err()
             || self.drafts.contains_key(&Num::Fps)
-            || self.drafts.contains_key(&Num::FileMib);
+            || (!streams && self.drafts.contains_key(&Num::FileMib));
         let mut options = column![disclosure(
             "Video settings",
             Some(self.forward_summary()),
@@ -2567,143 +2976,286 @@ impl Workbench {
                 crate::media::validate_encoder(self.forward_codec, self.forward_encoder.trim())
                     .err()
                     .map(|error| error.to_string());
-            options = options.push(
-                column![
-                    form_row(
-                        "Codec",
-                        pick_list(&CODECS[..], find(&CODECS, self.forward_codec), Message::Codec)
-                            .name("Video codec")
-                            .width(Fill)
-                            .text_size(style::BODY)
+            let mut settings = column![
+                form_row(
+                    "Codec",
+                    pick_list(&CODECS[..], find(&CODECS, self.forward_codec), Message::Codec)
+                        .name("Video codec")
+                        .width(Fill)
+                        .text_size(style::BODY)
+                        .padding([5, 8])
+                        .style(style::pick)
+                        .menu_style(style::menu),
+                    "",
+                    p,
+                ),
+                form_row("Frame rate", self.num(Num::Fps), "fps", p),
+                form_row(
+                    "Bitrate",
+                    column![
+                        text_input("4M", &self.forward_bitrate)
+                            .name("Recording bitrate")
+                            .description(
+                                "An FFmpeg bitrate, such as 4M for four megabits per second."
+                            )
+                            .invalid(
+                                crate::media::validate_bitrate(self.forward_bitrate.trim())
+                                    .err()
+                                    .map(|error| error.to_string())
+                            )
+                            .id("forward-bitrate")
+                            .on_input(Message::Bitrate)
+                            .size(style::BODY)
                             .padding([5, 8])
-                            .style(style::pick)
-                            .menu_style(style::menu),
-                        "",
-                        p,
-                    ),
-                    form_row("Frame rate", self.num(Num::Fps), "fps", p),
-                    form_row(
-                        "Bitrate",
-                        column![
-                            text_input("4M", &self.forward_bitrate)
-                                .name("Recording bitrate")
-                                .description(
-                                    "An FFmpeg bitrate, such as 4M for four megabits per second."
-                                )
-                                .invalid(
-                                    crate::media::validate_bitrate(self.forward_bitrate.trim())
-                                        .err()
-                                        .map(|error| error.to_string())
-                                )
-                                .id("forward-bitrate")
-                                .on_input(Message::Bitrate)
+                            .width(Fill)
+                            .style(
+                                if crate::media::validate_bitrate(self.forward_bitrate.trim())
+                                    .is_ok()
+                                {
+                                    style::input
+                                } else {
+                                    style::input_invalid
+                                }
+                            ),
+                        self.forward_field_error(false, p)
+                    ]
+                    .spacing(4),
+                    "",
+                    p,
+                ),
+                form_row(
+                    "Encoder",
+                    column![
+                        tip(
+                            text_input("auto", &self.forward_encoder)
+                                .name("Recording encoder")
+                                .invalid(encoder_error.clone())
+                                .id("forward-encoder")
+                                .on_input(Message::Encoder)
                                 .size(style::BODY)
                                 .padding([5, 8])
                                 .width(Fill)
-                                .style(
-                                    if crate::media::validate_bitrate(self.forward_bitrate.trim())
-                                        .is_ok()
-                                    {
-                                        style::input
-                                    } else {
-                                        style::input_invalid
-                                    }
-                                ),
-                            self.forward_field_error(false, p)
-                        ]
-                        .spacing(4),
-                        "",
-                        p,
-                    ),
-                    form_row(
-                        "Encoder",
-                        column![
-                            tip(
-                                text_input("auto", &self.forward_encoder)
-                                    .name("Recording encoder")
-                                    .invalid(encoder_error.clone())
-                                    .id("forward-encoder")
-                                    .on_input(Message::Encoder)
-                                    .size(style::BODY)
-                                    .padding([5, 8])
-                                    .width(Fill)
-                                    .style(if encoder_error.is_none() {
-                                        style::input
-                                    } else {
-                                        style::input_invalid
-                                    }),
-                                "auto picks an available encoder. Enter an FFmpeg encoder name to choose one.",
-                            ),
-                            self.forward_field_error(true, p)
-                        ]
-                        .spacing(4),
-                        "",
-                        p,
-                    ),
-                    form_row(
-                        "Maximum file",
-                        tip(
-                            self.num(Num::FileMib),
-                            "For file destinations, recording stops when this file size limit is reached.",
+                                .style(if encoder_error.is_none() {
+                                    style::input
+                                } else {
+                                    style::input_invalid
+                                }),
+                            "auto picks an available encoder. Enter an FFmpeg encoder name to choose one.",
                         ),
-                        "MiB",
-                        p,
+                        self.forward_field_error(true, p)
+                    ]
+                    .spacing(4),
+                    "",
+                    p,
+                ),
+            ]
+            .spacing(ROW_GAP);
+            // A stream has no file to limit.
+            if !streams {
+                settings = settings.push(form_row(
+                    "Maximum file",
+                    tip(
+                        self.num(Num::FileMib),
+                        "For file destinations, recording stops when this file size limit is reached.",
                     ),
-                    text("Auto chooses an available encoder. Check this computer's encoders with:")
-                        .size(style::SMALL)
-                        .color(p.secondary),
-                    self.copyable("capturefab doctor".into(), p),
-                ]
-                .spacing(ROW_GAP),
+                    "MiB",
+                    p,
+                ));
+            }
+            options = options.push(
+                settings
+                    .push(
+                        text("Auto chooses an available encoder. Check this computer's encoders with:")
+                            .size(style::SMALL)
+                            .color(p.secondary),
+                    )
+                    .push(self.copyable("capturefab doctor".into(), p)),
             );
         }
-        let controls = column![
-            accessibility::mapped(
-                self.record_to.view(
-                    &self.forward_output,
-                    "Stream URL or file",
-                    p,
-                    crate::destination::validate_output(
-                        self.record_to.selected.as_deref(),
-                        &self.forward_output
-                    )
-                    .and_then(|_| crate::media::validate_forward_output(&self.forward_output))
-                    .err()
-                    .map(|error| error.to_string())
+        let modes = segmented(
+            "Video output",
+            vec![
+                (
+                    "Record to file",
+                    Some(Message::ForwardMode(false)),
+                    "Save video to a file on this computer or a destination".into(),
                 ),
-                Message::RecordPicker,
-            ),
-            action,
-            options,
-        ]
-        .spacing(ROW_GAP);
+                (
+                    "Stream to URL",
+                    Some(Message::ForwardMode(true)),
+                    "Send live video to a server such as MediaMTX".into(),
+                ),
+            ],
+            usize::from(streams),
+            self.inspect.output_thumb.get(self.now),
+        );
+        let location = if streams {
+            self.stream_location(output_error, p)
+        } else {
+            self.record_location(output_error, p)
+        };
+        let controls = column![modes, location, action, options].spacing(ROW_GAP);
         // Purpose guidance already introduces this operation. Avoid stacking
-        // another heading and paragraph above its destination and start action.
+        // another heading above its destination and start action.
         if forward_guidance(self.camera_kind()).is_some() {
             controls.into()
         } else {
-            column![
-                section(
-                    if recording {
-                        "Record to a file"
-                    } else {
-                        "Record or stream video"
-                    },
-                    None,
-                    p
-                ),
-                text(if recording {
-                    "Save this camera's video to a recording file."
-                } else {
-                    "Enter a video file path to record, or a stream URL to forward to a recorder."
-                })
-                .size(style::SMALL)
-                .color(p.secondary),
-                controls,
-            ]
-            .spacing(ROW_GAP)
-            .into()
+            column![section("Record or stream video", None, p), controls]
+                .spacing(ROW_GAP)
+                .into()
         }
+    }
+
+    /// Whether the Video tab streams to a URL rather than records: its
+    /// output is a URL, or was switched to one and is still being typed.
+    pub(super) fn forward_streams(&self) -> bool {
+        !Output::of(&self.forward_output).recording()
+            || (self.stream_draft && !self.forward_output.contains(['/', '\\', '.']))
+    }
+
+    /// Switch the Video tab between recording (`stream` false) and
+    /// streaming. Each side keeps what it held, for this run only, so
+    /// switching back restores it; a stream URL never reaches the prefs
+    /// from here, only through `forward_output` and `prefs::storable`.
+    pub(super) fn forward_mode(&mut self, stream: bool) {
+        if stream == self.forward_streams() {
+            return;
+        }
+        let output = std::mem::take(&mut self.forward_output);
+        if stream {
+            self.stashed_record = Some((output, self.record_to.selected.clone()));
+            self.forward_output = std::mem::take(&mut self.stashed_stream);
+            let _ = self
+                .record_to
+                .restore_selection(None, &mut self.forward_output);
+            self.stream_draft = true;
+        } else {
+            self.stashed_stream = output;
+            let (output, selected) = self
+                .stashed_record
+                .take()
+                .unwrap_or_else(|| (prefs::default_record_output(), None));
+            self.forward_output = output;
+            // A destination removed meanwhile leaves this computer chosen.
+            if self
+                .record_to
+                .restore_selection(selected, &mut self.forward_output)
+                .is_err()
+            {
+                let _ = self
+                    .record_to
+                    .restore_selection(None, &mut self.forward_output);
+            }
+            self.stream_draft = false;
+        }
+    }
+
+    /// Streaming: one field for the URL, and what it is for.
+    fn stream_location(
+        &self,
+        output_error: Option<String>,
+        p: &'static Palette,
+    ) -> Element<'_, Message> {
+        let mut content = column![
+            text_input("rtsp://host:8554/camera", &self.forward_output)
+                .name("Stream URL")
+                .invalid(output_error.clone())
+                .id("record-output")
+                .on_input(|value| Message::RecordPicker(destinations::Message::Output(value)))
+                .size(style::BODY)
+                .padding([6, 10])
+                .style(if output_error.is_some() {
+                    style::input_invalid
+                } else {
+                    style::input
+                }),
+        ]
+        .spacing(6);
+        if let Some(error) = output_error {
+            content = content.push(field_error(error, p));
+        }
+        content
+            .push(
+                text("Send live video to an RTSP, SRT, RTMP or UDP server such as MediaMTX.")
+                    .size(style::SMALL)
+                    .color(p.secondary),
+            )
+            .into()
+    }
+
+    /// Recording: where the next file goes, and behind a disclosure, the
+    /// destination and file name to change it. The disclosure shows itself
+    /// whenever its value is custom, wrong or names a destination.
+    fn record_location(
+        &self,
+        output_error: Option<String>,
+        p: &'static Palette,
+    ) -> Element<'_, Message> {
+        let selected = self.record_to.selected.is_some();
+        let custom = std::path::Path::new(&self.forward_output).file_name()
+            != std::path::Path::new(&prefs::default_record_output()).file_name();
+        let open = self.inspect.record_location_open
+            || output_error.is_some()
+            || selected
+            || custom
+            || self.forward_output.trim().is_empty();
+        let mut content = column![].spacing(ROW_GAP);
+        if !selected && !self.forward_output.trim().is_empty() {
+            content = content.push(self.saves_as(p));
+        }
+        let mut location = column![disclosure(
+            "Change location or file name",
+            (!open).then(|| pattern_summary(&self.forward_output)),
+            if open { 1.0 } else { 0.0 },
+            Message::InspectorDisclosure(Section::RecordLocation),
+            p,
+        )]
+        .spacing(ROW_GAP);
+        if open {
+            location = location.push(accessibility::mapped(
+                self.record_to
+                    .view(&self.forward_output, "File", p, output_error),
+                Message::RecordPicker,
+            ));
+        }
+        content.push(location).into()
+    }
+
+    /// "Saves as" the next recording's file name, and the folder it goes
+    /// in; the whole path on hover.
+    fn saves_as(&self, p: &'static Palette) -> Element<'_, Message> {
+        let preview = self.preview_of(&self.forward_output);
+        let (file, folder) = split_preview(&preview);
+        let mut lines = column![
+            row![
+                text("Saves as").size(style::SMALL).color(p.secondary),
+                one_line(file, style::SMALL, style::MONO, p.text)
+                    .keep_end()
+                    .width(Fill),
+            ]
+            .spacing(5)
+        ]
+        .spacing(2);
+        if !folder.is_empty() {
+            lines = lines.push(
+                one_line(format!("in {folder}"), style::SMALL, style::SANS, p.secondary)
+                    .keep_end()
+                    .width(Fill),
+            );
+        }
+        tip(
+            row![
+                container(icon(Icon::Folder, 12.0, p.secondary))
+                    .height(style::line_height(style::SMALL))
+                    .align_y(Alignment::Center),
+                lines
+            ]
+            .spacing(6)
+            .align_y(Alignment::Start),
+            format!(
+                "{preview}\n{{date}} and {{datetime}} fill in when recording; {{seq}} becomes the next free number"
+            ),
+        )
     }
 
     fn forward_field_error(&self, encoder: bool, p: &'static Palette) -> Element<'_, Message> {
@@ -2827,26 +3379,25 @@ impl Workbench {
         .spacing(ROW_GAP);
         if open {
             content = content
-                .push(form_row(
-                    "Requested budget",
-                    self.num(Num::QuotaGib),
-                    "GiB",
+                .push(reason(
+                    "Your limits. An app-wide policy can be stricter.",
                     p,
                 ))
+                .push(form_row("Use up to", self.num(Num::QuotaGib), "GiB", p))
                 .push(form_row(
-                    "Requested files",
+                    "Keep at most",
                     self.num(Num::QuotaFiles),
-                    "",
+                    "files",
                     p,
                 ))
                 .push(form_row(
-                    "Requested action",
+                    "When full",
                     pick_list(
                         &ON_FULL[..],
                         find(&ON_FULL, self.quota_action),
                         Message::OnFull,
                     )
-                    .name("Requested action when a storage limit is reached")
+                    .name("When a storage limit is reached")
                     .width(Fill)
                     .text_size(style::BODY)
                     .padding([5, 8])
@@ -2856,13 +3407,13 @@ impl Workbench {
                     p,
                 ))
                 .push(checkbox(
-                    "Request an age limit",
+                    "Delete captures older than a set age",
                     self.retention_enabled,
                     Message::RetentionEnabled,
                 ));
             if self.retention_enabled {
                 content = content.push(form_row(
-                    "Requested age",
+                    "Older than",
                     self.num(Num::RetentionDays),
                     "days",
                     p,
@@ -3052,9 +3603,10 @@ mod tests {
         let _ = bench.update(Message::InspectorDisclosure(Section::EncoderOptions));
         let mut tree = Tree::empty();
         let mut identities = None;
+        // Custom file names and URLs keep their field in view in either mode.
         for (invalid, output, bitrate) in [
             (true, "recording.unsupported", "invalid"),
-            (false, "recording.mkv", "4M"),
+            (false, "clips/run.mkv", "4M"),
             (false, "rtsp://localhost:8554/camera", "4M"),
         ] {
             let _ = bench.update(Message::RecordPicker(destinations::Message::Output(
@@ -3080,12 +3632,13 @@ mod tests {
                 iced::advanced::Layout::new(&node),
                 &renderer,
             );
+            let streams = !Output::of(output).recording();
             let (output_id, output_field) = native
                 .nodes
                 .iter()
                 .find(|(_, node)| {
                     node.role() == accessibility::Role::TextInput
-                        && node.label() == Some("Stream URL or file")
+                        && node.label() == Some(if streams { "Stream URL" } else { "File" })
                 })
                 .unwrap();
             let (bitrate_id, bitrate_field) = native
@@ -3139,9 +3692,14 @@ mod tests {
                 .unwrap();
             assert_eq!(start.1.is_disabled(), invalid);
             assert_eq!(start.1.supports_action(accesskit::Action::Click), !invalid);
-            let current = (*output_id, *bitrate_id);
-            if let Some(identities) = identities {
-                assert_eq!(current, identities);
+            // A field keeps its identity while its mode does; the bitrate
+            // field always.
+            let current = (*output_id, *bitrate_id, streams);
+            if let Some((output, bitrate, mode)) = identities {
+                assert_eq!(current.1, bitrate);
+                if mode == streams {
+                    assert_eq!(current.0, output);
+                }
             }
             identities = Some(current);
         }
@@ -3318,8 +3876,9 @@ mod tests {
         assert_eq!(names("Device"), ["DeviceModelName"]);
         assert_eq!(index.listed, 6, "AcquisitionStop folds into the Stream row");
         assert_eq!(index.labels[5], "Stream");
-        assert_eq!(index.labels[3], "Exposure Time");
-        assert!(index.words[3].contains("exposure time"));
+        assert_eq!(index.labels[3], "Exposure");
+        assert!(index.words[3].contains("exposuretime"));
+        assert_eq!(index.labels[0], "Gain");
     }
 
     #[test]

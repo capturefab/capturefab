@@ -24,6 +24,7 @@ pub(super) fn one_line<'a>(
         width: Length::Shrink,
         align_x: text::Alignment::Default,
         yields: false,
+        keep_end: false,
     }
 }
 
@@ -36,6 +37,8 @@ pub(super) struct OneLine<'a> {
     align_x: text::Alignment,
     /// See `yield_room`.
     yields: bool,
+    /// See `keep_end`.
+    keep_end: bool,
 }
 
 impl OneLine<'_> {
@@ -49,6 +52,13 @@ impl OneLine<'_> {
     /// still follow right after. The row must be free to fill its room.
     pub(super) fn yield_room(mut self) -> Self {
         self.yields = true;
+        self
+    }
+
+    /// Cuts the start instead of the end, "…/2026-10-17/clip.mp4", for
+    /// paths and file names whose end tells them apart.
+    pub(super) fn keep_end(mut self) -> Self {
+        self.keep_end = true;
         self
     }
 
@@ -91,6 +101,42 @@ pub(super) fn fit(content: &str, room: f32, mut width: impl FnMut(&str) -> f32) 
     Cow::Owned(shown)
 }
 
+/// Like `fit`, but keeps the end of the first line: "…" and the longest
+/// suffix, starting at a char boundary, that fits with it.
+pub(super) fn fit_end(
+    content: &str,
+    room: f32,
+    mut width: impl FnMut(&str) -> f32,
+) -> Cow<'_, str> {
+    let (line, more) = first_line(content);
+    if !more && width(line) <= room {
+        return Cow::Borrowed(line);
+    }
+    let cut = |start: usize| format!("…{}", line[start..].trim_start());
+    // Where a cut may start, longest suffix first; the empty one last.
+    let mut starts: Vec<usize> = line.char_indices().map(|(at, _)| at).collect();
+    if !more {
+        // The whole line did not fit, so it is no candidate.
+        starts.retain(|&at| at > 0);
+    }
+    starts.push(line.len());
+    // The first (longest) fitting cut, assuming narrower for later starts.
+    let (mut low, mut high) = (0, starts.len() - 1);
+    while low < high {
+        let mid = (low + high) / 2;
+        if width(&cut(starts[mid])) <= room {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    let shown = cut(starts[low]);
+    if width(&shown) > room {
+        return Cow::Borrowed("");
+    }
+    Cow::Owned(shown)
+}
+
 /// The first line of `content`, and whether anything but blank lines follows.
 fn first_line(content: &str) -> (&str, bool) {
     match content.split_once('\n') {
@@ -111,6 +157,7 @@ struct State<P> {
     whole: f32,
     /// The room `shown` was fitted to.
     room: Option<f32>,
+    keep_end: bool,
     shown: String,
     paragraph: P,
 }
@@ -124,6 +171,7 @@ impl<P: Default> Default for State<P> {
             align_x: text::Alignment::Default,
             whole: 0.0,
             room: None,
+            keep_end: false,
             shown: String::new(),
             paragraph: P::default(),
         }
@@ -159,7 +207,7 @@ where
         limits: &layout::Limits,
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<State<R::Paragraph>>();
-        let (size, font, align_x) = (self.size, self.font, self.align_x);
+        let (size, font, align_x, keep_end) = (self.size, self.font, self.align_x, self.keep_end);
         let shape = |content: &str| {
             R::Paragraph::with_text(text::Text {
                 content,
@@ -178,12 +226,14 @@ where
             let fresh = state.content != content
                 || state.size != size
                 || state.font != font
-                || state.align_x != align_x;
+                || state.align_x != align_x
+                || state.keep_end != keep_end;
             let (line, _) = first_line(content);
             let mut whole = None;
             if fresh {
                 content.clone_into(&mut state.content);
-                (state.size, state.font, state.align_x) = (size, font, align_x);
+                (state.size, state.font, state.align_x, state.keep_end) =
+                    (size, font, align_x, keep_end);
                 let paragraph = shape(line);
                 state.whole = paragraph.min_width();
                 whole = Some(paragraph);
@@ -191,13 +241,18 @@ where
             if fresh || state.room != Some(room) {
                 state.room = Some(room);
                 let full = state.whole;
-                let shown = fit(content, room, |candidate| {
+                let measure = |candidate: &str| {
                     if candidate == line {
                         full
                     } else {
                         shape(candidate).min_width()
                     }
-                });
+                };
+                let shown = if keep_end {
+                    fit_end(content, room, measure)
+                } else {
+                    fit(content, room, measure)
+                };
                 if fresh || *shown != state.shown {
                     state.paragraph = match whole {
                         Some(paragraph) if *shown == *line => paragraph,
@@ -336,6 +391,24 @@ mod tests {
         );
         assert_eq!(fit("connect failed\r\ncaused by", 90.0, tens), "connect…");
         assert_eq!(fit("connect failed\n\n  \n", 400.0, tens), "connect failed");
+    }
+
+    #[test]
+    fn kept_ends_start_with_an_ellipsis_that_fits() {
+        assert!(matches!(
+            fit_end("clip.mp4", 80.0, tens),
+            Cow::Borrowed("clip.mp4")
+        ));
+        assert_eq!(fit_end("~/Capturefab/2026-10-17", 110.0, tens), "…2026-10-17");
+        assert_eq!(fit_end("camera-####.mp4", 50.0, tens), "….mp4");
+        for room in [0.0, 5.0, 10.0, 35.0, 99.0, 139.0] {
+            let shown = fit_end("Pattern camera", room, tens);
+            assert!(tens(&shown) <= room, "{room}");
+            assert!("Pattern camera".ends_with(shown.trim_start_matches('…')));
+        }
+        assert_eq!(fit_end("Pattern camera", 9.0, tens), "");
+        assert_eq!(fit_end("Pattern camera", 10.0, tens), "…");
+        assert_eq!(fit_end("日本語 📷 camera", 50.0, tens), "…mera");
     }
 
     #[test]

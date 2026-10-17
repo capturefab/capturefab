@@ -467,7 +467,7 @@ impl Workbench {
     pub(super) fn inspector_shown(&self) -> bool {
         !self.image_mode
             && if self.inspector_docked() {
-                self.inspector_open
+                self.inspector_open && (!self.first_run_quiet() || self.inspector_summoned)
             } else {
                 self.inspector_peek
             }

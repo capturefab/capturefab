@@ -150,6 +150,56 @@ pub(super) fn range_number(value: f64) -> String {
     }
 }
 
+/// The unit a feature's caption shows: "µs" for "us", and "fps" for a
+/// frame rate's "Hz".
+pub(super) fn feature_unit(feature: &FeatureInfo) -> Option<&str> {
+    let unit = unit_label(feature.unit.as_deref()?);
+    Some(if unit == "Hz" && feature.name.contains("FrameRate") {
+        "fps"
+    } else {
+        unit
+    })
+}
+
+/// A long exposure in everyday units, "10 ms" or "1.5 s", for the caption
+/// under its field, which keeps the camera's microseconds. None below a
+/// millisecond, or for any other unit.
+pub(super) fn human_duration(feature: &FeatureInfo) -> Option<String> {
+    human_duration_of(feature, feature.value.as_ref()?.as_f64()?)
+}
+
+/// `human_duration` for `value` in the feature's unit, such as a draft.
+pub(super) fn human_duration_of(feature: &FeatureInfo, value: f64) -> Option<String> {
+    if !matches!(feature.unit.as_deref(), Some("us" | "usec")) || value.is_nan() || value < 1000.0 {
+        return None;
+    }
+    let trim = |text: String| text.trim_end_matches(".0").to_owned();
+    Some(if value >= 1_000_000.0 {
+        format!("{} s", trim(format!("{:.1}", value / 1_000_000.0)))
+    } else {
+        format!("{} ms", trim(format!("{:.1}", value / 1000.0)))
+    })
+}
+
+/// The caption for a draft the field cannot take: a plain "Too low" or
+/// "Too high" with the bound when the draft is a number out of range, else
+/// `raw`, the check's own words, unchanged.
+pub(super) fn draft_error_text(feature: &FeatureInfo, draft: &str, raw: &str) -> String {
+    let Some(value) = draft.trim().parse::<f64>().ok().filter(|v| v.is_finite()) else {
+        return raw.to_owned();
+    };
+    let unit = feature_unit(feature).map_or_else(String::new, |unit| format!(" {unit}"));
+    match (feature.min, feature.max) {
+        (Some(min), _) if value < min => {
+            format!("Too low: use at least {}{unit}", range_number(min))
+        }
+        (_, Some(max)) if value > max => {
+            format!("Too high: use at most {}{unit}", range_number(max))
+        }
+        _ => raw.to_owned(),
+    }
+}
+
 /// A feature's range and unit for the caption under its field, such as
 /// "10 – 1,000,000 µs"; empty when it has neither.
 pub(super) fn range_text(feature: &FeatureInfo) -> String {
@@ -159,7 +209,7 @@ pub(super) fn range_text(feature: &FeatureInfo) -> String {
         (None, Some(max)) => format!("max {}", range_number(max)),
         _ => String::new(),
     };
-    match feature.unit.as_deref().map(unit_label) {
+    match feature_unit(feature) {
         Some(unit) if range.is_empty() => unit.to_owned(),
         Some(unit) => format!("{range} {unit}"),
         None => range,
@@ -664,6 +714,65 @@ mod tests {
             "0 – 3.4e38"
         );
         assert_eq!(unit_label("Hz"), "Hz");
+    }
+
+    #[test]
+    fn long_exposures_read_in_milliseconds_or_seconds() {
+        let exposure = |value: f64, unit: &str| FeatureInfo {
+            unit: Some(unit.into()),
+            ..sample_feature("ExposureTime", "Float", json!(value))
+        };
+        assert_eq!(human_duration(&exposure(10_000.0, "us")).as_deref(), Some("10 ms"));
+        assert_eq!(human_duration(&exposure(12_345.0, "usec")).as_deref(), Some("12.3 ms"));
+        assert_eq!(human_duration(&exposure(999.0, "us")), None);
+        assert_eq!(
+            human_duration(&exposure(1_500_000.0, "us")).as_deref(),
+            Some("1.5 s")
+        );
+        assert_eq!(human_duration(&exposure(10_000.0, "ms")), None);
+        let mut rate = FeatureInfo {
+            unit: Some("Hz".into()),
+            min: Some(1.0),
+            max: Some(120.0),
+            ..sample_feature("AcquisitionFrameRate", "Float", json!(30.0))
+        };
+        assert_eq!(range_text(&rate), "1 – 120 fps");
+        rate.name = "LineTriggerRate".into();
+        assert_eq!(range_text(&rate), "1 – 120 Hz");
+    }
+
+    #[test]
+    fn out_of_range_drafts_read_plainly_and_other_errors_pass_through() {
+        let feature = FeatureInfo {
+            unit: Some("us".into()),
+            min: Some(10.0),
+            max: Some(1_000_000.0),
+            ..sample_feature("ExposureTime", "Float", json!(100.0))
+        };
+        let raw = |draft: &str| format!("{:#}", feature.validate_input(draft).unwrap_err());
+        assert_eq!(
+            draft_error_text(&feature, "5", &raw("5")),
+            "Too low: use at least 10 µs"
+        );
+        assert_eq!(
+            draft_error_text(&feature, "2000000", &raw("2000000")),
+            "Too high: use at most 1,000,000 µs"
+        );
+        assert_eq!(draft_error_text(&feature, "fast", &raw("fast")), raw("fast"));
+        let unitless = FeatureInfo {
+            unit: None,
+            min: Some(0.0),
+            max: Some(24.0),
+            inc: Some(2.0),
+            ..sample_feature("Gain", "Integer", json!(0))
+        };
+        assert_eq!(
+            draft_error_text(&unitless, "-1", "raw"),
+            "Too low: use at least 0"
+        );
+        // An increment error is the check's own.
+        let error = format!("{:#}", unitless.validate_input("3").unwrap_err());
+        assert_eq!(draft_error_text(&unitless, "3", &error), error);
     }
 
     #[test]

@@ -146,7 +146,10 @@ fn collapsed_features_are_searchable_and_disclosures_retain_drafts_and_editor_id
     named(&searched, "Width");
     app.search = "exposure duration".into();
     let searched = snapshot(&app, Tab::Features, &mut tree, &renderer);
-    named(&searched, "Exposure Time");
+    named(&searched, "Exposure");
+    app.search = "exposuretime".into();
+    let searched = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    named(&searched, "Exposure");
 
     app.search = "VendorSpecial".into();
     let searched = snapshot(&app, Tab::Features, &mut tree, &renderer);
@@ -245,7 +248,7 @@ fn active_automatic_sessions_prioritize_review_without_moving_editors_on_suggest
     let mut app = app();
     let mut tree = Tree::empty();
     let manual = snapshot(&app, Tab::Capture, &mut tree, &renderer);
-    let output_id = named(&manual, "Output path").0;
+    let output_id = output_control(&manual).0;
     app.snapshot.capture_session = Some(crate::autocapture::SessionStatus {
         path: "/isolated/review.duckdb".into(),
         camera: "sim:0".into(),
@@ -261,10 +264,10 @@ fn active_automatic_sessions_prioritize_review_without_moving_editors_on_suggest
         model: "Session exemplar kNN".into(),
     });
     let active = snapshot(&app, Tab::Capture, &mut tree, &renderer);
-    assert_eq!(named(&active, "Output path").0, output_id);
+    assert_eq!(output_control(&active).0, output_id);
     let (review_id, review) = named(&active, "Review suggestions (0)");
     let review_bounds = review.bounds().unwrap();
-    assert!(review_bounds.y1 < named(&active, "Output path").1.bounds().unwrap().y0);
+    assert!(review_bounds.y1 < output_control(&active).1.bounds().unwrap().y0);
     assert!(
         review_bounds.y1 < 360.0,
         "review is among the first visible actions"
@@ -274,10 +277,10 @@ fn active_automatic_sessions_prioritize_review_without_moving_editors_on_suggest
     let (current_id, review) = named(&suggestions, "Review suggestions (3)");
     assert_eq!(current_id, review_id);
     assert_eq!(review.bounds(), Some(review_bounds));
-    assert_eq!(named(&suggestions, "Output path").0, output_id);
+    assert_eq!(output_control(&suggestions).0, output_id);
     app.snapshot.capture_session = None;
     let closed = snapshot(&app, Tab::Capture, &mut tree, &renderer);
-    assert_eq!(named(&closed, "Output path").0, output_id);
+    assert_eq!(output_control(&closed).0, output_id);
 }
 
 #[test]
@@ -314,4 +317,443 @@ fn the_schedule_command_shows_its_form_in_folded_capture_options() {
             .iter()
             .any(|(_, node)| node.label() == Some("Capture interval"))
     );
+}
+
+/// The node a default capture output is edited through: the raw "Output
+/// path" field, or the "File names" choice that may replace it.
+fn output_control(tree: &accesskit::TreeUpdate) -> (accesskit::NodeId, &accesskit::Node) {
+    if tree
+        .nodes
+        .iter()
+        .any(|(_, node)| node.label() == Some("Output path"))
+    {
+        named(tree, "Output path")
+    } else {
+        named(tree, "File names")
+    }
+}
+
+fn labels(tree: &accesskit::TreeUpdate) -> Vec<&str> {
+    tree.nodes.iter().filter_map(|(_, node)| node.label()).collect()
+}
+
+/// A workbench opened from what `app` would save, as on the next launch.
+fn relaunched(app: &Workbench) -> Workbench {
+    let mut next = Workbench::new(
+        SessionHandle::new(),
+        "disclosures".into(),
+        true,
+        Some(app.prefs()),
+    );
+    next.snapshot = app.snapshot.clone();
+    next.capture_to = destinations::Picker::new(false, false);
+    next.record_to = destinations::Picker::new(false, true);
+    next.tick_inspector();
+    next
+}
+
+#[test]
+fn opened_feature_groups_are_remembered_for_the_next_launch() {
+    let renderer = destinations::layout_tests::renderer();
+    let mut app = app();
+    assert!(app.prefs().open_sections.is_empty());
+    let _ = app.update(Message::InspectorDisclosure(Section::Features("Image")));
+    assert_eq!(app.prefs().open_sections, ["features:Image"]);
+    let next = relaunched(&app);
+    assert!(next.inspect.feature_groups_open.contains("Image"));
+    let mut tree = Tree::empty();
+    let features = snapshot(&next, Tab::Features, &mut tree, &renderer);
+    assert_eq!(named(&features, "Image").1.is_expanded(), Some(true));
+    named(&features, "Width");
+    // Closed again, it is forgotten.
+    let _ = app.update(Message::InspectorDisclosure(Section::Features("Image")));
+    assert!(app.prefs().open_sections.is_empty());
+}
+
+#[test]
+fn unknown_remembered_sections_are_ignored_and_dropped() {
+    let prefs = prefs::Prefs {
+        open_sections: vec![
+            "features:No such group".into(),
+            "telemetry".into(),
+            "features:Device".into(),
+        ],
+        ..Default::default()
+    };
+    let app = Workbench::new(SessionHandle::new(), "disclosures".into(), true, Some(prefs));
+    assert_eq!(app.inspect.feature_groups_open.len(), 1);
+    assert_eq!(app.prefs().open_sections, ["features:Device"]);
+}
+
+#[test]
+fn capture_tags_and_storage_reopen_where_they_were_left_without_turning() {
+    let renderer = destinations::layout_tests::renderer();
+    let mut app = app();
+    let _ = app.update(Message::InspectorDisclosure(Section::CaptureTags));
+    let _ = app.update(Message::ToggleStorage);
+    assert_eq!(app.prefs().open_sections, ["capture-tags", "storage"]);
+    let next = relaunched(&app);
+    assert!(next.storage_open);
+    assert!(
+        !next.inspect.storage_turn.animating(next.now),
+        "remembered state shows at rest"
+    );
+    assert_eq!(next.inspect.storage_turn.get(next.now), 1.0);
+    let mut tree = Tree::empty();
+    let capture = snapshot(&next, Tab::Capture, &mut tree, &renderer);
+    named(&capture, "Capture tag Line");
+    named(&capture, "Capture tag Station");
+    named(&capture, "When a storage limit is reached");
+}
+
+#[test]
+fn a_section_shown_for_an_invalid_value_is_not_remembered_open() {
+    let renderer = destinations::layout_tests::renderer();
+    let mut app = app();
+    app.forward_bitrate = "invalid".into();
+    let mut tree = Tree::empty();
+    let video = snapshot(&app, Tab::Forward, &mut tree, &renderer);
+    assert_eq!(named(&video, "Video settings").1.is_expanded(), Some(true));
+    assert!(!app.prefs().open_sections.contains(&"video-settings".into()));
+    let _ = app.update(Message::InspectorDisclosure(Section::EncoderOptions));
+    assert!(app.prefs().open_sections.contains(&"video-settings".into()));
+}
+
+#[test]
+fn expand_all_opens_every_group_and_collapse_all_closes_them() {
+    let renderer = destinations::layout_tests::renderer();
+    let mut app = app();
+    let mut tree = Tree::empty();
+    let folded = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    named(&folded, "Expand all");
+    assert!(labels(&folded).contains(&"6 settings"));
+    let _ = app.update(Message::ExpandFeatureGroups(true));
+    let groups: Vec<_> = app.inspect.index.groups.iter().map(|(g, _)| *g).collect();
+    assert!(
+        groups
+            .iter()
+            .all(|group| app.inspect.feature_groups_open.contains(group))
+    );
+    let open = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    named(&open, "Collapse all");
+    named(&open, "Vendor Special");
+    let _ = app.update(Message::InspectorDisclosure(Section::Features(groups[0])));
+    let one_closed = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    named(&one_closed, "Collapse all");
+    let _ = app.update(Message::ExpandFeatureGroups(false));
+    assert!(app.inspect.feature_groups_open.is_empty());
+    app.search = "gain".into();
+    let searching = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    assert!(
+        !labels(&searching)
+            .iter()
+            .any(|label| *label == "Expand all" || *label == "Collapse all"),
+        "searching reveals matches itself"
+    );
+}
+
+#[test]
+fn the_manual_exposure_card_explains_auto_and_toggles_the_histogram() {
+    let renderer = destinations::layout_tests::renderer();
+    let mut app = app();
+    let profile = &mut app.snapshot.connected.as_mut().unwrap().profile;
+    profile.kind = CameraKind::AreaScan;
+    profile.capabilities = vec![crate::camera_profile::CameraCapability::Exposure];
+    app.exposure_open = false;
+    let mut tree = Tree::empty();
+    let manual = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    assert!(labels(&manual).iter().any(|label| label.contains("choose Auto")));
+    let hint = |what: &str, action: Action| action.hint(what, Os::CURRENT);
+    let show = hint("Show the histogram", Action::ToggleExposure);
+    assert!(labels(&manual).contains(&show.as_str()), "{:?}", labels(&manual));
+    let focus = hint("Show the focus aid", Action::ToggleFocusRegion);
+    assert!(labels(&manual).contains(&focus.as_str()));
+    let _ = app.update(Message::ToggleExposure);
+    assert!(app.exposure_open);
+    let shown = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let hide = hint("Hide the histogram", Action::ToggleExposure);
+    assert!(labels(&shown).contains(&hide.as_str()));
+}
+
+#[test]
+fn quick_sliders_draft_while_dragging_and_apply_once_on_release() {
+    let renderer = destinations::layout_tests::renderer();
+    let mut app = app();
+    let exposure = app
+        .snapshot
+        .features
+        .iter_mut()
+        .find(|f| f.name == "ExposureTime")
+        .unwrap();
+    exposure.kind = "Float".into();
+    exposure.min = Some(10.0);
+    exposure.max = Some(1_000_000.0);
+    exposure.value = Some(serde_json::json!(10_000.0));
+    exposure.unit = Some("us".into());
+    let mut tree = Tree::empty();
+    let features = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let slider = features
+        .nodes
+        .iter()
+        .find(|(_, node)| node.role() == accessibility::Role::Slider && node.label() == Some("Exposure"))
+        .expect("the quick exposure control slides");
+    assert_eq!(slider.1.numeric_value(), Some(10_000.0));
+    assert!(labels(&features).contains(&"10 ms"));
+    let sets = |app: &Workbench| {
+        app.pending
+            .iter()
+            .filter(|pending| pending.job == Job::Set("ExposureTime".into()))
+            .count()
+    };
+    for value in ["12000", "15000", "20000"] {
+        let _ = app.update(Message::Draft("ExposureTime".into(), value.into()));
+    }
+    assert_eq!(sets(&app), 0, "dragging only drafts");
+    let _ = app.update(Message::Commit("ExposureTime".into()));
+    assert_eq!(sets(&app), 1, "releasing applies once");
+}
+
+#[test]
+fn an_out_of_range_draft_reads_plainly_and_keeps_the_raw_description() {
+    let renderer = destinations::layout_tests::renderer();
+    let mut app = app();
+    let exposure = app
+        .snapshot
+        .features
+        .iter_mut()
+        .find(|f| f.name == "ExposureTime")
+        .unwrap();
+    exposure.min = Some(10.0);
+    exposure.max = Some(1_000_000.0);
+    exposure.unit = Some("us".into());
+    let raw = format!("{:#}", exposure.validate_input("5").unwrap_err());
+    app.edits.insert("ExposureTime".into(), "5".into());
+    let mut tree = Tree::empty();
+    let features = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let field = features
+        .nodes
+        .iter()
+        .find(|(_, node)| {
+            node.role() == accessibility::Role::TextInput && node.label() == Some("Exposure")
+        })
+        .map(|(_, node)| node)
+        .unwrap();
+    assert_eq!(field.invalid(), Some(accesskit::Invalid::True));
+    assert_eq!(field.description(), Some(raw.as_str()));
+    assert!(labels(&features).contains(&"Too low: use at least 10 µs"));
+}
+
+#[test]
+fn the_next_capture_names_its_file_and_folder_apart() {
+    let renderer = destinations::layout_tests::renderer();
+    let mut app = app();
+    app.output = prefs::default_capture_output();
+    let preview = app.output_preview();
+    let (file, folder) = split_preview(&preview);
+    let camera = crate::naming::camera_label(app.snapshot.connected.as_ref().unwrap());
+    assert!(file.starts_with(&camera), "{file}");
+    assert!(file.ends_with(".png"), "{file}");
+    if std::env::var_os("HOME").is_some_and(|home| !home.is_empty()) && !cfg!(windows) {
+        assert!(folder.starts_with('~'), "{folder}");
+    }
+    assert_eq!(split_preview("clip.png"), ("clip.png".into(), String::new()));
+    assert_eq!(split_preview("/clip.png"), ("clip.png".into(), "/".into()));
+    assert_eq!(
+        split_preview("C:\\captures\\clip.png"),
+        ("clip.png".into(), "C:\\captures".into())
+    );
+    let mut tree = Tree::empty();
+    let capture = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    assert!(
+        labels(&capture)
+            .iter()
+            .any(|label| label.starts_with("Next file"))
+    );
+    assert!(labels(&capture).contains(&file.as_str()));
+}
+
+#[test]
+fn storage_limits_read_in_plain_words() {
+    let renderer = destinations::layout_tests::renderer();
+    let mut app = app();
+    let _ = app.update(Message::ToggleStorage);
+    let _ = app.update(Message::RetentionEnabled(true));
+    let mut tree = Tree::empty();
+    let capture = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    for label in [
+        "Use up to",
+        "Keep at most",
+        "When full",
+        "When a storage limit is reached",
+        "Delete captures older than a set age",
+        "Older than",
+        "Your limits. An app-wide policy can be stricter.",
+    ] {
+        assert!(labels(&capture).contains(&label), "missing {label}");
+    }
+    assert!(
+        !labels(&capture)
+            .iter()
+            .any(|label| label.starts_with("Requested"))
+    );
+}
+
+#[test]
+fn switching_to_a_stream_and_back_restores_the_recording_exactly() {
+    let mut app = app();
+    let template = "clips/{camera}-{seq}.mkv".to_owned();
+    app.forward_output = template.clone();
+    let command = format!("{:?}", app.forward_command());
+    let _ = app.update(Message::ForwardMode(true));
+    assert!(app.forward_streams());
+    assert_eq!(app.forward_output, "");
+    assert_eq!(app.record_to.selected, None);
+    let _ = app.update(Message::RecordPicker(destinations::Message::Output(
+        "rtsp://user:pass@host:8554/live".into(),
+    )));
+    let _ = app.update(Message::ForwardMode(false));
+    assert!(!app.forward_streams());
+    assert_eq!(app.forward_output, template);
+    assert_eq!(
+        format!("{:?}", app.forward_command()),
+        command,
+        "the same output sends the same command"
+    );
+    let saved = serde_json::to_string(&app.prefs()).unwrap();
+    assert!(!saved.contains("user:pass"), "a stashed URL never reaches the prefs");
+    // Back to the stream: its URL returns.
+    let _ = app.update(Message::ForwardMode(true));
+    assert_eq!(app.forward_output, "rtsp://user:pass@host:8554/live");
+    // Undo takes the switch back.
+    let _ = app.update(Message::Undo);
+    assert_eq!(app.forward_output, template);
+}
+
+#[test]
+fn recording_switched_to_first_starts_from_the_default_template() {
+    let mut app = app();
+    app.forward_output = "rtsp://127.0.0.1:8554/line-1".into();
+    let _ = app.update(Message::ForwardMode(false));
+    assert_eq!(app.forward_output, prefs::default_record_output());
+    assert_eq!(app.record_to.selected, None);
+    let _ = app.update(Message::ForwardMode(true));
+    assert_eq!(app.forward_output, "rtsp://127.0.0.1:8554/line-1");
+}
+
+#[test]
+fn a_stream_shows_one_url_field_and_nothing_about_files() {
+    let renderer = destinations::layout_tests::renderer();
+    let mut app = app();
+    app.forward_output = "rtsp://127.0.0.1:8554/line-1".into();
+    let _ = app.update(Message::InspectorDisclosure(Section::EncoderOptions));
+    let mut tree = Tree::empty();
+    let video = snapshot(&app, Tab::Forward, &mut tree, &renderer);
+    let field = named(&video, "Stream URL").1;
+    assert_eq!(field.value(), Some("rtsp://127.0.0.1:8554/line-1"));
+    named(&video, "Start forwarding");
+    for absent in ["Save destination", "Storage & retention", "Maximum file size"] {
+        assert!(!labels(&video).contains(&absent), "{absent} shows");
+    }
+    assert_eq!(
+        named(&video, "Stream to URL").1.toggled(),
+        Some(accesskit::Toggled::True)
+    );
+}
+
+#[test]
+fn an_empty_output_asks_once_without_a_red_field() {
+    let renderer = destinations::layout_tests::renderer();
+    for stream in [false, true] {
+        let mut app = app();
+        if stream {
+            let _ = app.update(Message::ForwardMode(true));
+        } else {
+            app.forward_output.clear();
+        }
+        let mut tree = Tree::empty();
+        let video = snapshot(&app, Tab::Forward, &mut tree, &renderer);
+        let field = named(&video, if stream { "Stream URL" } else { "File" }).1;
+        assert_eq!(field.invalid(), None);
+        let asks: Vec<_> = labels(&video)
+            .into_iter()
+            .filter(|label| label.starts_with("Enter a"))
+            .collect();
+        assert_eq!(asks.len(), 1, "{asks:?}");
+        assert!(
+            !labels(&video)
+                .iter()
+                .any(|label| label.contains("output needs") || label.contains("must")),
+            "{:?}",
+            labels(&video)
+        );
+        assert!(named(&video, if stream { "Start forwarding" } else { "Start recording" })
+            .1
+            .is_disabled());
+    }
+    // A wrong value says so once, at its field.
+    let mut app = app();
+    app.forward_output = "recording.unsupported".into();
+    let mut tree = Tree::empty();
+    let video = snapshot(&app, Tab::Forward, &mut tree, &renderer);
+    let error = crate::media::validate_forward_output("recording.unsupported")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        labels(&video).iter().filter(|label| **label == error).count(),
+        1,
+        "{:?}",
+        labels(&video)
+    );
+}
+
+#[test]
+fn a_capture_output_error_is_said_once() {
+    let renderer = destinations::layout_tests::renderer();
+    let mut app = app();
+    app.output = "rtsp://host/live".into();
+    let mut tree = Tree::empty();
+    let capture = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    let error = crate::engine::validate_capture_output("rtsp://host/live")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        labels(&capture).iter().filter(|label| **label == error).count(),
+        1
+    );
+}
+
+#[test]
+fn the_default_recording_shows_where_it_saves_and_folds_its_field() {
+    let renderer = destinations::layout_tests::renderer();
+    let mut app = app();
+    app.forward_output = prefs::default_record_output();
+    let mut tree = Tree::empty();
+    let video = snapshot(&app, Tab::Forward, &mut tree, &renderer);
+    assert!(!labels(&video).contains(&"File"), "the field waits folded");
+    let location = named(&video, "Change location or file name").1;
+    assert_eq!(location.is_expanded(), Some(false));
+    assert_eq!(
+        location.description(),
+        Some("Named by date, camera, time and number")
+    );
+    let now = chrono::Local::now();
+    let (file, _) = split_preview(&app.preview_at(&app.forward_output, now));
+    assert!(file.contains("####"), "{file}");
+    assert!(file.ends_with(".mp4"));
+    assert!(
+        labels(&video)
+            .iter()
+            .any(|label| label.ends_with("-####.mp4"))
+    );
+    let _ = app.update(Message::InspectorDisclosure(Section::RecordLocation));
+    assert_eq!(app.prefs().open_sections, ["record-location"]);
+    for output in ["clips/run.mkv", "recording.unsupported"] {
+        let mut app = super::disclosure_tests::app();
+        app.forward_output = output.into();
+        let video = snapshot(&app, Tab::Forward, &mut Tree::empty(), &renderer);
+        assert_eq!(named(&video, "File").1.value(), Some(output));
+        assert!(!app.prefs().open_sections.contains(&"record-location".into()));
+    }
+    assert_eq!(pattern_summary("clip.mkv"), "Custom name");
+    assert_eq!(pattern_summary("{camera}.mkv"), "Named by camera");
 }

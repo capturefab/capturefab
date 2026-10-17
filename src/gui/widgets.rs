@@ -200,6 +200,222 @@ pub(super) fn balance_slider<'a>(value: f64) -> Element<'a, Message> {
     .into()
 }
 
+/// How a quick control's slider maps its feature's range onto 0..=1:
+/// exposure on a log scale, since a tenth of a millisecond matters as much
+/// as ten; everything else evenly. Positions snap to the camera's increment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct FeatureScale {
+    min: f64,
+    max: f64,
+    inc: Option<f64>,
+    integer: bool,
+    log: bool,
+}
+
+impl FeatureScale {
+    /// The scale for feature `name` of GenICam `kind`, or None when its
+    /// range is missing, empty or too wide for a slider to be of use.
+    pub(super) fn new(
+        name: &str,
+        kind: &str,
+        min: Option<f64>,
+        max: Option<f64>,
+        inc: Option<f64>,
+    ) -> Option<Self> {
+        let (min, max) = (min?, max?);
+        if !(min.is_finite() && max.is_finite() && min < max) {
+            return None;
+        }
+        let integer = matches!(kind, "Integer" | "IntReg" | "MaskedIntReg");
+        if !integer && !kind.eq_ignore_ascii_case("float") {
+            return None;
+        }
+        let log = matches!(name, "ExposureTime" | "ExposureTimeAbs") && min > 0.0;
+        let fits = if log {
+            max / min < 1e7
+        } else {
+            max - min < 1e7
+        };
+        let inc = inc.filter(|inc| inc.is_finite() && *inc > 0.0);
+        fits.then_some(Self {
+            min,
+            max,
+            inc,
+            integer,
+            log,
+        })
+    }
+
+    /// Where `value` sits, from 0 at the minimum to 1 at the maximum.
+    pub(super) fn position(&self, value: f64) -> f64 {
+        let value = value.clamp(self.min, self.max);
+        let at = if self.log {
+            (value / self.min).ln() / (self.max / self.min).ln()
+        } else {
+            (value - self.min) / (self.max - self.min)
+        };
+        at.clamp(0.0, 1.0)
+    }
+
+    /// The value at `position`, snapped and within the range.
+    pub(super) fn value(&self, position: f64) -> f64 {
+        let position = position.clamp(0.0, 1.0);
+        let value = if self.log {
+            self.min * (self.max / self.min).powf(position)
+        } else {
+            self.min + position * (self.max - self.min)
+        };
+        self.snap(value)
+    }
+
+    /// `value` on the camera's increment, or a round figure: three
+    /// significant digits on a log scale, a hundredth of the decade evenly.
+    pub(super) fn snap(&self, value: f64) -> f64 {
+        let value = value.clamp(self.min, self.max);
+        let snapped = if let Some(inc) = self.inc {
+            self.min + ((value - self.min) / inc).round() * inc
+        } else {
+            let decade = if self.log {
+                value.abs().max(f64::MIN_POSITIVE)
+            } else {
+                self.max - self.min
+            };
+            let mut unit = 10f64.powf(decade.log10().floor() - 2.0);
+            if self.integer {
+                unit = unit.max(1.0).round();
+            }
+            (value / unit).round() * unit
+        };
+        let snapped = if self.integer {
+            snapped.round()
+        } else {
+            snapped
+        };
+        // A step that would land past a bound stays on the last one inside.
+        if snapped > self.max {
+            snapped - self.inc.unwrap_or(0.0).max(if self.integer { 1.0 } else { 0.0 })
+        } else if snapped < self.min {
+            self.min
+        } else {
+            snapped
+        }
+        .clamp(self.min, self.max)
+    }
+
+    /// One step up or down from `value`: 5% on a log scale, else the
+    /// camera's increment or a hundredth of the range. Always moves while
+    /// there is room.
+    pub(super) fn step(&self, value: f64, up: bool) -> f64 {
+        let next = if self.log {
+            if up { value * 1.05 } else { value / 1.05 }
+        } else {
+            let step = self
+                .inc
+                .unwrap_or(if self.integer { 1.0 } else { (self.max - self.min) / 100.0 });
+            if up { value + step } else { value - step }
+        };
+        let mut snapped = self.snap(next);
+        if snapped == self.snap(value) {
+            let nudge = self.inc.unwrap_or(if self.integer { 1.0 } else { 0.0 });
+            if nudge > 0.0 {
+                snapped = self.snap(if up { value + nudge } else { value - nudge });
+            }
+        }
+        snapped
+    }
+
+    /// `value` as the field holds it: plain digits that parse back.
+    pub(super) fn text(&self, value: f64) -> String {
+        if self.integer {
+            format!("{value:.0}")
+        } else {
+            number(value)
+        }
+    }
+}
+
+/// A quick control's slider over feature `name`'s range: dragging drafts
+/// the value and releasing applies it once; keys and assistive technology
+/// step it and apply each step. `on_press` is what activating it does.
+pub(super) fn feature_slider<'a>(
+    name: &str,
+    label: &str,
+    value: f64,
+    scale: FeatureScale,
+    on_press: Message,
+) -> Element<'a, Message> {
+    let drafted = name.to_owned();
+    let committed = name.to_owned();
+    let keyed = name.to_owned();
+    let set = name.to_owned();
+    let apply = move |value: f64| {
+        vec![
+            Message::Draft(keyed.clone(), scale.text(value)),
+            Message::Commit(keyed.clone()),
+        ]
+    };
+    let step = |up: bool| Message::Set(name.to_owned(), scale.text(scale.step(value, up)));
+    button(
+        iced::widget::slider(0.0..=1.0, scale.position(value), move |at| {
+            Message::Draft(drafted.clone(), scale.text(scale.value(at)))
+        })
+        .step(0.001)
+        .on_release(Message::Commit(committed))
+        .style(style::slide),
+    )
+    .name(label)
+    .role(accessibility::Role::Slider)
+    .value(scale.text(value))
+    .numeric_value(value, scale.min, scale.max, scale.inc.unwrap_or(0.0))
+    .increment(step(true))
+    .decrement(step(false))
+    .set_value(move |input| {
+        let value = input
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .map_or(value, |v| scale.snap(v));
+        Message::Set(set.clone(), scale.text(value))
+    })
+    .width(Fill)
+    .padding(0)
+    .style(style::bare)
+    .on_press(on_press)
+    .on_key_press(move |key, modifiers| {
+        use keyboard::{Key, key::Named};
+        let next = match key {
+            Key::Named(Named::ArrowRight | Named::ArrowUp) => {
+                let mut next = scale.step(value, true);
+                if modifiers.shift() {
+                    for _ in 0..9 {
+                        next = scale.step(next, true);
+                    }
+                }
+                next
+            }
+            Key::Named(Named::ArrowLeft | Named::ArrowDown) => {
+                let mut next = scale.step(value, false);
+                if modifiers.shift() {
+                    for _ in 0..9 {
+                        next = scale.step(next, false);
+                    }
+                }
+                next
+            }
+            Key::Named(Named::Home) => scale.min,
+            Key::Named(Named::End) => scale.snap(scale.max),
+            _ => return None,
+        };
+        Some(if scale.text(next) == scale.text(value) {
+            Vec::new()
+        } else {
+            apply(next)
+        })
+    })
+    .into()
+}
+
 fn balance_key_value(value: f64, key: &keyboard::Key, large_step: bool) -> Option<f64> {
     use keyboard::{Key, key::Named};
     let step = if large_step { 0.1 } else { 0.01 };
@@ -925,6 +1141,68 @@ pub(super) fn spark<'a, M: Clone + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exposure_slides_on_a_log_scale_between_its_bounds() {
+        let scale =
+            FeatureScale::new("ExposureTime", "Float", Some(10.0), Some(1_000_000.0), None)
+                .unwrap();
+        assert_eq!(scale.position(10.0), 0.0);
+        assert_eq!(scale.position(1_000_000.0), 1.0);
+        assert!((scale.position(1000.0) - 0.4).abs() < 1e-9, "log, not linear");
+        for value in [10.0, 37.0, 1234.0, 10_000.0, 999_000.0] {
+            let back = scale.value(scale.position(value));
+            assert!((back - value).abs() <= value * 0.01, "{value} → {back}");
+        }
+        assert!(scale.step(10_000.0, true) > 10_000.0);
+        assert!(scale.step(10_000.0, false) < 10_000.0);
+        assert_eq!(scale.step(1_000_000.0, true), 1_000_000.0);
+        assert_eq!(scale.text(scale.value(0.5)), "3160", "the geometric middle");
+    }
+
+    #[test]
+    fn integers_snap_to_their_increment_and_stay_in_range() {
+        let scale =
+            FeatureScale::new("ExposureTimeAbs", "Integer", Some(20.0), Some(100_000.0), Some(10.0))
+                .unwrap();
+        for at in [0.0, 0.13, 0.5, 0.77, 1.0] {
+            let value = scale.value(at);
+            assert_eq!((value - 20.0) % 10.0, 0.0, "{value}");
+            assert!((20.0..=100_000.0).contains(&value));
+            let back = scale.value(scale.position(value));
+            assert!((back - value).abs() <= 10.0, "{value} → {back}");
+        }
+        assert_eq!(scale.step(20.0, true), 30.0, "at least one increment");
+        assert_eq!(scale.snap(150_000.0), 100_000.0);
+    }
+
+    #[test]
+    fn gain_slides_evenly() {
+        let scale = FeatureScale::new("Gain", "Float", Some(0.0), Some(24.0), None).unwrap();
+        assert_eq!(scale.position(0.0), 0.0);
+        assert_eq!(scale.position(24.0), 1.0);
+        assert_eq!(scale.position(12.0), 0.5);
+        assert_eq!(scale.value(0.5), 12.0);
+        assert_eq!(scale.text(scale.value(0.25)), "6");
+        assert!((scale.step(12.0, true) - 12.2).abs() < 1e-9);
+        // An exposure that may be 0 cannot be logarithmic.
+        let zero = FeatureScale::new("ExposureTime", "Float", Some(0.0), Some(100.0), None).unwrap();
+        assert_eq!(zero.position(50.0), 0.5);
+    }
+
+    #[test]
+    fn unusable_ranges_get_no_slider() {
+        assert!(FeatureScale::new("Gain", "Float", None, Some(24.0), None).is_none());
+        assert!(FeatureScale::new("Gain", "Float", Some(24.0), Some(24.0), None).is_none());
+        assert!(FeatureScale::new("Gain", "Float", Some(0.0), Some(f64::INFINITY), None).is_none());
+        assert!(FeatureScale::new("Width", "Integer", Some(0.0), Some(1e9), None).is_none());
+        assert!(
+            FeatureScale::new("ExposureTime", "Float", Some(1.0), Some(1e8), None).is_none(),
+            "too many decades"
+        );
+        assert!(FeatureScale::new("PixelFormat", "Enumeration", Some(0.0), Some(4.0), None).is_none());
+    }
+
 
     #[test]
     fn shared_sheet_is_a_named_modal_dialog_with_retained_native_close() {
