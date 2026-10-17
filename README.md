@@ -1,10 +1,12 @@
 # capturefab
 
-A camera workbench with a native iced desktop and a scriptable CLI. Open `capturefab` to discover cameras, select a device, inspect its settings, and capture. The same executable runs headless and lets scripts or coding agents control an already visible GUI session.
+Capture camera images, video, sensor values and PLC tags on the plant floor, and keep them ready for analysis. Capturefab is a native desktop app and a scriptable CLI for manufacturing and process engineers who work on OT networks. It connects GigE Vision, USB3 Vision, webcams, RTSP/ONVIF cameras and document scanners; reads Modbus TCP, MQTT, OPC UA and MTConnect sources; and catalogs every saved file and sample in one DuckDB dataset. An export gives Parquet or CSV files plus a `README.md` and `manifest.json` that a notebook, a BI tool or an AI assistant such as Claude, ChatGPT or Gemini can read without more explanation.
 
-Capturefab is MIT-licensed. Its GigE Vision, USB3 Vision and GenICam implementation is Rust; media decoding, host-driver camera access and encoding use a bundled, source-built FFmpeg executable. Release binaries require no separately installed Aravis, FFmpeg, libusb, vendor SDK or Python. Operating-system graphics and camera drivers remain necessary.
+Everything runs on the local computer, with no cloud service. Files are never overwritten: captures get new names from templates such as `{camera}-{datetime}-{seq}.png`. Open `capturefab` to discover cameras, select a device, inspect its settings, and capture. The same executable runs headless and lets scripts or coding agents control an already visible GUI session.
 
-This is an initial implementation, not complete Aravis or vendor-SDK feature parity. The software is under rapid development; camera support and behavior may change between releases.
+Capturefab is MIT-licensed. Its GigE Vision, USB3 Vision, GenICam, Modbus TCP, MQTT, OPC UA and MTConnect clients are Rust; each signal source runs in its own helper process. Media decoding, host-driver camera access and encoding use a bundled, source-built FFmpeg executable. Release binaries require no separately installed Aravis, FFmpeg, libusb, vendor SDK or Python. Operating-system graphics and camera drivers remain necessary.
+
+This is an initial implementation, not complete Aravis or vendor-SDK feature parity. The software is under rapid development; camera, PLC and server support and behavior may change between releases.
 
 ## Start here
 
@@ -19,11 +21,15 @@ capturefab --camera sim:0 capture -o first.png
 capturefab --camera 192.168.1.10 features
 capturefab --camera 192.168.1.10 set ExposureTime=5000 Gain=0
 capturefab --camera 192.168.1.10 capture -n 10 -o frames
+capturefab --camera sim:0 capture -o 'line1/{date}/{camera}-{seq}.png' --context part=A-100 --dataset plant.duckdb
+capturefab signals read sim-signal://line1   # simulated line: temperature, pressure, counter, state
+capturefab log sim-signal://line1 --duration 1m --dataset plant.duckdb
+capturefab dataset export --file plant.duckdb -o plant-export
 ```
 
 Camera commands automatically use the only running GUI or `serve` session, so the workbench shows what an agent is doing. With no session, camera operations use a temporary worker. Use `--direct --camera ID` to request that explicitly; if several sessions are running, choose `--session NAME`. `--camera` can also come from `CAPTUREFAB_CAMERA`.
 
-Use `--json` for versioned machine-readable results. Human-readable output stays simple; diagnostics go to stderr; JSON success and error envelopes go to stdout; exit status reports failure. `--help`, `--version`, native shell completions and binary stdout follow normal shell conventions. Existing output files are never overwritten. A single filename or `{frame}` template infers its image format from `.png`, `.jpg`/`.jpeg`, `.raw`, `.pgm` or `.ppm`; directory sequences default to PNG, and `--format` overrides inference.
+Use `--json` for versioned machine-readable results. Human-readable output stays simple; diagnostics go to stderr; JSON success and error envelopes go to stdout; exit status reports failure. `--help`, `--version`, native shell completions and binary stdout follow normal shell conventions. Existing output files are never overwritten; see [name captures quickly](#name-captures-quickly). A single filename or template infers its image format from `.png`, `.jpg`/`.jpeg`, `.raw`, `.pgm` or `.ppm`; directory sequences default to PNG, and `--format` overrides inference.
 
 ```sh
 capturefab discover --json
@@ -36,6 +42,23 @@ capturefab doctor --json
 `schema --json` uses the same envelope as other JSON commands; its contract is in `result`, including a command tree with each option, default and accepted value. Plain `schema` prints the contract directly. `--timeout-ms` bounds a frame or transport operation; `--request-timeout 5m` sets the client deadline for a session request. A timed-out request can still finish in the session, so inspect `status` before retrying a write.
 
 Commands work from bash, zsh, fish, PowerShell, tmux, Ghostty, Warp, Claude Code, Codex, OpenCode and other tools that launch processes and read JSON. For repeatable multi-camera setup, use [JSON workflows](docs/cli-workflows.md) to avoid shell quoting and preserve an inspectable plan.
+
+## Plant-floor data for analysis
+
+A typical shift: open the desktop app (or `serve` on a headless line computer), connect the cameras, add the line's PLC or sensor sources, fill in the **Capture tags** (Line, Station, Part, Lot, Note), and capture or record. Each saved image and recording gets a row in the dataset, with its time, camera, path, SHA-256, destination and tags. Samples from every source go into the same file. The `captures_with_signals` view joins each capture with the latest value of every tag at that moment. At the end, `dataset export` writes an analysis bundle to a new folder.
+
+```sh
+capturefab serve --name line1 --dataset plant.duckdb
+# In another terminal, or from a coding agent:
+capturefab --session line1 signals start 'modbus-tcp://10.0.0.20/1/holding/0?type=f32&name=temp_c&unit=degC'
+capturefab --session line1 --camera 192.168.1.10 capture -o 'line1/{date}/{camera}-{datetime}-{seq}.png' \
+  --context line=L1 --context part=A-100
+capturefab --session line1 dataset note "changed nozzle" --context line=L1
+capturefab --session line1 dataset query "SELECT path, tag, value_double FROM captures_with_signals LIMIT 10"
+capturefab --session line1 dataset export -o exports/line1-shift-b
+```
+
+See the [plant-floor guide](docs/plant-floor.md) for a step-by-step task with simulators, and the sections below for [naming](#name-captures-quickly), [signals](#sensors-and-plcs), [datasets](#datasets-and-analysis-exports) and [FTP, SFTP and RustFS destinations](#save-to-drives-folders-s3-ftp-or-sftp).
 
 ## One session, many cameras
 
@@ -114,7 +137,7 @@ capturefab --session bench workflow apply examples/workflows/multi-camera-timela
 
 Workflow steps use the session RPC commands, can target different cameras, and reject unknown or duplicate fields. Files are limited to 1 MiB and 1–256 steps. Every step is validated before execution; live device capabilities and output availability are checked when each step runs. Execution stops at the first failure and retains earlier effects; JSON `error.details` identifies the failed step and completed results. Jobs and encoders remain in the session after the workflow command exits.
 
-Relative capture and recording paths resolve beside the workflow file; stdin workflows use the calling directory. Local `file:relative.mkv` and `sim:replay:relative-folder` sources use that same base, including workflow camera targets. Bare existing filenames are recognized as file sources. Ordinary CLI/RPC sources and outputs use the calling terminal's directory. Network/device locators and names inside `--destination` keep their meaning. Workflows require file outputs for captures. See the [workflow guide and runnable examples](docs/cli-workflows.md) for timelapse, feeder scans and bounded recording.
+Relative capture and recording paths resolve beside the workflow file; stdin workflows use the calling directory. Local `file:relative.mkv` and `sim:replay:relative-folder` sources use that same base, including workflow camera targets. Bare existing filenames are recognized as file sources. Ordinary CLI/RPC sources and outputs use the calling terminal's directory. Network/device locators and names inside `--destination` keep their meaning. Workflows require file outputs for captures. Workflow steps can also open a dataset (`dataset_open`), start signal sources (`signal_start`), add notes and export; [plant-line.json](examples/workflows/plant-line.json) is an example. See the [workflow guide and runnable examples](docs/cli-workflows.md) for timelapse, feeder scans and bounded recording.
 
 ## Remote browser control
 
@@ -122,7 +145,7 @@ Build the WebAssembly client with `./web-client/build.sh`, then run a headless s
 
 ## Session analytics
 
-The desktop toolbar's **Analytics** button and the browser's **Capture insights** section show acquired frames, payload throughput, missed frames and camera contributions for the current session. DuckDB collects one-second samples in memory, retaining at most 24 hours and 250,000 rows; totals continue across camera reconnects. The HTTP listener exposes JSON readiness at `/health`, Prometheus counters and gauges at `/metrics`, and the Plotters chart at `/api/analytics.svg`. See [analytics and monitoring](docs/remote-control.md#analytics-and-monitoring) for the endpoint contract and retention limits.
+The desktop toolbar's **Analytics** button and the browser's **Capture insights** section show acquired frames, payload throughput, missed frames and camera contributions for the current session. DuckDB collects one-second samples in memory, retaining at most 24 hours and 250,000 rows; totals continue across camera reconnects. The HTTP listener exposes JSON readiness at `/health`, Prometheus counters and gauges at `/metrics`, the Plotters chart at `/api/analytics.svg`, and sensor and PLC sources with their latest values at `/api/signals`. See [analytics and monitoring](docs/remote-control.md#analytics-and-monitoring) for the endpoint contract and retention limits.
 
 The desktop also collects numeric video measurements from short prompts using OpenAI (ChatGPT), Gemini or Claude. Configure API keys in **Settings** using the OS credential store, or launch with `OPENAI_API_KEY`, `GEMINI_API_KEY` / `GOOGLE_API_KEY`, or `ANTHROPIC_API_KEY`. In **Analytics**, choose a model, add prompts such as “count the number of tubes” or “estimate the length of ribbon in meters,” and explicitly start collection on a live camera. Structured results feed DuckDB history and per-measurement charts. See [prompt-driven video analytics](docs/video-analytics.md) for setup, sampling and retention.
 
@@ -190,7 +213,7 @@ capturefab --camera 'scanner:sane:DEVICE' --timeout-ms 60000 capture \
 
 In the GUI, discover and connect a scanner, choose **Scan resolution**, **Scan mode** and **Scan source** in Features, then **Scan & save** in Capture. Scanner captures have a separate GUI timeout, initially 60 seconds; use `--timeout-ms 60000` for CLI scans. `ScanResolution` accepts 75–600 dpi (default 150), `ScanMode` is `Color`, `Gray` or `Lineart` (default `Color`), and `ScanSource` is `Default`, `Flatbed` or `Feeder` (default `Default`, keeping the driver's paper source). Drivers can support a subset of these settings; rejected settings fail without silently switching modes. SANE's explicit source names are `Flatbed` and `Automatic Document Feeder`; use `Default` for drivers with other source names. `CAPTUREFAB_SCANIMAGE` can point to a specific executable.
 
-Connecting or starting acquisition does not scan. Each capture requests one page; `-n` requests successive pages, including feeder pages. Multiple pages save as separate image files in a directory or `{frame}` template. Scans appear in the existing preview. Samples normalize to 8-bit RGB/grayscale with a 128 MiB page limit, using the existing PNG, JPEG, PGM, PPM and raw formats. PDF assembly and OCR are not included. Scanner forwarding and camera auto exposure return unsupported errors. Timeout, stop or disconnect terminates acquisition. Inspect `doctor --json` for the compiled feature and runtime availability.
+Connecting or starting acquisition does not scan. Each capture requests one page; `-n` requests successive pages, including feeder pages. Multiple pages save as separate image files in a directory or a template with `{frame}` or `{seq}`. Scans appear in the existing preview. Samples normalize to 8-bit RGB/grayscale with a 128 MiB page limit, using the existing PNG, JPEG, PGM, PPM and raw formats. PDF assembly and OCR are not included. Scanner forwarding and camera auto exposure return unsupported errors. Timeout, stop or disconnect terminates acquisition. Inspect `doctor --json` for the compiled feature and runtime availability.
 
 Scanner IDs and previously discovered scanner serials receive a 128 MiB frame ring per slot (cameras default to 16 MiB). Use full scanner IDs when opening scanners directly, or set `CAPTUREFAB_FRAME_BYTES` when connecting by an undiscovered serial. Each worker keeps three slots, and the existing 256 MiB maximum override remains available.
 
@@ -236,7 +259,89 @@ capturefab --session bench cancel 1
 
 Schedules return a job ID in a persistent session. A direct CLI waits for its job to finish. Jobs expose progress, the next capture time, errors and cancellation. Keep the GUI, headless session or direct command running; schedules do not survive process exit. Timestamps require an explicit timezone. Durations accept `ms`, `s`, `m`, `h`, `d`, or seconds without a suffix. Each frame has a bounded transport timeout. `stop` cancels pending capture jobs on its camera.
 
-Durations and timestamp fractions must resolve to whole milliseconds: `1.001s` is valid; `1.1ms` is rejected instead of rounded. Every frame in a schedule must fall within 10 years. A past timestamp starts immediately, and a zero RPC interval captures consecutive frames. Active jobs cannot reserve the same future output file on one camera. Capture paths support only the `{frame}` placeholder; use `forward` for network stream outputs.
+Durations and timestamp fractions must resolve to whole milliseconds: `1.001s` is valid; `1.1ms` is rejected instead of rounded. Every frame in a schedule must fall within 10 years. A past timestamp starts immediately, and a zero RPC interval captures consecutive frames. Two active jobs on one camera cannot reserve the same static output (a fixed filename, or a `{frame}`-only template, without `--on-exists number`); directories, `{seq}` templates and numbered outputs can be shared. Capture paths do not accept network URLs; use `forward` for stream outputs.
+
+## Name captures quickly
+
+Capture and local recording outputs are a file, a directory or a template. A template picks a new name for each file, so the same command or button can run again and again:
+
+| Placeholder | Value |
+| --- | --- |
+| `{camera}` | `model-serial`, limited to `A-Z a-z 0-9 . _ -` and 64 bytes; never the address |
+| `{date}` / `{time}` / `{datetime}` | `YYYY-MM-DD` / `HHMMSS` / `YYYYMMDD-HHMMSS`, local time when the frame is requested |
+| `{seq}` | Next free number for that folder and pattern, zero-padded to 4 or more digits |
+| `{frame}` | 1-based index within a multi-frame request, 6 digits |
+
+```sh
+capturefab --camera sim:0 capture -o 'line1/{date}/{camera}-{datetime}-{seq}.png'
+capturefab --camera sim:0 capture -n 5 -o 'burst/{camera}-{seq}-{frame}.png'
+capturefab --camera sim:0 capture -o shot.png --on-exists number    # shot-0001.png, shot-0002.png, ...
+capturefab --camera sim:0 record -o 'video/{camera}-{seq}.mp4' --duration 30s --context line=L1
+capturefab --camera sim:0 capture -o 'qa/{camera}-{seq}.png' --context line=L1 --context part=A-100 --json
+```
+
+`{seq}` may appear once, only in the file name, and never directly before a digit or `{date}`, `{time}`, `{datetime}` or `{frame}`. Any other `{name}` is a usage error (exit 2). With `-n` above 1, a template needs `{frame}` or `{seq}`, or `--on-exists number`. `--on-exists fail` (the CLI and RPC default) refuses an existing name; `number` writes `stem-0001.ext`, `stem-0002.ext` and so on. A directory output continues `frame-NNNNNN` after the highest existing number, so a rerun into the same folder adds files. If no free name is found after 64 attempts, the capture fails with exit 1.
+
+`--context KEY=VALUE` tags captures and recordings; keys match `^[a-z][a-z0-9_]{0,31}$`, with at most 16 entries of 256 bytes each. The JSON capture result is `{files, frames:[{id,width,height,pixel_format,timestamp_ns,bytes,wall_ms,file}], count, context?, destination?, queued_uploads?, queued?}`; `wall_ms` is UTC milliseconds. `record` returns `{forwarding, since_ms, path}` with the resolved file, and `status` shows `forwarding_since_ms` while it records.
+
+The desktop app saves to `~/Capturefab/{date}/{camera}-{datetime}-{seq}.png` by default, records to the same pattern with `.mp4`, and always numbers names that exist. **Next:** in the Capture panel shows the next file name. The toolbar **Record** button and Cmd/Ctrl-Shift-R start and stop a local recording, with an elapsed-time pill; the File menu has the same action. **Show in Finder** (Explorer, or the folder on Linux) opens the last capture or recording. The overview has **Capture all** and **Record all**; each camera writes its own file. **Capture tags** (Line, Station, Part, Lot, Note) are sent with every capture and recording as the context keys `line`, `station`, `part`, `lot` and `note`. The setting **Start the live view when a camera connects** is on by default and never starts a document scanner.
+
+## Sensors and PLCs
+
+Signal sources are URIs. Each source runs in a separate helper process, restarts at most five times after a failure, and never shares a process with a camera.
+
+| Protocol | URI |
+| --- | --- |
+| Modbus TCP | `modbus-tcp://HOST[:502]/UNIT/coil\|discrete\|input\|holding/ADDRESS[?count=N&type=u16\|i16\|u32\|i32\|f32\|f64\|bool&order=abcd\|cdab\|badc\|dcba&scale=F&offset=F&name=TAG&unit=UNIT]` |
+| MQTT | `mqtt[s]://[USER[:PASS]@]BROKER[:1883\|8883]/TOPIC_FILTER[?client_id=ID&qos=0\|1]` |
+| OPC UA | `opc.tcp://[USER[:PASS]@]HOST[:4840][/PATH]?node=NODE_ID[&node=...][&root=NODE_ID][&security=none]` |
+| MTConnect | `mtconnect[s]://HOST[:5000\|443][/DEVICE]` (polls `/current`) |
+| Simulator | `sim-signal://LINE[?tags=1..64]` |
+
+```sh
+capturefab signals read sim-signal://line1
+capturefab signals read 'modbus-tcp://10.0.0.20/1/holding/0?type=f32&name=temp_c&unit=degC' --json
+capturefab signals browse opc.tcp://10.0.0.30:4840 --duration 5s
+capturefab signals browse 'mqtt://broker.local/plant/#' --duration 10s --limit 200
+capturefab log sim-signal://line1 'mtconnect://10.0.0.40:5000/Mill1' --interval 1s --duration 10m \
+  --dataset plant.duckdb --csv line1.csv
+capturefab --session line1 signals start 'opc.tcp://10.0.0.30:4840?node=ns=2;s=Line1.Temp' --interval 500ms
+capturefab --session line1 signals --json
+capturefab --session line1 signals stop all
+```
+
+Modbus addresses are 0-based protocol addresses (Modicon `40001` is `holding/0`); a source reads at most 125 registers or 2000 bits, and `value = raw*scale+offset`. MQTT accepts numbers, `true`/`false`, JSON objects (flattened to `topic/field`, depth 4, 256 leaves; a `ts`, `timestamp` or `time` field becomes `source_ts_ms`) and text, with one sample per tag per interval. OPC UA uses SecurityPolicy None only, so a password travels unencrypted and the helper prints a warning; browse starts at `i=85` and goes four levels deep. MTConnect tags are `DEVICE/DATA_ITEM_ID`, and `UNAVAILABLE` has quality `bad`. Percent-encode `@` in topics and node IDs, and `/ ? # @` in credentials. Credentials are redacted in every output; source IDs are `signal:<16 hex>` from the redacted URI.
+
+`signals read` uses the global `--timeout-ms`; `browse` takes `--duration` (100 ms to 60 s) and `--limit` (1 to 5000) and is unsupported for Modbus (exit 5). `signals start` (interval 100 ms to 1 h, optional repeatable `--tag`) and `signals stop ID|all` need a running GUI or `serve` session. `log` takes 1 to 16 URIs, runs until `--duration` or Ctrl-C, and needs `--csv` (a new file) or `--dataset`. A session holds at most 16 sources and 4096 tags per source. `ts_ms` is the host clock (UTC milliseconds) when a value was read; `source_ts_ms` is the device clock. Without a dataset or CSV, samples are kept only as latest values and `signals` reports `persisting:false`. Dropped samples are always counted. Exit codes: 2 for a bad URI, 3 for a refused connection or unknown source ID, 4 for a timeout, 5 for a protocol not compiled into this build.
+
+In the desktop app, **Live signals** in the Capture panel has an **Add data source** field, recent URIs (only those without credentials are saved) and per-tag values with sparklines. The sidebar lists **Data sources** with a stop button. `GET /api/signals?history=1` returns the same status over HTTP. `doctor --json` reports the compiled protocols in `signals`.
+
+## Datasets and analysis exports
+
+A dataset is one `.duckdb` file owned by one session. It catalogs every saved capture and finished local recording, every signal tag and sample, and notes. `--dataset FILE.duckdb` (or `CAPTUREFAB_DATASET`) on `capture`, `record`, `serve`, `gui` and `log` creates or opens it; a session already recording to a different file refuses with an error.
+
+```sh
+capturefab --session line1 dataset open plant.duckdb --max-bytes 8GiB   # --new or --existing to be strict
+capturefab --session line1 dataset status
+capturefab --session line1 dataset note "shift B start" --context line=L1
+capturefab --session line1 dataset query "SELECT camera_id, count(*) FROM captures GROUP BY 1"
+capturefab --session line1 dataset export -o exports/shift-b --format parquet,csv
+capturefab --session line1 dataset close
+# A file no session holds:
+capturefab dataset status --file plant.duckdb
+capturefab dataset query --file plant.duckdb "SELECT * FROM captures_with_signals LIMIT 20" --json
+capturefab dataset export --file plant.duckdb -o plant-export --since 2026-10-17T06:00:00-04:00
+```
+
+Tables are `captures`, `recordings`, `signals`, `samples`, `events` and the view `captures_with_signals` (each capture with the latest sample of every tag at or before its `wall_ms`, plus `sample_age_ms`). Every `*_ms` column is UTC Unix milliseconds from the host clock; `context` is JSON text. A queued upload adds its `upload_id`, `object_key` and `remote_url` to the capture row.
+
+`dataset query` runs one read-only `SELECT` or `WITH` statement that cannot reach other files. It returns `{columns, rows, row_count, truncated}`: `--limit` 1 to 10,000 (default 1000), at most 8 MiB of JSON, a 30 s timeout, SQL up to 64 KiB. Large integers and decimals come back as strings. Without `--file`, `status`, `query` and `export` need a session; `--file` on a file a running session holds fails with exit 3 and names the session to use.
+
+`dataset export` writes into a new folder (an existing one is refused with exit 1) through the storage budget, which it checks before writing anything. It writes each table in Parquet and CSV by default (`--format csv,parquet,json,jsonl`, `--tables`, `--since`, `--until`), plus `captures_wide` with one column per tag (1 to 256 tags), a `manifest.json` (columns, types, descriptions, SHA-256 of each file, cameras, tag statistics) and a `README.md` with the time base, loading code for pandas, DuckDB and polars, and a short summary for AI tools. Images and videos stay at the paths in the tables.
+
+The dataset file plus its write-ahead log is limited to 8 GiB by default. Writes stop with `Storage full` (exit 6) below 512 MiB of free disk space. In the desktop app, the **Dataset** section of the Capture panel has **New…**, **Open…**, **Export…**, **Show in Finder** and **Close**. With **Catalog captures automatically** (on by default), the app creates `~/Capturefab/capturefab.duckdb` on the first saved file or signal sample and reopens the chosen dataset at the next start.
+
+Session RPC and workflow files use the same operations: `dataset_open {path, mode: auto|create|open, max_bytes?}`, `dataset_close`, `dataset_status`, `dataset_note {text, context?, camera?}`, `dataset_query {sql, limit, timeout_ms}`, `dataset_export {output, formats?, tables?, since_ms?, until_ms?}`, and for signals `signals`, `signal_read {uri, timeout_ms}`, `signal_browse {uri, duration_ms, limit}`, `signal_start {uri, interval_ms, tags?}` and `signal_stop {id}`. RPC paths must be absolute; `schema --json` has an example of each in `result.rpc.commands`, and its `result.dataset` and `result.signals` sections list the tables, URI forms, limits and exit codes.
 
 ## Bounded storage and retention
 
@@ -255,24 +360,38 @@ capturefab storage configure --max-space 2GiB --max-files 1000 --on-full stop
 
 The budget covers capture/recording data, not unrelated files on the disk. Runtime frame rings, queues and extracted FFmpeg are separately bounded. Use the same `CAPTUREFAB_SESSION_DIR` for sessions that should share a storage budget. Changing it creates a separate ledger and budget.
 
-## Save to external drives, folders or S3
+## Save to drives, folders, S3, FTP or SFTP
 
-Captures, schedules and local recordings can go to a saved **destination**: a folder (on an external, removable or network drive, or anywhere on disk) or an S3-compatible bucket (AWS S3, Cloudflare R2, Backblaze B2, MinIO, Wasabi). In the GUI, **Save to** in the Capture and Video panels lists destinations and connected external drives (one click saves to a `Capturefab` folder on the drive); **Manage…** adds folders with the system folder picker and buckets with provider presets, then tests them.
+Captures, schedules and local recordings can go to a saved **destination**: a folder (on an external, removable or network drive, or anywhere on disk), an S3-compatible bucket (AWS S3, Cloudflare R2, Backblaze B2, MinIO, RustFS, Wasabi), an FTP or FTPS server, or an SFTP server. In the GUI, **Save to** in the Capture and Video panels lists destinations and connected external drives (one click saves to a `Capturefab` folder on the drive); **Manage…** adds folders with the system folder picker and buckets with provider presets (**MinIO, RustFS or self-hosted** for a server on the plant network), then tests them. FTP and SFTP servers are added and changed with the CLI; the GUI lists them and uses them.
 
 ```sh
 capturefab volumes --json                                   # external, removable and network volumes
 capturefab destination add-folder usb "/Volumes/CAMDISK/Capturefab"
 capturefab destination add-s3 archive --bucket camera-archive --region us-east-1 \
   --prefix line-1/ --access-key-id AKIA... --secret-stdin < secret.txt
-capturefab destination add-s3 nas --bucket frames --endpoint http://nas.local:9000 --path-style --profile lab
+capturefab destination add-s3 nas --bucket frames --endpoint http://nas.local:9000 --preset rustfs --profile lab
+printf '%s' "$FTP_PASSWORD" | capturefab destination add-ftp qa-ftp --host ftp.plant.local \
+  --user camera --dir images --password-stdin
+capturefab destination add-sftp qa-sftp --host files.plant.local --user camera --dir /srv/images \
+  --host-key SHA256:... --key-file /home/me/.ssh/id_ed25519
+capturefab destination test nas --probe-writes
 capturefab --camera sim:0 capture -n 10 -o run-1 --destination archive
+capturefab --camera sim:0 capture -o '{date}/{camera}-{seq}.png' --destination qa-sftp
 capturefab --camera sim:0 record -o clip.mkv --duration 10 --destination usb
 capturefab uploads --json && capturefab uploads retry
 ```
 
-With a destination, `--output` is a name inside it (a file, a folder or a `{frame}` template). Every file is first written locally through the storage ledger, so budgets, retention and never-overwrite still apply. A folder on an external drive that is not mounted fails with `unavailable` (exit 3) rather than writing to the system disk. Bucket destinations stage files under the platform's data directory (`CAPTUREFAB_STAGING_DIR` overrides it) and a persistent queue uploads them with Signature Version 4 over HTTPS, trusting the operating system's certificates. Payloads are signed with their SHA-256 and writes are conditional, so an existing object is never replaced. Files over 64 MiB use multipart upload. Network and service errors are retried with backoff; refused credentials, a missing bucket or an existing key wait for `uploads retry`. After a verified upload the local copy is deleted, only if unchanged, unless the destination keeps local copies. The GUI and `serve` upload in the background; a direct CLI capture waits for its uploads (up to ten minutes) and reports them.
+With a destination, `--output` is a name inside it (a file, a folder or a template). Every file is first written locally through the storage ledger, so budgets, retention and never-overwrite still apply. A folder on an external drive that is not mounted fails with `unavailable` (exit 3) rather than writing to the system disk. Remote destinations stage files under the platform's data directory (`CAPTUREFAB_STAGING_DIR` overrides it) and a persistent queue uploads them. Network and service errors are retried with backoff; refused credentials, a missing bucket or folder, a changed host key or an existing remote file wait for `uploads retry`. After a verified upload the local copy is deleted, only if unchanged, unless the destination keeps local copies (`--keep-local`). The GUI and `serve` upload in the background; a direct CLI capture waits for its uploads (up to ten minutes) and reports them.
 
-Secrets never go into Capturefab's files or commands. `--access-key-id` keeps the secret in the operating system's credential store (macOS Keychain, Windows Credential Manager, Secret Service on Linux), read from stdin with `--secret-stdin` or typed into the GUI. Headless hosts can use a profile from the AWS shared credentials file (`--profile`) or `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` in the uploading process (`--env`). `http://` endpoints are allowed for local object stores: requests are still signed and the secret is never sent, but data is not encrypted.
+| Destination | Transport and trust | Never-overwrite rule |
+| --- | --- | --- |
+| S3-compatible bucket | Signature Version 4 over HTTPS, trusting the operating system's certificates; `http://` endpoints for local stores | Conditional writes (`If-None-Match`); `--check-first` looks the key up first, which leaves a short race |
+| FTP / FTPS | Explicit FTPS (`AUTH TLS`) by default; `--plain` sends files and password unencrypted | Uploads `.NAME.HASH.part`, checks size, then renames; most servers let a rename replace a file, so use one writer per folder |
+| SFTP | SSH with the host key pinned by its SHA256 fingerprint | Exclusive temporary file, then an SFTPv3 rename that refuses an existing name |
+
+S3 payloads are signed with their SHA-256 and files over 64 MiB use multipart upload. Some self-hosted services ignore conditional writes. `--preset minio|rustfs` (which needs `--endpoint` and uses path-style addressing) tests this when the destination is saved, as does `--probe-writes` on `add-s3` or `destination test`; when the service does not refuse a replacement, the destination switches to `check_first`. FTP servers without `SIZE` and `MLST` are refused, and plain FTP is checked by size only. An SFTP host key that changes stops the upload with exit 1 and names both fingerprints; `--accept-host-key` trusts the key the server presents at save time and prints its fingerprint. FTP and SFTP `destination test` writes and removes a small `.capturefab-write-test-*` file.
+
+Secrets never go into Capturefab's files or commands. `--access-key-id` and `--password-stdin` keep the secret in the operating system's credential store (macOS Keychain, Windows Credential Manager, Secret Service on Linux), read from stdin or typed into the GUI. Headless hosts can use a profile from the AWS shared credentials file (`--profile`), `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (`--env`), `CAPTUREFAB_FTP_PASSWORD` or `CAPTUREFAB_SFTP_PASSWORD` (`--password-env`) in the uploading process. With `--key-file`, the SFTP password options give the key's passphrase. `--anonymous` signs in to FTP without a password. Locations and URLs never contain the user name: `ftps://host:21/dir`, `sftp://host:22/dir`, `s3://bucket/key`. `uploads --json` lists `pending`, `uploading` and `failed` items, plus `completed_seq` and the last 20 `recent_completed` uploads with their SHA-256. `destination remove NAME --forget-secret` keeps a secret that another destination still uses. Older Capturefab versions refuse an upload queue that holds FTP or SFTP items.
 
 ## Webcams, streams and recording
 
@@ -318,12 +437,13 @@ Single-component image conversion also accepts `Coord3D_C8`, `Coord3D_C16`, `Con
 
 ```sh
 cargo build --release                              # Rust desktop; bundles FFmpeg when supplied
-cargo build --release --no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox # headless
+cargo build --release --no-default-features \
+  --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,parquet,modbus,mqtt,opcua,mtconnect   # headless release set
 cargo test
 cargo clippy --all-features --all-targets -- -D warnings
 ```
 
-The `jpeg` feature, enabled in both builds above, compiles libjpeg-turbo from source and needs a C compiler and CMake, plus NASM on x86 for its SIMD code. Source development builds can use `CAPTUREFAB_FFMPEG=/absolute/path/to/ffmpeg`. Release builds embed `CAPTUREFAB_FFMPEG_BINARY`, or the automatic path `target/ffmpeg/<target>/bin/ffmpeg[.exe]`. `CAPTUREFAB_FFMPEG_LICENSE` embeds the matching notice. The source build script pins and checksums FFmpeg, SRT, OpenSSL and x264, and includes source/license/build metadata with distributed binaries.
+Default features add S3, FTP/FTPS and SFTP destinations (`s3`, `ftp`, `sftp`), Parquet and JSON dataset exports (`parquet`) and the `modbus`, `mqtt`, `opcua` and `mtconnect` signal protocols; `doctor --json` lists what a binary has. The headless release set above leaves out the network upload destinations, and a build without `parquet` exports CSV only. The `jpeg` feature, enabled in both builds above, compiles libjpeg-turbo from source and needs a C compiler and CMake, plus NASM on x86 for its SIMD code. Source development builds can use `CAPTUREFAB_FFMPEG=/absolute/path/to/ffmpeg`. Release builds embed `CAPTUREFAB_FFMPEG_BINARY`, or the automatic path `target/ffmpeg/<target>/bin/ffmpeg[.exe]`. `CAPTUREFAB_FFMPEG_LICENSE` embeds the matching notice. The source build script pins and checksums FFmpeg, SRT, OpenSSL and x264, and includes source/license/build metadata with distributed binaries.
 
 The release tooling uses SemVer, a cross-platform build matrix, checksums, authenticated signing, actual rendered GUI and terminal screenshots, GitHub Releases and a static site on Cloudflare Workers with an Atom feed. Build tools are development dependencies; they are not runtime dependencies. Platform-specific signing credentials are optional configuration, not keys fabricated by this repository. See the release scripts and workflows for the exact configured build matrix.
 
@@ -331,4 +451,4 @@ Local automated verification includes public CLI calls, isolated camera subproce
 
 ## License
 
-Capturefab is licensed under the [MIT License](LICENSE), SPDX `MIT`. Release binaries also bundle a separately executed FFmpeg payload that remains GPLv3 (with x264 GPLv2-or-later, SRT MPLv2 and OpenSSL Apache-2.0); it is never linked into Capturefab. Redistribute FFmpeg's complete corresponding source, build scripts and notices with binaries that include it. FFmpeg source archives and its exact build manifest accompany releases; never substitute an untraceable binary or enable nonfree FFmpeg components. See [FFmpeg compliance notes](docs/ffmpeg-build.md).
+Capturefab is licensed under the [MIT License](LICENSE), SPDX `MIT`. Release binaries also bundle a separately executed FFmpeg payload that remains GPLv3 (with x264 GPLv2-or-later, SRT MPLv2 and OpenSSL Apache-2.0); it is never linked into Capturefab. Redistribute FFmpeg's complete corresponding source, build scripts and notices with binaries that include it. The release license output also lists the linked Rust crates; the MPL-2.0 async-opcua crates carry a link to their source. FFmpeg source archives and its exact build manifest accompany releases; never substitute an untraceable binary or enable nonfree FFmpeg components. See [FFmpeg compliance notes](docs/ffmpeg-build.md).

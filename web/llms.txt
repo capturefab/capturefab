@@ -1,16 +1,21 @@
 # Capturefab
 
-> A desktop app and command-line interface for camera control, image capture and video recording.
+> A desktop app and command-line interface that captures camera images, video, sensor values and PLC tags for later analysis.
 
 Capturefab runs on macOS, Windows and Linux.
+It is for engineers who collect data on plant and OT networks.
 Persons and scripts can use the same local camera session.
-Use the built-in simulator to try commands without camera hardware.
+Signal sources use Modbus TCP, MQTT, OPC UA or MTConnect.
+A DuckDB dataset catalogs saved files and signal samples.
+Exports give Parquet or CSV files with a README and manifest for analysis tools.
+Use the built-in simulators to try commands without camera or PLC hardware.
 
 ## Canonical resources
 
 - [Documentation](docs.html): Task guides, app screenshots, installation and CLI reference.
 - [Agent instructions](agents.md): Detailed automation contract, session behavior and recovery rules.
 - [Camera compatibility](https://github.com/capturefab/capturefab/blob/main/docs/camera-compatibility.md): Transport requirements, camera profiles and unsupported paths.
+- [Plant-floor guide](https://github.com/capturefab/capturefab/blob/main/docs/plant-floor.md): Templates, capture tags, signals, datasets, exports and FTP/SFTP destinations.
 - [Workflow guide](https://github.com/capturefab/capturefab/blob/main/docs/cli-workflows.md): JSON plans, path resolution and partial failures.
 - [Workflow examples](https://github.com/capturefab/capturefab/tree/main/examples/workflows): Multi-camera timelapse, scanner feeder and local recording.
 - [Release manifest](releases.json): Published files, architectures, SHA-256 checksums and available signatures.
@@ -112,9 +117,10 @@ See the agent instructions for actor fields, log timestamps and HTTP command env
 Local CLI/RPC paths use the directory of the terminal that sends the command.
 Saved destination output names are relative to that destination.
 Existing output files are not overwritten.
-Single-file and `{frame}` template extensions select PNG, JPEG, raw, PGM or PPM.
+Single-file and template extensions select PNG, JPEG, raw, PGM or PPM.
 Directory sequences default to PNG; `--format` overrides format selection.
-Capture paths accept only `{frame}` templates and do not accept network URLs.
+Capture paths do not accept network URLs.
+See "Name and tag captures" for templates and numbering.
 
 Durations and timestamp fractions must resolve to whole milliseconds.
 `1.001s` is valid; `1.1ms` fails.
@@ -127,9 +133,12 @@ This works with temporary workers and persistent sessions.
 Without a duration, a session command returns immediately and records until `stop-forward`.
 A direct recording command stays active until Ctrl-C.
 
-Saved destinations include folders, external drives, network folders and S3-compatible buckets.
+Saved destinations include folders, external drives, network folders, S3-compatible buckets, FTP/FTPS servers and SFTP servers.
 Use `destination list --json`, `volumes --json` and `uploads --json` to inspect them.
 Credentials use the operating system keychain, AWS profiles or process environment.
+SFTP destinations must have a pinned host key: `--host-key SHA256:...` or `--accept-host-key`.
+`add-s3 --preset rustfs` or `--preset minio` must have `--endpoint`.
+A remote file is never replaced; FTP rename can replace on some servers, so use one writer per FTP folder.
 Persistent sessions return local capture results before upload completion; inspect the upload queue.
 
 Captures and recordings share a storage budget across processes with the same `CAPTUREFAB_SESSION_DIR`.
@@ -137,6 +146,78 @@ Defaults are 10 GiB and 10,000 files; each recording defaults to a 512 MiB file 
 Use `storage --json` to inspect usage and reservations.
 A storage-full error has exit code 6.
 You must have explicit user authorization for retention deletion or an increased global budget.
+
+## Name and tag captures
+
+Capture and local recording outputs accept a file, a directory or a template.
+Placeholders are `{camera}`, `{date}`, `{time}`, `{datetime}`, `{seq}` and `{frame}`.
+`{seq}` selects the next free number for that folder and pattern.
+`{camera}` is the sanitized model and serial, never the address.
+Times use local time when the frame is requested.
+Other placeholders cause a usage error (exit 2).
+
+```sh
+capturefab --camera sim:0 capture -o 'line1/{date}/{camera}-{datetime}-{seq}.png' --json
+capturefab --camera sim:0 capture -o shot.png --on-exists number --json
+capturefab --camera sim:0 capture -o 'qa/{camera}-{seq}.png' --context line=L1 --context part=A-100 --json
+```
+
+`--on-exists fail` is the CLI and RPC default.
+`--on-exists number` writes `stem-0001.ext`, `stem-0002.ext` and so on.
+A directory output continues its `frame-NNNNNN` numbers.
+`--context KEY=VALUE` tags captures and recordings; keys match `^[a-z][a-z0-9_]{0,31}$`.
+Read saved names from `result.files` and `result.frames[].file`.
+`frames[].wall_ms` is UTC milliseconds.
+A recording result gives the resolved file in `path` and the start time in `since_ms`.
+The desktop saves to `~/Capturefab/{date}/{camera}-{datetime}-{seq}.png` by default.
+
+## Read sensors and PLCs
+
+```sh
+capturefab signals read sim-signal://line1 --json
+capturefab signals browse opc.tcp://HOST:4840 --duration 5s --json
+capturefab log sim-signal://line1 --duration 10m --dataset plant.duckdb --csv line1.csv --json
+capturefab --session bench signals start 'modbus-tcp://HOST/1/holding/0?type=f32&name=temp_c' --json
+capturefab --session bench signals --json
+capturefab --session bench signals stop all --json
+```
+
+URI schemes are `modbus-tcp://`, `mqtt://`, `mqtts://`, `opc.tcp://`, `mtconnect://`, `mtconnects://` and `sim-signal://`.
+Read `result.signals.uris` in `schema --json` for the full syntax.
+Modbus addresses are 0-based; Modicon 40001 is `holding/0`.
+OPC UA uses SecurityPolicy None only, so passwords travel unencrypted.
+Capturefab removes credentials from all output.
+`signals start` and `signals stop` must have a running GUI or `serve` session.
+`log` must have `--csv`, `--dataset` or both.
+Browse is unsupported for Modbus (exit 5).
+Each source runs in a separate helper process and restarts a maximum of 5 times.
+A session holds a maximum of 16 sources.
+`ts_ms` is the host clock in UTC milliseconds; `source_ts_ms` is the device clock.
+Capturefab reads signal values; it does not write to devices.
+
+## Catalog and export datasets
+
+```sh
+capturefab --session bench dataset open /data/plant.duckdb --json
+capturefab --session bench dataset note "nozzle changed" --context line=L1 --json
+capturefab --session bench dataset query "SELECT * FROM captures_with_signals LIMIT 20" --json
+capturefab --session bench dataset export -o /data/exports/shift-b --json
+capturefab dataset query --file /data/plant.duckdb "SELECT count(*) FROM captures" --json
+```
+
+One `.duckdb` file is one dataset, owned by one session.
+`--dataset FILE.duckdb` on `capture`, `record`, `serve`, `gui` and `log` creates or opens it.
+Tables are `captures`, `recordings`, `signals`, `samples` and `events`.
+The `captures_with_signals` view joins each capture with the latest sample of each tag.
+Every `*_ms` column is UTC Unix milliseconds; `context` is JSON text.
+Queries accept one read-only SELECT or WITH statement and return at most 10,000 rows.
+`--file` on a dataset that a session holds fails with exit 3; use `--session`.
+Exports go to a new folder: Parquet and CSV files, `manifest.json` and `README.md`.
+Give the export `README.md` and `manifest.json` to an analysis model first.
+An existing export folder fails with exit 1; a full storage budget fails with exit 6 before writing.
+RPC operations are `dataset_open`, `dataset_close`, `dataset_status`, `dataset_note`, `dataset_query` and `dataset_export`.
+Signal RPC operations are `signals`, `signal_read`, `signal_browse`, `signal_start` and `signal_stop`.
+Workflow files can use these operations too.
 
 ## Apply workflow files
 

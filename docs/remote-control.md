@@ -85,12 +85,13 @@ The client uses same-origin HTTP endpoints without authentication headers. Reque
 | `GET /api/activity?after=REV&timeout_ms=20000` | Wait for an activity change; all watchers wake when commands or jobs change |
 | `POST /api/command` | A native session command result |
 | `GET /api/preview?camera=ID` | Latest camera preview as PNG, or HTTP 204 while no frame is available |
-| `GET /api/destinations` | Saved server destinations without credentials |
+| `GET /api/destinations` | Saved server destinations without credentials; each row has `kind` (`folder`, `s3`, `ftp` or `sftp`) |
 | `GET /api/storage` | Server storage usage and policy |
 | `GET`, `HEAD /health` | JSON readiness, uptime, camera counts and analytics health; HTTP 503 when stopping or analytics is unavailable |
 | `GET`, `HEAD /metrics` | Prometheus text metrics for session and camera acquisition |
 | `GET`, `HEAD /api/analytics` | Current session totals, camera summaries and bounded time series |
 | `GET`, `HEAD /api/analytics.svg` | Rust Plotters dashboard with frame rate, throughput, missed frames and camera data volume comparisons; optional `width=<logical pixels>` adapts charts to an interface |
+| `GET`, `HEAD /api/signals?history=0\|1` | Sensor and PLC sources with latest values: `{sources, persisting, dropped, sink_error}`; `history=1` adds up to 120 recent points per tag |
 
 Command requests wrap an existing `SessionCommand`:
 

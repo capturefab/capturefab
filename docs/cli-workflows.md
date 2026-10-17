@@ -91,9 +91,14 @@ Network URLs, device locators and other camera IDs retain their meaning. For
 example, a workflow using `sim:replay:frames` reads `frames` beside that workflow
 file; the same CLI source reads it from the terminal's current directory.
 
-Use a directory for a frame sequence or a `{frame}` template such as
-`run-1/frame-{frame}.png`. Captures never overwrite existing files; give a new run
-its own output directory or filename. Workflow captures require a file/directory
+Use a directory for a frame sequence, or a template such as
+`run-1/frame-{frame}.png` or `line1/{date}/{camera}-{datetime}-{seq}.png`.
+Templates accept `{camera}`, `{date}`, `{time}`, `{datetime}`, `{seq}` and
+`{frame}`; `{seq}` picks the next free number, so a rerun saves new files.
+Captures never overwrite existing files. A fixed filename fails when it exists
+unless the command has `"on_exists": "number"`; a directory continues its
+`frame-NNNNNN` numbering. A `"context"` object such as `{"line": "L1"}` tags
+captures, schedules and recordings. Workflow captures require a file/directory
 and cannot send a binary image to stdout. Ordinary CLI captures infer known
 single-file/template extensions; directory sequences default to PNG. `--format`
 overrides that inference.
@@ -124,6 +129,7 @@ edit camera selectors and output names before applying to hardware.
 | [scanner-feeder.json](../examples/workflows/scanner-feeder.json) | Configure resolution, grayscale and feeder mode, then save five pages with a 60-second deadline per page |
 | [start-recording.json](../examples/workflows/start-recording.json) | Start local H.264 recording with a 64 MiB file cap and a 512 MiB requested storage ceiling |
 | [stop-recording.json](../examples/workflows/stop-recording.json) | Finish that recording, then stop its camera acquisition |
+| [plant-line.json](../examples/workflows/plant-line.json) | Open a dataset, start a simulated line's signals, add a note and save one tagged, numbered capture |
 
 ```sh
 capturefab workflow validate examples/workflows/multi-camera-timelapse.json --json
@@ -155,6 +161,25 @@ immediately and continues until stopped; a direct command remains in the
 foreground. The per-file cap remains enforced regardless of elapsed time. Hitting
 it stops recording and reports a storage error. Encoder support depends on the
 FFmpeg build and host; `ffmpeg --json` and `doctor --json` describe availability.
+
+## Log signals and catalog captures
+
+Workflow steps can also open a dataset, start sensor and PLC sources and add
+notes. These steps omit the outer `camera` target:
+
+```json
+{"command": {"op": "dataset_open", "path": "plant/line1.duckdb", "mode": "auto"}}
+{"command": {"op": "signal_start", "uri": "sim-signal://line1", "interval_ms": 1000}}
+{"command": {"op": "dataset_note", "text": "shift A start", "context": {"line": "L1"}}}
+{"command": {"op": "dataset_export", "output": "exports/shift-a", "formats": ["csv"]}}
+```
+
+`dataset_open.path` and `dataset_export.output` resolve beside the workflow file,
+like capture outputs. `mode` is `auto` (create or open), `create` or `open`.
+Signal URIs keep their meaning and are redacted in plans. Sources and the open
+dataset stay in the session after Apply; stop them with
+`{"op": "signal_stop", "id": "all"}` and `{"op": "dataset_close"}`. The
+[plant-floor guide](plant-floor.md) shows the full task.
 
 ## Recover and observe
 
