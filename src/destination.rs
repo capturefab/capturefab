@@ -589,10 +589,15 @@ pub fn validate_name(name: &str) -> Result<()> {
 }
 
 /// Where network destinations stage files before upload: the platform's
-/// per-user data directory, or `CAPTUREFAB_STAGING_DIR`.
+/// per-user data directory, or `CAPTUREFAB_STAGING_DIR`. An explicit
+/// `CAPTUREFAB_SESSION_DIR` keeps its staging inside it, so isolated
+/// sessions (and tests) never share staged files with the user's own.
 pub fn staging_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("CAPTUREFAB_STAGING_DIR") {
         return dir.into();
+    }
+    if let Some(dir) = std::env::var_os("CAPTUREFAB_SESSION_DIR") {
+        return PathBuf::from(dir).join("staging");
     }
     let home = || std::env::var_os("HOME").map(PathBuf::from);
     let base = if cfg!(target_os = "macos") {

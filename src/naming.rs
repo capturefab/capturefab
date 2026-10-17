@@ -290,6 +290,8 @@ enum Part {
 #[derive(Default)]
 pub struct Namer {
     next: HashMap<(PathBuf, String), u32>,
+    /// Where network destinations stage files; `None` reads the default.
+    staging: Option<PathBuf>,
 }
 impl Namer {
     /// Never creates files. Returns a name that is free right now, or
@@ -416,6 +418,35 @@ impl Namer {
             Some(&last) => last.saturating_add(1),
             None => highest(dir, &parts).saturating_add(1),
         };
+        // Staged files are deleted once uploaded, so a folder scan cannot
+        // see numbers whose remote keys are already taken. Remember them.
+        let staging = self
+            .staging
+            .clone()
+            .unwrap_or_else(crate::destination::staging_root);
+        if dir.starts_with(&staging) && !staging.as_os_str().is_empty() {
+            let stored_key = format!("{}\0{}", dir.display(), key.1);
+            return Numbers::update(&staging, |numbers| {
+                let start = start.max(numbers.last(&stored_key).saturating_add(1));
+                let (n, path) = self.free(dir, &parts, width, plan, key, start)?;
+                numbers.set(stored_key, n);
+                Ok(path)
+            });
+        }
+        self.free(dir, &parts, width, plan, key, start)
+            .map(|(_, path)| path)
+    }
+
+    /// The first free name numbered `start` or higher, and its number.
+    fn free(
+        &mut self,
+        dir: &Path,
+        parts: &[Part],
+        width: usize,
+        plan: &Plan,
+        key: (PathBuf, String),
+        start: u32,
+    ) -> Result<(u32, PathBuf)> {
         let build = |n: u32| -> PathBuf {
             let name: String = parts
                 .iter()
@@ -440,12 +471,73 @@ impl Namer {
                         self.next.clear();
                     }
                     self.next.insert(key, n);
-                    return Ok(path);
+                    return Ok((n, path));
                 }
                 Err(e) if is_exists(&e) => n += 1,
                 Err(e) => return Err(e),
             }
         }
+    }
+}
+
+/// The last number handed out per staging folder and pattern, kept beside
+/// the staged folders (destination names cannot start with '.').
+#[derive(Default, Serialize, Deserialize)]
+struct Numbers {
+    /// key -> (last number, last used in ms since the epoch)
+    numbers: HashMap<String, (u32, u64)>,
+}
+const NUMBERS_FILE: &str = ".capturefab-numbers.json";
+const MAX_NUMBERS: usize = 4096;
+impl Numbers {
+    fn last(&self, key: &str) -> u32 {
+        self.numbers.get(key).map_or(0, |(n, _)| *n)
+    }
+    fn set(&mut self, key: String, n: u32) {
+        self.numbers.insert(key, (n, crate::scheduling::now_ms()));
+        while self.numbers.len() > MAX_NUMBERS {
+            let Some(oldest) = self
+                .numbers
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.numbers.remove(&oldest);
+        }
+    }
+    /// Read, update and write the numbers under an exclusive lock, so that
+    /// workers sharing a staging folder never hand out the same name.
+    fn update<T>(root: &Path, f: impl FnOnce(&mut Numbers) -> Result<T>) -> Result<T> {
+        use fs2::FileExt;
+        use std::io::Write;
+        std::fs::create_dir_all(root)
+            .with_context(|| format!("create staging folder {}", root.display()))?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(root.join(".capturefab-numbers.lock"))
+            .with_context(|| format!("open numbering lock in {}", root.display()))?;
+        lock.lock_exclusive()
+            .context("lock the staging folder's numbering")?;
+        let path = root.join(NUMBERS_FILE);
+        // A damaged file only loses what it remembered; the folder scan and
+        // the never-overwrite checks still apply.
+        let mut numbers: Numbers = std::fs::read(&path)
+            .ok()
+            .filter(|b| b.len() <= 4 << 20)
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let value = f(&mut numbers)?;
+        let temp = root.join(format!("{NUMBERS_FILE}.{}.tmp", std::process::id()));
+        let mut file =
+            std::fs::File::create(&temp).with_context(|| format!("write {}", temp.display()))?;
+        file.write_all(&serde_json::to_vec(&numbers)?)?;
+        drop(file);
+        std::fs::rename(&temp, &path).with_context(|| format!("write {}", path.display()))?;
+        Ok(value)
     }
 }
 
@@ -663,6 +755,51 @@ mod tests {
         let second = namer.candidate(&plan, &input, OnExists::Fail).unwrap();
         assert_eq!(second, dir.join("A-20261017-101501-0014.png"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn staged_numbers_survive_uploads_and_new_namers() {
+        // Staged files are deleted after upload; a new namer (a restarted
+        // worker) must not reuse their names, whose remote keys are taken.
+        let staging = temp("staged");
+        let dir = staging.join("bucket");
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan = Plan::Template(format!("{}/{{camera}}-{{seq}}.png", dir.display()));
+        let namer = || Namer {
+            staging: Some(staging.clone()),
+            ..Namer::default()
+        };
+        let input = input(fixed_time());
+        let mut first = namer();
+        for expected in ["Model-SN1-0001.png", "Model-SN1-0002.png"] {
+            let path = first.candidate(&plan, &input, OnExists::Fail).unwrap();
+            assert_eq!(path, dir.join(expected));
+        }
+        let mut second = namer();
+        let path = second.candidate(&plan, &input, OnExists::Fail).unwrap();
+        assert_eq!(path, dir.join("Model-SN1-0003.png"));
+        // Fixed names numbered on conflict are remembered the same way.
+        let fixed = Plan::File(dir.join("shot.png"));
+        std::fs::write(dir.join("shot.png"), b"x").unwrap();
+        let taken = namer().candidate(&fixed, &input, OnExists::Number).unwrap();
+        assert_eq!(taken, dir.join("shot-0001.png"));
+        let next = namer().candidate(&fixed, &input, OnExists::Number).unwrap();
+        assert_eq!(next, dir.join("shot-0002.png"));
+        // Folders outside staging keep counting from what is on disk.
+        let local = temp("unstaged");
+        let plan = Plan::Template(format!("{}/{{seq}}.png", local.display()));
+        let mut a = namer();
+        assert_eq!(
+            a.candidate(&plan, &input, OnExists::Fail).unwrap(),
+            local.join("0001.png")
+        );
+        let mut b = namer();
+        assert_eq!(
+            b.candidate(&plan, &input, OnExists::Fail).unwrap(),
+            local.join("0001.png")
+        );
+        std::fs::remove_dir_all(staging).unwrap();
+        std::fs::remove_dir_all(local).unwrap();
     }
 
     #[test]
