@@ -18,8 +18,7 @@ pub(super) enum Section {
     CaptureOptions,
     Automation,
     EncoderOptions,
-    // Toggled from the tags, dataset and signals views (Slices A, B and C).
-    #[allow(dead_code)]
+    // Toggled from the dataset and signals views (Slices B and C).
     CaptureTags,
     #[allow(dead_code)]
     Dataset,
@@ -2228,6 +2227,16 @@ impl Workbench {
         if let Some(status) = self.capture_status(connected, capturing, p) {
             action = action.push(status);
         }
+        action = action.push(tip(
+            one_line(
+                format!("Next: {}", self.output_preview()),
+                style::SMALL,
+                style::SANS,
+                p.secondary,
+            )
+            .width(Fill),
+            "{camera}, {date}, {time}, {datetime} and {frame} fill in when saving; {seq} becomes the next free number",
+        ));
         let mut head = column![section(capture_title(kind), None, p)].spacing(8);
         if let Some(guidance) = capture_guidance(kind) {
             head = head.push(reason(guidance, p));
@@ -2361,9 +2370,9 @@ impl Workbench {
         // when the session opens or closes.
         let automatic_first = self.snapshot.capture_session.is_some();
         column![
-            section_slot(super::tags::view(self, self.inspect.tags_open, p)),
             section_slot(automatic_first.then(|| self.auto_capture_settings(p))),
             section_slot(Some(save.into())),
+            section_slot(super::tags::view(self, self.inspect.tags_open, p)),
             section_slot(
                 (self.schedule_enabled || !self.snapshot.jobs.is_empty()).then(|| self.jobs(p))
             ),
@@ -2456,6 +2465,14 @@ impl Workbench {
                     .style(style::plain)
                     .on_press(Message::Copy(copy)),
                     if copied { "Copied" } else { "Copy path" },
+                ),
+                tip(
+                    button(icon(Icon::Folder, 12.0, p.secondary))
+                        .name(super::reveal::label())
+                        .padding(4)
+                        .style(style::plain)
+                        .on_press(Message::Reveal(saved.path.clone().into())),
+                    super::reveal::label(),
                 ),
             ]
             .spacing(6)
@@ -2745,6 +2762,29 @@ impl Workbench {
             .filter(|(output, _)| output == destination)
         {
             card = card.push(text(summary.as_str()).size(style::SMALL).color(p.secondary));
+        }
+        if recording && let Some(file) = self.recording_file() {
+            let name = std::path::Path::new(file)
+                .file_name()
+                .map_or_else(|| file.to_owned(), |name| name.to_string_lossy().into_owned());
+            card = card.push(
+                row![
+                    tip(
+                        one_line(name, style::SMALL, style::MONO, p.secondary).width(Fill),
+                        file.to_owned(),
+                    ),
+                    tip(
+                        button(icon(Icon::Folder, 12.0, p.secondary))
+                            .name(super::reveal::label())
+                            .padding(4)
+                            .style(style::plain)
+                            .on_press(Message::Reveal(file.into())),
+                        super::reveal::label(),
+                    ),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            );
         }
         let glyph = if stopping {
             icon::spinner(12.0, p.secondary, self.spin())

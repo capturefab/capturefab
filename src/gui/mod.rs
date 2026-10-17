@@ -877,8 +877,8 @@ struct Workbench {
     copied: Option<(String, Instant)>,
     /// The last capture that saved files.
     last_saved: Option<Saved>,
-    /// The file the last recording started here writes.
-    last_recording: Option<String>,
+    /// The file the last recording started here writes, and its camera.
+    last_recording: Option<(Option<String>, String)>,
     /// Start the live view when a camera connects.
     auto_start: bool,
     /// Capture context sent with captures and recordings.
@@ -1675,7 +1675,7 @@ impl Workbench {
         if pending.job == (Job::Forward { recording: true })
             && let Some(path) = result["path"].as_str()
         {
-            self.last_recording = Some(path.to_owned());
+            self.last_recording = Some((pending.camera.clone(), path.to_owned()));
         }
         if pending.job == Job::Capture {
             self.shutter.replay(1.0, 0.0, self.now);
@@ -2136,11 +2136,12 @@ impl Workbench {
         let mut command = self.forward_command();
         let keep = Output::of(&self.forward_output).recording()
             && (!per_camera || self.forward_output.contains("{camera}"));
-        if !keep && let SessionCommand::Forward {
-            output,
-            destination,
-            ..
-        } = &mut command
+        if !keep
+            && let SessionCommand::Forward {
+                output,
+                destination,
+                ..
+            } = &mut command
         {
             *output = prefs::default_record_output();
             *destination = None;
@@ -2192,7 +2193,10 @@ impl Workbench {
             .map_or_else(|| "camera".to_owned(), crate::naming::camera_label);
         let preview = crate::naming::preview(&self.output, &camera, chrono::Local::now());
         let home = prefs::capture_root();
-        match home.parent().and_then(|home| std::path::Path::new(&preview).strip_prefix(home).ok()) {
+        match home
+            .parent()
+            .and_then(|home| std::path::Path::new(&preview).strip_prefix(home).ok())
+        {
             Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
             None => preview,
         }
@@ -3942,6 +3946,7 @@ mod tests {
         bench.retention_enabled = true;
         assert!(bench.validate_input(&bench.capture_command(false)).is_err());
         bench.drafts.insert(Num::FileMib, "invalid".into());
+        bench.forward_output = "rtsp://127.0.0.1:8554/capturefab".into();
         assert!(bench.validate_input(&bench.forward_command()).is_ok());
         bench.forward_output = "recording.mkv".into();
         assert!(bench.validate_input(&bench.forward_command()).is_err());
@@ -3954,6 +3959,124 @@ mod tests {
             assert!(bench.set_num(key, "1.23456789"));
             assert_eq!(bench.num_text(key), "1.23456789");
         }
+    }
+
+    #[test]
+    fn captures_and_recordings_carry_tags_and_number_taken_names() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        assert!(bench.output.ends_with("{seq}.png"), "{}", bench.output);
+        bench.tags.line = " L1 ".into();
+        bench.tags.note = "  ".into();
+        let tags = crate::context::Context::from([("line".into(), "L1".into())]);
+        for command in [
+            bench.capture_command(false),
+            bench.capture_command_for(true, Some("sim:0")),
+            bench.forward_command(),
+        ] {
+            let (SessionCommand::Capture {
+                on_exists, context, ..
+            }
+            | SessionCommand::Schedule {
+                on_exists, context, ..
+            }
+            | SessionCommand::Forward {
+                on_exists, context, ..
+            }) = command
+            else {
+                panic!("expected a capture or recording");
+            };
+            assert_eq!(
+                (on_exists, context),
+                (crate::naming::OnExists::Number, tags.clone())
+            );
+        }
+        let output_of = |command| match command {
+            SessionCommand::Forward {
+                output,
+                destination,
+                ..
+            } => (output, destination),
+            _ => panic!("expected a recording"),
+        };
+        let default = (prefs::default_record_output(), None);
+        bench.forward_output = "rtsp://127.0.0.1:8554/capturefab".into();
+        assert_eq!(output_of(bench.record_command(false)), default);
+        bench.forward_output = "clips/run.mkv".into();
+        assert_eq!(output_of(bench.record_command(false)).0, "clips/run.mkv");
+        // Cameras recording at once each need their own name.
+        assert_eq!(output_of(bench.record_command(true)), default);
+        bench.forward_output = "clips/{camera}.mkv".into();
+        assert_eq!(
+            output_of(bench.record_command(true)).0,
+            "clips/{camera}.mkv"
+        );
+    }
+
+    #[test]
+    fn connecting_starts_the_live_view_unless_off_or_a_scanner() {
+        let connect = |bench: &mut Workbench, info: &CameraInfo| {
+            bench.pending.clear();
+            bench.settle(
+                &Pending {
+                    target: Some(info.id.clone()),
+                    ..Pending::unanswered(Job::Connect)
+                },
+                &Ok(serde_json::json!({ "connected": info })),
+            );
+            bench.pending_for(Job::Start, &info.id)
+        };
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        let info = crate::transport::simulator::info();
+        assert!(connect(&mut bench, &info));
+        let mut scanner = info.clone();
+        scanner.transport = crate::types::Transport::Scanner;
+        assert!(!connect(&mut bench, &scanner));
+        let mut streaming = liveness::streaming_camera(0, 0, 0.0);
+        streaming.info.id = info.id.clone();
+        bench.snapshot.cameras = vec![streaming];
+        assert!(!connect(&mut bench, &info), "already streaming");
+        bench.snapshot.cameras.clear();
+        let _ = bench.handle_message(Message::AutoStart(false));
+        assert!(!connect(&mut bench, &info));
+        assert!(!bench.prefs().auto_start);
+    }
+
+    #[test]
+    fn record_toggles_and_all_actions_reach_every_camera() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        bench.snapshot.connected = Some(crate::transport::simulator::info());
+        let _ = bench.dispatch_action(Action::Record);
+        assert!(bench.pending(Job::Forward { recording: true }));
+        bench.pending.clear();
+        bench.snapshot.forwarding = Some("/tmp/a.mp4".into());
+        let _ = bench.handle_message(Message::Record);
+        assert!(bench.pending(Job::StopForward { recording: true }));
+        bench.pending.clear();
+        bench.snapshot.forwarding = None;
+
+        let mut other = liveness::streaming_camera(0, 0, 0.0);
+        other.info.id = "sim:1".into();
+        bench.snapshot.cameras = vec![liveness::streaming_camera(0, 0, 0.0), other];
+        let _ = bench.handle_message(Message::AllCapture);
+        let _ = bench.handle_message(Message::AllRecord(true));
+        for job in [Job::Capture, Job::Forward { recording: true }] {
+            let cameras: Vec<_> = bench
+                .pending
+                .iter()
+                .filter(|p| p.job == job && p.batch)
+                .filter_map(|p| p.camera.clone())
+                .collect();
+            assert_eq!(cameras, ["sim:0", "sim:1"], "{job:?}");
+        }
+        assert_eq!(
+            bench
+                .pending
+                .iter()
+                .find(|p| p.batch && p.job == Job::Capture)
+                .unwrap()
+                .label(),
+            "Capturing all cameras"
+        );
     }
 
     #[test]

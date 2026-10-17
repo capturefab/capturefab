@@ -113,6 +113,8 @@ pub(super) struct Scene {
     held: Vec<mpsc::Sender<Result<serde_json::Value>>>,
     /// What the selected camera reports as forwarding to, whatever it does.
     forwarding: Option<String>,
+    /// When that forward started, UTC Unix milliseconds.
+    forwarding_since_ms: Option<u64>,
     /// The selected camera reports that it stopped streaming.
     stopped: bool,
     /// Turn on auto mode on every camera as the streams start.
@@ -149,11 +151,13 @@ impl Scene {
         for camera in selected {
             if self.forwarding.is_some() {
                 camera.forwarding = self.forwarding.clone();
+                camera.forwarding_since_ms = self.forwarding_since_ms;
             }
             camera.streaming &= !self.stopped;
         }
         if self.forwarding.is_some() {
             snapshot.forwarding = self.forwarding.clone();
+            snapshot.forwarding_since_ms = self.forwarding_since_ms;
         }
         snapshot.streaming &= !self.stopped;
     }
@@ -179,7 +183,8 @@ impl Workbench {
     ///   `copied` (the session command was just copied), `stalled` (the
     ///   selected camera's frames stopped arriving), `auto` (every camera in
     ///   auto mode), `forwarding` (the selected camera forwards to a URL),
-    ///   `recording` (the selected camera records to a file)
+    ///   `recording` (the selected camera records to a file, for 1:23)
+    /// - `tags`: the capture tags filled in and open
     /// - review fixtures: `network`, `network-empty`, `network-error`,
     ///   `destinations-remove`, `bucket-editor-advanced`, `settings-credentials`,
     ///   `settings-credential-error`, `analytics-measurements`,
@@ -261,9 +266,26 @@ impl Workbench {
                 "auto" => self.scene.auto = true,
                 "forwarding" => {
                     self.scene.forwarding =
-                        Some("rtsp://operator:secret@192.168.1.20:8554/line-1".into())
+                        Some("rtsp://operator:secret@192.168.1.20:8554/line-1".into());
+                    self.scene.forwarding_since_ms = Some(epoch_ms().saturating_sub(83_000));
                 }
-                "recording" => self.scene.forwarding = Some("recordings/line-1.mkv".into()),
+                "recording" => {
+                    self.scene.forwarding = Some(prefs::default_record_output());
+                    self.scene.forwarding_since_ms = Some(epoch_ms().saturating_sub(83_000));
+                    self.scene.late.push("recording-file".into());
+                }
+                "tags" => {
+                    self.tags = prefs::CaptureTags {
+                        line: "L1".into(),
+                        station: "Inspection 2".into(),
+                        part: "A-100".into(),
+                        lot: "2026-10-17-A".into(),
+                        note: String::new(),
+                    };
+                    let _ = self.handle_message(Message::InspectorDisclosure(
+                        inspector::Section::CaptureTags,
+                    ));
+                }
                 "connect-failed" => {
                     let target = "192.168.10.50";
                     self.address = target.into();
@@ -326,6 +348,15 @@ impl Workbench {
                     let result = json!({"files": ["capture-0001.png"], "count": 1});
                     self.last_saved = Saved::from_result(camera.clone(), &result, self.now);
                     self.scene_notice(command_notice(&Job::Capture, &Ok(result)));
+                }
+                "recording-file" => {
+                    let path = crate::naming::preview(
+                        &prefs::default_record_output(),
+                        "Sim-SIM0",
+                        chrono::Local::now(),
+                    )
+                    .replace("####", "0001");
+                    self.last_recording = Some((camera.clone(), path));
                 }
                 // Copy buttons confirm in place, with no notice.
                 "copied" => self.note_copied(self.session_command()),

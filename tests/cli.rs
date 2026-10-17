@@ -2479,6 +2479,96 @@ fn dataset_recordings_are_cataloged_on_duration_and_ctrl_c() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+fn naming_root(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "capturefab-{name}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
+
+#[test]
+fn capture_outputs_number_templates_and_carry_context() {
+    let root = naming_root("naming-cli");
+    let dir = root.join("sessions");
+    let out = root.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let capture = |args: &[&str]| {
+        let mut all = vec!["--json", "--camera", "sim:0", "capture"];
+        all.extend_from_slice(args);
+        cmd(&dir, &all)
+    };
+    let files = |output: &std::process::Output| -> Vec<String> {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+        v["result"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str().unwrap().to_owned())
+            .collect()
+    };
+    // A fixed name is refused once taken, unless numbering is asked for.
+    let file = out.join("capture.png");
+    let file = file.to_str().unwrap();
+    files(&capture(&["-o", file]));
+    let again = capture(&["-o", file]);
+    assert_eq!(again.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&again.stdout).contains("output already exists"));
+    assert_eq!(
+        files(&capture(&["-o", file, "--on-exists", "number"])),
+        [out.join("capture-0001.png").to_str().unwrap()]
+    );
+    // Templates expand per frame; {seq} continues.
+    let template = out.join("d/{date}/{camera}-{seq}.png");
+    for n in 1..=2 {
+        let output = capture(&["-o", template.to_str().unwrap(), "--context", "line=L1"]);
+        let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let path = std::path::Path::new(v["result"]["files"][0].as_str().unwrap());
+        assert!(path.exists());
+        assert!(
+            path.to_str().unwrap().ends_with(&format!("-{n:04}.png")),
+            "{path:?}"
+        );
+        let folder = path
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(folder.len(), 10, "{folder}");
+        assert_eq!(v["result"]["frames"][0]["file"], v["result"]["files"][0]);
+        assert!(v["result"]["frames"][0]["wall_ms"].as_u64().unwrap() > 0);
+        assert_eq!(v["result"]["context"]["line"], "L1");
+    }
+    // A directory continues its numbering.
+    let frames = out.join("frames");
+    for _ in 0..2 {
+        files(&capture(&["-o", frames.to_str().unwrap(), "-n", "2"]));
+    }
+    assert_eq!(std::fs::read_dir(&frames).unwrap().count(), 4);
+    // Bad context is a usage error before any session state exists.
+    let fresh = root.join("fresh-sessions");
+    for bad in [
+        &["--context", "Bad=1"][..],
+        &["--context", "a=1", "--context", "a=2"],
+    ] {
+        let mut all = vec!["--json", "--camera", "sim:0", "capture", "-o", file];
+        all.extend_from_slice(bad);
+        assert_eq!(cmd(&fresh, &all).status.code(), Some(2), "{bad:?}");
+    }
+    assert!(!fresh.exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 fn signals_json(dir: &PathBuf, args: &[&str]) -> Value {
     let mut all = vec!["--json"];
     all.extend_from_slice(args);
@@ -2496,12 +2586,24 @@ fn signals_read_and_browse_simulator() {
     assert!(read["id"].as_str().unwrap().starts_with("signal:"));
     let browse = signals_json(
         &dir,
-        &["signals", "browse", "sim-signal://line1", "--duration", "1s"],
+        &[
+            "signals",
+            "browse",
+            "sim-signal://line1",
+            "--duration",
+            "1s",
+        ],
     );
     assert_eq!(browse["items"].as_array().unwrap().len(), 6, "{browse}");
     let limited = signals_json(
         &dir,
-        &["signals", "browse", "sim-signal://line1?tags=9", "--limit", "4"],
+        &[
+            "signals",
+            "browse",
+            "sim-signal://line1?tags=9",
+            "--limit",
+            "4",
+        ],
     );
     assert_eq!(limited["items"].as_array().unwrap().len(), 4);
     assert_eq!(limited["truncated"], true);
@@ -2530,7 +2632,10 @@ fn signals_usage_errors_and_unsupported_browse() {
     let out = cmd(&dir, &["signals", "start", "sim-signal://a"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("needs a running session"));
-    let out = cmd(&dir, &["signals", "browse", "modbus-tcp://127.0.0.1/1/holding/0"]);
+    let out = cmd(
+        &dir,
+        &["signals", "browse", "modbus-tcp://127.0.0.1/1/holding/0"],
+    );
     assert_eq!(out.status.code(), Some(5));
     let _ = std::fs::remove_dir_all(root);
 }
@@ -2560,8 +2665,9 @@ fn signal_credentials_are_redacted() {
 fn signals_read_modbus_from_loopback_fake() {
     let root = temp_root("signals-modbus");
     let dir = root.join("sessions");
-    let fake =
-        capturefab::signals::modbus::fake::serve(std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+    let fake = capturefab::signals::modbus::fake::serve(
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+    );
     // 123.456 as f32 in cdab word order, then 1.5.
     fake.set_registers(3, 0, &[0xE979, 0x42F6, 0x0000, 0x3FC0]);
     let port = fake.address().port();
@@ -2570,7 +2676,9 @@ fn signals_read_modbus_from_loopback_fake() {
         &[
             "signals",
             "read",
-            &format!("modbus-tcp://127.0.0.1:{port}/1/holding/0?count=2&type=f32&order=cdab&name=temp"),
+            &format!(
+                "modbus-tcp://127.0.0.1:{port}/1/holding/0?count=2&type=f32&order=cdab&name=temp"
+            ),
         ],
     );
     let samples = read["samples"].as_array().unwrap();
@@ -2583,7 +2691,11 @@ fn signals_read_modbus_from_loopback_fake() {
     };
     let out = cmd(
         &dir,
-        &["signals", "read", &format!("modbus-tcp://127.0.0.1:{closed}/1/holding/0")],
+        &[
+            "signals",
+            "read",
+            &format!("modbus-tcp://127.0.0.1:{closed}/1/holding/0"),
+        ],
     );
     assert_eq!(out.status.code(), Some(3), "{out:?}");
     let _ = std::fs::remove_dir_all(root);
@@ -2604,7 +2716,13 @@ fn signals_session_lifecycle() {
         all.extend_from_slice(args);
         cmd(&dir, &all)
     };
-    let out = run(&["signals", "start", "sim-signal://line1", "--interval", "100ms"]);
+    let out = run(&[
+        "signals",
+        "start",
+        "sim-signal://line1",
+        "--interval",
+        "100ms",
+    ]);
     assert!(out.status.success(), "{out:?}");
     let started: Value = serde_json::from_slice(&out.stdout).unwrap();
     let id = started["result"]["id"].as_str().unwrap().to_string();
@@ -2620,10 +2738,23 @@ fn signals_session_lifecycle() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
     let snapshot: Value = serde_json::from_slice(&run(&["status"]).stdout).unwrap();
-    assert!(snapshot["result"]["signals"][0]["tags"].as_array().unwrap().len() <= 32);
-    assert_eq!(run(&["signals", "start", "sim-signal://line1"]).status.code(), Some(1));
+    assert!(
+        snapshot["result"]["signals"][0]["tags"]
+            .as_array()
+            .unwrap()
+            .len()
+            <= 32
+    );
     assert_eq!(
-        run(&["signals", "stop", "signal:0000000000000000"]).status.code(),
+        run(&["signals", "start", "sim-signal://line1"])
+            .status
+            .code(),
+        Some(1)
+    );
+    assert_eq!(
+        run(&["signals", "stop", "signal:0000000000000000"])
+            .status
+            .code(),
         Some(3)
     );
     let stopped: Value = serde_json::from_slice(&run(&["signals", "stop", &id]).stdout).unwrap();
@@ -2631,9 +2762,15 @@ fn signals_session_lifecycle() {
     let status: Value = serde_json::from_slice(&run(&["signals"]).stdout).unwrap();
     assert!(status["result"]["sources"].as_array().unwrap().is_empty());
     // A source still running when the session dies exits with it.
-    assert!(run(&["signals", "start", "sim-signal://line2"]).status.success());
+    assert!(
+        run(&["signals", "start", "sim-signal://line2"])
+            .status
+            .success()
+    );
     let status: Value = serde_json::from_slice(&run(&["signals"]).stdout).unwrap();
-    let pid2 = status["result"]["sources"][0]["helper_pid"].as_u64().unwrap();
+    let pid2 = status["result"]["sources"][0]["helper_pid"]
+        .as_u64()
+        .unwrap();
     assert_ne!(pid, pid2);
     drop(fixture);
     #[cfg(unix)]
@@ -2646,7 +2783,10 @@ fn signals_session_lifecycle() {
             .unwrap()
             .success()
         {
-            assert!(std::time::Instant::now() < deadline, "helper {pid2} outlived its session");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper {pid2} outlived its session"
+            );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
@@ -2684,12 +2824,25 @@ fn log_simulator_to_csv_and_dataset() {
     assert_eq!(text.lines().count() as u64, written + 1);
     let rows = signals_json(
         &dir,
-        &["dataset", "query", "--file", &dataset_arg, "SELECT count(*) FROM samples"],
+        &[
+            "dataset",
+            "query",
+            "--file",
+            &dataset_arg,
+            "SELECT count(*) FROM samples",
+        ],
     );
     assert_eq!(rows["rows"][0][0].as_u64(), Some(written));
     let out = cmd(
         &dir,
-        &["log", "sim-signal://line1", "--duration", "1s", "--csv", &csv_arg],
+        &[
+            "log",
+            "sim-signal://line1",
+            "--duration",
+            "1s",
+            "--csv",
+            &csv_arg,
+        ],
     );
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(std::fs::read_to_string(&csv).unwrap(), text);

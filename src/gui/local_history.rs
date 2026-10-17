@@ -819,7 +819,10 @@ impl Workbench {
 mod tests {
     use super::*;
     fn bench() -> Workbench {
-        Workbench::new(SessionHandle::new(), "history-test".into(), true, None)
+        let mut app = Workbench::new(SessionHandle::new(), "history-test".into(), true, None);
+        // The single-file output whose name follows the count and format.
+        app.output = "capture.png".into();
+        app
     }
     fn update(app: &mut Workbench, message: Message) {
         let _ = app.update(message);

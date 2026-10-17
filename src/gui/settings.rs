@@ -110,6 +110,14 @@ impl Workbench {
             text("Use simulated cameras to explore Capturefab without connecting a device.")
                 .size(style::SMALL)
                 .color(p.secondary),
+            checkbox(
+                "Start the live view when a camera connects",
+                self.auto_start,
+                Message::AutoStart,
+            ),
+            text("Document scanners never start on their own; each scan uses a page.")
+                .size(style::SMALL)
+                .color(p.secondary),
         ]
         .spacing(9);
         column![

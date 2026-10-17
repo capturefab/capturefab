@@ -906,7 +906,90 @@ impl Workbench {
         );
         let stopping = phase.pending();
         let stop = stopping.unwrap_or(snapshot.cameras.iter().all(|c| c.streaming));
+        let batch = |job: Job| self.pending.iter().any(|p| p.batch && p.job == job);
+        let capturing = batch(Job::Capture);
+        let recordings = snapshot
+            .cameras
+            .iter()
+            .filter(|c| {
+                c.forwarding
+                    .as_deref()
+                    .is_some_and(|o| Output::of(o).recording())
+            })
+            .count();
+        let recorders = snapshot
+            .cameras
+            .iter()
+            .filter(|c| {
+                c.info.transport != crate::types::Transport::Scanner
+                    && c.info.profile.kind != CameraKind::DocumentScanner
+            })
+            .count();
+        let record_busy =
+            batch(Job::Forward { recording: true }) || batch(Job::StopForward { recording: true });
+        let all_button =
+            |glyph: Icon, label: &'static str, busy: bool, message: Option<Message>| {
+                let glyph: Element<'_, Message> = if busy {
+                    icon::spinner(12.0, p.secondary, self.spin())
+                } else {
+                    icon(
+                        glyph,
+                        14.0,
+                        if message.is_some() {
+                            p.text
+                        } else {
+                            p.tertiary
+                        },
+                    )
+                };
+                button(
+                    row![glyph, text(label).size(style::BODY).font(style::MEDIUM)]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                )
+                .name(label)
+                .padding([5, 12])
+                .style(style::secondary)
+                .on_press_maybe(message.filter(|_| !busy))
+            };
         let actions = row![
+            tip(
+                all_button(
+                    Icon::Camera,
+                    "Capture all",
+                    capturing,
+                    (!snapshot.cameras.is_empty()).then_some(Message::AllCapture),
+                ),
+                if capturing {
+                    "Capturing from every camera…"
+                } else {
+                    "Capture one frame from every camera, using the Capture settings"
+                },
+            ),
+            tip(
+                all_button(
+                    if recordings > 0 {
+                        Icon::Stop
+                    } else {
+                        Icon::Video
+                    },
+                    if recordings > 0 {
+                        "Stop recordings"
+                    } else {
+                        "Record all"
+                    },
+                    record_busy,
+                    (recordings > 0 || recorders > 0)
+                        .then_some(Message::AllRecord(recordings == 0)),
+                ),
+                if record_busy {
+                    "Updating recordings…"
+                } else if recordings > 0 {
+                    "Stop every recording and finish its file"
+                } else {
+                    "Record every camera to its own file on this computer"
+                },
+            ),
             tip(
                 button(auto)
                     .name(auto_label)

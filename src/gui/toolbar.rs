@@ -13,6 +13,10 @@ mod responsive_layout_tests;
 const STATUS: f32 = 420.0;
 /// Keep the widest Capture label readable, including in the overview.
 const CAPTURE_ROOM: f32 = 160.0;
+/// Room the Record button and the gap before it take.
+const RECORD_ROOM: f32 = 96.0;
+/// Room the elapsed-time pill beside a recording's Stop button takes.
+const PILL_ROOM: f32 = 60.0;
 /// A compact notice still keeps its details and dismiss actions visible.
 const MIN_STATUS: f32 = 128.0;
 
@@ -56,9 +60,10 @@ impl Workbench {
         let width = fit.status;
         let mut left = row![].spacing(8).align_y(Alignment::Center);
         if capture {
+            let preview = self.output_preview();
             let destination: Element<'_, Message> = if fit.destination_label {
                 clipped(
-                    text(self.capture_to.label(&self.output))
+                    text(self.capture_to.label(&preview))
                         .size(style::SMALL)
                         .color(p.secondary)
                         .wrapping(text::Wrapping::None),
@@ -66,19 +71,23 @@ impl Workbench {
             } else {
                 icon(Icon::Folder, 16.0, p.secondary)
             };
-            left = left.push(self.capture_button(p)).push(tip_above(
+            left = left.push(self.capture_button(p));
+            if let Some(record) = self.record_button(p) {
+                left = left.push(record);
+            }
+            left = left.push(tip_above(
                 button(destination)
                     .name(format!(
                         "Capture destination: {}",
-                        self.capture_to.label(&self.output)
+                        self.capture_to.label(&preview)
                     ))
                     .padding([4, 6])
                     .style(style::plain)
                     .on_press(Message::ShowTab(Tab::Capture)),
                 Action::CaptureTab.hint(
                     &format!(
-                        "Where captures are saved: {}",
-                        self.capture_to.label(&self.output)
+                        "Where the next capture is saved: {}",
+                        self.capture_to.label(&preview)
                     ),
                     os,
                 ),
@@ -218,8 +227,18 @@ impl Workbench {
         let activity_label = main >= 620.0;
         let analytics_label = main >= 520.0;
         let destination_label = main >= 700.0;
+        let record = capture && self.record_shown();
         let capture_room = if capture {
             CAPTURE_ROOM + 8.0 + if destination_label { 120.0 } else { 28.0 }
+        } else {
+            0.0
+        } + if record {
+            RECORD_ROOM
+                + if self.recording_here() {
+                    PILL_ROOM
+                } else {
+                    0.0
+                }
         } else {
             0.0
         };
@@ -302,6 +321,102 @@ impl Workbench {
                 Action::Capture.hint("Save using the settings in Capture", os)
             },
         )
+    }
+
+    /// The file the selected camera records to, when this window started it.
+    pub(super) fn recording_file(&self) -> Option<&str> {
+        let (camera, path) = self.last_recording.as_ref()?;
+        (self.recording_here() && *camera == self.snapshot.active_camera).then_some(path.as_str())
+    }
+
+    /// Whether the selected camera can record: a camera, not a scanner, and
+    /// not shown with several others.
+    fn record_shown(&self) -> bool {
+        self.snapshot.connected.is_some() && !self.scanner_selected() && !self.overview()
+    }
+
+    /// Record or Stop for the selected camera, with how long it has been
+    /// recording beside it.
+    fn record_button(&self, p: &'static Palette) -> Option<Element<'_, Message>> {
+        if !self.record_shown() {
+            return None;
+        }
+        let os = Os::CURRENT;
+        let recording = self.recording_here();
+        let pending = self.forward_pending();
+        // A network forward runs from the Video panel; it is stopped there.
+        let forwarding = self.snapshot.forwarding.is_some() && !recording;
+        let (glyph, label): (Element<'_, Message>, _) = match pending {
+            Some(stopping) => (
+                icon::spinner(14.0, p.secondary, self.spin()),
+                if stopping {
+                    "Stopping…"
+                } else {
+                    "Starting…"
+                },
+            ),
+            None if recording => (icon(Icon::Stop, 14.0, p.text), "Stop"),
+            None => (
+                icon(
+                    Icon::Video,
+                    14.0,
+                    if forwarding { p.tertiary } else { p.text },
+                ),
+                "Record",
+            ),
+        };
+        let mut content = row![tip_above(
+            button(
+                row![glyph, text(label).size(style::BODY)]
+                    .spacing(7)
+                    .align_y(Alignment::Center),
+            )
+            .name(if recording {
+                "Stop recording"
+            } else {
+                "Record"
+            })
+            .padding([6, 12])
+            .style(if recording {
+                style::stop
+            } else {
+                style::secondary
+            })
+            .on_press_maybe((pending.is_none() && !forwarding).then_some(Message::Record)),
+            if forwarding {
+                "Stop forwarding in the Video panel to record".to_owned()
+            } else if recording {
+                Action::Record.hint("Stop and finish the recording", os)
+            } else {
+                Action::Record.hint("Record video to a file on this computer", os)
+            },
+        )]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        if recording && let Some(since) = self.snapshot.forwarding_since_ms {
+            let seconds = epoch_ms().saturating_sub(since) / 1000;
+            let elapsed = if seconds >= 3600 {
+                format!(
+                    "{}:{:02}:{:02}",
+                    seconds / 3600,
+                    seconds / 60 % 60,
+                    seconds % 60
+                )
+            } else {
+                format!("{:02}:{:02}", seconds / 60, seconds % 60)
+            };
+            content = content.push(
+                container(
+                    text(elapsed)
+                        .font(style::MONO)
+                        .size(style::SMALL)
+                        .color(p.ink(p.danger)),
+                )
+                .padding([2, 8])
+                .style(style::pill(p.danger)),
+            );
+        }
+        Some(content.into())
     }
 
     /// Whether `pending` shows its progress where it was asked for, on

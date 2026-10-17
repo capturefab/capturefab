@@ -88,10 +88,16 @@ pub(super) fn view<'a>(
 ) -> Option<Element<'a, Message>> {
     let tags = &bench.tags;
     let context = context(tags);
-    let summary = if context.is_empty() {
+    // In the fields' order, not the keys'.
+    let filled: Vec<&str> = TagField::ALL
+        .into_iter()
+        .map(|field| field.get(tags).trim())
+        .filter(|value| !value.is_empty())
+        .collect();
+    let summary = if filled.is_empty() {
         "None".to_owned()
     } else {
-        context.values().cloned().collect::<Vec<_>>().join(" · ")
+        filled.join(" · ")
     };
     let mut section = column![widgets::disclosure(
         "Capture tags",
