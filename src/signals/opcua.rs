@@ -181,8 +181,7 @@ async fn browse(ctx: &Ctx, session: &Session, duration: Duration, limit: usize) 
             .await
             .map_err(|e| anyhow!("OPC UA browse failed: {e}"))?;
         let mut references = Vec::new();
-        loop {
-            let Some(result) = results.pop() else { break };
+        while let Some(result) = results.pop() {
             references.extend(result.references.unwrap_or_default());
             let point = result.continuation_point;
             if point.is_null() || items.len() + references.len() >= limit {

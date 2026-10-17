@@ -998,7 +998,7 @@ mod tests {
         assert!(first.finished.load(Ordering::SeqCst));
         assert_eq!(
             lock(&second.registered).as_slice(),
-            [source.info.id.clone()]
+            std::slice::from_ref(&source.info.id)
         );
         writer.write_all(samples_line(50, 10).as_bytes()).unwrap();
         wait(|| source.samples.load(Ordering::Relaxed) == 60);

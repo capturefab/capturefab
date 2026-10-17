@@ -51,12 +51,10 @@ pub fn decode_payload(topic: &str, payload: &[u8], now_ms: u64) -> Vec<Sample> {
     {
         let source = ["ts", "timestamp", "time"].iter().find_map(|k| {
             let x = map.get(*k)?.as_f64()?;
-            (x.is_finite() && x > 0.0).then(|| {
-                if x < 1e11 {
-                    (x * 1000.0) as u64
-                } else {
-                    x as u64
-                }
+            (x.is_finite() && x > 0.0).then_some(if x < 1e11 {
+                (x * 1000.0) as u64
+            } else {
+                x as u64
             })
         });
         let mut out = Vec::new();

@@ -142,7 +142,7 @@ fn exception_name(code: u8) -> &'static str {
 
 /// Put one value's wire bytes into big-endian (ABCD...) order.
 fn reorder(bytes: &[u8], order: Order) -> Vec<u8> {
-    let mut words: Vec<[u8; 2]> = bytes.chunks_exact(2).map(|w| [w[0], w[1]]).collect();
+    let mut words: Vec<[u8; 2]> = bytes.as_chunks::<2>().0.to_vec();
     if matches!(order, Order::Cdab | Order::Dcba) {
         words.reverse();
     }
