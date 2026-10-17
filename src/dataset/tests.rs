@@ -448,6 +448,15 @@ fn validate_command_bounds() {
         mode: OpenMode::Auto,
         max_bytes: None
     }));
+    // An empty dataset already takes about 1 MiB, so 1 MiB could store nothing.
+    for (max_bytes, accepted) in [(1 << 20, false), (MIN_MAX_BYTES, true)] {
+        let open = C::DatasetOpen {
+            path: "/d/p.duckdb".into(),
+            mode: OpenMode::Auto,
+            max_bytes: Some(max_bytes),
+        };
+        assert_eq!(ok(open), accepted, "{max_bytes}");
+    }
     assert!(!ok(C::DatasetNote {
         text: String::new(),
         context: Context::new(),

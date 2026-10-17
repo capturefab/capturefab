@@ -491,6 +491,8 @@ pub const TABLES: [&str; 7] = [
     "captures_wide",
 ];
 pub const MAX_NOTE_BYTES: usize = 4096;
+/// The smallest `--max-bytes`: room for an empty dataset and some data.
+pub const MIN_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// A request the caller must change (exit code 2), raised while it runs.
 #[derive(Debug)]
@@ -523,9 +525,10 @@ pub fn validate_command(command: &crate::session::SessionCommand) -> Result<()> 
             {
                 bail!("dataset files use the .duckdb extension");
             }
+            // A new, empty dataset with its WAL already takes about 1 MiB.
             ensure!(
-                max_bytes.is_none_or(|b| b >= 1024 * 1024),
-                "dataset size limit must be at least 1 MiB"
+                max_bytes.is_none_or(|b| b >= MIN_MAX_BYTES),
+                "dataset size limit must be at least 16 MiB"
             );
         }
         C::DatasetNote {
@@ -605,7 +608,7 @@ pub fn schema_contract() -> Value {
             "signals": "one row per signal tag: source_id, protocol, uri (redacted), tag, unit, kind",
             "samples": "ts_ms, source_ts_ms, source_id, tag, value_double, value_text, quality",
             "events": "notes, dataset_opened/closed, data_gap, signal_gap, signal_error",
-            "captures_with_signals": "view: each capture with the latest sample of every tag at or before its wall_ms (ASOF join)",
+            "captures_with_signals": "view: each capture with the latest sample of every tag at or before its wall_ms (ASOF join): capture_id, wall_ms, camera_id, path, object_key, context, source_id, tag, unit, sample_ms, sample_age_ms (wall_ms - sample_ms), value_double, value_text, quality",
             "captures_wide": "export only: one row per capture, one column per tag (1..256 tags)",
         },
         "formats": if cfg!(feature = "parquet") { json!(["csv", "parquet", "json", "jsonl"]) } else { json!(["csv"]) },
@@ -619,6 +622,7 @@ pub fn schema_contract() -> Value {
             "sql_bytes": query::MAX_SQL_BYTES,
             "note_bytes": MAX_NOTE_BYTES,
             "max_bytes_default": db::DEFAULT_MAX_BYTES,
+            "max_bytes_min": MIN_MAX_BYTES,
             "context": {"entries": crate::context::MAX_ENTRIES, "key": "^[a-z][a-z0-9_]{0,31}$", "value_bytes": crate::context::MAX_VALUE},
         },
         "exit_codes": {
