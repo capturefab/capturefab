@@ -32,7 +32,7 @@ pub(super) const ISSUES: &str = "\0issues";
 const EDGE: f32 = 12.0;
 /// Inset of text and glyphs within a row, which headers and hints share, so
 /// the sidebar has one left edge.
-const INSET: f32 = 10.0;
+pub(super) const INSET: f32 = 10.0;
 /// The slot leading glyphs sit in, so device and recent titles align.
 const LEAD: f32 = 16.0;
 /// The slot trailing status glyphs and the eject button share.
@@ -627,6 +627,9 @@ impl Workbench {
         }
         for entry in recent {
             list = list.push(self.recent_row(entry, spin, p));
+        }
+        if let Some(sources) = self.sidebar_signals(p) {
+            list = list.push(sources);
         }
         container(
             column![

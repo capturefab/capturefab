@@ -491,9 +491,7 @@ enum Job {
     #[allow(dead_code)] // Notes come from the CLI and RPC for now.
     DatasetNote,
     DatasetExport,
-    #[allow(dead_code)] // Sent by the signals view (Slice C).
     SignalStart,
-    #[allow(dead_code)]
     SignalStop,
     /// Write a feature, by name.
     Set(String),
@@ -746,6 +744,7 @@ enum Message {
     AutoStart(bool),
     Tag(tags::TagField, String),
     Dataset(dataset::Msg),
+    Signals(signals::Msg),
     DismissNotice,
     /// Hide a camera's error badge, by camera ID, until the error recurs.
     DismissStageError(String),
@@ -885,6 +884,7 @@ struct Workbench {
     /// Capture context sent with captures and recordings.
     tags: CaptureTags,
     dataset: dataset::DatasetUi,
+    signals: signals::SignalsUi,
     recent: Vec<Recent>,
     saved: Option<Prefs>,
     prefs_saver: prefs::Saver,
@@ -952,6 +952,7 @@ impl Workbench {
         let shown = |open: bool| if open { 1.0 } else { 0.0 };
         let main_window = window::Id::unique();
         let dataset = dataset::DatasetUi::start(&handle, saved.as_ref());
+        let signals = signals::SignalsUi::start(saved.as_ref());
         let client_activity = client_activity::State::from_snapshot(&handle.snapshot());
         let video_analytics =
             video_analytics::State::new(handle.clone(), prefs.video_analytics.clone());
@@ -1068,6 +1069,7 @@ impl Workbench {
             auto_start: prefs.auto_start,
             tags: prefs.tags,
             dataset,
+            signals,
             recent: prefs.recent,
             saved,
             prefs_saver: prefs::Saver::new(),
@@ -1174,6 +1176,7 @@ impl Workbench {
             tags: self.tags.clone(),
             dataset_path: self.dataset.path.clone(),
             dataset_auto: self.dataset.auto,
+            recent_signals: self.signals.recent.clone(),
             // Not yet mirrored on the workbench: keep what was loaded.
             ..self.saved.clone().unwrap_or_default()
         }
@@ -1647,6 +1650,7 @@ impl Workbench {
         self.result_inspector(pending, result);
         self.result_autocapture(pending, result);
         self.dataset_settled(pending, result);
+        self.signals_settled(pending, result);
         let notice = if pending.batch {
             self.batch_result(&pending.job, result)
         } else {
@@ -1797,6 +1801,7 @@ impl Workbench {
         self.tick_analytics();
         self.tick_video_analytics();
         self.tick_autocapture();
+        self.tick_signals();
         self.save_prefs();
         Task::batch([
             pages,
@@ -3208,6 +3213,7 @@ impl Workbench {
             Message::AutoStart(on) => self.auto_start = on,
             Message::Tag(field, value) => field.set(&mut self.tags, value),
             Message::Dataset(message) => return self.dataset_update(message),
+            Message::Signals(message) => return self.signals_update(message),
             Message::Screenshot(shot) => {
                 if let Some(request) = &mut self.screenshot {
                     let path = request.sequence.path(&request.path);
