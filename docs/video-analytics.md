@@ -4,7 +4,7 @@ Capturefab can sample a live camera and ask OpenAI (the API for ChatGPT models),
 
 ## API keys
 
-In desktop **Settings**, choose a provider and enter its API key in the password field. Saving places the key in the OS native credential store: macOS Keychain, Windows Credential Manager or Linux Secret Service. Saved keys can be replaced or removed in Settings. A locked or unavailable credential store produces an error; Capturefab does not fall back to saving keys in a preferences file.
+In desktop **Settings**, expand **AI provider API keys** (or select **Manage API keys in Settings…** in **Analytics**), choose a provider and enter its API key in the password field. Saving places the key in the OS native credential store: macOS Keychain, Windows Credential Manager or Linux Secret Service. Saved keys can be replaced or removed in Settings. A locked or unavailable credential store produces an error; Capturefab does not fall back to saving keys in a preferences file.
 
 Alternatively, set the provider's standard environment variable before launching Capturefab:
 
