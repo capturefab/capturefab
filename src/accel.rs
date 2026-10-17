@@ -179,28 +179,9 @@ struct Helper {
     /// What the helper reported when it became ready.
     version: String,
 }
-// Linux can briefly refuse exec after a newly written helper was closed,
-// including while another process is completing a concurrent fork/exec. No
-// child was started on ETXTBSY, so retry only that error for a bounded time.
-pub(crate) fn spawn_helper(command: &mut Command) -> std::io::Result<Child> {
-    let deadline = Instant::now() + Duration::from_millis(500);
-    loop {
-        match command.spawn() {
-            Err(error)
-                if cfg!(target_os = "linux")
-                    && error.raw_os_error() == Some(26)
-                    && Instant::now() < deadline =>
-            {
-                thread::sleep(Duration::from_millis(10));
-            }
-            result => return result,
-        }
-    }
-}
-
 impl Helper {
     fn start(kind: &Kind, executable: &std::path::Path) -> Result<Self> {
-        let mut child = spawn_helper(
+        let mut child = crate::session::spawn_helper(
             Command::new(executable)
                 .arg(kind.argument)
                 .envs(kind.environment.iter().copied())
@@ -619,7 +600,7 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
             drop(writer);
         });
-        let mut child = spawn_helper(&mut command).unwrap();
+        let mut child = crate::session::spawn_helper(&mut command).unwrap();
         assert!(child.wait().unwrap().success());
         closer.join().unwrap();
         std::fs::remove_file(path).unwrap();

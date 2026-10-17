@@ -129,6 +129,25 @@ fn describe_column(name: &str) -> &'static str {
         "unit" => "Engineering unit, when known",
         "tag" => "Signal tag name",
         "source_id" => "Signal source identifier (signal:<hex>)",
+        "vendor" | "model" | "serial" => "Camera vendor, model or serial number, as reported",
+        "transport" => "How the camera was reached, such as gige, media or simulator",
+        "source" => "Camera address or stream URL, with credentials removed",
+        "width" | "height" => "Frame size in pixels",
+        "pixel_format" | "pixel_format_code" => "Camera pixel format, by name or GenICam code",
+        "format" => "Saved file format (png, jpeg, raw, ...)",
+        "origin" => "capture (on request) or schedule (a scheduled job)",
+        "job_id" => "Scheduled capture job, for origin = schedule",
+        "codec" | "encoder" | "fps" => "Video codec, FFmpeg encoder and frame rate",
+        "destination" => "Saved destination name, when one was used",
+        "upload_id" | "remote_url" | "uploaded_ms" => {
+            "Upload queue entry, remote location and upload time (UTC Unix milliseconds), once uploaded"
+        }
+        "protocol" => "Signal protocol (modbus-tcp, mqtt, opc.tcp, mtconnect, sim-signal)",
+        "uri" => "Signal source URI, with credentials removed",
+        "kind" => "Value kind for signals (number, bool, text); event kind for events",
+        "description" => "Tag description, when the source reports one",
+        "first_ms" | "last_ms" => "First and last sample, UTC Unix milliseconds",
+        "text" => "Event text, such as a note",
         _ => "",
     }
 }

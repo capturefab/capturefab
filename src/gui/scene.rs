@@ -184,7 +184,8 @@ impl Workbench {
     ///   selected camera's frames stopped arriving), `auto` (every camera in
     ///   auto mode), `forwarding` (the selected camera forwards to a URL),
     ///   `recording` (the selected camera records to a file, for 1:23)
-    /// - `tags`: the capture tags filled in and open
+    /// - `tags`: the capture tags filled in and open; `dataset`: the Dataset
+    ///   section open
     /// - review fixtures: `network`, `network-empty`, `network-error`,
     ///   `destinations-remove`, `bucket-editor-advanced`, `settings-credentials`,
     ///   `settings-credential-error`, `analytics-measurements`,
@@ -285,6 +286,10 @@ impl Workbench {
                     let _ = self.handle_message(Message::InspectorDisclosure(
                         inspector::Section::CaptureTags,
                     ));
+                }
+                "dataset" => {
+                    let _ = self
+                        .handle_message(Message::InspectorDisclosure(inspector::Section::Dataset));
                 }
                 "connect-failed" => {
                     let target = "192.168.10.50";

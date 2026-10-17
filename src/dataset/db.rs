@@ -182,6 +182,19 @@ pub(crate) fn explain(error: duckdb::Error, path: &Path, op: &str) -> anyhow::Er
     let text = error.to_string();
     if text.contains("Could not set lock") || text.contains("Conflicting lock") {
         anyhow!("{}", locked_message(path))
+    } else if op == "query"
+        && ["Binder Error", "Parser Error", "Catalog Error"]
+            .iter()
+            .any(|kind| text.starts_with(kind))
+    {
+        // The caller's SQL is wrong. DuckDB says "not found" for unknown
+        // columns, which `cli::error_code` would read as an unavailable
+        // camera or session.
+        super::Usage(format!(
+            "dataset query is invalid: {}",
+            text.replace("not found", "missing")
+        ))
+        .into()
     } else if text.contains("Out of Memory") {
         anyhow!("dataset {op} ran out of memory; narrow --since/--until or --tables")
     } else {

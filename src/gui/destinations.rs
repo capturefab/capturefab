@@ -1961,7 +1961,7 @@ impl Picker {
                 "Save to",
                 super::tip(
                     label_action("Manage…", Message::OpenManager),
-                    "Add, edit or test folders, external drives and S3 buckets",
+                    "Manage folders, external drives, S3 buckets and FTP/SFTP servers",
                 ),
                 p,
             ),
@@ -2335,7 +2335,7 @@ impl Picker {
         let mut body = column![
             history_controls(undo_label, redo_label, p),
             text(
-                "Save captures and recordings to a folder or drive, or upload them to an S3 bucket."
+                "Save captures and recordings to a folder or drive, or upload them to an S3 bucket or an FTP or SFTP server."
             )
             .size(style::SMALL)
             .color(p.secondary),

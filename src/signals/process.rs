@@ -26,7 +26,7 @@ impl SignalProcess {
         let executable = std::env::var_os("CAPTUREFAB_EXECUTABLE")
             .map(PathBuf::from)
             .unwrap_or(std::env::current_exe()?);
-        let mut child = crate::accel::spawn_helper(
+        let mut child = crate::session::spawn_helper(
             Command::new(executable)
                 .arg("__signal")
                 .stdin(Stdio::piped())

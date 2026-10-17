@@ -852,7 +852,7 @@ pub enum Command {
         #[arg(value_parser = clap::value_parser!(u64).range(1..))]
         id: u64,
     },
-    /// Manage saved capture destinations: folders, external drives and S3 buckets
+    /// Manage saved capture destinations: folders, external drives, S3 buckets and FTP/SFTP servers
     #[command(visible_alias = "destinations")]
     Destination {
         #[command(subcommand)]

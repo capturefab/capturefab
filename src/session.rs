@@ -913,6 +913,27 @@ struct Process {
     saved_seq: u64,
     saved_gaps: u64,
 }
+// Linux can briefly refuse exec after a newly written helper was closed,
+// including while another process is completing a concurrent fork/exec. No
+// child was started on ETXTBSY, so retry only that error for a bounded time.
+pub(crate) fn spawn_helper(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match command.spawn() {
+            Err(error)
+                if cfg!(target_os = "linux")
+                    && error.raw_os_error() == Some(26)
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
+
 impl Process {
     fn spawn(scanner: bool) -> Result<Self> {
         let capacity = frame_capacity(scanner)?;

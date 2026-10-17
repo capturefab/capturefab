@@ -59,8 +59,16 @@ fn batch(items: Vec<SavedFile>) -> SavedBatch {
     }
 }
 
-fn count(slot: &Slot, sql: &str) -> Value {
-    slot.reader().unwrap().query(sql, 10, 0).unwrap()["rows"][0][0].clone()
+/// First cell of `sql` on a closed dataset, read the way `--file` reads it,
+/// so the check also runs in builds that refuse queries in a session.
+fn count(path: &std::path::Path, sql: &str) -> Value {
+    Dataset::open_read_only(path)
+        .unwrap()
+        .reader()
+        .unwrap()
+        .query(sql, 10, 0)
+        .unwrap()["rows"][0][0]
+        .clone()
 }
 
 fn source() -> SignalInfo {
@@ -168,17 +176,17 @@ fn slot_records_saved_files_once_and_counts_gaps() {
     let status = slot.status_cached().unwrap();
     assert_eq!((status.captures, status.missed_files), (2, 2));
     assert_eq!(status.last_saved.as_deref(), Some("/x/b.png"));
-    assert_eq!(count(&slot, "SELECT count(*) FROM captures"), json!(2));
+    let closed = slot.close().unwrap().unwrap();
+    assert_eq!(closed.captures, 2);
+    assert_eq!(count(&path, "SELECT count(*) FROM captures"), json!(2));
     assert_eq!(
-        count(&slot, "SELECT count(*) FROM events WHERE kind = 'data_gap'"),
+        count(&path, "SELECT count(*) FROM events WHERE kind = 'data_gap'"),
         json!(1)
     );
     assert_eq!(
-        count(&slot, "SELECT context::VARCHAR FROM captures LIMIT 1"),
+        count(&path, "SELECT context::VARCHAR FROM captures LIMIT 1"),
         json!(r#"{"line":"L1"}"#)
     );
-    let closed = slot.close().unwrap().unwrap();
-    assert_eq!(closed.captures, 2);
     assert!(slot.status_cached().is_none() && slot.close().unwrap().is_none());
     // Reopening keeps the counts.
     assert_eq!(slot.open(&path, OpenMode::Open, None).unwrap().captures, 2);
@@ -213,12 +221,22 @@ fn auto_path_opens_lazily_on_first_saved_file() {
 #[test]
 fn query_guard_sandbox_limits_and_timeout() {
     let dir = temp_dir("query");
+    let path = dir.join("q.duckdb");
     let slot = Slot::new();
-    slot.open(&dir.join("q.duckdb"), OpenMode::Create, None)
-        .unwrap();
+    slot.open(&path, OpenMode::Create, None).unwrap();
     slot.record_saved(batch(vec![capture("/x/a.png", 1)]), 0);
     let reader = slot.reader().unwrap();
-    if cfg!(feature = "parquet") {
+    if !cfg!(feature = "parquet") {
+        // No SQL parser check: only a read-only `--file` reader may query.
+        let error = reader.query("SELECT 1", 1, 0).err().unwrap();
+        assert_eq!(crate::cli::error_code(&error).1, 5, "{error}");
+        drop(reader);
+        slot.close().unwrap();
+        check_reader(
+            &dir,
+            &Dataset::open_read_only(&path).unwrap().reader().unwrap(),
+        );
+    } else {
         for bad in [
             "DELETE FROM captures; SELECT 1",
             "SELECT 1; SELECT 2",
@@ -231,8 +249,22 @@ fn query_guard_sandbox_limits_and_timeout() {
             let error = reader.query(bad, 10, 0).err().unwrap();
             assert!(error.is::<Usage>(), "{bad}: {error}");
         }
-        assert_eq!(count(&slot, "SELECT count(*) FROM captures"), json!(1));
+        check_reader(&dir, &reader);
+        drop(reader);
+        slot.close().unwrap();
+        assert_eq!(count(&path, "SELECT count(*) FROM captures"), json!(1));
     }
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Sandbox, row limit, big integers and timeout of one reader.
+fn check_reader(dir: &std::path::Path, reader: &Reader) {
+    let error = reader
+        .query("SELECT no_such_column FROM captures", 10, 0)
+        .err()
+        .unwrap();
+    assert!(error.is::<Usage>(), "{error}");
+    assert_eq!(crate::cli::error_code(&error).1, 1, "{error}");
     let outside = dir.join("outside.csv");
     let error = reader
         .query(
@@ -261,9 +293,6 @@ fn query_guard_sandbox_limits_and_timeout() {
     assert!(error.to_string().contains("timed out"), "{error}");
     assert_eq!(crate::cli::error_code(&error).1, 4);
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
-    drop(reader);
-    slot.close().unwrap();
-    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -289,9 +318,9 @@ fn reader_does_not_block_writer_and_close_interrupts_readers() {
 #[test]
 fn samples_signals_notes_and_asof_view() {
     let dir = temp_dir("signals");
+    let path = dir.join("s.duckdb");
     let slot = Slot::new();
-    slot.open(&dir.join("s.duckdb"), OpenMode::Create, None)
-        .unwrap();
+    slot.open(&path, OpenMode::Create, None).unwrap();
     // A sink with nothing open accepts writes silently.
     let tags = [TagInfo {
         tag: "temp".into(),
@@ -320,7 +349,10 @@ fn samples_signals_notes_and_asof_view() {
     slot.record_saved(batch(vec![capture("/x/a.png", 250)]), 0);
     let status = slot.status_cached().unwrap();
     assert_eq!((status.samples, status.signals), (4, 2));
-    let reader = slot.reader().unwrap();
+    slot.finish().unwrap();
+    slot.close().unwrap();
+    let dataset = Dataset::open_read_only(&path).unwrap();
+    let reader = dataset.reader().unwrap();
     let rows = reader
         .query(
             "SELECT tag, value_double, sample_age_ms, unit FROM captures_with_signals ORDER BY tag",
@@ -340,9 +372,7 @@ fn samples_signals_notes_and_asof_view() {
         )
         .unwrap();
     assert_eq!(signal["rows"][0], json!([100, 300, "sim-signal", "number"]));
-    drop(reader);
-    slot.finish().unwrap();
-    slot.close().unwrap();
+    drop((reader, dataset));
     assert!(
         slot.write("x", &[sample(1, "t", Signal::Number(1.0))])
             .is_ok()
