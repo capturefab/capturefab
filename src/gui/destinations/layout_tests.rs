@@ -565,3 +565,64 @@ fn compact_editor_tab_and_shift_tab_reveal_the_actual_fields_and_pinned_actions(
         assert_focus_traversal_reveals(&mut view, &mut tree, &node, &renderer);
     }
 }
+
+#[test]
+fn footer_undo_and_redo_fit_beside_the_actions_at_every_interface_size() {
+    let renderer = renderer();
+    for scale in crate::gui::prefs::UiScale::ALL {
+        let viewport = Size::new(640.0, 480.0) / scale.factor();
+        let mut picker = Picker::new(false, false);
+        let mut output = String::new();
+        picker.update(Message::AddBucket, &mut output);
+        picker.update(Message::Bucket("line-1".into()), &mut output);
+        picker.update(Message::Region("eu-west-1".into()), &mut output);
+        picker.undo();
+        let mut view = accessibility::mapped(
+            picker.manager(
+                Palette::of(false),
+                (viewport.height - 80.0).max(320.0),
+                0,
+                Instant::now(),
+                None,
+                None,
+            ),
+            GuiMessage::CapturePicker,
+        );
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport),
+        );
+        let (snapshot, _, _) = accessibility::snapshot_widget(
+            view.as_widget_mut(),
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+        );
+        let mut found = 0;
+        for (_, action) in &snapshot.nodes {
+            let Some(label) = action.label() else {
+                continue;
+            };
+            if action.role() != accessibility::Role::Button
+                || !(label.starts_with("Undo ")
+                    || label.starts_with("Redo ")
+                    || label.starts_with("Check that ")
+                    || matches!(label, "Cancel" | "Save"))
+            {
+                continue;
+            }
+            found += 1;
+            let bounds = action.bounds().unwrap();
+            assert!(
+                bounds.x0 >= 0.0
+                    && bounds.x1 <= f64::from(node.size().width) + 0.5
+                    && bounds.width() >= 20.0,
+                "{label} at {bounds:?} fits the {:?} sheet at {scale}",
+                node.size()
+            );
+        }
+        assert_eq!(found, 5, "Undo, Redo, Test, Cancel and Save at {scale}");
+    }
+}
