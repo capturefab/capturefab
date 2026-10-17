@@ -19,8 +19,10 @@ const MAX_LEAVES: usize = 256;
 const MAX_DEPTH: usize = 4;
 
 /// Decode one message: a number, `true`/`false`, a JSON object flattened to
-/// `topic/field/sub`, or text. Top-level `ts`, `timestamp` or `time` fields
-/// become `source_ts_ms` (values below 1e11 are seconds).
+/// `topic/field/sub`, text, or `hex:` for binary payloads. The first
+/// top-level `ts`, `timestamp` or `time` field holding epoch seconds (below
+/// 1e11), epoch milliseconds or an RFC 3339 string becomes `source_ts_ms`;
+/// any other such field stays an ordinary tag.
 pub fn decode_payload(topic: &str, payload: &[u8], now_ms: u64) -> Vec<Sample> {
     let stamp = |tag: &str, value: Value, quality: Quality, source: Option<u64>| Sample {
         ts_ms: now_ms,
@@ -32,7 +34,18 @@ pub fn decode_payload(topic: &str, payload: &[u8], now_ms: u64) -> Vec<Sample> {
     if payload.len() > MAX_PAYLOAD {
         return Vec::new();
     }
-    let text = String::from_utf8_lossy(payload);
+    let Some(text) = std::str::from_utf8(payload).ok().filter(|t| {
+        !t.chars()
+            .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+    }) else {
+        // Binary payloads (non-UTF-8 or control bytes such as NUL) would
+        // corrupt CSV cells and dataset text; keep a bounded hex prefix.
+        let mut hex = String::from("hex:");
+        for byte in payload.iter().take(super::MAX_TEXT / 2) {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        return vec![stamp(topic, Value::text(&hex), Quality::Good, None)];
+    };
     let trimmed = text.trim();
     if trimmed == "true" || trimmed == "false" {
         return vec![stamp(
@@ -49,14 +62,14 @@ pub fn decode_payload(topic: &str, payload: &[u8], now_ms: u64) -> Vec<Sample> {
     if trimmed.starts_with('{')
         && let Ok(Json::Object(map)) = serde_json::from_str::<Json>(trimmed)
     {
-        let source = ["ts", "timestamp", "time"].iter().find_map(|k| {
-            let x = map.get(*k)?.as_f64()?;
-            (x.is_finite() && x > 0.0).then_some(if x < 1e11 {
-                (x * 1000.0) as u64
-            } else {
-                x as u64
-            })
-        });
+        let source = ["ts", "timestamp", "time"]
+            .into_iter()
+            .find_map(|k| Some((k, source_ts(map.get(k)?)?)));
+        let mut map = map;
+        if let Some((key, _)) = source {
+            map.remove(key);
+        }
+        let source = source.map(|(_, ms)| ms);
         let mut out = Vec::new();
         flatten(topic, &Json::Object(map), 0, &mut |tag, value| {
             let (value, quality) = match value {
@@ -71,16 +84,29 @@ pub fn decode_payload(topic: &str, payload: &[u8], now_ms: u64) -> Vec<Sample> {
         });
         return out;
     }
-    vec![stamp(topic, Value::text(&text), Quality::Good, None)]
+    vec![stamp(topic, Value::text(text), Quality::Good, None)]
+}
+
+/// Epoch seconds (below 1e11), epoch milliseconds or an RFC 3339 string.
+fn source_ts(value: &Json) -> Option<u64> {
+    if let Some(text) = value.as_str() {
+        let ms = chrono::DateTime::parse_from_rfc3339(text.trim())
+            .ok()?
+            .timestamp_millis();
+        return u64::try_from(ms).ok().filter(|ms| *ms > 0);
+    }
+    let x = value.as_f64()?;
+    (x.is_finite() && x > 0.0 && x < 1e15).then_some(if x < 1e11 {
+        (x * 1000.0) as u64
+    } else {
+        x as u64
+    })
 }
 
 fn flatten(prefix: &str, value: &Json, depth: usize, emit: &mut impl FnMut(String, &Json)) {
     match value {
         Json::Object(map) if depth < MAX_DEPTH => {
             for (key, value) in map {
-                if depth == 0 && matches!(key.as_str(), "ts" | "timestamp" | "time") {
-                    continue;
-                }
                 flatten(&format!("{prefix}/{key}"), value, depth + 1, emit);
             }
         }
@@ -139,6 +165,11 @@ fn options(ctx: &Ctx) -> Result<(MqttOptions, String, QoS)> {
 }
 
 fn connection_error(error: ConnectionError) -> anyhow::Error {
+    if let Some(certificate) = rejected_certificate(&error) {
+        return anyhow!(
+            "MQTT broker's TLS certificate was rejected: {certificate}; mqtts:// trusts the OS certificate store, so add the broker's CA certificate there"
+        );
+    }
     match error {
         // Not "connection refused": a rejected login is not an unreachable broker.
         ConnectionError::ConnectionRefused(code) => {
@@ -147,6 +178,32 @@ fn connection_error(error: ConnectionError) -> anyhow::Error {
         ConnectionError::NetworkTimeout => anyhow!("MQTT broker connection timed out"),
         other => anyhow!("MQTT connection failed: {other}"),
     }
+}
+
+/// The certificate verification failure inside a TLS connection error.
+fn rejected_certificate(error: &ConnectionError) -> Option<String> {
+    use rumqttc::TlsError;
+    let rustls_error = match error {
+        ConnectionError::Tls(TlsError::TLS(e)) => e,
+        ConnectionError::Tls(TlsError::Io(e)) | ConnectionError::Io(e) => {
+            e.get_ref()?.downcast_ref::<rustls::Error>()?
+        }
+        _ => return None,
+    };
+    match rustls_error {
+        rustls::Error::InvalidCertificate(rustls::CertificateError::Other(other)) => {
+            Some(other.to_string())
+        }
+        rustls::Error::InvalidCertificate(e) => Some(e.to_string()),
+        _ => None,
+    }
+}
+
+fn connect_timeout(ctx: &Ctx) -> anyhow::Error {
+    anyhow!(
+        "MQTT broker connection timed out after {} ms; check the port and mqtt:// versus mqtts://",
+        ctx.spec.timeout_ms
+    )
 }
 
 /// Collect messages until `until`, keeping the last sample per tag. Fails if
@@ -161,6 +218,7 @@ fn collect(
     client.subscribe(filter, qos)?;
     let connect_deadline = Instant::now() + ctx.timeout();
     let mut deadline = None;
+    let mut connected = false;
     let mut latest = BTreeMap::new();
     let mut truncated = false;
     loop {
@@ -168,6 +226,9 @@ fn collect(
         let end = deadline.unwrap_or(connect_deadline);
         if now >= end || ctx.stopped() {
             if deadline.is_none() && !ctx.stopped() {
+                if !connected {
+                    return Err(connect_timeout(ctx));
+                }
                 bail!(
                     "MQTT subscription timed out after {} ms",
                     ctx.spec.timeout_ms
@@ -176,6 +237,7 @@ fn collect(
             break;
         }
         match connection.recv_timeout((end - now).min(Duration::from_millis(100))) {
+            Ok(Ok(Event::Incoming(Packet::ConnAck(_)))) => connected = true,
             Ok(Ok(Event::Incoming(Packet::SubAck(_)))) => {
                 deadline = Some(Instant::now() + until_after_suback);
             }
@@ -257,10 +319,7 @@ fn log(ctx: &Ctx) -> Result<()> {
     let mut backoff = Duration::from_secs(1);
     while !ctx.stopped() {
         if !ever_connected && Instant::now() >= connect_deadline {
-            bail!(
-                "MQTT broker connection timed out after {} ms",
-                ctx.spec.timeout_ms
-            );
+            return Err(connect_timeout(ctx));
         }
         match connection.recv_timeout(Duration::from_millis(200)) {
             Ok(Ok(Event::Incoming(Packet::ConnAck(_)))) => {
@@ -370,5 +429,57 @@ mod tests {
             panic!()
         };
         assert!(t.len() <= 1024 && t.ends_with('…'));
+    }
+
+    #[test]
+    fn binary_payloads_become_hex() {
+        let s = decode_payload("b", &[0xff, 0x00, 0x10], 0);
+        assert_eq!(s[0].value, Value::Text("hex:ff0010".into()));
+        // Valid UTF-8 with a NUL is binary too; tabs and newlines are text.
+        let s = decode_payload("b", b"a\0b", 0);
+        assert_eq!(s[0].value, Value::Text("hex:610062".into()));
+        let s = decode_payload("b", b"a\tb\r\nc", 0);
+        assert_eq!(s[0].value, Value::Text("a\tb\r\nc".into()));
+        let s = decode_payload("b", &vec![0xffu8; 4096], 0);
+        let Value::Text(t) = &s[0].value else {
+            panic!()
+        };
+        assert!(t.starts_with("hex:ffff") && t.len() <= crate::signals::MAX_TEXT);
+    }
+
+    #[test]
+    fn timestamp_fields_parse_rfc3339_and_unused_ones_stay_tags() {
+        let s = decode_payload("m", br#"{"timestamp":"2026-01-01T00:00:00.5Z","v":1}"#, 0);
+        assert_eq!(s.len(), 1);
+        assert_eq!(
+            (s[0].tag.as_str(), s[0].source_ts_ms),
+            ("m/v", Some(1_767_225_600_500))
+        );
+        // Only the field used as the source time is consumed.
+        let s = decode_payload("m", br#"{"ts":1700000000,"time":"shift A","v":2}"#, 0);
+        let tags: Vec<_> = s.iter().map(|s| s.tag.as_str()).collect();
+        assert_eq!(tags, ["m/time", "m/v"]);
+        assert!(s.iter().all(|s| s.source_ts_ms == Some(1_700_000_000_000)));
+        // Unparseable times are kept as data instead of silently dropped.
+        let s = decode_payload("m", br#"{"time":"yesterday","v":3}"#, 0);
+        assert_eq!(s.len(), 2);
+        assert!(s.iter().all(|s| s.source_ts_ms.is_none()));
+    }
+
+    #[test]
+    fn certificate_errors_explain_the_trust_store() {
+        let io = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+        );
+        let message = connection_error(ConnectionError::Tls(rumqttc::TlsError::Io(io))).to_string();
+        assert!(
+            message.contains("TLS certificate was rejected: UnknownIssuer"),
+            "{message}"
+        );
+        assert!(message.contains("OS certificate store"), "{message}");
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        let message = connection_error(ConnectionError::Io(refused)).to_string();
+        assert!(message.starts_with("MQTT connection failed"), "{message}");
     }
 }
