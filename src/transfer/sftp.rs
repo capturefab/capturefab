@@ -173,6 +173,21 @@ fn join(parts: &[&str]) -> String {
     }
 }
 
+/// Why a private key file could not be used, with the fix for a missing
+/// passphrase.
+fn key_error(path: &Path, has_passphrase: bool, error: &russh::keys::Error) -> Permanent {
+    let hint = match error {
+        russh::keys::Error::KeyIsEncrypted if !has_passphrase => {
+            "; give its passphrase with --password-stdin or --password-env"
+        }
+        _ => "",
+    };
+    Permanent(format!(
+        "cannot load SFTP key {}: {error}{hint}",
+        path.display()
+    ))
+}
+
 fn no_such_file(error: &russh_sftp::client::error::Error) -> bool {
     matches!(error, russh_sftp::client::error::Error::Status(status) if status.status_code == StatusCode::NoSuchFile)
 }
@@ -200,9 +215,8 @@ impl SftpUploader {
         let account = format!("{}@{}:{}", server.user, server.host, server.port);
         let result = match &server.key_file {
             Some(path) => {
-                let key = russh::keys::load_secret_key(path, secret).map_err(|e| {
-                    Permanent(format!("cannot load SFTP key {}: {e}", path.display()))
-                })?;
+                let key = russh::keys::load_secret_key(path, secret)
+                    .map_err(|e| key_error(path, secret.is_some(), &e))?;
                 let hash = within(
                     AUTH_TIMEOUT,
                     "negotiating the key signature",
@@ -483,6 +497,23 @@ mod tests {
             password: SecretSource::Keychain,
             keep_local: false,
         }
+    }
+
+    #[test]
+    fn encrypted_key_without_passphrase_says_how_to_give_one() {
+        let path = Path::new("/keys/id_ed25519");
+        let encrypted = russh::keys::Error::KeyIsEncrypted;
+        let message = key_error(path, false, &encrypted).to_string();
+        assert!(
+            message.starts_with("cannot load SFTP key /keys/id_ed25519: "),
+            "{message}"
+        );
+        assert!(
+            message.contains("--password-stdin or --password-env"),
+            "{message}"
+        );
+        let message = key_error(path, true, &encrypted).to_string();
+        assert!(!message.contains("--password-stdin"), "{message}");
     }
 
     fn local(name: &str, data: &[u8]) -> (std::path::PathBuf, String) {
