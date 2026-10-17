@@ -182,7 +182,7 @@ struct Helper {
 // Linux can briefly refuse exec after a newly written helper was closed,
 // including while another process is completing a concurrent fork/exec. No
 // child was started on ETXTBSY, so retry only that error for a bounded time.
-fn spawn_helper(command: &mut Command) -> std::io::Result<Child> {
+pub(crate) fn spawn_helper(command: &mut Command) -> std::io::Result<Child> {
     let deadline = Instant::now() + Duration::from_millis(500);
     loop {
         match command.spawn() {

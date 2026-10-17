@@ -2244,6 +2244,11 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
         }
     } else if let Some(Command::Dataset { command }) = &cli.command {
         dataset_output(&mut out, command, &value)?;
+    } else if matches!(
+        &cli.command,
+        Some(Command::Signals { .. } | Command::Log { .. })
+    ) {
+        out.write_all(crate::signals::report::human(&value).as_bytes())?;
     } else if matches!(&cli.command, Some(Command::Activity { .. })) {
         writeln!(out, "Session activity · revision {}", value["revision"])?;
         for entry in value["activity"].as_array().into_iter().flatten() {
@@ -2967,6 +2972,10 @@ fn prepare_signals(cli: &Cli) -> Result<Option<SessionCommand>> {
             },
             Some(SignalsCommand::Stop { id }) => SessionCommand::SignalStop { id: id.clone() },
         }),
+        Some(Command::Log { .. }) => {
+            crate::signals::log::validate(&log_options(cli)?)?;
+            None
+        }
         _ => None,
     })
 }
@@ -2983,8 +2992,45 @@ fn signals_command(
 
 /// `log`: run a local session that logs signal sources into a dataset or
 /// CSV file for a duration or until Ctrl-C, then print the result.
-fn log_command(_cli: &Cli) -> Result<()> {
-    anyhow::bail!("log is not implemented yet")
+fn log_command(cli: &Cli) -> Result<()> {
+    let options = log_options(cli)?;
+    let handle = SessionHandle::new();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let flag = stopped.clone();
+    ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed))
+        .context("install signal handler")?;
+    let result = crate::signals::log::run(&handle, &options, &stopped);
+    handle.shutdown();
+    output(cli, result?)
+}
+
+/// `log` arguments as the signals module takes them.
+fn log_options(cli: &Cli) -> Result<crate::signals::log::LogOptions> {
+    let Some(Command::Log {
+        uris,
+        interval,
+        duration,
+        csv,
+        tags,
+        dataset,
+        storage,
+    }) = &cli.command
+    else {
+        anyhow::bail!("not a log command");
+    };
+    Ok(crate::signals::log::LogOptions {
+        uris: uris.clone(),
+        interval_ms: crate::scheduling::parse_duration(interval)?,
+        duration_ms: duration
+            .as_deref()
+            .map(crate::scheduling::parse_duration)
+            .transpose()?,
+        csv: csv.clone(),
+        dataset: dataset.dataset.clone(),
+        tags: tags.clone(),
+        policy: storage.policy()?,
+        progress: !cli.json,
+    })
 }
 
 /// A direct CLI capture to a bucket destination uploads before exiting, so
