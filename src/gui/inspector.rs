@@ -560,10 +560,10 @@ fn capture_guidance(kind: CameraKind) -> Option<&'static str> {
             Some("Each saved block contains the configured number of consecutive lines.")
         }
         CameraKind::Depth => Some(
-            "Use Raw pixels to preserve depth samples. Image formats produce 8-bit images. Keep the component's unit, scale and offset with your measurements.",
+            "Use Raw pixels for depth samples; image formats are 8-bit. Keep the component's unit, scale and offset for measurements.",
         ),
         CameraKind::Thermal => Some(
-            "Use Raw pixels to preserve temperature samples. Image formats produce 8-bit images. Keep the camera's temperature unit and calibration with your measurements.",
+            "Use Raw pixels for temperature samples; image formats are 8-bit. Keep the camera's temperature unit and calibration for measurements.",
         ),
         _ => None,
     }
@@ -3441,6 +3441,17 @@ mod tests {
                 .unwrap()
                 .contains("Raw pixels")
         );
+        for (kind, metadata) in [
+            (CameraKind::Depth, "unit, scale and offset"),
+            (CameraKind::Thermal, "temperature unit and calibration"),
+        ] {
+            let guidance = capture_guidance(kind).unwrap();
+            assert!(guidance.contains("Raw pixels"));
+            assert!(guidance.contains("samples"));
+            assert!(guidance.contains("image formats are 8-bit"));
+            assert!(guidance.contains(metadata));
+            assert!(guidance.contains("measurements"));
+        }
         assert!(
             forward_guidance(CameraKind::Thermal)
                 .unwrap()
