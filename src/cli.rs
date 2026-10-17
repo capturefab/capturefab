@@ -3701,7 +3701,16 @@ pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
     let s = format!("{error:#}").to_ascii_lowercase();
     if s.contains("storage full") || s.contains("no space left") {
         ("storage_full", 6)
-    } else if s.contains("connection refused") {
+    } else if s.contains("connection refused")
+        // A host name that does not resolve is as unreachable as a refused
+        // port (getaddrinfo wording on macOS, Linux and Windows).
+        || s.contains("failed to lookup address")
+        || s.contains("cannot resolve")
+        || s.contains("name or service not known")
+        || s.contains("nodename nor servname")
+        || s.contains("temporary failure in name resolution")
+        || s.contains("no such host is known")
+    {
         ("unavailable", 3)
     } else if s.contains("timed out")
         || s.contains("frame timeout")
@@ -4101,6 +4110,17 @@ mod tests {
     }
     #[test]
     fn error_codes() {
+        for unresolved in [
+            "cannot reach the server: cannot resolve ftps://nonexistent.invalid:21: failed to lookup address information: nodename nor servname provided, or not known",
+            "resolve Modbus server plc.invalid: failed to lookup address information: Name or service not known",
+            "connecting to sftp://x:22: Temporary failure in name resolution",
+        ] {
+            assert_eq!(
+                error_code(&anyhow::anyhow!("{unresolved}")),
+                ("unavailable", 3),
+                "{unresolved}"
+            );
+        }
         assert_eq!(
             error_code(&anyhow::anyhow!(
                 "dataset d.duckdb is locked by another process; reach it with --session NAME"
