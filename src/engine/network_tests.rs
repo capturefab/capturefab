@@ -141,6 +141,7 @@ impl Harness {
             ring: None,
             history: Arc::default(),
             saved: Arc::default(),
+            recording: Arc::default(),
         };
         let mut harness = Self {
             handle,

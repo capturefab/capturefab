@@ -2400,7 +2400,7 @@ fn recording_output(output: &str) -> Result<Option<(PathBuf, &'static str)>> {
     Ok(Some((path, container)))
 }
 
-fn local_file_path(value: &str) -> Result<PathBuf> {
+pub fn local_file_path(value: &str) -> Result<PathBuf> {
     if scheme(value).as_deref() != Some("file") {
         return Ok(value.into());
     }
@@ -2515,6 +2515,27 @@ impl Forwarder {
             final_stats: ForwardStats::default(),
             destination,
         })
+    }
+    /// Use an output the caller already resolved against `destination`
+    /// (and named), so the destination is not looked up a second time.
+    pub fn with_resolved(
+        config: ForwardConfig,
+        destination: Option<crate::destination::Resolved>,
+    ) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            process: None,
+            final_stats: ForwardStats::default(),
+            destination,
+        })
+    }
+    /// The local file this forwarder records to, if it records.
+    pub fn recording_path(&self) -> Option<PathBuf> {
+        recording_output(&self.config.output)
+            .ok()
+            .flatten()
+            .map(|(path, _)| path)
     }
     fn spawn(&mut self, width: u32, height: u32, raw: RawInput) -> Result<()> {
         ensure!(

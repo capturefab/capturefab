@@ -61,6 +61,8 @@ pub struct WorkerHandle {
     capture_session: Arc<Mutex<Option<crate::autocapture::CaptureSession>>>,
     /// Files saved since the coordinator last collected them.
     saved: Arc<Mutex<crate::dataset::SavedLog>>,
+    /// The local recording in progress, reported when it stops.
+    recording: Arc<Mutex<Option<crate::scheduling::RecordingMeta>>>,
 }
 impl Default for WorkerHandle {
     fn default() -> Self {
@@ -87,6 +89,7 @@ impl WorkerHandle {
             history: Arc::default(),
             capture_session: Arc::default(),
             saved: Arc::default(),
+            recording: Arc::default(),
         };
         let worker_handle = handle.clone();
         let thread = std::thread::Builder::new()
@@ -105,7 +108,6 @@ impl WorkerHandle {
         s
     }
     /// Report a finished file to the coordinator's dataset; stamps its `seq`.
-    #[allow(dead_code)] // Called from the capture and recording paths (Slice A).
     pub(crate) fn push_saved(&self, file: crate::dataset::SavedFile) {
         self.saved
             .lock()
@@ -342,18 +344,98 @@ fn stop_forward(
     forwarder: &mut Option<(Forwarder, f64)>,
     auto: &mut Option<AutoController>,
 ) -> Result<()> {
-    h.state
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .forwarding = None;
+    {
+        let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
+        s.forwarding = None;
+        s.forwarding_since_ms = None;
+    }
     if let Some(a) = auto.as_mut() {
         a.set_forward_fps(None)?;
     }
-    if let Some((mut f, _)) = forwarder.take() {
-        f.stop()
-    } else {
-        Ok(())
+    let meta = h
+        .recording
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    let Some((mut f, _)) = forwarder.take() else {
+        return Ok(());
+    };
+    let stopped = f.stop();
+    // A finished file is reported even when stopping reported an error.
+    if let Some(file) = f.stats().recording {
+        let context = meta.map(|m| m.context).unwrap_or_default();
+        h.push_saved(crate::dataset::SavedFile {
+            seq: 0,
+            wall_ms: file.started_ms,
+            path: absolute_path(std::path::Path::new(&file.path)),
+            bytes: file.bytes,
+            sha256: Some(file.sha256),
+            destination: file.destination,
+            object_key: file.object_key,
+            remote_url: file.remote_url,
+            upload_id: file.upload_id,
+            context,
+            item: crate::dataset::SavedItem::Recording {
+                started_ms: file.started_ms,
+                ended_ms: file.ended_ms,
+                codec: file.codec,
+                encoder: file.encoder,
+                fps: file.fps,
+            },
+        });
     }
+    stopped
+}
+fn absolute_path(path: &std::path::Path) -> String {
+    std::path::absolute(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+/// Queue a saved image for upload and report it to the coordinator's
+/// dataset. Returns what was queued, for the capture reply.
+#[allow(clippy::too_many_arguments)]
+fn report_image(
+    h: &WorkerHandle,
+    resolved: &crate::destination::Resolved,
+    path: &std::path::Path,
+    stored: crate::storage::Stored,
+    frame: &Frame,
+    format: &str,
+    wall_ms: u64,
+    job_id: Option<u64>,
+    context: &crate::context::Context,
+) -> Option<crate::destination::Queued> {
+    let queued = resolved.finished(path).unwrap_or_else(|e| {
+        h.log(
+            "error",
+            format!("{} saved but not queued for upload: {e:#}", path.display()),
+        );
+        None
+    });
+    h.push_saved(crate::dataset::SavedFile {
+        seq: 0,
+        wall_ms,
+        path: absolute_path(path),
+        bytes: stored.bytes,
+        sha256: Some(stored.sha256),
+        destination: resolved.destination.clone(),
+        object_key: queued.as_ref().map(|q| q.key.clone()),
+        remote_url: queued.as_ref().map(|q| q.url.clone()),
+        upload_id: queued.as_ref().map(|q| q.id.clone()),
+        context: context.clone(),
+        item: crate::dataset::SavedItem::Capture {
+            frame_id: frame.id,
+            timestamp_ns: frame.timestamp_ns,
+            width: frame.width,
+            height: frame.height,
+            pixel_format: frame.pixel_format,
+            format: format.into(),
+            origin: if job_id.is_some() { "schedule" } else { "capture" }.into(),
+            job_id,
+        },
+    });
+    queued
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -549,6 +631,7 @@ fn process_plain(
             storage,
             max_file_bytes,
             destination,
+            context,
             ..
         } => {
             ensure!(
@@ -559,6 +642,7 @@ fn process_plain(
                 forwarder.is_none(),
                 "forwarding is already active; stop-forward first"
             );
+            let f_destination = destination.clone();
             let f = Forwarder::new(ForwardConfig {
                 output: output.clone(),
                 codec,
@@ -569,17 +653,32 @@ fn process_plain(
                 max_file_bytes,
                 destination,
             })?;
+            let f_path = f.recording_path().map(|p| absolute_path(&p));
             camera_mut(camera)?.start()?;
             *forwarder = Some((f, fps));
             if let Some(a) = auto.as_mut() {
                 a.set_forward_fps(Some(fps))?;
             }
             refresh(h, camera, false);
-            h.state
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .forwarding = Some(crate::media::redact_url(&output));
-            Ok(json!({"forwarding":crate::media::redact_url(&output)}))
+            let since_ms = crate::scheduling::now_ms();
+            let shown = crate::media::redact_url(&output);
+            {
+                let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
+                s.forwarding = Some(shown.clone());
+                s.forwarding_since_ms = Some(since_ms);
+            }
+            let mut value = json!({"forwarding":shown,"since_ms":since_ms});
+            if let Some(path) = f_path {
+                value["path"] = json!(path);
+                *h.recording.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(crate::scheduling::RecordingMeta {
+                        path,
+                        since_ms,
+                        destination: f_destination,
+                        context,
+                    });
+            }
+            Ok(value)
         }
         SessionCommand::StopForward => {
             stop_forward(h, forwarder, auto)?;
@@ -876,6 +975,7 @@ fn process_plain(
             format,
             storage,
             destination,
+            context,
             ..
         } => {
             ensure!(
@@ -917,7 +1017,7 @@ fn process_plain(
                 let mut files = Vec::new();
                 let mut frames = Vec::new();
                 let mut status = None;
-                let mut queued = 0;
+                let mut queued = Vec::new();
                 if !was_streaming && auto.is_some() {
                     // Refresh the controller's streaming state before testing convergence:
                     // a previously stable acquisition must settle again after a restart.
@@ -952,24 +1052,24 @@ fn process_plain(
                     if index == 0 {
                         status = auto.as_ref().map(|a| a.status().clone());
                     }
+                    let wall_ms = crate::scheduling::now_ms();
                     let mut metadata = serde_json::to_value(&frame)?;
                     metadata["bytes"] = json!(frame.data.len());
+                    metadata["wall_ms"] = json!(wall_ms);
                     if output != "-" {
                         let path = output_path(&resolved.output, count, index, &format);
-                        crate::storage::save(&frame, &path, &format, &storage)
+                        let stored = crate::storage::save_hashed(&frame, &path, &format, &storage)
                             .with_context(|| format!("save {}", path.display()))?;
-                        if let Err(e) = resolved.finished(&path) {
-                            h.log(
-                                "error",
-                                format!(
-                                    "{} saved but not queued for upload: {e:#}",
-                                    path.display()
-                                ),
+                        let file = path.to_string_lossy().into_owned();
+                        if let Some(q) = report_image(
+                            h, &resolved, &path, stored, &frame, &format, wall_ms, None, &context,
+                        ) {
+                            queued.push(
+                                json!({"file":file,"upload_id":q.id,"key":q.key,"url":q.url}),
                             );
-                        } else if resolved.upload.is_some() {
-                            queued += 1;
                         }
-                        files.push(path.to_string_lossy().to_string());
+                        metadata["file"] = json!(file);
+                        files.push(file);
                     }
                     frames.push(metadata);
                     if let Err(error) = h.teach_capture(&frame) {
@@ -981,10 +1081,14 @@ fn process_plain(
                     let _ = h.record(frame);
                 }
                 let mut value = json!({"files":files,"frames":frames,"count":count});
+                if !context.is_empty() {
+                    value["context"] = json!(context);
+                }
                 if let Some(name) = &resolved.destination {
                     value["destination"] = json!(name);
                     if resolved.upload.is_some() {
-                        value["queued_uploads"] = json!(queued);
+                        value["queued_uploads"] = json!(queued.len());
+                        value["queued"] = json!(queued);
                     }
                 }
                 if let Some(status) = status {
@@ -1256,14 +1360,20 @@ fn capture_jobs(h: &WorkerHandle, frame: &Frame, jobs: &mut [Scheduled], settled
             job.info.captured,
             &job.format,
         );
-        match crate::storage::save(frame, &path, &job.format, &job.storage) {
-            Ok(()) => {
-                if let Err(e) = job.resolved.finished(&path) {
-                    h.log(
-                        "error",
-                        format!("{} saved but not queued for upload: {e:#}", path.display()),
-                    );
-                }
+        let wall_ms = crate::scheduling::now_ms();
+        match crate::storage::save_hashed(frame, &path, &job.format, &job.storage) {
+            Ok(stored) => {
+                report_image(
+                    h,
+                    &job.resolved,
+                    &path,
+                    stored,
+                    frame,
+                    &job.format,
+                    wall_ms,
+                    Some(job.info.id),
+                    &job.info.context,
+                );
                 job.info.captured += 1;
                 job.info.last_file = Some(path.to_string_lossy().into_owned());
                 job.deadline = None;
@@ -1575,6 +1685,48 @@ mod tests {
         h.request(SessionCommand::Disconnect).unwrap();
         assert!(h.snapshot().connected.is_none());
         h.shutdown();
+    }
+    #[test]
+    fn saved_captures_are_reported_with_context() {
+        let h = WorkerHandle::new();
+        connect(&h, "1000");
+        let root = std::env::temp_dir().join(format!(
+            "capturefab-saved-{}-{}",
+            std::process::id(),
+            crate::scheduling::now_ms()
+        ));
+        let context = crate::context::Context::from([("line".into(), "L1".into())]);
+        let v = h
+            .request(SessionCommand::Capture {
+                output: root.join("shot.raw").to_string_lossy().into_owned(),
+                count: 1,
+                timeout_ms: 1000,
+                format: "raw".into(),
+                storage: Default::default(),
+                destination: None,
+                on_exists: Default::default(),
+                context: context.clone(),
+            })
+            .unwrap();
+        assert_eq!(v["context"]["line"], "L1");
+        assert_eq!(v["frames"][0]["file"], v["files"][0]);
+        let wall_ms = v["frames"][0]["wall_ms"].as_u64().unwrap();
+        let batch = h.take_saved(10);
+        assert_eq!(batch.items.len(), 1);
+        let saved = &batch.items[0];
+        assert_eq!((saved.seq, saved.wall_ms), (1, wall_ms));
+        assert_eq!(saved.context, context);
+        assert_eq!(saved.bytes, 128 * 128);
+        assert!(saved.sha256.as_ref().is_some_and(|s| s.len() == 64));
+        assert!(std::path::Path::new(&saved.path).is_absolute());
+        assert!(matches!(
+            saved.item,
+            crate::dataset::SavedItem::Capture { ref origin, job_id: None, .. } if origin == "capture"
+        ));
+        assert_eq!(batch.camera.unwrap().id, "sim:0");
+        assert!(h.take_saved(10).is_empty());
+        h.shutdown();
+        let _ = std::fs::remove_dir_all(root);
     }
     #[test]
     fn capture_paths() {
