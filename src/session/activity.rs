@@ -328,6 +328,11 @@ impl Activity {
                 | SessionCommand::Xml
                 | SessionCommand::ReadMemory { .. }
                 | SessionCommand::CaptureReview { .. }
+                | SessionCommand::DatasetStatus
+                | SessionCommand::DatasetQuery { .. }
+                | SessionCommand::Signals
+                | SessionCommand::SignalRead { .. }
+                | SessionCommand::SignalBrowse { .. }
         ) {
             return None;
         }
@@ -592,7 +597,37 @@ fn describe(command: &SessionCommand) -> (&'static str, String) {
             ),
         ),
         StopForward => ("stop_forward", "Stop forwarding / recording".into()),
+        DatasetOpen { path, .. } => ("dataset_open", format!("Open dataset {}", file_name(path))),
+        DatasetClose => ("dataset_close", "Close dataset".into()),
+        DatasetStatus => ("dataset_status", "Read dataset status".into()),
+        DatasetNote { .. } => ("dataset_note", "Add dataset note".into()),
+        DatasetQuery { .. } => ("dataset_query", "Query dataset".into()),
+        DatasetExport { output, .. } => (
+            "dataset_export",
+            format!("Export dataset → {}", file_name(output)),
+        ),
+        SignalRead { uri, .. } => (
+            "signal_read",
+            format!("Read {}", crate::media::redact_url(uri)),
+        ),
+        SignalBrowse { uri, .. } => (
+            "signal_browse",
+            format!("Browse {}", crate::media::redact_url(uri)),
+        ),
+        SignalStart { uri, .. } => (
+            "signal_start",
+            format!("Log {}", crate::media::redact_url(uri)),
+        ),
+        SignalStop { id } => ("signal_stop", format!("Stop logging {id}")),
+        Signals => ("signals", "Signal status".into()),
     }
+}
+/// The last component of a path, so activity never shows a full folder tree.
+fn file_name(path: &str) -> String {
+    std::path::Path::new(path).file_name().map_or_else(
+        || path.to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 fn output_label(output: &str, destination: &Option<String>) -> String {
     match destination {
@@ -792,6 +827,7 @@ mod tests {
             last_file: None,
             error: None,
             destination: None,
+            context: Default::default(),
         };
         schedule.finish(&Ok(json!({"job":job,"worker_pid":42})));
         for _ in 0..HISTORY + 1 {

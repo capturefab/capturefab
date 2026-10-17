@@ -1147,6 +1147,8 @@ mod tests {
             format: "png".into(),
             storage: Default::default(),
             destination: None,
+            on_exists: Default::default(),
+            context: Default::default(),
         };
         assert!(validate_remote_command(&command).is_err());
         assert_eq!(

@@ -91,6 +91,8 @@ fn failed_file_capture_does_not_teach_and_successful_file_capture_does() {
         format: "raw".into(),
         storage: Default::default(),
         destination: None,
+        on_exists: Default::default(),
+        context: Default::default(),
     };
     f.worker.request(command()).unwrap();
     assert_eq!(f.worker.snapshot().capture_session.unwrap().manual_count, 1);

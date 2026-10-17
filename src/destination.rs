@@ -621,24 +621,49 @@ fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf> {
     }
 }
 
+/// A finished file queued for upload: its upload ID, the remote key and the
+/// object's URL (never with credentials).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Queued {
+    pub id: String,
+    pub key: String,
+    pub url: String,
+}
+
 impl Resolved {
     /// Queue a file this resolution produced for upload, if it has a bucket.
     /// Called after the file is complete and recorded in the storage ledger.
-    pub fn finished(&self, path: &Path) -> Result<()> {
+    /// Returns what was queued, or `None` for a local destination.
+    pub fn finished(&self, path: &Path) -> Result<Option<Queued>> {
         let (Some(bucket), Some(root), Some(name)) = (&self.upload, &self.root, &self.destination)
         else {
-            return Ok(());
+            return Ok(None);
         };
         let key = object_key(&bucket.prefix, root, path)?;
         #[cfg(feature = "s3")]
         {
-            crate::upload::enqueue(name, bucket, path, &key)
+            let id = crate::upload::enqueue(name, bucket, path, &key)?;
+            let url = format!("s3://{}/{key}", bucket.bucket);
+            Ok(Some(Queued { id, key, url }))
         }
         #[cfg(not(feature = "s3"))]
         {
             let _ = (name, key);
             bail!("S3 destinations are unsupported in this build")
         }
+    }
+
+    /// Refuse a path that leaves the destination's folder through a symbolic
+    /// link, checked again after a template expands below the root.
+    pub fn contain(&self, path: &Path) -> Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        ensure!(
+            resolve_existing_ancestor(path)?.starts_with(resolve_existing_ancestor(root)?),
+            "destination output escapes its folder through a symbolic link; choose a path inside the destination"
+        );
+        Ok(())
     }
 }
 

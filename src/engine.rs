@@ -59,6 +59,8 @@ pub struct WorkerHandle {
     ring: Option<Arc<Mutex<crate::shared_memory::SharedRing>>>,
     history: Arc<Mutex<history::Journal>>,
     capture_session: Arc<Mutex<Option<crate::autocapture::CaptureSession>>>,
+    /// Files saved since the coordinator last collected them.
+    saved: Arc<Mutex<crate::dataset::SavedLog>>,
 }
 impl Default for WorkerHandle {
     fn default() -> Self {
@@ -84,6 +86,7 @@ impl WorkerHandle {
             ring,
             history: Arc::default(),
             capture_session: Arc::default(),
+            saved: Arc::default(),
         };
         let worker_handle = handle.clone();
         let thread = std::thread::Builder::new()
@@ -100,6 +103,37 @@ impl WorkerHandle {
         s.dropped = self.counters.dropped.load(Ordering::Relaxed);
         s.fps = f64::from_bits(self.counters.fps_bits.load(Ordering::Relaxed));
         s
+    }
+    /// Report a finished file to the coordinator's dataset; stamps its `seq`.
+    #[allow(dead_code)] // Called from the capture and recording paths (Slice A).
+    pub(crate) fn push_saved(&self, file: crate::dataset::SavedFile) {
+        self.saved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(file);
+    }
+    /// Drain up to `max` saved files, with the camera that saved them.
+    pub(crate) fn take_saved(&self, max: usize) -> crate::dataset::SavedBatch {
+        let (items, lost) = self
+            .saved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(max);
+        if items.is_empty() && lost == 0 {
+            return crate::dataset::SavedBatch::default();
+        }
+        let camera = self
+            .state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .connected
+            .as_ref()
+            .map(crate::dataset::SavedCamera::from);
+        crate::dataset::SavedBatch {
+            camera,
+            items,
+            lost,
+        }
     }
     #[cfg(test)]
     pub fn latest_frame(&self) -> Option<Frame> {
@@ -457,6 +491,19 @@ fn process_plain(
         }
         SessionCommand::Select { .. } => anyhow::bail!("selection belongs to the coordinator"),
         SessionCommand::Activity { .. } => anyhow::bail!("activity belongs to the coordinator"),
+        SessionCommand::DatasetOpen { .. }
+        | SessionCommand::DatasetClose
+        | SessionCommand::DatasetStatus
+        | SessionCommand::DatasetNote { .. }
+        | SessionCommand::DatasetQuery { .. }
+        | SessionCommand::DatasetExport { .. } => {
+            anyhow::bail!("datasets belong to the coordinator")
+        }
+        SessionCommand::Signals
+        | SessionCommand::SignalRead { .. }
+        | SessionCommand::SignalBrowse { .. }
+        | SessionCommand::SignalStart { .. }
+        | SessionCommand::SignalStop { .. } => anyhow::bail!("signals belong to the coordinator"),
         SessionCommand::NetworkScan { .. } => {
             anyhow::bail!("network scan belongs to the coordinator")
         }
@@ -502,6 +549,7 @@ fn process_plain(
             storage,
             max_file_bytes,
             destination,
+            ..
         } => {
             ensure!(
                 !camera_mut(camera)?.is_scanner(),
@@ -709,6 +757,8 @@ fn process_plain(
             interval_ms,
             storage,
             destination,
+            context,
+            ..
         } => {
             validate_capture(&output, count, timeout_ms, &format)?;
             let resolved = crate::destination::resolve(destination.as_deref(), &output)?;
@@ -738,6 +788,7 @@ fn process_plain(
                 next_at_ms: first_at_ms,
                 last_file: None,
                 error: None,
+                context,
             };
             *next_job = next_job.checked_add(1).context("job ID exhausted")?;
             jobs.push(Scheduled {
@@ -825,6 +876,7 @@ fn process_plain(
             format,
             storage,
             destination,
+            ..
         } => {
             ensure!(
                 output != "-" || destination.is_none(),
@@ -1448,6 +1500,8 @@ mod tests {
             interval_ms: 1000,
             storage: Default::default(),
             destination: None,
+            on_exists: Default::default(),
+            context: Default::default(),
         };
         let directory = root.to_string_lossy().into_owned();
         handle
@@ -1511,6 +1565,8 @@ mod tests {
                 format: "raw".into(),
                 storage: Default::default(),
                 destination: None,
+                on_exists: Default::default(),
+                context: Default::default(),
             })
             .unwrap();
         assert_eq!(v["frames"][0]["width"], 128);
@@ -1633,6 +1689,8 @@ mod tests {
                 format: "raw".into(),
                 storage: Default::default(),
                 destination: None,
+                on_exists: Default::default(),
+                context: Default::default(),
             })
             .unwrap();
         assert_eq!(v["frames"][0]["width"], 128);
@@ -1762,6 +1820,8 @@ mod tests {
             format: "raw".into(),
             storage: Default::default(),
             destination: None,
+            on_exists: Default::default(),
+            context: Default::default(),
         }
     }
 
@@ -1900,6 +1960,7 @@ mod tests {
                 next_at_ms: now,
                 last_file: None,
                 error: None,
+                context: Default::default(),
             },
             resolved: crate::destination::resolve(None, "scan.png").unwrap(),
             timeout_ms: 1000,
@@ -1944,6 +2005,8 @@ mod tests {
                 interval_ms: 0,
                 storage: Default::default(),
                 destination: None,
+                on_exists: Default::default(),
+                context: Default::default(),
             },
         )
         .unwrap();
@@ -2005,6 +2068,8 @@ mod tests {
                     interval_ms: 60_000,
                     storage: Default::default(),
                     destination: None,
+                    on_exists: Default::default(),
+                    context: Default::default(),
                 },
             )
             .unwrap();

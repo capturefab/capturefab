@@ -246,6 +246,102 @@ impl AutoArgs {
         Ok(())
     }
 }
+#[derive(Debug, Args)]
+pub struct DatasetArg {
+    /// Catalog saved files in this dataset (.duckdb); created if missing
+    #[arg(long, env = "CAPTUREFAB_DATASET")]
+    pub dataset: Option<PathBuf>,
+}
+impl DatasetArg {
+    /// Open the dataset in the local or addressed session before the command runs.
+    fn apply(&self, _client: &Client) -> Result<()> {
+        if self.dataset.is_some() {
+            anyhow::bail!("--dataset is not implemented yet");
+        }
+        Ok(())
+    }
+}
+#[derive(Debug, Subcommand)]
+pub enum DatasetCommand {
+    /// Open or create the session's dataset; existing files are never overwritten
+    Open {
+        path: PathBuf,
+        /// Create a new file; fail if it exists
+        #[arg(long, conflicts_with = "existing")]
+        new: bool,
+        /// Open an existing dataset; fail if it is missing
+        #[arg(long)]
+        existing: bool,
+        /// Largest size the dataset file may grow to, e.g. 8GiB
+        #[arg(long, value_parser = parse_bytes_text)]
+        max_bytes: Option<String>,
+    },
+    /// Checkpoint and close the session's dataset
+    Close,
+    /// Show the session's dataset, or summarize --file
+    Status {
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Add a timestamped note (shift handover, defect, setup change)
+    Note {
+        text: String,
+        /// Tag the note, e.g. --context line=L1 (repeatable)
+        #[arg(long = "context", value_name = "KEY=VALUE", value_parser = crate::context::parse_pair)]
+        context: Vec<(String, String)>,
+    },
+    /// Run one read-only SELECT; --file reads a dataset no session holds
+    Query {
+        #[arg(long)]
+        file: Option<PathBuf>,
+        sql: String,
+        #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+        limit: u32,
+    },
+    /// Write data files, manifest.json and README.md into a new folder
+    Export {
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(short = 'o', long)]
+        output: PathBuf,
+        #[arg(long, value_enum, value_delimiter = ',')]
+        format: Vec<crate::dataset::ExportFormat>,
+        #[arg(long, value_delimiter = ',')]
+        tables: Vec<String>,
+        /// Only rows at or after this time (RFC 3339 with timezone)
+        #[arg(long, value_parser = parse_at_text)]
+        since: Option<String>,
+        /// Only rows at or before this time (RFC 3339 with timezone)
+        #[arg(long, value_parser = parse_at_text)]
+        until: Option<String>,
+        #[command(flatten)]
+        storage: StorageArgs,
+    },
+}
+#[derive(Debug, Subcommand)]
+pub enum SignalsCommand {
+    /// Read current values once
+    Read { uri: String },
+    /// List OPC UA nodes, MQTT topics or MTConnect data items
+    Browse {
+        uri: String,
+        #[arg(long, default_value = "5s", value_parser = parse_duration_text)]
+        duration: String,
+        #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u32).range(1..=5000))]
+        limit: u32,
+    },
+    /// Start logging in a running session
+    Start {
+        uri: String,
+        #[arg(long, default_value = "1s", value_parser = parse_duration_text)]
+        interval: String,
+        /// Log only these tags (repeatable)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// Stop logging (ID from `signals`, or `all`)
+    Stop { id: String },
+}
 #[derive(Debug, Subcommand)]
 pub enum DestinationCommand {
     /// List saved destinations
@@ -392,6 +488,8 @@ pub enum Command {
         screenshot: Option<PathBuf>,
         #[arg(long,default_value_t=1,value_parser=clap::value_parser!(u32).range(1..=16))]
         screenshot_cameras: u32,
+        #[command(flatten)]
+        dataset: DatasetArg,
     },
     /// Discover GigE Vision, USB3 Vision, ONVIF, host cameras and document scanners
     #[command(visible_aliases=["list","cameras"])]
@@ -484,10 +582,18 @@ pub enum Command {
         /// Saved destination (see `destination list`); --output is then a name inside it
         #[arg(long)]
         destination: Option<String>,
+        /// When the output file exists: fail (default) or number (-0001, -0002, ...)
+        #[arg(long, value_enum, default_value_t = crate::naming::OnExists::Fail)]
+        on_exists: crate::naming::OnExists,
+        /// Tag the recording, e.g. --context line=L1 --context part=A-100 (repeatable)
+        #[arg(long = "context", value_name = "KEY=VALUE", value_parser = crate::context::parse_pair)]
+        context: Vec<(String, String)>,
         #[command(flatten)]
         storage: StorageArgs,
         #[command(flatten)]
         auto: AutoArgs,
+        #[command(flatten)]
+        dataset: DatasetArg,
     },
     /// Stop the encoder in a persistent session
     StopForward,
@@ -525,10 +631,18 @@ pub enum Command {
         /// Saved destination (see `destination list`); --output is then a name inside it
         #[arg(long)]
         destination: Option<String>,
+        /// When the output file exists: fail (default) or number (-0001, -0002, ...). {seq} always picks a free number
+        #[arg(long, value_enum, default_value_t = crate::naming::OnExists::Fail)]
+        on_exists: crate::naming::OnExists,
+        /// Tag the capture, e.g. --context line=L1 --context part=A-100 (repeatable)
+        #[arg(long = "context", value_name = "KEY=VALUE", value_parser = crate::context::parse_pair)]
+        context: Vec<(String, String)>,
         #[command(flatten)]
         storage: StorageArgs,
         #[command(flatten)]
         auto: AutoArgs,
+        #[command(flatten)]
+        dataset: DatasetArg,
     },
     /// List capture schedules in a persistent session
     Jobs,
@@ -573,6 +687,8 @@ pub enum Command {
         web_dir: Option<PathBuf>,
         #[command(flatten)]
         auto: AutoArgs,
+        #[command(flatten)]
+        dataset: DatasetArg,
     },
     /// List local GUI and headless sessions
     Sessions,
@@ -587,6 +703,36 @@ pub enum Command {
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
+    },
+    /// Catalog captures, recordings and signals in a DuckDB dataset and export analysis bundles
+    Dataset {
+        #[command(subcommand)]
+        command: DatasetCommand,
+    },
+    /// Read, browse and log sensor and PLC signals (Modbus TCP, MQTT, OPC UA, MTConnect, sim-signal://)
+    Signals {
+        #[command(subcommand)]
+        command: Option<SignalsCommand>,
+    },
+    /// Log signal sources for a duration into a dataset and/or CSV file, then exit
+    Log {
+        #[arg(required = true, num_args = 1..=16)]
+        uris: Vec<String>,
+        #[arg(long, default_value = "1s", value_parser = parse_duration_text)]
+        interval: String,
+        /// Stop after this duration, e.g. 10m; omitted runs until Ctrl-C
+        #[arg(long, value_parser = parse_duration_text)]
+        duration: Option<String>,
+        /// Also write samples to this new CSV file
+        #[arg(long)]
+        csv: Option<PathBuf>,
+        /// Log only these tags (repeatable)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        #[command(flatten)]
+        dataset: DatasetArg,
+        #[command(flatten)]
+        storage: StorageArgs,
     },
     /// Report interfaces, platform and compiled capabilities
     Doctor,
@@ -797,6 +943,7 @@ impl<'a> Client<'a> {
                     None
                 }
                 SessionCommand::Activity { .. } => None,
+                command if command.is_dataset() || command.is_signal() => None,
                 _ => self.target.as_deref(),
             };
             ipc::call_to_as(
@@ -837,6 +984,15 @@ fn request_timeout(cli: &Cli, command: &SessionCommand) -> Result<Duration> {
                 .saturating_mul(u64::from(*count))
                 .saturating_add(60_000),
             SessionCommand::CaptureExample { timeout_ms } => timeout_ms.saturating_add(60_000),
+            SessionCommand::DatasetExport { .. } => 600_000,
+            SessionCommand::DatasetQuery { timeout_ms, .. } => (if *timeout_ms == 0 {
+                30_000
+            } else {
+                *timeout_ms
+            })
+            .saturating_add(10_000),
+            SessionCommand::SignalRead { timeout_ms, .. } => timeout_ms.saturating_add(10_000),
+            SessionCommand::SignalBrowse { duration_ms, .. } => duration_ms.saturating_add(15_000),
             _ => 60_000,
         }
     };
@@ -907,6 +1063,15 @@ fn uses_session(command: Option<&Command>) -> bool {
                     | Command::NetworkScan
                     | Command::Workflow {
                         command: WorkflowCommand::Apply { dry_run: false, .. }
+                    }
+                    | Command::Signals { .. }
+                    | Command::Dataset {
+                        command: DatasetCommand::Open { .. }
+                            | DatasetCommand::Close
+                            | DatasetCommand::Note { .. }
+                            | DatasetCommand::Status { file: None }
+                            | DatasetCommand::Query { file: None, .. }
+                            | DatasetCommand::Export { file: None, .. }
                     }
             )
         )
@@ -1167,8 +1332,11 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
             delay,
             interval,
             destination,
+            on_exists,
+            context,
             ..
         }) => {
+            let context = crate::context::from_pairs(context)?;
             ensure!(
                 output != "-" || (cli.session.is_none() && !cli.json && *count == 1),
                 "binary stdout needs one frame, a direct --camera, and no --json"
@@ -1203,6 +1371,8 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
                         .unwrap_or(0),
                     storage: crate::storage::StoragePolicy::default(),
                     destination: destination.clone(),
+                    on_exists: *on_exists,
+                    context: context.clone(),
                 }
             } else {
                 SessionCommand::Capture {
@@ -1212,6 +1382,8 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
                     format: format.name().into(),
                     storage: crate::storage::StoragePolicy::default(),
                     destination: destination.clone(),
+                    on_exists: *on_exists,
+                    context,
                 }
             };
             Some(command)
@@ -1225,8 +1397,11 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
             duration,
             max_file_size,
             destination,
+            on_exists,
+            context,
             ..
         }) => {
+            let context = crate::context::from_pairs(context)?;
             if let Some(duration) = duration {
                 crate::scheduling::parse_duration(duration)?;
             }
@@ -1242,8 +1417,12 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
                 },
                 max_file_bytes: crate::storage::parse_bytes(max_file_size)?,
                 destination: destination.clone(),
+                on_exists: *on_exists,
+                context,
             })
         }
+        Some(Command::Dataset { .. }) => prepare_dataset(cli)?,
+        Some(Command::Signals { .. } | Command::Log { .. }) => prepare_signals(cli)?,
         Some(Command::Memory { command }) => Some(match command {
             MemoryCommand::Read { address, length } => SessionCommand::ReadMemory {
                 address: *address,
@@ -1349,6 +1528,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     name,
                     screenshot,
                     screenshot_cameras,
+                    ..
                 }) => (name.as_str(), screenshot.clone(), *screenshot_cameras),
                 _ => ("gui", None, 1),
             };
@@ -1517,12 +1697,14 @@ pub fn run(mut cli: Cli) -> Result<()> {
             };
             return output(&cli, result);
         }
+        Some(Command::Log { .. }) => return log_command(&cli),
         Some(Command::Serve {
             name,
             stream,
             listen,
             web_dir,
             auto,
+            dataset,
         }) => {
             ensure!(
                 cli.session.is_none(),
@@ -1533,6 +1715,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             if *stream {
                 client.call(SessionCommand::Start)?;
             }
+            dataset.apply(&client)?;
             auto.apply(&client)?;
             let _server =
                 ipc::Server::start_with_kind(handle.clone(), name, ipc::SessionKind::Serve)?;
@@ -1590,6 +1773,15 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 | Command::Rpc
                 | Command::Jobs
                 | Command::Cancel { .. }
+                | Command::Dataset {
+                    command: DatasetCommand::Open { .. }
+                        | DatasetCommand::Close
+                        | DatasetCommand::Note { .. }
+                }
+                | Command::Signals {
+                    command: None
+                        | Some(SignalsCommand::Start { .. } | SignalsCommand::Stop { .. })
+                }
         )
     );
     input((|| {
@@ -1691,6 +1883,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             duration,
             destination: saved,
             auto,
+            dataset,
             ..
         } => {
             let until = duration
@@ -1698,6 +1891,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 .map(crate::scheduling::parse_duration)
                 .transpose()?
                 .map(Duration::from_millis);
+            dataset.apply(&client)?;
             auto.apply(&client)?;
             let result = client.call(prepared.clone().unwrap())?;
             if cli.session.is_none() {
@@ -1789,8 +1983,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
             settings,
             destination: saved,
             auto,
+            dataset,
             ..
         } => {
+            dataset.apply(&client)?;
             let settings = settings
                 .iter()
                 .map(|s| assignment(s))
@@ -1884,6 +2080,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 data: hex(data)?,
             })?,
         },
+        Command::Dataset { command } => dataset_command(&cli, &client, command, prepared.clone())?,
+        Command::Signals { command } => {
+            signals_command(&cli, &client, command.as_ref(), prepared.clone())?
+        }
         Command::Rpc => {
             use std::io::Read;
             let mut data = Vec::new();
@@ -2197,7 +2397,7 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
 }
 fn doctor() -> Value {
     let interfaces=if_addrs::get_if_addrs().map(|items|items.into_iter().filter_map(|i|match i.addr{if_addrs::IfAddr::V4(a)=>Some(json!({"name":i.name,"ip":a.ip,"netmask":a.netmask,"broadcast":a.broadcast})),_=>None}).collect::<Vec<_>>()).unwrap_or_default();
-    json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"scanner":cfg!(feature="scanner"),"wgpu":cfg!(feature="gui"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox")},"scanners":crate::scanner::doctor(),"jpeg":jpeg_backends(),"session_directory":ipc::session_dir(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox. Document scanning uses installed platform scanner drivers (SANE scanimage on Linux).","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}})
+    json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"scanner":cfg!(feature="scanner"),"wgpu":cfg!(feature="gui"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox"),"s3":cfg!(feature="s3"),"ftp":cfg!(feature="ftp"),"sftp":cfg!(feature="sftp"),"parquet":cfg!(feature="parquet"),"modbus":cfg!(feature="modbus"),"mqtt":cfg!(feature="mqtt"),"opcua":cfg!(feature="opcua"),"mtconnect":cfg!(feature="mtconnect")},"signals":crate::signals::compiled_protocols(),"scanners":crate::scanner::doctor(),"jpeg":jpeg_backends(),"session_directory":ipc::session_dir(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox. Document scanning uses installed platform scanner drivers (SANE scanimage on Linux).","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}})
 }
 /// JPEG encoders available to this build and host, best first.
 fn jpeg_backends() -> Value {
@@ -2414,7 +2614,80 @@ fn schema() -> Value {
         json!({"op":"review_capture","id":1,"keep":true}),
         json!({"op":"review_capture","id":2,"keep":false}),
     ]);
+    commands.extend(crate::dataset::rpc_examples());
+    commands.extend(crate::signals::rpc_examples());
+    contract["dataset"] = crate::dataset::schema_contract();
+    contract["signals"] = crate::signals::schema_contract();
     contract
+}
+
+/// Arguments of `dataset` subcommands, checked before any session is touched.
+fn prepare_dataset(cli: &Cli) -> Result<Option<SessionCommand>> {
+    let Some(Command::Dataset { command: _ }) = &cli.command else {
+        return Ok(None);
+    };
+    Ok(None)
+}
+
+/// `dataset` subcommands, in a session or on a --file no session holds.
+fn dataset_command(
+    _cli: &Cli,
+    _client: &Client,
+    _command: &DatasetCommand,
+    _prepared: Option<SessionCommand>,
+) -> Result<Value> {
+    anyhow::bail!("dataset commands are not implemented yet")
+}
+
+/// Arguments of `signals` and `log`, checked before any session is touched.
+/// Only the URI shape is checked here; protocols missing from this build
+/// fail when the command runs.
+fn prepare_signals(cli: &Cli) -> Result<Option<SessionCommand>> {
+    Ok(match &cli.command {
+        Some(Command::Signals { command }) => Some(match command {
+            None => SessionCommand::Signals,
+            Some(SignalsCommand::Read { uri }) => SessionCommand::SignalRead {
+                uri: uri.clone(),
+                timeout_ms: cli.timeout_ms,
+            },
+            Some(SignalsCommand::Browse {
+                uri,
+                duration,
+                limit,
+            }) => SessionCommand::SignalBrowse {
+                uri: uri.clone(),
+                duration_ms: crate::scheduling::parse_duration(duration)?,
+                limit: *limit,
+            },
+            Some(SignalsCommand::Start {
+                uri,
+                interval,
+                tags,
+            }) => SessionCommand::SignalStart {
+                uri: uri.clone(),
+                interval_ms: crate::scheduling::parse_duration(interval)?,
+                tags: tags.clone(),
+            },
+            Some(SignalsCommand::Stop { id }) => SessionCommand::SignalStop { id: id.clone() },
+        }),
+        _ => None,
+    })
+}
+
+/// `signals` subcommands; the command was built by `prepare_signals`.
+fn signals_command(
+    _cli: &Cli,
+    client: &Client,
+    _command: Option<&SignalsCommand>,
+    prepared: Option<SessionCommand>,
+) -> Result<Value> {
+    client.call(prepared.context("signals command was not prepared")?)
+}
+
+/// `log`: run a local session that logs signal sources into a dataset or
+/// CSV file for a duration or until Ctrl-C, then print the result.
+fn log_command(_cli: &Cli) -> Result<()> {
+    anyhow::bail!("log is not implemented yet")
 }
 
 /// A direct CLI capture to a bucket destination uploads before exiting, so
@@ -2659,6 +2932,7 @@ pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
         || s.contains("controlled by another application")
         || s.contains("camera access denied")
         || s.contains("camera is in use by another application")
+        || s.contains("is locked by another process")
     {
         ("unavailable", 3)
     } else {
@@ -2949,6 +3223,10 @@ mod tests {
         let commands = contract["rpc"]["commands"].as_array().unwrap();
         for command in commands {
             serde_json::from_value::<SessionCommand>(command.clone()).unwrap();
+            SessionCommand::from_json_slice(command.to_string().as_bytes())
+                .unwrap()
+                .validate()
+                .unwrap_or_else(|e| panic!("{command}: {e:#}"));
         }
         assert!(
             [
@@ -2963,7 +3241,18 @@ mod tests {
                 "capture_example",
                 "auto_capture",
                 "capture_review",
-                "review_capture"
+                "review_capture",
+                "dataset_open",
+                "dataset_close",
+                "dataset_status",
+                "dataset_note",
+                "dataset_query",
+                "dataset_export",
+                "signals",
+                "signal_read",
+                "signal_browse",
+                "signal_start",
+                "signal_stop"
             ]
             .iter()
             .all(|op| commands.iter().any(|c| c["op"] == *op))
@@ -3025,6 +3314,16 @@ mod tests {
     }
     #[test]
     fn error_codes() {
+        assert_eq!(
+            error_code(&anyhow::anyhow!(
+                "dataset d.duckdb is locked by another process; reach it with --session NAME"
+            )),
+            ("unavailable", 3)
+        );
+        assert_eq!(
+            error_code(&anyhow::anyhow!("datasets are not implemented yet")),
+            ("operation_failed", 1)
+        );
         assert_eq!(
             error_code(&anyhow::anyhow!(
                 "camera is controlled by another application; disconnect it first"

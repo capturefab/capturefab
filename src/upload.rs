@@ -180,7 +180,9 @@ fn id() -> Result<String> {
 }
 
 /// Queue a finished, ledger-recorded file for upload as `key`.
-pub fn enqueue(destination: &str, bucket: &Bucket, path: &Path, key: &str) -> Result<()> {
+/// Queue a finished file and return its upload ID. Queueing the same file for
+/// the same upload again returns the existing ID.
+pub fn enqueue(destination: &str, bucket: &Bucket, path: &Path, key: &str) -> Result<String> {
     crate::destination::validate_name(destination)?;
     bucket.validate()?;
     crate::destination::validate_object_key(key)?;
@@ -195,7 +197,7 @@ pub fn enqueue(destination: &str, bucket: &Bucket, path: &Path, key: &str) -> Re
                     && existing.key == key,
                 "this file is already queued for a different upload; retry or forget the existing upload first"
             );
-            return Ok(());
+            return Ok(existing.id.clone());
         }
         ensure!(
             queue.items.len() < MAX_ITEMS,
@@ -209,7 +211,7 @@ pub fn enqueue(destination: &str, bucket: &Bucket, path: &Path, key: &str) -> Re
         let sha256 = crate::storage::hold_for_upload(&path, true)?;
         held = true;
         queue.items.push(Item {
-            id,
+            id: id.clone(),
             destination: destination.into(),
             bucket: bucket.clone(),
             path: path.clone(),
@@ -222,17 +224,21 @@ pub fn enqueue(destination: &str, bucket: &Bucket, path: &Path, key: &str) -> Re
             state: State::Pending,
             error: None,
         });
-        Ok(())
+        Ok(id)
     });
-    if let Err(error) = result {
-        if held {
-            crate::storage::hold_for_upload(&path, false)
-                .context("release capture after it could not be queued for upload")?;
+    match result {
+        Ok(id) => {
+            WAKE.1.notify_all();
+            Ok(id)
         }
-        return Err(error);
+        Err(error) => {
+            if held {
+                crate::storage::hold_for_upload(&path, false)
+                    .context("release capture after it could not be queued for upload")?;
+            }
+            Err(error)
+        }
     }
-    WAKE.1.notify_all();
-    Ok(())
 }
 
 /// Queue summary and the most recent items, for status displays.

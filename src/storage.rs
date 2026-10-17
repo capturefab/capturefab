@@ -266,11 +266,18 @@ impl Manager {
             policy.max_bytes
         );
         let (base, path) = output_path(path)?;
-        ensure!(
-            fs::symlink_metadata(&path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
-            "capture output already exists or cannot be inspected: {}; choose a new file name and check directory permissions",
-            path.display()
-        );
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Err(OutputExists(path).into()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "capture output cannot be inspected: {}; check directory permissions",
+                        path.display()
+                    )
+                });
+            }
+        }
         locked.make_room(&policy, reserve)?;
         let id = nonce()?;
         let lease_name = format!("storage-{id}.lease");
@@ -282,6 +289,9 @@ impl Manager {
             Err(error) => {
                 drop(lease);
                 let _ = fs::remove_file(&lease_path);
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    return Err(OutputExists(path).into());
+                }
                 return Err(error).with_context(|| format!("cannot create capture output {}; check parent directory permissions, free disk space, and the storage limits", path.display()));
             }
         };
@@ -810,6 +820,10 @@ impl StorageWriter {
     pub fn bytes_written(&self) -> u64 {
         self.written
     }
+    /// SHA-256 of the bytes written so far, as lowercase hex.
+    pub fn sha256(&self) -> String {
+        format!("{:x}", self.hash.clone().finalize())
+    }
     /// Abandon an invalid recording. An externally altered output is preserved.
     pub fn abort(mut self) -> Result<()> {
         self.failed = true;
@@ -918,11 +932,48 @@ pub fn create_writer(
 ) -> Result<StorageWriter> {
     Manager::global().writer(path, policy, reserve_bytes)
 }
-pub fn save(frame: &Frame, path: &Path, format: &str, policy: &StoragePolicy) -> Result<()> {
-    let bytes = crate::frame::encode(frame, format)?;
+/// A finished output's size and SHA-256, as recorded in the ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stored {
+    pub bytes: u64,
+    pub sha256: String,
+}
+/// The output path is already taken. Callers that pick names retry with the
+/// next free one when this is in the error chain; nothing is ever replaced.
+#[derive(Debug)]
+pub struct OutputExists(pub PathBuf);
+impl std::fmt::Display for OutputExists {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "capture output already exists: {}; choose a new file name",
+            self.0.display()
+        )
+    }
+}
+impl std::error::Error for OutputExists {}
+/// Save already encoded bytes as a new file.
+pub fn save_bytes(bytes: &[u8], path: &Path, policy: &StoragePolicy) -> Result<Stored> {
     let mut writer = create_writer(path, policy, bytes.len() as u64)?;
-    writer.write_all(&bytes)?;
-    writer.finish()
+    writer.write_all(bytes)?;
+    let stored = Stored {
+        bytes: writer.bytes_written(),
+        sha256: writer.sha256(),
+    };
+    writer.finish()?;
+    Ok(stored)
+}
+pub fn save_hashed(
+    frame: &Frame,
+    path: &Path,
+    format: &str,
+    policy: &StoragePolicy,
+) -> Result<Stored> {
+    let bytes = crate::frame::encode(frame, format)?;
+    save_bytes(&bytes, path, policy)
+}
+pub fn save(frame: &Frame, path: &Path, format: &str, policy: &StoragePolicy) -> Result<()> {
+    save_hashed(frame, path, format, policy).map(drop)
 }
 /// Hold a finished capture back from retention while it waits for upload,
 /// or release it. Returns the SHA-256 recorded when the file was finished.

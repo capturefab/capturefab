@@ -2,13 +2,13 @@
 name = "capturefab"
 version = "0.2.2"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Rust camera workbench for GenICam GigE Vision and USB3 Vision"
 license = "MIT"
 repository = "https://github.com/capturefab/capturefab"
 
 [features]
-default = ["gui", "usb", "scanner", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "s3"]
+default = ["gui", "usb", "scanner", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "s3", "ftp", "sftp", "parquet", "modbus", "mqtt", "opcua", "mtconnect"]
 gui = ["ai", "dep:iced", "dep:bytemuck", "dep:rfd", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:mundy", "dep:accesskit", "dep:accesskit_macos", "dep:accesskit_windows", "dep:accesskit_unix", "dep:raw-window-handle", "dep:windows", "dep:x11-dl", "dep:libloading", "dep:libc"]
 usb = ["dep:nusb"]
 # Document scanners: SANE scanimage, Windows WIA and macOS ImageCaptureCore.
@@ -21,9 +21,25 @@ nvjpeg = ["dep:libloading"]
 # VA-API hardware JPEG (Intel iHD and other drivers), libva loaded at runtime in
 # an isolated helper process; libjpeg-turbo verifies its output at start-up.
 vaapi = ["dep:libloading", "jpeg"]
-# S3-compatible upload destinations: a pure-Rust HTTPS client (rustls, trusting
-# the OS certificate store) and the OS credential store for keys.
-s3 = ["dep:ureq", "dep:keyring"]
+# Upload queue and OS credential store shared by every network destination.
+uploads = ["dep:keyring"]
+# S3-compatible upload destinations (AWS, MinIO, RustFS, ...): a pure-Rust HTTPS
+# client (rustls, trusting the OS certificate store) and the OS credential store for keys.
+s3 = ["uploads", "dep:ureq"]
+# FTP and explicit FTPS (rustls with ring, OS trust store); synchronous, no async runtime.
+ftp = ["uploads", "dep:suppaftp", "dep:rustls", "dep:rustls-platform-verifier"]
+# SFTP over pure-Rust SSH (ring); a tokio current-thread runtime only inside upload threads.
+sftp = ["uploads", "dep:russh", "dep:russh-sftp", "dep:tokio"]
+# Parquet and JSON exports from the dataset catalog (DuckDB's statically linked extensions).
+parquet = ["duckdb/parquet", "duckdb/json"]
+# Industrial signal sources; each runs in an isolated `__signal` helper process.
+# Modbus TCP is hand-rolled over std::net.
+modbus = []
+mqtt = ["dep:rumqttc", "dep:rustls", "dep:rustls-platform-verifier"]
+# async-opcua is MPL-2.0; release.py adds its notice and source link.
+opcua = ["dep:async-opcua", "dep:tokio"]
+# MTConnect agents polled over HTTP(S).
+mtconnect = ["dep:ureq"]
 # Prompt measurements use HTTPS with the OS certificate store and native
 # Keychain / Credential Manager / Secret Service credentials.
 ai = ["dep:ureq", "dep:keyring", "dep:zeroize"]
@@ -59,8 +75,8 @@ md-5 = "0.10"
 sha2 = "0.10"
 fs2 = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-# Session analytics stays entirely in memory; bundling keeps releases portable.
-duckdb = { version = "~1.4.4", default-features = false, features = ["bundled"] }
+# In-memory session analytics and on-disk dataset catalogs; bundling keeps releases portable.
+duckdb = { version = "~1.10506.1", default-features = false, features = ["bundled"] }
 plotters = { version = "0.3.7", default-features = false, features = ["svg_backend", "line_series", "area_series"] }
 turbojpeg = { version = "1.5", optional = true, default-features = false, features = ["cmake", "require-simd"] }
 libloading = { version = "0.8", optional = true }
@@ -68,6 +84,16 @@ ureq = { version = "3.4", optional = true, default-features = false, features = 
 keyring = { version = "4.2", optional = true }
 zeroize = { version = "1", optional = true }
 rfd = { version = "0.17", optional = true }
+# TLS for FTPS and MQTT over TLS: ring only (no aws-lc-rs, so no C toolchain or cmake).
+rustls = { version = "0.23.45", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = { version = "0.7.1", optional = true }
+# Async runtime used only inside SFTP upload threads and signal helper processes.
+tokio = { version = "1.53", optional = true, default-features = false, features = ["rt", "time", "net", "io-util"] }
+suppaftp = { version = "12.2", optional = true, default-features = false, features = ["rustls-ring"] }
+russh = { version = "0.64", optional = true, default-features = false, features = ["ring", "flate2", "rsa"] }
+russh-sftp = { version = "3.0", optional = true }
+rumqttc = { version = "0.25.1", optional = true, default-features = false, features = ["use-rustls-no-provider"] }
+async-opcua = { version = "0.19.0", optional = true, default-features = false, features = ["client"] }
 
 # The refresh rate of the GUI window's screen, and the Reduce Motion and Reduce
 # Transparency settings; already in the tree via rfd.

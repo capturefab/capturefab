@@ -375,6 +375,12 @@ fn outcome(job: &Job, value: &Value) -> Option<(String, Option<String>, Level)> 
         }),
         Job::StopForward { recording: true } => done("Recording stopped".into()),
         Job::StopForward { recording: false } => done("Forwarding stopped".into()),
+        Job::DatasetOpen => done("Dataset opened".into()),
+        Job::DatasetClose => done("Dataset closed".into()),
+        Job::DatasetNote => done("Note added".into()),
+        Job::DatasetExport => done("Dataset exported".into()),
+        Job::SignalStart => done("Data source started".into()),
+        Job::SignalStop => done("Data source stopped".into()),
         Job::Set(feature) => {
             let name = value["name"].as_str().unwrap_or(feature);
             let mut text = match value.get("value") {
@@ -424,6 +430,12 @@ fn failure(job: &Job) -> String {
         Job::Forward { recording: false } => "Could not start forwarding",
         Job::StopForward { recording: true } => "Could not stop recording",
         Job::StopForward { recording: false } => "Could not stop forwarding",
+        Job::DatasetOpen => "Could not open the dataset",
+        Job::DatasetClose => "Could not close the dataset",
+        Job::DatasetNote => "Could not add the note",
+        Job::DatasetExport => "Could not export the dataset",
+        Job::SignalStart => "Could not start the data source",
+        Job::SignalStop => "Could not stop the data source",
         Job::Set(feature) => return format!("Could not set {}", words(feature)),
         Job::Execute(feature) => return format!("Could not execute {}", words(feature)),
     };

@@ -136,6 +136,7 @@ impl Workbench {
                 last_file: None,
                 error: None,
                 destination: None,
+                context: Default::default(),
             });
         }
         if self.chrome.scene_log && !snapshot.logs.iter().any(|entry| entry.level == "warn") {

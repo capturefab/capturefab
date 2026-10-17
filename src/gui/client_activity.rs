@@ -591,6 +591,12 @@ fn matches_job(entry: &SessionActivity, job: &Job) -> bool {
         Job::Cancel => entry.operation == "cancel_job",
         Job::Forward { .. } => entry.operation == "forward",
         Job::StopForward { .. } => entry.operation == "stop_forward",
+        Job::DatasetOpen => entry.operation == "dataset_open",
+        Job::DatasetClose => entry.operation == "dataset_close",
+        Job::DatasetNote => entry.operation == "dataset_note",
+        Job::DatasetExport => entry.operation == "dataset_export",
+        Job::SignalStart => entry.operation == "signal_start",
+        Job::SignalStop => entry.operation == "signal_stop",
         Job::Set(feature) => entry.operation == "set" && entry.feature.as_ref() == Some(feature),
         Job::Execute(feature) => {
             entry.operation == "execute" && entry.feature.as_ref() == Some(feature)

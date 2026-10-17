@@ -140,6 +140,7 @@ impl Harness {
             thread: Arc::new(Mutex::new(None)),
             ring: None,
             history: Arc::default(),
+            saved: Arc::default(),
         };
         let mut harness = Self {
             handle,
@@ -305,6 +306,7 @@ fn pending_and_running_capture_jobs_prevent_network_writes() {
                 next_at_ms: 1000,
                 last_file: None,
                 error: None,
+                context: Default::default(),
             },
             resolved: crate::destination::Resolved {
                 output: output.into(),

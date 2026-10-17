@@ -502,6 +502,29 @@ pub struct Prefs {
     pub window: Option<[f32; 2]>,
     pub logs_open: bool,
     pub video_analytics: super::video_analytics::Preferences,
+    /// 0 for files written before versioning; `Prefs::default()` is current.
+    #[serde(default)]
+    pub prefs_version: u32,
+    /// Start the live view when a camera connects.
+    pub auto_start: bool,
+    /// Capture context sent with every capture and recording.
+    pub tags: CaptureTags,
+    /// The dataset reopened at startup.
+    pub dataset_path: Option<PathBuf>,
+    /// Catalog captures in a dataset under the capture folder when none is open.
+    pub dataset_auto: bool,
+    /// Recently added signal sources, never with credentials.
+    pub recent_signals: Vec<String>,
+}
+/// Capture context fields; empty ones are not sent.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CaptureTags {
+    pub line: String,
+    pub station: String,
+    pub part: String,
+    pub lot: String,
+    pub note: String,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Recent {
@@ -546,6 +569,12 @@ impl Default for Prefs {
             window: None,
             logs_open: false,
             video_analytics: Default::default(),
+            prefs_version: 2,
+            auto_start: true,
+            tags: CaptureTags::default(),
+            dataset_path: None,
+            dataset_auto: true,
+            recent_signals: Vec::new(),
         }
     }
 }
@@ -728,11 +757,18 @@ fn write_snapshots(
 }
 
 fn load_from(path: &Path) -> Prefs {
-    fs::read(path)
+    let mut prefs: Prefs = fs::read(path)
         .ok()
         .filter(|bytes| bytes.len() <= 1 << 20)
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    upgrade(&mut prefs);
+    prefs
+}
+
+/// Bring preferences saved by an older version up to the current one.
+fn upgrade(prefs: &mut Prefs) {
+    prefs.prefs_version = prefs.prefs_version.max(Prefs::default().prefs_version);
 }
 
 fn save_to(path: &Path, prefs: &Prefs) -> Result<()> {

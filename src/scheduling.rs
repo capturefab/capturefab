@@ -19,11 +19,25 @@ pub struct CaptureJob {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub context: crate::context::Context,
 }
 impl CaptureJob {
     pub fn active(&self) -> bool {
         matches!(self.status.as_str(), "pending" | "running")
     }
+}
+/// A local recording in progress, kept by the worker until it stops so the
+/// finished file can be reported with its context.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordingMeta {
+    pub path: String,
+    /// UTC Unix milliseconds.
+    pub since_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub context: crate::context::Context,
 }
 pub fn now_ms() -> u64 {
     SystemTime::now()

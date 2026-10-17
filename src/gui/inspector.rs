@@ -18,6 +18,13 @@ pub(super) enum Section {
     CaptureOptions,
     Automation,
     EncoderOptions,
+    // Toggled from the tags, dataset and signals views (Slices A, B and C).
+    #[allow(dead_code)]
+    CaptureTags,
+    #[allow(dead_code)]
+    Dataset,
+    #[allow(dead_code)]
+    Signals,
 }
 #[cfg(test)]
 mod disclosure_tests;
@@ -592,6 +599,9 @@ pub(super) struct InspectorState {
     capture_options_open: bool,
     automation_open: bool,
     encoder_options_open: bool,
+    tags_open: bool,
+    dataset_open: bool,
+    signals_open: bool,
     /// The last write or command that failed on each of the shown camera's
     /// features, as the whole error; show its first line at the row. Kept by
     /// `failed()` and cleared by the feature's next success, a new draft, a
@@ -642,6 +652,9 @@ impl Default for InspectorState {
             capture_options_open: false,
             automation_open: false,
             encoder_options_open: false,
+            tags_open: false,
+            dataset_open: false,
+            signals_open: false,
             write_errors: HashMap::new(),
             accepted: Flashes::new(ACCEPTED),
             capture_failed: None,
@@ -817,6 +830,9 @@ impl Workbench {
             Section::EncoderOptions => {
                 self.inspect.encoder_options_open = !self.inspect.encoder_options_open
             }
+            Section::CaptureTags => self.inspect.tags_open = !self.inspect.tags_open,
+            Section::Dataset => self.inspect.dataset_open = !self.inspect.dataset_open,
+            Section::Signals => self.inspect.signals_open = !self.inspect.signals_open,
         }
     }
 
@@ -2345,6 +2361,7 @@ impl Workbench {
         // when the session opens or closes.
         let automatic_first = self.snapshot.capture_session.is_some();
         column![
+            section_slot(super::tags::view(self, self.inspect.tags_open, p)),
             section_slot(automatic_first.then(|| self.auto_capture_settings(p))),
             section_slot(Some(save.into())),
             section_slot(
@@ -2352,6 +2369,8 @@ impl Workbench {
             ),
             section_slot((!automatic_first).then(|| self.auto_capture_settings(p))),
             section_slot(Some(self.storage_settings(p))),
+            section_slot(super::dataset::view(self, self.inspect.dataset_open, p)),
+            section_slot(super::signals::view(self, self.inspect.signals_open, p)),
             automation,
         ]
         .into()

@@ -1819,6 +1819,9 @@ pub struct ForwardStats {
     pub dropped: u64,
     pub encoder: String,
     pub error: Option<String>,
+    /// The finished local recording, set once its file is complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<crate::dataset::RecordedFile>,
 }
 struct WriterState {
     latest: Option<Vec<u8>>,
@@ -2860,6 +2863,7 @@ impl Forwarder {
                     .unwrap_or_else(|e| e.into_inner())
                     .error
                     .clone(),
+                recording: None,
             }
         } else {
             self.final_stats.clone()
@@ -2951,6 +2955,7 @@ impl Forwarder {
                     .and_then(|()| match &self.destination {
                         Some(destination) => destination
                             .finished(&path)
+                            .map(drop)
                             .context("recording saved but not queued for upload"),
                         None => Ok(()),
                     })

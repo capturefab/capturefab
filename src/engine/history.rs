@@ -976,6 +976,8 @@ mod tests {
             interval_ms: 0,
             storage: Default::default(),
             destination: None,
+            on_exists: Default::default(),
+            context: Default::default(),
         })
         .unwrap();
         let stopped = h.request(SessionCommand::Stop).unwrap();

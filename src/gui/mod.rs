@@ -8,6 +8,7 @@ mod camera_history;
 mod camera_view;
 mod client_activity;
 mod close_error;
+mod dataset;
 mod destinations;
 mod format;
 mod gpu;
@@ -33,10 +34,12 @@ mod scene;
 mod scopes;
 mod settings;
 mod sidebar;
+mod signals;
 mod sparkline;
 mod stage;
 mod storage_policy;
 mod style;
+mod tags;
 mod text_input;
 mod time_format;
 mod titlebar;
@@ -429,6 +432,12 @@ impl Pending {
             Job::Forward { recording: false } => "Starting forwarding",
             Job::StopForward { recording: true } => "Stopping recording",
             Job::StopForward { recording: false } => "Stopping forwarding",
+            Job::DatasetOpen => "Opening dataset",
+            Job::DatasetClose => "Closing dataset",
+            Job::DatasetNote => "Adding note",
+            Job::DatasetExport => "Exporting dataset",
+            Job::SignalStart => "Starting data source",
+            Job::SignalStop => "Stopping data source",
             Job::Set(feature) => return format!("Setting {}", words(feature)),
             Job::Execute(feature) => return format!("Executing {}", words(feature)),
         };
@@ -473,6 +482,18 @@ enum Job {
     StopForward {
         recording: bool,
     },
+    #[allow(dead_code)] // Sent by the dataset view (Slice B).
+    DatasetOpen,
+    #[allow(dead_code)]
+    DatasetClose,
+    #[allow(dead_code)]
+    DatasetNote,
+    #[allow(dead_code)]
+    DatasetExport,
+    #[allow(dead_code)] // Sent by the signals view (Slice C).
+    SignalStart,
+    #[allow(dead_code)]
+    SignalStop,
     /// Write a feature, by name.
     Set(String),
     /// Run a command feature, by name.
@@ -1124,6 +1145,8 @@ impl Workbench {
             window: self.window,
             logs_open: self.logs_open,
             video_analytics: self.video_analytics.preferences.clone(),
+            // Not yet mirrored on the workbench: keep what was loaded.
+            ..self.saved.clone().unwrap_or_default()
         }
     }
 
@@ -2021,6 +2044,8 @@ impl Workbench {
                 interval_ms: (self.schedule_interval_seconds * 1000.0).round() as u64,
                 storage: self.storage_policy(),
                 destination: self.capture_to.selected.clone(),
+                on_exists: Default::default(),
+                context: Default::default(),
             }
         } else {
             SessionCommand::Capture {
@@ -2030,6 +2055,8 @@ impl Workbench {
                 format: self.format.into(),
                 storage: self.storage_policy(),
                 destination: self.capture_to.selected.clone(),
+                on_exists: Default::default(),
+                context: Default::default(),
             }
         }
     }
@@ -2044,6 +2071,8 @@ impl Workbench {
             storage: self.storage_policy(),
             max_file_bytes: (self.forward_file_mib * 1024.0 * 1024.0).round() as u64,
             destination: self.record_to.selected.clone(),
+            on_exists: Default::default(),
+            context: Default::default(),
         }
     }
 
@@ -2998,6 +3027,8 @@ impl Workbench {
                             format: self.format.into(),
                             storage: self.storage_policy(),
                             destination: self.capture_to.selected.clone(),
+                            on_exists: Default::default(),
+                            context: Default::default(),
                         },
                     );
                 }
