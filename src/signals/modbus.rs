@@ -50,11 +50,12 @@ impl Client {
     pub fn read(&mut self, unit: u8, function: u8, address: u16, quantity: u16) -> Result<Vec<u8>> {
         self.tid = self.tid.wrapping_add(1);
         self.stream
-            .write_all(&request(self.tid, unit, function, address, quantity))?;
+            .write_all(&request(self.tid, unit, function, address, quantity))
+            .map_err(|e| io_error(e, "send Modbus request"))?;
         let mut header = [0u8; 7];
         self.stream
             .read_exact(&mut header)
-            .context("read Modbus response")?;
+            .map_err(|e| io_error(e, "read Modbus response"))?;
         let length = u16::from_be_bytes([header[4], header[5]]) as usize;
         ensure!(
             (2..=MAX_LENGTH).contains(&length),
@@ -63,8 +64,24 @@ impl Client {
         let mut body = vec![0u8; length - 1];
         self.stream
             .read_exact(&mut body)
-            .context("read Modbus response")?;
+            .map_err(|e| io_error(e, "read Modbus response"))?;
         parse_response(self.tid, unit, function, quantity, &header, &body)
+    }
+}
+
+/// Name socket failures so `cli::error_code` classifies them: a read
+/// timeout surfaces as `WouldBlock` ("Resource temporarily unavailable") on
+/// Unix, which would otherwise be a generic failure instead of a timeout.
+fn io_error(error: std::io::Error, action: &str) -> anyhow::Error {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+            anyhow::anyhow!("{action}: Modbus server did not answer in time (timed out)")
+        }
+        ErrorKind::UnexpectedEof => {
+            anyhow::anyhow!("{action}: Modbus server closed the connection")
+        }
+        _ => anyhow::Error::new(error).context(action.to_string()),
     }
 }
 
@@ -104,7 +121,9 @@ pub fn parse_response(
         header[6]
     );
     let (&fc, rest) = body.split_first().context("Modbus response is empty")?;
-    if fc == function | 0x80 {
+    // Some servers and gateways answer an unknown unit with function 0x80
+    // rather than `function | 0x80`; report any exception's code.
+    if fc & 0x80 != 0 {
         let code = rest.first().copied().unwrap_or(0);
         bail!("modbus exception {code} ({})", exception_name(code));
     }
@@ -395,6 +414,12 @@ mod tests {
             error.to_string(),
             "modbus exception 2 (illegal data address)"
         );
+        // pymodbus answers an unknown unit ID with function 0x80, code 11.
+        let error = parse_response(1, 9, 3, 1, &[0, 1, 0, 0, 0, 3, 9], &[0x80, 11]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "modbus exception 11 (gateway target device failed to respond)"
+        );
         let error = parse_response(2, 1, 3, 1, &header, &[3, 2, 0, 0]).unwrap_err();
         assert!(error.to_string().contains("transaction ID mismatch"));
         assert!(parse_response(1, 1, 3, 2, &[0, 1, 0, 0, 0, 5, 1], &[3, 2, 0, 0]).is_err());
@@ -467,6 +492,29 @@ mod tests {
         fake.drop_connections(false);
         let mut client = Client::connect("127.0.0.1", port, Duration::from_secs(2)).unwrap();
         assert_eq!(client.read(1, 3, 10, 1).unwrap(), vec![0xE9, 0x79]);
+    }
+
+    #[test]
+    fn silent_server_times_out_and_closed_connection_is_named() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = std::thread::spawn(move || {
+            let (silent, _) = listener.accept().unwrap();
+            let (mut closed, _) = listener.accept().unwrap();
+            let mut frame = [0u8; 12];
+            closed.read_exact(&mut frame).unwrap();
+            drop(closed);
+            std::thread::sleep(Duration::from_millis(800));
+            drop(silent);
+        });
+        let mut client = Client::connect("127.0.0.1", port, Duration::from_millis(300)).unwrap();
+        let error = format!("{:#}", client.read(1, 3, 0, 1).unwrap_err());
+        assert!(error.contains("timed out"), "{error}");
+        assert_eq!(crate::cli::error_code(&anyhow::anyhow!(error)).1, 4);
+        let mut client = Client::connect("127.0.0.1", port, Duration::from_millis(300)).unwrap();
+        let error = format!("{:#}", client.read(1, 3, 0, 1).unwrap_err());
+        assert!(error.contains("closed the connection"), "{error}");
+        accept.join().unwrap();
     }
 
     #[test]
