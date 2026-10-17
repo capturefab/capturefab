@@ -334,14 +334,14 @@ impl Workbench {
     }
 }
 
-/// A small mark in a tile's caption, such as forwarding or auto mode,
-/// explained on hover.
 /// The tile's Open button's tooltip: which camera it opens, and the
 /// other way there.
 fn open_hint(camera: &CameraInfo) -> String {
     format!("Open {} (or double-click the tile)", identity(camera))
 }
 
+/// A small mark in a tile's caption, such as forwarding or auto mode,
+/// explained on hover.
 fn chip<'a>(content: impl Into<Element<'a, Message>>, about: String) -> Element<'a, Message> {
     tip_above(
         container(content)

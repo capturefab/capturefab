@@ -53,7 +53,7 @@ pub enum Metric {
 
 impl std::fmt::Display for Metric {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.label())
+        f.write_str(self.plain())
     }
 }
 
@@ -72,7 +72,9 @@ fn glass_pick(shown: f32) -> impl Fn(&Theme, super::pick_list::Status) -> super:
         super::pick_list::Style {
             text_color: on(style::ON_STAGE, 1.0),
             placeholder_color: on(style::ON_STAGE_SECONDARY, 1.0),
-            handle_color: on(style::ON_STAGE_SECONDARY, 1.0),
+            // Faint, so the filled handle weighs no more than the header's
+            // thin reset and close glyphs beside it.
+            handle_color: on(style::ON_STAGE_SECONDARY, 0.55),
             background: on(Color::WHITE, fill).into(),
             border: iced::Border {
                 color: on(Color::WHITE, 0.16),
@@ -98,6 +100,28 @@ impl Metric {
             Metric::Brenner => "Brenner",
             Metric::Variance => "Variance",
         }
+    }
+
+    /// What the measure looks for, in plain words, for the card's chooser
+    /// and the focus region's label; `label` keeps the algorithm's name for
+    /// the tooltip.
+    pub(super) fn plain(self) -> &'static str {
+        match self {
+            Metric::Laplacian => "Edges",
+            Metric::Tenengrad => "Strong edges",
+            Metric::Brenner => "Texture",
+            Metric::Variance => "Contrast",
+        }
+    }
+
+    /// The chooser's tooltip: the algorithm by name, and what it is good at.
+    fn about(self) -> String {
+        format!(
+            "Focus measure: {} ({}). {}",
+            self.plain(),
+            self.label(),
+            self.hint()
+        )
     }
 
     pub(super) fn hint(self) -> &'static str {
@@ -411,7 +435,7 @@ impl Workbench {
                 .padding([2, 6])
                 .style(glass_pick(shown))
                 .menu_style(style::menu),
-            format!("Focus measure: {}", metric.hint()),
+            metric.about(),
         );
         let header = row![
             text("Focus")
@@ -515,7 +539,7 @@ impl Workbench {
         }
         let label = match (self.focus.latest(), self.focus.share()) {
             (Some(latest), Some(share)) => format!("{}  {:.0}%", score(latest), share * 100.0),
-            _ => self.focus.metric.label().into(),
+            _ => self.focus.metric.plain().into(),
         };
         Some(
             canvas::Canvas::new(RegionEditor {
@@ -1354,7 +1378,12 @@ mod tests {
         drop(view);
         let _ = bench.update(Message::FocusMetric(Metric::Brenner));
         assert_eq!(bench.focus.metric, Metric::Brenner);
-        assert_eq!(Metric::Brenner.to_string(), "Brenner");
+        // Plain words on screen; the algorithm's name in the tooltip.
+        assert_eq!(Metric::Brenner.to_string(), "Texture");
+        for metric in Metric::ALL {
+            assert_ne!(metric.to_string(), metric.label());
+            assert!(metric.about().contains(metric.label()), "{metric:?}");
+        }
     }
 
     #[test]
