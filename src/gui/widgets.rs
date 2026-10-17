@@ -345,16 +345,19 @@ impl FeatureScale {
         if self.integer {
             return format!("{value:.0}");
         }
-        // Keep as many decimals as the camera's increment (or the slider's
-        // step) needs, so a snapped 0.0625 is not sent as 0.063.
-        let places = match self.inc.filter(|inc| *inc > 0.0 && inc.is_finite()) {
-            // The fewest decimals that write the increment exactly.
-            Some(inc) => (0..=12)
+        // Keep as many decimals as the camera's grid (minimum plus
+        // increments) or the slider's step needs, so a snapped 0.0625 is not
+        // sent as 0.063.
+        let exact = |x: f64| {
+            (0..=12)
                 .find(|p| {
-                    let scaled = inc * 10f64.powi(*p);
+                    let scaled = x.abs() * 10f64.powi(*p);
                     (scaled - scaled.round()).abs() < 1e-9 * scaled.max(1.0)
                 })
-                .unwrap_or(12) as usize,
+                .unwrap_or(12) as usize
+        };
+        let places = match self.inc.filter(|inc| *inc > 0.0 && inc.is_finite()) {
+            Some(inc) => exact(inc).max(exact(self.min)),
             None => {
                 let step = (self.max - self.min) / 100.0;
                 if step > 0.0 && step.is_finite() {
@@ -1346,6 +1349,13 @@ mod tests {
         let fine = FeatureScale::new("Gain", "Float", Some(0.0), Some(1.0), Some(0.0625)).unwrap();
         assert_eq!(fine.text(0.0625), "0.0625", "not rounded to 0.063");
         assert_eq!(fine.text(fine.step(0.0, true)), "0.0625");
+        let offset =
+            FeatureScale::new("Gain", "Float", Some(0.0625), Some(2.0), Some(0.125)).unwrap();
+        assert_eq!(
+            offset.text(offset.step(0.0625, true)),
+            "0.1875",
+            "on the grid"
+        );
         let tiny = FeatureScale::new("Gain", "Float", Some(0.0), Some(0.01), None).unwrap();
         assert_eq!(
             tiny.text(0.0001),
