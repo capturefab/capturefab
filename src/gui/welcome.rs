@@ -132,15 +132,10 @@ impl Workbench {
         self.welcome_content_for(p, false)
     }
 
-    fn welcome_content_for(
-        &self,
-        p: &'static Palette,
-        compact: bool,
-    ) -> (Element<'_, Message>, f32) {
-        let now = self.now;
-        let discovering = self.pending(Job::Discover);
-        let spin = self.spin();
-        let found: Vec<_> = self
+    /// What the welcome screen offers: the cameras found and recent ones
+    /// it lists as cards, and whether it says it is searching.
+    fn welcome_choices(&self, compact: bool) -> (Vec<&CameraInfo>, Vec<&Recent>, bool) {
+        let found: Vec<&CameraInfo> = self
             .snapshot
             .devices
             .iter()
@@ -155,7 +150,7 @@ impl Workbench {
             // duplicating a long source list above compact onboarding actions.
             .take(if compact && self.sidebar_open { 2 } else { 4 })
             .collect();
-        let recent: Vec<_> = self
+        let recent: Vec<&Recent> = self
             .recent
             .iter()
             .filter(|_| !compact || !self.sidebar_open)
@@ -170,7 +165,27 @@ impl Workbench {
             .take(4 - found.len().max(1))
             .collect();
         // A quick search keeps what the screen said; its button spins.
-        let searching_shown = discovering && self.searching_shown();
+        let searching_shown = self.pending(Job::Discover) && self.searching_shown();
+        (found, recent, searching_shown)
+    }
+
+    /// How the welcome screen offers a simulated camera; see
+    /// `simulator_offer`.
+    #[cfg(test)]
+    fn welcome_simulator(&self, compact: bool) -> Option<bool> {
+        let (found, recent, searching_shown) = self.welcome_choices(compact);
+        welcome_simulator_for(&found, &recent, searching_shown)
+    }
+
+    fn welcome_content_for(
+        &self,
+        p: &'static Palette,
+        compact: bool,
+    ) -> (Element<'_, Message>, f32) {
+        let now = self.now;
+        let discovering = self.pending(Job::Discover);
+        let spin = self.spin();
+        let (found, recent, searching_shown) = self.welcome_choices(compact);
         let subtitle = if !found.is_empty() {
             "Choose a camera to connect.".to_owned()
         } else if searching_shown {
@@ -324,97 +339,51 @@ impl Workbench {
             })
             .on_press_maybe((!busy).then_some(on))
         };
-        // A simulated camera already offered as a card needs no button.
-        let sim_listed = found.iter().any(|device| {
-            device.transport == crate::types::Transport::Simulator || device.id.starts_with("sim:")
-        }) || recent
-            .iter()
-            .any(|recent| recent.target.starts_with("sim:"));
-        let simulator = simulator_offer(
-            found.is_empty() && recent.is_empty(),
-            sim_listed,
-            searching_shown,
-        );
-        let actions = if found.is_empty() && recent.is_empty() {
-            // Nothing to choose yet: the ways in are the actions, and the
-            // simulator leads while nothing is being searched for.
-            row![
-                tip(
-                    action(
-                        Icon::Refresh,
-                        if discovering {
-                            "Searching…"
-                        } else {
-                            "Search again"
-                        },
-                        Message::Discover,
-                        discovering,
-                        false,
-                    ),
-                    Action::Discover.hint(DISCOVERS, os),
-                ),
+        let simulator = welcome_simulator_for(&found, &recent, searching_shown);
+        // One family of buttons in every state. The simulator comes last,
+        // so it can come and go (once a simulated camera is listed) without
+        // moving the others; it is the primary action only on an empty
+        // screen, where it is the quickest way in.
+        let mut actions = row![
+            tip(
                 action(
-                    Icon::Cube,
-                    "Try a simulated camera",
-                    Message::TrySimulator,
-                    self.connecting("sim:0"),
-                    simulator == Some(true),
+                    Icon::Refresh,
+                    if discovering {
+                        "Searching…"
+                    } else {
+                        "Search again"
+                    },
+                    Message::Discover,
+                    discovering,
+                    false,
                 ),
-                tip(
-                    action(
-                        Icon::Plus,
-                        "Enter an address",
-                        Message::EnterAddress,
-                        false,
-                        false,
-                    ),
-                    Action::ConnectAddress.hint(ADDRESSES, os),
+                Action::Discover.hint(DISCOVERS, os),
+            ),
+            tip(
+                action(
+                    Icon::Plus,
+                    "Enter an address",
+                    Message::EnterAddress,
+                    false,
+                    false,
                 ),
-            ]
-        } else {
-            // The cards are the choice; the rest are quiet links under them.
-            let link = |label: &'static str, on: Message, busy: bool| {
-                let ink = if busy { p.secondary } else { p.accent_text };
-                let mut content = row![].spacing(5).align_y(Alignment::Center);
-                if busy {
-                    content = content.push(icon::spinner(11.0, ink, spin));
-                }
-                button(content.push(text(label).size(style::SMALL)))
-                    .style(style::link)
-                    .padding([2, 6])
-                    .on_press_maybe((!busy).then_some(on))
-            };
-            let mut links = row![
-                tip(
-                    link(
-                        if discovering {
-                            "Searching…"
-                        } else {
-                            "Search again"
-                        },
-                        Message::Discover,
-                        discovering,
-                    ),
-                    Action::Discover.hint(DISCOVERS, os),
-                ),
-                tip(
-                    link("Enter an address", Message::EnterAddress, false),
-                    Action::ConnectAddress.hint(ADDRESSES, os),
-                ),
-            ];
-            if simulator.is_some() {
-                links = links.push(link(
-                    "Try a simulated camera",
-                    Message::TrySimulator,
-                    self.connecting("sim:0"),
-                ));
-            }
-            links
+                Action::ConnectAddress.hint(ADDRESSES, os),
+            ),
+        ];
+        if let Some(primary) = simulator {
+            actions = actions.push(action(
+                Icon::Cube,
+                "Try a simulated camera",
+                Message::TrySimulator,
+                self.connecting("sim:0"),
+                primary,
+            ));
         }
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .wrap()
-        .vertical_spacing(8);
+        let actions = actions
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .wrap()
+            .vertical_spacing(8);
         let guide = row![
             button(text("Quick guide").size(style::SMALL))
                 .style(style::link)
@@ -488,6 +457,21 @@ impl Workbench {
             None => card.into(),
         }
     }
+}
+
+/// `simulator_offer` for what the welcome screen lists.
+fn welcome_simulator_for(
+    found: &[&CameraInfo],
+    recent: &[&Recent],
+    searching: bool,
+) -> Option<bool> {
+    // A simulated camera already offered as a card needs no button.
+    let sim_listed = found.iter().any(|device| {
+        device.transport == crate::types::Transport::Simulator || device.id.starts_with("sim:")
+    }) || recent
+        .iter()
+        .any(|recent| recent.target.starts_with("sim:"));
+    simulator_offer(found.is_empty() && recent.is_empty(), sim_listed, searching)
 }
 
 /// How the welcome screen offers a simulated camera: `None` when one is
@@ -757,8 +741,25 @@ mod tests {
             );
             *id
         };
-        visible("Try a simulated camera");
-        assert_eq!(simulator_offer(true, false, false), Some(true), "primary");
+        // Primary from the very choices the view lists, and last in the
+        // row, so it comes and goes without moving the others.
+        assert_eq!(app.welcome_simulator(false), Some(true), "primary");
+        let x = |label: &str| {
+            let id = visible(label);
+            snapshot
+                .nodes
+                .iter()
+                .find(|(node, _)| *node == id)
+                .unwrap()
+                .1
+                .bounds()
+                .unwrap()
+                .x0
+        };
+        let search = Action::Discover.hint(DISCOVERS, Os::CURRENT);
+        let address = Action::ConnectAddress.hint(ADDRESSES, Os::CURRENT);
+        assert!(x(&search) < x(&address));
+        assert!(x(&address) < x("Try a simulated camera"));
         let tips = visible("Connection tips");
         let task = bridge.dispatch(accessibility::Request {
             window,

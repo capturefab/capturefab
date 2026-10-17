@@ -655,11 +655,11 @@ impl Workbench {
         if let Some(sources) = self.sidebar_signals(p) {
             list = list.push(sources);
         }
-        // The network check only once GigE is in play; the quick guide's
-        // connection notes keep it reachable otherwise. Its report only
-        // once there is one, so it is never shown disabled.
-        // The slot stays one container either way, so the widgets after it
-        // keep their state (the address field its focus) as it comes and goes.
+        // The network check only once GigE is in play, under the list; the
+        // quick guide's connection notes keep it reachable otherwise. Its
+        // report only once there is one, so it is never shown disabled. The
+        // slot stays one container either way, so the widgets after it keep
+        // their state (the address field its focus) as it comes and goes.
         let mut network = row![].align_y(Alignment::Center);
         let relevant = self.network_check_relevant();
         if relevant {
@@ -694,7 +694,6 @@ impl Workbench {
                         })
                         .into()
                 ),
-                network,
                 space().height(4),
                 container(keyboard_history::content_scope(
                     scrollable(list).height(Fill).style(style::scroll).into(),
@@ -702,6 +701,9 @@ impl Workbench {
                 ))
                 .height(Fill)
                 .padding([0.0, EDGE]),
+                // Under the list, so coming and going only trims its bottom
+                // and never moves a camera row.
+                network,
                 self.sidebar_footer(p),
             ]
             .padding(iced::Padding {
