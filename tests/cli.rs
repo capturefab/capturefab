@@ -2120,3 +2120,361 @@ fn doctor_reports_destination_features() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn dataset_rows(dir: &PathBuf, file: &std::path::Path, sql: &str) -> Value {
+    json(
+        dir,
+        &[
+            "--json",
+            "dataset",
+            "query",
+            "--file",
+            file.to_str().unwrap(),
+            sql,
+        ],
+    )["rows"]
+        .clone()
+}
+
+#[test]
+fn dataset_records_direct_captures() {
+    let root = temp_root("dataset-direct");
+    let dir = root.join("sessions");
+    let db = root.join("d.duckdb");
+    for name in ["a.png", "b.png"] {
+        let output = root.join(name);
+        json(
+            &dir,
+            &[
+                "--json",
+                "--camera",
+                "sim:0",
+                "capture",
+                "-o",
+                output.to_str().unwrap(),
+                "--dataset",
+                db.to_str().unwrap(),
+            ],
+        );
+    }
+    let rows = dataset_rows(
+        &dir,
+        &db,
+        "SELECT count(*), min(width) > 0, min(origin), max(camera_id) FROM captures",
+    );
+    assert_eq!(rows, serde_json::json!([[2, true, "capture", "sim:0"]]));
+    // The catalog's SHA-256 is the one the storage ledger recorded.
+    let sha = dataset_rows(&dir, &db, "SELECT sha256 FROM captures ORDER BY id LIMIT 1")[0][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ledger = std::fs::read_to_string(dir.join("storage.json")).unwrap();
+    assert!(ledger.contains(&sha), "{sha}");
+    let status = json(
+        &dir,
+        &[
+            "--json",
+            "dataset",
+            "status",
+            "--file",
+            db.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(status["captures"], 2);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dataset_records_schedule_and_session_notes_and_locks_the_file() {
+    let root = temp_root("dataset-session");
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let _fixture = Fixture {
+        child: serve_at(&dir, &root, "ds"),
+        dir: root.clone(),
+    };
+    let db = root.join("d.duckdb");
+    let db_text = db.to_str().unwrap();
+    let opened = json(
+        &dir,
+        &["--json", "--session", "ds", "dataset", "open", db_text],
+    );
+    assert_eq!(opened["captures"], 0);
+    json(&dir, &["--json", "--session", "ds", "connect", "sim:0"]);
+    let frames = root.join("frames");
+    json(
+        &dir,
+        &[
+            "--json",
+            "--session",
+            "ds",
+            "capture",
+            "-n",
+            "3",
+            "--interval",
+            "200ms",
+            "-o",
+            frames.to_str().unwrap(),
+            "--context",
+            "line=L1",
+        ],
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let status = json(&dir, &["--json", "--session", "ds", "dataset", "status"]);
+        if status["captures"] == 3 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{status}");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let note = json(
+        &dir,
+        &[
+            "--json",
+            "--session",
+            "ds",
+            "dataset",
+            "note",
+            "shift B",
+            "--context",
+            "line=L1",
+        ],
+    );
+    assert!(note["id"].as_u64().is_some());
+    let status = json(&dir, &["--json", "--session", "ds", "dataset", "status"]);
+    assert!(status["events"].as_u64().unwrap() >= 2, "{status}");
+    let rows = json(
+        &dir,
+        &[
+            "--json",
+            "--session",
+            "ds",
+            "dataset",
+            "query",
+            "SELECT origin, count(*), count(job_id), min(context) FROM captures GROUP BY 1",
+        ],
+    )["rows"]
+        .clone();
+    assert_eq!(
+        rows,
+        serde_json::json!([["schedule", 3, 3, r#"{"line":"L1"}"#]])
+    );
+    // The session holds the file: a direct read is refused and points to it.
+    let out = cmd(
+        &dir,
+        &["--json", "dataset", "query", "--file", db_text, "SELECT 1"],
+    );
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("--session"));
+    // A second --dataset for a different file is refused, not switched.
+    let other = root.join("other.duckdb");
+    let out = cmd(
+        &dir,
+        &[
+            "--json",
+            "--session",
+            "ds",
+            "capture",
+            "-o",
+            root.join("x.png").to_str().unwrap(),
+            "--dataset",
+            other.to_str().unwrap(),
+        ],
+    );
+    assert!(!out.status.success() && !other.exists());
+    let closed = json(&dir, &["--json", "--session", "ds", "dataset", "close"]);
+    assert_eq!(closed["closed"]["captures"], 3);
+    assert_eq!(
+        dataset_rows(&dir, &db, "SELECT count(*) FROM captures")[0][0],
+        3
+    );
+}
+
+#[test]
+fn dataset_export_bundle_never_overwrites() {
+    let root = temp_root("dataset-export");
+    let dir = root.join("sessions");
+    let db = root.join("d.duckdb");
+    json(
+        &dir,
+        &[
+            "--json",
+            "--camera",
+            "sim:0",
+            "capture",
+            "-o",
+            root.join("a.png").to_str().unwrap(),
+            "--dataset",
+            db.to_str().unwrap(),
+        ],
+    );
+    let out_dir = root.join("bundle");
+    let export = [
+        "--json",
+        "dataset",
+        "export",
+        "--file",
+        db.to_str().unwrap(),
+        "-o",
+        out_dir.to_str().unwrap(),
+        "--format",
+        "csv",
+    ];
+    let result = json(&dir, &export);
+    assert_eq!(result["tables"]["captures"], 1);
+    for name in [
+        "manifest.json",
+        "README.md",
+        "captures.csv",
+        "captures_with_signals.csv",
+    ] {
+        assert!(out_dir.join(name).is_file(), "{name}");
+    }
+    let before: Vec<_> = ["manifest.json", "README.md", "captures.csv"]
+        .iter()
+        .map(|name| std::fs::read(out_dir.join(name)).unwrap())
+        .collect();
+    let out = cmd(&dir, &export);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("already exists"));
+    let after: Vec<_> = ["manifest.json", "README.md", "captures.csv"]
+        .iter()
+        .map(|name| std::fs::read(out_dir.join(name)).unwrap())
+        .collect();
+    assert_eq!(before, after);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dataset_rejects_bad_inputs_exit_2() {
+    let root = temp_root("dataset-usage");
+    let dir = root.join("sessions");
+    let db = root.join("d.duckdb");
+    json(
+        &dir,
+        &[
+            "--json",
+            "--camera",
+            "sim:0",
+            "capture",
+            "-o",
+            root.join("a.png").to_str().unwrap(),
+            "--dataset",
+            db.to_str().unwrap(),
+        ],
+    );
+    let file = db.to_str().unwrap();
+    let bad_ext = root.join("d.db");
+    let export = root.join("e");
+    for args in [
+        vec![
+            "dataset",
+            "query",
+            "--file",
+            bad_ext.to_str().unwrap(),
+            "SELECT 1",
+        ],
+        vec![
+            "dataset", "query", "--file", file, "--limit", "0", "SELECT 1",
+        ],
+        vec![
+            "dataset",
+            "export",
+            "--file",
+            file,
+            "-o",
+            export.to_str().unwrap(),
+            "--tables",
+            "nope",
+        ],
+        vec![
+            "dataset",
+            "query",
+            "--file",
+            file,
+            "DELETE FROM captures; SELECT 1",
+        ],
+        vec!["dataset", "open", "--new", "--existing", file],
+        vec!["dataset", "status"],
+        vec!["dataset", "open", file],
+        vec!["dataset", "note", "x", "--context", "Bad=1"],
+    ] {
+        let mut full = vec!["--json"];
+        full.extend(args.iter().copied());
+        let out = cmd(&dir, &full);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    assert!(!export.exists());
+    assert_eq!(
+        dataset_rows(&dir, &db, "SELECT count(*) FROM captures")[0][0],
+        1
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Needs FFmpeg: a recording stopped by --duration or Ctrl-C is cataloged.
+#[cfg(unix)]
+#[test]
+#[ignore]
+fn dataset_recordings_are_cataloged_on_duration_and_ctrl_c() {
+    let root = temp_root("dataset-record");
+    let dir = root.join("sessions");
+    let db = root.join("d.duckdb");
+    std::fs::create_dir_all(&root).unwrap();
+    json(
+        &dir,
+        &[
+            "--json",
+            "--camera",
+            "sim:0",
+            "record",
+            "-o",
+            root.join("a.mp4").to_str().unwrap(),
+            "--duration",
+            "2s",
+            "--dataset",
+            db.to_str().unwrap(),
+        ],
+    );
+    let child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+        .env_remove("CAPTUREFAB_SESSION")
+        .env_remove("CAPTUREFAB_CAMERA")
+        .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .args([
+            "--json",
+            "--camera",
+            "sim:0",
+            "record",
+            "-o",
+            root.join("b.mp4").to_str().unwrap(),
+            "--dataset",
+            db.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success() || output.status.code() == Some(130));
+    let rows = dataset_rows(
+        &dir,
+        &db,
+        "SELECT file_name, bytes > 0, end_ms > start_ms FROM recordings ORDER BY file_name",
+    );
+    assert_eq!(
+        rows,
+        serde_json::json!([["a.mp4", true, true], ["b.mp4", true, true]])
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

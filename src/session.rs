@@ -1046,6 +1046,8 @@ struct Coordinator {
     workers: RwLock<BTreeMap<String, Arc<Mutex<Process>>>>,
     feeds: RwLock<BTreeMap<String, Arc<Mutex<FrameFeed>>>>,
     quitting: AtomicBool,
+    /// Set when `shutdown` has finished; later callers wait for it.
+    shut_down: (Mutex<bool>, Condvar),
     pending: AtomicUsize,
     connecting: Mutex<()>,
     command_order: Mutex<BTreeMap<CommandTarget, Weak<CommandOrder>>>,
@@ -1163,6 +1165,7 @@ impl SessionHandle {
                 workers: RwLock::new(BTreeMap::new()),
                 feeds: RwLock::new(BTreeMap::new()),
                 quitting: AtomicBool::new(false),
+                shut_down: (Mutex::new(false), Condvar::new()),
                 pending: AtomicUsize::new(0),
                 connecting: Mutex::new(()),
                 command_order: Mutex::new(BTreeMap::new()),
@@ -2094,6 +2097,12 @@ impl SessionHandle {
     }
     pub fn shutdown(&self) {
         if self.inner.quitting.swap(true, Ordering::AcqRel) {
+            // Another thread (a Ctrl-C handler) is finishing recordings and
+            // the dataset; returning now would let the process exit first.
+            let (done, finished) = &self.inner.shut_down;
+            let _ = finished
+                .wait_timeout_while(locked(done), Duration::from_secs(30), |done| !*done)
+                .unwrap_or_else(PoisonError::into_inner);
             return;
         }
         self.inner.activity.stop();
@@ -2136,6 +2145,9 @@ impl SessionHandle {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        let (done, finished) = &self.inner.shut_down;
+        *locked(done) = true;
+        finished.notify_all();
     }
     pub fn is_shutting_down(&self) -> bool {
         self.inner.quitting.load(Ordering::Relaxed)
@@ -2205,6 +2217,19 @@ pub fn run_worker(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parent_replies_carry_saved_files_even_when_failed() {
+        let old: ParentReply = serde_json::from_str(r#"{"ok":true,"snapshot":null}"#).unwrap();
+        assert!(old.saved.is_empty());
+        let failed: ParentReply = serde_json::from_str(
+            r#"{"ok":false,"error":"frame 3 timed out","saved":{"camera":{"id":"sim:0","transport":"simulator","vendor":"","model":"","serial":""},
+               "items":[{"seq":1,"wall_ms":5,"path":"/a.png","bytes":1,"kind":"capture","frame_id":1,"timestamp_ns":2,
+               "width":3,"height":4,"pixel_format":5,"format":"png","origin":"capture"}],"lost":2}}"#,
+        )
+        .unwrap();
+        assert!(!failed.ok);
+        assert_eq!((failed.saved.items.len(), failed.saved.lost), (1, 2));
+    }
     #[test]
     fn plant_floor_commands_keep_old_wire_shapes_and_strict_unit_ops() {
         let old = r#"{"op":"capture","output":"a.png","count":1,"timeout_ms":100,"format":"png"}"#;
