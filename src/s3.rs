@@ -526,7 +526,11 @@ impl Client {
             408 | 429 | 500..=599 => anyhow!(message),
             // Access, signature, missing bucket and request errors need a
             // configuration change, not a retry.
-            _ if detail.starts_with("RequestTimeout") || detail.starts_with("SlowDown") => {
+            // Also errors reported inside a 200 (multipart completion).
+            _ if detail.starts_with("RequestTimeout")
+                || detail.starts_with("SlowDown")
+                || detail.starts_with("InternalError") =>
+            {
                 anyhow!(message)
             }
             _ => Permanent(message).into(),
@@ -638,12 +642,10 @@ impl Client {
         let response = self.send("HEAD", "", &[], &[], &empty, None)?;
         match response.status {
             200 => Ok(()),
-            // Write-only credentials cannot inspect the bucket but may still
-            // upload; HEAD has no body to explain, so say what it means.
-            403 => bail!(Permanent(format!(
-                "the bucket {} exists but these credentials may not inspect it (HTTP 403); uploads can still work with write-only keys",
-                self.bucket.bucket
-            ))),
+            // HEAD has no body, so a 403 cannot tell refused credentials from
+            // write-only keys (or, on some services, a missing bucket); ask
+            // again with a request whose error names the reason.
+            403 => self.explain_forbidden(),
             404 => bail!(Permanent(format!(
                 "bucket {} not found",
                 self.bucket.bucket
@@ -653,6 +655,40 @@ impl Client {
                 self.bucket.bucket
             ))),
             _ => Err(self.failure("checking the bucket", &response)),
+        }
+    }
+
+    /// After HEAD on the bucket was refused: GetBucketLocation returns an
+    /// error body, so refused credentials are reported as such instead of
+    /// being mistaken for write-only keys.
+    fn explain_forbidden(&self) -> Result<()> {
+        let empty = hex(&Sha256::digest([]));
+        let response = self.send("GET", "", &[("location", "")], &[], &empty, None)?;
+        if response.status == 200 {
+            return Ok(());
+        }
+        let detail = error_text(&response.body);
+        let code = detail.split(':').next().unwrap_or_default();
+        match code {
+            "InvalidAccessKeyId"
+            | "SignatureDoesNotMatch"
+            | "InvalidToken"
+            | "ExpiredToken"
+            | "TokenRefreshRequired" => bail!(Permanent(format!(
+                "S3 credentials refused for bucket {}: {detail}",
+                self.bucket.bucket
+            ))),
+            "NoSuchBucket" => bail!(Permanent(format!(
+                "bucket {} not found",
+                self.bucket.bucket
+            ))),
+            _ if matches!(response.status, 408 | 429 | 500..=599) => {
+                Err(self.failure("checking the bucket", &response))
+            }
+            _ => bail!(Permanent(format!(
+                "the bucket {} exists but these credentials may not inspect it (HTTP 403); uploads can still work with write-only keys",
+                self.bucket.bucket
+            ))),
         }
     }
 
@@ -1079,12 +1115,21 @@ mod tests {
     /// A loopback HTTP server answering each request with the next status,
     /// recording the method, path and lowercase header names.
     fn scripted(statuses: &[u16]) -> (Bucket, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let responses: Vec<(u16, &'static str)> = statuses.iter().map(|&s| (s, "")).collect();
+        scripted_with(&responses)
+    }
+
+    /// Like `scripted`, with a body for each response.
+    fn scripted_with(
+        responses: &[(u16, &'static str)],
+    ) -> (Bucket, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{BufRead, BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = seen.clone();
-        let mut statuses: std::collections::VecDeque<u16> = statuses.iter().copied().collect();
+        let mut statuses: std::collections::VecDeque<(u16, &'static str)> =
+            responses.iter().copied().collect();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let mut out = stream.try_clone().unwrap();
@@ -1119,10 +1164,12 @@ mod tests {
                         line[1],
                         headers.join(",")
                     ));
-                    let status = statuses.pop_front().unwrap_or(500);
+                    let (status, reply) = statuses.pop_front().unwrap_or((500, ""));
+                    let length = if line[0] == "HEAD" { 0 } else { reply.len() };
                     write!(
                         out,
-                        "HTTP/1.1 {status} Scripted\r\ncontent-length: 0\r\n\r\n"
+                        "HTTP/1.1 {status} Scripted\r\ncontent-length: {length}\r\n\r\n{}",
+                        &reply[..length]
                     )
                     .unwrap();
                 }
@@ -1180,6 +1227,55 @@ mod tests {
             );
             assert!(seen.last().unwrap().starts_with("DELETE "));
         }
+    }
+
+    #[test]
+    fn check_names_refused_credentials_after_a_bodiless_403() {
+        let error_body = |code: &str| -> &'static str {
+            Box::leak(
+                format!("<Error><Code>{code}</Code><Message>m</Message></Error>").into_boxed_str(),
+            )
+        };
+        for (code, expected) in [
+            (
+                "SignatureDoesNotMatch",
+                "S3 credentials refused for bucket camera-archive",
+            ),
+            (
+                "InvalidAccessKeyId",
+                "S3 credentials refused for bucket camera-archive",
+            ),
+            ("NoSuchBucket", "bucket camera-archive not found"),
+            ("AccessDenied", "may not inspect it (HTTP 403)"),
+        ] {
+            let (bucket, seen) = scripted_with(&[(403, ""), (403, error_body(code))]);
+            let error = client(&bucket).check().unwrap_err();
+            assert!(!retryable(&error), "{code}: {error:#}");
+            assert!(error.to_string().contains(expected), "{code}: {error:#}");
+            if code != "AccessDenied" {
+                assert!(!error.to_string().contains("exists"), "{error:#}");
+            }
+            let seen = seen.lock().unwrap();
+            assert!(
+                seen[1].starts_with("GET /camera-archive?location"),
+                "{seen:?}"
+            );
+        }
+        // Write-only keys refused HEAD but allowed the follow-up.
+        let (bucket, _) = scripted_with(&[(403, ""), (200, "<LocationConstraint/>")]);
+        client(&bucket).check().unwrap();
+    }
+
+    #[test]
+    fn internal_error_inside_a_200_completion_is_retried() {
+        let (bucket, _) = scripted(&[]);
+        let response = Response {
+            status: 200,
+            etag: None,
+            body: "<Error><Code>InternalError</Code><Message>try again</Message></Error>".into(),
+        };
+        let error = client(&bucket).write_failure("completing a multipart upload", &response);
+        assert!(retryable(&error), "{error:#}");
     }
 
     #[test]
