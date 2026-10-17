@@ -1020,7 +1020,8 @@ impl Process {
         if let Some(camera) = batch.camera {
             self.saved_camera = Some(camera);
         }
-        self.saved_gaps += batch.lost;
+        // Entries the worker dropped are the oldest, so the jump to the next
+        // item's sequence number counts them; `batch.lost` would count twice.
         for item in batch.items {
             // Sequence numbers increase by one; a jump means lost entries.
             self.saved_gaps += item.seq.saturating_sub(self.saved_seq + 1);
@@ -1029,6 +1030,16 @@ impl Process {
                 self.saved_gaps += 1;
             } else {
                 self.saved.push(item);
+            }
+        }
+    }
+    /// Ask the worker until its saved-file log is empty; each reply drains a
+    /// bounded number of entries.
+    fn drain_saved(&mut self) {
+        for _ in 0..64 {
+            let before = self.saved_seq;
+            if self.exchange(SessionCommand::Status).is_err() || self.saved_seq == before {
+                break;
             }
         }
     }
@@ -1978,6 +1989,11 @@ impl SessionHandle {
                 let mut final_snapshot = self.snapshot();
                 let mut p = w.lock().unwrap_or_else(|e| e.into_inner());
                 let result = p.call(SessionCommand::Disconnect);
+                // The worker exits once dropped; collect what it still holds,
+                // keeping the disconnect reply's final counters.
+                let disconnected = p.snapshot.clone();
+                p.drain_saved();
+                p.snapshot = disconnected;
                 let (batch, gaps) = p.take_saved();
                 let result = match result {
                     Ok(result) => result,
@@ -2098,13 +2114,7 @@ impl SessionHandle {
             {
                 eprintln!("capturefab: stop recording on {id}: {e:#}");
             }
-            // Each reply drains a bounded number of entries; keep asking.
-            for _ in 0..64 {
-                let before = p.saved.len();
-                if p.exchange(SessionCommand::Status).is_err() || p.saved.len() == before {
-                    break;
-                }
-            }
+            p.drain_saved();
             let (batch, gaps) = p.take_saved();
             drop(p);
             self.inner.dataset.record_saved(batch, gaps);
