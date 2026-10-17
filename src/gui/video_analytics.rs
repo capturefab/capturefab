@@ -97,7 +97,7 @@ pub(super) struct State {
     secret: SecretDraft,
     credential_status: Option<String>,
     credential_notice: Option<&'static str>,
-    credential_error: Option<&'static str>,
+    pub(super) credential_error: Option<&'static str>,
     credential_pending: Option<Receiver<CredentialReply>>,
     pending: Option<Receiver<Report>>,
     refreshed: Option<Instant>,
@@ -114,6 +114,9 @@ pub(super) struct State {
     /// Settings was asked for from the measurements; opened on the next
     /// tick, once the analytics sheet has made way (`take_settings_request`).
     settings_requested: bool,
+    /// The model's provider, asked for by "Manage API keys" while a check
+    /// was pending; switched to once that check lands.
+    requested_provider: Option<Provider>,
 }
 
 impl State {
@@ -142,6 +145,7 @@ impl State {
             running_camera: None,
             keys_shown: false,
             settings_requested: false,
+            requested_provider: None,
         }
     }
 
@@ -194,8 +198,21 @@ impl State {
         } else if let Some(status) = &self.credential_status {
             format!("{} · {}", self.credential_provider, first_sentence(status))
         } else {
-            "Not checked yet".into()
+            "Optional · for prompt measurements".into()
         }
+    }
+
+    /// Show `provider`'s keys, dropping what was shown for another.
+    /// Returns whether it changed.
+    fn switch_provider(&mut self, provider: Provider) -> bool {
+        if self.credential_provider == provider {
+            return false;
+        }
+        self.credential_provider = provider;
+        self.clear_secret();
+        self.credential_status = None;
+        self.credential_notice = None;
+        true
     }
 
     pub(super) fn clear_secret(&mut self) {
@@ -441,16 +458,19 @@ impl Workbench {
             Input::Keys(open) => {
                 state.preferences.keys_open = open;
                 if !open {
+                    // Folding also dismisses what held it open, so the
+                    // chevron always does what it says.
                     state.keys_shown = false;
+                    state.credential_error = None;
                 }
             }
             Input::ManageKeys => {
                 let provider = state.preferences.model.provider;
-                if state.credential_pending.is_none() && state.credential_provider != provider {
-                    state.credential_provider = provider;
-                    state.clear_secret();
-                    state.credential_status = None;
-                    state.credential_notice = None;
+                if state.credential_pending.is_some() {
+                    // Switch once the check in flight lands.
+                    state.requested_provider = Some(provider);
+                } else {
+                    state.switch_provider(provider);
                 }
                 state.preferences.keys_open = true;
                 state.settings_requested = true;
@@ -492,6 +512,12 @@ impl Workbench {
                 }
                 Err(TryRecvError::Empty) => {}
             }
+        }
+        if state.credential_pending.is_none()
+            && let Some(provider) = state.requested_provider.take()
+            && state.switch_provider(provider)
+        {
+            state.refresh_credentials();
         }
         if let Some(pending) = &state.pending {
             match pending.try_recv() {
@@ -811,9 +837,10 @@ impl Workbench {
             ));
         }
         content = content.push(
+            // No side padding: the link lines up with the lines above it.
             button(text("Manage API keys in Settings…").size(style::SMALL))
                 .style(style::link)
-                .padding([2, 6])
+                .padding([2, 0])
                 .on_press(Message::VideoAnalytics(Input::ManageKeys)),
         );
         if let Some(error) = &state.history_error {
@@ -1078,7 +1105,8 @@ mod tests {
     #[test]
     fn the_folded_keys_say_what_is_set() {
         let mut state = State::new(SessionHandle::new(), Preferences::default());
-        assert_eq!(state.keys_summary(), "Not checked yet");
+        // Before any check: what the keys are for, nothing to do.
+        assert_eq!(state.keys_summary(), "Optional · for prompt measurements");
         let (_sender, receiver) = mpsc::channel();
         state.credential_pending = Some(receiver);
         assert_eq!(state.keys_summary(), "Checking keys…");
@@ -1125,6 +1153,37 @@ mod tests {
         assert!(!bench.prefs().video_analytics.keys_open);
         bench.video_analytics_input(Input::Keys(false));
         assert!(!bench.video_analytics.keys_section_open());
+        // Folding a section an error holds open dismisses the error, so the
+        // chevron is never a toggle that does nothing.
+        bench.video_analytics.credential_error =
+            Some("The OS credential store could not save this key.");
+        assert!(bench.video_analytics.keys_section_open());
+        bench.video_analytics_input(Input::Keys(false));
+        assert!(!bench.video_analytics.keys_section_open());
+        assert!(!bench.prefs().video_analytics.keys_open);
+    }
+
+    #[test]
+    fn managing_keys_during_a_check_switches_provider_once_it_lands() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), false, None);
+        bench.video_analytics.credential_provider = Provider::OpenAi;
+        bench.video_analytics_input(Input::Provider(Provider::Gemini));
+        let (sender, receiver) = mpsc::channel();
+        bench.video_analytics.credential_pending = Some(receiver);
+        bench.video_analytics_input(Input::ManageKeys);
+        assert_eq!(
+            bench.video_analytics.credential_provider,
+            Provider::OpenAi,
+            "not while the check is in flight"
+        );
+        sender.send(Ok(("No saved key.".into(), None))).unwrap();
+        bench.tick_video_analytics();
+        assert_eq!(bench.video_analytics.credential_provider, Provider::Gemini);
+        assert_eq!(bench.video_analytics.requested_provider, None);
+        assert!(
+            bench.video_analytics.credential_status.is_none(),
+            "the other provider's status is not shown for this one"
+        );
     }
 
     #[test]

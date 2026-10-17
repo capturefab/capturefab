@@ -142,7 +142,7 @@ impl Workbench {
         let mut section = column![disclosure(
             "AI provider API keys",
             (!open).then(|| state.keys_summary()),
-            self.sheets.keys_turn.get(self.now),
+            self.keys_chevron(),
             Message::VideoAnalytics(video_analytics::Input::Keys(!open)),
             p,
         )]
@@ -151,6 +151,21 @@ impl Workbench {
             section = section.push(self.api_credentials_content(p));
         }
         section.into()
+    }
+
+    /// The keys chevron's turn. It follows what shows: mid-turn only while
+    /// heading where the section now is, else at rest there, so a section
+    /// an error or scene opened never sits under a closed chevron.
+    fn keys_chevron(&self) -> f32 {
+        let open = self.video_analytics.keys_section_open();
+        let turn = &self.sheets.keys_turn;
+        if (turn.target() >= 0.5) == open {
+            turn.get(self.now)
+        } else if open {
+            1.0
+        } else {
+            0.0
+        }
     }
 
     /// The line under Settings: what applies at once, and while the keys
@@ -256,6 +271,27 @@ mod tests {
             bench.sheets.keys_turn.animating(bench.now),
             "turns while shown"
         );
+    }
+
+    #[test]
+    fn the_keys_chevron_points_down_whenever_the_section_shows() {
+        let _motion = motion::test_reduce_motion(false);
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        bench.sync_animations();
+        assert_eq!(bench.keys_chevron(), 0.0);
+        // An error opens it before any sync has turned the chevron.
+        bench.video_analytics.credential_error =
+            Some("The OS credential store could not save this key.");
+        assert!(bench.video_analytics.keys_section_open());
+        assert_eq!(bench.keys_chevron(), 1.0, "open, so pointing down");
+        // A screenshot scene shows it open too.
+        bench.video_analytics.credential_error = None;
+        assert!(bench.scene_video_analytics("settings-credentials", true));
+        assert_eq!(bench.keys_chevron(), 1.0);
+        // And folding it, even when it was held open, folds it.
+        bench.video_analytics_input(video_analytics::Input::Keys(false));
+        assert!(!bench.video_analytics.keys_section_open());
+        assert_eq!(bench.keys_chevron(), 0.0);
     }
 
     #[test]
