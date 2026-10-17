@@ -782,6 +782,21 @@ fn switching_to_a_stream_and_back_restores_the_recording_exactly() {
 }
 
 #[test]
+fn undoing_a_switch_back_to_recording_keeps_the_recording_for_later() {
+    let mut app = app();
+    let template = "clips/{camera}-{seq}.mkv".to_owned();
+    app.forward_output = template.clone();
+    let _ = app.update(Message::ForwardMode(true));
+    let _ = app.update(Message::ForwardMode(false));
+    assert_eq!(app.forward_output, template);
+    // Undo returns to the stream, and its stash with it.
+    let _ = app.update(Message::Undo);
+    assert!(app.forward_streams());
+    let _ = app.update(Message::ForwardMode(false));
+    assert_eq!(app.forward_output, template, "not the default template");
+}
+
+#[test]
 fn recording_switched_to_first_starts_from_the_default_template() {
     let mut app = app();
     app.forward_output = "rtsp://127.0.0.1:8554/line-1".into();

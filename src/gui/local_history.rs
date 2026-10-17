@@ -34,7 +34,8 @@ macro_rules! fields {
 fields! {
     include_simulator: bool, address: String, search: String, tab: Tab,
     output: String, count: u32, format: &'static str, timeout_ms: u64, scan_timeout_ms: u64,
-    forward_output: String, stream_draft: bool, forward_codec: &'static str, forward_encoder: String,
+    forward_output: String, stream_draft: bool, stashed_record: Option<(String, Option<String>)>,
+    stashed_stream: String, forward_codec: &'static str, forward_encoder: String,
     forward_fps: f64, forward_bitrate: String, forward_file_mib: f64,
     quota_gib: f64, quota_files: u32, retention_enabled: bool, retention_days: u64,
     quota_action: &'static str, schedule_enabled: bool, schedule_delay_seconds: u64,
