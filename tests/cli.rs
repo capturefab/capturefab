@@ -1684,3 +1684,439 @@ fn stale_session_descriptor_is_replaced_but_live_one_is_kept() {
     assert!(refused.contains("already exists"), "{refused}");
     third.wait().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Network destinations (FTP, SFTP, S3 presets) and the upload queue.
+
+#[path = "support/fake_ftp.rs"]
+mod fake_ftp;
+
+fn temp_root(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "capturefab-{name}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
+
+/// Run the binary with extra environment variables; never touches the
+/// keychain because every destination here uses environment secrets.
+fn cmd_env(dir: &PathBuf, env: &[(&str, &str)], args: &[&str]) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_capturefab"));
+    command
+        .env_remove("CAPTUREFAB_SESSION")
+        .env_remove("CAPTUREFAB_CAMERA")
+        .env_remove("CAPTUREFAB_FTP_PASSWORD")
+        .env_remove("CAPTUREFAB_SFTP_PASSWORD")
+        .env("CAPTUREFAB_SESSION_DIR", dir);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command.args(args).output().unwrap()
+}
+
+fn json_env(dir: &PathBuf, env: &[(&str, &str)], args: &[&str]) -> Value {
+    let out = cmd_env(dir, env, args);
+    assert!(
+        out.status.success(),
+        "{args:?}\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice::<Value>(&out.stdout).unwrap()["result"].clone()
+}
+
+#[test]
+fn destination_server_inputs_are_usage_errors_before_touching_settings() {
+    let dir = temp_root("destination-validation");
+    for args in [
+        &[
+            "destination",
+            "add-ftp",
+            "x",
+            "--host",
+            "ftp://h",
+            "--user",
+            "u",
+        ][..],
+        &[
+            "destination",
+            "add-ftp",
+            "x",
+            "--host",
+            "h",
+            "--user",
+            "u",
+            "--port",
+            "0",
+        ],
+        &[
+            "destination",
+            "add-ftp",
+            "x",
+            "--host",
+            "h",
+            "--user",
+            "u",
+            "--dir",
+            "../a",
+        ],
+        &[
+            "destination",
+            "add-ftp",
+            "x",
+            "--host",
+            "h",
+            "--user",
+            "a b",
+        ],
+        &["destination", "add-sftp", "x", "--host", "h", "--user", "u"],
+        &[
+            "destination",
+            "add-sftp",
+            "x",
+            "--host",
+            "h",
+            "--user",
+            "u",
+            "--host-key",
+            "bogus",
+        ],
+        &[
+            "destination",
+            "add-sftp",
+            "x",
+            "--host",
+            "h",
+            "--user",
+            "u",
+            "--accept-host-key",
+            "--no-check",
+        ],
+        &[
+            "destination",
+            "add-s3",
+            "x",
+            "--bucket",
+            "b",
+            "--env",
+            "--preset",
+            "rustfs",
+        ],
+        &[
+            "destination",
+            "add-s3",
+            "x",
+            "--bucket",
+            "bucket",
+            "--env",
+            "--preset",
+            "aws",
+        ],
+    ] {
+        let result = cmd(&dir, &[&["--json"][..], args].concat());
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "{args:?}: {}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let response: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(response["error"]["code"], "usage", "{args:?}");
+        assert!(
+            !dir.exists(),
+            "invalid input touched the session dir: {args:?}"
+        );
+    }
+}
+
+#[test]
+fn ftp_and_sftp_destinations_save_list_and_remove_without_secrets() {
+    let dir = temp_root("server-destinations");
+    let saved = json_env(
+        &dir,
+        &[],
+        &[
+            "--json",
+            "destination",
+            "add-ftp",
+            "line1",
+            "--host",
+            "10.0.0.5",
+            "--user",
+            "cam",
+            "--dir",
+            "incoming",
+            "--plain",
+            "--password-env",
+            "--no-check",
+        ],
+    );
+    let ftp = &saved["destination"];
+    assert_eq!(ftp["kind"], "ftp");
+    assert_eq!(ftp["port"], 21);
+    assert_eq!(ftp["tls"], "plain");
+    assert_eq!(ftp["password"], "environment");
+    assert_eq!(ftp["location"], "ftp://10.0.0.5:21/incoming");
+    assert_eq!(ftp["insecure"], true);
+    assert!(saved.get("check").is_none());
+    let key = format!("SHA256:{}", "x".repeat(43));
+    let saved = json_env(
+        &dir,
+        &[],
+        &[
+            "--json",
+            "destination",
+            "add-sftp",
+            "nas",
+            "--host",
+            "nas.local",
+            "--port",
+            "2222",
+            "--user",
+            "cam",
+            "--dir",
+            "/srv/drop",
+            "--host-key",
+            &key,
+            "--no-check",
+        ],
+    );
+    assert_eq!(saved["destination"]["kind"], "sftp");
+    assert_eq!(saved["destination"]["password"], "none");
+    assert_eq!(
+        saved["destination"]["location"],
+        "sftp://nas.local:2222//srv/drop"
+    );
+    assert_eq!(saved["destination"]["insecure"], false);
+    assert_eq!(saved["host_key"]["trust"], "pinned");
+    assert_eq!(saved["host_key"]["fingerprint"], key.as_str());
+    let listed = json(&dir, &["--json", "destination", "list"]);
+    let rows = listed["destinations"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert!(!row["location"].as_str().unwrap().contains("cam"), "{row}");
+        assert!(row.get("secret_saved").is_none(), "{row}");
+    }
+    let text = std::fs::read_to_string(dir.join("destinations.json")).unwrap();
+    assert!(!text.contains("secret"));
+    // A missing password variable is reported by the uploading process.
+    let test = cmd_env(&dir, &[], &["--json", "destination", "test", "line1"]);
+    assert_eq!(test.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&test.stdout).contains("CAPTUREFAB_FTP_PASSWORD is not set"));
+    let probe = cmd(
+        &dir,
+        &["--json", "destination", "test", "nas", "--probe-writes"],
+    );
+    assert_eq!(probe.status.code(), Some(2));
+    for name in ["line1", "nas"] {
+        let removed = json(
+            &dir,
+            &["--json", "destination", "remove", name, "--forget-secret"],
+        );
+        assert_eq!(removed["removed"], name);
+    }
+    assert!(
+        json(&dir, &["--json", "destination", "list"])["destinations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn direct_capture_to_unreachable_ftp_destination_stays_queued() {
+    let root = temp_root("ftp-unreachable");
+    let (dir, staging) = (root.join("sessions"), root.join("staging"));
+    let env = [
+        ("CAPTUREFAB_STAGING_DIR", staging.to_str().unwrap()),
+        ("CAPTUREFAB_FTP_PASSWORD", "secret"),
+    ];
+    json_env(
+        &dir,
+        &env,
+        &[
+            "--json",
+            "destination",
+            "add-ftp",
+            "down",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "1",
+            "--user",
+            "cam",
+            "--plain",
+            "--password-env",
+            "--no-check",
+        ],
+    );
+    let result = json_env(
+        &dir,
+        &env,
+        &[
+            "--json",
+            "--camera",
+            "sim:0",
+            "capture",
+            "-o",
+            "shot.png",
+            "--destination",
+            "down",
+        ],
+    );
+    let uploads = &result["uploads"];
+    assert_eq!(uploads["pending"], 1, "{result}");
+    assert!(
+        uploads["last_error"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("connection refused"),
+        "{uploads}"
+    );
+    assert!(staging.join("down/shot.png").is_file());
+    let status = json_env(&dir, &env, &["--json", "uploads"]);
+    assert_eq!(status["items"][0]["remote"]["kind"], "ftp");
+    assert!(status["items"][0].get("bucket").is_none());
+    assert_eq!(status["completed_seq"], 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn direct_capture_uploads_to_loopback_ftp_and_removes_staged_copy() {
+    use sha2::{Digest, Sha256};
+    let fake = fake_ftp::FakeFtp::start(|_| {});
+    let root = temp_root("ftp-upload");
+    let (dir, staging) = (root.join("sessions"), root.join("staging"));
+    let env = [
+        ("CAPTUREFAB_STAGING_DIR", staging.to_str().unwrap()),
+        ("CAPTUREFAB_FTP_PASSWORD", "secret"),
+    ];
+    let port = fake.port.to_string();
+    let saved = json_env(
+        &dir,
+        &env,
+        &[
+            "--json",
+            "destination",
+            "add-ftp",
+            "line1",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port,
+            "--user",
+            "cam",
+            "--dir",
+            "dir",
+            "--plain",
+            "--password-env",
+        ],
+    );
+    assert_eq!(saved["check"]["ok"], true, "{saved}");
+    let result = json_env(
+        &dir,
+        &env,
+        &[
+            "--json",
+            "--camera",
+            "sim:0",
+            "capture",
+            "-o",
+            "shot.png",
+            "--destination",
+            "line1",
+        ],
+    );
+    assert_eq!(result["uploads"]["pending"], 0, "{result}");
+    assert_eq!(result["uploads"]["failed"], 0, "{result}");
+    let received = fake
+        .file(&format!("{}/dir/shot.png", fake_ftp::HOME))
+        .expect("uploaded");
+    let sha = format!("{:x}", Sha256::digest(&received));
+    let status = json_env(&dir, &env, &["--json", "uploads"]);
+    assert_eq!(status["completed_seq"], 1);
+    let completed = &status["recent_completed"][0];
+    assert_eq!(completed["sha256"], sha.as_str());
+    assert_eq!(completed["kind"], "ftp");
+    assert_eq!(completed["key"], "shot.png");
+    assert_eq!(
+        completed["url"],
+        format!("ftp://127.0.0.1:{port}/dir/shot.png").as_str()
+    );
+    assert!(
+        !staging.join("line1/shot.png").exists(),
+        "staged copy removed"
+    );
+    assert!(fake.commands().iter().any(|c| c == "TYPE I"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn legacy_s3_upload_queue_lists_unchanged() {
+    let dir = temp_root("legacy-queue");
+    std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let item = serde_json::json!({
+        "id": "0123456789abcdef",
+        "destination": "archive",
+        "bucket": {"endpoint": "https://storage.example", "region": "auto", "bucket": "camera-archive", "prefix": "", "path_style": true, "credentials": {"source": "environment"}, "keep_local": true},
+        "path": dir.join("shot.png"),
+        "key": "line-1/shot.png",
+        "bytes": 10,
+        "sha256": "a".repeat(64),
+        "queued": 0,
+        "attempts": 3,
+        "next_attempt": 0,
+        "state": "failed",
+        "error": "previous failure"
+    });
+    std::fs::write(
+        dir.join("uploads.json"),
+        serde_json::to_vec(&serde_json::json!({"version": 1, "items": [item], "uploaded": 4, "uploaded_bytes": 40, "failures": 1})).unwrap(),
+    )
+    .unwrap();
+    let status = json(&dir, &["--json", "uploads"]);
+    assert_eq!(status["failed"], 1);
+    assert_eq!(status["uploaded"], 4);
+    let listed = &status["items"][0];
+    assert_eq!(listed["bucket"], item["bucket"]);
+    assert!(listed.get("remote").is_none());
+    let rewritten: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("uploads.json")).unwrap()).unwrap();
+    assert_eq!(rewritten["items"][0], item, "queue keeps the legacy shape");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn doctor_reports_destination_features() {
+    let dir = temp_root("doctor-destinations");
+    let doctor = json(&dir, &["--json", "doctor"]);
+    for (feature, compiled) in [
+        ("s3", cfg!(feature = "s3")),
+        ("ftp", cfg!(feature = "ftp")),
+        ("sftp", cfg!(feature = "sftp")),
+    ] {
+        assert_eq!(
+            doctor["features"][feature].as_bool(),
+            Some(compiled),
+            "{feature}"
+        );
+    }
+    let schema = json(&dir, &["--json", "schema"]);
+    let text = schema.to_string();
+    for command in ["add-ftp", "add-sftp", "probe_writes", "accept_host_key"] {
+        assert!(text.contains(command), "{command}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

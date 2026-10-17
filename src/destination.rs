@@ -508,6 +508,15 @@ impl Target {
     pub fn is_remote(&self) -> bool {
         !matches!(self, Target::Folder { .. })
     }
+    /// The serialized `kind`: `folder`, `s3`, `ftp` or `sftp`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Target::Folder { .. } => "folder",
+            Target::S3(_) => "s3",
+            Target::Ftp(_) => "ftp",
+            Target::Sftp(_) => "sftp",
+        }
+    }
 }
 
 /// Refuse a network destination whose upload support is not compiled in.

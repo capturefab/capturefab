@@ -439,6 +439,7 @@ impl Service {
                     Ok(destinations) => success(json!({
                         "destinations": destinations.iter().map(|destination| json!({
                             "name": destination.name,
+                            "kind": destination.target.kind(),
                             "location": destination.describe(),
                         })).collect::<Vec<_>>()
                     })),
