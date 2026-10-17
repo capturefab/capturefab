@@ -26,9 +26,7 @@ pub enum Icon {
     Activity,
     Help,
     Copy,
-    Sun,
-    Moon,
-    Contrast,
+    Gear,
     ChevronRight,
     ChevronDown,
     ChevronLeft,
@@ -78,9 +76,8 @@ impl Icon {
             Icon::Activity => (REGULAR, '\u{e000}'),
             Icon::Help => (REGULAR, '\u{e3e8}'),
             Icon::Copy => (REGULAR, '\u{e1ca}'),
-            Icon::Sun => (REGULAR, '\u{e472}'),
-            Icon::Moon => (REGULAR, '\u{e330}'),
-            Icon::Contrast => (REGULAR, '\u{e18c}'),
+            // Phosphor's gear-six, checked against the font's ligatures.
+            Icon::Gear => (REGULAR, '\u{e272}'),
             Icon::ChevronRight => (REGULAR, '\u{e13a}'),
             Icon::ChevronDown => (REGULAR, '\u{e136}'),
             Icon::ChevronLeft => (REGULAR, '\u{e138}'),
@@ -241,5 +238,103 @@ mod tests {
         assert_eq!(glow(0, 0), glow(SPOKES, 0));
         let total: f32 = (0..SPOKES).map(|spoke| glow(5, spoke)).sum();
         assert!((total - 5.2).abs() < 1e-5);
+    }
+
+    /// Whether the font in `bytes` maps `code` to a glyph, read from its
+    /// Unicode cmap subtable (format 4 or 12).
+    fn has_glyph(bytes: &[u8], code: char) -> bool {
+        let u16_at = |at: usize| u16::from_be_bytes([bytes[at], bytes[at + 1]]) as usize;
+        let u32_at = |at: usize| {
+            u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize
+        };
+        let code = code as usize;
+        let cmap = (0..u16_at(4))
+            .map(|table| 12 + table * 16)
+            .find(|&record| &bytes[record..record + 4] == b"cmap")
+            .map(|record| u32_at(record + 8))
+            .expect("the font has a cmap");
+        (0..u16_at(cmap + 2)).any(|index| {
+            let record = cmap + 4 + index * 8;
+            let table = cmap + u32_at(record + 4);
+            match u16_at(table) {
+                4 => {
+                    let segments = u16_at(table + 6) / 2;
+                    let ends = table + 14;
+                    let starts = ends + segments * 2 + 2;
+                    (0..segments).any(|segment| {
+                        let (start, end) =
+                            (u16_at(starts + segment * 2), u16_at(ends + segment * 2));
+                        start <= code && code <= end && code != 0xffff
+                    })
+                }
+                12 => (0..u32_at(table + 12)).any(|group| {
+                    let at = table + 16 + group * 12;
+                    u32_at(at) <= code && code <= u32_at(at + 4)
+                }),
+                _ => false,
+            }
+        })
+    }
+
+    #[test]
+    fn every_glyph_is_in_its_font() {
+        use Icon::*;
+        let all = [
+            Play,
+            Stop,
+            Camera,
+            Refresh,
+            Plus,
+            Minus,
+            Close,
+            Grid,
+            Chart,
+            Activity,
+            Help,
+            Copy,
+            Gear,
+            ChevronRight,
+            ChevronDown,
+            ChevronLeft,
+            Broadcast,
+            Folder,
+            Eject,
+            Search,
+            Recent,
+            Network,
+            Usb,
+            Video,
+            Cube,
+            Check,
+            Warning,
+            WarningTriangle,
+            Keyboard,
+            Sidebar,
+            Sliders,
+            CornersOut,
+            CornersIn,
+            Scan,
+            Reset,
+            Lock,
+            CloudArrowUp,
+            FolderPlus,
+            HardDrives,
+            Mark,
+        ];
+        for icon in all {
+            let (font, code) = icon.glyph();
+            let bytes = if font == FILL {
+                FILL_BYTES
+            } else {
+                REGULAR_BYTES
+            };
+            assert!(has_glyph(bytes, code), "{icon:?} U+{:04X}", code as u32);
+        }
+        // Settings uses Phosphor's gear-six, not the plainer gear (U+E270).
+        assert_eq!(Gear.glyph(), (REGULAR, '\u{e272}'));
+        assert!(
+            !has_glyph(REGULAR_BYTES, '\u{f8ff}'),
+            "the reader can say no"
+        );
     }
 }

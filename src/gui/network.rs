@@ -229,7 +229,37 @@ impl Workbench {
         }
     }
 
+    /// Whether the camera list offers the network check: only once GigE is
+    /// in play (a GigE camera found, connected, recent or failing to
+    /// connect), or a scan was run or shown. Elsewhere it is reachable from
+    /// the quick guide's connection notes.
+    pub(super) fn network_check_relevant(&self) -> bool {
+        let gige = |transport: Transport| transport == Transport::GigE;
+        self.snapshot
+            .devices
+            .iter()
+            .any(|device| gige(device.transport))
+            || self
+                .snapshot
+                .cameras
+                .iter()
+                .any(|camera| gige(camera.info.transport))
+            || self.recent.iter().any(|recent| gige(recent.transport))
+            || self
+                .side
+                .connect_failures
+                .keys()
+                .any(|target| sidebar::reads_as_gige(target, &self.snapshot.devices))
+            || self.snapshot.network_scan.is_some()
+            || self.pending(Job::NetworkScan)
+            || self.network_open
+    }
+
     pub(super) fn scan_network(&mut self) -> Task<Message> {
+        // From the quick guide's notes: the report takes the guide's place.
+        if self.help_open {
+            self.show_help(false);
+        }
         let focus = self.show_network(true);
         if !self.network_open || self.pending(Job::NetworkScan) {
             return focus;
@@ -271,7 +301,7 @@ impl Workbench {
             .padding([7, 10])
             .style(style::secondary)
             .on_press_maybe((!busy).then_some(Message::ScanNetwork)),
-            "Check camera connections and tune connected GigE cameras for the available bandwidth. Live previews may pause briefly.",
+            "Tunes connected GigE cameras for the available bandwidth and checks network adapters. Live previews may pause briefly.",
         )
     }
 
