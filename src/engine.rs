@@ -8,7 +8,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -63,6 +63,8 @@ pub struct WorkerHandle {
     saved: Arc<Mutex<crate::dataset::SavedLog>>,
     /// The local recording in progress, reported when it stops.
     recording: Arc<Mutex<Option<crate::scheduling::RecordingMeta>>>,
+    /// Output numbers handed out, so concurrent captures never share a name.
+    names: Arc<Mutex<crate::naming::Namer>>,
 }
 impl Default for WorkerHandle {
     fn default() -> Self {
@@ -90,6 +92,7 @@ impl WorkerHandle {
             capture_session: Arc::default(),
             saved: Arc::default(),
             recording: Arc::default(),
+            names: Arc::default(),
         };
         let worker_handle = handle.clone();
         let thread = std::thread::Builder::new()
@@ -352,11 +355,7 @@ fn stop_forward(
     if let Some(a) = auto.as_mut() {
         a.set_forward_fps(None)?;
     }
-    let meta = h
-        .recording
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take();
+    let meta = h.recording.lock().unwrap_or_else(|e| e.into_inner()).take();
     let Some((mut f, _)) = forwarder.take() else {
         return Ok(());
     };
@@ -385,6 +384,40 @@ fn stop_forward(
         });
     }
     stopped
+}
+/// Pick a free name for a recording template under its destination. The file
+/// itself is created at the first frame; a writer that takes the name first
+/// stops the recording rather than being overwritten.
+fn name_recording(
+    h: &WorkerHandle,
+    config: &ForwardConfig,
+    camera: &str,
+    on_exists: crate::naming::OnExists,
+) -> Result<(PathBuf, crate::destination::Resolved)> {
+    let resolved = crate::destination::resolve(config.destination.as_deref(), &config.output)?;
+    let local = crate::media::local_file_path(&resolved.output)?;
+    let local = local
+        .to_str()
+        .context("recording path must be valid UTF-8")?
+        .to_owned();
+    let plan = if crate::naming::has_placeholder(&local) {
+        crate::naming::Plan::Template(local)
+    } else {
+        crate::naming::Plan::File(local.into())
+    };
+    let input = crate::naming::NameInput {
+        camera,
+        now: chrono::Local::now(),
+        index: 0,
+    };
+    let path = h
+        .names
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .candidate(&plan, &input, on_exists)?;
+    resolved.contain(&path)?;
+    check_parents(&path)?;
+    Ok((path, resolved))
 }
 fn absolute_path(path: &std::path::Path) -> String {
     std::path::absolute(path)
@@ -431,7 +464,12 @@ fn report_image(
             height: frame.height,
             pixel_format: frame.pixel_format,
             format: format.into(),
-            origin: if job_id.is_some() { "schedule" } else { "capture" }.into(),
+            origin: if job_id.is_some() {
+                "schedule"
+            } else {
+                "capture"
+            }
+            .into(),
             job_id,
         },
     });
@@ -631,8 +669,8 @@ fn process_plain(
             storage,
             max_file_bytes,
             destination,
+            on_exists,
             context,
-            ..
         } => {
             ensure!(
                 !camera_mut(camera)?.is_scanner(),
@@ -643,7 +681,7 @@ fn process_plain(
                 "forwarding is already active; stop-forward first"
             );
             let f_destination = destination.clone();
-            let f = Forwarder::new(ForwardConfig {
+            let mut config = ForwardConfig {
                 output: output.clone(),
                 codec,
                 encoder,
@@ -652,7 +690,22 @@ fn process_plain(
                 storage,
                 max_file_bytes,
                 destination,
-            })?;
+            };
+            let named = crate::media::is_recording(&output)
+                && (crate::naming::has_placeholder(&output) || !on_exists.is_fail());
+            let f = if named {
+                config.validate()?;
+                let label = crate::naming::camera_label(&camera_mut(camera)?.info);
+                let (path, resolved) = name_recording(h, &config, &label, on_exists)?;
+                config.output = path.to_string_lossy().into_owned();
+                config.destination = None;
+                Forwarder::with_resolved(
+                    config,
+                    resolved.destination.is_some().then_some(resolved),
+                )?
+            } else {
+                Forwarder::new(config)?
+            };
             let f_path = f.recording_path().map(|p| absolute_path(&p));
             camera_mut(camera)?.start()?;
             *forwarder = Some((f, fps));
@@ -856,13 +909,13 @@ fn process_plain(
             interval_ms,
             storage,
             destination,
+            on_exists,
             context,
-            ..
         } => {
             validate_capture(&output, count, timeout_ms, &format)?;
             let resolved = crate::destination::resolve(destination.as_deref(), &output)?;
-            preflight_capture_output(&resolved.output, count, &format)?;
-            validate_schedule_outputs(&resolved.output, count, &format, jobs)?;
+            preflight_capture_output(&resolved.output, count, &format, on_exists)?;
+            validate_schedule_outputs(&resolved.output, count, &format, on_exists, jobs)?;
             storage.validate()?;
             ensure!(
                 output != "-",
@@ -873,7 +926,7 @@ fn process_plain(
                 "capture schedule queue is full (32 active jobs)"
             );
             crate::scheduling::validate_schedule(first_at_ms, interval_ms, count)?;
-            camera_mut(camera)?;
+            let label = crate::naming::camera_label(&camera_mut(camera)?.info);
             let first_at_ms = first_at_ms.max(crate::scheduling::now_ms());
             let info = crate::scheduling::CaptureJob {
                 id: *next_job,
@@ -892,12 +945,16 @@ fn process_plain(
             *next_job = next_job.checked_add(1).context("job ID exhausted")?;
             jobs.push(Scheduled {
                 info: info.clone(),
+                plan: crate::naming::Plan::new(&resolved.output, count, &format),
                 resolved,
                 timeout_ms,
                 format,
                 storage,
                 deadline: None,
                 warm: None,
+                camera: label,
+                on_exists,
+                next: None,
             });
             trim_jobs(jobs);
             sync_jobs(h, jobs);
@@ -975,8 +1032,8 @@ fn process_plain(
             format,
             storage,
             destination,
+            on_exists,
             context,
-            ..
         } => {
             ensure!(
                 output != "-" || destination.is_none(),
@@ -990,7 +1047,7 @@ fn process_plain(
             validate_capture(&output, count, timeout_ms, &format)?;
             storage.validate()?;
             if output != "-" {
-                preflight_capture_output(&resolved.output, count, &format)?;
+                preflight_capture_output(&resolved.output, count, &format, on_exists)?;
             }
             let duration = timeout(timeout_ms)?;
             ensure!((1..=100_000).contains(&count), "count must be 1..100000");
@@ -1037,15 +1094,28 @@ fn process_plain(
                         let _ = h.record(frame);
                     }
                 }
+                let label = crate::naming::camera_label(&c.info);
+                let plan = crate::naming::Plan::new(&resolved.output, count, &format);
                 for index in 0..count {
-                    if c.is_scanner() && output != "-" {
-                        preflight_scanner_output(&output_path(
-                            &resolved.output,
-                            count,
-                            index,
-                            &format,
-                        ))?;
-                    }
+                    // Pick the name before requesting the frame: a feeder
+                    // consumes paper irreversibly, so a taken name in fail
+                    // mode is refused first.
+                    let input = crate::naming::NameInput {
+                        camera: &label,
+                        now: chrono::Local::now(),
+                        index,
+                    };
+                    let first = if output == "-" {
+                        None
+                    } else {
+                        let path = h
+                            .names
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .candidate(&plan, &input, on_exists)?;
+                        resolved.contain(&path)?;
+                        Some(path)
+                    };
                     c.request_frame()?;
                     let frame = next_frame(h, c, auto, Instant::now() + duration)?
                         .context("frame timeout")?;
@@ -1056,10 +1126,20 @@ fn process_plain(
                     let mut metadata = serde_json::to_value(&frame)?;
                     metadata["bytes"] = json!(frame.data.len());
                     metadata["wall_ms"] = json!(wall_ms);
-                    if output != "-" {
-                        let path = output_path(&resolved.output, count, index, &format);
-                        let stored = crate::storage::save_hashed(&frame, &path, &format, &storage)
-                            .with_context(|| format!("save {}", path.display()))?;
+                    if let Some(first) = first {
+                        let bytes = crate::frame::encode(&frame, &format)?;
+                        let (path, stored) = crate::naming::save_named(
+                            &h.names,
+                            &plan,
+                            &input,
+                            on_exists,
+                            first.clone(),
+                            |path| {
+                                resolved.contain(path)?;
+                                crate::storage::save_bytes(&bytes, path, &storage)
+                            },
+                        )
+                        .with_context(|| format!("save {}", first.display()))?;
                         let file = path.to_string_lossy().into_owned();
                         if let Some(q) = report_image(
                             h, &resolved, &path, stored, &frame, &format, wall_ms, None, &context,
@@ -1116,11 +1196,40 @@ fn process_plain(
 struct Scheduled {
     info: crate::scheduling::CaptureJob,
     resolved: crate::destination::Resolved,
+    plan: crate::naming::Plan,
     timeout_ms: u64,
     format: String,
     storage: crate::storage::StoragePolicy,
     deadline: Option<Instant>,
     warm: Option<Instant>,
+    /// The camera label for {camera}, taken when the job was scheduled.
+    camera: String,
+    on_exists: crate::naming::OnExists,
+    /// The name picked for the frame being requested, with its clock time.
+    next: Option<(PathBuf, chrono::DateTime<chrono::Local>)>,
+}
+impl Scheduled {
+    /// Pick the next frame's name: a free one, inside the destination.
+    fn allocate(
+        &self,
+        names: &Mutex<crate::naming::Namer>,
+    ) -> Result<(PathBuf, chrono::DateTime<chrono::Local>)> {
+        let now = chrono::Local::now();
+        let path = names.lock().unwrap_or_else(|e| e.into_inner()).candidate(
+            &self.plan,
+            &self.input(now),
+            self.on_exists,
+        )?;
+        self.resolved.contain(&path)?;
+        Ok((path, now))
+    }
+    fn input(&self, now: chrono::DateTime<chrono::Local>) -> crate::naming::NameInput<'_> {
+        crate::naming::NameInput {
+            camera: &self.camera,
+            now,
+            index: self.info.captured,
+        }
+    }
 }
 fn validate_capture(output: &str, count: u32, timeout_ms: u64, format: &str) -> Result<()> {
     timeout(timeout_ms)?;
@@ -1138,40 +1247,61 @@ pub fn validate_capture_output(output: &str) -> Result<()> {
         !output.contains("://") && !output.starts_with("file:"),
         "capture output must be a file or directory; use forward for a network stream"
     );
-    let literal = output.replace("{frame}", "");
-    ensure!(
-        !literal.contains(['{', '}']),
-        "capture output only supports the {{frame}} placeholder"
-    );
-    Ok(())
+    crate::naming::validate_template(output)
 }
 /// Reject collisions and unusable parent paths before settings are changed or
 /// acquisition starts. The storage writer still creates each file atomically.
-pub fn preflight_capture_output(output: &str, count: u32, format: &str) -> Result<()> {
+pub fn preflight_capture_output(
+    output: &str,
+    count: u32,
+    format: &str,
+    on_exists: crate::naming::OnExists,
+) -> Result<()> {
     validate_capture_output(output)?;
     ensure!((1..=100_000).contains(&count), "count must be 1..100000");
+    let plan = crate::naming::Plan::new(output, count, format);
+    if !plan.is_static() {
+        // Names are picked per frame; only the folders before the first
+        // placeholder are known now.
+        let fixed = match output.find('{') {
+            Some(i) => &output[..i],
+            None => output,
+        };
+        let probe = match &plan {
+            crate::naming::Plan::Directory { .. } => Path::new(output).join("frame"),
+            _ if fixed.ends_with(std::path::is_separator) => Path::new(fixed).join("x"),
+            _ => PathBuf::from(fixed),
+        };
+        return check_parents(&probe);
+    }
     for index in 0..count {
         let path = output_path(output, count, index, format);
-        preflight_scanner_output(&path)?;
-        let mut ancestor = path.parent();
-        while let Some(parent) = ancestor.filter(|parent| !parent.as_os_str().is_empty()) {
-            match std::fs::metadata(parent) {
-                Ok(metadata) => {
-                    ensure!(
-                        metadata.is_dir(),
-                        "capture output parent is not a directory: {}",
-                        parent.display()
-                    );
-                    break;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    ancestor = parent.parent()
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("inspect capture output parent {}", parent.display())
-                    });
-                }
+        if on_exists.is_fail() {
+            crate::naming::check_free(&path)?;
+        }
+        check_parents(&path)?;
+    }
+    Ok(())
+}
+fn check_parents(path: &Path) -> Result<()> {
+    let mut ancestor = path.parent();
+    while let Some(parent) = ancestor.filter(|parent| !parent.as_os_str().is_empty()) {
+        match std::fs::metadata(parent) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_dir(),
+                    "capture output parent is not a directory: {}",
+                    parent.display()
+                );
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = parent.parent()
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect capture output parent {}", parent.display())
+                });
             }
         }
     }
@@ -1209,15 +1339,23 @@ fn validate_schedule_outputs(
     output: &str,
     count: u32,
     format: &str,
+    on_exists: crate::naming::OnExists,
     jobs: &[Scheduled],
 ) -> Result<()> {
     use std::{
         collections::{HashMap, hash_map::DefaultHasher},
         hash::{Hash, Hasher},
     };
+    // Names picked per frame never collide: the namer skips taken ones.
+    let dynamic = |plan: &crate::naming::Plan, on_exists| {
+        !plan.is_static() || crate::naming::renumbers(plan, on_exists)
+    };
+    if dynamic(&crate::naming::Plan::new(output, count, format), on_exists) {
+        return Ok(());
+    }
     let active = jobs
         .iter()
-        .filter(|job| job.info.active())
+        .filter(|job| job.info.active() && !dynamic(&job.plan, job.on_exists))
         .collect::<Vec<_>>();
     if active.is_empty() {
         return Ok(());
@@ -1298,13 +1436,8 @@ fn tick_jobs(
                 }
                 if c.is_scanner() {
                     *started = true;
-                    preflight_scanner_output(&output_path(
-                        &job.info.output,
-                        job.info.count,
-                        job.info.captured,
-                        &job.format,
-                    ))?;
                 }
+                job.next = Some(job.allocate(&h.names)?);
                 c.request_frame()?;
                 Ok(stopped)
             })();
@@ -1354,15 +1487,28 @@ fn capture_jobs(h: &WorkerHandle, frame: &Frame, jobs: &mut [Scheduled], settled
             && j.info.next_at_ms <= now
             && (settled || j.warm.is_none_or(|w| Instant::now() >= w))
     }) {
-        let path = output_path(
-            &job.info.output,
-            job.info.count,
-            job.info.captured,
-            &job.format,
-        );
         let wall_ms = crate::scheduling::now_ms();
-        match crate::storage::save_hashed(frame, &path, &job.format, &job.storage) {
-            Ok(stored) => {
+        let saved = (|| {
+            let (first, now) = match job.next.take() {
+                Some(next) => next,
+                None => job.allocate(&h.names)?,
+            };
+            let bytes = crate::frame::encode(frame, &job.format)?;
+            crate::naming::save_named(
+                &h.names,
+                &job.plan,
+                &job.input(now),
+                job.on_exists,
+                first.clone(),
+                |path| {
+                    job.resolved.contain(path)?;
+                    crate::storage::save_bytes(&bytes, path, &job.storage)
+                },
+            )
+            .with_context(|| format!("save {}", first.display()))
+        })();
+        match saved {
+            Ok((path, stored)) => {
                 report_image(
                     h,
                     &job.resolved,
@@ -1427,23 +1573,7 @@ fn fail_scanner_jobs(h: &WorkerHandle, jobs: &mut [Scheduled], error: &anyhow::E
     sync_jobs(h, jobs);
 }
 
-fn preflight_scanner_output(path: &std::path::Path) -> Result<()> {
-    // A feeder consumes paper irreversibly. Reject known output conflicts
-    // before asking for a page; storage still creates the file atomically to
-    // protect against a file appearing after this check.
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => anyhow::bail!(
-            "capture output already exists: {}; choose a new file name",
-            path.display()
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("inspect capture output {}", path.display()))
-        }
-    }
-}
-
-pub fn output_path(output: &str, count: u32, index: u32, format: &str) -> PathBuf {
+fn output_path(output: &str, count: u32, index: u32, format: &str) -> PathBuf {
     if output.contains("{frame}") {
         PathBuf::from(output.replace("{frame}", &format!("{:06}", index + 1)))
     } else if count > 1 || PathBuf::from(output).is_dir() {
@@ -1613,14 +1743,12 @@ mod tests {
             on_exists: Default::default(),
             context: Default::default(),
         };
-        let directory = root.to_string_lossy().into_owned();
-        handle
-            .request(schedule(directory.clone(), 3, "raw"))
-            .unwrap();
+        let frames = root.join("f-{frame}.raw").to_string_lossy().into_owned();
+        handle.request(schedule(frames.clone(), 3, "raw")).unwrap();
         for (output, count, format) in [
-            (directory.clone(), 2, "raw"),
+            (frames.clone(), 2, "raw"),
             (
-                root.join("frame-000002.raw").to_string_lossy().into_owned(),
+                root.join("f-000002.raw").to_string_lossy().into_owned(),
                 1,
                 "png",
             ),
@@ -1628,14 +1756,19 @@ mod tests {
             let error = handle.request(schedule(output, count, format)).unwrap_err();
             assert!(error.to_string().contains("already scheduled"), "{error:#}");
         }
-        // The directory transform includes the format; these are distinct paths.
-        handle.request(schedule(directory, 3, "png")).unwrap();
+        // Directories and {seq} templates pick a free name per frame, so
+        // jobs can share them with each other and with static names.
+        let directory = root.to_string_lossy().into_owned();
+        let seq = root.join("s-{seq}.raw").to_string_lossy().into_owned();
+        for output in [directory.clone(), directory, seq.clone(), seq] {
+            handle.request(schedule(output, 2, "raw")).unwrap();
+        }
         assert_eq!(
             handle.request(SessionCommand::Jobs).unwrap()["jobs"]
                 .as_array()
                 .unwrap()
                 .len(),
-            2
+            5
         );
         assert!(!root.exists());
         handle.shutdown();
@@ -1727,6 +1860,143 @@ mod tests {
         assert!(h.take_saved(10).is_empty());
         h.shutdown();
         let _ = std::fs::remove_dir_all(root);
+    }
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "capturefab-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    fn capture_to(output: &Path, count: u32, on_exists: crate::naming::OnExists) -> SessionCommand {
+        SessionCommand::Capture {
+            output: output.to_string_lossy().into_owned(),
+            count,
+            timeout_ms: 1000,
+            format: "raw".into(),
+            storage: Default::default(),
+            destination: None,
+            on_exists,
+            context: Default::default(),
+        }
+    }
+    #[test]
+    fn repeated_captures_pick_free_names() {
+        use crate::naming::OnExists;
+        let h = WorkerHandle::new();
+        connect(&h, "1000");
+        let dir = temp_dir("names");
+        let label = crate::naming::camera_label(&h.snapshot().connected.unwrap());
+        let files = |v: Value| -> Vec<String> {
+            v["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| {
+                    Path::new(f.as_str().unwrap())
+                        .strip_prefix(&dir)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect()
+        };
+        let seq = dir.join("{camera}-{seq}.raw");
+        for n in 1..=2 {
+            let v = h.request(capture_to(&seq, 1, OnExists::Fail)).unwrap();
+            assert_eq!(files(v), [format!("{label}-{n:04}.raw")]);
+        }
+        let file = dir.join("shot.raw");
+        h.request(capture_to(&file, 1, OnExists::Fail)).unwrap();
+        let error = h.request(capture_to(&file, 1, OnExists::Fail)).unwrap_err();
+        assert!(
+            error.to_string().contains("output already exists"),
+            "{error:#}"
+        );
+        let v = h.request(capture_to(&file, 1, OnExists::Number)).unwrap();
+        assert_eq!(files(v), ["shot-0001.raw"]);
+        // A directory continues its numbering on every run.
+        let frames = dir.join("frames");
+        for run in 0..2 {
+            let v = h.request(capture_to(&frames, 2, OnExists::Fail)).unwrap();
+            assert_eq!(
+                files(v),
+                [1, 2].map(|i| format!("frames/frame-{:06}.raw", run * 2 + i))
+            );
+        }
+        h.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn scheduled_seq_jobs_save_distinct_files() {
+        let h = WorkerHandle::new();
+        connect(&h, "1000");
+        let dir = temp_dir("scheduled-seq");
+        let job = h
+            .request(SessionCommand::Schedule {
+                output: dir.join("s-{seq}.raw").to_string_lossy().into_owned(),
+                count: 3,
+                timeout_ms: 1000,
+                format: "raw".into(),
+                first_at_ms: 0,
+                interval_ms: 10,
+                storage: Default::default(),
+                destination: None,
+                on_exists: Default::default(),
+                context: crate::context::Context::from([("lot".into(), "7".into())]),
+            })
+            .unwrap();
+        assert_eq!(job["job"]["context"]["lot"], "7");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.snapshot().jobs.iter().any(|j| j.active()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(h.snapshot().jobs[0].status, "complete");
+        let mut names = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["s-0001.raw", "s-0002.raw", "s-0003.raw"]);
+        let batch = h.take_saved(10);
+        assert_eq!(batch.items.len(), 3);
+        assert!(batch.items.iter().all(|f| f.context["lot"] == "7"
+            && matches!(
+                f.item,
+                crate::dataset::SavedItem::Capture {
+                    job_id: Some(1),
+                    ..
+                }
+            )));
+        h.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn numbered_scanner_capture_uses_one_page() {
+        let h = WorkerHandle::new();
+        let (mut camera, requests, _) = scanner(Duration::ZERO);
+        let dir = temp_dir("scanner-number");
+        let path = dir.join("document.raw");
+        std::fs::write(&path, b"existing document").unwrap();
+        let v = scanner_command(
+            &h,
+            &mut camera,
+            capture_to(&path, 1, crate::naming::OnExists::Number),
+        )
+        .unwrap();
+        assert_eq!(
+            v["files"][0].as_str().unwrap(),
+            dir.join("document-0001.raw").to_str().unwrap()
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing document");
+        h.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn capture_paths() {
@@ -2100,6 +2370,10 @@ mod tests {
         let (mut camera, requests, stops) = scanner(Duration::from_secs(1));
         let now = crate::scheduling::now_ms();
         let mut jobs = vec![Scheduled {
+            plan: crate::naming::Plan::File("scan.png".into()),
+            camera: "camera".into(),
+            on_exists: Default::default(),
+            next: None,
             info: crate::scheduling::CaptureJob {
                 id: 1,
                 status: "pending".into(),

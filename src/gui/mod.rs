@@ -30,6 +30,7 @@ mod pick_list;
 mod prefs;
 mod preview;
 mod refresh;
+mod reveal;
 mod scene;
 mod scopes;
 mod settings;
@@ -80,7 +81,7 @@ use motion::{Kind, Motion};
 use notice::{Batch, Level, Notice, Saved, command_notice};
 use pick_list::pick_list;
 pub(crate) use prefs::migrate as migrate_prefs;
-use prefs::{Prefs, Recent, UiScale};
+use prefs::{CaptureTags, Prefs, Recent, UiScale};
 use preview::Shown;
 use scene::{Scene, ScreenshotRequest};
 use std::{
@@ -414,6 +415,7 @@ impl Pending {
             Job::Start => "Starting stream",
             Job::Stop if self.batch => "Stopping streams",
             Job::Stop => "Stopping stream",
+            Job::Capture if self.batch => "Capturing all cameras",
             Job::Capture => "Saving capture",
             Job::CaptureSessionOpen => "Opening capture session",
             Job::CaptureSessionClose => "Closing capture session",
@@ -428,8 +430,10 @@ impl Pending {
             Job::Schedule => "Scheduling capture",
             Job::RefreshJobs => "Refreshing capture jobs",
             Job::Cancel => "Cancelling capture job",
+            Job::Forward { recording: true } if self.batch => "Starting recordings",
             Job::Forward { recording: true } => "Starting recording",
             Job::Forward { recording: false } => "Starting forwarding",
+            Job::StopForward { recording: true } if self.batch => "Stopping recordings",
             Job::StopForward { recording: true } => "Stopping recording",
             Job::StopForward { recording: false } => "Stopping forwarding",
             Job::DatasetOpen => "Opening dataset",
@@ -733,6 +737,17 @@ enum Message {
     HoverTile(Option<String>),
     FocusTile(String),
     CaptureCamera(String),
+    /// Capture from every connected camera at once.
+    AllCapture,
+    /// Start recording on every camera that can, or stop all recordings.
+    AllRecord(bool),
+    /// Start recording the selected camera, or stop it.
+    Record,
+    /// Show a saved file in the system file manager.
+    Reveal(PathBuf),
+    /// Start the live view when a camera connects.
+    AutoStart(bool),
+    Tag(tags::TagField, String),
     DismissNotice,
     /// Hide a camera's error badge, by camera ID, until the error recurs.
     DismissStageError(String),
@@ -865,6 +880,12 @@ struct Workbench {
     copied: Option<(String, Instant)>,
     /// The last capture that saved files.
     last_saved: Option<Saved>,
+    /// The file the last recording started here writes.
+    last_recording: Option<String>,
+    /// Start the live view when a camera connects.
+    auto_start: bool,
+    /// Capture context sent with captures and recordings.
+    tags: CaptureTags,
     recent: Vec<Recent>,
     saved: Option<Prefs>,
     prefs_saver: prefs::Saver,
@@ -1043,6 +1064,9 @@ impl Workbench {
             notice_shown: Motion::new(0.0, motion::NOTICE_IN, motion::NOTICE_OUT, Kind::Fade),
             copied: None,
             last_saved: None,
+            last_recording: None,
+            auto_start: prefs.auto_start,
+            tags: prefs.tags,
             recent: prefs.recent,
             saved,
             prefs_saver: prefs::Saver::new(),
@@ -1145,6 +1169,8 @@ impl Workbench {
             window: self.window,
             logs_open: self.logs_open,
             video_analytics: self.video_analytics.preferences.clone(),
+            auto_start: self.auto_start,
+            tags: self.tags.clone(),
             // Not yet mirrored on the workbench: keep what was loaded.
             ..self.saved.clone().unwrap_or_default()
         }
@@ -1636,6 +1662,11 @@ impl Workbench {
 
     /// Shared bookkeeping for a command that worked, before its notice.
     fn finished(&mut self, pending: &Pending, result: &serde_json::Value) {
+        if pending.job == (Job::Forward { recording: true })
+            && let Some(path) = result["path"].as_str()
+        {
+            self.last_recording = Some(path.to_owned());
+        }
         if pending.job == Job::Capture {
             self.shutter.replay(1.0, 0.0, self.now);
             if let Some(saved) = Saved::from_result(pending.camera.clone(), result, self.now) {
@@ -1672,6 +1703,9 @@ impl Workbench {
             return;
         };
         self.local_camera = Some(camera.id.clone());
+        if pending.job == Job::Connect && self.starts_on_connect(&camera) {
+            self.send_to(&camera.id, Job::Start, SessionCommand::Start);
+        }
         let detail = match &camera.address {
             Some(address) => format!("{} · {}", camera.transport, redact_address(address)),
             None => format!("{} · S/N {}", camera.transport, camera.serial),
@@ -2033,30 +2067,38 @@ impl Workbench {
     }
 
     fn capture_command(&self, scheduled: bool) -> SessionCommand {
+        self.capture_command_for(scheduled, None)
+    }
+
+    /// The capture or schedule the Capture settings describe, for `target`
+    /// or the selected camera. Names never collide: taken ones are numbered.
+    fn capture_command_for(&self, scheduled: bool, target: Option<&str>) -> SessionCommand {
+        let context = tags::context(&self.tags);
+        let on_exists = crate::naming::OnExists::Number;
         if scheduled {
             SessionCommand::Schedule {
                 output: self.output.clone(),
                 count: self.count,
-                timeout_ms: self.capture_timeout(None),
+                timeout_ms: self.capture_timeout(target),
                 format: self.format.into(),
                 first_at_ms: epoch_ms()
                     .saturating_add(self.schedule_delay_seconds.saturating_mul(1000)),
                 interval_ms: (self.schedule_interval_seconds * 1000.0).round() as u64,
                 storage: self.storage_policy(),
                 destination: self.capture_to.selected.clone(),
-                on_exists: Default::default(),
-                context: Default::default(),
+                on_exists,
+                context,
             }
         } else {
             SessionCommand::Capture {
                 output: self.output.clone(),
                 count: self.count,
-                timeout_ms: self.capture_timeout(None),
+                timeout_ms: self.capture_timeout(target),
                 format: self.format.into(),
                 storage: self.storage_policy(),
                 destination: self.capture_to.selected.clone(),
-                on_exists: Default::default(),
-                context: Default::default(),
+                on_exists,
+                context,
             }
         }
     }
@@ -2071,8 +2113,77 @@ impl Workbench {
             storage: self.storage_policy(),
             max_file_bytes: (self.forward_file_mib * 1024.0 * 1024.0).round() as u64,
             destination: self.record_to.selected.clone(),
-            on_exists: Default::default(),
-            context: Default::default(),
+            on_exists: crate::naming::OnExists::Number,
+            context: tags::context(&self.tags),
+        }
+    }
+
+    /// Record to a local file: the Video output when it is one, else the
+    /// default recording folder. With `per_camera`, the output must name the
+    /// camera, so that cameras recording at once never race for one name.
+    fn record_command(&self, per_camera: bool) -> SessionCommand {
+        let mut command = self.forward_command();
+        let keep = Output::of(&self.forward_output).recording()
+            && (!per_camera || self.forward_output.contains("{camera}"));
+        if !keep && let SessionCommand::Forward {
+            output,
+            destination,
+            ..
+        } = &mut command
+        {
+            *output = prefs::default_record_output();
+            *destination = None;
+        }
+        command
+    }
+
+    /// Whether the selected camera records to a local file now.
+    fn recording_here(&self) -> bool {
+        self.snapshot
+            .forwarding
+            .as_deref()
+            .is_some_and(|output| Output::of(output).recording())
+    }
+
+    /// Start recording the selected camera, or stop its recording.
+    fn record(&mut self) {
+        if self.forward_pending().is_some() || self.scanner_selected() {
+            return;
+        }
+        if self.recording_here() {
+            self.send(
+                Job::StopForward { recording: true },
+                SessionCommand::StopForward,
+            );
+        } else if self.snapshot.forwarding.is_none() {
+            self.send(Job::Forward { recording: true }, self.record_command(false));
+        }
+    }
+
+    /// Whether to start `camera`'s live view as it connects.
+    fn starts_on_connect(&self, camera: &CameraInfo) -> bool {
+        self.auto_start
+            && camera.transport != crate::types::Transport::Scanner
+            && camera.profile.kind != CameraKind::DocumentScanner
+            && !self
+                .snapshot
+                .cameras
+                .iter()
+                .any(|c| c.info.id == camera.id && c.streaming)
+    }
+
+    /// What the capture output saves to next, `{seq}` shown as `####`.
+    fn output_preview(&self) -> String {
+        let camera = self
+            .snapshot
+            .connected
+            .as_ref()
+            .map_or_else(|| "camera".to_owned(), crate::naming::camera_label);
+        let preview = crate::naming::preview(&self.output, &camera, chrono::Local::now());
+        let home = prefs::capture_root();
+        match home.parent().and_then(|home| std::path::Path::new(&preview).strip_prefix(home).ok()) {
+            Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+            None => preview,
         }
     }
 
@@ -2760,9 +2871,9 @@ impl Workbench {
                     .map(|camera| camera.info.id.clone())
                     .collect();
                 if start {
-                    self.send_batch(cameras, Job::Start, || SessionCommand::Start);
+                    self.send_batch(cameras, Job::Start, |_| SessionCommand::Start);
                 } else {
-                    self.send_batch(cameras, Job::Stop, || SessionCommand::Stop);
+                    self.send_batch(cameras, Job::Stop, |_| SessionCommand::Stop);
                 }
             }
             Message::AllAuto(auto) => {
@@ -2778,9 +2889,9 @@ impl Workbench {
                     .collect();
                 let balance = Some(self.balance);
                 if auto {
-                    self.send_batch(cameras, Job::AutoOn, || SessionCommand::Auto { balance });
+                    self.send_batch(cameras, Job::AutoOn, |_| SessionCommand::Auto { balance });
                 } else {
-                    self.send_batch(cameras, Job::AutoOff, || SessionCommand::Manual {
+                    self.send_batch(cameras, Job::AutoOff, |_| SessionCommand::Manual {
                         revert: false,
                     });
                 }
@@ -3017,22 +3128,79 @@ impl Workbench {
             }
             Message::CaptureCamera(id) => {
                 if !self.pending_for(Job::Capture, &id) {
-                    self.send_to(
-                        &id,
-                        Job::Capture,
-                        SessionCommand::Capture {
-                            output: self.output.clone(),
-                            count: self.count,
-                            timeout_ms: self.capture_timeout(Some(&id)),
-                            format: self.format.into(),
-                            storage: self.storage_policy(),
-                            destination: self.capture_to.selected.clone(),
-                            on_exists: Default::default(),
-                            context: Default::default(),
-                        },
+                    let command = self.capture_command_for(false, Some(&id));
+                    self.send_to(&id, Job::Capture, command);
+                }
+            }
+            Message::AllCapture => {
+                let cameras = self
+                    .snapshot
+                    .cameras
+                    .iter()
+                    .map(|camera| camera.info.id.clone())
+                    .filter(|id| !self.pending_for(Job::Capture, id))
+                    .collect();
+                let commands: HashMap<String, SessionCommand> = self
+                    .snapshot
+                    .cameras
+                    .iter()
+                    .map(|camera| {
+                        let id = camera.info.id.clone();
+                        let command = self.capture_command_for(false, Some(&id));
+                        (id, command)
+                    })
+                    .collect();
+                self.send_batch(cameras, Job::Capture, |id| commands[id].clone());
+            }
+            Message::AllRecord(start) => {
+                let cameras = self
+                    .snapshot
+                    .cameras
+                    .iter()
+                    .filter(|camera| {
+                        let recording = camera
+                            .forwarding
+                            .as_deref()
+                            .is_some_and(|output| Output::of(output).recording());
+                        if start {
+                            camera.forwarding.is_none()
+                                && camera.info.transport != crate::types::Transport::Scanner
+                                && camera.info.profile.kind != CameraKind::DocumentScanner
+                        } else {
+                            recording
+                        }
+                    })
+                    .map(|camera| camera.info.id.clone())
+                    .collect();
+                if start {
+                    let command = self.record_command(true);
+                    self.send_batch(cameras, Job::Forward { recording: true }, |_| {
+                        command.clone()
+                    });
+                } else {
+                    self.send_batch(cameras, Job::StopForward { recording: true }, |_| {
+                        SessionCommand::StopForward
+                    });
+                }
+            }
+            Message::Record => self.record(),
+            Message::Reveal(path) => {
+                if std::fs::symlink_metadata(&path).is_err() {
+                    self.set_notice(
+                        "The file is no longer on this computer (it may have been uploaded)",
+                        Some(path.to_string_lossy().into_owned()),
+                        Level::Warning,
+                    );
+                } else if let Err(error) = reveal::reveal(&path) {
+                    self.set_notice(
+                        format!("Could not open the file manager: {error}"),
+                        None,
+                        Level::Error,
                     );
                 }
             }
+            Message::AutoStart(on) => self.auto_start = on,
+            Message::Tag(field, value) => field.set(&mut self.tags, value),
             Message::Screenshot(shot) => {
                 if let Some(request) = &mut self.screenshot {
                     let path = request.sequence.path(&request.path);
@@ -3140,6 +3308,7 @@ impl Workbench {
             Action::Overview if self.snapshot.cameras.len() > 1 => self.focus_camera = false,
             Action::ToggleStream if connected => self.toggle_stream(),
             Action::Capture if connected => self.capture(),
+            Action::Record if connected => self.record(),
             Action::ToggleAuto if connected => self.toggle_auto(),
             Action::SearchFeatures => {
                 let open = self.handle_message(Message::ShowTab(Tab::Features));

@@ -120,6 +120,15 @@ impl Workbench {
                         Action::Capture,
                         camera && !self.capturing_here(),
                     ),
+                    action(
+                        if self.recording_here() {
+                            "Stop Recording"
+                        } else {
+                            "Start Recording"
+                        },
+                        Action::Record,
+                        camera && !scanner && self.forward_pending().is_none(),
+                    ),
                     Some(Item::command(
                         "Schedule Capture",
                         Command::Schedule,

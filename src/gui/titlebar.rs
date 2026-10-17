@@ -1161,11 +1161,11 @@ mod tests {
         // Start all and Stop all reach the camera shown too.
         bench.pending.clear();
         bench.snapshot.streaming = false;
-        bench.send_batch(vec!["sim:0".into()], Job::Start, || SessionCommand::Start);
+        bench.send_batch(vec!["sim:0".into()], Job::Start, |_| SessionCommand::Start);
         assert_eq!(bench.single_phase(), Some(Phase::Starting));
         bench.pending.clear();
         bench.snapshot.streaming = true;
-        bench.send_batch(vec!["sim:0".into()], Job::Stop, || SessionCommand::Stop);
+        bench.send_batch(vec!["sim:0".into()], Job::Stop, |_| SessionCommand::Stop);
         assert_eq!(bench.single_phase(), Some(Phase::Stopping));
         bench.snapshot.connected = None;
         assert_eq!(bench.single_phase(), None);

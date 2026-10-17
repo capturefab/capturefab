@@ -142,6 +142,7 @@ impl Harness {
             history: Arc::default(),
             saved: Arc::default(),
             recording: Arc::default(),
+            names: Arc::default(),
         };
         let mut harness = Self {
             handle,
@@ -295,6 +296,10 @@ fn pending_and_running_capture_jobs_prevent_network_writes() {
         let mut harness = Harness::new(Transport::GigE, true);
         let output = "network-scan-protected.png";
         harness.jobs.push(Scheduled {
+            plan: crate::naming::Plan::File(output.into()),
+            camera: "camera".into(),
+            on_exists: Default::default(),
+            next: None,
             info: crate::scheduling::CaptureJob {
                 id: 1,
                 status: status.into(),

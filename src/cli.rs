@@ -135,7 +135,7 @@ fn capture_format(format: Option<ImageFormat>, output: &str, count: u32) -> Resu
     if let Some(format) = format {
         return Ok(format);
     }
-    if count > 1 && !output.contains("{frame}")
+    if count > 1 && !crate::naming::has_placeholder(output)
         || output == "-"
         || std::path::Path::new(output).is_dir()
     {
@@ -608,7 +608,7 @@ pub enum Command {
     Ffmpeg,
     /// Capture complete frames to files; existing files are never overwritten
     Capture {
-        /// File for one frame, directory for a sequence, or template containing {frame}; '-' writes one image to stdout
+        /// File, directory, or template with {camera} {date} {time} {datetime} {seq} {frame}; '-' writes one image to stdout
         #[arg(short = 'o', long)]
         output: String,
         #[arg(short='n',long,default_value_t=1,value_parser=clap::value_parser!(u32).range(1..=100_000))]
@@ -1474,6 +1474,7 @@ fn prepare_outputs(cli: &Cli, command: &mut Option<SessionCommand>) -> Result<()
             count,
             format,
             destination,
+            on_exists,
             ..
         }
         | SessionCommand::Schedule {
@@ -1481,12 +1482,18 @@ fn prepare_outputs(cli: &Cli, command: &mut Option<SessionCommand>) -> Result<()
             count,
             format,
             destination,
+            on_exists,
             ..
         } = command
             && output != "-"
         {
             let resolved = crate::destination::resolve(destination.as_deref(), output)?;
-            crate::engine::preflight_capture_output(&resolved.output, *count, format)?;
+            crate::engine::preflight_capture_output(
+                &resolved.output,
+                *count,
+                format,
+                *on_exists,
+            )?;
         }
     }
     Ok(())
@@ -2444,7 +2451,7 @@ fn command_schema(command: &clap::Command) -> Value {
     })
 }
 fn schema() -> Value {
-    let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"gui","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"capture","output":"run-1","count":10,"timeout_ms":2000,"format":"png","destination":"archive"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","jpeg","raw","pgm","ppm"],"paths":"one frame: file; multiple: directory or {frame} template; existing files fail","stdout":"--camera ... capture -n 1 -o - --format raw; no --json","destination":"--destination NAME (or \"destination\" in capture/schedule/forward RPC): -o is a relative name inside a saved folder or S3 bucket; see destination list, volumes and uploads"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized with GUI operations."});
+    let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"gui","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"capture","output":"run-1","count":10,"timeout_ms":2000,"format":"png","destination":"archive"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","jpeg","raw","pgm","ppm"],"stdout":"--camera ... capture -n 1 -o - --format raw; no --json","destination":"--destination NAME (or \"destination\" in capture/schedule/forward RPC): -o is a relative name inside a saved folder or S3 bucket; see destination list, volumes and uploads"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized with GUI operations."});
     contract["exit_codes"]["6"] = json!("storage quota or disk full");
     let mut command = Cli::command();
     command.build();
@@ -2469,6 +2476,32 @@ fn schema() -> Value {
     contract["capture"]["path_base"] = json!(
         "CLI capture/record/RPC local output paths resolve in the calling terminal; workflow paths resolve beside their file; named destination paths remain relative to the destination"
     );
+    contract["capture"]["paths"] = json!(
+        "file, directory (continues frame-NNNNNN numbering after the highest existing number) or template; {seq} picks the next free number; other existing names fail unless on_exists=number. Files are never overwritten."
+    );
+    contract["capture"]["placeholders"] = json!({
+        "camera":"model-serial, limited to A-Z a-z 0-9 . _ - (at most 64 bytes)",
+        "date":"YYYY-MM-DD","time":"HHMMSS","datetime":"YYYYMMDD-HHMMSS",
+        "seq":"next free number in that folder for that pattern, 4 or more digits; file name only",
+        "frame":"1-based index within the request, 6 digits",
+        "clock":"local time when the frame is requested; wall_ms is UTC milliseconds"
+    });
+    contract["capture"]["on_exists"] = json!({
+        "values":["fail","number"],"default":"fail",
+        "number":"an existing name without {seq} becomes stem-0001.ext, stem-0002.ext, ...",
+        "applies_to":"capture, schedule and local recordings (record/forward)"
+    });
+    contract["capture"]["context"] = json!({
+        "cli":"--context KEY=VALUE (repeatable)","keys":"^[a-z][a-z0-9_]{0,31}$",
+        "max_entries":crate::context::MAX_ENTRIES,"max_value_bytes":crate::context::MAX_VALUE,
+        "duplicate_key":"usage error (exit 2)",
+        "recorded":"echoed in the capture result, kept on scheduled jobs and stored with each file in an open dataset"
+    });
+    contract["capture"]["result"] = json!({
+        "capture":"{files:[path],frames:[{id,width,height,pixel_format,timestamp_ns,bytes,wall_ms,file?}],count,context?,destination?,queued_uploads?,queued?:[{file,upload_id,key,url}]}",
+        "record":"{forwarding,since_ms,path?}; path is the local recording file",
+        "status":"forwarding_since_ms per camera and at the top level while forwarding"
+    });
     contract["capture_session"] = json!({
         "cli":"--session NAME [--camera ID] capture-session new PATH.duckdb | resume PATH.duckdb | close | teach | auto [--pause] [--sensitivity 0.5] [--cooldown-ms 2000] | review [--id ID] | keep ID | discard ID",
         "scope":"Camera-bound persistent controls; connect the camera in a GUI/serve session first. Temporary --direct workers are rejected.",
@@ -2614,6 +2647,7 @@ fn schema() -> Value {
         json!({"op":"review_capture","id":1,"keep":true}),
         json!({"op":"review_capture","id":2,"keep":false}),
     ]);
+    commands.push(json!({"op":"capture","output":"line1/{date}/{camera}-{datetime}-{seq}.png","count":1,"timeout_ms":2000,"format":"png","on_exists":"number","context":{"line":"L1","part":"A-100"}}));
     commands.extend(crate::dataset::rpc_examples());
     commands.extend(crate::signals::rpc_examples());
     contract["dataset"] = crate::dataset::schema_contract();

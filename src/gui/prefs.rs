@@ -547,14 +547,14 @@ impl Default for Prefs {
             focus_metric: Metric::default(),
             sidebar_open: true,
             inspector_open: true,
-            output: "capture.png".into(),
+            output: default_capture_output(),
             format: "png".into(),
             count: 1,
             timeout_ms: 5000,
             scan_timeout_ms: 60_000,
             schedule_delay_seconds: 5,
             schedule_interval_seconds: 60.0,
-            forward_output: "rtsp://127.0.0.1:8554/capturefab".into(),
+            forward_output: default_record_output(),
             forward_codec: "h264".into(),
             forward_encoder: "auto".into(),
             forward_fps: 30.0,
@@ -577,6 +577,34 @@ impl Default for Prefs {
             recent_signals: Vec::new(),
         }
     }
+}
+/// Where the GUI saves by default: `Capturefab` in the user's home folder.
+pub fn capture_root() -> PathBuf {
+    let home = if cfg!(windows) {
+        std::env::var_os("USERPROFILE")
+    } else {
+        std::env::var_os("HOME")
+    };
+    home.filter(|home| !home.is_empty()).map_or_else(
+        || PathBuf::from("Capturefab"),
+        |home| PathBuf::from(home).join("Capturefab"),
+    )
+}
+/// A dated folder of uniquely named stills under `capture_root`.
+pub fn default_capture_output() -> String {
+    capture_root()
+        .join("{date}")
+        .join("{camera}-{datetime}-{seq}.png")
+        .to_string_lossy()
+        .into_owned()
+}
+/// Like `default_capture_output`, for local recordings.
+pub fn default_record_output() -> String {
+    capture_root()
+        .join("{date}")
+        .join("{camera}-{datetime}-{seq}.mp4")
+        .to_string_lossy()
+        .into_owned()
 }
 pub fn storable(address: &str) -> bool {
     crate::media::redact_url(address) == address
@@ -768,6 +796,17 @@ fn load_from(path: &Path) -> Prefs {
 
 /// Bring preferences saved by an older version up to the current one.
 fn upgrade(prefs: &mut Prefs) {
+    // Version 2: the old defaults, one fixed file name and an RTSP forward,
+    // become dated, numbered files under the capture folder. Values the
+    // user chose are kept.
+    if prefs.prefs_version < 2 {
+        if prefs.output == "capture.png" {
+            prefs.output = default_capture_output();
+        }
+        if prefs.forward_output == "rtsp://127.0.0.1:8554/capturefab" {
+            prefs.forward_output = default_record_output();
+        }
+    }
     prefs.prefs_version = prefs.prefs_version.max(Prefs::default().prefs_version);
 }
 
@@ -1165,6 +1204,37 @@ mod tests {
         );
         fs::write(&file, b"not json").unwrap();
         assert_eq!(load_from(&file), Prefs::default());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn upgrade_replaces_only_legacy_defaults() {
+        let dir = std::env::temp_dir().join(format!("capturefab-upgrade-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(FILE);
+        fs::write(
+            &file,
+            br#"{"output":"capture.png","forward_output":"rtsp://127.0.0.1:8554/capturefab"}"#,
+        )
+        .unwrap();
+        let prefs = load_from(&file);
+        assert_eq!(prefs.output, default_capture_output());
+        assert_eq!(prefs.forward_output, default_record_output());
+        assert_eq!(prefs.prefs_version, 2);
+        assert!(prefs.output.ends_with("{camera}-{datetime}-{seq}.png"));
+        fs::write(
+            &file,
+            br#"{"output":"mine.png","forward_output":"rtsp://h/x"}"#,
+        )
+        .unwrap();
+        let prefs = load_from(&file);
+        assert_eq!(
+            (prefs.output.as_str(), prefs.forward_output.as_str()),
+            ("mine.png", "rtsp://h/x")
+        );
+        // Once upgraded, a value equal to an old default is the user's choice.
+        fs::write(&file, br#"{"output":"capture.png","prefs_version":2}"#).unwrap();
+        assert_eq!(load_from(&file).output, "capture.png");
         fs::remove_dir_all(&dir).unwrap();
     }
 

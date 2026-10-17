@@ -227,6 +227,7 @@ pub enum Action {
     Overview,
     ToggleStream,
     Capture,
+    Record,
     ToggleAuto,
     SearchFeatures,
     FeaturesTab,
@@ -251,7 +252,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 31] = [
+    pub const ALL: [Action; 32] = [
         Action::Undo,
         Action::Redo,
         Action::Discover,
@@ -262,6 +263,7 @@ impl Action {
         Action::Overview,
         Action::ToggleStream,
         Action::Capture,
+        Action::Record,
         Action::ToggleAuto,
         Action::SearchFeatures,
         Action::FeaturesTab,
@@ -304,6 +306,7 @@ impl Action {
             &[
                 Action::ToggleStream,
                 Action::Capture,
+                Action::Record,
                 Action::ToggleAuto,
                 Action::SearchFeatures,
             ],
@@ -358,6 +361,7 @@ impl Action {
             Action::Overview => "Back to all cameras",
             Action::ToggleStream => "Start or stop streaming",
             Action::Capture => "Capture and save",
+            Action::Record => "Start or stop recording",
             Action::ToggleAuto => "Switch between auto and manual",
             Action::SearchFeatures => "Search camera features",
             Action::FeaturesTab => "Features panel",
@@ -415,6 +419,8 @@ impl Action {
             Action::Overview => vec![bare(Key::Escape)],
             Action::ToggleStream => vec![bare(Key::Space)],
             Action::Capture => vec![cmd('s')],
+            // ⌘R is Discover; R alone toggles the focus region.
+            Action::Record => vec![with(cmd_shift, Key::Char('r'))],
             Action::ToggleAuto => vec![with(cmd_shift, Key::Char('a'))],
             Action::SearchFeatures => vec![cmd('f')],
             Action::FeaturesTab => vec![cmd('1')],

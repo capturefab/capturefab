@@ -41,7 +41,7 @@ fields! {
     schedule_interval_seconds: f64, storage_open: bool, auto_changes_open: bool,
     appearance: Appearance, ui_scale: UiScale, logs_open: bool, fit: bool, zoom: f32, exposure_open: bool,
     focus_camera: bool, sidebar_open: bool, inspector_open: bool, inspector_peek: bool,
-    image_mode: bool, recent: Vec<Recent>,
+    image_mode: bool, recent: Vec<Recent>, auto_start: bool, tags: CaptureTags,
 }
 
 #[derive(Clone)]
@@ -214,6 +214,11 @@ pub(super) fn gesture(message: &Message) -> Option<(String, Option<String>)> {
             Some(format!("feature:{feature}")),
         ),
         Message::Encoder(_) => ("Edit encoder".into(), Some("encoder".into())),
+        Message::Tag(field, _) => (
+            format!("Edit {} tag", field.label().to_lowercase()),
+            Some(format!("tag:{}", field.key())),
+        ),
+        Message::AutoStart(_) => ("Change live view on connect".into(), None),
         Message::Bitrate(_) => ("Edit bitrate".into(), Some("bitrate".into())),
         Message::FocusRegion(_) => ("Move focus region".into(), Some("focus-region".into())),
         Message::CapturePicker(destinations::Message::Output(_)) => {

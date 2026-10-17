@@ -204,10 +204,10 @@ impl Workbench {
         &mut self,
         cameras: Vec<String>,
         job: Job,
-        command: impl Fn() -> SessionCommand,
+        command: impl Fn(&str) -> SessionCommand,
     ) {
         for camera in cameras {
-            let refused = match self.try_submit(Some(&camera), job.clone(), command()) {
+            let refused = match self.try_submit(Some(&camera), job.clone(), command(&camera)) {
                 Ok(pending) => {
                     pending.batch = true;
                     None
@@ -897,7 +897,7 @@ mod tests {
         let mut bench = bench();
         bench.handle.shutdown();
         let cameras = vec!["sim:0".to_owned(), "sim:1".to_owned()];
-        bench.send_batch(cameras, Job::Stop, || SessionCommand::Stop);
+        bench.send_batch(cameras, Job::Stop, |_| SessionCommand::Stop);
         assert!(bench.pending.is_empty() && bench.batches.is_empty());
         let notice = bench.notice.as_ref().expect("a notice");
         assert_eq!(
