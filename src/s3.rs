@@ -1075,4 +1075,163 @@ mod tests {
             "/camera-archive/Exact%20%252f%20/clip.mkv"
         );
     }
+
+    /// A loopback HTTP server answering each request with the next status,
+    /// recording the method, path and lowercase header names.
+    fn scripted(statuses: &[u16]) -> (Bucket, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let mut statuses: std::collections::VecDeque<u16> = statuses.iter().copied().collect();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut out = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                loop {
+                    let mut request = String::new();
+                    if reader.read_line(&mut request).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let mut headers = Vec::new();
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        let line = line.trim_end();
+                        if line.is_empty() {
+                            break;
+                        }
+                        let (name, value) = line.split_once(':').unwrap();
+                        let name = name.trim().to_ascii_lowercase();
+                        if name == "content-length" {
+                            length = value.trim().parse().unwrap();
+                        }
+                        headers.push(name);
+                    }
+                    let mut body = vec![0; length];
+                    std::io::Read::read_exact(&mut reader, &mut body).unwrap();
+                    let line: Vec<&str> = request.split_whitespace().collect();
+                    log.lock().unwrap().push(format!(
+                        "{} {} [{}]",
+                        line[0],
+                        line[1],
+                        headers.join(",")
+                    ));
+                    let status = statuses.pop_front().unwrap_or(500);
+                    write!(
+                        out,
+                        "HTTP/1.1 {status} Scripted\r\ncontent-length: 0\r\n\r\n"
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        let bucket = Bucket {
+            endpoint: format!("http://127.0.0.1:{port}"),
+            region: "us-east-1".into(),
+            bucket: "camera-archive".into(),
+            prefix: "line-1".into(),
+            path_style: true,
+            credentials: Credentials::Environment,
+            keep_local: false,
+            no_overwrite: NoOverwrite::IfNoneMatch,
+        };
+        (bucket, seen)
+    }
+
+    fn client(bucket: &Bucket) -> Client {
+        Client::with_keys(
+            bucket,
+            Keys {
+                id: "access".into(),
+                secret: "secret".into(),
+                token: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn upload_file() -> (std::path::PathBuf, String) {
+        let path = std::env::temp_dir().join(format!("capturefab-s3-{}.bin", std::process::id()));
+        std::fs::write(&path, b"frame").unwrap();
+        (path, hex(&Sha256::digest(b"frame")))
+    }
+
+    #[test]
+    fn probe_classifies_enforced_ignored_unsupported() {
+        for (statuses, expected, removed) in [
+            (&[200, 412, 204][..], ConditionalWrites::Enforced, true),
+            (&[200, 200, 204][..], ConditionalWrites::Ignored, true),
+            (&[501, 404][..], ConditionalWrites::Unsupported, true),
+            (&[200, 412, 403][..], ConditionalWrites::Enforced, false),
+        ] {
+            let (bucket, seen) = scripted(statuses);
+            assert_eq!(
+                client(&bucket).probe_conditional_writes().unwrap(),
+                (expected, removed)
+            );
+            let seen = seen.lock().unwrap();
+            assert!(
+                seen[0].starts_with("PUT /camera-archive/line-1/.capturefab-probe-")
+                    && seen[0].contains("if-none-match"),
+                "{seen:?}"
+            );
+            assert!(seen.last().unwrap().starts_with("DELETE "));
+        }
+    }
+
+    #[test]
+    fn check_first_head_200_refuses_without_put() {
+        let (mut bucket, seen) = scripted(&[200]);
+        bucket.no_overwrite = NoOverwrite::CheckFirst;
+        let (path, sha) = upload_file();
+        let error = client(&bucket)
+            .upload(&path, "line-1/a.png", &sha, 5)
+            .unwrap_err();
+        assert!(!retryable(&error));
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(seen.lock().unwrap()[0].starts_with("HEAD /camera-archive/line-1/a.png"));
+        let (mut bucket, _) = scripted(&[403]);
+        bucket.no_overwrite = NoOverwrite::CheckFirst;
+        let error = client(&bucket)
+            .upload(&path, "line-1/a.png", &sha, 5)
+            .unwrap_err();
+        assert!(!retryable(&error) && error.to_string().contains("HTTP 403 on HEAD"));
+    }
+
+    #[test]
+    fn check_first_404_puts_without_if_none_match() {
+        let (mut bucket, seen) = scripted(&[404, 200]);
+        bucket.no_overwrite = NoOverwrite::CheckFirst;
+        let (path, sha) = upload_file();
+        client(&bucket)
+            .upload(&path, "line-1/a.png", &sha, 5)
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[1].starts_with("PUT /camera-archive/line-1/a.png"));
+        assert!(!seen[1].contains("if-none-match"), "{seen:?}");
+    }
+
+    #[test]
+    fn if_none_match_501_is_permanent_with_probe_hint() {
+        let (bucket, seen) = scripted(&[501]);
+        let (path, sha) = upload_file();
+        let error = client(&bucket)
+            .upload(&path, "line-1/a.png", &sha, 5)
+            .unwrap_err();
+        assert!(!retryable(&error), "501 used to be retried forever");
+        assert!(error.to_string().contains("--probe-writes"), "{error:#}");
+        assert!(seen.lock().unwrap()[0].contains("if-none-match"));
+        // Without the conditional header a 501 stays an ordinary server error.
+        let (mut bucket, _) = scripted(&[404, 501]);
+        bucket.no_overwrite = NoOverwrite::CheckFirst;
+        let error = client(&bucket)
+            .upload(&path, "line-1/a.png", &sha, 5)
+            .unwrap_err();
+        assert!(retryable(&error));
+    }
 }

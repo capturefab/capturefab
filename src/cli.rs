@@ -369,7 +369,7 @@ pub enum DestinationCommand {
     List,
     /// Save a folder destination, such as a directory on an external drive or network share
     AddFolder { name: String, path: PathBuf },
-    /// Save an S3-compatible bucket (AWS S3, Cloudflare R2, Backblaze B2, MinIO, Wasabi)
+    /// Save an S3-compatible bucket (AWS S3, Cloudflare R2, Backblaze B2, MinIO, RustFS, Wasabi)
     AddS3 {
         name: String,
         #[arg(long)]
@@ -403,16 +403,196 @@ pub enum DestinationCommand {
         /// Save without checking that the bucket is reachable
         #[arg(long)]
         no_check: bool,
+        /// Self-hosted service settings (path-style addressing); needs --endpoint
+        #[arg(long, value_enum)]
+        preset: Option<S3Preset>,
+        /// Check that the service refuses to replace objects, and use check-first uploads if it does not (implied by --preset unless --no-check)
+        #[arg(long, conflicts_with_all = ["no_check", "check_first"])]
+        probe_writes: bool,
+        /// Look up each key before writing, for services that ignore conditional writes
+        #[arg(long)]
+        check_first: bool,
+    },
+    /// Save an FTP server: explicit FTPS (AUTH TLS) unless --plain
+    AddFtp {
+        name: String,
+        /// DNS name, IPv4 address or [IPv6] address
+        #[arg(long)]
+        host: String,
+        #[arg(long, default_value_t = 21, value_parser = clap::value_parser!(u16).range(1..))]
+        port: u16,
+        #[arg(long)]
+        user: String,
+        /// Folder for uploads: relative to the login folder, or absolute with a leading /
+        #[arg(long, default_value = "")]
+        dir: String,
+        /// Plain FTP without TLS: files and the password travel unencrypted
+        #[arg(long)]
+        plain: bool,
+        /// Read the password from stdin and save it in the OS credential store
+        #[arg(long, conflicts_with_all = ["password_env", "anonymous"])]
+        password_stdin: bool,
+        /// Use CAPTUREFAB_FTP_PASSWORD from the uploading process
+        #[arg(long, conflicts_with = "anonymous")]
+        password_env: bool,
+        /// Sign in as an anonymous user, without a password
+        #[arg(long)]
+        anonymous: bool,
+        /// Keep local copies after a verified upload
+        #[arg(long)]
+        keep_local: bool,
+        /// Save without checking that the server is reachable
+        #[arg(long)]
+        no_check: bool,
+    },
+    /// Save an SFTP server, pinned to its host key
+    #[command(group(clap::ArgGroup::new("trust").required(true).args(["host_key", "accept_host_key"])))]
+    AddSftp {
+        name: String,
+        /// DNS name, IPv4 address or [IPv6] address
+        #[arg(long)]
+        host: String,
+        #[arg(long, default_value_t = 22, value_parser = clap::value_parser!(u16).range(1..))]
+        port: u16,
+        #[arg(long)]
+        user: String,
+        /// Folder for uploads: relative to the login folder, or absolute with a leading /
+        #[arg(long, default_value = "")]
+        dir: String,
+        /// The server's OpenSSH host-key fingerprint, SHA256:...
+        #[arg(long)]
+        host_key: Option<String>,
+        /// Trust the key the server presents now; confirm its fingerprint with the administrator
+        #[arg(long, conflicts_with = "no_check")]
+        accept_host_key: bool,
+        /// Sign in with this private key; --password-stdin or --password-env then give its passphrase
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// Read the password (or key passphrase) from stdin and save it in the OS credential store
+        #[arg(long, conflicts_with = "password_env")]
+        password_stdin: bool,
+        /// Use CAPTUREFAB_SFTP_PASSWORD from the uploading process
+        #[arg(long)]
+        password_env: bool,
+        /// Keep local copies after a verified upload
+        #[arg(long)]
+        keep_local: bool,
+        /// Save without checking that the server is reachable
+        #[arg(long)]
+        no_check: bool,
     },
     /// Remove a saved destination
     Remove {
         name: String,
-        /// Also delete its secret key from the OS credential store
+        /// Also delete its secret from the OS credential store, unless another destination uses it
         #[arg(long)]
         forget_secret: bool,
     },
     /// Check that a destination is reachable and writable
-    Test { name: String },
+    Test {
+        name: String,
+        /// S3: check that the service refuses to replace objects, and switch to check-first uploads if it does not
+        #[arg(long)]
+        probe_writes: bool,
+    },
+}
+
+/// Settings for self-hosted S3-compatible services.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum S3Preset {
+    Minio,
+    Rustfs,
+}
+
+impl S3Preset {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Minio => "minio",
+            Self::Rustfs => "rustfs",
+        }
+    }
+}
+
+/// A valid stand-in fingerprint, to check the other settings of an SFTP
+/// destination whose host key is accepted on first use.
+const PENDING_HOST_KEY: &str = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+/// The FTP or SFTP destination an add-ftp or add-sftp command describes,
+/// with `host_key` for an SFTP server.
+fn server_destination(
+    command: &DestinationCommand,
+    host_key: &str,
+) -> Option<crate::destination::Destination> {
+    use crate::destination::{Destination, FtpServer, FtpTls, SecretSource, SftpServer, Target};
+    let secret = |stdin: bool, env: bool, none: bool| {
+        if env {
+            SecretSource::Environment
+        } else if none || !stdin {
+            SecretSource::NoSecret
+        } else {
+            SecretSource::Keychain
+        }
+    };
+    Some(match command {
+        DestinationCommand::AddFtp {
+            name,
+            host,
+            port,
+            user,
+            dir,
+            plain,
+            password_stdin,
+            password_env,
+            anonymous,
+            keep_local,
+            ..
+        } => Destination {
+            name: name.clone(),
+            target: Target::Ftp(FtpServer {
+                host: host.clone(),
+                port: *port,
+                user: user.clone(),
+                dir: dir.clone(),
+                tls: if *plain {
+                    FtpTls::Plain
+                } else {
+                    FtpTls::Explicit
+                },
+                // Without a password option, use the one saved earlier.
+                password: if !*password_stdin && !*password_env && !*anonymous {
+                    SecretSource::Keychain
+                } else {
+                    secret(*password_stdin, *password_env, *anonymous)
+                },
+                keep_local: *keep_local,
+            }),
+        },
+        DestinationCommand::AddSftp {
+            name,
+            host,
+            port,
+            user,
+            dir,
+            key_file,
+            password_stdin,
+            password_env,
+            keep_local,
+            ..
+        } => Destination {
+            name: name.clone(),
+            target: Target::Sftp(SftpServer {
+                host: host.clone(),
+                port: *port,
+                user: user.clone(),
+                dir: dir.clone(),
+                host_key: host_key.into(),
+                key_file: key_file.clone(),
+                password: secret(*password_stdin, *password_env, false),
+                keep_local: *keep_local,
+            }),
+        },
+        _ => return None,
+    })
 }
 #[derive(Debug, Subcommand)]
 pub enum UploadsCommand {
@@ -868,22 +1048,7 @@ fn hex(s: &str) -> Result<Vec<u8>> {
 
 #[cfg(feature = "s3")]
 fn read_secret(reader: impl io::Read) -> Result<String> {
-    use std::io::Read;
-    let mut data = Vec::new();
-    // Allow a maximum-size key followed by CRLF, plus one byte to detect an
-    // oversized input without reading an unbounded pipe into memory.
-    reader.take(4099).read_to_end(&mut data)?;
-    ensure!(
-        data.len() <= 4098,
-        "S3 secret stdin exceeds 4096 bytes plus a terminal newline"
-    );
-    if data.last() == Some(&b'\n') {
-        data.pop();
-        if data.last() == Some(&b'\r') {
-            data.pop();
-        }
-    }
-    let secret = String::from_utf8(data).context("S3 secret stdin must be UTF-8")?;
+    let secret = crate::transfer::read_stdin_secret(reader, "S3 secret")?;
     crate::s3::validate_secret(&secret)?;
     Ok(secret)
 }
@@ -1243,9 +1408,38 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
                     );
                     Some(name)
                 }
-                DestinationCommand::AddS3 { name, .. }
-                | DestinationCommand::Remove { name, .. }
-                | DestinationCommand::Test { name } => Some(name),
+                DestinationCommand::AddS3 {
+                    name,
+                    preset,
+                    endpoint,
+                    ..
+                } => {
+                    if let Some(preset) = preset {
+                        ensure!(
+                            !endpoint.is_empty(),
+                            "--preset {} needs --endpoint http://HOST:9000",
+                            preset.name()
+                        );
+                    }
+                    Some(name)
+                }
+                DestinationCommand::AddFtp { name, .. }
+                | DestinationCommand::AddSftp { name, .. } => {
+                    let host_key = match command {
+                        DestinationCommand::AddSftp {
+                            host_key: Some(key),
+                            ..
+                        } => key.as_str(),
+                        _ => PENDING_HOST_KEY,
+                    };
+                    server_destination(command, host_key)
+                        .expect("server destination")
+                        .validate()?;
+                    Some(name)
+                }
+                DestinationCommand::Remove { name, .. } | DestinationCommand::Test { name, .. } => {
+                    Some(name)
+                }
             };
             if let Some(name) = name {
                 crate::destination::validate_name(name)?;
@@ -1255,9 +1449,9 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
         Some(Command::Uploads {
             command: Some(UploadsCommand::Retry { id: Some(id) } | UploadsCommand::Forget { id }),
         }) => {
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "uploads")]
             crate::upload::validate_id(id)?;
-            #[cfg(not(feature = "s3"))]
+            #[cfg(not(feature = "uploads"))]
             let _ = id;
             None
         }
@@ -1570,7 +1764,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             crate::gui::migrate_prefs();
             let _server =
                 ipc::Server::start_with_kind(handle.clone(), name, ipc::SessionKind::Gui)?;
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "uploads")]
             crate::upload::start();
             #[cfg(feature = "gui")]
             {
@@ -1776,7 +1970,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 })
                 .transpose()?;
             // A persistent session uploads what its cameras queue.
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "uploads")]
             crate::upload::start();
             let mut ready = json!({"session":name,"pid":std::process::id(),"ready":true});
             if let Some(server) = &remote_server {
@@ -2496,7 +2690,7 @@ fn command_schema(command: &clap::Command) -> Value {
     })
 }
 fn schema() -> Value {
-    let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"gui","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"capture","output":"run-1","count":10,"timeout_ms":2000,"format":"png","destination":"archive"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","jpeg","raw","pgm","ppm"],"stdout":"--camera ... capture -n 1 -o - --format raw; no --json","destination":"--destination NAME (or \"destination\" in capture/schedule/forward RPC): -o is a relative name inside a saved folder or S3 bucket; see destination list, volumes and uploads"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized with GUI operations."});
+    let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"gui","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"capture","output":"run-1","count":10,"timeout_ms":2000,"format":"png","destination":"archive"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","jpeg","raw","pgm","ppm"],"stdout":"--camera ... capture -n 1 -o - --format raw; no --json","destination":"--destination NAME (or \"destination\" in capture/schedule/forward RPC): -o is a relative name inside a saved folder, S3 bucket, FTP(S) or SFTP server; see destination list, volumes and uploads"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized with GUI operations."});
     contract["exit_codes"]["6"] = json!("storage quota or disk full");
     let mut command = Cli::command();
     command.build();
@@ -3033,23 +3227,18 @@ fn log_options(cli: &Cli) -> Result<crate::signals::log::LogOptions> {
     })
 }
 
-/// A direct CLI capture to a bucket destination uploads before exiting, so
+/// A direct CLI capture to a network destination uploads before exiting, so
 /// files are not left waiting for a process that never runs.
 fn wait_for_uploads(cli: &Cli, destination: Option<&str>, result: &mut Value) -> Result<()> {
     let Some(name) = destination else {
         return Ok(());
     };
-    if cli.session.is_some()
-        || !matches!(
-            crate::destination::get(name)?.target,
-            crate::destination::Target::S3(_)
-        )
-    {
+    if cli.session.is_some() || !crate::destination::get(name)?.target.is_remote() {
         return Ok(());
     }
-    #[cfg(not(feature = "s3"))]
+    #[cfg(not(feature = "uploads"))]
     let _ = result;
-    #[cfg(feature = "s3")]
+    #[cfg(feature = "uploads")]
     {
         if !cli.json {
             eprintln!("Uploading to {name}...");
@@ -3071,18 +3260,109 @@ fn wait_for_uploads(cli: &Cli, destination: Option<&str>, result: &mut Value) ->
     Ok(())
 }
 
+/// The bucket an add-s3 command describes.
+fn s3_bucket(command: &DestinationCommand) -> Result<crate::destination::Bucket> {
+    use crate::destination::{Bucket, Credentials, NoOverwrite};
+    let DestinationCommand::AddS3 {
+        bucket,
+        region,
+        endpoint,
+        prefix,
+        path_style,
+        access_key_id,
+        profile,
+        env,
+        keep_local,
+        preset,
+        check_first,
+        ..
+    } = command
+    else {
+        anyhow::bail!("not an add-s3 command");
+    };
+    let credentials = match (access_key_id, profile, env) {
+        (Some(id), _, _) => Credentials::Keychain {
+            access_key_id: id.clone(),
+        },
+        (_, Some(name), _) => Credentials::Profile { name: name.clone() },
+        (_, _, true) => Credentials::Environment,
+        _ => {
+            return Err(InvalidInput(
+                "choose credentials: --access-key-id ID --secret-stdin, --profile NAME or --env"
+                    .into(),
+            )
+            .into());
+        }
+    };
+    Ok(Bucket {
+        endpoint: endpoint.clone(),
+        region: region.clone(),
+        bucket: bucket.clone(),
+        prefix: prefix.clone(),
+        // MinIO and RustFS serve buckets in the URL path.
+        path_style: *path_style || preset.is_some(),
+        credentials,
+        keep_local: *keep_local,
+        no_overwrite: if *check_first {
+            NoOverwrite::CheckFirst
+        } else {
+            NoOverwrite::IfNoneMatch
+        },
+    })
+}
+
+/// Find out whether a bucket refuses to replace objects; switch the saved
+/// destination to check-first uploads when it does not, and back when it
+/// does. The switch is a compare-and-swap, so a concurrent edit wins.
+#[cfg(feature = "s3")]
+fn probe_writes(saved: &crate::destination::Destination) -> Result<Value> {
+    use crate::destination::{NoOverwrite, Target};
+    let Target::S3(bucket) = &saved.target else {
+        return Err(InvalidInput("--probe-writes applies to S3 destinations only".into()).into());
+    };
+    let (writes, removed) = crate::s3::Client::new(bucket)?.probe_conditional_writes()?;
+    let mode = if writes == crate::s3::ConditionalWrites::Enforced {
+        NoOverwrite::IfNoneMatch
+    } else {
+        NoOverwrite::CheckFirst
+    };
+    let saved_now = if mode == bucket.no_overwrite {
+        true
+    } else {
+        let mut after = saved.clone();
+        if let Target::S3(bucket) = &mut after.target {
+            bucket.no_overwrite = mode;
+        }
+        crate::destination::replace(Some(saved), Some(&after)).is_ok()
+    };
+    Ok(json!({
+        "ok": true,
+        "conditional_writes": writes.as_str(),
+        "no_overwrite": mode,
+        "saved": saved_now,
+        "probe_removed": removed,
+    }))
+}
+
 fn destination_command(command: &DestinationCommand) -> Result<Value> {
-    use crate::destination::{self, Bucket, Credentials, Destination, Target};
+    use crate::destination::{self, Destination, Target};
     let describe = |d: &Destination| {
         let mut value = serde_json::to_value(d).unwrap_or_default();
         value["location"] = json!(d.describe());
+        if let Some(remote) = d.target.remote() {
+            value["insecure"] = json!(remote.insecure());
+        }
         #[cfg(feature = "s3")]
-        if let Target::S3(Bucket {
-            credentials: Credentials::Keychain { access_key_id },
+        if let Target::S3(crate::destination::Bucket {
+            credentials: crate::destination::Credentials::Keychain { access_key_id },
             ..
         }) = &d.target
         {
             value["secret_saved"] = json!(crate::s3::has_secret(access_key_id));
+        }
+        #[cfg(feature = "uploads")]
+        if let Some((service, account)) = d.target.remote().and_then(|r| r.secret_ref()) {
+            value["secret_saved"] = json!(crate::transfer::has_secret(service, &account));
         }
         value
     };
@@ -3105,43 +3385,29 @@ fn destination_command(command: &DestinationCommand) -> Result<Value> {
         }
         DestinationCommand::AddS3 {
             name,
-            bucket,
-            region,
-            endpoint,
-            prefix,
-            path_style,
             access_key_id,
             secret_stdin,
-            profile,
-            env,
-            keep_local,
             no_check,
+            preset,
+            probe_writes: probe,
+            check_first,
+            ..
         } => {
-            let credentials = match (access_key_id, profile, env) {
-                (Some(id), _, _) => Credentials::Keychain {
-                    access_key_id: id.clone(),
-                },
-                (_, Some(name), _) => Credentials::Profile { name: name.clone() },
-                (_, _, true) => Credentials::Environment,
-                _ => return Err(InvalidInput("choose credentials: --access-key-id ID --secret-stdin, --profile NAME or --env".into()).into()),
-            };
             let saved = Destination {
                 name: name.clone(),
-                target: Target::S3(Bucket {
-                    endpoint: endpoint.clone(),
-                    region: region.clone(),
-                    bucket: bucket.clone(),
-                    prefix: prefix.clone(),
-                    path_style: *path_style,
-                    credentials,
-                    keep_local: *keep_local,
-                    no_overwrite: Default::default(),
-                }),
+                target: Target::S3(s3_bucket(command)?),
             };
             input(saved.validate())?;
             #[cfg(not(feature = "s3"))]
             {
-                let _ = (secret_stdin, no_check);
+                let _ = (
+                    access_key_id,
+                    secret_stdin,
+                    no_check,
+                    preset,
+                    probe,
+                    check_first,
+                );
                 anyhow::bail!(
                     "S3 destinations are unsupported in this build; rebuild with --features s3"
                 );
@@ -3175,6 +3441,124 @@ fn destination_command(command: &DestinationCommand) -> Result<Value> {
                         Err(error) => json!({"ok": false, "warning": format!("{error:#}")}),
                     };
                 }
+                // Self-hosted services differ in conditional-write support,
+                // so presets find out unless asked not to check.
+                if *probe || (preset.is_some() && !*no_check && !*check_first) {
+                    value["probe"] = probe_writes(&saved).unwrap_or_else(
+                        |error| json!({"ok": false, "warning": format!("{error:#}")}),
+                    );
+                    if let Ok(current) = destination::get(name) {
+                        value["destination"] = describe(&current);
+                    }
+                }
+                value
+            }
+        }
+        DestinationCommand::AddFtp {
+            password_stdin,
+            no_check,
+            ..
+        }
+        | DestinationCommand::AddSftp {
+            password_stdin,
+            no_check,
+            ..
+        } => {
+            let (host, port, given, accept) = match command {
+                DestinationCommand::AddSftp {
+                    host,
+                    port,
+                    host_key,
+                    accept_host_key,
+                    ..
+                } => (host, *port, host_key.clone(), *accept_host_key),
+                DestinationCommand::AddFtp { host, port, .. } => (host, *port, None, false),
+                _ => unreachable!(),
+            };
+            let sftp = matches!(command, DestinationCommand::AddSftp { .. });
+            let (kind, feature) = if sftp {
+                ("SFTP", cfg!(feature = "sftp"))
+            } else {
+                ("FTP", cfg!(feature = "ftp"))
+            };
+            // Shape checks first: a bad setting is a usage error even in a
+            // build without this destination kind.
+            input(
+                server_destination(command, given.as_deref().unwrap_or(PENDING_HOST_KEY))
+                    .expect("server destination")
+                    .validate(),
+            )?;
+            ensure!(
+                feature,
+                "{kind} destinations are unsupported in this build; rebuild with --features {}",
+                kind.to_ascii_lowercase()
+            );
+            let host_key = match given {
+                Some(key) => key,
+                None if accept => {
+                    #[cfg(feature = "sftp")]
+                    {
+                        let key = crate::transfer::sftp::fetch_host_key(host, port).map_err(
+                            |error| {
+                                anyhow::anyhow!(
+                                    "cannot reach the server: {error:#}; fix the settings and try again"
+                                )
+                            },
+                        )?;
+                        eprintln!(
+                            "capturefab: trusting SFTP host key {key} for {host}:{port} on first use"
+                        );
+                        key
+                    }
+                    #[cfg(not(feature = "sftp"))]
+                    {
+                        let _ = (host, port);
+                        unreachable!("checked above")
+                    }
+                }
+                None => String::new(),
+            };
+            let saved = server_destination(command, &host_key).expect("server destination");
+            input(saved.validate())?;
+            let remote = saved.target.remote().expect("network destination");
+            #[cfg(not(feature = "uploads"))]
+            {
+                let _ = (password_stdin, no_check, remote);
+                unreachable!("checked above")
+            }
+            #[cfg(feature = "uploads")]
+            {
+                if *password_stdin {
+                    let secret = input(crate::transfer::read_stdin_secret(
+                        io::stdin().lock(),
+                        "password",
+                    ))?;
+                    let (service, account) = remote.secret_ref().expect("keychain secret");
+                    crate::transfer::store_secret(service, &account, &secret)?;
+                }
+                let check = (!*no_check)
+                    .then(|| crate::transfer::connect(&remote).and_then(|mut u| u.check()));
+                if let Some(Err(error)) = &check
+                    && crate::transfer::retryable(error)
+                {
+                    anyhow::bail!(
+                        "cannot reach the server: {error:#}; fix the settings or save with --no-check"
+                    );
+                }
+                destination::save(saved.clone())?;
+                let mut value = json!({"destination": describe(&saved)});
+                if sftp {
+                    value["host_key"] = json!({
+                        "fingerprint": host_key,
+                        "trust": if accept { "accepted_on_first_use" } else { "pinned" },
+                    });
+                }
+                if let Some(check) = check {
+                    value["check"] = match check {
+                        Ok(()) => json!({"ok": true}),
+                        Err(error) => json!({"ok": false, "warning": format!("{error:#}")}),
+                    };
+                }
                 value
             }
         }
@@ -3183,21 +3567,49 @@ fn destination_command(command: &DestinationCommand) -> Result<Value> {
             forget_secret,
         } => {
             let removed = destination::remove(name)?;
-            #[cfg(feature = "s3")]
-            if *forget_secret
-                && let Target::S3(Bucket {
-                    credentials: Credentials::Keychain { access_key_id },
-                    ..
-                }) = &removed.target
-            {
-                crate::s3::delete_secret(access_key_id)?;
+            let mut value = json!({"removed": removed.name});
+            #[cfg(feature = "uploads")]
+            if *forget_secret {
+                // S3 keychain keys are stored by access key ID; servers by
+                // user@host:port.
+                let secret = |target: &Target| match target {
+                    Target::S3(crate::destination::Bucket {
+                        credentials: crate::destination::Credentials::Keychain { access_key_id },
+                        ..
+                    }) => Some(("capturefab-s3", access_key_id.clone())),
+                    target => target.remote().and_then(|r| r.secret_ref()),
+                };
+                if let Some(reference) = secret(&removed.target) {
+                    match destination::list()?
+                        .into_iter()
+                        .find(|d| secret(&d.target).as_ref() == Some(&reference))
+                    {
+                        Some(other) => {
+                            value["secret_kept"] = json!(format!("used by {}", other.name))
+                        }
+                        None => crate::transfer::delete_secret(reference.0, &reference.1)?,
+                    }
+                }
             }
-            #[cfg(not(feature = "s3"))]
+            #[cfg(not(feature = "uploads"))]
             let _ = forget_secret;
-            json!({"removed": removed.name})
+            value
         }
-        DestinationCommand::Test { name } => {
+        DestinationCommand::Test {
+            name,
+            probe_writes: probe,
+        } => {
             let saved = destination::get(name)?;
+            if *probe {
+                if !matches!(saved.target, Target::S3(_)) {
+                    return Err(InvalidInput(
+                        "--probe-writes applies to S3 destinations only".into(),
+                    )
+                    .into());
+                }
+                #[cfg(feature = "s3")]
+                return probe_writes(&saved);
+            }
             match &saved.target {
                 Target::Folder { path } => {
                     crate::volumes::ensure_present(path)?;
@@ -3220,7 +3632,9 @@ fn destination_command(command: &DestinationCommand) -> Result<Value> {
                     #[cfg(not(feature = "s3"))]
                     {
                         let _ = bucket;
-                        anyhow::bail!("S3 destinations are unsupported in this build")
+                        anyhow::bail!(
+                            "S3 destinations are unsupported in this build; rebuild with --features s3"
+                        )
                     }
                 }
                 Target::Ftp(_) | Target::Sftp(_) => {
@@ -3244,7 +3658,7 @@ fn destination_command(command: &DestinationCommand) -> Result<Value> {
 }
 
 fn uploads_command(command: Option<&UploadsCommand>) -> Result<Value> {
-    #[cfg(feature = "s3")]
+    #[cfg(feature = "uploads")]
     {
         Ok(match command {
             None | Some(UploadsCommand::Status) => crate::upload::status()?,
@@ -3259,10 +3673,12 @@ fn uploads_command(command: Option<&UploadsCommand>) -> Result<Value> {
             ))?,
         })
     }
-    #[cfg(not(feature = "s3"))]
+    #[cfg(not(feature = "uploads"))]
     {
         let _ = command;
-        anyhow::bail!("uploads are unsupported in this build; rebuild with --features s3")
+        anyhow::bail!(
+            "uploads are unsupported in this build; rebuild with --features s3, ftp or sftp"
+        )
     }
 }
 
@@ -3695,6 +4111,141 @@ mod tests {
             )),
             ("unsupported", 5)
         );
+        assert_eq!(
+            error_code(&anyhow::anyhow!(
+                "FTP destinations are unsupported in this build; rebuild with --features ftp"
+            )),
+            ("unsupported", 5)
+        );
+        assert_eq!(
+            error_code(&anyhow::anyhow!(
+                "SFTP host key changed: expected SHA256:a, server offered SHA256:b; confirm with the server administrator and update the destination"
+            )),
+            ("operation_failed", 1)
+        );
+        assert_eq!(
+            error_code(&anyhow::anyhow!(
+                "cannot reach the server: connecting on ftp://h:21: Connection refused (os error 61); fix the settings or save with --no-check"
+            )),
+            ("unavailable", 3)
+        );
+    }
+    #[test]
+    fn s3_presets_set_path_style_and_require_endpoint() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(
+                [
+                    "capturefab",
+                    "destination",
+                    "add-s3",
+                    "x",
+                    "--bucket",
+                    "camera-archive",
+                    "--env",
+                ]
+                .iter()
+                .chain(args),
+            )
+        };
+        let cli = parse(&["--preset", "rustfs"]).unwrap();
+        let error = prepare(&cli).unwrap_err().to_string();
+        assert!(
+            error.contains("--preset rustfs needs --endpoint"),
+            "{error}"
+        );
+        let cli = parse(&["--preset", "minio", "--endpoint", "http://nas:9000"]).unwrap();
+        assert!(prepare(&cli).is_ok());
+        let Some(Command::Destination { command }) = &cli.command else {
+            panic!("destination")
+        };
+        let DestinationCommand::AddS3 {
+            preset, path_style, ..
+        } = command
+        else {
+            panic!("add-s3")
+        };
+        assert_eq!((*preset, *path_style), (Some(S3Preset::Minio), false));
+        assert!(
+            s3_bucket(command).unwrap().path_style,
+            "presets imply path-style addressing"
+        );
+        assert!(parse(&["--probe-writes", "--no-check"]).is_err());
+        assert!(parse(&["--probe-writes", "--check-first"]).is_err());
+        assert!(parse(&["--preset", "aws"]).is_err());
+    }
+    #[test]
+    fn server_destinations_validate_before_touching_settings() {
+        let parse =
+            |args: &[&str]| Cli::try_parse_from(["capturefab", "destination"].iter().chain(args));
+        for args in [
+            &["add-ftp", "x", "--host", "ftp://h", "--user", "u"][..],
+            &[
+                "add-ftp", "x", "--host", "h", "--user", "u", "--dir", "../a",
+            ],
+            &[
+                "add-sftp",
+                "x",
+                "--host",
+                "h",
+                "--user",
+                "u",
+                "--host-key",
+                "bogus",
+            ],
+            &[
+                "add-sftp",
+                "x",
+                "--host",
+                "h",
+                "--user",
+                "u",
+                "--accept-host-key",
+                "--key-file",
+                "rel/id",
+            ],
+        ] {
+            let cli = parse(args).unwrap();
+            assert!(prepare(&cli).is_err(), "{args:?}");
+        }
+        assert!(parse(&["add-ftp", "x", "--host", "h", "--user", "u", "--port", "0"]).is_err());
+        assert!(parse(&["add-sftp", "x", "--host", "h", "--user", "u"]).is_err());
+        assert!(
+            parse(&[
+                "add-sftp",
+                "x",
+                "--host",
+                "h",
+                "--user",
+                "u",
+                "--accept-host-key",
+                "--no-check"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "add-ftp",
+                "x",
+                "--host",
+                "h",
+                "--user",
+                "u",
+                "--anonymous",
+                "--password-env"
+            ])
+            .is_err()
+        );
+        let cli = parse(&[
+            "add-sftp",
+            "x",
+            "--host",
+            "h",
+            "--user",
+            "u",
+            "--accept-host-key",
+        ])
+        .unwrap();
+        assert!(prepare(&cli).is_ok());
     }
     #[test]
     fn assignments_and_hex() {
