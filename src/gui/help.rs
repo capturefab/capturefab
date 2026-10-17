@@ -169,12 +169,14 @@ impl Workbench {
     fn guide_steps_view(&self, p: &'static Palette) -> Element<'_, Message> {
         let done = self.guide_steps();
         let next = done.iter().position(|done| !done);
+        let os = Os::CURRENT;
+        // Small buttons, the shortcut beside the label, so the next step
+        // reads as something to press.
         let link = |label: &'static str, name: &'static str, on: Option<Message>| {
-            button(text(label).size(style::SMALL))
-                .name(name)
-                .style(style::link)
-                .padding([2, 6])
-                .on_press_maybe(on)
+            step_button(label, None, name, on, p)
+        };
+        let keyed = |label: &'static str, key: Action, name: &'static str, on: Option<Message>| {
+            step_button(label, Some(key.key_label(os)), name, on, p)
         };
         let mut steps = column![].spacing(4);
         for (index, label) in ["Connect a camera", "Start the stream", "Capture a frame"]
@@ -190,8 +192,13 @@ impl Workbench {
                     .color(p.secondary)
                     .into()
             };
+            // The mark starts at the content edge, under the headings.
             let mut step = row![
-                container(mark).center_x(18).center_y(22),
+                container(mark)
+                    .width(18)
+                    .height(26)
+                    .align_x(Alignment::Start)
+                    .align_y(Alignment::Center),
                 text(label)
                     .size(style::BODY)
                     .color(if done[index] { p.secondary } else { p.text }),
@@ -203,20 +210,22 @@ impl Workbench {
                 match index {
                     0 => {
                         step = step
-                            .push(link(
+                            .push(keyed(
                                 "Enter an address",
+                                Action::ConnectAddress,
                                 "Enter an address",
                                 Some(Message::EnterAddress),
                             ))
                             .push(link(
-                                "Try the simulator",
+                                "No camera? Try the simulator",
                                 "Try the simulator",
                                 (!self.connecting("sim:0")).then_some(Message::TrySimulator),
                             ));
                     }
                     1 => {
-                        step = step.push(link(
+                        step = step.push(keyed(
                             "Start",
+                            Action::ToggleStream,
                             "Start the stream",
                             self.snapshot
                                 .active_camera
@@ -225,8 +234,9 @@ impl Workbench {
                         ));
                     }
                     _ => {
-                        step = step.push(link(
+                        step = step.push(keyed(
                             "Capture",
+                            Action::Capture,
                             "Capture a frame",
                             (!self.capturing_here()
                                 && self.validate_input(&self.capture_command(false)).is_ok())
@@ -420,29 +430,7 @@ impl Workbench {
         ]
         .spacing(14);
         if more {
-            body = body.push(
-                column![
-                    text("Add stream URLs directly. Use sim:replay:PATH to loop a video file or a folder of image frames or videos, sorted by filename without searching subfolders. Native camera sources use avfoundation:// on macOS, v4l2:// on Linux, and dshow:// on Windows. GigE: use a reachable address on the camera's subnet. USB3: the operating system must allow access to the camera. Activity shows connection and capture errors.")
-                        .size(style::SMALL)
-                        .color(p.secondary),
-                    row![
-                        text("GigE cameras slow or unreachable?")
-                            .size(style::SMALL)
-                            .color(p.secondary),
-                        tip(
-                            button(text("Check network").size(style::SMALL))
-                                .name("Check network")
-                                .style(style::link)
-                                .padding([2, 6])
-                                .on_press(Message::ScanNetwork),
-                            "Tunes connected GigE cameras for the available bandwidth and checks network adapters. Live previews may pause briefly.",
-                        ),
-                    ]
-                    .spacing(2)
-                    .align_y(Alignment::Center),
-                ]
-                .spacing(6),
-            );
+            body = body.push(connection_notes(p));
         }
         let body = body
             .push(
@@ -498,6 +486,92 @@ fn plain_keys_note(os: Os) -> String {
         "{keys} act on the workbench when no field has keyboard focus. Press {} or click elsewhere to leave a field.",
         Action::Overview.key_label(os)
     )
+}
+
+/// A guide step's action: a small button, its shortcut beside the label.
+fn step_button<'a>(
+    label: &'static str,
+    key: Option<String>,
+    name: &'static str,
+    on: Option<Message>,
+    p: &'static Palette,
+) -> Element<'a, Message> {
+    let mut content = row![text(label).size(style::SMALL)]
+        .spacing(6)
+        .align_y(Alignment::Center);
+    if let Some(key) = key.filter(|key| !key.is_empty()) {
+        content = content.push(text(key).size(style::CAPTION).color(p.secondary));
+    }
+    button(content)
+        .name(name)
+        .style(style::secondary)
+        .padding([3, 9])
+        .on_press_maybe(on)
+        .into()
+}
+
+/// The native camera scheme on this system, for the webcam note.
+fn webcam_scheme() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "avfoundation://"
+    } else if cfg!(target_os = "windows") {
+        "dshow://"
+    } else {
+        "v4l2://"
+    }
+}
+
+/// The guide's notes on connecting cameras: one short line per kind of
+/// source, what to type for it in small monospace.
+fn connection_notes<'a>(p: &'static Palette) -> Element<'a, Message> {
+    let note = |kind: &'static str, about: &'static str, syntax: Option<&'static str>| {
+        let mut line = row![
+            text(kind)
+                .size(style::SMALL)
+                .font(style::MEDIUM)
+                .color(p.text)
+                .width(92),
+            text(about).size(style::SMALL).color(p.secondary),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        if let Some(syntax) = syntax {
+            line = line.push(
+                text(syntax)
+                    .size(style::CAPTION)
+                    .font(style::MONO)
+                    .color(p.secondary),
+            );
+        }
+        line
+    };
+    column![
+        note(
+            "Streams",
+            "Paste an RTSP, SRT, RTMP or HTTP address.",
+            Some("rtsp://host/stream")
+        ),
+        note(
+            "Video files",
+            "Loop a file, or a folder's frames by name (not subfolders).",
+            Some("sim:replay:PATH")
+        ),
+        note("Webcams", "Built-in and USB webcams.", Some(webcam_scheme())),
+        note("GigE", "Use an address on the camera's subnet.", None).push(tip(
+            step_button("Check network", None, "Check network", Some(Message::ScanNetwork), p),
+            "Tunes connected GigE cameras for the available bandwidth and checks network adapters. Live previews may pause briefly.",
+        )),
+        note(
+            "USB3",
+            "The operating system must allow access to the camera.",
+            None
+        ),
+        text("Activity shows connection and capture errors.")
+            .size(style::SMALL)
+            .color(p.secondary),
+    ]
+    .spacing(6)
+    .into()
 }
 
 #[cfg(test)]
@@ -690,7 +764,11 @@ mod tests {
         assert!(!buttons.iter().any(|(label, _)| label == "Enter an address"));
         bench.snapshot.cameras[0].streaming = true;
         let buttons = guide_buttons(&bench);
-        assert!(buttons.iter().any(|(label, _)| label == "Capture a frame"));
+        assert!(
+            matches!(sent(&buttons, "Capture a frame"), Some(Message::Capture)),
+            "the streaming camera can capture: {:?}",
+            sent(&buttons, "Capture a frame")
+        );
         // The notes hold the network check.
         bench.sheets.more = true;
         let buttons = guide_buttons(&bench);
