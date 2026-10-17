@@ -346,7 +346,7 @@ impl FeatureScale {
             return format!("{value:.0}");
         }
         // Keep as many decimals as the camera's grid (minimum plus
-        // increments) or the slider's step needs, so a snapped 0.0625 is not
+        // increments) or the slider's snapping unit needs, so a snapped 0.0625 is not
         // sent as 0.063.
         let exact = |x: f64| {
             (0..=12)
@@ -358,14 +358,9 @@ impl FeatureScale {
         };
         let places = match self.inc.filter(|inc| *inc > 0.0 && inc.is_finite()) {
             Some(inc) => exact(inc).max(exact(self.min)),
-            None => {
-                let step = (self.max - self.min) / 100.0;
-                if step > 0.0 && step.is_finite() {
-                    (-step.log10()).ceil().max(0.0) as usize + 1
-                } else {
-                    0
-                }
-            }
+            // `snap` rounds to this unit, which shrinks with the value on
+            // a log scale.
+            None => exact(self.unit(value)).max(exact(self.min)),
         };
         let places = places.clamp(3, 12);
         let text = format!("{value:.places$}");
@@ -1364,6 +1359,14 @@ mod tests {
         );
         let coarse = FeatureScale::new("Gain", "Float", Some(0.0), Some(24.0), None).unwrap();
         assert_eq!(coarse.text(12.0), "12");
+        let log =
+            FeatureScale::new("ExposureTime", "Float", Some(0.0001), Some(100.0), None).unwrap();
+        assert_eq!(
+            log.text(log.value(0.0)),
+            "0.0001",
+            "the minimum is not zero"
+        );
+        assert_eq!(log.text(log.snap(0.000_234_5)), "0.000235");
         assert_eq!(coarse.text(0.1 + 0.2), "0.3", "no float noise");
     }
 
