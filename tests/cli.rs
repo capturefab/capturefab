@@ -2695,3 +2695,72 @@ fn log_simulator_to_csv_and_dataset() {
     assert_eq!(std::fs::read_to_string(&csv).unwrap(), text);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn dataset_with_signals_asof() {
+    let root = temp_root("dataset-signals");
+    let dir = root.join("sessions");
+    let db = root.join("d.duckdb");
+    let db_text = db.to_str().unwrap();
+    json(
+        &dir,
+        &[
+            "--json",
+            "log",
+            "sim-signal://line1",
+            "--duration",
+            "2s",
+            "--dataset",
+            db_text,
+        ],
+    );
+    json(
+        &dir,
+        &[
+            "--json",
+            "--camera",
+            "sim:0",
+            "capture",
+            "-o",
+            root.join("a.png").to_str().unwrap(),
+            "--dataset",
+            db_text,
+        ],
+    );
+    let rows = dataset_rows(
+        &dir,
+        &db,
+        "SELECT count(*), count(value_double), min(sample_age_ms) >= 0 FROM captures_with_signals",
+    );
+    assert!(rows[0][1].as_u64().unwrap() > 0, "{rows}");
+    assert_eq!(rows[0][2], true);
+    let out_dir = root.join("bundle");
+    let result = json(
+        &dir,
+        &[
+            "--json",
+            "dataset",
+            "export",
+            "--file",
+            db_text,
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--format",
+            "csv",
+        ],
+    );
+    assert_eq!(result["tables"]["captures_wide"], 1);
+    let joined = std::fs::read_to_string(out_dir.join("captures_with_signals.csv")).unwrap();
+    assert!(joined.contains("line1/"), "{joined}");
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(out_dir.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        manifest["signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["samples"].as_u64() > Some(0)),
+        "{manifest}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

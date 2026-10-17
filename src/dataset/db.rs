@@ -55,6 +55,9 @@ CREATE VIEW captures_with_signals AS
   LEFT JOIN signals g ON g.source_id = t.source_id AND g.tag = t.tag;
 ";
 
+/// New captures, new recordings, and the newest new file with its time.
+type Inserted = (usize, usize, Option<(String, u64)>);
+
 pub(crate) fn now_ms() -> u64 {
     crate::scheduling::now_ms()
 }
@@ -450,7 +453,7 @@ impl Dataset {
         let conn = &self.conn;
         conn.execute_batch("BEGIN TRANSACTION")
             .map_err(|e| explain(e, &path, "insert"))?;
-        let inserted = (|| -> Result<(usize, usize, Option<(String, u64)>)> {
+        let inserted = (|| -> Result<Inserted> {
             let (mut captures, mut recordings, mut last) = (0, 0, None);
             for item in items {
                 let name = file_label(Path::new(&item.path));
