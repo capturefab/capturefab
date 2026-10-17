@@ -335,9 +335,34 @@ impl FeatureScale {
     /// `value` as the field holds it: plain digits that parse back.
     pub(super) fn text(&self, value: f64) -> String {
         if self.integer {
-            format!("{value:.0}")
+            return format!("{value:.0}");
+        }
+        // Keep as many decimals as the camera's increment (or the slider's
+        // step) needs, so a snapped 0.0625 is not sent as 0.063.
+        let places = match self.inc.filter(|inc| *inc > 0.0 && inc.is_finite()) {
+            // The fewest decimals that write the increment exactly.
+            Some(inc) => (0..=12)
+                .find(|p| {
+                    let scaled = inc * 10f64.powi(*p);
+                    (scaled - scaled.round()).abs() < 1e-9 * scaled.max(1.0)
+                })
+                .unwrap_or(12) as usize,
+            None => {
+                let step = (self.max - self.min) / 100.0;
+                if step > 0.0 && step.is_finite() {
+                    (-step.log10()).ceil().max(0.0) as usize + 1
+                } else {
+                    0
+                }
+            }
+        };
+        let places = places.clamp(3, 12);
+        let text = format!("{value:.places$}");
+        let text = text.trim_end_matches('0').trim_end_matches('.');
+        if text == "-0" {
+            "0".into()
         } else {
-            number(value)
+            text.into()
         }
     }
 }
@@ -1298,6 +1323,22 @@ mod tests {
         }
         assert_eq!(scale.step(20.0, true), 30.0, "at least one increment");
         assert_eq!(scale.snap(150_000.0), 100_000.0);
+    }
+
+    #[test]
+    fn float_values_keep_the_precision_their_increment_needs() {
+        let fine = FeatureScale::new("Gain", "Float", Some(0.0), Some(1.0), Some(0.0625)).unwrap();
+        assert_eq!(fine.text(0.0625), "0.0625", "not rounded to 0.063");
+        assert_eq!(fine.text(fine.step(0.0, true)), "0.0625");
+        let tiny = FeatureScale::new("Gain", "Float", Some(0.0), Some(0.01), None).unwrap();
+        assert_eq!(
+            tiny.text(0.0001),
+            "0.0001",
+            "small values do not become zero"
+        );
+        let coarse = FeatureScale::new("Gain", "Float", Some(0.0), Some(24.0), None).unwrap();
+        assert_eq!(coarse.text(12.0), "12");
+        assert_eq!(coarse.text(0.1 + 0.2), "0.3", "no float noise");
     }
 
     #[test]
