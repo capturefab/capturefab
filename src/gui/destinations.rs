@@ -51,6 +51,8 @@ mod confirmation_tests;
 mod form_tests;
 #[cfg(test)]
 pub(super) mod layout_tests;
+mod naming_presets;
+pub use naming_presets::Naming;
 static SECRET_WRITES: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 static NEXT_SECRET_WRITE: AtomicU64 = AtomicU64::new(1);
 
@@ -477,7 +479,6 @@ impl Editor {
                 editor.keep_local = bucket.keep_local;
                 editor.no_overwrite = bucket.no_overwrite;
                 editor.provider = provider_of(&bucket.endpoint);
-                editor.advanced = editor.custom_advanced();
                 match &bucket.credentials {
                     Credentials::Keychain { access_key_id } => {
                         editor.access_key_id = access_key_id.clone();
@@ -494,6 +495,7 @@ impl Editor {
                     }
                     Credentials::Environment => editor.source = Source::Environment,
                 }
+                editor.advanced = editor.custom_advanced();
             }
         }
         editor
@@ -543,7 +545,15 @@ impl Editor {
     /// Whether the Advanced fields differ from what a new bucket of this
     /// service starts with, so they show without being asked for.
     fn custom_advanced(&self) -> bool {
-        self.prefix != DEFAULT_PREFIX || self.path_style != PROVIDERS[self.provider].3
+        self.prefix != DEFAULT_PREFIX
+            || self.path_style != PROVIDERS[self.provider].3
+            || self.source != Source::Keychain
+            || (self.region_advanced() && self.region != PROVIDERS[self.provider].2)
+    }
+
+    /// Whether the region is under Advanced: Cloudflare R2 takes "auto".
+    fn region_advanced(&self) -> bool {
+        self.provider == 1
     }
 
     /// The access key ID changed at `at`: whether the keychain holds its
@@ -714,7 +724,12 @@ impl Editor {
         if problems.is_empty() {
             self.message = Some((capitalize(&message), true));
         } else {
-            self.advanced |= problems.iter().any(|(field, _)| *field == Field::Prefix);
+            // A refused field under Advanced opens it.
+            self.advanced |= problems.iter().any(|(field, _)| match field {
+                Field::Prefix | Field::Profile => true,
+                Field::Region => self.region_advanced(),
+                _ => false,
+            });
             self.invalid = problems;
             self.message = None;
         }
@@ -1026,6 +1041,8 @@ pub enum Message {
     Redo,
     Select(Choice),
     Output(String),
+    /// Name captured files with a preset, or show the template to edit.
+    Naming(Naming),
     BrowseOutput,
     UseVolume(usize),
     OpenManager,
@@ -1107,6 +1124,9 @@ pub struct Picker {
     remember: bool,
     /// Files are recordings, not stills; changes a few labels.
     recording: bool,
+    /// "Custom pattern…" was chosen, or the template typed, so the output
+    /// field shows even for a preset's template. Never remembered.
+    custom_naming: bool,
     changes: Vec<Change>,
     saving_context: Option<SaveContext>,
     replay: Option<Replay>,
@@ -1154,6 +1174,7 @@ impl Picker {
             focus: None,
             remember,
             recording,
+            custom_naming: false,
             changes: Vec::new(),
             saving_context: None,
             replay: None,
@@ -1575,6 +1596,74 @@ impl Picker {
         self.saved.iter().find(|d| &d.name == name)
     }
 
+    /// The folder and preset `output` names its files with; `Custom` for
+    /// recordings and hand-edited templates.
+    fn naming_of(&self, output: &str) -> (Option<PathBuf>, Naming) {
+        match naming_presets::extension(output).filter(|_| !self.recording) {
+            Some(ext) => naming_presets::split(output, ext),
+            None => (None, Naming::Custom),
+        }
+    }
+
+    /// `output` with its files named by `naming`, keeping its folder and
+    /// extension. A hand-edited template keeps the folder before its file
+    /// name when that holds no placeholder, else the default folder.
+    fn with_naming(&self, output: &str, naming: Naming) -> String {
+        if naming == Naming::Custom {
+            return output.into();
+        }
+        let ext = naming_presets::extension(output).unwrap_or("png");
+        let folder = match self.naming_of(output) {
+            (folder, preset) if preset != Naming::Custom => folder,
+            _ => {
+                let path = Path::new(output);
+                // Without an extension, the output is a folder of frames.
+                let folder = if naming_presets::extension(output).is_some() {
+                    path.parent()
+                } else {
+                    Some(path)
+                }
+                .filter(|f| !f.as_os_str().is_empty() && !f.to_string_lossy().contains(['{', '}']))
+                .map(Path::to_path_buf);
+                match self.selected {
+                    None => folder
+                        .filter(|f| f.is_absolute())
+                        .or_else(|| Some(super::prefs::capture_root())),
+                    Some(_) => folder.filter(|f| !f.is_absolute()),
+                }
+            }
+        };
+        naming_presets::join(folder.as_deref(), naming, ext)
+    }
+
+    /// What choosing `naming` under "File names" sends. A preset changes
+    /// the output as typing does, so the app's undo history records it.
+    fn naming_message(&self, output: &str, naming: Naming) -> Message {
+        match self.with_naming(output, naming) {
+            changed if naming != Naming::Custom && changed != output => Message::Output(changed),
+            _ => Message::Naming(naming),
+        }
+    }
+
+    /// The output after choosing `folder` with "Choose…": a preset keeps its
+    /// dated folders and file names, anything else keeps its file name.
+    fn browsed(&self, output: &str, folder: &Path) -> String {
+        match self.naming_of(output) {
+            (_, Naming::Custom) => {
+                let name = Path::new(output)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "capture.png".into());
+                folder.join(name).to_string_lossy().into_owned()
+            }
+            (_, naming) => naming_presets::join(
+                Some(folder),
+                naming,
+                naming_presets::extension(output).unwrap_or("png"),
+            ),
+        }
+    }
+
     /// The editor saved `name`: back to the list, due to reload, with its
     /// row glowing, and chosen.
     fn saved_as(&mut self, name: String, output: &mut String) {
@@ -1591,7 +1680,10 @@ impl Picker {
         let local_during_replay = self.replay.is_some()
             && matches!(
                 message,
-                Message::Output(_) | Message::Select(_) | Message::BrowseOutput
+                Message::Output(_)
+                    | Message::Naming(_)
+                    | Message::Select(_)
+                    | Message::BrowseOutput
             );
         if self.mutation_busy()
             && !local_during_replay
@@ -1606,9 +1698,29 @@ impl Picker {
             Message::Redo => {
                 self.redo();
             }
-            Message::Select(choice) => self.select(choice.name, output),
+            Message::Select(choice) => {
+                if choice.name != self.selected {
+                    self.custom_naming = false;
+                }
+                self.select(choice.name, output);
+            }
             Message::Output(value) => {
+                if value != *output {
+                    // A preset chosen under "File names" hides the field;
+                    // typing never does, so the field never vanishes under
+                    // the caret.
+                    let chosen = !single_edit(output, &value)
+                        && Naming::PRESETS
+                            .iter()
+                            .any(|&naming| self.with_naming(output, naming) == value);
+                    self.custom_naming = !chosen;
+                }
                 *output = value;
+                self.select(self.selected.clone(), output);
+            }
+            Message::Naming(naming) => {
+                self.custom_naming = naming == Naming::Custom;
+                *output = self.with_naming(output, naming);
                 self.select(self.selected.clone(), output);
             }
             Message::BrowseOutput => {
@@ -1620,11 +1732,7 @@ impl Picker {
                         self.notice = Some((folder_encoding_error().into(), true));
                         return;
                     }
-                    let name = Path::new(output.as_str())
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "capture.png".into());
-                    *output = folder.join(name).to_str().unwrap().to_owned();
+                    *output = self.browsed(output, &folder);
                 }
             }
             Message::UseVolume(index) => {
@@ -1989,75 +2097,138 @@ impl Picker {
             content = content.push(self.drive_shortcuts(p));
         }
         let (local_example, named_example) = if self.recording {
-            ("rtsp://host:8554/camera or recording.mkv", "recording.mkv")
+            ("recording.mp4", "recording.mkv")
         } else {
             ("capture.png", "capture.png")
         };
-        match self.selected_destination() {
-            None => {
-                content = content
-                    .push(space().height(4))
-                    .push(labeled(
-                        local_label,
-                        super::tip(
-                            label_action("Choose…", Message::BrowseOutput),
-                            "Choose a folder",
-                        ),
-                        p,
-                    ))
-                    .push(
-                        text_input(local_example, output)
-                            .name(local_label)
-                            .invalid(output_error.clone())
-                            .id(if self.recording {
-                                "record-output"
-                            } else {
-                                "capture-output"
-                            })
-                            .on_input(Message::Output)
-                            .size(style::BODY)
-                            .padding([6, 10])
-                            .style(if output_error.is_some() {
-                                style::input_invalid
-                            } else {
-                                style::input
-                            }),
-                    );
+        let (folder, naming) = self.naming_of(output);
+        let shown = if self.custom_naming {
+            Naming::Custom
+        } else {
+            naming
+        };
+        let destination = self.selected_destination();
+        // Stills name their files with a preset; the template shows when it
+        // is chosen, hand-edited or refused. Recordings keep their field.
+        let simple = !self.recording
+            && shown != Naming::Custom
+            && output_error.is_none()
+            && (destination.is_some() || folder.as_deref().is_some_and(Path::is_absolute));
+        let input = |placeholder: &'a str, name: &'a str| {
+            text_input(placeholder, output)
+                .name(name)
+                .invalid(output_error.clone())
+                .id(if self.recording {
+                    "record-output"
+                } else {
+                    "capture-output"
+                })
+                .on_input(Message::Output)
+                .size(style::BODY)
+                .padding([6, 10])
+                .style(if output_error.is_some() {
+                    style::input_invalid
+                } else {
+                    style::input
+                })
+        };
+        content = content.push(space().height(4));
+        if self.recording {
+            // Recordings keep their field: a stream URL or a file name.
+            match destination {
+                None => {
+                    content = content
+                        .push(labeled(
+                            local_label,
+                            super::tip(
+                                label_action("Choose…", Message::BrowseOutput),
+                                "Choose a folder",
+                            ),
+                            p,
+                        ))
+                        .push(input(local_example, local_label));
+                }
+                Some(destination) => {
+                    content = content
+                        .push(label("Recording file name in destination", p))
+                        .push(input(named_example, "Recording file name in destination"))
+                        .push(self.summary(destination, p));
+                }
             }
-            Some(destination) => {
-                content = content
-                    .push(space().height(4))
-                    .push(label(
-                        if self.recording {
-                            "Recording file name in destination"
-                        } else {
-                            "Name in destination (file, folder or {frame} template)"
-                        },
-                        p,
-                    ))
-                    .push(
-                        text_input(named_example, output)
-                            .name(if self.recording {
-                                "Recording file name in destination"
-                            } else {
-                                "Capture name in destination"
-                            })
-                            .invalid(output_error.clone())
-                            .id(if self.recording {
-                                "record-output"
-                            } else {
-                                "capture-output"
-                            })
-                            .on_input(Message::Output)
-                            .size(style::BODY)
-                            .padding([6, 10])
-                            .style(if output_error.is_some() {
-                                style::input_invalid
-                            } else {
-                                style::input
-                            }),
-                    )
-                    .push(self.summary(destination, p));
+        } else {
+            // The choice stays on the first line, as tall as the label line
+            // it replaces, so the lines under it change without moving it.
+            content = content.push(
+                row![
+                    label("File names", p),
+                    super::tip(
+                        pick_list(
+                            &Naming::ALL[..],
+                            Some(if simple { shown } else { Naming::Custom }),
+                            move |naming| self.naming_message(output, naming),
+                        )
+                        .name("File names")
+                        .width(Fill)
+                        .text_size(style::SMALL)
+                        .padding([1, 6])
+                        .style(style::pick)
+                        .menu_style(style::menu),
+                        "How captured files are named. By date, camera and time is recommended.",
+                    ),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+            // The template, with what it may hold in its tooltip.
+            let template = |placeholder: &'a str, name: &'a str| {
+                super::tip(
+                    input(placeholder, name),
+                    "Placeholders: {camera} {date} {time} {datetime} {frame} {seq}",
+                )
+            };
+            match destination {
+                None if simple => {
+                    let folder = folder.unwrap_or_default();
+                    content = content.push(
+                        row![
+                            label("Folder", p),
+                            super::tip(
+                                one_line(home_short(&folder), style::SMALL, style::SANS, p.text)
+                                    .width(Fill),
+                                folder.display(),
+                            ),
+                            super::tip(
+                                label_action("Choose…", Message::BrowseOutput),
+                                "Choose a folder",
+                            ),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    );
+                }
+                None => {
+                    content = content.push(
+                        row![
+                            template(local_example, local_label),
+                            super::tip(
+                                button(icon(Icon::Folder, 15.0, p.secondary))
+                                    .padding(6)
+                                    .style(style::plain)
+                                    .on_press(Message::BrowseOutput),
+                                "Choose a folder",
+                            ),
+                        ]
+                        .spacing(4)
+                        .align_y(Alignment::Center),
+                    );
+                }
+                Some(destination) => {
+                    if !simple {
+                        content =
+                            content.push(template(named_example, "Capture name in destination"));
+                    }
+                    content = content.push(self.summary(destination, p));
+                }
             }
         }
         if let Some(error) = output_error {
@@ -2070,19 +2241,31 @@ impl Picker {
     fn drive_shortcuts(&self, p: &'static Palette) -> Element<'_, Message> {
         let mut content = column![].spacing(6);
         if !self.volumes.is_empty() {
-            let drives = self
+            let current = match self.selected_destination().map(|d| &d.target) {
+                Some(Target::Folder { path }) => Some(path),
+                _ => None,
+            };
+            let mut chips = self
                 .volumes
                 .iter()
                 .enumerate()
-                .fold(row![], |drives, (index, volume)| {
+                .map(|(index, volume)| {
                     let (glyph, kind) = if volume.kind == "network" {
                         (Icon::Network, "network")
                     } else {
                         (Icon::HardDrives, "external")
                     };
-                    drives.push(super::tip(
+                    // The drive saved to now; pressing it again reselects it.
+                    let chosen =
+                        current.is_some_and(|path| *path == volume.path.join("Capturefab"));
+                    super::tip(
                         button(
                             row![
+                                icon(
+                                    if chosen { Icon::Check } else { Icon::Plus },
+                                    12.0,
+                                    if chosen { p.ink(p.accent) } else { p.secondary },
+                                ),
                                 icon(glyph, 12.0, p.secondary),
                                 text(format!(
                                     "{} · {} free",
@@ -2095,7 +2278,8 @@ impl Picker {
                             .align_y(Alignment::Center),
                         )
                         .padding([4, 8])
-                        .style(style::secondary)
+                        .style(style::toggle(chosen))
+                        .selected(chosen)
                         .on_press(Message::UseVolume(index)),
                         format!(
                             "Save to a Capturefab folder on this {kind} drive: {} ({} of {} free)",
@@ -2103,9 +2287,32 @@ impl Picker {
                             bytes(volume.free_bytes),
                             bytes(volume.total_bytes)
                         ),
-                    ))
-                });
-            content = content.push(drives.spacing(6).wrap().vertical_spacing(6));
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_iter();
+            // The lead shares the first chip's line, cut short before the
+            // chip is, so it never adds a line of its own.
+            let first = chips.next().expect("a drive");
+            content = content.push(
+                row![
+                    one_line(
+                        "Or save to a drive:",
+                        style::SMALL,
+                        style::SANS,
+                        p.secondary
+                    )
+                    .yield_room(),
+                    first,
+                ]
+                .spacing(6)
+                .width(Fill)
+                .align_y(Alignment::Center),
+            );
+            let rest = chips.fold(row![], |drives, chip| drives.push(chip));
+            if self.volumes.len() > 1 {
+                content = content.push(rest.spacing(6).wrap().vertical_spacing(6));
+            }
         }
         content.into()
     }
@@ -2346,7 +2553,7 @@ impl Picker {
         let mut body = column![
             history_controls(undo_label, redo_label, p),
             text(
-                "Save captures and recordings to a folder or drive, or upload them to an S3 bucket. FTP and SFTP servers are added from the command line with capturefab destination add-ftp or add-sftp."
+                "Save captures and recordings to a folder or drive, or upload them to an S3 bucket."
             )
             .size(style::SMALL)
             .color(p.secondary),
@@ -2375,6 +2582,7 @@ impl Picker {
                             Message::AddBucket,
                             p,
                         ),
+                        server_note(p),
                     ]
                     .spacing(8),
                 ),
@@ -2383,22 +2591,30 @@ impl Picker {
         let rows = self.saved.iter().fold(column![].spacing(2), |rows, d| {
             rows.push(self.row(d, p, now))
         });
-        let add = |glyph, label, on| {
+        let add = |glyph, label: &'static str, on| {
             button(
                 row![icon(glyph, 14.0, p.text), text(label).size(style::BODY)]
                     .spacing(6)
                     .align_y(Alignment::Center),
             )
+            .name(label)
             .padding([7, 12])
             .style(style::secondary)
             .on_press(on)
         };
         frame(body.push(rows)).footer(
-            row![
-                add(Icon::FolderPlus, "Add folder…", Message::AddFolder),
-                add(Icon::CloudArrowUp, "Add S3 bucket…", Message::AddBucket),
+            column![
+                row![
+                    add(Icon::FolderPlus, "Add folder…", Message::AddFolder),
+                    super::tip(
+                        add(Icon::CloudArrowUp, "Add S3 bucket…", Message::AddBucket),
+                        "Amazon S3, Cloudflare R2, Backblaze B2, MinIO and other S3-compatible services",
+                    ),
+                ]
+                .spacing(8),
+                server_note(p),
             ]
-            .spacing(8),
+            .spacing(6),
         )
     }
 
@@ -2436,10 +2652,12 @@ impl Picker {
                 // action the button reads as a caption.
                 button(text("Edit with CLI").size(style::SMALL))
                     .name(format!("{SERVER_EDIT_HINT} {name}"))
+                    .description(destination.describe())
                     .style(style::link)
             } else {
                 button(text("Edit…").size(style::SMALL))
                     .name(format!("Edit destination {name}"))
+                    .description(destination.describe())
                     .style(style::link)
                     .on_press(Message::Edit(name))
             };
@@ -2452,13 +2670,13 @@ impl Picker {
                 .font(style::SEMIBOLD),
             super::tip(
                 one_line(
-                    description.clone(),
+                    row_summary(destination),
                     style::CAPTION,
                     style::SANS,
                     p.secondary
                 )
                 .width(Fill),
-                description,
+                description.clone(),
             ),
         ]
         .spacing(2)
@@ -2566,24 +2784,18 @@ impl Picker {
                 ),
             ),
         );
-        let status_visible = !saving && editor.testing.is_none() && editor.message.is_some();
-        let full_status: Element<'a, Message> = if !saving
-            && editor.testing.is_none()
-            && let Some((message, error)) = &editor.message
-        {
-            // Full service/path errors remain readable in the scroll body;
-            // they must not consume the pinned actions' entire viewport.
-            status(
-                message.clone(),
-                if *error { Status::Failed } else { Status::Done },
-                spin,
-                p,
-            )
-        } else {
-            space().into()
-        };
-        let mut form =
-            column![history_controls(self.undo_label(), self.redo_label(), p)].spacing(10);
+        // A success fits the footer; only a problem repeats in full.
+        let status_visible =
+            !saving && editor.testing.is_none() && matches!(editor.message, Some((_, true)));
+        let full_status: Element<'a, Message> =
+            if status_visible && let Some((message, _)) = &editor.message {
+                // Full service/path errors remain readable in the scroll body;
+                // they must not consume the pinned actions' entire viewport.
+                status(message.clone(), Status::Failed, spin, p)
+            } else {
+                space().into()
+            };
+        let mut form = column![].spacing(10);
         if editor.s3 {
             form = form.push(field(
                 "Service",
@@ -2616,72 +2828,66 @@ impl Picker {
                     ),
                 ));
             }
-            form = form
-                .push(checked(
-                    Field::Bucket,
-                    field(
-                        "Bucket",
-                        input(
-                            "bucket-name",
-                            &editor.bucket,
-                            Message::Bucket,
-                            Field::Bucket,
-                        )
-                        .id(BUCKET_FIELD)
-                        .into(),
-                    ),
-                ))
-                .push(checked(
+            form = form.push(checked(
+                Field::Bucket,
+                field(
+                    "Bucket",
+                    input(
+                        "bucket-name",
+                        &editor.bucket,
+                        Message::Bucket,
+                        Field::Bucket,
+                    )
+                    .id(BUCKET_FIELD)
+                    .into(),
+                ),
+            ));
+            // Cloudflare R2 takes "auto", so its region waits under Advanced.
+            let region_advanced = editor.region_advanced();
+            let region = || {
+                checked(
                     Field::Region,
                     field(
                         "Region",
                         input("us-east-1", &editor.region, Message::Region, Field::Region).into(),
                     ),
-                ))
-                .push(field(
-                    "Credentials",
-                    pick_list(&Source::ALL[..], Some(editor.source), Message::Source)
-                        .name("Credentials source")
-                        .enabled(editable)
-                        .width(Fill)
-                        .text_size(style::BODY)
-                        .padding([6, 10])
-                        .style(style::pick)
-                        .menu_style(style::menu)
-                        .into(),
-                ));
-            form = match editor.source {
-                Source::Keychain => {
-                    let mut secret = row![
-                        text_input(
-                            if editor.stored_secret {
-                                "Type to replace"
-                            } else {
-                                "Secret access key"
-                            },
-                            &editor.secret,
-                        )
-                        .name("S3 secret access key")
-                        .invalid(editor.refusal(Field::Secret).map(str::to_owned))
-                        .on_input_maybe(editable.then_some(Message::Secret))
-                        .on_submit_maybe(can_save.then_some(Message::Save))
-                        .secure(true)
-                        .size(style::BODY)
-                        .padding([6, 10])
-                        .style(
-                            if editor.refusal(Field::Secret).is_some() {
-                                style::input_invalid
-                            } else {
-                                style::input
-                            }
-                        )
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Center);
-                    if editor.stored_secret {
-                        secret = secret.push(stored_badge(p));
-                    }
-                    form.push(checked(
+                )
+            };
+            if !region_advanced {
+                form = form.push(region());
+            }
+            // An access key is the usual way in; a profile or the environment
+            // are chosen under Advanced.
+            if editor.source == Source::Keychain {
+                let mut secret = row![
+                    text_input(
+                        if editor.stored_secret {
+                            "Type to replace"
+                        } else {
+                            "Secret access key"
+                        },
+                        &editor.secret,
+                    )
+                    .name("S3 secret access key")
+                    .invalid(editor.refusal(Field::Secret).map(str::to_owned))
+                    .on_input_maybe(editable.then_some(Message::Secret))
+                    .on_submit_maybe(can_save.then_some(Message::Save))
+                    .secure(true)
+                    .size(style::BODY)
+                    .padding([6, 10])
+                    .style(if editor.refusal(Field::Secret).is_some() {
+                        style::input_invalid
+                    } else {
+                        style::input
+                    })
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center);
+                if editor.stored_secret {
+                    secret = secret.push(stored_badge(p));
+                }
+                form = form
+                    .push(checked(
                         Field::AccessKey,
                         field(
                             "Access key ID",
@@ -2695,23 +2901,8 @@ impl Picker {
                         ),
                     ))
                     .push(checked(Field::Secret, field("Secret key", secret.into())))
-                    .push(field("", caption(KEYCHAIN_NOTE, p)))
-                }
-                Source::Profile => form.push(checked(
-                    Field::Profile,
-                    field(
-                        "Profile",
-                        input("default", &editor.profile, Message::Profile, Field::Profile).into(),
-                    ),
-                )),
-                Source::Environment => form.push(field(
-                    "",
-                    caption(
-                        "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY of the process that uploads",
-                        p,
-                    ),
-                )),
-            };
+                    .push(field("", caption(KEYCHAIN_NOTE, p)));
+            }
             let open = editor.advanced;
             form = form
                 .push(name)
@@ -2735,14 +2926,16 @@ impl Picker {
                     .push(checked(
                         Field::Prefix,
                         field(
-                            "Key prefix",
-                            input(
-                                "cameras/line-1/",
-                                &editor.prefix,
-                                Message::Prefix,
-                                Field::Prefix,
-                            )
-                            .into(),
+                            "Folder in bucket",
+                            super::tip(
+                                input(
+                                    "cameras/line-1/",
+                                    &editor.prefix,
+                                    Message::Prefix,
+                                    Field::Prefix,
+                                ),
+                                "S3 key prefix; files are uploaded under it",
+                            ),
                         ),
                     ))
                     .push(field(
@@ -2756,6 +2949,39 @@ impl Picker {
                             "Needed by MinIO and most non-AWS services",
                         ),
                     ));
+                if region_advanced {
+                    form = form.push(region());
+                }
+                form = form.push(field(
+                    "Credentials",
+                    pick_list(&Source::ALL[..], Some(editor.source), Message::Source)
+                        .name("Credentials source")
+                        .enabled(editable)
+                        .width(Fill)
+                        .text_size(style::BODY)
+                        .padding([6, 10])
+                        .style(style::pick)
+                        .menu_style(style::menu)
+                        .into(),
+                ));
+                form = match editor.source {
+                    Source::Keychain => form,
+                    Source::Profile => form.push(checked(
+                        Field::Profile,
+                        field(
+                            "Profile",
+                            input("default", &editor.profile, Message::Profile, Field::Profile)
+                                .into(),
+                        ),
+                    )),
+                    Source::Environment => form.push(field(
+                        "",
+                        caption(
+                            "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY of the process that uploads",
+                            p,
+                        ),
+                    )),
+                };
             }
         } else {
             form = form.push(name).push(checked(
@@ -2808,8 +3034,14 @@ impl Picker {
             .style(style::primary)
             .on_press_maybe(can_save.then_some(Message::Save));
         let (first, second) = super::widgets::dialog_actions(cancel, save, false);
-        let footer = row![
-            super::tip(
+        let mut footer = row![];
+        // Shown once there is something to undo, and kept while a save
+        // briefly disables them, so Test never shifts under the pointer.
+        if !editor.history.undo.is_empty() || !editor.history.redo.is_empty() {
+            footer = footer.extend(history_buttons(self.undo_label(), self.redo_label()));
+        }
+        let footer = footer
+            .push(super::tip(
                 button(text("Test").size(style::BODY))
                     .padding([7, 14])
                     .style(style::secondary)
@@ -2819,13 +3051,12 @@ impl Picker {
                 } else {
                     "Check that the folder can be written to"
                 },
-            ),
-            container(outcome).width(Fill).padding([0, 4]),
-            first,
-            second,
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
+            ))
+            .push(container(outcome).width(Fill).padding([0, 4]))
+            .push(first)
+            .push(second)
+            .spacing(8)
+            .align_y(Alignment::Center);
         let title = match &editor.original {
             Some(name) => format!("Edit {name}"),
             None if editor.s3 => "New S3 bucket".into(),
@@ -2848,8 +3079,13 @@ impl Picker {
     /// saves them in the session folder, so give the screenshot its own),
     /// `folder-editor`, `bucket-editor` (filled in, its secret stored and
     /// checked) and `testing` (after an editor word: its check never ends).
+    /// `capture-custom` shows the capture panel's template field instead.
     pub(super) fn scene(&mut self, word: &str) -> bool {
         match word {
+            "capture-custom" => {
+                self.custom_naming = true;
+                return true;
+            }
             "destinations-list" | "destinations-remove" => {
                 for (name, target) in [
                     (
@@ -2955,6 +3191,50 @@ fn caption<'a>(value: &'a str, p: &'static Palette) -> Element<'a, Message> {
     text(value).size(style::CAPTION).color(p.secondary).into()
 }
 
+/// Whether `after` is `before` with at most one character typed, deleted
+/// or replaced, as one keystroke in a field changes it.
+fn single_edit(before: &str, after: &str) -> bool {
+    let (before, after): (Vec<char>, Vec<char>) =
+        (before.chars().collect(), after.chars().collect());
+    let prefix = before
+        .iter()
+        .zip(&after)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let (before, after) = (&before[prefix..], &after[prefix..]);
+    let suffix = before
+        .iter()
+        .rev()
+        .zip(after.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    before.len() - suffix <= 1 && after.len() - suffix <= 1
+}
+
+/// The user's home folder, where it is written `~`.
+fn home() -> Option<PathBuf> {
+    if cfg!(windows) {
+        return None;
+    }
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .filter(|home| home.parent().is_some())
+}
+
+/// `path` with the home folder shown as `~`.
+fn home_short(path: &Path) -> String {
+    tilde(path, home().as_deref())
+}
+
+fn tilde(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
 /// What a status line reports.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Status {
@@ -2969,6 +3249,10 @@ fn history_controls<'a>(
     _p: &'static Palette,
 ) -> Element<'a, Message> {
     use super::keys::{Action, Os};
+    // Nothing to undo or redo: no disabled stops for Tab to land on.
+    if undo_label.is_none() && redo_label.is_none() {
+        return space().into();
+    }
     let control = |action: Action, label: Option<&str>, on: Message, word: &str| {
         let description = label
             .map(|label| format!("{word} {label}"))
@@ -2989,6 +3273,31 @@ fn history_controls<'a>(
     ]
     .spacing(8)
     .into()
+}
+
+/// The editor footer's compact Undo and Redo, each enabled while it has a
+/// change to replay; their tooltips name it and the shortcut.
+fn history_buttons<'a>(
+    undo_label: Option<&str>,
+    redo_label: Option<&str>,
+) -> [Element<'a, Message>; 2] {
+    use super::keys::{Action, Os};
+    let control = |action: Action, label: Option<&str>, on: Message, word: &'static str| {
+        let description = label
+            .map(|label| format!("{word} {label}"))
+            .unwrap_or_else(|| format!("Nothing to {}", word.to_lowercase()));
+        super::tip(
+            button(text(word).size(style::BODY))
+                .padding([7, 10])
+                .style(style::plain)
+                .on_press_maybe(label.map(|_| on)),
+            action.hint(&description, Os::CURRENT),
+        )
+    };
+    [
+        control(Action::Undo, undo_label, Message::Undo, "Undo"),
+        control(Action::Redo, redo_label, Message::Redo, "Redo"),
+    ]
 }
 
 /// An outcome in the toolbar's manner: a glyph, then the text. `spin` steps
@@ -3080,6 +3389,34 @@ fn choice<'a>(
     .into()
 }
 
+/// Where FTP and SFTP servers are added, under the manager's add actions.
+fn server_note<'a>(p: &'static Palette) -> Element<'a, Message> {
+    text("FTP and SFTP servers: capturefab destination add-ftp or add-sftp")
+        .size(style::CAPTION)
+        .color(p.secondary)
+        .into()
+}
+
+/// A saved destination's line under its name in the manager, in plain
+/// words; `Destination::describe` stays in its tooltip.
+fn row_summary(destination: &Destination) -> String {
+    match &destination.target {
+        Target::S3(bucket) => format!(
+            "{} · {}/{}{}",
+            PROVIDERS[provider_of(&bucket.endpoint)].0,
+            bucket.bucket,
+            bucket.prefix,
+            if bucket.keep_local {
+                " · keeps local copies"
+            } else {
+                ""
+            }
+        ),
+        Target::Folder { path } => home_short(path),
+        Target::Ftp(_) | Target::Sftp(_) => destination.describe(),
+    }
+}
+
 /// Says that the credential store holds the access key's secret.
 fn stored_badge<'a>(p: &'static Palette) -> Element<'a, Message> {
     super::tip(
@@ -3104,15 +3441,22 @@ fn stored_badge<'a>(p: &'static Palette) -> Element<'a, Message> {
 
 /// The Advanced group's values, shown while it is closed.
 fn advanced_summary(editor: &Editor) -> String {
-    let prefix = match editor.prefix.as_str() {
-        "" => "No key prefix",
-        prefix => prefix,
+    let mut summary = match editor.prefix.as_str() {
+        "" => "No folder".to_string(),
+        prefix => format!("Folder {prefix}"),
     };
     if editor.path_style {
-        format!("{prefix} · path-style")
-    } else {
-        prefix.into()
+        summary.push_str(" · path-style");
     }
+    match editor.source {
+        Source::Keychain => {}
+        Source::Profile => summary.push_str(&format!(" · AWS profile {}", editor.profile.trim())),
+        Source::Environment => summary.push_str(" · environment credentials"),
+    }
+    if editor.region_advanced() && editor.region != PROVIDERS[editor.provider].2 {
+        summary.push_str(&format!(" · region {}", editor.region.trim()));
+    }
+    summary
 }
 
 fn folder_encoding_error() -> &'static str {
@@ -3941,7 +4285,7 @@ mod tests {
         assert!(!bucket(|_| {}).custom_advanced());
         assert_eq!(
             advanced_summary(&bucket(|e| e.path_style = true)),
-            "capturefab/ · path-style"
+            "Folder capturefab/ · path-style"
         );
     }
 
