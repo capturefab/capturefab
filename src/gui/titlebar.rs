@@ -992,10 +992,10 @@ impl Workbench {
         let (tint, reveal) = self.live_level();
         let on = phase.state().color(p);
         let (recordings, recorders) = record_counts(&snapshot.cameras);
-        let record_label = if recordings > 0 {
-            "Stop recordings"
-        } else {
-            "Record all"
+        let record_label = match recordings {
+            0 => "Record all",
+            1 => "Stop recording",
+            _ => "Stop recordings",
         };
         let auto_on = snapshot.cameras.iter().filter(|c| c.auto.is_some()).count();
         let auto_total = snapshot
@@ -1111,14 +1111,18 @@ impl Workbench {
                         Icon::Video
                     },
                     record_label,
-                    fit.record_label,
+                    // A running recording keeps its words, so its stop never
+                    // reads as the bare stop beside "Stop all".
+                    fit.record_label || recordings > 0,
                     record_busy,
                     (recordings > 0 || recorders > 0)
                         .then_some(Message::AllRecord(recordings == 0)),
                 ),
                 if record_busy {
                     "Updating recordings…"
-                } else if recordings > 0 {
+                } else if recordings == 1 {
+                    "Stop the recording and finish its file"
+                } else if recordings > 1 {
                     "Stop every recording and finish its file"
                 } else {
                     "Record every camera to its own file on this computer"
@@ -1197,10 +1201,12 @@ impl Workbench {
         let chrome = 3.0 * 28.0 + 3.0 * 8.0 + 2.0 * 10.0;
         let heading = rough("All cameras", style::TITLE);
         let pill = 32.0 + rough(word, style::SMALL);
+        // While recording, the record button always keeps its words.
+        let recording = record != "Record all";
         OverviewWidths {
-            base: chrome + heading + pill + actions,
+            base: chrome + heading + pill + actions + if recording { worded(record) } else { 0.0 },
             auto_label: auto_width(true) - auto_width(false),
-            record_label: worded(record),
+            record_label: if recording { 0.0 } else { worded(record) },
             capture_label: worded("Capture all"),
             figure: live_width(false, Some(&format!("{total} of {total}")), None),
         }
@@ -1611,6 +1617,9 @@ mod tests {
             }
         }
         bench.snapshot.cameras[0].forwarding = Some("/tmp/a.mp4".into());
+        let names = bar_names(&bench, 700.0);
+        assert!(names.iter().any(|n| n == "Stop recording"), "{names:?}");
+        bench.snapshot.cameras[1].forwarding = Some("/tmp/b.mp4".into());
         let names = bar_names(&bench, 700.0);
         assert!(names.iter().any(|n| n == "Stop recordings"), "{names:?}");
     }

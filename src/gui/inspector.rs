@@ -9,6 +9,8 @@ use std::hash::{Hash, Hasher};
 /// The width of every control in the panel's forms and feature rows, so
 /// their edges line up.
 const CONTROL: f32 = 136.0;
+/// The slot a field's unit suffix takes inside CONTROL.
+const UNIT_SLOT: f32 = 22.0;
 /// The width of a unit after a control in its slot: "MiB", "days".
 const UNIT: f32 = 28.0;
 #[derive(Clone, Copy, Debug)]
@@ -1304,10 +1306,19 @@ impl Workbench {
 fn file_preview<'a>(
     label: &'static str,
     preview: &str,
+    root: &str,
     about: &str,
     p: &'static Palette,
 ) -> Element<'a, Message> {
-    let (file, folder) = split_preview(preview);
+    let (leaf, folder) = split_preview(preview);
+    // Under the chosen folder, the path from it ("2026-10-17/clip.png"), so
+    // a dated subfolder shows; else just the file name.
+    let file = (!root.is_empty())
+        .then(|| preview.strip_prefix(root))
+        .flatten()
+        .and_then(|rest| rest.strip_prefix(['/', '\\']))
+        .filter(|rest| !rest.is_empty())
+        .map_or(leaf, str::to_owned);
     let hover = if folder.is_empty() {
         format!("{preview}\n{about}")
     } else {
@@ -1642,7 +1653,7 @@ impl Workbench {
                     .align_x(Alignment::Center),
                 row![
                     link("Set up capture", Some(Message::Tab(Tab::Capture))),
-                    link("Record or stream video", Some(Message::Tab(Tab::Forward))),
+                    link("Record or forward video", Some(Message::Tab(Tab::Forward))),
                 ]
                 .spacing(4),
             ]
@@ -2056,7 +2067,7 @@ impl Workbench {
     }
 
     /// The exposure card's ways to judge the image: the histogram and, where
-    /// the image has one, the focus aid. Each says what pressing it does.
+    /// the image has one, the focus region. Each says what pressing it does.
     fn scope_links(&self) -> Element<'_, Message> {
         let os = Os::CURRENT;
         let scoped = self.intensity_image() && self.camera_kind() != CameraKind::LineScan;
@@ -2078,8 +2089,8 @@ impl Workbench {
         let mut links = row![].align_y(Alignment::Center);
         if scoped {
             // The scopes draw over a single camera, not the overview's
-            // tiles: there an open scope reads as off, and pressing it opens
-            // the selected camera, where it shows.
+            // tiles: there a scope reads as off, and pressing it turns it on
+            // and opens the selected camera, where it shows.
             let overview = self.overview();
             let camera = self.snapshot.active_camera.clone();
             let link = |shown_label: &'static str,
@@ -2087,15 +2098,17 @@ impl Workbench {
                         what: &str,
                         open: bool,
                         toggle: Message,
+                        scope: Scope,
                         action: Action| {
                 let shown = open && !overview;
-                let on = match (&camera, open && overview) {
-                    (Some(camera), true) => Message::FocusTile(camera.clone()),
+                let elsewhere = overview && camera.is_some();
+                let on = match &camera {
+                    Some(camera) if overview => Message::ShowScopeOn(camera.clone(), scope),
                     _ => toggle,
                 };
                 let hint = if shown {
                     format!("Hide the {what}")
-                } else if open && overview {
+                } else if elsewhere {
                     format!("Show the {what} on the selected camera")
                 } else {
                     format!("Show the {what}")
@@ -2112,14 +2125,16 @@ impl Workbench {
                 "histogram",
                 self.exposure_open,
                 Message::ToggleExposure,
+                Scope::Histogram,
                 Action::ToggleExposure,
             );
             let focus = link(
-                "Hide focus aid",
-                "Focus aid",
-                "focus aid",
+                "Hide focus region",
+                "Focus region",
+                "focus region",
                 self.focus.open,
                 Message::ToggleFocusRegion,
+                Scope::Focus,
                 Action::ToggleFocusRegion,
             );
             links = links.push(histogram).push(focus);
@@ -2177,6 +2192,18 @@ impl Workbench {
         let mut trailing = None;
         let read_only = !writable && !command && !locked;
         let scan = command && name == "AcquisitionStart" && self.scanner_selected();
+        // A microsecond field over a long range adds its value in ms to the
+        // caption and names its own unit in a slot beside it, inside the same
+        // CONTROL width as every other field so their right edges line up.
+        let value = self
+            .edits
+            .get(name)
+            .and_then(|draft| draft.trim().parse::<f64>().ok())
+            .or_else(|| feature.value.as_ref().and_then(|v| v.as_f64()));
+        let in_ms = (writable && !command)
+            .then(|| milliseconds_readout(feature, value))
+            .flatten();
+        let in_microseconds = in_ms.is_some() && feature.choices.is_empty();
         let control: Element<'_, Message> = if scan {
             button(text("Scan & save").size(style::SMALL))
                 .padding([4, 10])
@@ -2316,7 +2343,11 @@ impl Workbench {
                 .on_submit(Message::Commit(feature.name.clone()))
                 .size(style::SMALL)
                 .padding([5, 8])
-                .width(CONTROL)
+                .width(if in_microseconds {
+                    CONTROL - UNIT_SLOT - 4.0
+                } else {
+                    CONTROL
+                })
                 .align_x(Alignment::End)
                 .style(move |theme, status| match edit {
                     Edit::Refused => style::input_invalid(theme, status),
@@ -2331,21 +2362,14 @@ impl Workbench {
                 "Editing it switches the camera to manual",
             ));
         }
-        let mut in_microseconds = false;
         if writable && !command {
-            // A microsecond field reads in milliseconds, value and range
-            // alike, as typed; anything else gives its range in its unit.
-            let value = self
-                .edits
-                .get(name)
-                .and_then(|draft| draft.trim().parse::<f64>().ok())
-                .or_else(|| feature.value.as_ref().and_then(|v| v.as_f64()));
-            let readout = match milliseconds_readout(feature, value) {
-                Some(readout) => {
-                    in_microseconds = feature.choices.is_empty();
-                    readout
-                }
-                None => range_text(feature),
+            // The range stays in the field's own unit; a µs field adds its
+            // value in ms as an explicit conversion: "= 10 ms · 10 – … µs".
+            let range = range_text(feature);
+            let readout = match in_ms {
+                Some(ms) if range.is_empty() => ms,
+                Some(ms) => format!("{ms} · {range}"),
+                None => range,
             };
             if !readout.is_empty() {
                 notes.push(note(readout, p.secondary));
@@ -2358,12 +2382,15 @@ impl Workbench {
         } else {
             tip(label, about)
         };
-        // The caption reads in ms, so the field names its own unit.
+        // The caption converts to ms, so the field names its own unit.
         let control: Element<'_, Message> = if in_microseconds {
-            row![control, text("µs").size(style::SMALL).color(p.secondary)]
-                .spacing(4)
-                .align_y(Alignment::Center)
-                .into()
+            row![
+                control,
+                container(text("µs").size(style::SMALL).color(p.secondary)).width(UNIT_SLOT)
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .into()
         } else {
             control
         };
@@ -2581,6 +2608,7 @@ impl Workbench {
         action = action.push(file_preview(
             "Next file",
             &self.output_preview(),
+            &self.fixed_folder(&self.output).unwrap_or_default(),
             "{camera}, {date}, {time}, {datetime} and {frame} fill in when saving; {seq} becomes the next free number",
             p,
         ));
@@ -2633,17 +2661,17 @@ impl Workbench {
                 ),
                 Message::CapturePicker,
             ),
-            form_row(
+            // On the File names column, so the whole block starts together.
+            destinations::side_row(
                 match kind {
                     CameraKind::DocumentScanner => "Pages",
                     CameraKind::LineScan => "Blocks",
                     _ => "Frames",
                 },
                 self.num(Num::Count),
-                "",
                 p
             ),
-            form_row(
+            destinations::side_row(
                 "Format",
                 pick_list(&FORMATS[..], find(&FORMATS, self.format), Message::Format)
                     .name("Capture format")
@@ -2652,7 +2680,6 @@ impl Workbench {
                     .padding([5, 8])
                     .style(style::pick)
                     .menu_style(style::menu),
-                "",
                 p,
             ),
             action,
@@ -2909,7 +2936,7 @@ impl Workbench {
             if starting {
                 "Starting…"
             } else if streams {
-                "Start streaming"
+                "Start forwarding"
             } else {
                 "Start recording"
             },
@@ -2963,6 +2990,10 @@ impl Workbench {
             && !shown.contains(&problem.to_string())
         {
             action = action.push(error_caption(problem.to_string(), false, p));
+        }
+        // Where it saves, under the button, as Capture's "Next file" is.
+        if !streams && self.record_to.selected.is_none() && !self.forward_output.trim().is_empty() {
+            action = action.push(self.saves_as(p));
         }
         // How the video is encoded, folded behind its summary, opened while
         // any of it is being edited or wrong.
@@ -3090,7 +3121,7 @@ impl Workbench {
                     "Save video to a file on this computer or a destination".into(),
                 ),
                 (
-                    "Stream to URL",
+                    "Forward to URL",
                     Some(Message::ForwardMode(true)),
                     "Send live video to a server such as MediaMTX".into(),
                 ),
@@ -3109,7 +3140,7 @@ impl Workbench {
         if forward_guidance(self.camera_kind()).is_some() {
             controls.into()
         } else {
-            column![section("Record or stream video", None, p), controls]
+            column![section("Record or forward video", None, p), controls]
                 .spacing(ROW_GAP)
                 .into()
         }
@@ -3210,10 +3241,6 @@ impl Workbench {
             || selected
             || custom
             || self.forward_output.trim().is_empty();
-        let mut content = column![].spacing(ROW_GAP);
-        if !selected && !self.forward_output.trim().is_empty() {
-            content = content.push(self.saves_as(p));
-        }
         let mut location = column![disclosure(
             "Location & name",
             (!open).then(|| self.record_summary()),
@@ -3229,14 +3256,22 @@ impl Workbench {
                 Message::RecordPicker,
             ));
         }
-        content.push(location).into()
+        location.into()
     }
 
     /// Where a folded recording location saves: "This computer ·
     /// ~/Capturefab", its folder up to the first part that fills in.
     fn record_summary(&self) -> String {
-        let template = self.forward_output.trim();
-        let folder = std::path::Path::new(template)
+        match self.fixed_folder(&self.forward_output) {
+            Some(folder) => format!("This computer · {folder}"),
+            None => "This computer".into(),
+        }
+    }
+
+    /// A template's folder up to the first part that fills in, as shown
+    /// (under `~` when in the home folder); None when it has none.
+    fn fixed_folder(&self, template: &str) -> Option<String> {
+        let folder = std::path::Path::new(template.trim())
             .parent()
             .map(|parent| {
                 parent
@@ -3245,22 +3280,16 @@ impl Workbench {
                     .collect::<std::path::PathBuf>()
             })
             .unwrap_or_default();
-        if folder.as_os_str().is_empty() {
-            "This computer".into()
-        } else {
-            format!(
-                "This computer · {}",
-                self.preview_of(&folder.to_string_lossy())
-            )
-        }
+        (!folder.as_os_str().is_empty()).then(|| self.preview_of(&folder.to_string_lossy()))
     }
 
-    /// "Saves as" the next recording's file name; its folder and the whole
-    /// path on hover.
+    /// "Saves as" the next recording's path from its chosen folder; the
+    /// whole path on hover.
     fn saves_as(&self, p: &'static Palette) -> Element<'_, Message> {
         file_preview(
             "Saves as",
             &self.preview_of(&self.forward_output),
+            &self.fixed_folder(&self.forward_output).unwrap_or_default(),
             "{date} and {datetime} fill in when recording; {seq} becomes the next free number",
             p,
         )
@@ -3694,7 +3723,7 @@ mod tests {
                         == Some(if Output::of(output).recording() {
                             "Start recording"
                         } else {
-                            "Start streaming"
+                            "Start forwarding"
                         })
                 })
                 .unwrap();

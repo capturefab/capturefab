@@ -466,12 +466,19 @@ fn welcome_simulator_for(
     searching: bool,
 ) -> Option<bool> {
     // A simulated camera already offered as a card needs no button.
-    let sim_listed = found.iter().any(|device| {
+    let listed = sim_listed(found.iter().copied(), recent.iter().copied());
+    simulator_offer(found.is_empty() && recent.is_empty(), listed, searching)
+}
+
+/// Whether a simulated camera is already offered among `devices` found or
+/// `recent` ones, so nothing needs to suggest trying the simulator.
+pub(super) fn sim_listed<'a>(
+    mut devices: impl Iterator<Item = &'a CameraInfo>,
+    mut recent: impl Iterator<Item = &'a Recent>,
+) -> bool {
+    devices.any(|device| {
         device.transport == crate::types::Transport::Simulator || device.id.starts_with("sim:")
-    }) || recent
-        .iter()
-        .any(|recent| recent.target.starts_with("sim:"));
-    simulator_offer(found.is_empty() && recent.is_empty(), sim_listed, searching)
+    }) || recent.any(|recent| recent.target.starts_with("sim:"))
 }
 
 /// How the welcome screen offers a simulated camera: `None` when one is

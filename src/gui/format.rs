@@ -161,43 +161,31 @@ pub(super) fn feature_unit(feature: &FeatureInfo) -> Option<&str> {
     })
 }
 
-/// A microsecond feature's value and range in milliseconds, one unit for
-/// the whole caption: "10 ms · 0.01 – 1,000 ms". The field beside it keeps
-/// the camera's microseconds and says so. None for any other unit, or for a
-/// range that stays under a millisecond, which reads better in µs.
+/// A microsecond feature's value converted to milliseconds, marked as a
+/// conversion so it does not read as the field's own unit: "= 10 ms". The
+/// caption keeps the range in the field's µs. None for any other unit, for
+/// no value, or for a range that stays under a millisecond.
 pub(super) fn milliseconds_readout(feature: &FeatureInfo, value: Option<f64>) -> Option<String> {
     if !matches!(feature.unit.as_deref(), Some("us" | "usec")) {
         return None;
     }
-    let value = value.filter(|v| v.is_finite());
-    let top = feature.max.or(value)?;
+    let value = value.filter(|v| v.is_finite())?;
+    let top = feature.max.unwrap_or(value);
     if top < 1000.0 {
         return None;
     }
-    let ms = |us: f64| {
-        let ms = us / 1000.0;
-        if ms.fract() == 0.0 && ms.abs() < 1e15 {
-            let digits = grouped(ms.abs() as u64);
-            if ms < 0.0 {
-                format!("-{digits}")
-            } else {
-                digits
-            }
+    let ms = value / 1000.0;
+    let ms = if ms.fract() == 0.0 && ms.abs() < 1e15 {
+        let digits = grouped(ms.abs() as u64);
+        if ms < 0.0 {
+            format!("-{digits}")
         } else {
-            range_number(ms)
+            digits
         }
+    } else {
+        range_number(ms)
     };
-    let range = match (feature.min, feature.max) {
-        (Some(min), Some(max)) => format!("{} – {} ms", ms(min), ms(max)),
-        (Some(min), None) => format!("min {} ms", ms(min)),
-        (None, Some(max)) => format!("max {} ms", ms(max)),
-        _ => String::new(),
-    };
-    Some(match (value, range.is_empty()) {
-        (Some(value), true) => format!("{} ms", ms(value)),
-        (Some(value), false) => format!("{} ms · {range}", ms(value)),
-        (None, _) => range,
-    })
+    Some(format!("= {ms} ms"))
 }
 
 /// The caption for a draft the field cannot take: a plain "Too low" or
@@ -746,15 +734,15 @@ mod tests {
         let read = |feature: &FeatureInfo, value: f64| milliseconds_readout(feature, Some(value));
         assert_eq!(
             read(&exposure(10_000.0, "us"), 10_000.0).as_deref(),
-            Some("10 ms · 0.01 – 1,000 ms")
+            Some("= 10 ms")
         );
         assert_eq!(
             read(&exposure(12_345.0, "usec"), 12_345.0).as_deref(),
-            Some("12.345 ms · 0.01 – 1,000 ms")
+            Some("= 12.345 ms")
         );
         assert_eq!(
             read(&exposure(1_500_000.0, "us"), 1_500_000.0).as_deref(),
-            Some("1,500 ms · 0.01 – 1,000 ms")
+            Some("= 1,500 ms")
         );
         assert_eq!(read(&exposure(10_000.0, "ms"), 10_000.0), None);
         let short = FeatureInfo {

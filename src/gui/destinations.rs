@@ -2336,13 +2336,8 @@ impl Picker {
             let first = chips.next().expect("a drive");
             content = content.push(
                 row![
-                    one_line(
-                        "Or save to a drive",
-                        style::SMALL,
-                        style::SANS,
-                        p.secondary
-                    )
-                    .yield_room(),
+                    one_line("Or save to a drive", style::SMALL, style::SANS, p.secondary)
+                        .yield_room(),
                     first,
                 ]
                 .spacing(6)
@@ -3217,6 +3212,20 @@ fn side_label<'a>(value: &'a str, p: &'static Palette) -> Element<'a, Message> {
         .into()
 }
 
+/// A row on that label column, its control taking the rest of the width,
+/// so other rows of the same form start their controls together.
+pub(super) fn side_row<'a, M: 'a>(
+    value: &'a str,
+    control: impl Into<Element<'a, M>>,
+    p: &'static Palette,
+) -> Element<'a, M> {
+    let label = container(text(value).size(style::BODY).color(p.secondary)).width(SIDE_LABEL);
+    row![label, container(control).width(Fill)]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into()
+}
+
 /// The width of that column: "File names" at body size, with room to spare.
 const SIDE_LABEL: f32 = 74.0;
 
@@ -3488,18 +3497,18 @@ fn choice<'a>(
 
 /// Where FTP and SFTP servers are added, under the manager's add actions.
 fn server_note<'a>(p: &'static Palette) -> Element<'a, Message> {
-    super::tip(
-        text(SERVER_NOTE).size(style::CAPTION).color(p.secondary),
-        SERVER_COMMANDS,
-    )
+    text(SERVER_NOTE)
+        .size(style::CAPTION)
+        .color(p.secondary)
+        .into()
 }
 
-/// The note under the add actions, in plain words; the commands it means
-/// are in its tooltip.
-const SERVER_NOTE: &str = "FTP and SFTP servers can be added from the command line.";
-const SERVER_COMMANDS: &str = "capturefab destination add-ftp or add-sftp";
+/// The note under the add actions, naming the commands to run, in view
+/// rather than in a tooltip.
+const SERVER_NOTE: &str = "Add FTP and SFTP servers from the command line with capturefab destination add-ftp or add-sftp.";
 /// What "S3 bucket" covers, for the add action once the list has entries.
-const S3_SERVICES: &str = "Amazon S3, Cloudflare R2, Backblaze B2, MinIO and other S3-compatible services";
+const S3_SERVICES: &str =
+    "Amazon S3, Cloudflare R2, Backblaze B2, MinIO and other S3-compatible services";
 
 /// A saved destination's line under its name in the manager, in plain
 /// words; `Destination::describe` stays in its tooltip.

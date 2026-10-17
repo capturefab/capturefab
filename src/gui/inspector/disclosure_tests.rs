@@ -482,7 +482,7 @@ fn the_manual_exposure_card_explains_auto_and_toggles_the_histogram() {
         "{:?}",
         labels(&manual)
     );
-    let focus = hint("Show the focus aid", Action::ToggleFocusRegion);
+    let focus = hint("Show the focus region", Action::ToggleFocusRegion);
     assert!(labels(&manual).contains(&focus.as_str()));
     let _ = app.update(Message::ToggleExposure);
     assert!(app.exposure_open);
@@ -507,6 +507,21 @@ fn the_manual_exposure_card_explains_auto_and_toggles_the_histogram() {
         labels(&overview)
     );
     assert!(!labels(&overview).contains(&hide.as_str()));
+    // Off in the overview, one press turns it on and opens the camera.
+    app.exposure_open = false;
+    let off = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    assert!(
+        labels(&off).contains(&elsewhere.as_str()),
+        "{:?}",
+        labels(&off)
+    );
+    let camera = app.snapshot.active_camera.clone().unwrap();
+    let _ = app.update(Message::ShowScopeOn(camera.clone(), Scope::Histogram));
+    assert!(app.exposure_open && app.focus_camera);
+    // Already on, the same press leaves it on.
+    app.focus_camera = false;
+    let _ = app.update(Message::ShowScopeOn(camera, Scope::Histogram));
+    assert!(app.exposure_open && app.focus_camera);
 }
 
 #[test]
@@ -534,9 +549,10 @@ fn quick_sliders_draft_while_dragging_and_apply_once_on_release() {
         })
         .expect("the quick exposure control slides");
     assert_eq!(slider.1.numeric_value(), Some(10_000.0));
-    // One unit on the caption, and the field says its own.
+    // The range in the field's unit, the value converted to ms, and the
+    // field says its own unit.
     assert!(
-        labels(&features).contains(&"10 ms · 0.01 – 1,000 ms"),
+        labels(&features).contains(&"= 10 ms · 10 – 1,000,000 µs"),
         "{:?}",
         labels(&features)
     );
@@ -698,7 +714,11 @@ fn the_next_capture_names_its_file_and_folder_apart() {
             .iter()
             .any(|label| label.starts_with("Next file"))
     );
-    assert!(labels(&capture).contains(&file.as_str()));
+    // From the chosen folder, so the dated subfolder shows too.
+    let root = app.fixed_folder(&app.output).unwrap();
+    let shown = &preview[root.len() + 1..];
+    assert!(shown.ends_with(&file) && shown != file, "{shown}");
+    assert!(labels(&capture).contains(&shown), "{:?}", labels(&capture));
 }
 
 #[test]
@@ -824,7 +844,7 @@ fn a_stream_shows_one_url_field_and_nothing_about_files() {
     let video = snapshot(&app, Tab::Forward, &mut tree, &renderer);
     let field = named(&video, "Stream URL").1;
     assert_eq!(field.value(), Some("rtsp://127.0.0.1:8554/line-1"));
-    named(&video, "Start streaming");
+    named(&video, "Start forwarding");
     for absent in [
         "Save destination",
         "Storage & retention",
@@ -833,7 +853,7 @@ fn a_stream_shows_one_url_field_and_nothing_about_files() {
         assert!(!labels(&video).contains(&absent), "{absent} shows");
     }
     assert_eq!(
-        named(&video, "Stream to URL").1.toggled(),
+        named(&video, "Forward to URL").1.toggled(),
         Some(accesskit::Toggled::True)
     );
 }
@@ -868,7 +888,7 @@ fn an_empty_output_asks_once_without_a_red_field() {
             named(
                 &video,
                 if stream {
-                    "Start streaming"
+                    "Start forwarding"
                 } else {
                     "Start recording"
                 }

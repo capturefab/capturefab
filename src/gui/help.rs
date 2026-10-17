@@ -209,18 +209,27 @@ impl Workbench {
                 step = step.push(space().width(4));
                 match index {
                     0 => {
-                        step = step
-                            .push(keyed(
-                                "Enter an address",
-                                Action::ConnectAddress,
-                                "Enter an address",
-                                Some(Message::EnterAddress),
-                            ))
-                            .push(link(
+                        step = step.push(keyed(
+                            "Enter an address",
+                            Action::ConnectAddress,
+                            "Enter an address",
+                            Some(Message::EnterAddress),
+                        ));
+                        // A simulated camera already listed needs no offer;
+                        // with cameras listed, picking one is the next step.
+                        if !welcome::sim_listed(self.snapshot.devices.iter(), self.recent.iter()) {
+                            step = step.push(link(
                                 "No camera? Try the simulator",
                                 "Try the simulator",
                                 (!self.connecting("sim:0")).then_some(Message::TrySimulator),
                             ));
+                        } else if !self.snapshot.devices.is_empty() {
+                            step = step.push(
+                                text("or pick one on the left")
+                                    .size(style::SMALL)
+                                    .color(p.secondary),
+                            );
+                        }
                     }
                     1 => {
                         step = step.push(keyed(
@@ -751,6 +760,19 @@ mod tests {
             Some(Message::TrySimulator)
         ));
         assert!(!buttons.iter().any(|(label, _)| label == "Start the stream"));
+        // A simulated camera already listed: no offer to try one.
+        bench.snapshot.devices = vec![crate::transport::simulator::info()];
+        let buttons = guide_buttons(&bench);
+        assert!(
+            !buttons
+                .iter()
+                .any(|(label, _)| label == "Try the simulator")
+        );
+        assert!(matches!(
+            sent(&buttons, "Enter an address"),
+            Some(Message::EnterAddress)
+        ));
+        bench.snapshot.devices.clear();
         // Connected: the next step's link, and the first step's are gone.
         let mut camera = super::super::liveness::streaming_camera(10, 0, 30.0);
         camera.streaming = false;

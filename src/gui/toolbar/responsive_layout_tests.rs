@@ -99,10 +99,15 @@ fn responsive_toolbar_keeps_capture_and_session_actions_visible_and_clickable() 
                 // The overview names the selected camera: a twin here, so
                 // by its plain serial.
                 let connected = app.snapshot.connected.clone().unwrap();
+                let named = app.toolbar_fit(true).capture_name;
                 let (capture, capture_text) = if overview {
                     (
                         format!("Capture from {} {}", connected.model, identity(&connected)),
-                        format!("Capture {}", connected.serial),
+                        if named {
+                            format!("Capture {}", connected.serial)
+                        } else {
+                            "Capture".to_owned()
+                        },
                     )
                 } else {
                     ("Capture".to_owned(), "Capture".to_owned())
@@ -229,6 +234,73 @@ fn responsive_toolbar_reveals_labels_before_duplicate_edit_actions() {
             .unwrap();
         assert_eq!(activity.1.is_expanded(), Some(false));
     }
+}
+
+#[test]
+fn a_problem_notice_keeps_room_to_say_what_went_wrong() {
+    let renderer = renderer();
+    for main in [650.0, 760.0, 1100.0] {
+        let mut app = bench();
+        app.focus_camera = false;
+        app.sidebar_slide.set(0.0);
+        app.inspector_slide.set(0.0);
+        app.sidebar_open = false;
+        app.inspector_open = false;
+        app.width = main;
+        app.put_notice(
+            "Could not connect: no GigE Vision camera answered at 192.168.1.20".into(),
+            None,
+            Level::Error,
+        );
+        assert!(app.overview());
+        let size = Size::new(app.main_width(), TOOLBAR);
+        let mut view = app.toolbar(Palette::of(false));
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        let mut geometry = Geometry::default();
+        view.as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut geometry);
+        let (_, text) = geometry
+            .labels
+            .iter()
+            .find(|(label, _)| label.starts_with("Could not connect"))
+            .unwrap_or_else(|| panic!("{main}: {:?}", geometry.labels));
+        assert!(text.width >= 100.0, "{main}: {text:?}");
+    }
+}
+
+#[test]
+fn the_welcome_toolbar_offers_no_dead_undo_or_redo() {
+    let renderer = renderer();
+    let mut app = Workbench::new(SessionHandle::new(), "toolbar-welcome".into(), true, None);
+    app.width = 1200.0;
+    app.sidebar_slide.set(0.0);
+    app.inspector_slide.set(0.0);
+    app.sidebar_open = false;
+    app.inspector_open = false;
+    assert!(app.snapshot.connected.is_none() && app.history_label(true).is_none());
+    let mut view = app.toolbar(Palette::of(false));
+    let mut tree = Tree::new(view.as_widget());
+    let node = view.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(Size::ZERO, Size::new(app.main_width(), TOOLBAR)),
+    );
+    let mut geometry = Geometry::default();
+    view.as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut geometry);
+    assert!(
+        !geometry
+            .controls
+            .iter()
+            .any(|(label, _)| label == "Undo" || label == "Redo"),
+        "{:?}",
+        geometry.controls
+    );
 }
 
 #[test]

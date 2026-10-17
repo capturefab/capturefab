@@ -589,6 +589,13 @@ enum Num {
     RetentionDays,
 }
 
+/// A scope the overview cannot draw over its tiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Histogram,
+    Focus,
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     Undo,
@@ -737,6 +744,8 @@ enum Message {
     OverControls(bool),
     HoverTile(Option<String>),
     FocusTile(String),
+    /// Turn a scope on if it is off and open this camera, where it draws.
+    ShowScopeOn(String, Scope),
     CaptureCamera(String),
     /// Capture from every connected camera at once.
     AllCapture,
@@ -1186,7 +1195,19 @@ impl Workbench {
             scan_timeout_ms: self.scan_timeout_ms,
             schedule_delay_seconds: self.schedule_delay_seconds,
             schedule_interval_seconds: self.schedule_interval_seconds,
-            forward_output: self.forward_output.clone(),
+            forward_output: if self.forward_streams()
+                && Output::of(&self.forward_output).recording()
+            {
+                // Stream mode with no URL yet (empty or no scheme): keep the
+                // recording template it replaced, so the next launch opens
+                // Record with it rather than an empty or half-typed path.
+                self.stashed_record
+                    .as_ref()
+                    .map(|(output, _)| output.clone())
+                    .unwrap_or_else(prefs::default_record_output)
+            } else {
+                self.forward_output.clone()
+            },
             forward_codec: self.forward_codec.into(),
             forward_encoder: self.forward_encoder.clone(),
             forward_fps: self.forward_fps,
@@ -2317,6 +2338,14 @@ impl Workbench {
         self.send(Job::Select, SessionCommand::Select { camera });
     }
 
+    /// Open one camera from the overview, selecting it first if needed.
+    fn focus_tile(&mut self, camera: String) {
+        self.focus_camera = true;
+        if self.snapshot.active_camera.as_ref() != Some(&camera) {
+            self.send(Job::Select, SessionCommand::Select { camera });
+        }
+    }
+
     fn toggle_exposure(&mut self) {
         if !self.intensity_image() || self.camera_kind() == CameraKind::LineScan {
             return;
@@ -3201,11 +3230,14 @@ impl Workbench {
                 }
                 self.hovered_tile = id;
             }
-            Message::FocusTile(camera) => {
-                self.focus_camera = true;
-                if self.snapshot.active_camera.as_ref() != Some(&camera) {
-                    self.send(Job::Select, SessionCommand::Select { camera });
+            Message::FocusTile(camera) => self.focus_tile(camera),
+            Message::ShowScopeOn(camera, scope) => {
+                match scope {
+                    Scope::Histogram if !self.exposure_open => self.toggle_exposure(),
+                    Scope::Focus if !self.focus.open => self.toggle_focus_region(),
+                    _ => {}
                 }
+                self.focus_tile(camera);
             }
             Message::CaptureCamera(id) => {
                 if !self.pending_for(Job::Capture, &id) {
@@ -3872,6 +3904,24 @@ mod tests {
         bench.snapshot.connected = None;
         assert_eq!(bench.capture_timeout(None), 5000);
         assert_eq!(bench.prefs().scan_timeout_ms, 45_000);
+    }
+
+    #[test]
+    fn an_unfinished_stream_draft_saves_the_recording_it_replaced() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), false, None);
+        let before = "/tmp/capturefab-test/clip-{seq}.mkv".to_owned();
+        bench.forward_output = before.clone();
+        bench.stream_draft = false;
+        let _ = bench.update(Message::ForwardMode(true));
+        assert!(bench.forward_streams());
+        for draft in ["", "rts"] {
+            bench.forward_output = draft.into();
+            let saved = bench.prefs().forward_output;
+            assert_eq!(saved, before, "{draft:?}");
+            assert!(Output::of(&saved).recording());
+        }
+        bench.forward_output = "rtsp://127.0.0.1:8554/live".into();
+        assert_eq!(bench.prefs().forward_output, "rtsp://127.0.0.1:8554/live");
     }
 
     #[test]

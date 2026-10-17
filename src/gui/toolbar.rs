@@ -21,12 +21,19 @@ const RECORD_ROOM: f32 = 96.0;
 const PILL_ROOM: f32 = 60.0;
 /// A compact notice still keeps its details and dismiss actions visible.
 const MIN_STATUS: f32 = 128.0;
+/// The room a warning or error is given before the toolbar's extras: its
+/// actions and enough text to say what went wrong.
+const PROBLEM_STATUS: f32 = NOTICE_GLYPH + NOTICE_DETAILS + NOTICE_DISMISS + 110.0;
+/// Narrower than this, a notice's text gives way to its glyph alone.
+const NOTICE_TEXT_MIN: f32 = 60.0;
 
 struct ToolbarFit {
     history: bool,
     activity_label: bool,
     analytics_label: bool,
     destination_label: bool,
+    /// The overview's Capture button names the selected camera.
+    capture_name: bool,
     status: f32,
 }
 /// Room a notice's glyph and the gap after it take.
@@ -188,7 +195,7 @@ impl Workbench {
             } else {
                 icon(Icon::Folder, 16.0, p.secondary)
             };
-            left = left.push(self.capture_button(p));
+            left = left.push(self.capture_button(fit.capture_name, p));
             if let Some(record) = self.record_button(p) {
                 left = left.push(record);
             }
@@ -340,48 +347,77 @@ impl Workbench {
     /// area. Labels return before the duplicated Edit controls do.
     fn toolbar_fit(&self, capture: bool) -> ToolbarFit {
         let main = self.main_width();
-        let history = main >= 900.0;
-        let activity_label = main >= 620.0;
-        let analytics_label = main >= 520.0;
-        let destination_label = main >= 700.0;
+        let history = main >= 900.0
+            && (capture
+                || self.history_label(true).is_some()
+                || self.history_label(false).is_some());
         let record = capture && self.record_shown();
-        let named = if self.overview() && self.snapshot.connected.is_some() {
-            CAPTURE_NAME_ROOM
-        } else {
-            0.0
-        };
-        let capture_room = if capture {
-            CAPTURE_ROOM + named + 8.0 + if destination_label { 120.0 } else { 28.0 }
-        } else {
-            0.0
-        } + if record {
-            RECORD_ROOM
-                + if self.recording_here() {
-                    PILL_ROOM
-                } else {
-                    0.0
-                }
-        } else {
-            0.0
-        };
-        let actions = if analytics_label { 76.0 } else { 28.0 }
-            + if activity_label { 80.0 } else { 28.0 }
-            + if history { 104.0 } else { 0.0 };
-        let gaps = if history { 4.0 } else { 3.0 } * 10.0;
-        let status =
-            (main - 2.0 * (GUTTER - 6.0) - gaps - actions - capture_room).clamp(MIN_STATUS, STATUS);
-        ToolbarFit {
+        let mut fit = ToolbarFit {
             history,
-            activity_label,
-            analytics_label,
-            destination_label,
-            status,
+            activity_label: main >= 620.0,
+            analytics_label: main >= 520.0,
+            destination_label: main >= 700.0,
+            capture_name: self.overview() && self.snapshot.connected.is_some(),
+            status: 0.0,
+        };
+        let status = |fit: &ToolbarFit| {
+            let capture_room = if capture {
+                CAPTURE_ROOM
+                    + if fit.capture_name {
+                        CAPTURE_NAME_ROOM
+                    } else {
+                        0.0
+                    }
+                    + 8.0
+                    + if fit.destination_label { 120.0 } else { 28.0 }
+            } else {
+                0.0
+            } + if record {
+                RECORD_ROOM
+                    + if self.recording_here() {
+                        PILL_ROOM
+                    } else {
+                        0.0
+                    }
+            } else {
+                0.0
+            };
+            let actions = if fit.analytics_label { 76.0 } else { 28.0 }
+                + if fit.activity_label { 80.0 } else { 28.0 }
+                + if fit.history { 104.0 } else { 0.0 };
+            let gaps = if fit.history { 4.0 } else { 3.0 } * 10.0;
+            main - 2.0 * (GUTTER - 6.0) - gaps - actions - capture_room
+        };
+        // A warning or error must say what went wrong: the extras give way,
+        // one at a time, until its text has room to read.
+        if self.problem_notice_shown() {
+            let steps: [fn(&mut ToolbarFit); 4] = [
+                |fit| fit.destination_label = false,
+                |fit| fit.capture_name = false,
+                |fit| fit.activity_label = false,
+                |fit| fit.analytics_label = false,
+            ];
+            for step in steps {
+                if status(&fit) >= PROBLEM_STATUS {
+                    break;
+                }
+                step(&mut fit);
+            }
         }
+        fit.status = status(&fit).clamp(MIN_STATUS, STATUS);
+        fit
+    }
+
+    /// Whether the status shows a warning or an error notice.
+    fn problem_notice_shown(&self) -> bool {
+        self.notice
+            .as_ref()
+            .is_some_and(|notice| notice.level != Level::Done && !self.welcome_says(notice))
     }
 
     /// Capture for the selected camera. While saving, the spinner takes the
     /// glyph's place; just after, it reads as saved.
-    fn capture_button(&self, p: &'static Palette) -> Element<'_, Message> {
+    fn capture_button(&self, named: bool, p: &'static Palette) -> Element<'_, Message> {
         let os = Os::CURRENT;
         let connected = self.snapshot.connected.is_some();
         let problem = self.validate_input(&self.capture_command(false)).err();
@@ -410,7 +446,7 @@ impl Workbench {
                     14.0,
                     if connected { p.text } else { p.tertiary },
                 ),
-                if self.overview() {
+                if self.overview() && named {
                     overview_capture_label(
                         &self.snapshot.cameras,
                         self.snapshot.connected.as_ref(),
@@ -445,7 +481,7 @@ impl Workbench {
                             },
                         )
                     )
-                    .width(if self.overview() {
+                    .width(if self.overview() && named {
                         Length::Fixed(overview_capture_slot(&self.snapshot.cameras))
                     } else {
                         Length::Shrink
@@ -794,20 +830,27 @@ impl Workbench {
         if dismiss {
             room -= NOTICE_DISMISS;
         }
-        let mut line = row![
-            icon(level.icon(), 13.0, fade(level.color(p), alpha)),
-            space().width(6),
-            tip_above(
-                container(one_line(
-                    notice.text.as_str(),
-                    style::SMALL,
-                    style::SANS,
-                    fade(ink, alpha),
-                ))
-                .max_width(room),
-                notice.about(),
-            ),
-        ]
+        let glyph = icon(level.icon(), 13.0, fade(level.color(p), alpha));
+        // Too narrow for words that say anything: the glyph alone, the whole
+        // text on hover and in the accessible label, and Details beside it.
+        let mut line = if room < NOTICE_TEXT_MIN {
+            row![tip_above(glyph, notice.about())]
+        } else {
+            row![
+                glyph,
+                space().width(6),
+                tip_above(
+                    container(one_line(
+                        notice.text.as_str(),
+                        style::SMALL,
+                        style::SANS,
+                        fade(ink, alpha),
+                    ))
+                    .max_width(room),
+                    notice.about(),
+                ),
+            ]
+        }
         .align_y(Alignment::Center);
         if details {
             line = line.push(space().width(4)).push(

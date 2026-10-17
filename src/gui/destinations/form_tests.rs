@@ -398,7 +398,10 @@ fn the_output_field_writes_home_as_a_tilde_both_ways_exactly() {
         shorten_home(&format!("/Users/ada{sep}x.png"), Some(home)),
         format!("~{sep}x.png")
     );
-    assert_eq!(shorten_home("/Users/adam/x.png", Some(home)), "/Users/adam/x.png");
+    assert_eq!(
+        shorten_home("/Users/adam/x.png", Some(home)),
+        "/Users/adam/x.png"
+    );
     assert_eq!(expand_tilde("~x", Some(home)), "~x");
     assert_eq!(expand_tilde("~/x", None), "~/x");
 }
@@ -429,7 +432,10 @@ fn back_on_this_computer_a_destination_name_returns_below_the_capture_folder() {
     // A preset chosen for a relative output left behind (as before this
     // fix, or from a remembered session) also lands in the capture folder.
     let mut output = "{date}/{camera}-{datetime}-{seq}.png".to_string();
-    picker.update(picker.naming_message(&output, Naming::CameraTime), &mut output);
+    picker.update(
+        picker.naming_message(&output, Naming::CameraTime),
+        &mut output,
+    );
     assert_eq!(
         output,
         naming_presets::join(
