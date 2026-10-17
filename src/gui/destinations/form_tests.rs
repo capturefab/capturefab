@@ -328,9 +328,153 @@ fn the_default_capture_output_shows_a_folder_and_a_file_name_choice() {
     );
     assert!(
         nodes.iter().any(|(_, node)| {
-            node.description() == Some("By date, camera and time")
-                || node.value() == Some("By date, camera and time")
-        }) || shows_text(&nodes, "By date, camera and time") > 0
+            node.description() == Some("By date, camera and time (recommended)")
+                || node.value() == Some("By date, camera and time (recommended)")
+        }) || shows_text(&nodes, "By date, camera and time (recommended)") > 0
+    );
+    // No pattern line while no template shows.
+    assert_eq!(shows_text(&nodes, "Pattern"), 0);
+}
+
+/// How tall the capture panel's part of the picker lays out.
+fn capture_height(picker: &Picker, output: &str) -> f32 {
+    let renderer = super::layout_tests::renderer();
+    let mut view = mapped(
+        picker.view(output, "Output path", Palette::of(false), None),
+        crate::gui::Message::CapturePicker,
+    );
+    let mut tree = Tree::new(view.as_widget());
+    view.as_widget_mut()
+        .layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(320.0, 2000.0)),
+        )
+        .size()
+        .height
+}
+
+#[test]
+fn choosing_custom_pattern_moves_nothing_below_and_shows_what_a_template_holds() {
+    let mut picker = Picker::new(false, false);
+    let mut output = crate::gui::prefs::default_capture_output();
+    let simple = capture_height(&picker, &output);
+    picker.update(Message::Naming(Naming::Custom), &mut output);
+    assert_eq!(capture_height(&picker, &output), simple);
+    let nodes = capture_nodes(&picker, &output);
+    assert!(has(&nodes, Role::TextInput, "Output path"));
+    // The template has a visible label in place of the folder's.
+    assert_eq!(shows_text(&nodes, "Pattern"), 1);
+    assert_eq!(shows_text(&nodes, "Folder"), 0);
+    // The field writes the home folder as `~`; its description and what
+    // it sends are the full path.
+    let field = nodes
+        .iter()
+        .find(|(_, node)| node.role() == Role::TextInput)
+        .map(|(_, node)| node)
+        .unwrap();
+    assert_eq!(field.description(), Some(output.as_str()));
+    assert_eq!(home_long(field.value().unwrap()), output);
+}
+
+#[test]
+fn the_output_field_writes_home_as_a_tilde_both_ways_exactly() {
+    let home = Path::new("/Users/ada");
+    let sep = std::path::MAIN_SEPARATOR;
+    for value in [
+        "/Users/ada".to_string(),
+        format!("/Users/ada{sep}"),
+        format!("/Users/ada{sep}Capturefab{sep}{{date}}{sep}"),
+        format!("/Users/ada{sep}{sep}x.png"),
+        "/Users/adam/x.png".into(),
+        "relative/x.png".into(),
+        "srt://host:9000".into(),
+        String::new(),
+    ] {
+        let short = shorten_home(&value, Some(home));
+        assert_eq!(expand_tilde(&short, Some(home)), value, "{value}");
+    }
+    assert_eq!(
+        shorten_home(&format!("/Users/ada{sep}x.png"), Some(home)),
+        format!("~{sep}x.png")
+    );
+    assert_eq!(shorten_home("/Users/adam/x.png", Some(home)), "/Users/adam/x.png");
+    assert_eq!(expand_tilde("~x", Some(home)), "~x");
+    assert_eq!(expand_tilde("~/x", None), "~/x");
+}
+
+#[test]
+fn back_on_this_computer_a_destination_name_returns_below_the_capture_folder() {
+    let mut picker = Picker::new(false, false);
+    picker.saved = vec![Destination {
+        name: "archive".into(),
+        target: Target::Folder {
+            path: std::env::temp_dir().join("archive"),
+        },
+    }];
+    let mut output = crate::gui::prefs::default_capture_output();
+    let choose = |name: Option<&str>| {
+        Message::Select(Choice {
+            name: name.map(Into::into),
+            label: name.unwrap_or("This computer").into(),
+        })
+    };
+    picker.update(choose(Some("archive")), &mut output);
+    assert!(Path::new(&output).is_relative());
+    picker.update(choose(None), &mut output);
+    assert_eq!(output, crate::gui::prefs::default_capture_output());
+    let nodes = capture_nodes(&picker, &output);
+    assert!(shows_text(&nodes, "Folder") > 0);
+    assert!(!has(&nodes, Role::TextInput, "Output path"));
+    // A preset chosen for a relative output left behind (as before this
+    // fix, or from a remembered session) also lands in the capture folder.
+    let mut output = "{date}/{camera}-{datetime}-{seq}.png".to_string();
+    picker.update(picker.naming_message(&output, Naming::CameraTime), &mut output);
+    assert_eq!(
+        output,
+        naming_presets::join(
+            Some(&crate::gui::prefs::capture_root()),
+            Naming::CameraTime,
+            "png"
+        )
+    );
+    let nodes = capture_nodes(&picker, &output);
+    assert!(shows_text(&nodes, "Folder") > 0);
+    assert!(!has(&nodes, Role::TextInput, "Output path"));
+    // A relative path typed on this computer stays as typed.
+    picker.update(Message::Naming(Naming::Custom), &mut output);
+    picker.update(Message::Output("shots/x.png".into()), &mut output);
+    assert_eq!(output, "shots/x.png");
+}
+
+#[test]
+fn a_subfolder_in_a_destination_shows_its_name_field() {
+    let mut picker = Picker::new(false, false);
+    picker.saved = vec![Destination {
+        name: "archive".into(),
+        target: Target::Folder {
+            path: std::env::temp_dir().join("archive"),
+        },
+    }];
+    let mut output = naming_presets::join(
+        Some(&crate::gui::prefs::capture_root().join("line1")),
+        Naming::DatedCameraTime,
+        "png",
+    );
+    picker.select(Some("archive".into()), &mut output);
+    assert_eq!(
+        naming_presets::split(&output, "png"),
+        (Some("line1".into()), Naming::DatedCameraTime)
+    );
+    let nodes = capture_nodes(&picker, &output);
+    assert!(has(&nodes, Role::TextInput, "Capture name in destination"));
+    // The choice still names the preset it is.
+    assert!(
+        nodes.iter().any(|(_, node)| node.role() == Role::ComboBox
+            && node.label() == Some("File names")
+            && (node.value() == Some("By date, camera and time (recommended)")
+                || node.description() == Some("By date, camera and time (recommended)")))
+            || shows_text(&nodes, "By date, camera and time (recommended)") > 0
     );
 }
 
@@ -478,7 +622,7 @@ fn drive_shortcuts_say_what_they_do_and_mark_the_drive_in_use() {
     super::layout_tests::add_external_drive(&mut picker);
     let output = crate::gui::prefs::default_capture_output();
     let nodes = capture_nodes(&picker, &output);
-    assert_eq!(shows_text(&nodes, "Or save to a drive:"), 1);
+    assert_eq!(shows_text(&nodes, "Or save to a drive"), 1);
     let chip = |nodes: &[(NodeId, Node)]| {
         nodes
             .iter()

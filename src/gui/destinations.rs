@@ -1570,12 +1570,27 @@ impl Picker {
     }
 
     fn select(&mut self, name: Option<String>, output: &mut String) {
-        if self.selected != name {
+        let changed = self.selected != name;
+        if changed {
             if self.remember && self.replay.is_none() {
                 let _ = destination::set_preferred(name.as_deref());
             }
             self.selected = name;
             self.folder = None;
+        }
+        // Back on this computer, a destination's relative name goes below
+        // the default capture folder again, undoing what choosing it did.
+        // Only on the change itself: a relative path typed here stays.
+        if changed
+            && self.selected.is_none()
+            && !self.recording
+            && !output.is_empty()
+            && Path::new(output.as_str()).is_relative()
+        {
+            *output = super::prefs::capture_root()
+                .join(output.as_str())
+                .to_string_lossy()
+                .into_owned();
         }
         // A destination holds relative names; drop a leftover absolute path,
         // keeping a template's folders below the default capture folder.
@@ -1614,7 +1629,15 @@ impl Picker {
         }
         let ext = naming_presets::extension(output).unwrap_or("png");
         let folder = match self.naming_of(output) {
-            (folder, preset) if preset != Naming::Custom => folder,
+            // On this computer a preset's folder is absolute: a relative
+            // one, left by a destination, goes below the capture folder.
+            (folder, preset) if preset != Naming::Custom => match self.selected {
+                None if !folder.as_deref().is_some_and(Path::is_absolute) => {
+                    let root = super::prefs::capture_root();
+                    Some(folder.map_or_else(|| root.clone(), |f| root.join(f)))
+                }
+                _ => folder,
+            },
             _ => {
                 let path = Path::new(output);
                 // Without an extension, the output is a folder of frames.
@@ -2110,12 +2133,22 @@ impl Picker {
         let destination = self.selected_destination();
         // Stills name their files with a preset; the template shows when it
         // is chosen, hand-edited or refused. Recordings keep their field.
-        let simple = !self.recording
-            && shown != Naming::Custom
-            && output_error.is_none()
-            && (destination.is_some() || folder.as_deref().is_some_and(Path::is_absolute));
+        let preset = !self.recording && shown != Naming::Custom && output_error.is_none();
+        let simple = preset
+            && match destination {
+                // A subfolder in a destination is customised, so it shows.
+                Some(_) => folder.is_none(),
+                None => folder.as_deref().is_some_and(Path::is_absolute),
+            };
+        // The field shows the home folder as `~`, so the part that varies
+        // stays in view; what it sends, and its description, are the path.
         let input = |placeholder: &'a str, name: &'a str| {
-            text_input(placeholder, output)
+            let shown = home_text(output);
+            let mut field = text_input(placeholder, &shown);
+            if shown != output {
+                field = field.description(output);
+            }
+            field
                 .name(name)
                 .invalid(output_error.clone())
                 .id(if self.recording {
@@ -2123,16 +2156,15 @@ impl Picker {
                 } else {
                     "capture-output"
                 })
-                .on_input(Message::Output)
+                .on_input(|value| Message::Output(home_long(&value)))
                 .size(style::BODY)
-                .padding([6, 10])
+                .padding(if self.recording { [6, 10] } else { [3, 10] })
                 .style(if output_error.is_some() {
                     style::input_invalid
                 } else {
                     style::input
                 })
         };
-        content = content.push(space().height(4));
         if self.recording {
             // Recordings keep their field: a stream URL or a file name.
             match destination {
@@ -2156,44 +2188,46 @@ impl Picker {
                 }
             }
         } else {
-            // The choice stays on the first line, as tall as the label line
-            // it replaces, so the lines under it change without moving it.
-            content = content.push(
-                row![
-                    label("File names", p),
-                    super::tip(
-                        pick_list(
-                            &Naming::ALL[..],
-                            Some(if simple { shown } else { Naming::Custom }),
-                            move |naming| self.naming_message(output, naming),
-                        )
-                        .name("File names")
-                        .width(Fill)
-                        .text_size(style::SMALL)
-                        .padding([1, 6])
-                        .style(style::pick)
-                        .menu_style(style::menu),
-                        "How captured files are named. By date, camera and time is recommended.",
-                    ),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            );
+            // "File names" and the line under it share a label column, so
+            // their controls start together and take the rest of the width.
+            let names = row![
+                side_label("File names", p),
+                super::tip(
+                    pick_list(
+                        &Naming::ALL[..],
+                        Some(if preset && (simple || destination.is_some()) {
+                            shown
+                        } else {
+                            Naming::Custom
+                        }),
+                        move |naming| self.naming_message(output, naming),
+                    )
+                    .name("File names")
+                    .width(Fill)
+                    .text_size(style::BODY)
+                    .padding([5, 8])
+                    .style(style::pick)
+                    .menu_style(style::menu),
+                    "How captured files are named. By date, camera and time is recommended.",
+                ),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+            content = content.push(names);
             // The template, with what it may hold in its tooltip.
             let template = |placeholder: &'a str, name: &'a str| {
-                super::tip(
-                    input(placeholder, name),
-                    "Placeholders: {camera} {date} {time} {datetime} {frame} {seq}",
-                )
+                super::tip(input(placeholder, name), PLACEHOLDERS)
             };
             match destination {
-                None if simple => {
-                    let folder = folder.unwrap_or_default();
-                    content = content.push(
+                // The folder line and the template share one slot as tall
+                // as the field, so choosing either moves nothing below.
+                None => {
+                    let line: Element<'a, Message> = if simple {
+                        let folder = folder.unwrap_or_default();
                         row![
-                            label("Folder", p),
+                            side_label("Folder", p),
                             super::tip(
-                                one_line(home_short(&folder), style::SMALL, style::SANS, p.text)
+                                one_line(home_short(&folder), style::BODY, style::SANS, p.text)
                                     .width(Fill),
                                 folder.display(),
                             ),
@@ -2202,24 +2236,29 @@ impl Picker {
                                 "Choose a folder",
                             ),
                         ]
-                        .spacing(8)
-                        .align_y(Alignment::Center),
-                    );
-                }
-                None => {
-                    content = content.push(
+                        .spacing(6)
+                        .align_y(Alignment::Center)
+                        .into()
+                    } else {
                         row![
+                            super::tip(side_label("Pattern", p), PLACEHOLDERS),
                             template(local_example, local_label),
                             super::tip(
                                 button(icon(Icon::Folder, 15.0, p.secondary))
-                                    .padding(6)
+                                    .padding(4)
                                     .style(style::plain)
                                     .on_press(Message::BrowseOutput),
                                 "Choose a folder",
                             ),
                         ]
-                        .spacing(4)
-                        .align_y(Alignment::Center),
+                        .spacing(6)
+                        .align_y(Alignment::Center)
+                        .into()
+                    };
+                    content = content.push(
+                        container(line)
+                            .height(FIELD_HEIGHT)
+                            .align_y(Alignment::Center),
                     );
                 }
                 Some(destination) => {
@@ -2261,12 +2300,13 @@ impl Picker {
                     super::tip(
                         button(
                             row![
+                                // The drive's glyph, a check once chosen; one
+                                // icon either way, so the chip keeps its width.
                                 icon(
-                                    if chosen { Icon::Check } else { Icon::Plus },
+                                    if chosen { Icon::Check } else { glyph },
                                     12.0,
                                     if chosen { p.ink(p.accent) } else { p.secondary },
                                 ),
-                                icon(glyph, 12.0, p.secondary),
                                 text(format!(
                                     "{} · {} free",
                                     volume.name,
@@ -2297,7 +2337,7 @@ impl Picker {
             content = content.push(
                 row![
                     one_line(
-                        "Or save to a drive:",
+                        "Or save to a drive",
                         style::SMALL,
                         style::SANS,
                         p.secondary
@@ -2607,11 +2647,15 @@ impl Picker {
                 row![
                     add(Icon::FolderPlus, "Add folder…", Message::AddFolder),
                     super::tip(
-                        add(Icon::CloudArrowUp, "Add S3 bucket…", Message::AddBucket),
-                        "Amazon S3, Cloudflare R2, Backblaze B2, MinIO and other S3-compatible services",
+                        add(Icon::CloudArrowUp, "Add S3 bucket…", Message::AddBucket)
+                            .description(S3_SERVICES),
+                        S3_SERVICES,
                     ),
                 ]
                 .spacing(8),
+                text("S3 buckets include Amazon S3, Cloudflare R2, Backblaze B2 and MinIO.")
+                    .size(style::CAPTION)
+                    .color(p.secondary),
                 server_note(p),
             ]
             .spacing(6),
@@ -3166,6 +3210,16 @@ fn label<'a>(value: &'a str, p: &'static Palette) -> Element<'a, Message> {
     text(value).size(style::SMALL).color(p.secondary).into()
 }
 
+/// A label in the column beside "File names" and its folder or pattern.
+fn side_label<'a>(value: &'a str, p: &'static Palette) -> Element<'a, Message> {
+    container(text(value).size(style::BODY).color(p.secondary))
+        .width(SIDE_LABEL)
+        .into()
+}
+
+/// The width of that column: "File names" at body size, with room to spare.
+const SIDE_LABEL: f32 = 74.0;
+
 /// A field's label with an action at the end of its line.
 fn labeled<'a>(
     value: &'a str,
@@ -3209,6 +3263,49 @@ fn single_edit(before: &str, after: &str) -> bool {
         .take_while(|(a, b)| a == b)
         .count();
     before.len() - suffix <= 1 && after.len() - suffix <= 1
+}
+
+/// What an output template may hold, in full, for tooltips.
+const PLACEHOLDERS: &str = "Placeholders: {camera} {date} {time} {datetime} {frame} {seq}";
+/// The template field's height (13 px text at 1.3 lines, 3 px padding each
+/// side), which the line under "File names" keeps in every mode.
+const FIELD_HEIGHT: f32 = 23.0;
+
+/// The output field's text: `value` with a leading home folder written
+/// `~`, character for character, so `home_long` gives `value` back and
+/// typing never loses a separator.
+fn home_text(value: &str) -> String {
+    shorten_home(value, home().as_deref())
+}
+
+fn shorten_home(value: &str, home: Option<&Path>) -> String {
+    let Some(home) = home.and_then(Path::to_str) else {
+        return value.into();
+    };
+    match value.strip_prefix(home) {
+        Some("") => "~".into(),
+        Some(rest) if rest.starts_with(std::path::MAIN_SEPARATOR) => format!("~{rest}"),
+        _ => value.into(),
+    }
+}
+
+/// `value` with a leading `~` written out as the home folder, undoing
+/// `home_short` for what the output field sends.
+fn home_long(value: &str) -> String {
+    expand_tilde(value, home().as_deref())
+}
+
+fn expand_tilde(value: &str, home: Option<&Path>) -> String {
+    let Some(home) = home else {
+        return value.into();
+    };
+    match value.strip_prefix('~') {
+        Some("") => home.to_string_lossy().into_owned(),
+        Some(rest) if rest.starts_with(std::path::MAIN_SEPARATOR) => {
+            format!("{}{rest}", home.display())
+        }
+        _ => value.into(),
+    }
 }
 
 /// The user's home folder, where it is written `~`.
@@ -3391,11 +3488,18 @@ fn choice<'a>(
 
 /// Where FTP and SFTP servers are added, under the manager's add actions.
 fn server_note<'a>(p: &'static Palette) -> Element<'a, Message> {
-    text("FTP and SFTP servers: capturefab destination add-ftp or add-sftp")
-        .size(style::CAPTION)
-        .color(p.secondary)
-        .into()
+    super::tip(
+        text(SERVER_NOTE).size(style::CAPTION).color(p.secondary),
+        SERVER_COMMANDS,
+    )
 }
+
+/// The note under the add actions, in plain words; the commands it means
+/// are in its tooltip.
+const SERVER_NOTE: &str = "FTP and SFTP servers can be added from the command line.";
+const SERVER_COMMANDS: &str = "capturefab destination add-ftp or add-sftp";
+/// What "S3 bucket" covers, for the add action once the list has entries.
+const S3_SERVICES: &str = "Amazon S3, Cloudflare R2, Backblaze B2, MinIO and other S3-compatible services";
 
 /// A saved destination's line under its name in the manager, in plain
 /// words; `Destination::describe` stays in its tooltip.

@@ -94,7 +94,7 @@
       ],
       "sha256": "ef2bc018245ff573ba786515b92808a6239a91ba67f7a725cd2087d58e203bbc",
       "scene": "dark,capture,noscopes,inspector-storage-default",
-      "description": "Ordinary capture controls first, followed by the Capture options (timeout and scheduling), Automatic capture, Storage and retention, and Shell and agents disclosures; no automatic capture session is open in this scene."
+      "description": "Ordinary capture controls first: Save to, File names with its Folder line, Frames and Format, then the Capture options (timeout and scheduling), Automatic capture, Storage and retention, and Shell and agents disclosures; no automatic capture session is open in this scene."
     },
     {
       "file": "schedule.png",
@@ -138,7 +138,7 @@
       ],
       "sha256": "3b700a38dd1b213be4255b1daa31d453275d8b7b4f8e846fbed490fd4befe7c3",
       "scene": "dark,destinations-list,noscopes",
-      "description": "Destination manager showing example folder and S3-compatible bucket destinations."
+      "description": "Destination manager showing example folder and S3-compatible bucket destinations, with Add folder and Add S3 bucket actions and notes on the S3 services covered and on adding FTP and SFTP servers."
     },
     {
       "file": "scopes.png",
@@ -204,7 +204,7 @@
       ],
       "sha256": "2358c94db1c5f5c78c3fbcbfc6ae4404d3ab7d021ac54d440aae356b30ccc772",
       "scene": "dark,destinations-list,noscopes",
-      "description": "Undo and Redo controls in the destination manager; macOS keyboard shortcuts are shown."
+      "description": "Undo and Redo controls in the destination manager; macOS keyboard shortcuts are shown beside each action."
     }
   ]
 }

@@ -52,7 +52,7 @@ impl fmt::Display for Naming {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // {seq} grows as needed, so promise no particular width.
         f.write_str(match self {
-            Naming::DatedCameraTime => "By date, camera and time",
+            Naming::DatedCameraTime => "By date, camera and time (recommended)",
             Naming::CameraTime => "Camera and time",
             Naming::Numbered => "Numbered (capture-1, capture-2…)",
             Naming::Custom => "Custom pattern…",
