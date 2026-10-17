@@ -3592,7 +3592,7 @@ fn destination_command(command: &DestinationCommand) -> Result<Value> {
                 }
             }
             #[cfg(not(feature = "uploads"))]
-            let _ = forget_secret;
+            let _ = (forget_secret, &mut value);
             value
         }
         DestinationCommand::Test {
