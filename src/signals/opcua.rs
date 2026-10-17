@@ -21,6 +21,14 @@ use std::{
 
 /// Deepest level browsed below the root.
 const BROWSE_DEPTH: usize = 4;
+/// Decoding limits. The library defaults (1000-element arrays, five 64 KiB
+/// chunks) make a browse of a folder with more than 1000 children, or a read
+/// of a larger array, fail with a closed connection, and servers may ignore
+/// the requested maximum references per node. The helper process bounds the
+/// damage, so these are generous but still finite.
+const MAX_ARRAY_LENGTH: usize = 100_000;
+const MAX_CHUNK_COUNT: usize = 256;
+const MAX_MESSAGE_SIZE: usize = 16 << 20;
 
 fn target(ctx: &Ctx) -> (&str, &[String], Option<&str>) {
     match &ctx.uri.target {
@@ -40,15 +48,44 @@ fn node_ids(nodes: &[String]) -> Result<Vec<NodeId>> {
         .collect()
 }
 
-async fn connect(ctx: &Ctx) -> Result<(Arc<Session>, tokio::task::JoinHandle<StatusCode>)> {
+/// `host:port` of an `opc.tcp://host:port[/path]` endpoint.
+fn endpoint_addr(endpoint: &str) -> &str {
+    let rest = endpoint.strip_prefix("opc.tcp://").unwrap_or(endpoint);
+    rest.split('/').next().unwrap_or(rest)
+}
+
+/// Fail fast, and classifiably, when nothing listens on the endpoint: the
+/// OPC UA client would otherwise retry a refused connection until the
+/// timeout and report it as a timeout.
+async fn probe(addr: &str, timeout: Duration) -> Result<()> {
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
+        Err(_) => bail!(
+            "OPC UA connection to {addr} timed out after {} ms",
+            timeout.as_millis()
+        ),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            bail!("OPC UA connection refused by {addr}")
+        }
+        Ok(Err(e)) => bail!("OPC UA connection to {addr} failed: {e}"),
+        Ok(Ok(_)) => Ok(()),
+    }
+}
+
+type Connection = (Arc<Session>, tokio::task::JoinHandle<StatusCode>);
+
+async fn connect(ctx: &Ctx) -> Result<Connection> {
     let (endpoint, _, _) = target(ctx);
+    probe(endpoint_addr(endpoint), ctx.timeout()).await?;
     let mut builder = ClientBuilder::new()
         .application_name("Capturefab")
         .application_uri("urn:capturefab")
         .product_uri("urn:capturefab")
         .create_sample_keypair(false)
         .trust_server_certs(false)
-        .session_retry_limit(3)
+        .session_retry_limit(0)
+        .max_array_length(MAX_ARRAY_LENGTH)
+        .max_chunk_count(MAX_CHUNK_COUNT)
+        .max_message_size(MAX_MESSAGE_SIZE)
         .request_timeout(ctx.timeout());
     if let Some(pki) = &ctx.spec.pki_dir {
         builder = builder.pki_dir(pki.clone());
@@ -82,15 +119,32 @@ async fn connect(ctx: &Ctx) -> Result<(Arc<Session>, tokio::task::JoinHandle<Sta
             )
         })?
         .map_err(|e| anyhow!("OPC UA connection failed: {e}"))?;
-    let handle = event_loop.spawn();
-    let connected = tokio::time::timeout(ctx.timeout(), session.wait_for_connection())
-        .await
-        .unwrap_or(false);
-    if !connected {
-        handle.abort();
-        bail!("OPC UA session could not be established");
+    // With no session retries, a rejected session (for example
+    // BadUserAccessDenied) ends the event loop at once with its status
+    // instead of retrying until the timeout; `log` reconnects itself.
+    let mut handle = event_loop.spawn();
+    let deadline = Instant::now() + ctx.timeout();
+    loop {
+        let step =
+            Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now()));
+        if let Ok(true) = tokio::time::timeout(step, session.wait_for_connection()).await {
+            return Ok((session, handle));
+        }
+        if handle.is_finished() {
+            let status = (&mut handle)
+                .await
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "event loop failed".into());
+            bail!("OPC UA session could not be established: {status}");
+        }
+        if Instant::now() >= deadline {
+            handle.abort();
+            bail!(
+                "OPC UA session could not be established: timed out after {} ms",
+                ctx.spec.timeout_ms
+            );
+        }
     }
-    Ok((session, handle))
 }
 
 /// Map a Variant to a sample value; arrays and structures become text.
@@ -111,6 +165,18 @@ fn value(variant: &Variant) -> (Value, &'static str) {
         Variant::String(s) => (Value::text(s.as_ref()), "text"),
         Variant::LocalizedText(t) => (Value::text(t.text.as_ref()), "text"),
         Variant::DateTime(t) => (Value::text(&t.as_chrono().to_rfc3339()), "text"),
+        Variant::Empty => (Value::text(""), "text"),
+        Variant::Array(array) => {
+            let items: Vec<String> = array
+                .values
+                .iter()
+                .map(|v| match value(v).0 {
+                    Value::Text(t) => serde_json::Value::String(t).to_string(),
+                    other => other.to_string(),
+                })
+                .collect();
+            (Value::text(&format!("[{}]", items.join(","))), "text")
+        }
         other => (Value::text(&format!("{other:?}")), "text"),
     }
 }
@@ -132,9 +198,14 @@ fn sample(tag: &str, data: &DataValue) -> Sample {
         .unwrap_or((Value::text(""), "text"));
     let non_finite = matches!(&v, Value::Text(t) if t == "NaN" || t == "inf" || t == "-inf")
         && matches!(&data.value, Some(Variant::Float(_) | Variant::Double(_)));
+    let empty = matches!(data.value, None | Some(Variant::Empty));
     let mut sample = Sample::now(tag, v, quality(data.status));
-    if non_finite || data.value.is_none() {
+    if non_finite || empty {
         sample.quality = Quality::Bad;
+    }
+    if empty && let Some(status) = data.status.filter(|s| !s.is_good()) {
+        // A read with no value, such as BadNodeIdUnknown, says why.
+        sample.value = Value::text(&status.to_string());
     }
     sample.source_ts_ms = data
         .source_timestamp
@@ -177,7 +248,11 @@ async fn browse(ctx: &Ctx, session: &Session, duration: Duration, limit: usize) 
             result_mask: BrowseResultMask::All as u32,
         };
         let mut results = session
-            .browse(&[description], 1000, None)
+            .browse(
+                &[description],
+                limit.saturating_sub(items.len()).clamp(1, 1000) as u32,
+                None,
+            )
             .await
             .map_err(|e| anyhow!("OPC UA browse failed: {e}"))?;
         let mut references = Vec::new();
@@ -242,7 +317,11 @@ async fn browse(ctx: &Ctx, session: &Session, duration: Duration, limit: usize) 
         };
         for ((index, _), pair) in chunk.iter().zip(values.chunks(2)) {
             let item = &mut items[*index];
-            if let Some(v) = pair.first().and_then(|d| d.value.as_ref()) {
+            if let Some(v) = pair
+                .first()
+                .and_then(|d| d.value.as_ref())
+                .filter(|v| !matches!(v, Variant::Empty))
+            {
                 item.value = Some(value(v).0);
             }
             if let Some(Variant::NodeId(t)) = pair.get(1).and_then(|d| d.value.as_ref()) {
@@ -252,6 +331,89 @@ async fn browse(ctx: &Ctx, session: &Session, duration: Duration, limit: usize) 
     }
     ctx.browse(items);
     Ok(truncated)
+}
+
+async fn disconnect((session, handle): Connection) {
+    let _ = tokio::time::timeout(Duration::from_secs(2), session.disconnect()).await;
+    handle.abort();
+}
+
+/// Sleep until `until` in short steps; false when stopped.
+async fn sleep_until(ctx: &Ctx, until: Instant) -> bool {
+    loop {
+        if ctx.stopped() {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= until {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50).min(until - now)).await;
+    }
+}
+
+/// Poll on the log schedule. When the session's event loop ends (it makes
+/// one reconnect attempt after a lost connection), reconnect with a new
+/// session, backing off from 1 s to 30 s. Errors are reported
+/// when they start or change, not on every tick.
+async fn log(ctx: &Ctx, connection: Connection, reads: &[ReadValueId], tags: &[String]) {
+    let mut connection = Some(connection);
+    let mut tick = Instant::now();
+    let mut backoff = Duration::from_secs(1);
+    let mut last_error: Option<String> = None;
+    let report = |error: anyhow::Error, last_error: &mut Option<String>| {
+        let message = format!("{error:#}");
+        if last_error.as_deref() != Some(message.as_str()) {
+            ctx.reconnecting(&error);
+            *last_error = Some(message);
+        }
+    };
+    loop {
+        if ctx.stopped() {
+            break;
+        }
+        if connection
+            .as_ref()
+            .is_some_and(|(_, handle)| handle.is_finished())
+        {
+            // The event loop gave up; its session cannot recover.
+            if let Some(dead) = connection.take() {
+                disconnect(dead).await;
+            }
+        }
+        match &connection {
+            Some((session, _)) => match read(ctx, session, reads, tags).await {
+                Ok(()) => {
+                    if last_error.take().is_some() {
+                        ctx.connected();
+                    }
+                    backoff = Duration::from_secs(1);
+                }
+                Err(error) => report(error, &mut last_error),
+            },
+            None => match connect(ctx).await {
+                Ok(fresh) => {
+                    connection = Some(fresh);
+                    continue;
+                }
+                Err(error) => report(error, &mut last_error),
+            },
+        }
+        ctx.flush_dropped();
+        let until = if connection.is_some() {
+            ctx.next_tick(&mut tick)
+        } else {
+            let until = Instant::now() + backoff;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+            until
+        };
+        if !sleep_until(ctx, until).await {
+            break;
+        }
+    }
+    if let Some(connection) = connection {
+        disconnect(connection).await;
+    }
 }
 
 pub fn run(ctx: &Ctx) -> Result<bool> {
@@ -274,7 +436,8 @@ pub fn run(ctx: &Ctx) -> Result<bool> {
         if !matches!(ctx.mode(), Mode::Browse { .. }) && nodes.is_empty() {
             bail!("opc.tcp:// read and start need at least one ?node=NODE_ID");
         }
-        let (session, handle) = connect(ctx).await?;
+        let connection = connect(ctx).await?;
+        let session = connection.0.clone();
         let result = match ctx.mode() {
             Mode::Browse { duration_ms, limit } => {
                 browse(
@@ -292,38 +455,84 @@ pub fn run(ctx: &Ctx) -> Result<bool> {
             Mode::Log => {
                 ctx.ready(infos);
                 ctx.connected();
-                let mut tick = Instant::now();
-                let mut failing = false;
-                loop {
-                    match read(ctx, &session, &reads, nodes).await {
-                        Ok(()) if failing => {
-                            failing = false;
-                            ctx.connected();
-                        }
-                        Ok(()) => {}
-                        Err(error) => {
-                            // The session's event loop reconnects on its own.
-                            failing = true;
-                            ctx.reconnecting(&error);
-                        }
-                    }
-                    ctx.flush_dropped();
-                    let until = ctx.next_tick(&mut tick);
-                    while Instant::now() < until {
-                        if ctx.stopped() {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(50).min(until - Instant::now()))
-                            .await;
-                    }
-                    if ctx.stopped() {
-                        break Ok(false);
-                    }
-                }
+                drop(session);
+                log(ctx, connection, &reads, nodes).await;
+                return Ok(false);
             }
         };
-        let _ = tokio::time::timeout(Duration::from_secs(2), session.disconnect()).await;
-        handle.abort();
+        drop(session);
+        disconnect(connection).await;
         result
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opcua::types::Array;
+
+    #[test]
+    fn endpoint_addresses() {
+        assert_eq!(endpoint_addr("opc.tcp://h:4840/a/b"), "h:4840");
+        assert_eq!(endpoint_addr("opc.tcp://[::1]:4841"), "[::1]:4841");
+    }
+
+    #[test]
+    fn arrays_are_compact_text_and_empty_is_blank() {
+        let numbers = Variant::Array(Box::new(
+            Array::new(
+                opcua::types::VariantScalarTypeId::Double,
+                vec![Variant::Double(1.0), Variant::Double(2.5)],
+            )
+            .unwrap(),
+        ));
+        assert_eq!(value(&numbers).0, Value::text("[1,2.5]"));
+        let words = Variant::Array(Box::new(
+            Array::new(
+                opcua::types::VariantScalarTypeId::String,
+                vec![Variant::from("a\"b"), Variant::from("c")],
+            )
+            .unwrap(),
+        ));
+        assert_eq!(value(&words).0, Value::text(r#"["a\"b","c"]"#));
+        assert_eq!(value(&Variant::Empty).0, Value::text(""));
+    }
+
+    #[test]
+    fn missing_values_carry_their_status() {
+        for data in [
+            DataValue {
+                value: Some(Variant::Empty),
+                status: Some(StatusCode::BadNodeIdUnknown),
+                ..Default::default()
+            },
+            DataValue {
+                value: None,
+                status: Some(StatusCode::BadNodeIdUnknown),
+                ..Default::default()
+            },
+        ] {
+            let s = sample("t", &data);
+            assert_eq!(s.quality, Quality::Bad);
+            assert_eq!(s.value, Value::text("BadNodeIdUnknown"));
+        }
+        let empty = sample("t", &DataValue::default());
+        assert_eq!(empty.quality, Quality::Bad);
+        assert_eq!(empty.value, Value::text(""));
+    }
+
+    #[test]
+    fn refused_connections_are_unavailable_not_timeouts() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(probe(&addr, Duration::from_secs(2)))
+            .unwrap_err();
+        assert_eq!(crate::cli::error_code(&error), ("unavailable", 3));
+    }
 }
