@@ -105,6 +105,47 @@ fn state_color(state: SourceState, p: &Palette) -> Color {
     }
 }
 
+/// Error text ink: only a source that gave up is drawn as a failure.
+fn error_ink(state: SourceState, p: &Palette) -> Color {
+    match state {
+        SourceState::Failed => p.ink(p.danger),
+        SourceState::Connecting | SourceState::Reconnecting => p.ink(p.warn),
+        _ => p.secondary,
+    }
+}
+
+/// A short label that tells sources on one host apart: the host, then the
+/// path and the name or node chosen, e.g. `192.168.1.30 · 1/holding/10
+/// (pressure)`. The URI is already redacted.
+fn source_label(uri: &str) -> String {
+    let rest = uri.split_once("://").map_or(uri, |(_, rest)| rest);
+    let (location, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let (authority, path) = location.split_once('/').unwrap_or((location, ""));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let mut label = host.to_string();
+    let path = path.trim_matches('/');
+    if !path.is_empty() {
+        label.push_str(" · ");
+        label.push_str(path);
+    }
+    let names: Vec<&str> = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .filter(|(key, _)| matches!(*key, "name" | "node"))
+        .map(|(_, value)| value)
+        .collect();
+    if !names.is_empty() {
+        label.push_str(&format!(" ({})", names.join(", ")));
+    }
+    if label.is_empty() {
+        uri.to_string()
+    } else {
+        label
+    }
+}
+
 fn state_label(source: &SourceStatus) -> String {
     let state = match source.state {
         SourceState::Connecting => "Connecting",
@@ -236,21 +277,32 @@ impl Workbench {
                 .filter(|_| source.state != SourceState::Running)
                 .map(|e| format::first_line(e).to_string())
                 .unwrap_or_else(|| state_label(source));
-            let ink = match source.state {
-                SourceState::Failed => p.ink(p.danger),
-                SourceState::Reconnecting => p.ink(p.warn),
-                _ => p.secondary,
+            let ink = error_ink(source.state, p);
+            let full = match source.error.as_deref() {
+                Some(error) if source.state != SourceState::Running => {
+                    format!("{}\n{error}", source.uri)
+                }
+                _ => source.uri.clone(),
             };
             let line = row![
                 container(widgets::dot(state_color(source.state, p), 8.0))
                     .width(16)
                     .center_x(16),
-                column![
-                    one_line(source.uri.as_str(), style::BODY, style::MEDIUM, p.text).width(Fill),
-                    one_line(detail, style::CAPTION, style::SANS, ink).width(Fill),
-                ]
-                .spacing(1)
-                .width(Fill),
+                tip(
+                    column![
+                        one_line(
+                            source_label(&source.uri),
+                            style::BODY,
+                            style::MEDIUM,
+                            p.text
+                        )
+                        .width(Fill),
+                        one_line(detail, style::CAPTION, style::SANS, ink).width(Fill),
+                    ]
+                    .spacing(1)
+                    .width(Fill),
+                    full,
+                ),
                 tip(
                     button(icon(Icon::Stop, 11.0, p.secondary))
                         .name(format!("Stop logging {}", source.uri))
@@ -432,7 +484,16 @@ fn source_view<'a>(source: &'a SourceStatus, p: &'static Palette) -> Element<'a,
     let mut rows = column![
         row![
             widgets::dot(state_color(source.state, p), 8.0),
-            one_line(source.uri.as_str(), style::SMALL, style::MEDIUM, p.text).width(Fill),
+            tip(
+                one_line(
+                    source_label(&source.uri),
+                    style::SMALL,
+                    style::MEDIUM,
+                    p.text
+                )
+                .width(Fill),
+                source.uri.clone(),
+            ),
             text(state_label(source))
                 .size(style::CAPTION)
                 .color(p.secondary),
@@ -449,7 +510,7 @@ fn source_view<'a>(source: &'a SourceStatus, p: &'static Palette) -> Element<'a,
         rows = rows.push(
             text(error.to_string())
                 .size(style::CAPTION)
-                .color(p.ink(p.danger)),
+                .color(error_ink(source.state, p)),
         );
     }
     for tag in source.tags.iter().take(ROWS) {
@@ -571,6 +632,31 @@ mod tests {
         let flat = scale(&[(0, 3.0), (10, 3.0)], size);
         assert!(flat.iter().all(|p| p.y == 10.0));
         assert!(scale(&[], size).is_empty());
+    }
+
+    #[test]
+    fn source_labels_tell_registers_on_one_plc_apart() {
+        for (uri, label) in [
+            (
+                "modbus-tcp://192.168.1.30/1/holding/0?type=f32&name=temp",
+                "192.168.1.30 · 1/holding/0 (temp)",
+            ),
+            (
+                "modbus-tcp://192.168.1.30/1/holding/10?name=pressure",
+                "192.168.1.30 · 1/holding/10 (pressure)",
+            ),
+            ("sim-signal://line1", "line1"),
+            (
+                "mqtt://<redacted>@broker:1883/plant/#",
+                "broker:1883 · plant/#",
+            ),
+            (
+                "opc.tcp://plc:4840/?node=ns=2;s=Temp",
+                "plc:4840 (ns=2;s=Temp)",
+            ),
+        ] {
+            assert_eq!(source_label(uri), label, "{uri}");
+        }
     }
 
     #[test]

@@ -397,6 +397,17 @@ struct Editor {
 /// Where FTP and SFTP destinations are changed until the form supports them.
 const SERVER_EDIT_HINT: &str = "Edit with capturefab destination add-ftp/add-sftp";
 
+/// The command that changes a server destination, shown on its row because
+/// the form cannot edit one.
+fn server_hint(target: &Target) -> Option<String> {
+    let command = match target {
+        Target::Ftp(_) => "add-ftp",
+        Target::Sftp(_) => "add-sftp",
+        _ => return None,
+    };
+    Some(format!("Edit with capturefab destination {command}"))
+}
+
 impl Editor {
     fn new_folder(name: String, folder: PathBuf) -> Self {
         Self {
@@ -2335,7 +2346,7 @@ impl Picker {
         let mut body = column![
             history_controls(undo_label, redo_label, p),
             text(
-                "Save captures and recordings to a folder or drive, or upload them to an S3 bucket or an FTP or SFTP server."
+                "Save captures and recordings to a folder or drive, or upload them to an S3 bucket. FTP and SFTP servers are added from the command line with capturefab destination add-ftp or add-sftp."
             )
             .size(style::SMALL)
             .color(p.secondary),
@@ -2435,6 +2446,26 @@ impl Picker {
             (edit, remove)
         };
         let description = destination.describe();
+        let mut info = column![
+            text(destination.name.as_str())
+                .size(style::BODY)
+                .font(style::SEMIBOLD),
+            super::tip(
+                one_line(
+                    description.clone(),
+                    style::CAPTION,
+                    style::SANS,
+                    p.secondary
+                )
+                .width(Fill),
+                description,
+            ),
+        ]
+        .spacing(2)
+        .width(Fill);
+        if let Some(hint) = server_hint(&destination.target) {
+            info = info.push(one_line(hint, style::CAPTION, style::SANS, p.tertiary).width(Fill));
+        }
         let glow = self.saved_glow.level(destination.name.as_str(), now);
         container(
             row![
@@ -2447,23 +2478,7 @@ impl Picker {
                     15.0,
                     p.accent,
                 ),
-                column![
-                    text(destination.name.as_str())
-                        .size(style::BODY)
-                        .font(style::SEMIBOLD),
-                    super::tip(
-                        one_line(
-                            description.clone(),
-                            style::CAPTION,
-                            style::SANS,
-                            p.secondary
-                        )
-                        .width(Fill),
-                        description,
-                    ),
-                ]
-                .spacing(2)
-                .width(Fill),
+                info,
                 first.padding([3, 8]),
                 second.padding([3, 8]),
             ]
