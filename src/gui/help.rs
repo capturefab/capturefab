@@ -49,6 +49,8 @@ pub(super) struct SheetState {
     pub(super) more: bool,
     /// The notes' chevron: 0 closed, 1 open.
     pub(super) more_turn: Motion,
+    /// The chevron of Settings' API keys section: 0 folded, 1 open.
+    pub(super) keys_turn: Motion,
 }
 
 impl Default for SheetState {
@@ -58,13 +60,14 @@ impl Default for SheetState {
             scrolled: false,
             more: false,
             more_turn: Motion::new(0.0, motion::RING, motion::RING_OUT, Kind::Move),
+            keys_turn: Motion::new(0.0, motion::RING, motion::RING_OUT, Kind::Move),
         }
     }
 }
 
 impl SheetState {
     super::motion::registry! {
-        motions: [shown, more_turn],
+        motions: [shown, more_turn, keys_turn],
         flashes: [],
     }
 }
@@ -78,6 +81,14 @@ impl Workbench {
         let now = self.now;
         self.sheets.shown.show(self.sheet_open(), now);
         self.sheets.more_turn.show(self.sheets.more, now);
+        // The keys section turns only while Settings shows; otherwise, as
+        // at launch with it remembered open, it is already where it rests.
+        let keys = self.video_analytics.keys_section_open();
+        if self.settings_open {
+            self.sheets.keys_turn.show(keys, now);
+        } else {
+            self.sheets.keys_turn.set(if keys { 1.0 } else { 0.0 });
+        }
         self.capture_to.sync(now);
         self.record_to.sync(now);
     }
@@ -124,15 +135,119 @@ impl Workbench {
         }
     }
 
-    /// Open or close the guide's notes on connecting cameras. They are its
-    /// last item, so opening them scrolls them into view.
+    /// Open or close the guide's notes on connecting cameras. Opening them
+    /// from elsewhere, as the welcome screen's "Connection tips" does, opens
+    /// the guide too, unless another sheet is open. They sit under the
+    /// guide's first steps, so they open in view.
     pub(super) fn show_help_notes(&mut self, open: bool) -> Task<Message> {
-        self.sheets.more = open;
-        if open {
-            operation::snap_to_end(SHEET_BODY)
-        } else {
-            Task::none()
+        if open && !self.help_open {
+            self.show_help(true);
+            if !self.help_open {
+                return Task::none();
+            }
+            // `show_help` closes the notes; they open as the sheet does.
+            self.sheets.more = true;
+            self.sheets.more_turn.set(1.0);
+            return operation::focus("sheet-close");
         }
+        self.sheets.more = open;
+        Task::none()
+    }
+
+    /// Which of the guide's first steps are done: a camera connected, a
+    /// stream started, a frame captured.
+    pub(super) fn guide_steps(&self) -> [bool; 3] {
+        [
+            !self.snapshot.cameras.is_empty(),
+            self.snapshot.cameras.iter().any(|camera| camera.streaming),
+            self.last_saved.is_some(),
+        ]
+    }
+
+    /// The guide's first steps, each marked once done; the first one not
+    /// done offers what does it.
+    fn guide_steps_view(&self, p: &'static Palette) -> Element<'_, Message> {
+        let done = self.guide_steps();
+        let next = done.iter().position(|done| !done);
+        let os = Os::CURRENT;
+        // Small buttons, the shortcut beside the label, so the next step
+        // reads as something to press.
+        let link = |label: &'static str, name: &'static str, on: Option<Message>| {
+            step_button(label, None, name, on, p)
+        };
+        let keyed = |label: &'static str, key: Action, name: &'static str, on: Option<Message>| {
+            step_button(label, Some(key.key_label(os)), name, on, p)
+        };
+        let mut steps = column![].spacing(4);
+        for (index, label) in ["Connect a camera", "Start the stream", "Capture a frame"]
+            .into_iter()
+            .enumerate()
+        {
+            let mark: Element<'_, Message> = if done[index] {
+                icon(Icon::Check, 14.0, p.ink(p.live))
+            } else {
+                text((index + 1).to_string())
+                    .size(style::SMALL)
+                    .font(style::SEMIBOLD)
+                    .color(p.secondary)
+                    .into()
+            };
+            // The mark starts at the content edge, under the headings.
+            let mut step = row![
+                container(mark)
+                    .width(18)
+                    .height(26)
+                    .align_x(Alignment::Start)
+                    .align_y(Alignment::Center),
+                text(label)
+                    .size(style::BODY)
+                    .color(if done[index] { p.secondary } else { p.text }),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+            if next == Some(index) {
+                step = step.push(space().width(4));
+                match index {
+                    0 => {
+                        step = step
+                            .push(keyed(
+                                "Enter an address",
+                                Action::ConnectAddress,
+                                "Enter an address",
+                                Some(Message::EnterAddress),
+                            ))
+                            .push(link(
+                                "No camera? Try the simulator",
+                                "Try the simulator",
+                                (!self.connecting("sim:0")).then_some(Message::TrySimulator),
+                            ));
+                    }
+                    1 => {
+                        step = step.push(keyed(
+                            "Start",
+                            Action::ToggleStream,
+                            "Start the stream",
+                            self.snapshot
+                                .active_camera
+                                .is_some()
+                                .then_some(Message::ToggleStream),
+                        ));
+                    }
+                    _ => {
+                        step = step.push(keyed(
+                            "Capture",
+                            Action::Capture,
+                            "Capture a frame",
+                            (!self.capturing_here()
+                                && self.validate_input(&self.capture_command(false)).is_ok())
+                            .then_some(Message::Capture),
+                        ));
+                    }
+                }
+            }
+            steps = steps.push(step);
+        }
+        steps.into()
     }
 
     /// Hand a message to the capture (`recording` false) or recording
@@ -167,10 +282,13 @@ impl Workbench {
 
     /// Bring a destination sheet whose page changed on its own, as a
     /// finished save does, to its top; from `tick()`.
+    /// Also opens Settings when the measurements asked for it, which needs
+    /// a task this tick can carry (see `take_settings_request`).
     pub(super) fn pickers_to_top(&mut self) -> Task<Message> {
         Task::batch([
             page_top(&mut self.capture_to),
             page_top(&mut self.record_to),
+            self.take_settings_request(),
         ])
     }
 
@@ -301,25 +419,7 @@ impl Workbench {
         let [editing, cameras, acquisition, view, panels, window] = Action::SECTIONS;
         let more = self.sheets.more;
         let mut body = column![
-            text("Discover a camera, connect, then start a stream. The simulator is available without camera hardware.")
-                .size(style::BODY)
-                .color(p.secondary),
-            row![
-                column![section(editing), section(cameras), section(acquisition), section(window)]
-                    .spacing(18)
-                    .width(Fill),
-                column![section(view), section(panels)].spacing(18).width(Fill),
-            ]
-            .spacing(32),
-            text("Undo and Redo work in text fields and restore reversible settings changes. Captures and uploads stay saved.")
-                .size(style::SMALL)
-                .color(p.secondary),
-            text(plain_keys_note(os)).size(style::SMALL).color(p.secondary),
-            heading("Control this window from a terminal or agent", p),
-            text("Copy the session command to attach your terminal or coding agent. Everyone shares camera connections, settings and captures. Activity shows who acted and capture progress; your selected camera and unfinished edits stay local.")
-                .size(style::BODY),
-            self.copyable(self.session_command(), p),
-            self.copyable("capturefab --help".into(), p),
+            self.guide_steps_view(p),
             disclosure(
                 "Connecting cameras",
                 None,
@@ -330,12 +430,31 @@ impl Workbench {
         ]
         .spacing(14);
         if more {
-            body = body.push(
-                text("Add stream URLs directly. Use sim:replay:PATH to loop a video file or a folder of image frames or videos, sorted by filename without searching subfolders. Native camera sources use avfoundation:// on macOS, v4l2:// on Linux, and dshow:// on Windows. GigE: use a reachable address on the camera's subnet. USB3: the operating system must allow access to the camera. Activity shows connection and capture errors.")
+            body = body.push(connection_notes(p));
+        }
+        let body = body
+            .push(
+                row![
+                    column![section(editing), section(cameras), section(acquisition), section(window)]
+                        .spacing(18)
+                        .width(Fill),
+                    column![section(view), section(panels)].spacing(18).width(Fill),
+                ]
+                .spacing(32),
+            )
+            .push(
+                text("Undo and Redo work in text fields and restore reversible settings changes. Captures and uploads stay saved.")
                     .size(style::SMALL)
                     .color(p.secondary),
-            );
-        }
+            )
+            .push(text(plain_keys_note(os)).size(style::SMALL).color(p.secondary))
+            .push(heading("Control this window from a terminal or agent", p))
+            .push(
+                text("Copy the session command to attach your terminal or coding agent. Everyone shares camera connections, settings and captures. Activity shows who acted and capture progress; your selected camera and unfinished edits stay local.")
+                    .size(style::BODY),
+            )
+            .push(self.copyable(self.session_command(), p))
+            .push(self.copyable("capturefab --help".into(), p));
         sheet_frame("Quick guide", Message::Help(false), body, p)
             .mark(Icon::Keyboard)
             .size(700.0, height)
@@ -367,6 +486,92 @@ fn plain_keys_note(os: Os) -> String {
         "{keys} act on the workbench when no field has keyboard focus. Press {} or click elsewhere to leave a field.",
         Action::Overview.key_label(os)
     )
+}
+
+/// A guide step's action: a small button, its shortcut beside the label.
+fn step_button<'a>(
+    label: &'static str,
+    key: Option<String>,
+    name: &'static str,
+    on: Option<Message>,
+    p: &'static Palette,
+) -> Element<'a, Message> {
+    let mut content = row![text(label).size(style::SMALL)]
+        .spacing(6)
+        .align_y(Alignment::Center);
+    if let Some(key) = key.filter(|key| !key.is_empty()) {
+        content = content.push(text(key).size(style::CAPTION).color(p.secondary));
+    }
+    button(content)
+        .name(name)
+        .style(style::secondary)
+        .padding([3, 9])
+        .on_press_maybe(on)
+        .into()
+}
+
+/// The native camera scheme on this system, for the webcam note.
+fn webcam_scheme() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "avfoundation://"
+    } else if cfg!(target_os = "windows") {
+        "dshow://"
+    } else {
+        "v4l2://"
+    }
+}
+
+/// The guide's notes on connecting cameras: one short line per kind of
+/// source, what to type for it in small monospace.
+fn connection_notes<'a>(p: &'static Palette) -> Element<'a, Message> {
+    let note = |kind: &'static str, about: &'static str, syntax: Option<&'static str>| {
+        let mut line = row![
+            text(kind)
+                .size(style::SMALL)
+                .font(style::MEDIUM)
+                .color(p.text)
+                .width(92),
+            text(about).size(style::SMALL).color(p.secondary),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        if let Some(syntax) = syntax {
+            line = line.push(
+                text(syntax)
+                    .size(style::CAPTION)
+                    .font(style::MONO)
+                    .color(p.secondary),
+            );
+        }
+        line
+    };
+    column![
+        note(
+            "Streams",
+            "Paste an RTSP, SRT, RTMP or HTTP address.",
+            Some("rtsp://host/stream")
+        ),
+        note(
+            "Video files",
+            "Loop a file, or a folder's frames by name (not subfolders).",
+            Some("sim:replay:PATH")
+        ),
+        note("Webcams", "Built-in and USB webcams.", Some(webcam_scheme())),
+        note("GigE", "Use an address on the camera's subnet.", None).push(tip(
+            step_button("Check network", None, "Check network", Some(Message::ScanNetwork), p),
+            "Tunes connected GigE cameras for the available bandwidth and checks network adapters. Live previews may pause briefly.",
+        )),
+        note(
+            "USB3",
+            "The operating system must allow access to the camera.",
+            None
+        ),
+        text("Activity shows connection and capture errors.")
+            .size(style::SMALL)
+            .color(p.secondary),
+    ]
+    .spacing(6)
+    .into()
 }
 
 #[cfg(test)]
@@ -441,6 +646,151 @@ mod tests {
         let _ = bench.handle_message(Message::Help(false));
         let _ = bench.handle_message(Message::Help(true));
         assert!(!bench.sheets.scrolled && !bench.sheets.more);
+    }
+
+    #[test]
+    fn connection_tips_open_the_guide_at_its_notes() {
+        let mut bench = bench();
+        let _ = bench.handle_message(Message::HelpMore(true));
+        assert!(
+            bench.help_open && bench.sheets.more,
+            "from the welcome screen"
+        );
+        assert_eq!(bench.sheets.more_turn.get(bench.now), 1.0, "already open");
+        let _ = bench.handle_message(Message::HelpMore(false));
+        assert!(
+            bench.help_open && !bench.sheets.more,
+            "the fold closes them"
+        );
+        // Another sheet keeps the guide waiting.
+        let mut bench = self::bench();
+        bench.capture_to.manager_open = true;
+        let _ = bench.handle_message(Message::HelpMore(true));
+        assert!(!bench.help_open && !bench.sheets.more);
+    }
+
+    #[test]
+    fn the_guide_marks_its_first_steps_as_they_are_done() {
+        let mut bench = bench();
+        assert_eq!(bench.guide_steps(), [false; 3]);
+        let mut camera = super::super::liveness::streaming_camera(10, 0, 30.0);
+        camera.streaming = false;
+        bench.snapshot.cameras = vec![camera];
+        assert_eq!(bench.guide_steps(), [true, false, false]);
+        bench.snapshot.cameras[0].streaming = true;
+        assert_eq!(bench.guide_steps(), [true, true, false]);
+    }
+
+    /// The guide's controls by name and what each sends, at the sheet's
+    /// size; the steps and notes come first.
+    fn guide_buttons(bench: &Workbench) -> Vec<(String, Option<Message>)> {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced::futures::StreamExt;
+        let renderer = super::super::destinations::layout_tests::renderer();
+        let mut view = bench.help(Palette::of(false), 820.0);
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(1000.0, 900.0)),
+        );
+        let (snapshot, bridge, window) = accessibility::snapshot_widget(
+            view.as_widget_mut(),
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+        );
+        snapshot
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.role() == accessibility::Role::Button)
+            .map(|(id, node)| {
+                let task = bridge.dispatch(accessibility::Request {
+                    window,
+                    replay: None,
+                    action: accesskit::ActionRequest {
+                        action: accesskit::Action::Click,
+                        target: *id,
+                        data: None,
+                    },
+                });
+                let sent = iced_runtime::task::into_stream(task).and_then(|mut actions| {
+                    match iced::futures::executor::block_on(actions.next()) {
+                        Some(iced_runtime::Action::Output(message)) => Some(message),
+                        _ => None,
+                    }
+                });
+                (node.label().unwrap_or_default().to_owned(), sent)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_next_step_offers_what_does_it_under_a_name() {
+        let mut bench = bench();
+        bench.help_open = true;
+        let sent = |buttons: &[(String, Option<Message>)], name: &str| {
+            buttons
+                .iter()
+                .find(|(label, _)| label == name)
+                .unwrap_or_else(|| panic!("{name} in the guide"))
+                .1
+                .clone()
+        };
+        let buttons = guide_buttons(&bench);
+        assert!(
+            buttons.iter().all(|(label, _)| !label.is_empty()),
+            "{buttons:?}"
+        );
+        assert!(matches!(
+            sent(&buttons, "Enter an address"),
+            Some(Message::EnterAddress)
+        ));
+        assert!(matches!(
+            sent(&buttons, "Try the simulator"),
+            Some(Message::TrySimulator)
+        ));
+        assert!(!buttons.iter().any(|(label, _)| label == "Start the stream"));
+        // Connected: the next step's link, and the first step's are gone.
+        let mut camera = super::super::liveness::streaming_camera(10, 0, 30.0);
+        camera.streaming = false;
+        bench.snapshot.active_camera = Some(camera.info.id.clone());
+        bench.snapshot.cameras = vec![camera];
+        let buttons = guide_buttons(&bench);
+        assert!(matches!(
+            sent(&buttons, "Start the stream"),
+            Some(Message::ToggleStream)
+        ));
+        assert!(!buttons.iter().any(|(label, _)| label == "Enter an address"));
+        bench.snapshot.cameras[0].streaming = true;
+        let buttons = guide_buttons(&bench);
+        assert!(
+            matches!(sent(&buttons, "Capture a frame"), Some(Message::Capture)),
+            "the streaming camera can capture: {:?}",
+            sent(&buttons, "Capture a frame")
+        );
+        // The notes hold the network check.
+        bench.sheets.more = true;
+        let buttons = guide_buttons(&bench);
+        assert!(matches!(
+            sent(&buttons, "Check network"),
+            Some(Message::ScanNetwork)
+        ));
+    }
+
+    #[test]
+    fn the_guide_makes_way_for_what_its_links_open() {
+        let mut bench = bench();
+        let _ = bench.handle_message(Message::Help(true));
+        let _ = bench.handle_message(Message::EnterAddress);
+        assert!(!bench.help_open, "the address field is under the guide");
+        let _ = bench.handle_message(Message::Help(true));
+        bench.sheets.more = true;
+        let _ = bench.handle_message(Message::ScanNetwork);
+        assert!(
+            !bench.help_open && bench.network_open,
+            "the report takes its place"
+        );
     }
 
     #[test]

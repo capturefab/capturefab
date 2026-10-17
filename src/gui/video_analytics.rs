@@ -19,6 +19,9 @@ pub(super) struct Preferences {
     pub model: ModelConfig,
     pub measurements: Vec<MeasurementDefinition>,
     pub interval_seconds: u64,
+    /// Settings' API keys section is open. Only the user's toggle writes
+    /// it; a credential error shows the section without changing it.
+    pub keys_open: bool,
 }
 
 impl Default for Preferences {
@@ -32,6 +35,7 @@ impl Default for Preferences {
                 unit: "tubes".into(),
             }],
             interval_seconds: 30,
+            keys_open: false,
         }
     }
 }
@@ -69,6 +73,10 @@ pub(super) enum Input {
     SaveKey,
     DeleteKey,
     RefreshKey,
+    /// Open (true) or fold Settings' API keys section.
+    Keys(bool),
+    /// From the measurements: Settings, open at the keys for their provider.
+    ManageKeys,
 }
 
 enum CredentialAction {
@@ -89,7 +97,7 @@ pub(super) struct State {
     secret: SecretDraft,
     credential_status: Option<String>,
     credential_notice: Option<&'static str>,
-    credential_error: Option<&'static str>,
+    pub(super) credential_error: Option<&'static str>,
     credential_pending: Option<Receiver<CredentialReply>>,
     pending: Option<Receiver<Report>>,
     refreshed: Option<Instant>,
@@ -101,6 +109,14 @@ pub(super) struct State {
     history_error: Option<String>,
     paused_for_edit: bool,
     pub running_camera: Option<String>,
+    /// A screenshot scene shows the keys section, without remembering it.
+    keys_shown: bool,
+    /// Settings was asked for from the measurements; opened on the next
+    /// tick, once the analytics sheet has made way (`take_settings_request`).
+    settings_requested: bool,
+    /// The model's provider, asked for by "Manage API keys" while a check
+    /// was pending; switched to once that check lands.
+    requested_provider: Option<Provider>,
 }
 
 impl State {
@@ -127,6 +143,9 @@ impl State {
             history_error: None,
             paused_for_edit: false,
             running_camera: None,
+            keys_shown: false,
+            settings_requested: false,
+            requested_provider: None,
         }
     }
 
@@ -164,6 +183,36 @@ impl State {
             measurements: self.preferences.measurements.clone(),
             interval_seconds,
         })
+    }
+
+    /// Whether Settings' API keys section shows open: as the user left it,
+    /// or while it has an error to show, or in a screenshot scene.
+    pub(super) fn keys_section_open(&self) -> bool {
+        self.preferences.keys_open || self.keys_shown || self.credential_error.is_some()
+    }
+
+    /// What the folded API keys section says is set.
+    pub(super) fn keys_summary(&self) -> String {
+        if self.credential_pending.is_some() {
+            "Checking keys…".into()
+        } else if let Some(status) = &self.credential_status {
+            format!("{} · {}", self.credential_provider, first_sentence(status))
+        } else {
+            "Optional · for prompt measurements".into()
+        }
+    }
+
+    /// Show `provider`'s keys, dropping what was shown for another.
+    /// Returns whether it changed.
+    fn switch_provider(&mut self, provider: Provider) -> bool {
+        if self.credential_provider == provider {
+            return false;
+        }
+        self.credential_provider = provider;
+        self.clear_secret();
+        self.credential_status = None;
+        self.credential_notice = None;
+        true
     }
 
     pub(super) fn clear_secret(&mut self) {
@@ -209,6 +258,13 @@ impl State {
     }
 }
 
+/// `text` up to the end of its first sentence, without the full stop.
+fn first_sentence(text: &str) -> &str {
+    let text = text.trim();
+    let end = text.find(". ").unwrap_or(text.len());
+    text[..end].trim_end_matches('.')
+}
+
 fn spawn_credentials(
     work: impl FnOnce() -> CredentialReply + Send + 'static,
 ) -> std::io::Result<Receiver<CredentialReply>> {
@@ -233,6 +289,7 @@ impl Workbench {
                     return false;
                 }
                 let state = &mut self.video_analytics;
+                state.keys_shown = true;
                 state.credential_provider = Provider::Gemini;
                 state.credential_pending = None;
                 state.credential_status =
@@ -398,6 +455,38 @@ impl Workbench {
                 state.credentials(CredentialAction::Delete);
             }
             Input::RefreshKey => state.refresh_credentials(),
+            Input::Keys(open) => {
+                state.preferences.keys_open = open;
+                if !open {
+                    // Folding also dismisses what held it open, so the
+                    // chevron always does what it says.
+                    state.keys_shown = false;
+                    state.credential_error = None;
+                }
+            }
+            Input::ManageKeys => {
+                let provider = state.preferences.model.provider;
+                if state.credential_pending.is_some() {
+                    // Switch once the check in flight lands.
+                    state.requested_provider = Some(provider);
+                } else {
+                    state.switch_provider(provider);
+                }
+                state.preferences.keys_open = true;
+                state.settings_requested = true;
+                // Settings waits while another sheet is open; this one makes way.
+                let _ = self.show_analytics(false);
+            }
+        }
+    }
+
+    /// Settings, if the measurements asked for it; from the tick, which can
+    /// open its window. Opening still follows `Message::Settings`'s rules.
+    pub(super) fn take_settings_request(&mut self) -> Task<Message> {
+        if std::mem::take(&mut self.video_analytics.settings_requested) {
+            Task::done(Message::Settings(true))
+        } else {
+            Task::none()
         }
     }
 
@@ -423,6 +512,12 @@ impl Workbench {
                 }
                 Err(TryRecvError::Empty) => {}
             }
+        }
+        if state.credential_pending.is_none()
+            && let Some(provider) = state.requested_provider.take()
+            && state.switch_provider(provider)
+        {
+            state.refresh_credentials();
         }
         if let Some(pending) = &state.pending {
             match pending.try_recv() {
@@ -494,15 +589,21 @@ impl Workbench {
     pub(super) fn api_credentials_content(&self, p: &'static Palette) -> Element<'_, Message> {
         let state = &self.video_analytics;
         let ready = state.credential_pending.is_none();
-        let provider = pick_list(Provider::ALL, Some(state.credential_provider), |value| {
-            Message::VideoAnalytics(Input::CredentialProvider(value))
-        })
-        .name("API key provider")
-        .enabled(ready)
-        .width(Fill)
-        .padding([6, 10])
-        .text_size(style::BODY)
-        .style(style::pick);
+        let provider = tip(
+            pick_list(Provider::ALL, Some(state.credential_provider), |value| {
+                Message::VideoAnalytics(Input::CredentialProvider(value))
+            })
+            .name("API key provider")
+            .enabled(ready)
+            .width(Fill)
+            .padding([6, 10])
+            .text_size(style::BODY)
+            .style(style::pick),
+            format!(
+                "Environment: {}. Environment values take precedence over a saved key.",
+                state.credential_provider.env_names().join(" or ")
+            ),
+        );
         let input = text_input("API key", &state.secret.0)
             .name(format!("{} API key", state.credential_provider))
             .description(
@@ -530,8 +631,8 @@ impl Workbench {
             .on_press_maybe(ready.then_some(Message::VideoAnalytics(Input::DeleteKey)));
         let refresh = button(text("Refresh").size(style::BODY))
             .name("Refresh API credential status")
-            .padding([6, 12])
-            .style(style::secondary)
+            .padding([6, 8])
+            .style(style::link)
             .on_press_maybe(ready.then_some(Message::VideoAnalytics(Input::RefreshKey)));
         let status = if ready {
             state
@@ -542,12 +643,12 @@ impl Workbench {
             "Accessing OS credential store…"
         };
         let mut content = column![
-            heading("AI provider API keys", p),
             provider,
-            text(format!("Environment: {}. Environment values take precedence over a saved key.", state.credential_provider.env_names().join(" or "))).size(style::SMALL).color(p.secondary),
             text(status).size(style::SMALL).color(p.secondary),
             input,
-            row![save, remove, refresh].spacing(8),
+            row![save, remove, refresh]
+                .spacing(8)
+                .align_y(Alignment::Center),
             text("Keys entered here are stored in your OS native credential store. Configure the model and measurements in Session analytics.")
                 .size(style::SMALL).color(p.secondary),
         ].spacing(9);
@@ -736,9 +837,11 @@ impl Workbench {
             ));
         }
         content = content.push(
-            text("Configure API keys in Settings.")
-                .size(style::SMALL)
-                .color(p.secondary),
+            // No side padding: the link lines up with the lines above it.
+            button(text("Manage API keys in Settings…").size(style::SMALL))
+                .style(style::link)
+                .padding([2, 0])
+                .on_press(Message::VideoAnalytics(Input::ManageKeys)),
         );
         if let Some(error) = &state.history_error {
             content = content.push(field_error(error.clone(), p));
@@ -997,6 +1100,118 @@ mod tests {
         assert!(!json.contains("running"));
         assert!(!json.contains("secret"));
         assert!(!json.contains("api_key"));
+    }
+
+    #[test]
+    fn the_folded_keys_say_what_is_set() {
+        let mut state = State::new(SessionHandle::new(), Preferences::default());
+        // Before any check: what the keys are for, nothing to do.
+        assert_eq!(state.keys_summary(), "Optional · for prompt measurements");
+        let (_sender, receiver) = mpsc::channel();
+        state.credential_pending = Some(receiver);
+        assert_eq!(state.keys_summary(), "Checking keys…");
+        state.credential_pending = None;
+        state.credential_provider = Provider::Gemini;
+        state.credential_status =
+            Some("No saved key. Enter an API key to enable prompt measurements.".into());
+        assert_eq!(state.keys_summary(), "Gemini · No saved key");
+        state.credential_status = Some(ai::CredentialStatus::Keyring.to_string());
+        assert_eq!(
+            state.keys_summary(),
+            "Gemini · API key saved in the OS credential store"
+        );
+    }
+
+    #[test]
+    fn the_keys_section_is_remembered_and_an_error_shows_it_without_remembering() {
+        // Older preferences have no flag: folded.
+        let legacy: Preferences = serde_json::from_str(r#"{"interval_seconds": 45}"#).unwrap();
+        assert!(!legacy.keys_open);
+        let open = Preferences {
+            keys_open: true,
+            ..Preferences::default()
+        };
+        let json = serde_json::to_string(&open).unwrap();
+        assert_eq!(serde_json::from_str::<Preferences>(&json).unwrap(), open);
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), false, None);
+        assert!(!bench.video_analytics.keys_section_open());
+        bench.video_analytics.credential_error =
+            Some("The OS credential store could not save this key.");
+        assert!(
+            bench.video_analytics.keys_section_open(),
+            "shown for its error"
+        );
+        assert!(!bench.prefs().video_analytics.keys_open, "not remembered");
+        bench.video_analytics.credential_error = None;
+        bench.video_analytics_input(Input::Keys(true));
+        assert!(bench.prefs().video_analytics.keys_open);
+        bench.video_analytics_input(Input::Keys(false));
+        assert!(!bench.video_analytics.keys_section_open());
+        // The review scenes show it, and closing it ends that.
+        assert!(bench.scene_video_analytics("settings-credentials", true));
+        assert!(bench.video_analytics.keys_section_open());
+        assert!(!bench.prefs().video_analytics.keys_open);
+        bench.video_analytics_input(Input::Keys(false));
+        assert!(!bench.video_analytics.keys_section_open());
+        // Folding a section an error holds open dismisses the error, so the
+        // chevron is never a toggle that does nothing.
+        bench.video_analytics.credential_error =
+            Some("The OS credential store could not save this key.");
+        assert!(bench.video_analytics.keys_section_open());
+        bench.video_analytics_input(Input::Keys(false));
+        assert!(!bench.video_analytics.keys_section_open());
+        assert!(!bench.prefs().video_analytics.keys_open);
+    }
+
+    #[test]
+    fn managing_keys_during_a_check_switches_provider_once_it_lands() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), false, None);
+        bench.video_analytics.credential_provider = Provider::OpenAi;
+        bench.video_analytics_input(Input::Provider(Provider::Gemini));
+        let (sender, receiver) = mpsc::channel();
+        bench.video_analytics.credential_pending = Some(receiver);
+        bench.video_analytics_input(Input::ManageKeys);
+        assert_eq!(
+            bench.video_analytics.credential_provider,
+            Provider::OpenAi,
+            "not while the check is in flight"
+        );
+        sender.send(Ok(("No saved key.".into(), None))).unwrap();
+        bench.tick_video_analytics();
+        assert_eq!(bench.video_analytics.credential_provider, Provider::Gemini);
+        assert_eq!(bench.video_analytics.requested_provider, None);
+        assert!(
+            bench.video_analytics.credential_status.is_none(),
+            "the other provider's status is not shown for this one"
+        );
+    }
+
+    #[test]
+    fn managing_keys_from_measurements_opens_settings_at_their_provider() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), false, None);
+        let _ = bench.handle_message(Message::Analytics(true));
+        assert!(bench.analytics.open);
+        bench.video_analytics_input(Input::Provider(Provider::Gemini));
+        bench.video_analytics_input(Input::ManageKeys);
+        assert_eq!(bench.video_analytics.credential_provider, Provider::Gemini);
+        assert!(bench.video_analytics.keys_section_open());
+        assert!(!bench.analytics.open, "the analytics sheet makes way");
+        assert!(!bench.settings_open, "opened by the tick");
+        let opens = |bench: &mut Workbench| {
+            use iced::futures::StreamExt;
+            iced_runtime::task::into_stream(bench.take_settings_request()).is_some_and(
+                |mut actions| {
+                    matches!(
+                        iced::futures::executor::block_on(actions.next()),
+                        Some(iced_runtime::Action::Output(Message::Settings(true)))
+                    )
+                },
+            )
+        };
+        assert!(opens(&mut bench));
+        assert!(!opens(&mut bench), "asked once");
+        let _ = bench.handle_message(Message::Settings(true));
+        assert!(bench.settings_open);
     }
 
     #[test]

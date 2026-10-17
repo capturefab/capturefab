@@ -49,7 +49,7 @@ pub(super) const DISCOVERING: &str =
 pub(super) const ADDRESSES: &str =
     "IP address, stream URL (RTSP, SRT, RTMP, HTTP), onvif: address, video file or sim:replay:PATH";
 /// What the address field takes, in the room under it.
-const ADDRESS_HINT: &str = "IP, stream URL, onvif: or video file";
+const ADDRESS_HINT: &str = "e.g. 192.168.1.20 or rtsp://host/stream";
 
 /// State for the camera list and the welcome screen.
 pub(super) struct SideState {
@@ -228,6 +228,11 @@ impl Workbench {
     /// screen's "Enter an address" and its shortcut. The sidebar joins the
     /// view as it heads open, so the focus finds the field at once.
     pub(super) fn enter_address(&mut self) -> Task<Message> {
+        // From the quick guide's first step: the field it leads to is
+        // under the guide.
+        if self.help_open {
+            self.show_help(false);
+        }
         self.image_mode = false;
         self.sidebar_open = true;
         focus_address()
@@ -451,6 +456,18 @@ fn read_address(input: &str, devices: &[CameraInfo], file: Option<bool>) -> Opti
         .map(|device| format!("Will try {} · S/N {}", device.model, device.serial))
 }
 
+/// Whether connecting to `target` tries GigE Vision, as `read_address`
+/// reads it; a found GigE camera's ID or serial counts too.
+pub(super) fn reads_as_gige(target: &str, devices: &[CameraInfo]) -> bool {
+    target.starts_with("gige:")
+        || read_address(target, devices, None)
+            .is_some_and(|reading| reading.starts_with("Will try GigE Vision"))
+        || devices.iter().any(|device| {
+            device.transport == crate::types::Transport::GigE
+                && (device.id == target || device.serial == target)
+        })
+}
+
 /// `glyph` centered in the leading slot.
 fn lead<'a>(glyph: Element<'a, Message>) -> Element<'a, Message> {
     container(glyph).center_x(LEAD).into()
@@ -638,6 +655,32 @@ impl Workbench {
         if let Some(sources) = self.sidebar_signals(p) {
             list = list.push(sources);
         }
+        // The network check only once GigE is in play, under the list; the
+        // quick guide's connection notes keep it reachable otherwise. Its
+        // report only once there is one, so it is never shown disabled. The
+        // slot stays one container either way, so the widgets after it keep
+        // their state (the address field its focus) as it comes and goes.
+        let mut network = row![].align_y(Alignment::Center);
+        let relevant = self.network_check_relevant();
+        if relevant {
+            network = network
+                .push(self.network_scan_button(p))
+                .push(space::horizontal());
+            if self.snapshot.network_scan.is_some() {
+                network = network.push(
+                    button(text("Report").size(style::SMALL))
+                        .name("Open network scan results")
+                        .padding([4, 5])
+                        .style(style::plain)
+                        .on_press(Message::NetworkReport(true)),
+                );
+            }
+        }
+        let network = container(network).padding(if relevant {
+            iced::Padding::from([6.0, EDGE + INSET])
+        } else {
+            iced::Padding::ZERO
+        });
         container(
             column![
                 // Camera controls share the title row beside macOS traffic
@@ -651,24 +694,6 @@ impl Workbench {
                         })
                         .into()
                 ),
-                container(
-                    row![
-                        self.network_scan_button(p),
-                        space::horizontal(),
-                        button(text("Results").size(style::SMALL))
-                            .name("Open network scan results")
-                            .padding([4, 5])
-                            .style(style::plain)
-                            .on_press_maybe(
-                                self.snapshot
-                                    .network_scan
-                                    .as_ref()
-                                    .map(|_| Message::NetworkReport(true))
-                            ),
-                    ]
-                    .align_y(Alignment::Center),
-                )
-                .padding([6.0, EDGE + INSET]),
                 space().height(4),
                 container(keyboard_history::content_scope(
                     scrollable(list).height(Fill).style(style::scroll).into(),
@@ -676,6 +701,9 @@ impl Workbench {
                 ))
                 .height(Fill)
                 .padding([0.0, EDGE]),
+                // Under the list, so coming and going only trims its bottom
+                // and never moves a camera row.
+                network,
                 self.sidebar_footer(p),
             ]
             .padding(iced::Padding {
@@ -961,7 +989,7 @@ impl Workbench {
         let typed = self.address.trim();
         let failure = self.side.connect_failures.get(typed);
         let shake = self.side.shake(typed, self.now);
-        let field = text_input("Add camera, IP or stream URL", &self.address)
+        let field = text_input("Camera IP, stream URL or file", &self.address)
             .name("Camera address")
             .description("Enter a camera IP address, stream URL or device identifier, then press Return to connect.")
             .invalid(failure.map(|(error, _)| format!("Could not connect: {error}")))
@@ -1007,11 +1035,6 @@ impl Workbench {
                 .width(Fill)
                 .into()
         };
-        let appearance = match self.appearance {
-            Appearance::System => (Icon::Contrast, "Appearance: match system"),
-            Appearance::Light => (Icon::Sun, "Appearance: light"),
-            Appearance::Dark => (Icon::Moon, "Appearance: dark"),
-        };
         let command = self.session_command();
         let copied = self.just_copied(&command);
         // The session's name and a copy of the command that drives it, in
@@ -1047,7 +1070,7 @@ impl Workbench {
         );
         let settings = row![
             tip_above(
-                button(icon(appearance.0, 15.0, p.secondary))
+                button(icon(Icon::Gear, 15.0, p.secondary))
                     .name("Settings")
                     .padding(6)
                     .style(style::plain)
@@ -1545,6 +1568,149 @@ mod tests {
         bench.sync_animations();
         assert!(bench.sidebar_shown());
         assert_eq!(bench.sidebar_slide.target(), 1.0);
+    }
+
+    /// The sidebar's accessible controls by name, and what pressing each
+    /// one sends.
+    fn sidebar_buttons(bench: &Workbench) -> Vec<(String, Option<Message>)> {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced::futures::StreamExt;
+        let renderer = super::super::destinations::layout_tests::renderer();
+        let mut view = bench.sidebar(Palette::of(false));
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(SIDEBAR, 700.0)),
+        );
+        let (snapshot, bridge, window) = accessibility::snapshot_widget(
+            view.as_widget_mut(),
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+        );
+        snapshot
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.role() == accessibility::Role::Button)
+            .map(|(id, node)| {
+                let task = bridge.dispatch(accessibility::Request {
+                    window,
+                    replay: None,
+                    action: accesskit::ActionRequest {
+                        action: accesskit::Action::Click,
+                        target: *id,
+                        data: None,
+                    },
+                });
+                let sent = iced_runtime::task::into_stream(task).and_then(|mut actions| {
+                    match iced::futures::executor::block_on(actions.next()) {
+                        Some(iced_runtime::Action::Output(message)) => Some(message),
+                        _ => None,
+                    }
+                });
+                (node.label().unwrap_or_default().to_owned(), sent)
+            })
+            .collect()
+    }
+
+    fn has(buttons: &[(String, Option<Message>)], name: &str) -> bool {
+        buttons.iter().any(|(label, _)| label == name)
+    }
+
+    #[test]
+    fn the_network_check_waits_until_gige_is_in_play() {
+        let mut bench = bench();
+        // Simulated cameras only: no network to check.
+        bench.snapshot.devices = vec![device("sim:0", "SIM0"), device("sim:1", "SIM1")];
+        assert!(!bench.network_check_relevant());
+        let buttons = sidebar_buttons(&bench);
+        assert!(!has(&buttons, "Scan network"));
+        assert!(!has(&buttons, "Open network scan results"));
+        // A GigE camera found: the check, but no report to open yet.
+        let mut gige = device("gige:10.0.0.2", "GE1");
+        gige.transport = Transport::GigE;
+        gige.address = Some("10.0.0.2".into());
+        bench.snapshot.devices.push(gige);
+        let buttons = sidebar_buttons(&bench);
+        assert!(has(&buttons, "Scan network"));
+        assert!(
+            !has(&buttons, "Open network scan results"),
+            "never shown disabled"
+        );
+        // With a report, it opens it.
+        bench.snapshot.network_scan = Some(crate::network::NetworkScan {
+            interfaces: Vec::new(),
+            cameras: Vec::new(),
+            warnings: Vec::new(),
+            scanned_at_ms: 0,
+        });
+        let buttons = sidebar_buttons(&bench);
+        let report = buttons
+            .iter()
+            .find(|(label, _)| label == "Open network scan results")
+            .expect("the report button");
+        assert!(matches!(report.1, Some(Message::NetworkReport(true))));
+    }
+
+    #[test]
+    fn a_gige_recent_or_failed_address_brings_the_network_check() {
+        let mut bench = bench();
+        assert!(!bench.network_check_relevant(), "a first run has none");
+        bench.recent = vec![Recent {
+            target: "192.168.1.40".into(),
+            label: "acA1920-40gc".into(),
+            detail: "GigE · 192.168.1.40".into(),
+            transport: Transport::GigE,
+        }];
+        assert!(has(&sidebar_buttons(&bench), "Scan network"));
+        bench.recent.clear();
+        bench
+            .side
+            .connect_failed("rtsp://10.0.0.7/dock", "no answer".into(), bench.now);
+        assert!(!bench.network_check_relevant(), "a stream is not GigE");
+        bench
+            .side
+            .connect_failed("192.168.1.50", "no answer".into(), bench.now);
+        assert!(bench.network_check_relevant(), "an IP address is");
+        assert!(reads_as_gige("gige:10.0.0.9", &[]));
+        // The report keeps it while open.
+        let mut bench = self::bench();
+        bench.network_open = true;
+        assert!(bench.network_check_relevant());
+    }
+
+    #[test]
+    fn the_address_hint_shows_examples_until_something_reads() {
+        assert!(
+            ADDRESS_HINT.chars().count() <= 40,
+            "one line at the sidebar's width in caption size"
+        );
+        let mut bench = bench();
+        bench.sync_side();
+        assert_eq!(bench.side.hint, (String::new(), None));
+        // Empty: the examples (see `sidebar_footer`); then what it will try.
+        bench.address = "192.168.1.20".into();
+        bench.sync_side();
+        assert!(
+            bench
+                .side
+                .hint
+                .1
+                .as_deref()
+                .is_some_and(|reading| reading.starts_with("Will try GigE Vision"))
+        );
+    }
+
+    #[test]
+    fn the_footer_opens_settings_from_its_gear() {
+        let buttons = sidebar_buttons(&bench());
+        let settings = buttons
+            .iter()
+            .find(|(label, _)| label == "Settings")
+            .expect("a Settings button");
+        assert!(matches!(settings.1, Some(Message::Settings(true))));
+        assert!(has(&buttons, "Keyboard shortcuts and quick guide"));
     }
 
     #[test]

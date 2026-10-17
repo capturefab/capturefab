@@ -93,20 +93,11 @@ impl Workbench {
                 ),
                 ActivityState::Queued => (dot(p.secondary, 5.0), p.secondary),
             };
-            let target = entry
-                .camera
-                .as_ref()
-                .map(|camera| format!(" · {camera}"))
-                .unwrap_or_default();
-            let label = format!(
-                "{} · {}{} · {}",
-                actor_text(entry),
-                activity_state(entry),
-                target,
-                entry.label
-            );
+            // The row reads plainly; who exactly, and the raw camera ID, are
+            // in the status mark's tooltip and the copied log.
+            let (line, full) = self.activity_texts(entry);
             let mut body = iced::widget::column![
-                text(label)
+                text(line)
                     .size(style::CAPTION)
                     .color(ink)
                     .width(Fill)
@@ -130,10 +121,13 @@ impl Workbench {
                     accessibility::group_with_id(
                         row![
                             time_format::view_with_id(labels, p, Some(time_id)),
-                            container(mark)
-                                .width(11)
-                                .height(style::line_height(style::CAPTION))
-                                .align_y(Alignment::Center),
+                            super::tip(
+                                container(mark)
+                                    .width(11)
+                                    .height(style::line_height(style::CAPTION))
+                                    .align_y(Alignment::Center),
+                                full,
+                            ),
                             body,
                         ]
                         .spacing(6)
@@ -464,6 +458,24 @@ impl Workbench {
             .join("\n")
     }
 
+    /// `activity_line` for `entry`, naming its camera as the session does.
+    pub(super) fn activity_texts(&self, entry: &SessionActivity) -> (String, String) {
+        let name = entry.camera.as_ref().and_then(|id| {
+            self.snapshot
+                .cameras
+                .iter()
+                .find(|camera| &camera.info.id == id)
+                .map(|camera| {
+                    format!(
+                        "{} {}",
+                        camera.info.model,
+                        super::format::identity(&camera.info)
+                    )
+                })
+        });
+        activity_line(entry, self.other_activity(entry), name.as_deref())
+    }
+
     pub(super) fn other_activity(&self, entry: &SessionActivity) -> bool {
         entry
             .actor
@@ -472,6 +484,59 @@ impl Workbench {
                 actor.id != self.actor.id
             })
     }
+}
+
+/// A command as its activity row reads, and in full. The row says what was
+/// done, then to which camera (by `camera_name` when the session knows it),
+/// then how it went unless it simply succeeded. Who did it leads only when it
+/// was someone else (`other`), shortened as in the toolbar, or an AI agent.
+/// The full text, for the tooltip and the row's accessible name, keeps the
+/// whole actor identity, raw camera ID, state and command label.
+pub(super) fn activity_line(
+    entry: &SessionActivity,
+    other: bool,
+    camera_name: Option<&str>,
+) -> (String, String) {
+    let mut line = entry.label.clone();
+    if let Some(camera) = &entry.camera {
+        let shown = camera_name.unwrap_or(camera);
+        let tokens: Vec<_> = entry.label.split_whitespace().collect();
+        if tokens.last() == Some(&camera.as_str()) {
+            // "Connect sim:0" reads like every other row: "Connect · sim:0".
+            let head =
+                entry.label.trim_end()[..entry.label.trim_end().len() - camera.len()].trim_end();
+            line = format!("{head} · {shown}");
+        } else if !tokens.contains(&camera.as_str()) {
+            line.push_str(&format!(" · {shown}"));
+        }
+    }
+    if effective_state(entry) != ActivityState::Succeeded || entry.job.is_some() {
+        line.push_str(&format!(" · {}", activity_state(entry)));
+    }
+    let agent = entry
+        .actor
+        .as_ref()
+        .is_some_and(|actor| actor.kind == crate::session::ActorKind::Agent);
+    if agent {
+        // An agent's whole ID: the row wraps rather than leave two agents
+        // looking alike.
+        let actor = entry.actor.as_ref().expect("agent");
+        line = format!("AI agent {} [{}] · {line}", actor.name, actor.id);
+    } else if other {
+        line = format!("{} · {line}", actor_display(entry));
+    }
+    let target = entry
+        .camera
+        .as_ref()
+        .map(|camera| format!(" · {camera}"))
+        .unwrap_or_default();
+    let full = format!(
+        "{} · {}{target} · {}",
+        actor_text(entry),
+        activity_state(entry),
+        entry.label
+    );
+    (line, full)
 }
 
 /// Expanded activity and accessible status retain full participant identity.
@@ -670,6 +735,79 @@ mod tests {
         }
     }
     #[test]
+    fn activity_rows_read_plainly_and_name_who_only_when_it_matters() {
+        let human = |id: &str, name: &str| {
+            Some(
+                crate::session::SessionActor::new(id, name, crate::session::ActorKind::Human)
+                    .unwrap(),
+            )
+        };
+        let line = |entry: &SessionActivity, other: bool| activity_line(entry, other, None).0;
+        let mut connect = entry(1, ActivityState::Succeeded);
+        connect.actor = human("desktop:1", "Desktop 1");
+        connect.operation = "connect".into();
+        connect.label = "Connect sim:0".into();
+        connect.detail = None;
+        // Our own success: what was done and to which camera, in the one form
+        // every row uses.
+        assert_eq!(line(&connect, false), "Connect · sim:0");
+        // A known camera reads by name; the raw ID stays in the full text.
+        let (named, full) = activity_line(&connect, false, Some("Pattern camera S/N SIM0"));
+        assert_eq!(named, "Connect · Pattern camera S/N SIM0");
+        assert_eq!(
+            full,
+            "Desktop 1 [desktop:1] · Human · Done · sim:0 · Connect sim:0"
+        );
+        // Anything but a plain success says how it went.
+        connect.state = ActivityState::Failed;
+        assert_eq!(line(&connect, false), "Connect · sim:0 · Failed");
+        connect.state = ActivityState::Succeeded;
+        // Someone else's says who, shortened as in the toolbar.
+        connect.actor = human("desktop:7200", "Desktop 7200");
+        assert_eq!(
+            line(&connect, true),
+            "Desktop 7200 [desktop:7200] · Connect · sim:0"
+        );
+        // A camera the label leaves out is added.
+        connect.label = "Start acquisition".into();
+        assert_eq!(line(&connect, false), "Start acquisition · sim:0");
+        // Only a whole word names the camera: sim:1 is not in "sim:10".
+        connect.camera = Some("sim:1".into());
+        connect.label = "Connect sim:10".into();
+        assert_eq!(line(&connect, false), "Connect sim:10 · sim:1");
+        // Agents always say so, with their whole ID.
+        let mut agent = entry(2, ActivityState::Running);
+        let id = format!("cli-agent-{}", "b".repeat(64));
+        agent.actor = Some(
+            crate::session::SessionActor::new(
+                id.clone(),
+                "Workflow agent",
+                crate::session::ActorKind::Agent,
+            )
+            .unwrap(),
+        );
+        let (row, full) = activity_line(&agent, false, None);
+        assert_eq!(
+            row,
+            format!(
+                "AI agent Workflow agent [{id}] · Capture 1 png frame(s) → frame.png · sim:0 · Running"
+            )
+        );
+        assert!(full.starts_with(&format!("Workflow agent [{id}] · AI agent · Running")));
+        // A job reports its progress even once it is done.
+        agent.job = Some(ActivityJob {
+            id: 1,
+            worker_pid: 0,
+            status: "done".into(),
+            count: 3,
+            captured: 3,
+            last_file: None,
+            error: None,
+        });
+        assert!(line(&agent, false).ends_with(" · Done · 3/3 frames"));
+    }
+
+    #[test]
     fn compact_actor_labels_leave_full_identity_in_expanded_activity() {
         let mut command = entry(1, ActivityState::Succeeded);
         let id = format!("cli-agent-{}", "a".repeat(64));
@@ -788,20 +926,7 @@ mod tests {
                     .map(|id| nodes[id].label().unwrap())
                     .collect();
                 assert_eq!(children[0], activity_time(entry));
-                let target = entry
-                    .camera
-                    .as_ref()
-                    .map(|camera| format!(" · {camera}"))
-                    .unwrap_or_default();
-                assert_eq!(
-                    children[1],
-                    format!(
-                        "{} · {}{target} · {}",
-                        actor_text(entry),
-                        activity_state(entry),
-                        entry.label
-                    )
-                );
+                assert_eq!(children[1], bench.activity_texts(entry).0);
                 assert_eq!(children.get(2).copied(), activity_detail(entry));
                 for child in group.children() {
                     assert_eq!(
@@ -1030,7 +1155,7 @@ mod tests {
                         assert!(
                             body.children()[0].bounds().height
                                 > style::line_height(style::CAPTION) * 1.5,
-                            "the full unbroken actor ID retains its readable wrapped lines"
+                            "the full unbroken agent ID retains its readable wrapped lines"
                         );
                         assert!(
                             body.children()[1].bounds().height
@@ -1050,24 +1175,14 @@ mod tests {
                             "wrapping and viewport changes retain the command's native identity"
                         );
                     }
-                    let target = entry
-                        .camera
-                        .as_ref()
-                        .map(|id| format!(" · {id}"))
-                        .unwrap_or_default();
-                    let expected = format!(
-                        "{} · {}{target} · {}",
-                        actor_text(entry),
-                        activity_state(entry),
-                        entry.label
-                    );
+                    let expected = bench.activity_texts(entry).0;
                     assert!(
                         group.children().iter().any(|id| snapshot
                             .nodes
                             .iter()
                             .any(|(node_id, node)| node_id == id
                                 && node.label() == Some(expected.as_str()))),
-                        "native text retains the full actor and outcome"
+                        "native text reads the plain line"
                     );
                     if let Some(detail) = activity_detail(entry) {
                         assert!(group.children().iter().any(|id| {
