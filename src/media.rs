@@ -1864,6 +1864,9 @@ pub struct Forwarder {
     final_stats: ForwardStats,
     /// The recording's destination, which may upload the finished file.
     destination: Option<crate::destination::Resolved>,
+    /// The recording file, created when its name was picked so no other
+    /// writer can take the name before the first frame.
+    reserved: Option<crate::storage::StorageWriter>,
 }
 fn codec_family(codec: &str) -> Result<&'static str> {
     match codec {
@@ -2516,13 +2519,16 @@ impl Forwarder {
             process: None,
             final_stats: ForwardStats::default(),
             destination,
+            reserved: None,
         })
     }
     /// Use an output the caller already resolved against `destination`
     /// (and named), so the destination is not looked up a second time.
+    /// `reserved` is the already created recording file, if any.
     pub fn with_resolved(
         config: ForwardConfig,
         destination: Option<crate::destination::Resolved>,
+        reserved: Option<crate::storage::StorageWriter>,
     ) -> Result<Self> {
         config.validate()?;
         Ok(Self {
@@ -2530,6 +2536,7 @@ impl Forwarder {
             process: None,
             final_stats: ForwardStats::default(),
             destination,
+            reserved,
         })
     }
     /// The local file this forwarder records to, if it records.
@@ -2659,15 +2666,18 @@ impl Forwarder {
         cmd.stdout(if local { Stdio::piped() } else { Stdio::null() })
             .stderr(Stdio::piped());
         // Validate/probe before creating a file, then reserve the global budget.
-        let storage = recording
-            .map(|(path, _)| {
-                crate::storage::create_writer(
-                    &path,
-                    &self.config.storage,
-                    self.config.max_file_bytes,
-                )
-            })
-            .transpose()?;
+        let storage = match self.reserved.take() {
+            Some(reserved) => Some(reserved),
+            None => recording
+                .map(|(path, _)| {
+                    crate::storage::create_writer(
+                        &path,
+                        &self.config.storage,
+                        self.config.max_file_bytes,
+                    )
+                })
+                .transpose()?,
+        };
         let started_ms = crate::scheduling::now_ms();
         let mut child = match cmd.spawn() {
             Ok(child) => child,
@@ -2896,6 +2906,10 @@ impl Forwarder {
     }
     pub fn stop(&mut self) -> Result<()> {
         self.final_stats = self.stats();
+        // A recording that never got a frame leaves no empty file behind.
+        if let Some(reserved) = self.reserved.take() {
+            reserved.abort().context("remove unused recording output")?;
+        }
         let Some(mut process) = self.process.take() else {
             return Ok(());
         };

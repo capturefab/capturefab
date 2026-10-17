@@ -385,15 +385,19 @@ fn stop_forward(
     }
     stopped
 }
-/// Pick a free name for a recording template under its destination. The file
-/// itself is created at the first frame; a writer that takes the name first
-/// stops the recording rather than being overwritten.
+/// Pick a free name for a recording template under its destination and
+/// create the file, moving to the next free name when another writer (another
+/// camera's worker) took it first.
 fn name_recording(
     h: &WorkerHandle,
     config: &ForwardConfig,
     camera: &str,
     on_exists: crate::naming::OnExists,
-) -> Result<(PathBuf, crate::destination::Resolved)> {
+) -> Result<(
+    PathBuf,
+    crate::destination::Resolved,
+    crate::storage::StorageWriter,
+)> {
     let resolved = crate::destination::resolve(config.destination.as_deref(), &config.output)?;
     let local = crate::media::local_file_path(&resolved.output)?;
     let local = local
@@ -410,14 +414,18 @@ fn name_recording(
         now: chrono::Local::now(),
         index: 0,
     };
-    let path = h
+    let first = h
         .names
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .candidate(&plan, &input, on_exists)?;
-    resolved.contain(&path)?;
-    check_parents(&path)?;
-    Ok((path, resolved))
+    let (path, writer) =
+        crate::naming::save_named(&h.names, &plan, &input, on_exists, first, |path| {
+            resolved.contain(path)?;
+            check_parents(path)?;
+            crate::storage::create_writer(path, &config.storage, config.max_file_bytes)
+        })?;
+    Ok((path, resolved, writer))
 }
 fn absolute_path(path: &std::path::Path) -> String {
     std::path::absolute(path)
@@ -696,12 +704,13 @@ fn process_plain(
             let f = if named {
                 config.validate()?;
                 let label = crate::naming::camera_label(&camera_mut(camera)?.info);
-                let (path, resolved) = name_recording(h, &config, &label, on_exists)?;
+                let (path, resolved, reserved) = name_recording(h, &config, &label, on_exists)?;
                 config.output = path.to_string_lossy().into_owned();
                 config.destination = None;
                 Forwarder::with_resolved(
                     config,
                     resolved.destination.is_some().then_some(resolved),
+                    Some(reserved),
                 )?
             } else {
                 Forwarder::new(config)?
@@ -1772,6 +1781,49 @@ mod tests {
         );
         assert!(!root.exists());
         handle.shutdown();
+    }
+    #[test]
+    fn recordings_reserve_their_seq_name_before_the_first_frame() {
+        // Two cameras' workers have separate namers; the name must be taken
+        // when it is picked, or both would record to rec-0001.
+        let root = std::env::temp_dir().join(format!(
+            "capturefab-rec-reserve-{}-{}",
+            std::process::id(),
+            crate::scheduling::now_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let output = root.join("rec-{seq}.mkv").to_string_lossy().into_owned();
+        let forward = || SessionCommand::Forward {
+            output: output.clone(),
+            codec: "h264".into(),
+            encoder: "auto".into(),
+            fps: 5.0,
+            bitrate: "1M".into(),
+            storage: Default::default(),
+            max_file_bytes: 1 << 20,
+            destination: None,
+            on_exists: Default::default(),
+            context: Default::default(),
+        };
+        let mut paths = Vec::new();
+        let handles: Vec<_> = (0..2).map(|_| WorkerHandle::new()).collect();
+        for h in &handles {
+            h.request(SessionCommand::Connect {
+                camera: "sim:0".into(),
+                timeout_ms: 100,
+            })
+            .unwrap();
+            let reply = h.request(forward()).unwrap();
+            paths.push(reply["path"].as_str().unwrap().to_owned());
+        }
+        assert_ne!(paths[0], paths[1]);
+        assert!(paths[0].ends_with("rec-0001.mkv"), "{paths:?}");
+        assert!(paths[1].ends_with("rec-0002.mkv"), "{paths:?}");
+        for h in handles {
+            let _ = h.request(SessionCommand::StopForward);
+            h.shutdown();
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
     #[test]
     fn session_simulator_configuration_and_acquisition() {
