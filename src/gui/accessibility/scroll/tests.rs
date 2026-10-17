@@ -186,7 +186,7 @@ fn actual_mapped_destination_editor_uses_scrolled_bounds_and_reveals_native_focu
         &layout::Limits::new(Size::ZERO, Size::new(560.0, 310.0)),
     );
     let before = snapshot(&mut view, &mut tree, &node, &renderer);
-    let (target, field) = named(&before, "S3 secret access key", Role::PasswordInput);
+    let (target, field) = named(&before, "S3 key prefix", Role::TextInput);
     assert_eq!(field.bounds().unwrap().height(), 0.0);
     apply(
         &mut view,
@@ -198,16 +198,13 @@ fn actual_mapped_destination_editor_uses_scrolled_bounds_and_reveals_native_focu
     let geometry = raw(&mut view, &mut tree, &node, &renderer);
     let (viewport, translation) = geometry.scrolls[0];
     let after = snapshot(&mut view, &mut tree, &node, &renderer);
-    let (id, field) = named(&after, "S3 secret access key", Role::PasswordInput);
+    let (id, field) = named(&after, "S3 key prefix", Role::TextInput);
     assert_eq!(id, target);
     assert_eq!(after.focus, target);
     assert_eq!(
         field.bounds(),
         Some(rect(
-            clipped(
-                geometry.controls["S3 secret access key"] - translation,
-                viewport
-            ),
+            clipped(geometry.controls["S3 key prefix"] - translation, viewport),
             1.0
         ))
     );
