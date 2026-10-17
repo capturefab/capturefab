@@ -62,12 +62,14 @@ impl Workbench {
         if capture {
             let preview = self.output_preview();
             let destination: Element<'_, Message> = if fit.destination_label {
-                clipped(
-                    text(self.capture_to.label(&preview))
-                        .size(style::SMALL)
-                        .color(p.secondary)
-                        .wrapping(text::Wrapping::None),
+                one_line(
+                    self.capture_to.label(&preview),
+                    style::SMALL,
+                    style::SANS,
+                    p.secondary,
                 )
+                .yield_room()
+                .into()
             } else {
                 icon(Icon::Folder, 16.0, p.secondary)
             };

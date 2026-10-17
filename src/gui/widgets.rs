@@ -216,10 +216,6 @@ fn balance_key_value(value: f64, key: &keyboard::Key, large_step: bool) -> Optio
 }
 
 /// Single-line text that is cut off at its container's edge.
-pub(super) fn clipped<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Element<'a, M> {
-    container(content).clip(true).into()
-}
-
 pub(super) fn fade(color: Color, amount: f32) -> Color {
     Color {
         a: color.a * amount,

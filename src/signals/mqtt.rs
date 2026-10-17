@@ -206,6 +206,21 @@ fn connect_timeout(ctx: &Ctx) -> anyhow::Error {
     )
 }
 
+/// A broker that accepts the login can still deny the topic, for example
+/// through its ACL; SUBACK then carries a failure code instead of a QoS.
+fn refused(ack: &rumqttc::SubAck, filter: &str) -> Result<()> {
+    if ack
+        .return_codes
+        .iter()
+        .any(|code| matches!(code, rumqttc::SubscribeReasonCode::Failure))
+    {
+        bail!(
+            "MQTT broker refused the subscription to {filter}; check the broker's topic permissions"
+        );
+    }
+    Ok(())
+}
+
 /// Collect messages until `until`, keeping the last sample per tag. Fails if
 /// the broker cannot be reached or the subscription is not acknowledged.
 fn collect(
@@ -215,7 +230,7 @@ fn collect(
 ) -> Result<(BTreeMap<String, Sample>, bool)> {
     let (options, filter, qos) = options(ctx)?;
     let (client, mut connection) = Client::new(options, 64);
-    client.subscribe(filter, qos)?;
+    client.subscribe(filter.clone(), qos)?;
     let connect_deadline = Instant::now() + ctx.timeout();
     let mut deadline = None;
     let mut connected = false;
@@ -238,7 +253,8 @@ fn collect(
         }
         match connection.recv_timeout((end - now).min(Duration::from_millis(100))) {
             Ok(Ok(Event::Incoming(Packet::ConnAck(_)))) => connected = true,
-            Ok(Ok(Event::Incoming(Packet::SubAck(_)))) => {
+            Ok(Ok(Event::Incoming(Packet::SubAck(ack)))) => {
+                refused(&ack, &filter)?;
                 deadline = Some(Instant::now() + until_after_suback);
             }
             Ok(Ok(Event::Incoming(Packet::Publish(message)))) => {
@@ -328,7 +344,8 @@ fn log(ctx: &Ctx) -> Result<()> {
                     client.subscribe(filter.clone(), qos)?;
                 }
             }
-            Ok(Ok(Event::Incoming(Packet::SubAck(_)))) => {
+            Ok(Ok(Event::Incoming(Packet::SubAck(ack)))) => {
+                refused(&ack, &filter)?;
                 if !connected {
                     connected = true;
                     ever_connected = true;
@@ -395,6 +412,19 @@ fn log(ctx: &Ctx) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refused_subscriptions_fail() {
+        use rumqttc::{SubAck, SubscribeReasonCode};
+        let ok = SubAck::new(1, vec![SubscribeReasonCode::Success(QoS::AtMostOnce)]);
+        assert!(refused(&ok, "plant/#").is_ok());
+        let denied = SubAck::new(1, vec![SubscribeReasonCode::Failure]);
+        let error = refused(&denied, "plant/#").unwrap_err().to_string();
+        assert!(
+            error.contains("refused the subscription to plant/#"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn decodes_payloads() {

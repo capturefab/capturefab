@@ -420,7 +420,7 @@ pub(super) fn view<'a>(
     let starting = bench.pending(Job::SignalStart);
     let invalid = invalid(&ui.input);
     section = section.push(
-        text_input("sim-signal://line1, modbus-tcp://, mqtt://, opc.tcp://", &ui.input)
+        text_input("modbus-tcp://, mqtt://, opc.tcp://…", &ui.input)
             .name("Add data source")
             .description(
                 "Enter a Modbus TCP, MQTT, OPC UA, MTConnect or sim-signal URI, then press Return to start logging.",
