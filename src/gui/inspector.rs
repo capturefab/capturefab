@@ -9,6 +9,8 @@ use std::hash::{Hash, Hasher};
 /// The width of every control in the panel's forms and feature rows, so
 /// their edges line up.
 const CONTROL: f32 = 136.0;
+/// The width of a unit after a control in its slot: "MiB", "days".
+const UNIT: f32 = 28.0;
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Section {
     Features(&'static str),
@@ -24,7 +26,7 @@ mod layout_tests;
 /// Room between the panel's sections.
 const SECTION_GAP: f32 = 20.0;
 /// Room between the rows of a section.
-const ROW_GAP: f32 = 12.0;
+pub(super) const ROW_GAP: f32 = 12.0;
 /// How long a segmented control's thumb takes to slide one segment.
 const THUMB: Duration = Duration::from_millis(180);
 /// How long a field glows once the camera has taken its value.
@@ -1063,7 +1065,7 @@ impl Workbench {
                 self.forward_codec = "h265";
                 self.quota_action = "delete-oldest";
                 self.storage_open = true;
-                self.schedule_enabled = true;
+                self.reveal_schedule();
             }
             // These need streaming cameras.
             (
@@ -1129,6 +1131,12 @@ impl Workbench {
     }
 
     /// The forward settings as sent: "H.264 · 30 fps · 4M".
+    /// Turn scheduling on and open Capture options, where its form is.
+    pub(super) fn reveal_schedule(&mut self) {
+        self.schedule_enabled = true;
+        self.inspect.capture_options_open = true;
+    }
+
     fn forward_summary(&self) -> String {
         let mut parts = vec![
             find(&CODECS, self.forward_codec)
@@ -1175,14 +1183,25 @@ fn form_row<'a>(
     unit_label: &'a str,
     p: &'static Palette,
 ) -> Element<'a, Message> {
+    // A unit shares the control's slot, so every control ends at the panel's
+    // edge, under the full-width fields and buttons around it.
+    let control: Element<'a, Message> = if unit_label.is_empty() {
+        control.into()
+    } else {
+        row![
+            container(control).width(Fill),
+            container(text(unit_label).size(style::SMALL).color(p.secondary))
+                .padding(iced::Padding::ZERO.top(6.0))
+                .width(UNIT),
+        ]
+        .spacing(6)
+        .into()
+    };
     row![
         container(text(label).size(style::BODY).color(p.secondary))
             .padding(iced::Padding::ZERO.top(5.0))
             .width(Fill),
         container(control).width(CONTROL),
-        container(text(unit_label).size(style::SMALL).color(p.secondary))
-            .padding(iced::Padding::ZERO.top(6.0))
-            .width(28.0),
     ]
     .spacing(6)
     .align_y(Alignment::Start)
@@ -2197,21 +2216,33 @@ impl Workbench {
         if let Some(guidance) = capture_guidance(kind) {
             head = head.push(reason(guidance, p));
         }
-        let options_open =
-            self.inspect.capture_options_open || self.drafts.contains_key(&Num::Timeout);
+        // Timing and scheduling are for repeat work; they stay folded behind
+        // a summary that says when a schedule is on, unless a value is wrong.
+        let options_open = self.inspect.capture_options_open
+            || self.drafts.contains_key(&Num::Timeout)
+            || (self.schedule_enabled
+                && (self.drafts.contains_key(&Num::Delay)
+                    || self.drafts.contains_key(&Num::Interval)));
         let mut options = column![disclosure(
             "Capture options",
-            Some(format!(
-                "{} ms timeout",
-                grouped(self.capture_timeout(None))
-            )),
+            Some(if self.schedule_enabled {
+                "Scheduled".into()
+            } else {
+                format!("{} ms timeout", grouped(self.capture_timeout(None)))
+            }),
             if options_open { 1.0 } else { 0.0 },
             Message::InspectorDisclosure(Section::CaptureOptions),
             p,
         )]
         .spacing(ROW_GAP);
         if options_open {
-            options = options.push(form_row("Timeout", self.num(Num::Timeout), "ms", p));
+            options = options
+                .push(form_row("Timeout", self.num(Num::Timeout), "ms", p))
+                .push(checkbox(
+                    "Capture on a schedule",
+                    self.schedule_enabled,
+                    Message::ScheduleEnabled,
+                ));
         }
         let essentials = column![
             head,
@@ -2255,20 +2286,9 @@ impl Workbench {
             action,
         ]
         .spacing(8);
-        let mut save = column![
-            essentials,
-            accessibility::mapped(self.capture_to.drive_shortcuts(p), Message::CapturePicker),
-            options,
-            checkbox(
-                "Capture on a schedule",
-                self.schedule_enabled,
-                Message::ScheduleEnabled,
-            ),
-        ]
-        .spacing(ROW_GAP);
-        if self.schedule_enabled {
+        if options_open && self.schedule_enabled {
             let problem = self.validate_input(&self.capture_command(true)).err();
-            save = save
+            options = options
                 .push(form_row("Start after", self.num(Num::Delay), "s", p))
                 .push(form_row(
                     match kind {
@@ -2299,9 +2319,10 @@ impl Workbench {
                     .on_press_maybe((connected && problem.is_none()).then_some(Message::Schedule)),
                 );
             if let Some(problem) = problem {
-                save = save.push(error_caption(problem.to_string(), false, p));
+                options = options.push(error_caption(problem.to_string(), false, p));
             }
         }
+        let save = column![essentials, options].spacing(ROW_GAP);
         let automation_open = self.inspect.automation_open;
         let mut automation = column![disclosure(
             "Shell & agents",
@@ -2489,56 +2510,116 @@ impl Workbench {
         } else if let Some(problem) = problem {
             action = action.push(error_caption(problem.to_string(), false, p));
         }
+        // How the video is encoded, folded behind its summary, opened while
+        // any of it is being edited or wrong.
         let options_open = self.inspect.encoder_options_open
             || crate::media::validate_encoder(self.forward_codec, self.forward_encoder.trim())
                 .is_err()
+            || crate::media::validate_bitrate(self.forward_bitrate.trim()).is_err()
+            || self.drafts.contains_key(&Num::Fps)
             || self.drafts.contains_key(&Num::FileMib);
-        let encoder = if self.forward_encoder.trim() == "auto" {
-            "Automatic encoder"
-        } else {
-            self.forward_encoder.trim()
-        };
         let mut options = column![disclosure(
-            "Encoder & limits",
-            Some(encoder.into()),
+            "Video settings",
+            Some(self.forward_summary()),
             if options_open { 1.0 } else { 0.0 },
             Message::InspectorDisclosure(Section::EncoderOptions),
             p
         )]
         .spacing(ROW_GAP);
         if options_open {
-            options = options.push(column![
-            form_row(
-                "Encoder",
-                column![tip(
-                    text_input("auto", &self.forward_encoder)
-                        .name("Recording encoder")
-                        .invalid(crate::media::validate_encoder(self.forward_codec, self.forward_encoder.trim()).err().map(|error| error.to_string()))
-                        .id("forward-encoder")
-                        .on_input(Message::Encoder)
-                        .size(style::BODY)
-                        .padding([5, 8])
-                        .width(Fill)
-                        .style(if crate::media::validate_encoder(self.forward_codec, self.forward_encoder.trim()).is_ok() { style::input } else { style::input_invalid }),
-                    "auto picks an available encoder. Enter an FFmpeg encoder name to choose one.",
-                ),
-                self.forward_field_error(true, p)].spacing(4),
-                "",
-                p,
-            ),
-            form_row(
-                "Maximum file",
-                tip(
-                    self.num(Num::FileMib),
-                    "For file destinations, recording stops when this file size limit is reached.",
-                ),
-                "MiB",
-                p,
-            ),
-                text("Auto chooses an available encoder. Check this computer's encoders with:")
-                    .size(style::SMALL).color(p.secondary),
-                self.copyable("capturefab doctor".into(), p),
-            ].spacing(ROW_GAP));
+            let encoder_error =
+                crate::media::validate_encoder(self.forward_codec, self.forward_encoder.trim())
+                    .err()
+                    .map(|error| error.to_string());
+            options = options.push(
+                column![
+                    form_row(
+                        "Codec",
+                        pick_list(&CODECS[..], find(&CODECS, self.forward_codec), Message::Codec)
+                            .name("Video codec")
+                            .width(Fill)
+                            .text_size(style::BODY)
+                            .padding([5, 8])
+                            .style(style::pick)
+                            .menu_style(style::menu),
+                        "",
+                        p,
+                    ),
+                    form_row("Frame rate", self.num(Num::Fps), "fps", p),
+                    form_row(
+                        "Bitrate",
+                        column![
+                            text_input("4M", &self.forward_bitrate)
+                                .name("Recording bitrate")
+                                .description(
+                                    "An FFmpeg bitrate, such as 4M for four megabits per second."
+                                )
+                                .invalid(
+                                    crate::media::validate_bitrate(self.forward_bitrate.trim())
+                                        .err()
+                                        .map(|error| error.to_string())
+                                )
+                                .id("forward-bitrate")
+                                .on_input(Message::Bitrate)
+                                .size(style::BODY)
+                                .padding([5, 8])
+                                .width(Fill)
+                                .style(
+                                    if crate::media::validate_bitrate(self.forward_bitrate.trim())
+                                        .is_ok()
+                                    {
+                                        style::input
+                                    } else {
+                                        style::input_invalid
+                                    }
+                                ),
+                            self.forward_field_error(false, p)
+                        ]
+                        .spacing(4),
+                        "",
+                        p,
+                    ),
+                    form_row(
+                        "Encoder",
+                        column![
+                            tip(
+                                text_input("auto", &self.forward_encoder)
+                                    .name("Recording encoder")
+                                    .invalid(encoder_error.clone())
+                                    .id("forward-encoder")
+                                    .on_input(Message::Encoder)
+                                    .size(style::BODY)
+                                    .padding([5, 8])
+                                    .width(Fill)
+                                    .style(if encoder_error.is_none() {
+                                        style::input
+                                    } else {
+                                        style::input_invalid
+                                    }),
+                                "auto picks an available encoder. Enter an FFmpeg encoder name to choose one.",
+                            ),
+                            self.forward_field_error(true, p)
+                        ]
+                        .spacing(4),
+                        "",
+                        p,
+                    ),
+                    form_row(
+                        "Maximum file",
+                        tip(
+                            self.num(Num::FileMib),
+                            "For file destinations, recording stops when this file size limit is reached.",
+                        ),
+                        "MiB",
+                        p,
+                    ),
+                    text("Auto chooses an available encoder. Check this computer's encoders with:")
+                        .size(style::SMALL)
+                        .color(p.secondary),
+                    self.copyable("capturefab doctor".into(), p),
+                ]
+                .spacing(ROW_GAP),
+            );
         }
         let controls = column![
             accessibility::mapped(
@@ -2556,57 +2637,7 @@ impl Workbench {
                 ),
                 Message::RecordPicker,
             ),
-            text(self.forward_summary())
-                .size(style::SMALL)
-                .color(p.secondary),
             action,
-            accessibility::mapped(self.record_to.drive_shortcuts(p), Message::RecordPicker),
-            form_row(
-                "Codec",
-                pick_list(
-                    &CODECS[..],
-                    find(&CODECS, self.forward_codec),
-                    Message::Codec
-                )
-                .name("Video codec")
-                .width(Fill)
-                .text_size(style::BODY)
-                .padding([5, 8])
-                .style(style::pick)
-                .menu_style(style::menu),
-                "",
-                p,
-            ),
-            form_row("Frame rate", self.num(Num::Fps), "fps", p),
-            form_row(
-                "Bitrate",
-                column![
-                    text_input("4M", &self.forward_bitrate)
-                        .name("Recording bitrate")
-                        .description("An FFmpeg bitrate, such as 4M for four megabits per second.")
-                        .invalid(
-                            crate::media::validate_bitrate(self.forward_bitrate.trim())
-                                .err()
-                                .map(|error| error.to_string())
-                        )
-                        .id("forward-bitrate")
-                        .on_input(Message::Bitrate)
-                        .size(style::BODY)
-                        .padding([5, 8])
-                        .width(Fill)
-                        .style(
-                            if crate::media::validate_bitrate(self.forward_bitrate.trim()).is_ok() {
-                                style::input
-                            } else {
-                                style::input_invalid
-                            }
-                        ),
-                    self.forward_field_error(false, p)
-                ]
-                .spacing(4),
-                "",
-                p,
-            ),
             options,
         ]
         .spacing(ROW_GAP);
@@ -2779,8 +2810,15 @@ impl Workbench {
             }
         }
         // The backend also merges a separately configured app-wide policy.
-        // Show its actual limits/deletion behavior even with the form folded.
-        for caption in self.storage_status.state().captions(&self.storage_policy()) {
+        // Folded, the summary already gives its limits; warnings such as
+        // deleting the oldest files still show.
+        for caption in self
+            .storage_status
+            .state()
+            .captions(&self.storage_policy())
+            .into_iter()
+            .filter(|caption| open || caption.tone != storage_policy::Tone::Normal)
+        {
             let color = match caption.tone {
                 storage_policy::Tone::Normal => p.secondary,
                 storage_policy::Tone::Warning => p.ink(p.warn),
@@ -2950,6 +2988,8 @@ mod tests {
             }
             identity = Some(*id);
         }
+        // The bitrate is in Video settings, opened to edit it.
+        let _ = bench.update(Message::InspectorDisclosure(Section::EncoderOptions));
         let mut tree = Tree::empty();
         let mut identities = None;
         for (invalid, output, bitrate) in [

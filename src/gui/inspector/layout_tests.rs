@@ -58,7 +58,7 @@ fn bench() -> Workbench {
     app.snapshot.cameras = vec![current, other];
     app.snapshot.active_camera = Some(info.id);
     app.output = "/tmp/laboratory-camera-captures/a-long-capture-directory-name/capture.png".into();
-    app.schedule_enabled = true;
+    app.reveal_schedule();
     app.storage_open = true;
     app.retention_enabled = true;
     let mut feature = sample_feature("ExposureTime", "Float", serde_json::json!(10000.0));

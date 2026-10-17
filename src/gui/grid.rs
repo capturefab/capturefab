@@ -8,6 +8,10 @@ use iced::widget::column;
 use iced::{Point, Rectangle, Renderer, mouse};
 
 const GAP: f32 = 8.0;
+/// Room each tile keeps around its picture for the selection ring, so the
+/// ring never covers the picture and every tile shows the same image area.
+/// Half the gap: the pictures stay `GAP` apart.
+const OUTSET: f32 = GAP / 2.0;
 const MIN_TILE_HEIGHT: f32 = 140.0;
 /// Tiles narrower than this leave out the frame rate's sparkline.
 const SPARK_WIDTH: f32 = 320.0;
@@ -56,7 +60,7 @@ impl Workbench {
         column![
             self.overview_bar(p),
             container(grid)
-                .padding(GAP)
+                .padding(GAP - OUTSET)
                 .width(Fill)
                 .height(Fill)
                 .style(style::stage),
@@ -74,12 +78,17 @@ impl Workbench {
             .map_or(4.0 / 3.0, |(_, width, height, _)| {
                 width as f32 / height.max(1) as f32
             });
-        let (columns, tile) = tiles(cameras.len(), aspect, size);
+        let pictures = Size::new(
+            (size.width - 2.0 * OUTSET).max(1.0),
+            (size.height - 2.0 * OUTSET).max(1.0),
+        );
+        let (columns, tile) = tiles(cameras.len(), aspect, pictures);
         let rows = cameras.len().div_ceil(columns).max(1);
-        let height = rows as f32 * tile.height + GAP * (rows - 1) as f32;
-        let mut grid = column![].spacing(GAP).align_x(Alignment::Center);
+        // Adjacent outsets make up the gap between pictures.
+        let height = rows as f32 * (tile.height + 2.0 * OUTSET);
+        let mut grid = column![].align_x(Alignment::Center);
         for chunk in cameras.chunks(columns) {
-            let mut line = row![].spacing(GAP);
+            let mut line = row![];
             for camera in chunk {
                 line = line.push(self.tile(camera, tile));
             }
@@ -214,34 +223,30 @@ impl Workbench {
             );
         }
         let ring = self.selection_level(id);
-        if ring > 0.0 {
-            // The dark inner edge keeps selection blue distinct on blue frames.
-            layers = layers.push(container(space().width(Fill).height(Fill)).style(move |_| {
-                container::Style {
-                    border: iced::Border {
-                        color: fade(Color::BLACK, 0.9 * ring),
-                        width: 5.0,
-                        radius: style::RADIUS_MEDIUM.into(),
-                    },
-                    ..container::Style::default()
-                }
-            }));
-            layers = layers.push(
-                container(space().width(Fill).height(Fill)).style(style::ring(
-                    ring,
-                    self.selection_emphasized(keyboard_history::Area::Image),
-                )),
-            );
-        }
-        container(
+        let picture = container(
             mouse_area(layers)
                 .on_enter(Message::HoverTile(Some(id.clone())))
                 .on_exit(Message::HoverTile(None))
                 .on_double_click(Message::FocusTile(id.clone())),
         )
         .width(size.width)
-        .height(size.height)
-        .into()
+        .height(size.height);
+        // Outside the picture, concentric with its corners; the stage showing
+        // between them keeps selection blue distinct on blue frames.
+        let mut tile = stack![container(picture).padding(OUTSET)];
+        if ring > 0.0 {
+            tile = tile.push(
+                container(space().width(Fill).height(Fill)).style(style::ring(
+                    ring,
+                    self.selection_emphasized(keyboard_history::Area::Image),
+                    style::RADIUS_MEDIUM + OUTSET,
+                )),
+            );
+        }
+        container(tile)
+            .width(size.width + 2.0 * OUTSET)
+            .height(size.height + 2.0 * OUTSET)
+            .into()
     }
 
     /// The line over the bottom of a tile's picture: whether frames come,
@@ -431,5 +436,25 @@ mod tests {
                 assert!(columns >= 1 && columns <= count);
             }
         }
+    }
+
+    #[test]
+    fn selection_ring_room_keeps_pictures_where_the_gap_put_them() {
+        // Adjacent outsets are the gap between pictures, and the stage's
+        // padding plus one outset is the gap at its edge, so every picture,
+        // selected or not, keeps the size and place the layout gave it.
+        assert_eq!(2.0 * OUTSET, GAP);
+        let stage = Size::new(1000.0, 700.0);
+        let inner = Size::new(
+            stage.width - 2.0 * (GAP - OUTSET),
+            stage.height - 2.0 * (GAP - OUTSET),
+        );
+        let pictures = Size::new(inner.width - 2.0 * OUTSET, inner.height - 2.0 * OUTSET);
+        let (columns, tile) = tiles(3, 4.0 / 3.0, pictures);
+        let unpadded = Size::new(stage.width - 2.0 * GAP, stage.height - 2.0 * GAP);
+        assert_eq!((columns, tile), tiles(3, 4.0 / 3.0, unpadded));
+        let boxes = columns as f32 * (tile.width + 2.0 * OUTSET);
+        let spaced = columns as f32 * tile.width + GAP * (columns - 1) as f32 + 2.0 * OUTSET;
+        assert_eq!(boxes, spaced);
     }
 }

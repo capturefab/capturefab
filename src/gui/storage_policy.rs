@@ -164,11 +164,16 @@ impl State {
             Self::Unavailable(_) => "Policy unavailable".into(),
             Self::Available(global) => {
                 let effective = global.effective(requested);
-                format!(
+                // Every effective limit, as the folded panel shows only this.
+                let mut summary = format!(
                     "{} · {} files",
                     bytes(effective.max_bytes),
                     super::format::grouped(effective.max_files.into())
-                )
+                );
+                if let Some(age) = effective.max_age_seconds {
+                    summary = format!("{summary} · {}", age_label(age));
+                }
+                summary
             }
         }
     }
@@ -305,11 +310,28 @@ mod tests {
     }
 
     #[test]
+    fn the_folded_summary_names_every_effective_limit() {
+        // A stop at an age limit set app-wide is not otherwise visible when
+        // the storage panel is folded.
+        let global = Policy::try_from(policy(1024, 20, Some(7 * 86400), "stop")).unwrap();
+        let state = State::Available(global);
+        assert_eq!(
+            state.summary(&policy(2048, 50, None, "stop")),
+            "1 KiB · 20 files · 7 days"
+        );
+        let global = Policy::try_from(policy(1024, 20, None, "stop")).unwrap();
+        assert_eq!(
+            State::Available(global).summary(&policy(2048, 50, None, "stop")),
+            "1 KiB · 20 files"
+        );
+    }
+
+    #[test]
     fn actual_global_deletion_overrides_stop_and_is_visible_even_without_gui_retention() {
         let requested = policy(2048, 50, None, "stop");
         let global = Policy::try_from(policy(1024, 20, Some(60), "delete-oldest")).unwrap();
         let state = State::Available(global);
-        assert_eq!(state.summary(&requested), "1 KiB · 20 files");
+        assert_eq!(state.summary(&requested), "1 KiB · 20 files · 1 minute");
         let captions = state.captions(&requested);
         assert!(captions.iter().any(
             |caption| caption.text.contains("overrides this panel’s Stop")

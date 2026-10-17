@@ -187,6 +187,13 @@ fn capture_and_video_prioritize_actions_and_reveal_invalid_advanced_fields() {
         !capture
             .nodes
             .iter()
+            .any(|(_, node)| node.label() == Some("Capture on a schedule")),
+        "scheduling waits in Capture options"
+    );
+    assert!(
+        !capture
+            .nodes
+            .iter()
             .any(|(_, node)| node.invalid().is_some())
     );
     app.drafts.insert(Num::Timeout, "invalid".into());
@@ -205,17 +212,25 @@ fn capture_and_video_prioritize_actions_and_reveal_invalid_advanced_fields() {
     let mut tree = Tree::empty();
     let video = snapshot(&app, Tab::Forward, &mut tree, &renderer);
     let start = named(&video, "Start recording").1.bounds().unwrap();
-    assert!(start.y1 < named(&video, "Encoder & limits").1.bounds().unwrap().y0);
-    assert!(
-        !video
-            .nodes
-            .iter()
-            .any(|(_, node)| node.label() == Some("Recording encoder"))
+    assert!(start.y1 < named(&video, "Video settings").1.bounds().unwrap().y0);
+    for folded in ["Recording encoder", "Video codec", "Recording bitrate"] {
+        assert!(
+            !video
+                .nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some(folded)),
+            "{folded} waits in Video settings"
+        );
+    }
+    assert_eq!(
+        named(&video, "Video settings").1.description(),
+        Some("H.264 · 30 fps · 4M"),
+        "the folded settings are summed up"
     );
     app.forward_encoder = "invalid/encoder".into();
     let invalid = snapshot(&app, Tab::Forward, &mut tree, &renderer);
     assert_eq!(
-        named(&invalid, "Encoder & limits").1.is_expanded(),
+        named(&invalid, "Video settings").1.is_expanded(),
         Some(true)
     );
     assert_eq!(
@@ -263,4 +278,40 @@ fn active_automatic_sessions_prioritize_review_without_moving_editors_on_suggest
     app.snapshot.capture_session = None;
     let closed = snapshot(&app, Tab::Capture, &mut tree, &renderer);
     assert_eq!(named(&closed, "Output path").0, output_id);
+}
+
+#[test]
+fn the_schedule_command_shows_its_form_in_folded_capture_options() {
+    let renderer = destinations::layout_tests::renderer();
+    let mut app = app();
+    let mut tree = Tree::empty();
+    let folded = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    assert!(
+        !folded
+            .nodes
+            .iter()
+            .any(|(_, node)| node.label() == Some("Capture interval"))
+    );
+    let _ = app.menu_command(super::super::menus::Command::Schedule);
+    let shown = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    assert_eq!(named(&shown, "Capture options").1.is_expanded(), Some(true));
+    assert_eq!(
+        named(&shown, "Capture on a schedule").1.toggled(),
+        Some(accesskit::Toggled::True)
+    );
+    named(&shown, "Capture delay");
+    named(&shown, "Capture interval");
+
+    // Folded again, the summary says a schedule is on; its form waits.
+    let _ = app.update(Message::InspectorDisclosure(Section::CaptureOptions));
+    let folded = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    let options = named(&folded, "Capture options").1;
+    assert_eq!(options.is_expanded(), Some(false));
+    assert_eq!(options.description(), Some("Scheduled"));
+    assert!(
+        !folded
+            .nodes
+            .iter()
+            .any(|(_, node)| node.label() == Some("Capture interval"))
+    );
 }

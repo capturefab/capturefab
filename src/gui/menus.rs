@@ -396,7 +396,7 @@ impl Workbench {
                 }
             }
             Command::Schedule => {
-                self.schedule_enabled = true;
+                self.reveal_schedule();
                 self.handle_message(Message::ShowTab(Tab::Capture))
             }
         }

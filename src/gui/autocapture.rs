@@ -552,13 +552,20 @@ impl Workbench {
                 .font(style::BOLD)
                 .into()
         };
-        let mut content = column![header].spacing(9);
+        // Folded, it is a row like the panel's other disclosures; open, its
+        // body sits in a well under the same header, which does not move.
         if !expanded {
-            return container(content)
-                .padding(12)
-                .width(Fill)
-                .style(style::well)
-                .into();
+            return header;
+        }
+        // Over its body in the well once a session is open; above it before.
+        let (outside, inside) = if can_open {
+            (Some(header), None)
+        } else {
+            (None, Some(header))
+        };
+        let mut content = column![].spacing(9);
+        if let Some(header) = inside {
+            content = content.push(header);
         }
         if let Some(status) = &self.snapshot.capture_session {
             let name = std::path::Path::new(&status.path)
@@ -747,11 +754,16 @@ impl Workbench {
                         .color(p.secondary),
                 );
         }
-        container(content)
+        let well = container(content)
             .padding(12)
             .width(Fill)
-            .style(style::well)
-            .into()
+            .style(style::well);
+        match outside {
+            Some(header) => column![header, well]
+                .spacing(super::inspector::ROW_GAP)
+                .into(),
+            None => well.into(),
+        }
     }
 
     pub(super) fn auto_capture_review(

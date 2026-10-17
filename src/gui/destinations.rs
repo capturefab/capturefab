@@ -1905,28 +1905,29 @@ impl Picker {
         }))
         .collect();
         let selected = choices.iter().find(|c| c.name == self.selected).cloned();
+        // Each field's action sits on its label's line, so the fields take
+        // the panel's full width like the buttons under them.
         let mut content = column![
-            label("Save to", p),
-            row![
-                pick_list(choices, selected, Message::Select)
-                    .name("Save destination")
-                    .width(Fill)
-                    .text_size(style::BODY)
-                    .padding([6, 10])
-                    .style(style::pick)
-                    .menu_style(style::menu),
+            labeled(
+                "Save to",
                 super::tip(
-                    button(text("Manage…").size(style::SMALL))
-                        .padding([6, 8])
-                        .style(style::plain)
-                        .on_press(Message::OpenManager),
+                    label_action("Manage…", Message::OpenManager),
                     "Add, edit or test folders, external drives and S3 buckets",
                 ),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
+                p,
+            ),
+            pick_list(choices, selected, Message::Select)
+                .name("Save destination")
+                .width(Fill)
+                .text_size(style::BODY)
+                .padding([6, 10])
+                .style(style::pick)
+                .menu_style(style::menu),
         ]
         .spacing(6);
+        if !self.volumes.is_empty() {
+            content = content.push(self.drive_shortcuts(p));
+        }
         let (local_example, named_example) = if self.recording {
             ("rtsp://host:8554/camera or recording.mkv", "recording.mkv")
         } else {
@@ -1936,35 +1937,31 @@ impl Picker {
             None => {
                 content = content
                     .push(space().height(4))
-                    .push(label(local_label, p))
+                    .push(labeled(
+                        local_label,
+                        super::tip(
+                            label_action("Choose…", Message::BrowseOutput),
+                            "Choose a folder",
+                        ),
+                        p,
+                    ))
                     .push(
-                        row![
-                            text_input(local_example, output)
-                                .name(local_label)
-                                .invalid(output_error.clone())
-                                .id(if self.recording {
-                                    "record-output"
-                                } else {
-                                    "capture-output"
-                                })
-                                .on_input(Message::Output)
-                                .size(style::BODY)
-                                .padding([6, 10])
-                                .style(if output_error.is_some() {
-                                    style::input_invalid
-                                } else {
-                                    style::input
-                                }),
-                            super::tip(
-                                button(icon(Icon::Folder, 15.0, p.secondary))
-                                    .padding(6)
-                                    .style(style::plain)
-                                    .on_press(Message::BrowseOutput),
-                                "Choose a folder",
-                            ),
-                        ]
-                        .spacing(6)
-                        .align_y(Alignment::Center),
+                        text_input(local_example, output)
+                            .name(local_label)
+                            .invalid(output_error.clone())
+                            .id(if self.recording {
+                                "record-output"
+                            } else {
+                                "capture-output"
+                            })
+                            .on_input(Message::Output)
+                            .size(style::BODY)
+                            .padding([6, 10])
+                            .style(if output_error.is_some() {
+                                style::input_invalid
+                            } else {
+                                style::input
+                            }),
                     );
             }
             Some(destination) => {
@@ -2009,7 +2006,8 @@ impl Picker {
         content.into()
     }
 
-    pub fn drive_shortcuts(&self, p: &'static Palette) -> Element<'_, Message> {
+    /// One-click destinations on the external drives, under "Save to".
+    fn drive_shortcuts(&self, p: &'static Palette) -> Element<'_, Message> {
         let mut content = column![].spacing(6);
         if !self.volumes.is_empty() {
             let drives = self
@@ -2047,10 +2045,7 @@ impl Picker {
                         ),
                     ))
                 });
-            content = content
-                .push(space().height(4))
-                .push(label("External drives", p))
-                .push(drives.spacing(6).wrap().vertical_spacing(6));
+            content = content.push(drives.spacing(6).wrap().vertical_spacing(6));
         }
         content.into()
     }
@@ -2834,6 +2829,27 @@ const KEYCHAIN_NOTE: &str = if cfg!(target_os = "macos") {
 
 fn label<'a>(value: &'a str, p: &'static Palette) -> Element<'a, Message> {
     text(value).size(style::SMALL).color(p.secondary).into()
+}
+
+/// A field's label with an action at the end of its line.
+fn labeled<'a>(
+    value: &'a str,
+    action: impl Into<Element<'a, Message>>,
+    p: &'static Palette,
+) -> Element<'a, Message> {
+    row![label(value, p), space::horizontal(), action.into()]
+        .align_y(Alignment::Center)
+        .into()
+}
+
+/// A small link-styled action on a label's line. Its padding is the hover
+/// fill's, so the text ends where disclosure summaries end.
+fn label_action(value: &str, on: Message) -> Element<'_, Message> {
+    button(text(value).size(style::SMALL))
+        .padding([1, 6])
+        .style(style::link)
+        .on_press(on)
+        .into()
 }
 
 fn caption<'a>(value: &'a str, p: &'static Palette) -> Element<'a, Message> {

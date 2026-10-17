@@ -575,8 +575,9 @@ pub fn tile(theme: &Theme) -> container::Style {
     }
 }
 
-/// The accent ring drawn over the selected tile; `shown` fades it.
-pub fn ring(shown: f32, emphasized: bool) -> impl Fn(&Theme) -> container::Style {
+/// The accent ring drawn around the selected tile, with corners of
+/// `radius`; `shown` fades it.
+pub fn ring(shown: f32, emphasized: bool, radius: f32) -> impl Fn(&Theme) -> container::Style {
     move |theme| container::Style {
         border: Border {
             color: alpha(
@@ -588,7 +589,7 @@ pub fn ring(shown: f32, emphasized: bool) -> impl Fn(&Theme) -> container::Style
                 shown,
             ),
             width: 2.5,
-            radius: RADIUS_MEDIUM.into(),
+            radius: radius.into(),
         },
         ..container::Style::default()
     }
@@ -1423,8 +1424,14 @@ mod tests {
                 );
                 assert_eq!(input_invalid(&theme, focused).border.color, p.danger);
                 assert_eq!(input_dirty(&theme, focused).border.color, p.accent);
-                assert_eq!(ring(1.0, true)(&theme).border.color, STAGE_INACTIVE.accent);
-                assert_ne!(ring(1.0, true)(&theme).border.color, STAGE.accent);
+                assert_eq!(
+                    ring(1.0, true, RADIUS_MEDIUM)(&theme).border.color,
+                    STAGE_INACTIVE.accent
+                );
+                assert_ne!(
+                    ring(1.0, true, RADIUS_MEDIUM)(&theme).border.color,
+                    STAGE.accent
+                );
             }
         }
     }

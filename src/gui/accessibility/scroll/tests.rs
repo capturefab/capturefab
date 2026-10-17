@@ -117,7 +117,7 @@ fn actual_scrolled_inspector_bounds_follow_visual_translation_and_native_focus_r
     app.snapshot.connected = Some(crate::transport::simulator::info());
     app.snapshot.active_camera = Some("sim:0".into());
     app.tab = Tab::Capture;
-    app.schedule_enabled = true;
+    app.reveal_schedule();
     app.storage_open = true;
     app.retention_enabled = true;
     let mut view = app.inspector(style::Palette::of(false));

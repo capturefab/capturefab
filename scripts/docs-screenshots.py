@@ -33,11 +33,11 @@ CROPS = {
     "workspace": ("workspace", (0, 0, 1100, 700), "Four simulator cameras in the live workbench, with camera list and the selected camera's inspector."),
     "cameras": ("workspace", (0, 0, 240, 700), "Connected simulator camera list and controls for finding or adding a source."),
     "features": ("features", (784, 0, 1100, 652), "Quick controls for the selected camera, with search and collapsed feature groups for less common settings."),
-    "capture": ("capture", (784, 0, 1100, 700), "Ordinary capture controls first, followed by Capture options, scheduling, Automatic capture, Storage and retention, and Shell and agents disclosures; no automatic capture session is open in this scene."),
-    "schedule": ("schedule", (800, 427, 1085, 606), "The capture scheduling form with start delay and frame interval."),
+    "capture": ("capture", (784, 0, 1100, 700), "Ordinary capture controls first, followed by the Capture options (timeout and scheduling), Automatic capture, Storage and retention, and Shell and agents disclosures; no automatic capture session is open in this scene."),
+    "schedule": ("schedule", (800, 414, 1085, 596), "The capture scheduling form in Capture options, with start delay and frame interval."),
     "destinations": ("destinations", (264, 174, 836, 526), "Destination manager showing example folder and S3-compatible bucket destinations."),
     "scopes": ("scopes", (438, 40, 1096, 442), "Live focus metric and exposure histogram alongside the focus region on a simulator image."),
-    "forwarding": ("forwarding", (784, 0, 1100, 600), "Video panel with destination, codec, frame rate, bitrate and a start action, followed by the Encoder and limits disclosure."),
+    "forwarding": ("forwarding", (784, 0, 1100, 420), "Video panel with destination, stream URL or file and a start action, followed by the Video settings disclosure summing up codec, frame rate and bitrate."),
     "history": ("destinations", (288, 238, 464, 277), "Undo and Redo controls in the destination manager; macOS keyboard shortcuts are shown."),
 }
 

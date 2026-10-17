@@ -466,34 +466,6 @@ fn reveal<'a>(button: Element<'a, Message>, p: &'static Palette) -> Element<'a, 
     .into()
 }
 
-/// A quiet checkbox for a developer option: small, with a secondary label.
-fn quiet_checkbox<'a>(
-    label: &'a str,
-    checked: bool,
-    on: impl Fn(bool) -> Message + 'a,
-    p: &'static Palette,
-) -> Element<'a, Message> {
-    let toggle = on(!checked);
-    let check = iced::widget::checkbox(checked)
-        .label(label)
-        .on_toggle(on)
-        .size(14)
-        .spacing(7)
-        .text_size(style::SMALL)
-        .style(move |theme, status| iced::widget::checkbox::Style {
-            text_color: Some(p.secondary),
-            ..style::check(theme, status)
-        });
-    button(check)
-        .name(label)
-        .role(accessibility::Role::CheckBox)
-        .checked(checked)
-        .padding(0)
-        .style(style::bare)
-        .on_press(toggle)
-        .into()
-}
-
 /// What a connected camera's trailing slot shows, if anything: a glyph, its
 /// color and what it means. `error` is the one its stage badge would show
 /// (`camera_error`), so one already told, retired or dismissed is not. A
@@ -1092,19 +1064,8 @@ impl Workbench {
                 right: EDGE - shake,
                 ..iced::Padding::ZERO
             }),
-            container(
-                column![
-                    hint,
-                    quiet_checkbox(
-                        "Include simulated cameras",
-                        self.include_simulator,
-                        Message::IncludeSimulator,
-                        p,
-                    ),
-                ]
-                .spacing(10)
-            )
-            .padding([0.0, EDGE + INSET]),
+            // Simulated cameras are a setting; the empty state offers one.
+            container(hint).padding([0.0, EDGE + INSET]),
             container(rule::horizontal(1).style(style::line)).padding([0.0, EDGE]),
             container(settings).padding(iced::Padding {
                 left: EDGE + 4.0,
