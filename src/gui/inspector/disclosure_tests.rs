@@ -1003,3 +1003,16 @@ fn the_default_recording_shows_where_it_saves_and_folds_its_field() {
     app.forward_output = "clip.mkv".into();
     assert_eq!(app.record_summary(), "This computer");
 }
+
+#[test]
+fn quick_recording_ignores_an_unfinished_stream_url() {
+    let mut app = app();
+    let _ = app.update(Message::ForwardMode(true));
+    assert_eq!(app.forward_output, "");
+    match app.record_command(false) {
+        SessionCommand::Forward { output, .. } => {
+            assert_eq!(output, prefs::default_record_output())
+        }
+        other => panic!("{other:?}"),
+    }
+}

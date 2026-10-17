@@ -2191,7 +2191,9 @@ impl Workbench {
     /// camera, so that cameras recording at once never race for one name.
     fn record_command(&self, per_camera: bool) -> SessionCommand {
         let mut command = self.forward_command();
-        let keep = Output::of(&self.forward_output).recording()
+        // An unfinished stream URL is not a recording path either.
+        let keep = !self.forward_streams()
+            && Output::of(&self.forward_output).recording()
             && (!per_camera || self.forward_output.contains("{camera}"));
         if !keep
             && let SessionCommand::Forward {
