@@ -2764,9 +2764,10 @@ impl Workbench {
             card = card.push(text(summary.as_str()).size(style::SMALL).color(p.secondary));
         }
         if recording && let Some(file) = self.recording_file() {
-            let name = std::path::Path::new(file)
-                .file_name()
-                .map_or_else(|| file.to_owned(), |name| name.to_string_lossy().into_owned());
+            let name = std::path::Path::new(file).file_name().map_or_else(
+                || file.to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            );
             card = card.push(
                 row![
                     tip(

@@ -1933,6 +1933,7 @@ fn ftp_and_sftp_destinations_save_list_and_remove_without_secrets() {
 fn direct_capture_to_unreachable_ftp_destination_stays_queued() {
     let root = temp_root("ftp-unreachable");
     let (dir, staging) = (root.join("sessions"), root.join("staging"));
+    let catalog = root.join("catalog.duckdb");
     let env = [
         ("CAPTUREFAB_STAGING_DIR", staging.to_str().unwrap()),
         ("CAPTUREFAB_FTP_PASSWORD", "secret"),
@@ -1968,6 +1969,8 @@ fn direct_capture_to_unreachable_ftp_destination_stays_queued() {
             "shot.png",
             "--destination",
             "down",
+            "--dataset",
+            catalog.to_str().unwrap(),
         ],
     );
     let uploads = &result["uploads"];
@@ -1985,6 +1988,19 @@ fn direct_capture_to_unreachable_ftp_destination_stays_queued() {
     assert_eq!(status["items"][0]["remote"]["kind"], "ftp");
     assert!(status["items"][0].get("bucket").is_none());
     assert_eq!(status["completed_seq"], 0);
+    // The queued upload's id, key and URL reach the dataset catalog.
+    let queued = &result["queued"][0];
+    assert_eq!(queued["key"], "shot.png", "{result}");
+    assert_eq!(queued["url"], "ftp://127.0.0.1:1/shot.png");
+    let rows = dataset_rows(
+        &dir,
+        &catalog,
+        "SELECT destination, object_key, upload_id, remote_url, uploaded_ms FROM captures",
+    );
+    assert_eq!(
+        rows,
+        serde_json::json!([["down", "shot.png", queued["upload_id"], queued["url"], null]])
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -2475,6 +2491,53 @@ fn dataset_recordings_are_cataloged_on_duration_and_ctrl_c() {
     assert_eq!(
         rows,
         serde_json::json!([["a.mp4", true, true], ["b.mp4", true, true]])
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Needs FFmpeg: a templated recording picks a free name in the worker,
+/// reports it as `path`, and the catalog records the same file and context.
+#[test]
+#[ignore]
+fn record_template_expands() {
+    let root = temp_root("record-template");
+    let dir = root.join("sessions");
+    let db = root.join("d.duckdb");
+    let template = root.join("r/{camera}-{seq}.mp4");
+    let mut paths = Vec::new();
+    for _ in 0..2 {
+        let result = json(
+            &dir,
+            &[
+                "--json",
+                "--camera",
+                "sim:0",
+                "record",
+                "-o",
+                template.to_str().unwrap(),
+                "--duration",
+                "1s",
+                "--dataset",
+                db.to_str().unwrap(),
+                "--context",
+                "line=L1",
+            ],
+        );
+        assert!(result["since_ms"].as_u64().is_some(), "{result}");
+        let path = PathBuf::from(result["path"].as_str().unwrap());
+        assert!(path.is_file(), "{result}");
+        paths.push(path.file_name().unwrap().to_str().unwrap().to_owned());
+    }
+    assert!(paths[0].ends_with("-0001.mp4") && paths[1].ends_with("-0002.mp4"));
+    assert!(!paths[0].contains('{'), "{paths:?}");
+    let rows = dataset_rows(
+        &dir,
+        &db,
+        "SELECT file_name, context::JSON->>'line' FROM recordings ORDER BY file_name",
+    );
+    assert_eq!(
+        rows,
+        serde_json::json!([[paths[0], "L1"], [paths[1], "L1"]])
     );
     let _ = std::fs::remove_dir_all(&root);
 }
