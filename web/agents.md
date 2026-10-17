@@ -22,7 +22,7 @@ An explicit `CAPTUREFAB_MAX_CAMERAS` must be an integer from 1 to 64. `CAPTUREFA
 
 ## Use an existing visible session
 
-Camera/session commands, discovery and network scans automatically attach to the only authenticated active GUI or `serve` session. With none, supported camera commands use a temporary worker. With several, choose `--session NAME` or receive `usage` (exit 2); the CLI never guesses. List sessions to identify a user's visible workbench, or use `--direct --camera ID` for a separate temporary worker. Binary stdout captures use a temporary worker and cannot combine with `--session`; use `--direct` to override an environment session. Camera control is often exclusive.
+Camera/session commands, discovery and network scans automatically attach to the only authenticated active GUI or `serve` session. With none, supported camera commands use a temporary worker. With several, choose `--session NAME` or receive `usage` (exit 2); the CLI never guesses. `signals read` and `signals browse` need no workbench, so with several sessions they run in the CLI process instead. List sessions to identify a user's visible workbench, or use `--direct --camera ID` for a separate temporary worker. Binary stdout captures use a temporary worker and cannot combine with `--session`; use `--direct` to override an environment session. Camera control is often exclusive.
 
 ```sh
 capturefab sessions --json

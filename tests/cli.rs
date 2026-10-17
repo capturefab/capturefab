@@ -225,6 +225,9 @@ fn ambiguous_sessions_require_target_and_direct_bypasses_them() {
             .unwrap()
             .contains("multiple sessions")
     );
+    // One-shot signal reads need no workbench, so they never ask to choose.
+    let read = json(&dir, &["--json", "signals", "read", "sim-signal://line1"]);
+    assert!(read.to_string().contains("line1"), "{read}");
     for name in ["first", "second"] {
         assert!(
             json(&dir, &["--json", "--session", name, "status"])["cameras"]

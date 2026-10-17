@@ -1296,6 +1296,15 @@ fn resolve_session(cli: &mut Cli) -> Result<()> {
             }
             cli.session = Some(session.name.clone());
         }
+        // A one-shot read or browse needs no workbench: with several
+        // running, it runs here instead of refusing to choose.
+        _ if matches!(
+            &cli.command,
+            Some(Command::Signals {
+                command: Some(SignalsCommand::Read { .. } | SignalsCommand::Browse { .. }),
+                ..
+            })
+        ) => {}
         _ => {
             return input(Err(anyhow::anyhow!(
                 "multiple sessions are running ({}); choose --session NAME or --direct --camera ID; list them with capturefab sessions",
