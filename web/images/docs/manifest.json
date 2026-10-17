@@ -1,7 +1,7 @@
 {
   "method": "Actual iced desktop renderer screenshots; crop only, no generated or reconstructed interface.",
   "source_note": "Current development desktop build from the workspace source.",
-  "binary_sha256": "a530fb83c71aaae486b86cd46329352674d2a943220a4251a48bde12012770c3",
+  "binary_sha256": "018a5a5470b5369363b1450a7806763b3ed091b418bf5ca0e9c971a569189e72",
   "logical_window": [
     1100,
     700
@@ -11,7 +11,7 @@
     {
       "file": "workspace.png",
       "source": "source/workspace.png",
-      "source_sha256": "2284d8b2aee01208bff062579de1c0045a62000f0f9ff5c0791a16fbe2a4b44a",
+      "source_sha256": "dc0525f2d2c853a67a1ebdca00c8e38f80a0535acb6773689f7c13ae3411e8cc",
       "source_size": [
         2200,
         1400
@@ -26,14 +26,14 @@
         2200,
         1400
       ],
-      "sha256": "2284d8b2aee01208bff062579de1c0045a62000f0f9ff5c0791a16fbe2a4b44a",
+      "sha256": "dc0525f2d2c853a67a1ebdca00c8e38f80a0535acb6773689f7c13ae3411e8cc",
       "scene": "dark,features,focus,exposure",
       "description": "Four simulator cameras in the live workbench, with camera list and the selected camera's inspector."
     },
     {
       "file": "cameras.png",
       "source": "source/workspace.png",
-      "source_sha256": "2284d8b2aee01208bff062579de1c0045a62000f0f9ff5c0791a16fbe2a4b44a",
+      "source_sha256": "dc0525f2d2c853a67a1ebdca00c8e38f80a0535acb6773689f7c13ae3411e8cc",
       "source_size": [
         2200,
         1400
@@ -48,14 +48,14 @@
         480,
         1400
       ],
-      "sha256": "64d703eaf178dadad65c7ccaf83401d0d52feb6b11ce1d58e4e0e5b39318afd0",
+      "sha256": "b739db1251881111d9eb819069db6c9ddeb174b29c5d7150b30fee15385fb175",
       "scene": "dark,features,focus,exposure",
       "description": "Connected simulator camera list and controls for finding or adding a source."
     },
     {
       "file": "features.png",
       "source": "source/features.png",
-      "source_sha256": "dba17a4785ce520301aa0db0afa825d3b882d01383f5913151f5fdf810080e04",
+      "source_sha256": "15bf3113c3841aa600577a0a7bce92af7786f1fb3a293368b1b14216e86f9201",
       "source_size": [
         2200,
         1400
@@ -70,14 +70,14 @@
         632,
         1304
       ],
-      "sha256": "2babb8887cfdddb6d0eacf9f246055383677c9f52e7aeb8375737ae7742eff04",
+      "sha256": "43a3b8250a8accac7633038bb709b55cc1521c4ac722b5c35caecb8b239087c7",
       "scene": "dark,features,noscopes",
       "description": "Quick controls for the selected camera, with search and collapsed feature groups for less common settings."
     },
     {
       "file": "capture.png",
       "source": "source/capture.png",
-      "source_sha256": "42842e0f5a425ac95fad7caedb22ac69285f12069a860ae1ef36f52ea2d66bc9",
+      "source_sha256": "78e5bf1f53886571409d2e3021ba546db58d8f4f1ba93967a8fae4f2b25fde71",
       "source_size": [
         2200,
         1400
@@ -92,14 +92,14 @@
         632,
         1400
       ],
-      "sha256": "ef2bc018245ff573ba786515b92808a6239a91ba67f7a725cd2087d58e203bbc",
+      "sha256": "35d77a90be36211baa48482f7fc99e483c308aee02e5f294ca52a4a1d9294db2",
       "scene": "dark,capture,noscopes,inspector-storage-default",
-      "description": "Ordinary capture controls first: Save to, File names with its Folder line, Frames and Format, then the Capture options (timeout and scheduling), Automatic capture, Storage and retention, and Shell and agents disclosures; no automatic capture session is open in this scene."
+      "description": "Ordinary capture controls first, followed by the Capture options (timeout and scheduling), Automatic capture, Storage and retention, and Shell and agents disclosures; no automatic capture session is open in this scene."
     },
     {
       "file": "schedule.png",
       "source": "source/schedule.png",
-      "source_sha256": "0979a52c3048821181bb412e1723954e86ac5974ff38fb020b444bb24340b95a",
+      "source_sha256": "5a80f3c2ed40a66c878594296a6f191f58a786f30fbeacf55759ce7e1bcff5bd",
       "source_size": [
         2200,
         1400
@@ -114,14 +114,14 @@
         570,
         364
       ],
-      "sha256": "1c5fd11e3cf1c56f6fc2c0ff5055718ca9973fcc2dfcaa250a8121b39e81902d",
+      "sha256": "cf661903a2601e9ed4a8f0af4e744e2b27ea34689392fb14ce1cb5df3e65683f",
       "scene": "dark,capture,noscopes,inspector-widest,inspector-storage-default,scheduled",
       "description": "The capture scheduling form in Capture options, with start delay and frame interval."
     },
     {
       "file": "destinations.png",
       "source": "source/destinations.png",
-      "source_sha256": "a35e870c45d103166432c5394b4446b215dbb7be490cddf4b31800154db0f3ad",
+      "source_sha256": "3ea95ba40dade8e13fab896e0404ded28844040a2ca0daec7af3c777795b3b06",
       "source_size": [
         2200,
         1400
@@ -136,14 +136,14 @@
         1144,
         704
       ],
-      "sha256": "3b700a38dd1b213be4255b1daa31d453275d8b7b4f8e846fbed490fd4befe7c3",
+      "sha256": "55076c8e71c99e2af642ea67b6dc493fed7093d42c046b7ff613624f0c420081",
       "scene": "dark,destinations-list,noscopes",
-      "description": "Destination manager showing example folder and S3-compatible bucket destinations, with Add folder and Add S3 bucket actions and notes on the S3 services covered and on adding FTP and SFTP servers."
+      "description": "Destination manager showing example folder and S3-compatible bucket destinations."
     },
     {
       "file": "scopes.png",
       "source": "source/scopes.png",
-      "source_sha256": "83b8f18510a1c8c65edc606aefa1440adb19a43f1fff1ad90e859b86b04261aa",
+      "source_sha256": "555793e9e4affd6c2e5a9c356033c99755b8bf69b8d4c289094fd5b785d0d501",
       "source_size": [
         2200,
         1400
@@ -158,14 +158,14 @@
         1316,
         804
       ],
-      "sha256": "eda0529f40133aa1a20ea25cff2a0a485f4e505a61780cab0fc981d1e7960cc4",
+      "sha256": "ebcc5afa8b927c1d19fddcfdfd74aaac47da5bde5f5f7fcc0dc6fc1522e0f349",
       "scene": "dark,noinspector,nosidebar,focus,exposure",
-      "description": "Live focus metric and exposure histogram alongside the focus region on a simulator image."
+      "description": "Live focus score with its focus measure chooser and exposure histogram alongside the focus region on a simulator image."
     },
     {
       "file": "forwarding.png",
       "source": "source/forwarding.png",
-      "source_sha256": "bc217c90ec8cd8221da099ec98fd6eb9dd0308dfe2f48f69958aaf90e52a2e07",
+      "source_sha256": "510bb3cd01790fa80a3c07c8277f2be2b3e49b8f290dbe320048a574de5bc550",
       "source_size": [
         2200,
         1400
@@ -180,14 +180,14 @@
         632,
         840
       ],
-      "sha256": "59d1e68c7444837d79225e2cb618c11fcaa6f3c5574e4f74877b999ba8b62734",
+      "sha256": "6e05989c6c1393c7c1c093fe1e6fcec43593f8a75729578dd06410c7e09e0868",
       "scene": "dark,forward,noscopes,inspector-storage-default",
-      "description": "Video panel with destination, stream URL or file and a start action, followed by the Video settings disclosure summing up codec, frame rate and bitrate."
+      "description": "Video panel with the Record to file or Forward to URL choice, the folded Location and name section, a start action and the next file name, followed by the Video settings disclosure summing up codec, frame rate and bitrate."
     },
     {
       "file": "history.png",
       "source": "source/destinations.png",
-      "source_sha256": "a35e870c45d103166432c5394b4446b215dbb7be490cddf4b31800154db0f3ad",
+      "source_sha256": "3ea95ba40dade8e13fab896e0404ded28844040a2ca0daec7af3c777795b3b06",
       "source_size": [
         2200,
         1400
@@ -202,9 +202,9 @@
         352,
         78
       ],
-      "sha256": "2358c94db1c5f5c78c3fbcbfc6ae4404d3ab7d021ac54d440aae356b30ccc772",
+      "sha256": "7edac401b19d1290187de32fc5edb9e38e714e96b23f5cbb8c4baa0525996744",
       "scene": "dark,destinations-list,noscopes",
-      "description": "Undo and Redo controls in the destination manager; macOS keyboard shortcuts are shown beside each action."
+      "description": "Undo and Redo controls in the destination manager; macOS keyboard shortcuts are shown."
     }
   ]
 }
