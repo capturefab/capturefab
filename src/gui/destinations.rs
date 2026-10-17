@@ -1545,12 +1545,17 @@ impl Picker {
             self.selected = name;
             self.folder = None;
         }
-        // A destination holds relative names; drop a leftover absolute path.
+        // A destination holds relative names; drop a leftover absolute path,
+        // keeping a template's folders below the default capture folder.
         if self.selected.is_some() && Path::new(output.as_str()).is_absolute() {
-            *output = Path::new(output.as_str())
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let path = Path::new(output.as_str());
+            *output = match path.strip_prefix(super::prefs::capture_root()) {
+                Ok(rest) if !rest.as_os_str().is_empty() => rest.to_string_lossy().into_owned(),
+                _ => path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            };
         }
     }
 
@@ -3108,6 +3113,24 @@ mod tests {
     }
 
     #[test]
+    fn choosing_a_destination_keeps_template_folders_below_the_capture_root() {
+        let mut picker = Picker::new(false, false);
+        let mut output = super::super::prefs::default_capture_output();
+        picker.select(Some("archive".into()), &mut output);
+        assert_eq!(
+            Path::new(&output),
+            Path::new("{date}").join("{camera}-{datetime}-{seq}.png")
+        );
+        let mut output = std::env::temp_dir()
+            .join("elsewhere")
+            .join("shot.png")
+            .to_string_lossy()
+            .into_owned();
+        picker.select(Some("archive".into()), &mut output);
+        assert_eq!(output, "shot.png");
+    }
+
+    #[test]
     fn draft_undo_groups_typing_and_restores_fields_changed_by_presets() {
         let mut picker = Picker::new(false, false);
         let mut output = "capture.png".to_string();
@@ -3905,5 +3928,41 @@ mod tests {
             advanced_summary(&bucket(|e| e.path_style = true)),
             "capturefab/ · path-style"
         );
+    }
+
+    #[test]
+    fn ftp_destination_offers_no_edit_and_never_saves_as_folder() {
+        let server = Destination {
+            name: "line1".into(),
+            target: Target::Ftp(destination::FtpServer {
+                host: "10.0.0.5".into(),
+                port: 21,
+                user: "cam".into(),
+                dir: "incoming".into(),
+                tls: destination::FtpTls::Explicit,
+                password: destination::SecretSource::Environment,
+                keep_local: false,
+            }),
+        };
+        let mut picker = Picker::new(false, false);
+        picker.saved = vec![server.clone()];
+        let mut output = String::new();
+        picker.update(Message::Edit("line1".into()), &mut output);
+        assert!(picker.editor.is_none(), "rows of servers cannot be edited");
+        // Even if an editor were opened, it refuses to save.
+        let editor = Editor::edit(&server);
+        assert!(editor.read_only);
+        assert!(
+            editor
+                .destination()
+                .unwrap_err()
+                .to_string()
+                .contains("add-ftp/add-sftp")
+        );
+        assert_eq!(
+            editor.message.as_ref().map(|(text, _)| text.as_str()),
+            Some(SERVER_EDIT_HINT)
+        );
+        assert!(!editor.s3);
     }
 }

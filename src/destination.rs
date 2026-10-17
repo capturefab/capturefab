@@ -273,7 +273,7 @@ impl Bucket {
                 && self.bucket.parse::<std::net::Ipv4Addr>().is_err(),
             "S3 bucket names are 3-63 lowercase letters, digits, dots and hyphens, must start/end with a letter or digit, and cannot contain adjacent dots or be an IP address"
         );
-        validate_prefix(&self.prefix)?;
+        validate_prefix(&self.prefix, "S3 key prefix")?;
         self.credentials.validate()?;
         Ok(())
     }
@@ -1007,17 +1007,15 @@ impl Resolved {
     }
 }
 
-fn validate_prefix(prefix: &str) -> Result<()> {
-    ensure!(
-        prefix.len() <= 512,
-        "remote key prefix must be at most 512 bytes"
-    );
+/// `what` opens the message, which the GUI uses to find the field at fault.
+fn validate_prefix(prefix: &str, what: &str) -> Result<()> {
+    ensure!(prefix.len() <= 512, "{what} must be at most 512 bytes");
     ensure!(
         !prefix.starts_with('/')
             && !prefix.contains('\\')
             && !prefix.chars().any(char::is_control)
             && !prefix.split('/').any(|part| matches!(part, "." | "..")),
-        "remote key prefix must be relative, without backslashes, control characters or . and .. components, like cameras/line-1/"
+        "{what} must be relative, without backslashes, control characters or . and .. components, like cameras/line-1/"
     );
     Ok(())
 }
@@ -1025,7 +1023,7 @@ fn validate_prefix(prefix: &str) -> Result<()> {
 /// The object key for a staged file: the prefix plus its path below the
 /// staging root, with forward slashes.
 pub fn object_key(prefix: &str, root: &Path, path: &Path) -> Result<String> {
-    validate_prefix(prefix)?;
+    validate_prefix(prefix, "remote key prefix")?;
     let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let relative = path

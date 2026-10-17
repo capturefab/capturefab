@@ -60,8 +60,9 @@ pub struct SftpUploader {
     secret: Option<String>,
     /// `sftp://host:port/dir`, for messages; never the user.
     location: String,
-    runtime: tokio::runtime::Runtime,
+    /// Declared before the runtime, so the session drops while it still runs.
     conn: Option<(client::Handle<Pin>, SftpSession)>,
+    runtime: tokio::runtime::Runtime,
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {
