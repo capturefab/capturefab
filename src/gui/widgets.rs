@@ -277,15 +277,7 @@ impl FeatureScale {
         let snapped = if let Some(inc) = self.inc {
             self.min + ((value - self.min) / inc).round() * inc
         } else {
-            let decade = if self.log {
-                value.abs().max(f64::MIN_POSITIVE)
-            } else {
-                self.max - self.min
-            };
-            let mut unit = 10f64.powf(decade.log10().floor() - 2.0);
-            if self.integer {
-                unit = unit.max(1.0).round();
-            }
+            let unit = self.unit(value);
             (value / unit).round() * unit
         };
         let snapped = if self.integer {
@@ -308,6 +300,21 @@ impl FeatureScale {
         .clamp(self.min, self.max)
     }
 
+    /// The round figure `snap` uses near `value` without an increment.
+    fn unit(&self, value: f64) -> f64 {
+        let decade = if self.log {
+            value.abs().max(f64::MIN_POSITIVE)
+        } else {
+            self.max - self.min
+        };
+        let unit = 10f64.powf(decade.log10().floor() - 2.0);
+        if self.integer {
+            unit.max(1.0).round()
+        } else {
+            unit
+        }
+    }
+
     /// One step up or down from `value`: 5% on a log scale, else the
     /// camera's increment or a hundredth of the range. Always moves while
     /// there is room.
@@ -316,7 +323,7 @@ impl FeatureScale {
             if up { value * 1.05 } else { value / 1.05 }
         } else {
             let step = self.inc.unwrap_or(if self.integer {
-                1.0
+                self.unit(value)
             } else {
                 (self.max - self.min) / 100.0
             });
@@ -324,7 +331,8 @@ impl FeatureScale {
         };
         let mut snapped = self.snap(next);
         if snapped == self.snap(value) {
-            let nudge = self.inc.unwrap_or(if self.integer { 1.0 } else { 0.0 });
+            // The next figure `snap` can land on.
+            let nudge = self.inc.unwrap_or_else(|| self.unit(value));
             if nudge > 0.0 {
                 snapped = self.snap(if up { value + nudge } else { value - nudge });
             }
@@ -1323,6 +1331,14 @@ mod tests {
         }
         assert_eq!(scale.step(20.0, true), 30.0, "at least one increment");
         assert_eq!(scale.snap(150_000.0), 100_000.0);
+    }
+
+    #[test]
+    fn keys_move_wide_integer_ranges_without_an_increment() {
+        let scale = FeatureScale::new("Gain", "Integer", Some(0.0), Some(1000.0), None).unwrap();
+        assert_eq!(scale.step(100.0, true), 110.0);
+        assert_eq!(scale.step(100.0, false), 90.0);
+        assert_eq!(scale.step(1000.0, true), 1000.0, "stays at the bound");
     }
 
     #[test]
