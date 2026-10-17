@@ -390,6 +390,11 @@ impl Client {
 
     fn with_keys(bucket: &Bucket, keys: Keys) -> Result<Self> {
         bucket.validate()?;
+        // `BUCKET.127.0.0.1` cannot resolve: an IP or localhost endpoint
+        // always takes the bucket in the path.
+        let mut bucket = bucket.clone();
+        bucket.path_style |= crate::destination::endpoint_needs_path_style(&bucket.endpoint);
+        let bucket = &bucket;
         keys.validate()?;
         let service = bucket.service_url();
         let (scheme, authority) = service

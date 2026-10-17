@@ -575,6 +575,22 @@ impl Destination {
     }
 }
 
+/// Whether an S3 endpoint can only be reached with path-style addressing:
+/// its host is an IP address or localhost, so `BUCKET.host` cannot resolve.
+pub fn endpoint_needs_path_style(endpoint: &str) -> bool {
+    let Some((_, rest)) = endpoint.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if authority.starts_with('[') {
+        return true;
+    }
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host);
+    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::Ipv4Addr>().is_ok()
+}
+
 pub fn validate_name(name: &str) -> Result<()> {
     ensure!(
         !name.is_empty()
@@ -1669,6 +1685,15 @@ mod tests {
             target: Target::Ftp(ftp()),
         };
         assert_eq!(destination.describe(), "ftps://10.0.0.5:21/incoming");
+        for (endpoint, needed) in [
+            ("http://127.0.0.1:9000", true),
+            ("http://LOCALHOST:9000", true),
+            ("http://[::1]:9000", true),
+            ("https://minio.example:9000", false),
+            ("", false),
+        ] {
+            assert_eq!(endpoint_needs_path_style(endpoint), needed, "{endpoint}");
+        }
         assert!(destination.target.is_remote());
         assert!(!folder("x").target.is_remote());
         assert!(folder("x").target.remote().is_none());

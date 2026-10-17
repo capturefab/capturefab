@@ -2018,6 +2018,38 @@ fn direct_capture_uploads_to_loopback_ftp_and_removes_staged_copy() {
         ("CAPTUREFAB_FTP_PASSWORD", "secret"),
     ];
     let port = fake.port.to_string();
+    // A refused sign-in is not saved: every upload would fail.
+    let add = |name: &str| {
+        vec![
+            "--json".to_string(),
+            "destination".into(),
+            "add-ftp".into(),
+            name.into(),
+            "--host".into(),
+            "127.0.0.1".into(),
+            "--port".into(),
+            port.clone(),
+            "--user".into(),
+            "cam".into(),
+            "--dir".into(),
+            "dir".into(),
+            "--plain".into(),
+            "--password-env".into(),
+        ]
+    };
+    let refused_args = add("refused");
+    let refused = cmd_env(
+        &dir,
+        &[
+            ("CAPTUREFAB_STAGING_DIR", staging.to_str().unwrap()),
+            ("CAPTUREFAB_FTP_PASSWORD", "wrong"),
+        ],
+        &refused_args.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stdout).contains("the server check failed"));
+    let listed = json_env(&dir, &env, &["--json", "destination", "list"]);
+    assert!(!listed.to_string().contains("refused"), "{listed}");
     let saved = json_env(
         &dir,
         &env,

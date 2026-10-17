@@ -459,7 +459,9 @@ pub enum DestinationCommand {
         /// Folder for uploads: relative to the login folder, or absolute with a leading /
         #[arg(long, default_value = "")]
         dir: String,
-        /// The server's OpenSSH host-key fingerprint, SHA256:...
+        /// The server's OpenSSH host-key fingerprint, SHA256:... (on the server:
+        /// ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub; a wrong one is refused
+        /// with the fingerprint the server offered)
         #[arg(long)]
         host_key: Option<String>,
         /// Trust the key the server presents now; confirm its fingerprint with the administrator
@@ -3308,8 +3310,11 @@ fn s3_bucket(command: &DestinationCommand) -> Result<crate::destination::Bucket>
         region: region.clone(),
         bucket: bucket.clone(),
         prefix: prefix.clone(),
-        // MinIO and RustFS serve buckets in the URL path.
-        path_style: *path_style || preset.is_some(),
+        // MinIO and RustFS serve buckets in the URL path, and an IP or
+        // localhost endpoint cannot take the bucket in its host name.
+        path_style: *path_style
+            || preset.is_some()
+            || crate::destination::endpoint_needs_path_style(endpoint),
         credentials,
         keep_local: *keep_local,
         no_overwrite: if *check_first {
@@ -3435,12 +3440,20 @@ fn destination_command(command: &DestinationCommand) -> Result<Value> {
                 } else {
                     Some(crate::s3::Client::new(bucket).and_then(|client| client.check()))
                 };
-                if let Some(Err(error)) = &check
-                    && crate::s3::retryable(error)
-                {
-                    anyhow::bail!(
-                        "cannot reach the bucket: {error:#}; fix the settings or save with --no-check"
-                    );
+                if let Some(Err(error)) = &check {
+                    if crate::s3::retryable(error) {
+                        anyhow::bail!(
+                            "cannot reach the bucket: {error:#}; fix the settings or save with --no-check"
+                        );
+                    }
+                    // Write-only keys may not inspect the bucket yet can
+                    // upload: save with a warning. Anything else (refused
+                    // credentials, a missing bucket) is not saved.
+                    if !format!("{error:#}").contains("may not inspect it") {
+                        anyhow::bail!(
+                            "the bucket check failed: {error:#}; fix the settings or save with --no-check"
+                        );
+                    }
                 }
                 destination::save(saved.clone())?;
                 let mut value = json!({"destination": describe(&saved)});
@@ -3547,11 +3560,16 @@ fn destination_command(command: &DestinationCommand) -> Result<Value> {
                 }
                 let check = (!*no_check)
                     .then(|| crate::transfer::connect(&remote).and_then(|mut u| u.check()));
-                if let Some(Err(error)) = &check
-                    && crate::transfer::retryable(error)
-                {
+                if let Some(Err(error)) = &check {
+                    // A refused sign-in, a wrong host key or an untrusted
+                    // certificate would only fail every upload: not saved.
+                    if crate::transfer::retryable(error) {
+                        anyhow::bail!(
+                            "cannot reach the server: {error:#}; fix the settings or save with --no-check"
+                        );
+                    }
                     anyhow::bail!(
-                        "cannot reach the server: {error:#}; fix the settings or save with --no-check"
+                        "the server check failed: {error:#}; fix the settings or save with --no-check"
                     );
                 }
                 destination::save(saved.clone())?;
