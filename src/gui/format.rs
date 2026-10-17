@@ -161,23 +161,42 @@ pub(super) fn feature_unit(feature: &FeatureInfo) -> Option<&str> {
     })
 }
 
-/// A long exposure in everyday units, "10 ms" or "1.5 s", for the caption
-/// under its field, which keeps the camera's microseconds. None below a
-/// millisecond, or for any other unit.
-pub(super) fn human_duration(feature: &FeatureInfo) -> Option<String> {
-    human_duration_of(feature, feature.value.as_ref()?.as_f64()?)
-}
-
-/// `human_duration` for `value` in the feature's unit, such as a draft.
-pub(super) fn human_duration_of(feature: &FeatureInfo, value: f64) -> Option<String> {
-    if !matches!(feature.unit.as_deref(), Some("us" | "usec")) || value.is_nan() || value < 1000.0 {
+/// A microsecond feature's value and range in milliseconds, one unit for
+/// the whole caption: "10 ms · 0.01 – 1,000 ms". The field beside it keeps
+/// the camera's microseconds and says so. None for any other unit, or for a
+/// range that stays under a millisecond, which reads better in µs.
+pub(super) fn milliseconds_readout(feature: &FeatureInfo, value: Option<f64>) -> Option<String> {
+    if !matches!(feature.unit.as_deref(), Some("us" | "usec")) {
         return None;
     }
-    let trim = |text: String| text.trim_end_matches(".0").to_owned();
-    Some(if value >= 1_000_000.0 {
-        format!("{} s", trim(format!("{:.1}", value / 1_000_000.0)))
-    } else {
-        format!("{} ms", trim(format!("{:.1}", value / 1000.0)))
+    let value = value.filter(|v| v.is_finite());
+    let top = feature.max.or(value)?;
+    if top < 1000.0 {
+        return None;
+    }
+    let ms = |us: f64| {
+        let ms = us / 1000.0;
+        if ms.fract() == 0.0 && ms.abs() < 1e15 {
+            let digits = grouped(ms.abs() as u64);
+            if ms < 0.0 {
+                format!("-{digits}")
+            } else {
+                digits
+            }
+        } else {
+            range_number(ms)
+        }
+    };
+    let range = match (feature.min, feature.max) {
+        (Some(min), Some(max)) => format!("{} – {} ms", ms(min), ms(max)),
+        (Some(min), None) => format!("min {} ms", ms(min)),
+        (None, Some(max)) => format!("max {} ms", ms(max)),
+        _ => String::new(),
+    };
+    Some(match (value, range.is_empty()) {
+        (Some(value), true) => format!("{} ms", ms(value)),
+        (Some(value), false) => format!("{} ms · {range}", ms(value)),
+        (None, _) => range,
     })
 }
 
@@ -720,16 +739,33 @@ mod tests {
     fn long_exposures_read_in_milliseconds_or_seconds() {
         let exposure = |value: f64, unit: &str| FeatureInfo {
             unit: Some(unit.into()),
+            min: Some(10.0),
+            max: Some(1_000_000.0),
             ..sample_feature("ExposureTime", "Float", json!(value))
         };
-        assert_eq!(human_duration(&exposure(10_000.0, "us")).as_deref(), Some("10 ms"));
-        assert_eq!(human_duration(&exposure(12_345.0, "usec")).as_deref(), Some("12.3 ms"));
-        assert_eq!(human_duration(&exposure(999.0, "us")), None);
+        let read = |feature: &FeatureInfo, value: f64| milliseconds_readout(feature, Some(value));
         assert_eq!(
-            human_duration(&exposure(1_500_000.0, "us")).as_deref(),
-            Some("1.5 s")
+            read(&exposure(10_000.0, "us"), 10_000.0).as_deref(),
+            Some("10 ms · 0.01 – 1,000 ms")
         );
-        assert_eq!(human_duration(&exposure(10_000.0, "ms")), None);
+        assert_eq!(
+            read(&exposure(12_345.0, "usec"), 12_345.0).as_deref(),
+            Some("12.345 ms · 0.01 – 1,000 ms")
+        );
+        assert_eq!(
+            read(&exposure(1_500_000.0, "us"), 1_500_000.0).as_deref(),
+            Some("1,500 ms · 0.01 – 1,000 ms")
+        );
+        assert_eq!(read(&exposure(10_000.0, "ms"), 10_000.0), None);
+        let short = FeatureInfo {
+            max: Some(999.0),
+            ..exposure(500.0, "us")
+        };
+        assert_eq!(
+            read(&short, 500.0),
+            None,
+            "a sub-millisecond range stays in µs"
+        );
         let mut rate = FeatureInfo {
             unit: Some("Hz".into()),
             min: Some(1.0),
@@ -758,7 +794,10 @@ mod tests {
             draft_error_text(&feature, "2000000", &raw("2000000")),
             "Too high: use at most 1,000,000 µs"
         );
-        assert_eq!(draft_error_text(&feature, "fast", &raw("fast")), raw("fast"));
+        assert_eq!(
+            draft_error_text(&feature, "fast", &raw("fast")),
+            raw("fast")
+        );
         let unitless = FeatureInfo {
             unit: None,
             min: Some(0.0),

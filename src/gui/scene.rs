@@ -220,7 +220,11 @@ impl Workbench {
                     self.focus.open = false;
                 }
                 "noinspector" => self.inspector_open = false,
-                "inspector" => self.inspector_open = true,
+                "inspector" => {
+                    // Asked for by name: show it even on a quiet first run.
+                    self.inspector_open = true;
+                    self.inspector_summoned = true;
+                }
                 "nosidebar" => self.sidebar_open = false,
                 "sidebar" => self.sidebar_open = true,
                 "peek" => self.inspector_peek = true,

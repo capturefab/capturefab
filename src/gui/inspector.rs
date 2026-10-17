@@ -99,8 +99,6 @@ fn feature_groups(kind: CameraKind) -> &'static [&'static str] {
     }
 }
 
-/// Classify only features the camera supplies. Unknown names stay accessible
-/// in the ordinary feature groups and through search.
 /// The group named `name` among those of any camera type, as the static
 /// name the panel keys its disclosures by.
 fn known_feature_group(name: &str) -> Option<&'static str> {
@@ -119,6 +117,8 @@ fn known_feature_group(name: &str) -> Option<&'static str> {
     .find(|group| *group == name)
 }
 
+/// Classify only features the camera supplies. Unknown names stay accessible
+/// in the ordinary feature groups and through search.
 fn adaptive_feature_group(name: &str, kind: CameraKind) -> &'static str {
     let starts = |prefixes: &[&str]| prefixes.iter().any(|prefix| name.starts_with(prefix));
     match kind {
@@ -734,6 +734,8 @@ struct FeatureIndex {
     /// Each group with its features' indices, in display order.
     groups: Vec<(&'static str, Vec<usize>)>,
     quick: Vec<usize>,
+    /// Whether each feature is among `quick`, for a constant-time check.
+    is_quick: Vec<bool>,
     /// Each feature's label and tooltip.
     labels: Vec<String>,
     tips: Vec<String>,
@@ -825,12 +827,17 @@ impl FeatureIndex {
             .filter(|&i| quick_feature_rank(&features[i].name, kind).is_some())
             .collect();
         quick.sort_by_key(|&i| quick_feature_rank(&features[i].name, kind));
+        let mut is_quick = vec![false; features.len()];
+        for &i in &quick {
+            is_quick[i] = true;
+        }
         Self {
             key: Self::key(features, kind),
             kind,
             len: features.len(),
             groups,
             quick,
+            is_quick,
             labels,
             tips,
             words,
@@ -1291,47 +1298,49 @@ impl Workbench {
     }
 }
 
+/// The next file a capture or recording saves, on one line: a folder glyph,
+/// `label`, and the file name cut in the middle so the camera and the
+/// extension both stay. Its folder, the whole path and `about` on hover.
+fn file_preview<'a>(
+    label: &'static str,
+    preview: &str,
+    about: &str,
+    p: &'static Palette,
+) -> Element<'a, Message> {
+    let (file, folder) = split_preview(preview);
+    let hover = if folder.is_empty() {
+        format!("{preview}\n{about}")
+    } else {
+        format!("In {folder}\n{preview}\n{about}")
+    };
+    tip(
+        row![
+            icon(Icon::Folder, 12.0, p.secondary),
+            text(label).size(style::SMALL).color(p.secondary),
+            one_line(file, style::SMALL, style::SANS, p.text)
+                .keep_ends()
+                .width(Fill),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+        hover,
+    )
+}
+
 /// A home-shortened path split into its file name and its folder, at the
 /// last `/` or `\`; the folder is empty for a bare name.
 fn split_preview(preview: &str) -> (String, String) {
     match preview.rfind(['/', '\\']) {
         Some(at) => {
             let folder = &preview[..at];
-            let folder = if folder.is_empty() { &preview[..=at] } else { folder };
+            let folder = if folder.is_empty() {
+                &preview[..=at]
+            } else {
+                folder
+            };
             (preview[at + 1..].to_owned(), folder.to_owned())
         }
         None => (preview.to_owned(), String::new()),
-    }
-}
-
-/// What a file name template names its files by, in plain words: "Named
-/// by date, camera, time and number"; "Custom name" without placeholders.
-fn pattern_summary(template: &str) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    let mut add = |part| {
-        if !parts.contains(&part) {
-            parts.push(part);
-        }
-    };
-    let mut rest = template;
-    while let Some(start) = rest.find('{') {
-        let Some(end) = rest[start..].find('}') else {
-            break;
-        };
-        match &rest[start + 1..start + end] {
-            "date" => add("date"),
-            "camera" => add("camera"),
-            "datetime" | "time" => add("time"),
-            "seq" => add("number"),
-            "frame" => add("frame"),
-            _ => {}
-        }
-        rest = &rest[start + end + 1..];
-    }
-    match parts.as_slice() {
-        [] => "Custom name".into(),
-        [one] => format!("Named by {one}"),
-        [init @ .., last] => format!("Named by {} and {last}", init.join(", ")),
     }
 }
 
@@ -1442,8 +1451,10 @@ fn error_caption<'a>(message: String, quiet: bool, p: &'static Palette) -> Eleme
 }
 
 /// An accent text action.
+/// A text action, set in the medium weight so it reads apart from the
+/// counts and notes beside it.
 fn link<'a>(label: &'a str, on: Option<Message>) -> Element<'a, Message> {
-    button(text(label).size(style::SMALL))
+    button(text(label).size(style::SMALL).font(style::MEDIUM))
         .padding([3, 8])
         .style(style::link)
         .on_press_maybe(on)
@@ -1678,7 +1689,7 @@ impl Workbench {
                                 .split_whitespace()
                                 .all(|term| index.words[i].contains(term))
                         } else {
-                            !index.quick.contains(&i)
+                            !index.is_quick[i]
                         }
                 })
                 .collect();
@@ -1739,7 +1750,11 @@ impl Workbench {
             space().into()
         } else {
             link(
-                if any_open { "Collapse all" } else { "Expand all" },
+                if any_open {
+                    "Collapse all"
+                } else {
+                    "Expand all"
+                },
                 Some(Message::ExpandFeatureGroups(!any_open)),
             )
         };
@@ -1806,6 +1821,7 @@ impl Workbench {
                 i,
                 self.feature(
                     feature,
+                    self.inspect.index.is_quick[i],
                     &self.inspect.index.labels[i],
                     &self.inspect.index.tips[i],
                     p,
@@ -2047,7 +2063,7 @@ impl Workbench {
         let small = |label: &'static str, on: Message, hint: String| -> Element<'_, Message> {
             tip(
                 // Flush with the card's text; the room goes between them.
-                button(text(label).size(style::CAPTION))
+                button(text(label).size(style::CAPTION).font(style::MEDIUM))
                     .padding(iced::Padding {
                         top: 2.0,
                         right: 14.0,
@@ -2061,39 +2077,52 @@ impl Workbench {
         };
         let mut links = row![].align_y(Alignment::Center);
         if scoped {
-            links = links
-                .push(small(
-                    if self.exposure_open {
-                        "Hide histogram"
-                    } else {
-                        "Histogram"
-                    },
-                    Message::ToggleExposure,
-                    Action::ToggleExposure.hint(
-                        if self.exposure_open {
-                            "Hide the histogram"
-                        } else {
-                            "Show the histogram"
-                        },
-                        os,
-                    ),
-                ))
-                .push(small(
-                    if self.focus.open {
-                        "Hide focus aid"
-                    } else {
-                        "Focus aid"
-                    },
-                    Message::ToggleFocusRegion,
-                    Action::ToggleFocusRegion.hint(
-                        if self.focus.open {
-                            "Hide the focus aid"
-                        } else {
-                            "Show the focus aid"
-                        },
-                        os,
-                    ),
-                ));
+            // The scopes draw over a single camera, not the overview's
+            // tiles: there an open scope reads as off, and pressing it opens
+            // the selected camera, where it shows.
+            let overview = self.overview();
+            let camera = self.snapshot.active_camera.clone();
+            let link = |shown_label: &'static str,
+                        hidden_label: &'static str,
+                        what: &str,
+                        open: bool,
+                        toggle: Message,
+                        action: Action| {
+                let shown = open && !overview;
+                let on = match (&camera, open && overview) {
+                    (Some(camera), true) => Message::FocusTile(camera.clone()),
+                    _ => toggle,
+                };
+                let hint = if shown {
+                    format!("Hide the {what}")
+                } else if open && overview {
+                    format!("Show the {what} on the selected camera")
+                } else {
+                    format!("Show the {what}")
+                };
+                small(
+                    if shown { shown_label } else { hidden_label },
+                    on,
+                    action.hint(&hint, os),
+                )
+            };
+            let histogram = link(
+                "Hide histogram",
+                "Histogram",
+                "histogram",
+                self.exposure_open,
+                Message::ToggleExposure,
+                Action::ToggleExposure,
+            );
+            let focus = link(
+                "Hide focus aid",
+                "Focus aid",
+                "focus aid",
+                self.focus.open,
+                Message::ToggleFocusRegion,
+                Action::ToggleFocusRegion,
+            );
+            links = links.push(histogram).push(focus);
         }
         links.into()
     }
@@ -2105,6 +2134,7 @@ impl Workbench {
     pub(super) fn feature<'a>(
         &'a self,
         feature: &'a FeatureInfo,
+        quick: bool,
         label: &'a str,
         about: &'a str,
         p: &'static Palette,
@@ -2259,9 +2289,11 @@ impl Workbench {
                     .into()
             } else if dirty {
                 tip(
-                    button(text("Apply").size(style::CAPTION))
-                        .padding([0, 4])
-                        .style(style::link)
+                    // A small filled button, as tall as the caption line, so
+                    // the pending edit has a clear way to land.
+                    button(text("Apply").size(style::CAPTION).font(style::MEDIUM))
+                        .padding([0, 8])
+                        .style(style::secondary)
                         .on_press_maybe(
                             draft_error
                                 .is_none()
@@ -2299,22 +2331,24 @@ impl Workbench {
                 "Editing it switches the camera to manual",
             ));
         }
+        let mut in_microseconds = false;
         if writable && !command {
-            // What the field's microseconds come to, as typed.
-            let duration = match self
+            // A microsecond field reads in milliseconds, value and range
+            // alike, as typed; anything else gives its range in its unit.
+            let value = self
                 .edits
                 .get(name)
                 .and_then(|draft| draft.trim().parse::<f64>().ok())
-            {
-                Some(draft) => human_duration_of(feature, draft),
-                None => human_duration(feature),
+                .or_else(|| feature.value.as_ref().and_then(|v| v.as_f64()));
+            let readout = match milliseconds_readout(feature, value) {
+                Some(readout) => {
+                    in_microseconds = feature.choices.is_empty();
+                    readout
+                }
+                None => range_text(feature),
             };
-            if let Some(duration) = duration {
-                notes.push(note(duration, p.secondary));
-            }
-            let range = range_text(feature);
-            if !range.is_empty() {
-                notes.push(note(range, p.secondary));
+            if !readout.is_empty() {
+                notes.push(note(readout, p.secondary));
             }
         }
         let label_text = label;
@@ -2324,13 +2358,26 @@ impl Workbench {
         } else {
             tip(label, about)
         };
+        // The caption reads in ms, so the field names its own unit.
+        let control: Element<'_, Message> = if in_microseconds {
+            row![control, text("µs").size(style::SMALL).color(p.secondary)]
+                .spacing(4)
+                .align_y(Alignment::Center)
+                .into()
+        } else {
+            control
+        };
         let head = row![container(label).width(Fill), control,]
             .spacing(10)
             .align_y(Alignment::Center);
         // A quick numeric control also slides across its range.
-        let slider = self.quick_slider(feature, label_text, writable && !command && !locked);
+        let slider = self.quick_slider(
+            feature,
+            label_text,
+            quick && writable && !command && !locked,
+        );
         let head: Element<'_, Message> = match slider {
-            Some(slider) => column![head, slider].spacing(4).into(),
+            Some(slider) => column![head, slider].spacing(2).into(),
             None => head.into(),
         };
         // A refusal takes the notes' place; Apply stays beside it.
@@ -2366,15 +2413,6 @@ impl Workbench {
         if !editable || !feature.choices.is_empty() || feature.error.is_some() {
             return None;
         }
-        let index = &self.inspect.index;
-        let position = self
-            .snapshot
-            .features
-            .iter()
-            .position(|f| std::ptr::eq(f, feature))?;
-        if !index.quick.contains(&position) {
-            return None;
-        }
         let scale = widgets::FeatureScale::new(
             &feature.name,
             &feature.kind,
@@ -2401,13 +2439,7 @@ impl Workbench {
         } else {
             Message::Draft(feature.name.clone(), feature_value(feature))
         };
-        Some(widgets::feature_slider(
-            name,
-            label,
-            value,
-            scale,
-            on_press,
-        ))
+        Some(widgets::feature_slider(name, label, value, scale, on_press))
     }
 
     /// The Stream row: starts or stops the selected camera, with a spinner
@@ -2546,31 +2578,11 @@ impl Workbench {
         if let Some(status) = self.capture_status(connected, capturing, p) {
             action = action.push(status);
         }
-        let (file, folder) = split_preview(&self.output_preview());
-        let mut next = column![
-            row![
-                text("Next file:").size(style::SMALL).color(p.secondary),
-                one_line(file, style::SMALL, style::SANS, p.secondary)
-                    .keep_end()
-                    .width(Fill),
-            ]
-            .spacing(4)
-        ]
-        .spacing(2);
-        if !folder.is_empty() {
-            next = next.push(
-                row![
-                    text("in").size(style::SMALL).color(p.secondary),
-                    one_line(folder, style::SMALL, style::SANS, p.secondary)
-                        .keep_end()
-                        .width(Fill),
-                ]
-                .spacing(4),
-            );
-        }
-        action = action.push(tip(
-            next,
+        action = action.push(file_preview(
+            "Next file",
+            &self.output_preview(),
             "{camera}, {date}, {time}, {datetime} and {frame} fill in when saving; {seq} becomes the next free number",
+            p,
         ));
         let mut head = column![section(capture_title(kind), None, p)].spacing(8);
         if let Some(guidance) = capture_guidance(kind) {
@@ -2890,17 +2902,14 @@ impl Workbench {
         } else if streams {
             icon(Icon::Broadcast, 15.0, action_ink)
         } else {
-            dot(
-                if ready { Color::WHITE } else { p.ink(p.danger) },
-                8.0,
-            )
+            dot(if ready { Color::WHITE } else { p.ink(p.danger) }, 8.0)
         };
         let mut action = column![wide_button(
             glyph,
             if starting {
                 "Starting…"
             } else if streams {
-                "Start forwarding"
+                "Start streaming"
             } else {
                 "Start recording"
             },
@@ -3107,10 +3116,11 @@ impl Workbench {
     }
 
     /// Whether the Video tab streams to a URL rather than records: its
-    /// output is a URL, or was switched to one and is still being typed.
+    /// output is a URL, or Stream mode was chosen (or shown) and is kept
+    /// while the URL is edited, even when it is empty or has no scheme yet.
+    /// Only the Record/Stream switch leaves Stream mode.
     pub(super) fn forward_streams(&self) -> bool {
-        !Output::of(&self.forward_output).recording()
-            || (self.stream_draft && !self.forward_output.contains(['/', '\\', '.']))
+        self.stream_draft || !Output::of(&self.forward_output).recording()
     }
 
     /// Switch the Video tab between recording (`stream` false) and
@@ -3157,6 +3167,7 @@ impl Workbench {
         p: &'static Palette,
     ) -> Element<'_, Message> {
         let mut content = column![
+            text("Stream URL").size(style::SMALL).color(p.secondary),
             text_input("rtsp://host:8554/camera", &self.forward_output)
                 .name("Stream URL")
                 .invalid(output_error.clone())
@@ -3204,8 +3215,8 @@ impl Workbench {
             content = content.push(self.saves_as(p));
         }
         let mut location = column![disclosure(
-            "Change location or file name",
-            (!open).then(|| pattern_summary(&self.forward_output)),
+            "Location & name",
+            (!open).then(|| self.record_summary()),
             if open { 1.0 } else { 0.0 },
             Message::InspectorDisclosure(Section::RecordLocation),
             p,
@@ -3221,40 +3232,37 @@ impl Workbench {
         content.push(location).into()
     }
 
-    /// "Saves as" the next recording's file name, and the folder it goes
-    /// in; the whole path on hover.
-    fn saves_as(&self, p: &'static Palette) -> Element<'_, Message> {
-        let preview = self.preview_of(&self.forward_output);
-        let (file, folder) = split_preview(&preview);
-        let mut lines = column![
-            row![
-                text("Saves as").size(style::SMALL).color(p.secondary),
-                one_line(file, style::SMALL, style::MONO, p.text)
-                    .keep_end()
-                    .width(Fill),
-            ]
-            .spacing(5)
-        ]
-        .spacing(2);
-        if !folder.is_empty() {
-            lines = lines.push(
-                one_line(format!("in {folder}"), style::SMALL, style::SANS, p.secondary)
-                    .keep_end()
-                    .width(Fill),
-            );
-        }
-        tip(
-            row![
-                container(icon(Icon::Folder, 12.0, p.secondary))
-                    .height(style::line_height(style::SMALL))
-                    .align_y(Alignment::Center),
-                lines
-            ]
-            .spacing(6)
-            .align_y(Alignment::Start),
+    /// Where a folded recording location saves: "This computer ·
+    /// ~/Capturefab", its folder up to the first part that fills in.
+    fn record_summary(&self) -> String {
+        let template = self.forward_output.trim();
+        let folder = std::path::Path::new(template)
+            .parent()
+            .map(|parent| {
+                parent
+                    .components()
+                    .take_while(|part| !part.as_os_str().to_string_lossy().contains('{'))
+                    .collect::<std::path::PathBuf>()
+            })
+            .unwrap_or_default();
+        if folder.as_os_str().is_empty() {
+            "This computer".into()
+        } else {
             format!(
-                "{preview}\n{{date}} and {{datetime}} fill in when recording; {{seq}} becomes the next free number"
-            ),
+                "This computer · {}",
+                self.preview_of(&folder.to_string_lossy())
+            )
+        }
+    }
+
+    /// "Saves as" the next recording's file name; its folder and the whole
+    /// path on hover.
+    fn saves_as(&self, p: &'static Palette) -> Element<'_, Message> {
+        file_preview(
+            "Saves as",
+            &self.preview_of(&self.forward_output),
+            "{date} and {datetime} fill in when recording; {seq} becomes the next free number",
+            p,
         )
     }
 
@@ -3686,7 +3694,7 @@ mod tests {
                         == Some(if Output::of(output).recording() {
                             "Start recording"
                         } else {
-                            "Start forwarding"
+                            "Start streaming"
                         })
                 })
                 .unwrap();

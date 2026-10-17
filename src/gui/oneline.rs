@@ -24,8 +24,16 @@ pub(super) fn one_line<'a>(
         width: Length::Shrink,
         align_x: text::Alignment::Default,
         yields: false,
-        keep_end: false,
+        cut: Cut::End,
     }
+}
+
+/// Where a line that does not fit loses its text.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Cut {
+    #[default]
+    End,
+    Middle,
 }
 
 pub(super) struct OneLine<'a> {
@@ -37,8 +45,8 @@ pub(super) struct OneLine<'a> {
     align_x: text::Alignment,
     /// See `yield_room`.
     yields: bool,
-    /// See `keep_end`.
-    keep_end: bool,
+    /// See `keep_ends`.
+    cut: Cut,
 }
 
 impl OneLine<'_> {
@@ -55,10 +63,10 @@ impl OneLine<'_> {
         self
     }
 
-    /// Cuts the start instead of the end, "…/2026-10-17/clip.mp4", for
-    /// paths and file names whose end tells them apart.
-    pub(super) fn keep_end(mut self) -> Self {
-        self.keep_end = true;
+    /// Cuts the middle, "Pattern-cam…-####.mp4", for file names whose start
+    /// says what they are and whose end says which one.
+    pub(super) fn keep_ends(mut self) -> Self {
+        self.cut = Cut::Middle;
         self
     }
 
@@ -101,9 +109,9 @@ pub(super) fn fit(content: &str, room: f32, mut width: impl FnMut(&str) -> f32) 
     Cow::Owned(shown)
 }
 
-/// Like `fit`, but keeps the end of the first line: "…" and the longest
-/// suffix, starting at a char boundary, that fits with it.
-pub(super) fn fit_end(
+/// Like `fit`, but cuts the middle of the first line: its start, "…", and
+/// its end, keeping about as much of each.
+pub(super) fn fit_middle(
     content: &str,
     room: f32,
     mut width: impl FnMut(&str) -> f32,
@@ -112,25 +120,32 @@ pub(super) fn fit_end(
     if !more && width(line) <= room {
         return Cow::Borrowed(line);
     }
-    let cut = |start: usize| format!("…{}", line[start..].trim_start());
-    // Where a cut may start, longest suffix first; the empty one last.
-    let mut starts: Vec<usize> = line.char_indices().map(|(at, _)| at).collect();
-    if !more {
-        // The whole line did not fit, so it is no candidate.
-        starts.retain(|&at| at > 0);
-    }
-    starts.push(line.len());
-    // The first (longest) fitting cut, assuming narrower for later starts.
-    let (mut low, mut high) = (0, starts.len() - 1);
+    let bounds: Vec<usize> = line
+        .char_indices()
+        .map(|(at, _)| at)
+        .chain([line.len()])
+        .collect();
+    let chars = bounds.len() - 1;
+    // `kept` chars: the first half from the start, the rest from the end.
+    let cut = |kept: usize| {
+        let head = kept.div_ceil(2);
+        let tail = kept - head;
+        format!(
+            "{}…{}",
+            line[..bounds[head]].trim_end(),
+            line[bounds[chars - tail]..].trim_start()
+        )
+    };
+    let (mut low, mut high) = (0, chars.saturating_sub(1));
     while low < high {
-        let mid = (low + high) / 2;
-        if width(&cut(starts[mid])) <= room {
-            high = mid;
+        let mid = (low + high).div_ceil(2);
+        if width(&cut(mid)) <= room {
+            low = mid;
         } else {
-            low = mid + 1;
+            high = mid - 1;
         }
     }
-    let shown = cut(starts[low]);
+    let shown = cut(low);
     if width(&shown) > room {
         return Cow::Borrowed("");
     }
@@ -157,7 +172,7 @@ struct State<P> {
     whole: f32,
     /// The room `shown` was fitted to.
     room: Option<f32>,
-    keep_end: bool,
+    cut: Cut,
     shown: String,
     paragraph: P,
 }
@@ -171,7 +186,7 @@ impl<P: Default> Default for State<P> {
             align_x: text::Alignment::Default,
             whole: 0.0,
             room: None,
-            keep_end: false,
+            cut: Cut::End,
             shown: String::new(),
             paragraph: P::default(),
         }
@@ -207,7 +222,7 @@ where
         limits: &layout::Limits,
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<State<R::Paragraph>>();
-        let (size, font, align_x, keep_end) = (self.size, self.font, self.align_x, self.keep_end);
+        let (size, font, align_x, cut) = (self.size, self.font, self.align_x, self.cut);
         let shape = |content: &str| {
             R::Paragraph::with_text(text::Text {
                 content,
@@ -227,13 +242,12 @@ where
                 || state.size != size
                 || state.font != font
                 || state.align_x != align_x
-                || state.keep_end != keep_end;
+                || state.cut != cut;
             let (line, _) = first_line(content);
             let mut whole = None;
             if fresh {
                 content.clone_into(&mut state.content);
-                (state.size, state.font, state.align_x, state.keep_end) =
-                    (size, font, align_x, keep_end);
+                (state.size, state.font, state.align_x, state.cut) = (size, font, align_x, cut);
                 let paragraph = shape(line);
                 state.whole = paragraph.min_width();
                 whole = Some(paragraph);
@@ -248,10 +262,9 @@ where
                         shape(candidate).min_width()
                     }
                 };
-                let shown = if keep_end {
-                    fit_end(content, room, measure)
-                } else {
-                    fit(content, room, measure)
+                let shown = match cut {
+                    Cut::Middle => fit_middle(content, room, measure),
+                    Cut::End => fit(content, room, measure),
                 };
                 if fresh || *shown != state.shown {
                     state.paragraph = match whole {
@@ -394,21 +407,20 @@ mod tests {
     }
 
     #[test]
-    fn kept_ends_start_with_an_ellipsis_that_fits() {
-        assert!(matches!(
-            fit_end("clip.mp4", 80.0, tens),
-            Cow::Borrowed("clip.mp4")
-        ));
-        assert_eq!(fit_end("~/Capturefab/2026-10-17", 110.0, tens), "…2026-10-17");
-        assert_eq!(fit_end("camera-####.mp4", 50.0, tens), "….mp4");
-        for room in [0.0, 5.0, 10.0, 35.0, 99.0, 139.0] {
-            let shown = fit_end("Pattern camera", room, tens);
+    fn kept_ends_cut_the_middle_and_keep_both_sides() {
+        let name = "Pattern-camera-SIM0-20261017-####.mp4";
+        assert!(matches!(fit_middle(name, 1000.0, tens), Cow::Borrowed(_)));
+        assert_eq!(fit_middle(name, 150.0, tens), "Pattern…###.mp4");
+        for room in [0.0, 10.0, 25.0, 99.0, 369.0] {
+            let shown = fit_middle(name, room, tens);
             assert!(tens(&shown) <= room, "{room}");
-            assert!("Pattern camera".ends_with(shown.trim_start_matches('…')));
+            if let Some((head, tail)) = shown.split_once('…') {
+                assert!(name.starts_with(head) && name.ends_with(tail), "{shown}");
+            }
         }
-        assert_eq!(fit_end("Pattern camera", 9.0, tens), "");
-        assert_eq!(fit_end("Pattern camera", 10.0, tens), "…");
-        assert_eq!(fit_end("日本語 📷 camera", 50.0, tens), "…mera");
+        assert_eq!(fit_middle(name, 9.0, tens), "");
+        assert_eq!(fit_middle(name, 10.0, tens), "…");
+        assert_eq!(fit_middle("日本語 📷 camera", 50.0, tens), "日本…ra");
     }
 
     #[test]

@@ -118,7 +118,7 @@ fn compact_video_keeps_its_start_action_visible_before_encoding_details() {
             let label = if Output::of(output).recording() {
                 "Start recording"
             } else {
-                "Start forwarding"
+                "Start streaming"
             };
             let action = snapshot
                 .nodes
@@ -196,7 +196,7 @@ fn compact_purpose_guidance_and_primary_actions_fit_before_external_drive_shortc
                     &renderer,
                 );
                 let label = if tab == Tab::Forward {
-                    "Start forwarding"
+                    "Start streaming"
                 } else {
                     "Capture and save · ⌘S"
                 };

@@ -702,6 +702,8 @@ enum Message {
     ToggleAutoChanges,
     Draft(String, String),
     Commit(String),
+    /// A quick slider let go: applies its draft, if dragging made one.
+    SliderReleased(String),
     Set(String, String),
     Execute(String),
     Num(Num, String),
@@ -959,6 +961,9 @@ impl Workbench {
         // A first run keeps the inspector out of the way until a camera
         // comes; it must not slide away on launch.
         let quiet = prefs.recent.is_empty();
+        // A saved stream URL opens the Video tab in Stream mode, and keeps it
+        // there while the URL is cleared and retyped.
+        let stream_draft = !Output::of(&prefs.forward_output).recording();
         let defaults = Prefs::default();
         let pick = |choices: &[Choice], value: &str, fallback: &str| {
             find(choices, value)
@@ -1125,7 +1130,7 @@ impl Workbench {
             inspector_summoned: false,
             stashed_record: None,
             stashed_stream: String::new(),
-            stream_draft: false,
+            stream_draft,
             image_mode: false,
             width: 1280.0,
             height: 840.0,
@@ -3068,6 +3073,11 @@ impl Workbench {
                     SessionCommand::Set { feature, value },
                 );
             }
+            Message::SliderReleased(feature) => {
+                if self.edits.contains_key(&feature) {
+                    return self.handle_message(Message::Commit(feature));
+                }
+            }
             Message::Set(feature, value) => self.send(
                 Job::Set(feature.clone()),
                 SessionCommand::Set { feature, value },
@@ -3133,7 +3143,14 @@ impl Workbench {
             }
             Message::CapturePicker(message) => return self.picker(false, message),
             Message::AutoCapture(input) => return self.update_autocapture(input),
-            Message::RecordPicker(message) => return self.picker(true, message),
+            Message::RecordPicker(message) => {
+                // Typing never switches between Record and Stream: once the
+                // form streams, it keeps streaming until the switch says so.
+                if matches!(message, destinations::Message::Output(_)) && self.forward_streams() {
+                    self.stream_draft = true;
+                }
+                return self.picker(true, message);
+            }
             Message::ToggleSidebar => {
                 self.image_mode = false;
                 self.sidebar_open = !self.sidebar_open;
@@ -3875,12 +3892,27 @@ mod tests {
         bench.width = 1280.0;
         assert!(bench.inspector_open && bench.first_run_quiet());
         assert!(!bench.inspector_shown(), "nothing to inspect yet");
-        assert_eq!(bench.inspector_slide.get(bench.now), 0.0, "no slide on launch");
+        assert_eq!(
+            bench.inspector_slide.get(bench.now),
+            0.0,
+            "no slide on launch"
+        );
         // ⌘I shows it on the first press, leaving the preference as it was.
         let _ = bench.handle_message(Message::ToggleInspector);
         assert!(bench.inspector_open && bench.inspector_shown());
         let _ = bench.handle_message(Message::ToggleInspector);
         assert!(!bench.inspector_open && !bench.inspector_shown());
+
+        // So does a shortcut or menu item that shows one of its tabs.
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        bench.width = 1280.0;
+        let _ = bench.handle_message(Message::ShowTab(Tab::Capture));
+        assert!(bench.inspector_shown() && bench.tab == Tab::Capture);
+        // And a screenshot scene that names it.
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        bench.width = 1280.0;
+        bench.apply_scene(&["inspector"]);
+        assert!(bench.inspector_shown(), "the inspector scene word shows it");
 
         // A camera on its way shows it.
         let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);

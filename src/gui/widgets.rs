@@ -1,6 +1,8 @@
 //! Small building blocks shared by the views.
 use super::*;
+use iced::advanced::{self, Widget};
 use iced::widget::{Row, Stack, column};
+use iced::{Rectangle, mouse};
 mod keyboard_scroll;
 #[cfg(test)]
 mod keyboard_scroll_panel_tests;
@@ -293,7 +295,11 @@ impl FeatureScale {
         };
         // A step that would land past a bound stays on the last one inside.
         if snapped > self.max {
-            snapped - self.inc.unwrap_or(0.0).max(if self.integer { 1.0 } else { 0.0 })
+            snapped
+                - self
+                    .inc
+                    .unwrap_or(0.0)
+                    .max(if self.integer { 1.0 } else { 0.0 })
         } else if snapped < self.min {
             self.min
         } else {
@@ -309,9 +315,11 @@ impl FeatureScale {
         let next = if self.log {
             if up { value * 1.05 } else { value / 1.05 }
         } else {
-            let step = self
-                .inc
-                .unwrap_or(if self.integer { 1.0 } else { (self.max - self.min) / 100.0 });
+            let step = self.inc.unwrap_or(if self.integer {
+                1.0
+            } else {
+                (self.max - self.min) / 100.0
+            });
             if up { value + step } else { value - step }
         };
         let mut snapped = self.snap(next);
@@ -337,6 +345,114 @@ impl FeatureScale {
 /// A quick control's slider over feature `name`'s range: dragging drafts
 /// the value and releasing applies it once; keys and assistive technology
 /// step it and apply each step. `on_press` is what activating it does.
+/// Gives its content pointer drags only. iced's slider also moves on arrow
+/// keys and Ctrl-scroll while hovered, which would draft a value with no
+/// release to apply it; the surrounding button handles keys instead.
+struct PointerOnly<'a>(Element<'a, Message>);
+
+impl<'a> From<PointerOnly<'a>> for Element<'a, Message> {
+    fn from(guard: PointerOnly<'a>) -> Self {
+        Element::new(guard)
+    }
+}
+
+impl Widget<Message, Theme, iced::Renderer> for PointerOnly<'_> {
+    fn size(&self) -> Size<Length> {
+        self.0.as_widget().size()
+    }
+    fn size_hint(&self) -> Size<Length> {
+        self.0.as_widget().size_hint()
+    }
+    fn children(&self) -> Vec<advanced::widget::Tree> {
+        vec![advanced::widget::Tree::new(self.0.as_widget())]
+    }
+    fn diff(&self, tree: &mut advanced::widget::Tree) {
+        tree.diff_children(&[self.0.as_widget()]);
+    }
+    fn layout(
+        &mut self,
+        tree: &mut advanced::widget::Tree,
+        renderer: &iced::Renderer,
+        limits: &advanced::layout::Limits,
+    ) -> advanced::layout::Node {
+        self.0
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+    fn draw(
+        &self,
+        tree: &advanced::widget::Tree,
+        renderer: &mut iced::Renderer,
+        theme: &Theme,
+        style: &advanced::renderer::Style,
+        layout: advanced::Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.0.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+    fn operate(
+        &mut self,
+        tree: &mut advanced::widget::Tree,
+        layout: advanced::Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn advanced::widget::Operation,
+    ) {
+        self.0
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+    fn update(
+        &mut self,
+        tree: &mut advanced::widget::Tree,
+        event: &iced::Event,
+        layout: advanced::Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn advanced::Clipboard,
+        shell: &mut advanced::Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        if matches!(
+            event,
+            iced::Event::Keyboard(keyboard::Event::KeyPressed { .. })
+                | iced::Event::Mouse(mouse::Event::WheelScrolled { .. })
+        ) {
+            return;
+        }
+        self.0.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &advanced::widget::Tree,
+        layout: advanced::Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        self.0
+            .as_widget()
+            .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
+    }
+}
+
 pub(super) fn feature_slider<'a>(
     name: &str,
     label: &str,
@@ -355,14 +471,15 @@ pub(super) fn feature_slider<'a>(
         ]
     };
     let step = |up: bool| Message::Set(name.to_owned(), scale.text(scale.step(value, up)));
-    button(
+    button(PointerOnly(
         iced::widget::slider(0.0..=1.0, scale.position(value), move |at| {
             Message::Draft(drafted.clone(), scale.text(scale.value(at)))
         })
         .step(0.001)
-        .on_release(Message::Commit(committed))
-        .style(style::slide),
-    )
+        .on_release(Message::SliderReleased(committed))
+        .style(style::slide)
+        .into(),
+    ))
     .name(label)
     .role(accessibility::Role::Slider)
     .value(scale.text(value))
@@ -1144,12 +1261,14 @@ mod tests {
 
     #[test]
     fn exposure_slides_on_a_log_scale_between_its_bounds() {
-        let scale =
-            FeatureScale::new("ExposureTime", "Float", Some(10.0), Some(1_000_000.0), None)
-                .unwrap();
+        let scale = FeatureScale::new("ExposureTime", "Float", Some(10.0), Some(1_000_000.0), None)
+            .unwrap();
         assert_eq!(scale.position(10.0), 0.0);
         assert_eq!(scale.position(1_000_000.0), 1.0);
-        assert!((scale.position(1000.0) - 0.4).abs() < 1e-9, "log, not linear");
+        assert!(
+            (scale.position(1000.0) - 0.4).abs() < 1e-9,
+            "log, not linear"
+        );
         for value in [10.0, 37.0, 1234.0, 10_000.0, 999_000.0] {
             let back = scale.value(scale.position(value));
             assert!((back - value).abs() <= value * 0.01, "{value} → {back}");
@@ -1162,9 +1281,14 @@ mod tests {
 
     #[test]
     fn integers_snap_to_their_increment_and_stay_in_range() {
-        let scale =
-            FeatureScale::new("ExposureTimeAbs", "Integer", Some(20.0), Some(100_000.0), Some(10.0))
-                .unwrap();
+        let scale = FeatureScale::new(
+            "ExposureTimeAbs",
+            "Integer",
+            Some(20.0),
+            Some(100_000.0),
+            Some(10.0),
+        )
+        .unwrap();
         for at in [0.0, 0.13, 0.5, 0.77, 1.0] {
             let value = scale.value(at);
             assert_eq!((value - 20.0) % 10.0, 0.0, "{value}");
@@ -1186,7 +1310,8 @@ mod tests {
         assert_eq!(scale.text(scale.value(0.25)), "6");
         assert!((scale.step(12.0, true) - 12.2).abs() < 1e-9);
         // An exposure that may be 0 cannot be logarithmic.
-        let zero = FeatureScale::new("ExposureTime", "Float", Some(0.0), Some(100.0), None).unwrap();
+        let zero =
+            FeatureScale::new("ExposureTime", "Float", Some(0.0), Some(100.0), None).unwrap();
         assert_eq!(zero.position(50.0), 0.5);
     }
 
@@ -1200,9 +1325,10 @@ mod tests {
             FeatureScale::new("ExposureTime", "Float", Some(1.0), Some(1e8), None).is_none(),
             "too many decades"
         );
-        assert!(FeatureScale::new("PixelFormat", "Enumeration", Some(0.0), Some(4.0), None).is_none());
+        assert!(
+            FeatureScale::new("PixelFormat", "Enumeration", Some(0.0), Some(4.0), None).is_none()
+        );
     }
-
 
     #[test]
     fn shared_sheet_is_a_named_modal_dialog_with_retained_native_close() {

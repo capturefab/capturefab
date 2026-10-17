@@ -334,7 +334,10 @@ fn output_control(tree: &accesskit::TreeUpdate) -> (accesskit::NodeId, &accesski
 }
 
 fn labels(tree: &accesskit::TreeUpdate) -> Vec<&str> {
-    tree.nodes.iter().filter_map(|(_, node)| node.label()).collect()
+    tree.nodes
+        .iter()
+        .filter_map(|(_, node)| node.label())
+        .collect()
 }
 
 /// A workbench opened from what `app` would save, as on the next launch.
@@ -380,7 +383,12 @@ fn unknown_remembered_sections_are_ignored_and_dropped() {
         ],
         ..Default::default()
     };
-    let app = Workbench::new(SessionHandle::new(), "disclosures".into(), true, Some(prefs));
+    let app = Workbench::new(
+        SessionHandle::new(),
+        "disclosures".into(),
+        true,
+        Some(prefs),
+    );
     assert_eq!(app.inspect.feature_groups_open.len(), 1);
     assert_eq!(app.prefs().open_sections, ["features:Device"]);
 }
@@ -462,10 +470,18 @@ fn the_manual_exposure_card_explains_auto_and_toggles_the_histogram() {
     app.exposure_open = false;
     let mut tree = Tree::empty();
     let manual = snapshot(&app, Tab::Features, &mut tree, &renderer);
-    assert!(labels(&manual).iter().any(|label| label.contains("choose Auto")));
+    assert!(
+        labels(&manual)
+            .iter()
+            .any(|label| label.contains("choose Auto"))
+    );
     let hint = |what: &str, action: Action| action.hint(what, Os::CURRENT);
     let show = hint("Show the histogram", Action::ToggleExposure);
-    assert!(labels(&manual).contains(&show.as_str()), "{:?}", labels(&manual));
+    assert!(
+        labels(&manual).contains(&show.as_str()),
+        "{:?}",
+        labels(&manual)
+    );
     let focus = hint("Show the focus aid", Action::ToggleFocusRegion);
     assert!(labels(&manual).contains(&focus.as_str()));
     let _ = app.update(Message::ToggleExposure);
@@ -473,6 +489,24 @@ fn the_manual_exposure_card_explains_auto_and_toggles_the_histogram() {
     let shown = snapshot(&app, Tab::Features, &mut tree, &renderer);
     let hide = hint("Hide the histogram", Action::ToggleExposure);
     assert!(labels(&shown).contains(&hide.as_str()));
+    // The overview's tiles draw no histogram: the link says it is off, and
+    // opens the selected camera where it shows.
+    let mut other = liveness::streaming_camera(10, 0, 30.0);
+    other.info.id = "sim:1".into();
+    app.snapshot.cameras = vec![liveness::streaming_camera(10, 0, 30.0), other];
+    app.focus_camera = false;
+    assert!(app.overview() && app.exposure_open);
+    let overview = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let elsewhere = hint(
+        "Show the histogram on the selected camera",
+        Action::ToggleExposure,
+    );
+    assert!(
+        labels(&overview).contains(&elsewhere.as_str()),
+        "{:?}",
+        labels(&overview)
+    );
+    assert!(!labels(&overview).contains(&hide.as_str()));
 }
 
 #[test]
@@ -495,10 +529,18 @@ fn quick_sliders_draft_while_dragging_and_apply_once_on_release() {
     let slider = features
         .nodes
         .iter()
-        .find(|(_, node)| node.role() == accessibility::Role::Slider && node.label() == Some("Exposure"))
+        .find(|(_, node)| {
+            node.role() == accessibility::Role::Slider && node.label() == Some("Exposure")
+        })
         .expect("the quick exposure control slides");
     assert_eq!(slider.1.numeric_value(), Some(10_000.0));
-    assert!(labels(&features).contains(&"10 ms"));
+    // One unit on the caption, and the field says its own.
+    assert!(
+        labels(&features).contains(&"10 ms · 0.01 – 1,000 ms"),
+        "{:?}",
+        labels(&features)
+    );
+    assert!(labels(&features).contains(&"µs"));
     let sets = |app: &Workbench| {
         app.pending
             .iter()
@@ -511,6 +553,90 @@ fn quick_sliders_draft_while_dragging_and_apply_once_on_release() {
     assert_eq!(sets(&app), 0, "dragging only drafts");
     let _ = app.update(Message::Commit("ExposureTime".into()));
     assert_eq!(sets(&app), 1, "releasing applies once");
+}
+
+/// Drive the real quick slider with pointer and key events at `x`, the
+/// fraction of its width, and return what it publishes.
+fn slide(value: f64, events: &[iced::Event], x: f32) -> Vec<Message> {
+    let renderer = destinations::layout_tests::renderer();
+    let scale =
+        widgets::FeatureScale::new("ExposureTime", "Float", Some(10.0), Some(1e6), None).unwrap();
+    let on_press = Message::Draft("ExposureTime".into(), "10".into());
+    let mut view = widgets::feature_slider("ExposureTime", "Exposure", value, scale, on_press);
+    let mut tree = Tree::new(view.as_widget());
+    let node = view.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(Size::ZERO, Size::new(300.0, 40.0)),
+    );
+    let bounds = node.bounds();
+    let cursor = iced::mouse::Cursor::Available(iced::Point::new(
+        bounds.x + bounds.width * x,
+        bounds.center_y(),
+    ));
+    let mut messages = Vec::new();
+    for event in events {
+        view.as_widget_mut().update(
+            &mut tree,
+            event,
+            Layout::new(&node),
+            cursor,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut iced::advanced::Shell::new(&mut messages),
+            &bounds,
+        );
+    }
+    messages
+}
+
+#[test]
+fn a_quick_slider_applies_only_what_a_drag_changed() {
+    use iced::mouse::{Button, Event as Mouse};
+    let press = iced::Event::Mouse(Mouse::ButtonPressed(Button::Left));
+    let release = iced::Event::Mouse(Mouse::ButtonReleased(Button::Left));
+    let sets = |messages: Vec<Message>| {
+        let mut app = app();
+        for message in messages {
+            let _ = app.update(message);
+        }
+        app.pending
+            .iter()
+            .filter(|pending| pending.job == Job::Set("ExposureTime".into()))
+            .count()
+    };
+    // Pressing and letting go at the bound it already sits on changes nothing.
+    let still = slide(10.0, &[press.clone(), release.clone()], 0.0);
+    assert!(
+        !still.iter().any(|m| matches!(m, Message::Draft(..))),
+        "{still:?}"
+    );
+    assert_eq!(sets(still), 0, "an unchanged release sends nothing");
+    // A real drag drafts, and its release applies once.
+    let dragged = slide(10.0, &[press, release], 0.5);
+    assert!(dragged.iter().any(|m| matches!(m, Message::Draft(..))));
+    assert_eq!(sets(dragged), 1);
+    // Hover keys and Ctrl-scroll leave the slider to its focused button.
+    let keys = [
+        iced::keyboard::Event::ModifiersChanged(iced::keyboard::Modifiers::CTRL),
+        iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp),
+            modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp),
+            physical_key: iced::keyboard::key::Physical::Unidentified(
+                iced::keyboard::key::NativeCode::Unidentified,
+            ),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::CTRL,
+            text: None,
+            repeat: false,
+        },
+    ]
+    .map(iced::Event::Keyboard);
+    let wheel = iced::Event::Mouse(Mouse::WheelScrolled {
+        delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+    });
+    let hovered = slide(10_000.0, &[keys[0].clone(), keys[1].clone(), wheel], 0.5);
+    assert!(hovered.is_empty(), "{hovered:?}");
 }
 
 #[test]
@@ -556,7 +682,10 @@ fn the_next_capture_names_its_file_and_folder_apart() {
     if std::env::var_os("HOME").is_some_and(|home| !home.is_empty()) && !cfg!(windows) {
         assert!(folder.starts_with('~'), "{folder}");
     }
-    assert_eq!(split_preview("clip.png"), ("clip.png".into(), String::new()));
+    assert_eq!(
+        split_preview("clip.png"),
+        ("clip.png".into(), String::new())
+    );
     assert_eq!(split_preview("/clip.png"), ("clip.png".into(), "/".into()));
     assert_eq!(
         split_preview("C:\\captures\\clip.png"),
@@ -620,7 +749,10 @@ fn switching_to_a_stream_and_back_restores_the_recording_exactly() {
         "the same output sends the same command"
     );
     let saved = serde_json::to_string(&app.prefs()).unwrap();
-    assert!(!saved.contains("user:pass"), "a stashed URL never reaches the prefs");
+    assert!(
+        !saved.contains("user:pass"),
+        "a stashed URL never reaches the prefs"
+    );
     // Back to the stream: its URL returns.
     let _ = app.update(Message::ForwardMode(true));
     assert_eq!(app.forward_output, "rtsp://user:pass@host:8554/live");
@@ -641,6 +773,48 @@ fn recording_switched_to_first_starts_from_the_default_template() {
 }
 
 #[test]
+fn a_stream_url_being_retyped_stays_in_stream_mode() {
+    let renderer = destinations::layout_tests::renderer();
+    // A returning user whose saved output is a stream URL.
+    let saved = prefs::Prefs {
+        forward_output: "rtsp://127.0.0.1:8554/line-1".into(),
+        ..prefs::Prefs::default()
+    };
+    let mut relaunched = Workbench::new(
+        SessionHandle::new(),
+        "disclosures".into(),
+        true,
+        Some(saved),
+    );
+    relaunched.snapshot = app().snapshot.clone();
+    // And one who typed a URL into the File field.
+    let mut typed = app();
+    let _ = typed.update(Message::RecordPicker(destinations::Message::Output(
+        "rtsp://host/live".into(),
+    )));
+    for mut app in [relaunched, typed] {
+        assert!(app.forward_streams());
+        for value in ["", "192.", "192.168.1.10:8554/live", "mediamtx.local"] {
+            let _ = app.update(Message::RecordPicker(destinations::Message::Output(
+                value.into(),
+            )));
+            assert!(app.forward_streams(), "{value:?} switched to Record");
+            let video = snapshot(&app, Tab::Forward, &mut Tree::empty(), &renderer);
+            assert_eq!(named(&video, "Stream URL").1.value(), Some(value));
+        }
+        // Only the switch leaves Stream mode, and Undo takes it back.
+        let _ = app.update(Message::RecordPicker(destinations::Message::Output(
+            String::new(),
+        )));
+        let _ = app.update(Message::ForwardMode(false));
+        assert!(!app.forward_streams());
+        let _ = app.update(Message::Undo);
+        assert!(app.forward_streams(), "Undo restores the empty stream");
+        assert_eq!(app.forward_output, "");
+    }
+}
+
+#[test]
 fn a_stream_shows_one_url_field_and_nothing_about_files() {
     let renderer = destinations::layout_tests::renderer();
     let mut app = app();
@@ -650,8 +824,12 @@ fn a_stream_shows_one_url_field_and_nothing_about_files() {
     let video = snapshot(&app, Tab::Forward, &mut tree, &renderer);
     let field = named(&video, "Stream URL").1;
     assert_eq!(field.value(), Some("rtsp://127.0.0.1:8554/line-1"));
-    named(&video, "Start forwarding");
-    for absent in ["Save destination", "Storage & retention", "Maximum file size"] {
+    named(&video, "Start streaming");
+    for absent in [
+        "Save destination",
+        "Storage & retention",
+        "Maximum file size",
+    ] {
         assert!(!labels(&video).contains(&absent), "{absent} shows");
     }
     assert_eq!(
@@ -686,9 +864,18 @@ fn an_empty_output_asks_once_without_a_red_field() {
             "{:?}",
             labels(&video)
         );
-        assert!(named(&video, if stream { "Start forwarding" } else { "Start recording" })
+        assert!(
+            named(
+                &video,
+                if stream {
+                    "Start streaming"
+                } else {
+                    "Start recording"
+                }
+            )
             .1
-            .is_disabled());
+            .is_disabled()
+        );
     }
     // A wrong value says so once, at its field.
     let mut app = app();
@@ -699,7 +886,10 @@ fn an_empty_output_asks_once_without_a_red_field() {
         .unwrap_err()
         .to_string();
     assert_eq!(
-        labels(&video).iter().filter(|label| **label == error).count(),
+        labels(&video)
+            .iter()
+            .filter(|label| **label == error)
+            .count(),
         1,
         "{:?}",
         labels(&video)
@@ -717,7 +907,10 @@ fn a_capture_output_error_is_said_once() {
         .unwrap_err()
         .to_string();
     assert_eq!(
-        labels(&capture).iter().filter(|label| **label == error).count(),
+        labels(&capture)
+            .iter()
+            .filter(|label| **label == error)
+            .count(),
         1
     );
 }
@@ -730,11 +923,13 @@ fn the_default_recording_shows_where_it_saves_and_folds_its_field() {
     let mut tree = Tree::empty();
     let video = snapshot(&app, Tab::Forward, &mut tree, &renderer);
     assert!(!labels(&video).contains(&"File"), "the field waits folded");
-    let location = named(&video, "Change location or file name").1;
+    let location = named(&video, "Location & name").1;
     assert_eq!(location.is_expanded(), Some(false));
-    assert_eq!(
-        location.description(),
-        Some("Named by date, camera, time and number")
+    let summary = location.description().unwrap();
+    assert!(summary.starts_with("This computer · "), "{summary}");
+    assert!(
+        !summary.contains('{') && !summary.contains("####"),
+        "{summary}"
     );
     let now = chrono::Local::now();
     let (file, _) = split_preview(&app.preview_at(&app.forward_output, now));
@@ -752,8 +947,24 @@ fn the_default_recording_shows_where_it_saves_and_folds_its_field() {
         app.forward_output = output.into();
         let video = snapshot(&app, Tab::Forward, &mut Tree::empty(), &renderer);
         assert_eq!(named(&video, "File").1.value(), Some(output));
-        assert!(!app.prefs().open_sections.contains(&"record-location".into()));
+        assert!(
+            !app.prefs()
+                .open_sections
+                .contains(&"record-location".into())
+        );
     }
-    assert_eq!(pattern_summary("clip.mkv"), "Custom name");
-    assert_eq!(pattern_summary("{camera}.mkv"), "Named by camera");
+    // A chosen destination shows the field, view-only.
+    let mut app = super::disclosure_tests::app();
+    app.forward_output = prefs::default_record_output();
+    app.record_to.selected = Some("named destination".into());
+    let video = snapshot(&app, Tab::Forward, &mut Tree::empty(), &renderer);
+    assert_eq!(named(&video, "Location & name").1.is_expanded(), Some(true));
+    assert!(!labels(&video).iter().any(|l| l.starts_with("Saves as")));
+    assert!(
+        !app.prefs()
+            .open_sections
+            .contains(&"record-location".into())
+    );
+    app.forward_output = "clip.mkv".into();
+    assert_eq!(app.record_summary(), "This computer");
 }
