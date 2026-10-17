@@ -198,6 +198,15 @@ fn auto_path_opens_lazily_on_first_saved_file() {
     assert_eq!(slot.status_cached().unwrap().captures, 1);
     slot.close().unwrap();
     assert!(path.exists());
+    // Signal samples open it too.
+    let samples = dir.join("samples.duckdb");
+    slot.set_auto_path(Some(samples.clone()));
+    slot.write("signal:0001", &[]).unwrap();
+    assert!(!samples.exists());
+    slot.write("signal:0001", &[sample(1, "t", Signal::Number(1.0))])
+        .unwrap();
+    assert_eq!(slot.status_cached().unwrap().samples, 1);
+    slot.close().unwrap();
     let _ = fs::remove_dir_all(dir);
 }
 

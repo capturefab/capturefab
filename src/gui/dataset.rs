@@ -66,6 +66,19 @@ fn summary(status: Option<&DatasetStatus>) -> String {
     }
 }
 
+/// Start or stop cataloging into the automatic dataset, for captures and
+/// signal samples alike, while no dataset is open.
+fn auto_catalog(handle: &SessionHandle, on: bool) {
+    let slot = handle.dataset();
+    slot.set_auto_path(on.then(auto_path));
+    let sink: Option<Arc<dyn crate::signals::SampleSink>> = on.then(|| slot.clone() as _);
+    if on != handle.signals().has_sink()
+        && let Err(error) = handle.signals().set_sink(sink, Duration::from_secs(10))
+    {
+        eprintln!("capturefab: signal samples will not reach the automatic dataset: {error:#}");
+    }
+}
+
 impl DatasetUi {
     /// Restore the remembered dataset and the automatic one. Without saved
     /// preferences (tests, screenshots) nothing is opened or created.
@@ -104,7 +117,7 @@ impl DatasetUi {
             }
         }
         if handle.dataset().status_cached().is_none() && ui.auto {
-            handle.dataset().set_auto_path(Some(auto_path()));
+            auto_catalog(handle, true);
         }
         ui
     }
@@ -241,8 +254,9 @@ impl Workbench {
             }
             Msg::Auto(on) => {
                 self.dataset.auto = on;
-                let slot = self.handle.dataset();
-                slot.set_auto_path((on && slot.status_cached().is_none()).then(auto_path));
+                if self.handle.dataset().status_cached().is_none() {
+                    auto_catalog(&self.handle, on);
+                }
             }
         }
         Task::none()

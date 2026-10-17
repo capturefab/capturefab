@@ -430,11 +430,12 @@ impl crate::signals::SampleSink for Slot {
         source: &crate::signals::SignalInfo,
         tags: &[crate::signals::TagInfo],
     ) -> Result<()> {
-        self.with_open(false, |d| d.register(source, tags))
+        // Signals open the GUI's automatic dataset just as captures do.
+        self.with_open(true, |d| d.register(source, tags))
             .unwrap_or(Ok(()))
     }
     fn write(&self, source_id: &str, batch: &[crate::signals::Sample]) -> Result<()> {
-        self.with_open(false, |d| {
+        self.with_open(!batch.is_empty(), |d| {
             let written = d.append_samples(source_id, batch);
             if written.is_err() {
                 d.status.dropped_samples += batch.len() as u64;
