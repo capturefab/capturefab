@@ -1166,6 +1166,7 @@ dependencies = [
  "tokio",
  "turbojpeg",
  "unicode-segmentation",
+ "unicode-width",
  "ureq",
  "windows 0.61.3",
  "windows-sys 0.61.2",
