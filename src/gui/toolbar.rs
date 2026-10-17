@@ -13,6 +13,8 @@ mod responsive_layout_tests;
 const STATUS: f32 = 420.0;
 /// Keep the widest Capture label readable, including in the overview.
 const CAPTURE_ROOM: f32 = 160.0;
+/// What the overview's Capture button may add to name its camera.
+const CAPTURE_NAME_ROOM: f32 = 100.0;
 /// Room the Record button and the gap before it take.
 const RECORD_ROOM: f32 = 96.0;
 /// Room the elapsed-time pill beside a recording's Stop button takes.
@@ -33,6 +35,62 @@ const NOTICE_GLYPH: f32 = 13.0 + 6.0;
 const NOTICE_DETAILS: f32 = 52.0 + 4.0;
 /// Room a notice's dismiss button and the gap before it take.
 const NOTICE_DISMISS: f32 = 21.0 + 2.0;
+
+/// The capture root as the toolbar shows it: the home folder folded to `~`,
+/// the way `Workbench::output_preview` folds it.
+fn shown_root() -> String {
+    let root = prefs::capture_root();
+    match root.parent().zip(root.file_name()) {
+        Some((home, name)) if !home.as_os_str().is_empty() => {
+            format!("~{}{}", std::path::MAIN_SEPARATOR, name.to_string_lossy())
+        }
+        _ => root.to_string_lossy().into_owned(),
+    }
+}
+
+/// Where the next capture goes, in a few plain words, for the toolbar: the
+/// destination's name and the first folder of the file it writes, else
+/// the folder of `preview` (a path with home folded to `~`), else `root`
+/// for a bare file name. The full next file name is in its tooltip.
+fn save_summary(preview: &str, destination: Option<&str>, root: &str) -> String {
+    let separators = ['/', '\\'];
+    let parent = preview
+        .rfind(separators)
+        .map(|end| &preview[..end])
+        .filter(|parent| !parent.is_empty());
+    match destination {
+        Some(name) => {
+            let first =
+                parent.and_then(|parent| parent.split(separators).find(|part| !part.is_empty()));
+            match first {
+                Some(folder) => format!("Saves to {name} · {folder}"),
+                None => format!("Saves to {name}"),
+            }
+        }
+        None => format!("Saves to {}", parent.unwrap_or(root)),
+    }
+}
+
+/// Whether a link's transport counters say something worth reading at a
+/// glance: notes, resent packets or lost frames. Clean counters wait in a
+/// tooltip.
+fn transport_inline(stats: &TransportStats) -> bool {
+    !stats.notes.is_empty() || stats.resend_requested > 0 || format::transport_loss(stats) > 0
+}
+
+/// The overview Capture button's label: what it captures from, by the
+/// outlined camera's model, or what tells it from a twin of the same model.
+fn overview_capture_label(
+    cameras: &[crate::session::CameraSnapshot],
+    connected: Option<&CameraInfo>,
+    scanner: bool,
+) -> String {
+    let Some(camera) = connected else {
+        return "Capture selected".into();
+    };
+    let short = twin_identity(cameras, camera).unwrap_or_else(|| camera.model.clone());
+    format!("{} {short}", if scanner { "Scan" } else { "Capture" })
+}
 
 /// `style` with its text and fill faded by `alpha`, for controls that come
 /// and go with a notice.
@@ -62,13 +120,18 @@ impl Workbench {
         if capture {
             let preview = self.output_preview();
             let destination: Element<'_, Message> = if fit.destination_label {
-                one_line(
-                    self.capture_to.label(&preview),
-                    style::SMALL,
-                    style::SANS,
-                    p.secondary,
-                )
-                .yield_room()
+                row![
+                    icon(Icon::Folder, 14.0, p.secondary),
+                    one_line(
+                        save_summary(&preview, self.capture_to.selected.as_deref(), &shown_root()),
+                        style::SMALL,
+                        style::SANS,
+                        p.secondary,
+                    )
+                    .yield_room(),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center)
                 .into()
             } else {
                 icon(Icon::Folder, 16.0, p.secondary)
@@ -88,7 +151,7 @@ impl Workbench {
                     .on_press(Message::ShowTab(Tab::Capture)),
                 Action::CaptureTab.hint(
                     &format!(
-                        "Where the next capture is saved: {}",
+                        "Next file: {} · change it in Capture",
                         self.capture_to.label(&preview)
                     ),
                     os,
@@ -230,8 +293,13 @@ impl Workbench {
         let analytics_label = main >= 520.0;
         let destination_label = main >= 700.0;
         let record = capture && self.record_shown();
+        let named = if self.overview() && self.snapshot.connected.is_some() {
+            CAPTURE_NAME_ROOM
+        } else {
+            0.0
+        };
         let capture_room = if capture {
-            CAPTURE_ROOM + 8.0 + if destination_label { 120.0 } else { 28.0 }
+            CAPTURE_ROOM + named + 8.0 + if destination_label { 120.0 } else { 28.0 }
         } else {
             0.0
         } + if record {
@@ -270,13 +338,19 @@ impl Workbench {
         // This user's pending capture is per camera. Other participants can
         // keep capturing while this button queues the user's own request.
         let saved = !capturing && self.just_saved(self.snapshot.active_camera.as_deref());
-        let (glyph, label): (Element<'_, Message>, _) = if capturing {
+        // In the overview, an idle button names the outlined camera.
+        let outlined = self
+            .snapshot
+            .connected
+            .as_ref()
+            .filter(|_| self.overview() && !capturing && !saved);
+        let (glyph, label): (Element<'_, Message>, String) = if capturing {
             (
                 icon::spinner(14.0, p.secondary, self.spin()),
-                if scanner { "Scanning…" } else { "Saving…" },
+                if scanner { "Scanning…" } else { "Saving…" }.into(),
             )
         } else if saved {
-            (icon(Icon::Check, 14.0, p.ink(p.live)), "Saved")
+            (icon(Icon::Check, 14.0, p.ink(p.live)), "Saved".into())
         } else {
             (
                 icon(
@@ -285,21 +359,46 @@ impl Workbench {
                     if connected { p.text } else { p.tertiary },
                 ),
                 if self.overview() {
-                    "Capture selected"
+                    overview_capture_label(
+                        &self.snapshot.cameras,
+                        self.snapshot.connected.as_ref(),
+                        scanner,
+                    )
                 } else if scanner {
-                    "Scan"
+                    "Scan".into()
                 } else {
-                    "Capture"
+                    "Capture".into()
                 },
             )
         };
+        let name = match outlined {
+            Some(camera) => format!("Capture from {} {}", camera.model, identity(camera)),
+            None => label.clone(),
+        };
         tip_above(
             button(
-                row![glyph, text(label).size(style::BODY)]
-                    .spacing(7)
-                    .align_y(Alignment::Center),
+                row![
+                    glyph,
+                    container(
+                        // As the button's style inks it: dimmed only while
+                        // disabled, not while saving.
+                        one_line(
+                            label,
+                            style::BODY,
+                            style::SANS,
+                            if capturing || (connected && problem.is_none()) {
+                                p.text
+                            } else {
+                                p.secondary
+                            },
+                        )
+                    )
+                    .max_width(CAPTURE_ROOM + CAPTURE_NAME_ROOM)
+                ]
+                .spacing(7)
+                .align_y(Alignment::Center),
             )
-            .name(label)
+            .name(name)
             .padding([6, 12])
             // Ignoring presses while saving would otherwise read as disabled.
             .style(move |theme, status| {
@@ -319,6 +418,11 @@ impl Workbench {
                 "Select a camera to capture from".to_owned()
             } else if let Some(problem) = problem {
                 problem.to_string()
+            } else if outlined.is_some() {
+                Action::Capture.hint(
+                    "Save from the outlined camera using the settings in Capture",
+                    os,
+                )
             } else {
                 Action::Capture.hint("Save using the settings in Capture", os)
             },
@@ -562,6 +666,19 @@ impl Workbench {
                 .wrapping(text::Wrapping::None)
         ]
         .spacing(10);
+        if let Some(stats) = snapshot.transport.as_ref().filter(|s| !transport_inline(s)) {
+            // Clean counters: the link alone, with them in its tooltip.
+            return tip_above(
+                text(format!("{} · {}", camera.transport, identity(camera)))
+                    .size(style::SMALL)
+                    .color(p.secondary)
+                    .wrapping(text::Wrapping::None),
+                format!(
+                    "{}\nPacket size · resent packets recovered/requested · incomplete or missing frames",
+                    transport_text(stats)
+                ),
+            );
+        }
         if let Some(stats) = &snapshot.transport {
             parts = parts.push(tip_above(
                 text(transport_text(stats))
@@ -980,6 +1097,127 @@ mod tests {
         bench.sidebar_open = false;
         assert!(!bench.shown_in_place(&discovery));
         assert!(!bench.shown_in_place(&Pending::unanswered(Job::Set("Gain".into()))));
+    }
+
+    #[test]
+    fn the_save_summary_says_where_in_plain_words() {
+        let root = "~/Capturefab";
+        // The default: a dated folder under the capture root, home folded.
+        assert_eq!(
+            save_summary("~/Capturefab/2026-10-17/cam-####.png", None, root),
+            "Saves to ~/Capturefab/2026-10-17"
+        );
+        assert_eq!(
+            save_summary("/mnt/data/runs/cam-####.png", None, root),
+            "Saves to /mnt/data/runs"
+        );
+        // A bare file name goes to the capture root.
+        assert_eq!(
+            save_summary("cam-####.png", None, root),
+            "Saves to ~/Capturefab"
+        );
+        // A named destination, with the first folder of its relative name.
+        assert_eq!(
+            save_summary("cam-####.png", Some("Lab NAS"), root),
+            "Saves to Lab NAS"
+        );
+        assert_eq!(
+            save_summary("2026-10-17/line/cam-####.png", Some("bucket"), root),
+            "Saves to bucket · 2026-10-17"
+        );
+        // Windows separators.
+        assert_eq!(
+            save_summary(
+                r"~\Capturefab\2026-10-17\cam-####.png",
+                None,
+                r"~\Capturefab"
+            ),
+            r"Saves to ~\Capturefab\2026-10-17"
+        );
+        assert_eq!(
+            save_summary(r"C:\Captures\cam-####.png", None, root),
+            r"Saves to C:\Captures"
+        );
+        assert_eq!(
+            save_summary(r"day\cam-####.png", Some("share"), root),
+            "Saves to share · day"
+        );
+        // Never a sequence number: that is the tooltip's, as ####.
+        assert!(!save_summary("cam-####.png", None, root).contains('#'));
+    }
+
+    #[test]
+    fn the_capture_root_is_shown_with_home_folded() {
+        let root = shown_root();
+        let real = prefs::capture_root();
+        if real
+            .parent()
+            .is_some_and(|home| !home.as_os_str().is_empty())
+        {
+            assert_eq!(root, format!("~{}Capturefab", std::path::MAIN_SEPARATOR));
+        } else {
+            assert_eq!(root, "Capturefab");
+        }
+    }
+
+    #[test]
+    fn clean_transport_counters_wait_in_a_tooltip() {
+        let clean = TransportStats {
+            packet_size: Some(8192),
+            packets_received: 10_000,
+            ..TransportStats::default()
+        };
+        assert!(!transport_inline(&clean));
+        let noted = TransportStats {
+            notes: vec!["packet size is above the link's MTU".into()],
+            ..clean.clone()
+        };
+        assert!(transport_inline(&noted));
+        let resent = TransportStats {
+            resend_requested: 3,
+            resend_recovered: 3,
+            ..clean.clone()
+        };
+        assert!(transport_inline(&resent));
+        let lost = TransportStats {
+            lost_frames: 1,
+            ..clean.clone()
+        };
+        assert!(transport_inline(&lost));
+        let incomplete = TransportStats {
+            incomplete_frames: 2,
+            ..clean
+        };
+        assert!(transport_inline(&incomplete));
+    }
+
+    #[test]
+    fn the_overview_capture_button_names_its_camera() {
+        let first = liveness::streaming_camera(0, 0, 0.0);
+        let mut twin = first.clone();
+        twin.info.id = "sim:1".into();
+        twin.info.serial = "SIM1".into();
+        let cameras = vec![first.clone(), twin.clone()];
+        assert_eq!(
+            overview_capture_label(&cameras, Some(&twin.info), false),
+            "Capture S/N SIM1"
+        );
+        assert_eq!(
+            overview_capture_label(&cameras, Some(&twin.info), true),
+            "Scan S/N SIM1"
+        );
+        // Distinct models carry the model.
+        let mut other = twin.clone();
+        other.info.model = "Line camera".into();
+        let cameras = vec![first, other.clone()];
+        assert_eq!(
+            overview_capture_label(&cameras, Some(&other.info), false),
+            "Capture Line camera"
+        );
+        assert_eq!(
+            overview_capture_label(&cameras, None, false),
+            "Capture selected"
+        );
     }
 
     #[test]
