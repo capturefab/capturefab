@@ -1426,14 +1426,14 @@ impl StorageWriter {
         // Hash before taking the lock, so that reading back a long recording
         // does not hold up other processes' saves. Under the lock, the same
         // identity, length and time show that nothing touched it since.
-        let disappeared = || anyhow!("capture output disappeared: {}", self.path.display());
+        let disappeared = || format!("capture output disappeared: {}", self.path.display());
         let changed = || {
             anyhow!(
                 "capture output changed externally; preserving {} without enabling retention deletion",
                 self.path.display()
             )
         };
-        let hashed = fs::symlink_metadata(&self.path).map_err(|_| disappeared())?;
+        let hashed = fs::symlink_metadata(&self.path).with_context(disappeared)?;
         ensure!(self.ours(&hashed, None), changed());
         let hash = self.sha256();
         ensure!(
@@ -1449,7 +1449,7 @@ impl StorageWriter {
             .position(|entry| entry.id == self.id)
             .ok_or_else(|| anyhow!("capture reservation disappeared from storage ledger"))?;
         let meta = current_meta(&locked.ledger.entries[index], &mut HashSet::new())?
-            .ok_or_else(disappeared)?;
+            .ok_or_else(|| anyhow!(disappeared()))?;
         ensure!(self.ours(&meta, Some(&hashed)), changed());
         let entry = locked.entry_mut(index);
         entry.bytes = self.written;
@@ -2539,11 +2539,13 @@ mod tests {
         populate(&manager, &temp, 2_000);
         let mut locked = manager.lock().unwrap();
         let base = fs::canonicalize(&temp.0).unwrap();
+        // A lowered file limit leaves 1,901 files to remove for this save.
         locked
-            .make_room(&policy(1 << 30, 2_000, "delete-oldest"), 1, &base)
+            .make_room(&policy(1 << 30, 100, "delete-oldest"), 1, &base)
             .unwrap();
-        assert_eq!(locked.ledger.entries.len(), 1_999);
+        assert_eq!(locked.ledger.entries.len(), 99);
         assert_eq!(locked.commits, 1);
+        assert!(!temp.path("filler-1900").exists() && temp.path("filler-1901").exists());
         // An age limit removes at most a batch per save while there is room.
         for index in 0..locked.ledger.entries.len() {
             locked.entry_mut(index).created = now() - 100;
@@ -2553,9 +2555,8 @@ mod tests {
         policy.max_age_seconds = Some(10);
         locked.commits = 0;
         locked.make_room(&policy, 1, &base).unwrap();
-        assert_eq!(locked.ledger.entries.len(), 1_999 - EXPIRED_BATCH);
+        assert_eq!(locked.ledger.entries.len(), 99 - EXPIRED_BATCH);
         assert_eq!(locked.commits, 1);
-        assert!(!temp.path("filler-0").exists());
     }
     #[test]
     fn finishing_a_recording_reads_it_back_without_holding_the_lock() {
