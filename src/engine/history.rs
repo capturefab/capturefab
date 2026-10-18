@@ -233,24 +233,46 @@ fn addresses(camera: &mut Camera, feature: &str, all_banks: bool) -> Result<Vec<
     Ok(addresses)
 }
 
+/// Read the configuration values a command may change. The names come from
+/// the last feature walk, which every edit ends with, so an edit does not
+/// walk every feature again; the values are read now.
 fn capture(
+    h: &WorkerHandle,
     camera: &mut Camera,
     auto: &Option<AutoController>,
     feature: Option<&str>,
 ) -> Result<Configuration> {
     let all = feature.is_none();
-    let mut names = camera
-        .features()
+    let mut walked = h
+        .state
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .features
+        .iter()
+        .filter(|feature| feature.value.is_some())
+        .map(|feature| feature.name.clone())
+        .collect::<Vec<_>>();
+    if walked.is_empty() {
+        walked = camera
+            .features()
+            .into_iter()
+            .filter(|feature| feature.value.is_some())
+            .map(|feature| feature.name)
+            .collect();
+    }
+    let mut names = walked
         .into_iter()
-        .filter(|feature| feature.value.is_some() && camera.is_configuration_value(&feature.name))
-        .map(|feature| feature.name)
+        .filter(|name| camera.is_configuration_value(name))
         .collect::<BTreeSet<_>>();
+    // These must be read. Any other name the walk read and the camera no
+    // longer can is left out, as a new walk would leave it out.
+    let mut required = BTreeSet::new();
     if let Some(feature) = feature {
-        names.insert(feature.into());
+        required.insert(feature.to_owned());
     }
     if all {
         if let Some(controller) = auto {
-            names.extend(controller.status().managed.iter().cloned());
+            required.extend(controller.status().managed.iter().cloned());
         }
         // Firmware may lock the numeric features while auto is running.
         // They still have readable originals and must be included when a
@@ -268,20 +290,32 @@ fn capture(
             "GainSelector",
         ] {
             if camera.has(name) && camera.get(name).is_ok() {
-                names.insert(name.into());
+                required.insert(name.to_owned());
             }
         }
     }
+    names.extend(required.iter().cloned());
     let mut values = BTreeMap::new();
     for name in names {
         // Auto can change every gain/white-balance bank. Other selectors stay
         // at their current bank, avoiding intrusive enumeration of unrelated
         // device settings just to checkpoint one control.
         let all_banks = all && matches!(name.as_str(), "Gain" | "GainAbs" | "BalanceRatio");
-        for address in addresses(camera, &name, all_banks)? {
-            let value = addressed(camera, &address, |camera| camera.get(&name))
-                .with_context(|| format!("read {name} for undo"))?;
-            values.insert(address, value);
+        let read = (|| -> Result<Vec<(Address, Value)>> {
+            let mut read = Vec::new();
+            for address in addresses(camera, &name, all_banks)? {
+                let value = addressed(camera, &address, |camera| camera.get(&name))
+                    .with_context(|| format!("read {name} for undo"))?;
+                read.push((address, value));
+            }
+            Ok(read)
+        })();
+        match read {
+            Ok(read) => values.extend(read),
+            // Reading the current bank switches no selector, so its failure
+            // leaves the camera as it was.
+            Err(_) if !all_banks && !required.contains(&name) => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(Configuration {
@@ -429,8 +463,16 @@ fn restore(
     Ok(())
 }
 
-fn publish(h: &WorkerHandle, camera: &mut Option<Camera>, auto: &Option<AutoController>) {
-    refresh(h, camera, true);
+/// Publish the camera after a change. `features` walks every feature again;
+/// a command that ended with its own walk, or only started or stopped the
+/// stream, passes false.
+fn publish(
+    h: &WorkerHandle,
+    camera: &mut Option<Camera>,
+    auto: &Option<AutoController>,
+    features: bool,
+) {
+    refresh(h, camera, features);
     if let Some(controller) = auto {
         publish_auto(h, controller);
     } else {
@@ -569,7 +611,7 @@ fn replay(
             let all_fields = wanted.values.keys().cloned().collect::<Vec<_>>();
             if let Err(error) = restore(c, auto, &wanted, &all_fields, switch_auto) {
                 let rollback_result = restore(c, auto, &rollback, &all_fields, switch_auto);
-                publish(h, camera, auto);
+                publish(h, camera, auto, true);
                 return match rollback_result {
                     Ok(()) => {
                         Err(error.context("undo/redo failed; previous camera state restored"))
@@ -592,7 +634,7 @@ fn replay(
         entry.last_changed_at_us = now_us();
         journal.status()
     };
-    publish(h, camera, auto);
+    publish(h, camera, auto, true);
     h.log(
         "info",
         format!("{} {}", if undo { "Undid" } else { "Redid" }, change.label),
@@ -686,7 +728,7 @@ pub(super) fn process(
     let before = if stream {
         None
     } else {
-        match capture(c, auto, feature) {
+        match capture(h, c, auto, feature) {
             Ok(before) => Some(before),
             Err(error) => {
                 // A write-only control is still useful. Its previous state
@@ -734,7 +776,7 @@ pub(super) fn process(
                 let fields = before.values.keys().cloned().collect::<Vec<_>>();
                 let switch_auto = auto_policy(&before.auto) != auto_policy(auto);
                 let rollback = restore(camera_mut(camera)?, auto, before, &fields, switch_auto);
-                publish(h, camera, auto);
+                publish(h, camera, auto, true);
                 if let Err(rollback_error) = rollback {
                     return Err(
                         error.context(format!("failed command rollback: {rollback_error:#}"))
@@ -758,7 +800,7 @@ pub(super) fn process(
                 let fields = before.values.keys().cloned().collect::<Vec<_>>();
                 let switch_auto = auto_policy(&before.auto) != auto_policy(auto);
                 let rollback = restore(camera_mut(camera)?, auto, &before, &fields, switch_auto);
-                publish(h, camera, auto);
+                publish(h, camera, auto, true);
                 return match rollback {
                     Ok(()) => Err(error.context("change could not be acknowledged accurately; previous camera state restored")),
                     Err(rollback_error) => Err(error.context(format!("checkpoint read failed and rollback failed: {rollback_error:#}"))),
@@ -791,8 +833,11 @@ pub(super) fn process(
             feature,
             checkpoint,
         );
-        publish(h, camera, auto);
-        result["history"] = serde_json::to_value(&h.snapshot().history)?;
+        // The command already walked the features, or only moved the stream,
+        // and the checkpoint since only read values.
+        publish(h, camera, auto, false);
+        result["history"] =
+            serde_json::to_value(&h.state.read().unwrap_or_else(|e| e.into_inner()).history)?;
     }
     Ok(result)
 }
@@ -1357,6 +1402,124 @@ mod tests {
         assert!(format!("{error:#}").contains("previous camera state restored"));
         assert_eq!(coupled_values(&state), (640, 100));
         assert_eq!(h.snapshot().history, CameraHistoryStatus::default());
+        h.shutdown();
+    }
+
+    /// The simulator with two registers only a full feature walk reads:
+    /// Gain's maximum, which counts walks, and a lock on Width that holds
+    /// while the camera streams.
+    struct Walked {
+        simulator: crate::transport::simulator::Simulator,
+        walks: Arc<AtomicU64>,
+        streaming: bool,
+    }
+    const GAIN_MAX: u64 = 0x1f0;
+    const LOCKED: u64 = 0x1f8;
+    impl crate::types::RegisterIo for Walked {
+        fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
+            match address {
+                GAIN_MAX => {
+                    self.walks.fetch_add(1, Ordering::Relaxed);
+                    Ok(24f64.to_le_bytes().to_vec())
+                }
+                LOCKED => Ok(u32::from(self.streaming).to_le_bytes().to_vec()),
+                _ => self.simulator.read_memory(address, length),
+            }
+        }
+        fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
+            self.simulator.write_memory(address, data)
+        }
+    }
+    impl crate::types::Backend for Walked {
+        fn xml(&mut self) -> Result<String> {
+            let registers = concat!(
+                "<FloatReg Name='GainMax'><Address>0x1f0</Address><Length>8</Length><AccessMode>RO</AccessMode><Endianess>LittleEndian</Endianess></FloatReg>",
+                "<IntReg Name='Locked'><Address>0x1f8</Address><Length>4</Length><AccessMode>RO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>",
+                "</RegisterDescription>"
+            );
+            Ok(self
+                .simulator
+                .xml()?
+                .replace("<Max>24</Max>", "<pMax>GainMax</pMax>")
+                .replace(
+                    "<pValue>WidthReg</pValue>",
+                    "<pIsLocked>Locked</pIsLocked><pValue>WidthReg</pValue>",
+                )
+                .replace("</RegisterDescription>", registers))
+        }
+        fn start(&mut self, payload: usize) -> Result<()> {
+            self.streaming = true;
+            self.simulator.start(payload)
+        }
+        fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
+            self.simulator.next_frame(timeout)
+        }
+        fn stop(&mut self) -> Result<()> {
+            self.streaming = false;
+            self.simulator.stop()
+        }
+    }
+
+    #[test]
+    fn an_edit_walks_the_features_once_and_starting_walks_none() {
+        let walks = Arc::new(AtomicU64::new(0));
+        let h = WorkerHandle::new();
+        let mut camera = Some(
+            Camera::from_backend(
+                crate::transport::simulator::info(),
+                Box::new(Walked {
+                    simulator: Default::default(),
+                    walks: walks.clone(),
+                    streaming: false,
+                }),
+            )
+            .unwrap(),
+        );
+        // Connecting walks the features once.
+        refresh(&h, &mut camera, true);
+        let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
+        let (mut next, mut scheduled) = (1, false);
+        let mut walked = |camera: &mut Option<Camera>, command| {
+            let before = walks.load(Ordering::Relaxed);
+            let result = process(
+                &h,
+                camera,
+                &mut forwarder,
+                &mut auto,
+                &mut jobs,
+                &mut next,
+                &mut scheduled,
+                command,
+            )
+            .unwrap();
+            (walks.load(Ordering::Relaxed) - before, result)
+        };
+        let set = |feature: &str, value: &str| SessionCommand::Set {
+            feature: feature.into(),
+            value: value.into(),
+        };
+        let (count, result) = walked(&mut camera, set("Width", "128"));
+        assert_eq!(count, 1);
+        assert!(result["camera_change"]["token"].is_string());
+        assert_eq!(result["history"]["undo"], "Set Width");
+        assert_eq!(walked(&mut camera, SessionCommand::Start).0, 0);
+        let writable = |h: &WorkerHandle, name: &str| {
+            h.snapshot()
+                .features
+                .iter()
+                .find(|feature| feature.name == name)
+                .unwrap()
+                .writable
+        };
+        // A walk while streaming sees Width locked; stopping unlocks it
+        // without another walk.
+        assert_eq!(walked(&mut camera, set("ExposureTime", "5000")).0, 1);
+        assert!(!writable(&h, "Width"));
+        assert_eq!(walked(&mut camera, SessionCommand::Stop).0, 0);
+        assert!(writable(&h, "Width"));
+        // Undo still reads every value it restores, and walks once.
+        assert_eq!(walked(&mut camera, SessionCommand::Undo).0, 1);
+        assert!(camera.as_ref().unwrap().is_streaming());
         h.shutdown();
     }
 }

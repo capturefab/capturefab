@@ -1,5 +1,6 @@
 //! Text formatting for values, statistics and addresses.
 use super::*;
+pub(super) use crate::camera::stream_locked;
 
 pub(super) fn feature_value(feature: &FeatureInfo) -> String {
     feature
@@ -221,24 +222,6 @@ pub(super) fn range_text(feature: &FeatureInfo) -> String {
         Some(unit) => format!("{range} {unit}"),
         None => range,
     }
-}
-
-/// Features a camera cannot change while it streams: the image's geometry
-/// and format.
-pub(super) fn stream_locked(name: &str) -> bool {
-    matches!(
-        name,
-        "Width"
-            | "Height"
-            | "OffsetX"
-            | "OffsetY"
-            | "PixelFormat"
-            | "BinningHorizontal"
-            | "BinningVertical"
-            | "DecimationHorizontal"
-            | "DecimationVertical"
-            | "VideoMode"
-    )
 }
 
 /// Where a feature sorts within its group: in the order a camera is set up,

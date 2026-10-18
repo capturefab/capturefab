@@ -360,6 +360,35 @@ fn refresh(h: &WorkerHandle, camera: &mut Option<Camera>, features: bool) {
         s.features.clear();
     }
 }
+/// Stopping unlocks the image geometry and format: read whether those
+/// features are writable again, without walking every feature.
+fn unlock_features(h: &WorkerHandle, camera: &mut Option<Camera>) {
+    let Some(c) = camera.as_mut() else {
+        return;
+    };
+    let names = h
+        .state
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .features
+        .iter()
+        .filter(|feature| crate::camera::stream_locked(&feature.name))
+        .map(|feature| feature.name.clone())
+        .collect::<Vec<_>>();
+    let writable = names
+        .into_iter()
+        .map(|name| {
+            let writable = c.is_writable(&name);
+            (name, writable)
+        })
+        .collect::<Vec<_>>();
+    let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
+    for (name, writable) in writable {
+        if let Some(feature) = s.features.iter_mut().find(|f| f.name == name) {
+            feature.writable = writable;
+        }
+    }
+}
 fn release_auto(
     h: &WorkerHandle,
     auto: &mut Option<AutoController>,
@@ -1140,6 +1169,7 @@ fn process_plain(
             let forward_result = stop_forward(h, forwarder, auto);
             let camera_result = camera_mut(camera)?.stop();
             refresh(h, camera, false);
+            unlock_features(h, camera);
             forward_result?;
             camera_result?;
             h.log("info", "Acquisition stopped".into());
