@@ -740,8 +740,11 @@ impl Workbench {
                 style::mix(p.accent_text, on, tint),
                 reveal,
             );
-            status = status.push(match phase {
-                Phase::Waiting(silent) => tip(pill, silence(silent)),
+            status = status.push(match (phase, self.preview_figure(id)) {
+                (Phase::Waiting(silent), _) => tip(pill, silence(silent)),
+                (Phase::Streaming, Some(figure)) => {
+                    tip(pill, format!("{figure}. {}", self.preview_about()))
+                }
                 _ => pill,
             });
         }

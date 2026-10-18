@@ -7,7 +7,8 @@
 //! `Flashes` field joins a `registry!` list: the workbench's below, or the
 //! one beside an area's own state in its file. That is what keeps redraws
 //! running while something moves and stops them once it settles. Reduce
-//! Motion keeps fades and snaps movement.
+//! Motion keeps fades and snaps movement; efficiency mode snaps both, and
+//! acknowledgements fade only as fast as other updates redraw them.
 use super::*;
 use iced::animation::Easing;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -24,6 +25,10 @@ pub(super) const CONTROLS_IN: Duration = Duration::from_millis(140);
 pub(super) const CONTROLS_OUT: Duration = Duration::from_millis(300);
 /// How long the stage controls stay after the pointer last moved.
 pub(super) const CONTROLS_IDLE: Duration = Duration::from_secs(2);
+/// How long after waking the stage controls further pointer moves go
+/// unheard. A rebuild, a tick at the latest, hears them again well inside
+/// `CONTROLS_IDLE`, so the controls never hide under a moving pointer.
+const POINTER_DEAF: Duration = Duration::from_millis(500);
 pub(super) const HOVER: Duration = Duration::from_millis(120);
 pub(super) const HOVER_OUT: Duration = Duration::from_millis(80);
 pub(super) const RING: Duration = Duration::from_millis(160);
@@ -162,9 +167,9 @@ pub(super) fn always_show_scrollbars() -> bool {
 }
 
 /// How far content still sits below its resting place as `shown` goes from
-/// 0 to 1; nothing under Reduce Motion.
+/// 0 to 1; nothing under Reduce Motion or in efficiency mode.
 pub(super) fn rise(by: f32, shown: f32) -> f32 {
-    if reduce_motion() {
+    if reduce_motion() || performance::efficient() {
         0.0
     } else {
         by * (1.0 - shown)
@@ -242,7 +247,7 @@ impl Motion {
     }
 
     fn value(&self, now: Instant, reduced: bool) -> f32 {
-        if reduced && self.kind == Kind::Move {
+        if self.snaps(reduced) {
             self.target()
         } else {
             self.animation.interpolate_with(|value| value, now)
@@ -264,7 +269,13 @@ impl Motion {
     }
 
     fn active(&self, now: Instant, reduced: bool) -> bool {
-        !(reduced && self.kind == Kind::Move) && self.animation.is_animating(now)
+        !self.snaps(reduced) && self.animation.is_animating(now)
+    }
+
+    /// Whether it jumps to its target: movement under Reduce Motion, and
+    /// every motion in efficiency mode, which saves the redraws.
+    fn snaps(&self, reduced: bool) -> bool {
+        reduced && self.kind == Kind::Move || performance::efficient()
     }
 
     /// The longest any change can take.
@@ -275,7 +286,7 @@ impl Motion {
 
     /// How long going from `from` to `to` takes.
     fn span(&self, from: f32, to: f32, reduce: bool) -> Duration {
-        if reduce && self.kind == Kind::Move {
+        if self.snaps(reduce) {
             return Duration::ZERO;
         }
         let base = if to > from { self.enter } else { self.exit };
@@ -326,11 +337,14 @@ impl<K: Eq + Hash> Flashes<K> {
         self.at.is_empty()
     }
 
-    /// Whether any hit is still fading.
+    /// Whether any hit is still fading, which keeps redraws coming; in
+    /// efficiency mode other updates redraw it often enough.
     pub(super) fn animating(&self, now: Instant) -> bool {
-        self.at
-            .values()
-            .any(|at| now.saturating_duration_since(*at) < self.duration)
+        !performance::efficient()
+            && self
+                .at
+                .values()
+                .any(|at| now.saturating_duration_since(*at) < self.duration)
     }
 
     /// Forget hits that have faded. Hits set in the future, for a staggered
@@ -501,6 +515,14 @@ impl Workbench {
         self.pointer_moved = Some(self.now);
     }
 
+    /// Whether the stage hears the pointer move: not just after it woke
+    /// the controls, so a moving pointer rebuilds the window a few times a
+    /// second rather than with every move.
+    pub(super) fn pointer_heard(&self) -> bool {
+        self.pointer_moved
+            .is_none_or(|moved| self.now.saturating_duration_since(moved) >= POINTER_DEAF)
+    }
+
     /// How selected camera `id` reads, from 0 to 1: the selection draws in
     /// on the newly selected camera as it fades from the one before, in step
     /// with the overview's ring. For the tile ring, sidebar rows and the
@@ -581,6 +603,21 @@ mod tests {
     }
 
     #[test]
+    fn a_moving_pointer_keeps_the_controls_up_with_few_messages() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        let start = bench.now;
+        assert!(bench.pointer_heard());
+        bench.wake_controls();
+        assert!(!bench.pointer_heard(), "the next moves are not needed");
+        // Ticks rebuild the view at least once a second: by then it hears
+        // the pointer again, long before the controls would hide.
+        bench.now = start + POINTER_DEAF;
+        assert!(bench.pointer_heard());
+        assert!(POINTER_DEAF + Duration::from_secs(1) < CONTROLS_IDLE);
+        assert!(controls_wanted(bench.pointer_moved, bench.now, false));
+    }
+
+    #[test]
     fn motion_eases_in_and_out_with_its_own_timings() {
         let start = Instant::now();
         let mut motion = Motion::new(0.0, ms(200), ms(100), Kind::Fade);
@@ -652,6 +689,23 @@ mod tests {
         // Index targets further than one step take the full time, no longer.
         assert_eq!(slide.span(0.0, 2.0, false), ms(200));
         assert_eq!(slide.span(0.5, 0.0, false), ms(75));
+    }
+
+    #[test]
+    fn efficiency_mode_snaps_fades_too_and_lets_flashes_rest() {
+        let start = Instant::now();
+        let _efficient = performance::process::force(true);
+        for kind in [Kind::Move, Kind::Fade] {
+            let mut motion = Motion::new(0.0, ms(200), ms(100), kind);
+            motion.go(1.0, start);
+            assert_eq!(motion.get(start + ms(50)), 1.0, "{kind:?} snaps");
+            assert!(!motion.animating(start + ms(50)));
+        }
+        assert_eq!(rise(6.0, 0.5), 0.0);
+        let mut flashes = Flashes::new(ms(400));
+        flashes.hit("Gain".to_string(), start);
+        assert!(!flashes.animating(start + ms(100)), "no redraws of its own");
+        assert!(flashes.level("Gain", start + ms(100)) > 0.0, "still shown");
     }
 
     #[test]

@@ -5,7 +5,8 @@
 //! and a 120 Hz display is not held to 60. iced reports no refresh rate, so on
 //! macOS the screen is asked directly; there, redraws are not paced by vsync
 //! and run ahead of a 60 Hz display. Elsewhere presentation blocks on vsync,
-//! and the spacing of `window::frames` ticks is the rate the display delivers.
+//! and the spacing of `window::frames` ticks is the rate the display delivers,
+//! except under the software renderer, which presents without waiting.
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,8 @@ pub(super) struct Refresh {
     measured: Duration,
     /// The interval the platform reports for the window's screen.
     reported: Option<Duration>,
+    /// Redraws time the drawing, not the display: never measure.
+    unpaced: bool,
 }
 
 impl Default for Refresh {
@@ -40,6 +43,7 @@ impl Default for Refresh {
             redraws: 0,
             measured: DEFAULT,
             reported: None,
+            unpaced: false,
         }
     }
 }
@@ -47,6 +51,9 @@ impl Default for Refresh {
 impl Refresh {
     /// Note a vsync-paced redraw at `at`.
     pub(super) fn redraw(&mut self, at: Instant) {
+        if self.unpaced {
+            return;
+        }
         self.redraws = self.redraws.saturating_add(1);
         let Some(last) = self.last.replace(at) else {
             return;
@@ -76,7 +83,20 @@ impl Refresh {
     /// Whether measuring is done: the rate is reported, enough redraws were
     /// timed since the last recalibration, or too many redraws gave nothing.
     pub(super) fn calibrated(&self) -> bool {
-        self.reported.is_some() || self.intervals.len() >= ENOUGH || self.redraws >= GIVE_UP
+        self.unpaced
+            || self.reported.is_some()
+            || self.intervals.len() >= ENOUGH
+            || self.redraws >= GIVE_UP
+    }
+
+    /// Stop measuring for good under the software renderer, which presents
+    /// without waiting for vsync: its redraws take as long as drawing does,
+    /// and slow ones would keep redrawing back to back until `GIVE_UP`. The
+    /// estimate so far, or `DEFAULT`, stays in use.
+    pub(super) fn unpaced(&mut self) {
+        self.unpaced = true;
+        self.intervals.clear();
+        self.last = None;
     }
 
     /// Measure again, e.g. after the window moved to another display. The old
@@ -173,6 +193,20 @@ mod tests {
         assert_eq!(refresh.period(), DEFAULT);
         refresh.recalibrate();
         assert!(!refresh.calibrated());
+    }
+
+    #[test]
+    fn a_software_renderer_is_never_timed() {
+        let mut refresh = Refresh::default();
+        let start = Instant::now();
+        feed(&mut refresh, start, [40_000; 4]);
+        refresh.unpaced();
+        assert!(refresh.calibrated());
+        // Slow software redraws neither count nor keep redraws coming.
+        feed(&mut refresh, start + Duration::from_secs(1), [20_000; 20]);
+        assert_eq!(refresh.period(), DEFAULT);
+        refresh.recalibrate();
+        assert!(refresh.calibrated(), "moving the window changes nothing");
     }
 
     #[test]

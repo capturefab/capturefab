@@ -45,6 +45,11 @@ const ERROR_BESIDE_STALL: f32 = 120.0;
 const BADGE_INSET: f32 = 12.0;
 /// The error a screenshot scene shows.
 const SCENE_ERROR: &str = "Frame timeout: the camera sent no frame within 2000 ms";
+/// How a camera's worker begins its report of a network stream it reopens.
+/// It retires the report once frames flow again.
+const RECONNECTING: &str = "Stream lost; ";
+/// The reconnect a screenshot scene shows.
+const SCENE_RECONNECT: &str = "Stream lost; reconnecting to rtsp://<redacted>@192.168.1.20:8554/line-1 (attempt 3): timed out after the stream ended (Connection refused)";
 
 /// State for the single-camera stage, the overview grid and the scopes.
 pub(super) struct StageState {
@@ -187,8 +192,8 @@ impl BadgePlan {
 struct StageScene {
     /// Every camera reports lost frames.
     lost: bool,
-    /// The selected camera reports `SCENE_ERROR`.
-    error: bool,
+    /// What the selected camera reports: `SCENE_ERROR` or `SCENE_RECONNECT`.
+    error: Option<&'static str>,
 }
 
 impl Default for StageState {
@@ -387,9 +392,10 @@ impl Workbench {
     /// `stage-controls` (the stage controls stay up), `stage-zoom` (zoomed
     /// to 150%), `stage-lost` (every camera lost frames, the first and every
     /// other one lately), `stage-error` (the selected camera reports an
-    /// error; pair it with `stalled` so no frame retires it), `stage-flash`
-    /// (the selected camera's capture flash, held part way) and `stage-hover`
-    /// (the pointer over the selected camera's tile).
+    /// error; pair it with `stalled` so no frame retires it),
+    /// `stage-reconnecting` (likewise, its network stream being reopened),
+    /// `stage-flash` (the selected camera's capture flash, held part way) and
+    /// `stage-hover` (the pointer over the selected camera's tile).
     pub(super) fn scene_stage(&mut self, word: &str, late: bool) -> bool {
         let camera = self.snapshot.active_camera.clone();
         match (word, late) {
@@ -414,8 +420,13 @@ impl Workbench {
                 }
                 self.patch_stage_scene();
             }
-            ("stage-error", true) => {
-                self.stage_ui.scene.error = true;
+            ("stage-error" | "stage-reconnecting", true) => {
+                let text = if word == "stage-error" {
+                    SCENE_ERROR
+                } else {
+                    SCENE_RECONNECT
+                };
+                self.stage_ui.scene.error = Some(text);
                 self.patch_stage_scene();
                 // Shown at once: the shot is of a frame drawn before the next tick.
                 if let Some(id) = camera {
@@ -423,7 +434,7 @@ impl Workbench {
                         .now
                         .checked_sub(Duration::from_secs(1))
                         .unwrap_or(self.born);
-                    let mut error = CameraError::new(SCENE_ERROR, None, at);
+                    let mut error = CameraError::new(text, None, at);
                     error.shown = true;
                     self.stage_ui.errors.insert(id, error);
                 }
@@ -446,16 +457,19 @@ impl Workbench {
     /// Make the snapshot say what a stage scene holds in place; every tick.
     fn patch_stage_scene(&mut self) {
         let scene = &self.stage_ui.scene;
-        if !scene.lost && !scene.error {
+        if !scene.lost && scene.error.is_none() {
             return;
         }
         let active = self.snapshot.active_camera.clone();
         for (index, camera) in self.snapshot.cameras.iter_mut().enumerate() {
             if scene.lost {
+                camera.lost += 2 + index as u64;
                 camera.dropped += 2 + index as u64;
             }
-            if scene.error && active.as_ref() == Some(&camera.info.id) {
-                camera.last_error = Some(SCENE_ERROR.into());
+            if let Some(error) = scene.error
+                && active.as_ref() == Some(&camera.info.id)
+            {
+                camera.last_error = Some(error.into());
                 camera.error_logged = None;
             }
         }
@@ -564,13 +578,27 @@ impl Workbench {
     ) -> Element<'_, Message> {
         let stalled = self.stalled(id);
         let error = self.badge_error(id);
-        let plan = BadgePlan::new(room, hover, stopped, stalled.is_some(), error.is_some());
+        // A stream being reopened says why frames stopped, calmly, in the
+        // stall badge's place.
+        let reconnecting = error
+            .filter(|error| error.reported && error.text.starts_with(RECONNECTING))
+            .map(|error| error.text);
+        let error = error.filter(|_| reconnecting.is_none());
+        let plan = BadgePlan::new(
+            room,
+            hover,
+            stopped,
+            stalled.is_some() || reconnecting.is_some(),
+            error.is_some(),
+        );
         let mut badges = row![].spacing(6).align_y(Alignment::Center);
         if plan.last_frame {
             badges = badges.push(last_frame());
         }
-        if let (Some(silent), Some(whole)) = (stalled, plan.stall) {
-            badges = badges.push(stall_badge(silent, whole));
+        match (reconnecting, stalled, plan.stall) {
+            (Some(report), _, Some(whole)) => badges = badges.push(reconnect_badge(report, whole)),
+            (None, Some(silent), Some(whole)) => badges = badges.push(stall_badge(silent, whole)),
+            _ => {}
         }
         if let Some(error) = error {
             badges = badges.push(self.error_badge(id, error, plan.error));
@@ -745,6 +773,32 @@ fn stall_badge<'a>(silent: Duration, whole: bool) -> Element<'a, Message> {
     .into()
 }
 
+/// A network stream being reopened, on the stage or a tile: calm, since it
+/// comes back by itself, with the worker's report on hover; unless `whole`,
+/// the mark alone.
+fn reconnect_badge<'a>(report: &str, whole: bool) -> Element<'a, Message> {
+    let mark = icon(Icon::Refresh, 12.0, style::STAGE.secondary);
+    let about = format!("{report}. Frames resume on their own once the stream is back.");
+    if !whole {
+        return tip(container(mark).padding([4, 6]).style(style::badge), about);
+    }
+    tip(
+        container(
+            row![
+                mark,
+                text("Reconnecting…")
+                    .size(style::SMALL)
+                    .wrapping(text::Wrapping::None),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center),
+        )
+        .padding([2, 8])
+        .style(style::badge),
+        about,
+    )
+}
+
 /// `from` to `to` at `t`, evenly in ratio, so each step of the way zooms by
 /// the same factor.
 fn ease_scale(from: f32, to: f32, t: f32) -> f32 {
@@ -888,10 +942,12 @@ impl Workbench {
                 }),
             );
         }
-        mouse_area(layers)
-            .on_move(|_| Message::Pointer)
-            .on_double_click(Message::ToggleImage)
-            .into()
+        let stage = mouse_area(layers).on_double_click(Message::ToggleImage);
+        if self.pointer_heard() {
+            stage.on_move(|_| Message::Pointer).into()
+        } else {
+            stage.into()
+        }
     }
 
     /// Zoom, scope and image mode controls with the frame's details, on
@@ -983,6 +1039,15 @@ impl Workbench {
             .align_right()
         ]
         .align_y(Alignment::Center);
+        if let Some(chip) = camera.and_then(|camera| self.preview_chip(&camera.info.id, shown)) {
+            summary = summary
+                .push(
+                    text("  ·  ")
+                        .size(style::SMALL)
+                        .color(fade(stage.secondary, shown)),
+                )
+                .push(chip);
+        }
         // Only the loss takes a status color.
         let lost = camera.map_or(0, liveness::camera_loss);
         if let Some(camera) = camera.filter(|_| lost > 0) {
@@ -1468,6 +1533,47 @@ mod tests {
         bench.now = start + ERROR_SETTLE * 2;
         bench.tick_stage();
         assert_eq!(bench.camera_error("sim:0"), None);
+    }
+
+    #[test]
+    fn a_stream_being_reopened_shows_a_calm_badge_until_frames_flow() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let renderer = destinations::layout_tests::renderer();
+        let labels = |bench: &Workbench| {
+            let mut badges = bench.badges("sim:0", false, 400.0, 0.0, 0.0);
+            let mut tree = Tree::new(badges.as_widget());
+            let node = badges.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(400.0, 40.0)),
+            );
+            let (native, _, _) = accessibility::snapshot_widget(
+                badges.as_widget_mut(),
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+            );
+            native
+                .nodes
+                .into_iter()
+                .filter_map(|(_, node)| node.label().map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
+        let mut bench = bench();
+        let start = bench.now;
+        bench.observe_liveness();
+        bench.snapshot.cameras[0].last_error = Some(SCENE_RECONNECT.into());
+        bench.tick_stage();
+        bench.now = start + Duration::from_secs(8);
+        bench.tick_stage();
+        assert!(bench.stalled("sim:0").is_some());
+        // It stands in for the stall and the error: no alarm, no Details.
+        assert_eq!(labels(&bench), ["Reconnecting…", "Capturefab"]);
+        // Frames flow again: the worker retires it, and so does the badge.
+        bench.frame_seen("sim:0");
+        bench.now += Duration::from_millis(100);
+        bench.tick_stage();
+        assert_eq!(labels(&bench), ["Capturefab"]);
     }
 
     #[test]

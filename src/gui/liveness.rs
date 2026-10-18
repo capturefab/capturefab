@@ -22,14 +22,12 @@ const BUSY_GRACE: Duration = Duration::from_secs(1);
 /// How long after the last lost frame a loss still counts as recent.
 pub(super) const LOSS_RECENT: Duration = Duration::from_secs(10);
 
-/// Frames a camera lost at the camera or on the way: the transport's count
-/// where it keeps statistics, otherwise the worker's. Frames this window
-/// skipped because a newer one was already waiting are not losses.
+/// Frames a camera lost at the camera or on the way: the worker's receive
+/// errors and the transport's incomplete and missing frames, as the session
+/// counts them. Frames a preview skipped because a newer one was already
+/// waiting are not losses.
 pub(super) fn camera_loss(camera: &CameraSnapshot) -> u64 {
-    camera.transport.as_ref().map_or(
-        camera.dropped.saturating_sub(camera.preview_skipped),
-        transport_loss,
-    )
+    camera.lost
 }
 
 /// What a camera's status dot says. The camera list, the tiles, the
@@ -355,14 +353,14 @@ impl Workbench {
 
 /// A streaming simulated camera with these counters, for tests.
 #[cfg(test)]
-pub(super) fn streaming_camera(frames: u64, dropped: u64, fps: f64) -> CameraSnapshot {
+pub(super) fn streaming_camera(frames: u64, lost: u64, fps: f64) -> CameraSnapshot {
     CameraSnapshot {
         info: crate::transport::simulator::info(),
         features: Vec::new(),
         streaming: true,
         frames,
         received_bytes: 0,
-        dropped,
+        dropped: lost,
         fps,
         last_error: None,
         worker_pid: 0,
@@ -372,7 +370,7 @@ pub(super) fn streaming_camera(frames: u64, dropped: u64, fps: f64) -> CameraSna
         capture_session: None,
         transport: None,
         history: crate::session::CameraHistoryStatus::default(),
-        lost: 0,
+        lost,
         preview_skipped: 0,
         stale: false,
         error_logged: None,
@@ -687,8 +685,9 @@ mod tests {
         report(&mut bench, start, ms(0), streaming_camera(10, 5, 30.0));
         assert!(!bench.recent_loss(id));
         assert_eq!(bench.liveness[id].lost, 0);
-        // Frames this window skipped are not losses.
-        let mut skipped = streaming_camera(40, 25, 30.0);
+        // Frames a preview skipped are not losses.
+        let mut skipped = streaming_camera(40, 5, 30.0);
+        skipped.dropped += 20;
         skipped.preview_skipped = 20;
         report(&mut bench, start, ms(1000), skipped);
         assert!(!bench.recent_loss(id));

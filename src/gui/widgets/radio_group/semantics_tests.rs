@@ -192,7 +192,7 @@ fn actual_preferences_and_exposure_use_distinct_meaningful_radio_groups() {
     );
     let mut settings = app.settings_content(Palette::of(false));
     let (snapshot, _, _, _) = collect(&mut settings, &mut Tree::empty(), &renderer);
-    for (name, count) in [("Appearance", 3), ("Interface size", 3)] {
+    for (name, count) in [("Appearance", 3), ("Interface size", 3), ("Performance", 3)] {
         let (_, parent) = group(&snapshot, name);
         assert_eq!(parent.children().len(), count);
     }
@@ -202,7 +202,7 @@ fn actual_preferences_and_exposure_use_distinct_meaningful_radio_groups() {
             .iter()
             .filter(|(_, node)| node.role() == accessibility::Role::RadioGroup)
             .count(),
-        2
+        3
     );
     let mut exposure = app.auto_card(Palette::of(false));
     let (snapshot, _, _, _) = collect(&mut exposure, &mut Tree::empty(), &renderer);

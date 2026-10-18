@@ -472,6 +472,9 @@ fn fit_size(wanted: Size, available: Size) -> (Size, Size) {
 pub struct Prefs {
     pub appearance: Appearance,
     pub ui_scale: UiScale,
+    /// Settings › Performance; a choice from a newer version reads as
+    /// Automatic.
+    pub performance: crate::efficiency::Mode,
     pub include_simulator: bool,
     pub tab: Tab,
     pub exposure_open: bool,
@@ -542,6 +545,7 @@ impl Default for Prefs {
         Self {
             appearance: Appearance::System,
             ui_scale: UiScale::Standard,
+            performance: crate::efficiency::Mode::Auto,
             include_simulator: false,
             tab: Tab::Features,
             exposure_open: true,
@@ -572,7 +576,7 @@ impl Default for Prefs {
             window: None,
             logs_open: false,
             video_analytics: Default::default(),
-            prefs_version: 2,
+            prefs_version: 3,
             auto_start: true,
             tags: CaptureTags::default(),
             dataset_path: None,
@@ -803,6 +807,7 @@ fn upgrade(prefs: &mut Prefs) {
             prefs.forward_output = default_record_output();
         }
     }
+    // Version 3 adds `performance`, which files without it read as Automatic.
     prefs.prefs_version = prefs.prefs_version.max(Prefs::default().prefs_version);
 }
 
@@ -984,6 +989,37 @@ mod tests {
             UiScale::ALL,
             [UiScale::Standard, UiScale::Large, UiScale::Larger]
         );
+    }
+
+    #[test]
+    fn the_performance_setting_round_trips_and_unknown_choices_read_as_automatic() {
+        use crate::efficiency::Mode;
+        assert_eq!(Prefs::default().performance, Mode::Auto);
+        for mode in Mode::ALL {
+            let prefs = Prefs {
+                performance: mode,
+                count: 17,
+                ..Prefs::default()
+            };
+            let json = serde_json::to_vec(&prefs).unwrap();
+            assert_eq!(serde_json::from_slice::<Prefs>(&json).unwrap(), prefs);
+        }
+        let dir = test_dir("performance");
+        let file = dir.join(FILE);
+        fs::write(
+            &file,
+            br#"{"performance":"turbo","count":17,"prefs_version":2}"#,
+        )
+        .unwrap();
+        let future = load_from(&file);
+        assert_eq!(
+            (future.performance, future.count, future.prefs_version),
+            (Mode::Auto, 17, 3),
+            "a newer choice keeps the other preferences"
+        );
+        fs::write(&file, br#"{"count":17}"#).unwrap();
+        assert_eq!(load_from(&file).performance, Mode::Auto);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn snapshot(
@@ -1229,7 +1265,7 @@ mod tests {
         let prefs = load_from(&file);
         assert_eq!(prefs.output, default_capture_output());
         assert_eq!(prefs.forward_output, default_record_output());
-        assert_eq!(prefs.prefs_version, 2);
+        assert_eq!(prefs.prefs_version, 3);
         assert!(prefs.output.ends_with("{camera}-{datetime}-{seq}.png"));
         fs::write(
             &file,
