@@ -79,7 +79,7 @@ pub struct Cli {
         default_value = "auto"
     )]
     pub hwaccel: String,
-    /// Efficiency mode for this process (default: CAPTUREFAB_EFFICIENCY, then auto, which is efficient on small or low-power computers)
+    /// Efficiency mode for this process and the camera workers it starts (default: CAPTUREFAB_EFFICIENCY, then auto, which is efficient on small or low-power computers)
     #[arg(
         long,
         global = true,
@@ -2993,7 +2993,7 @@ fn schema() -> Value {
         "environment":crate::efficiency::ENV,
         "precedence":"--efficiency, then CAPTUREFAB_EFFICIENCY, then auto; an unknown CAPTUREFAB_EFFICIENCY value means auto",
         "auto":"efficient with at most 2 CPU cores, at most 2 GiB of memory, or the OS low-power or battery-saver mode; running on battery alone stays smooth",
-        "scope":"The process that parses it, such as the desktop window or serve; a running session keeps its own setting. Captures and recordings keep every frame in every mode.",
+        "scope":"The process that parses it, such as the desktop window, serve or a direct command, and the camera workers it starts, which are told efficient whenever that process resolved efficient; a running session keeps its own setting. In workers, efficient decodes each live stream with one thread and picks a faster libx264 preset. Captures and recordings keep every frame in every mode.",
         "status":"doctor --json efficiency {setting,efficient,reasons}"
     });
     contract["doctor"] = json!({

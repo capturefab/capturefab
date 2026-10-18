@@ -449,7 +449,7 @@ RTSP, SRT, RTMP, HTTP, UDP, TCP and RTP sources reconnect by themselves when the
 
 `serve` prints the warnings on one line when it starts. `doctor --json` keeps its existing keys and adds `host` (CPU cores, memory, battery, low-power mode), `efficiency`, `paths` (file system type, RAM-backed, free space), `limits` (`rmem_max` and `usbfs_memory_mb` on Linux), `graphics` and `checks` (`{id,level,message,fix}`).
 
-Efficiency mode is `auto` (the default), `smooth` or `efficient`; captures and recordings keep every frame in every mode. Auto chooses efficient with at most two CPU cores or 2 GiB of memory, or in macOS Low Power Mode, Windows battery saver or the Linux `low-power` power profile. Running on battery alone keeps it smooth. The global `--efficiency` flag wins over `CAPTUREFAB_EFFICIENCY`. It applies to the process that reads it, such as the desktop window or `serve`; a running session keeps its own.
+Efficiency mode is `auto` (the default), `smooth` or `efficient`; captures and recordings keep every frame in every mode. Auto chooses efficient with at most two CPU cores or 2 GiB of memory, or in macOS Low Power Mode, Windows battery saver or the Linux `low-power` power profile. Running on battery alone keeps it smooth. The global `--efficiency` flag wins over `CAPTUREFAB_EFFICIENCY`. It applies to the process that reads it, such as the desktop window, `serve` or a direct command, and to the camera workers that process starts, where it sets FFmpeg's decoding threads and libx264 preset; a running session keeps its own.
 
 ```sh
 capturefab doctor

@@ -52,7 +52,7 @@ Binary image stdout, raw XML, completions, help and version output use their com
 
 Plain `doctor` checks the host and prints a fix for each warning.
 `doctor --json` adds `host`, `efficiency`, `paths`, `limits`, `graphics` and `checks` (`{id,level,message,fix}`).
-`--efficiency auto|smooth|efficient` or `CAPTUREFAB_EFFICIENCY` sets efficiency mode; `doctor` reports the mode in force and why.
+`--efficiency auto|smooth|efficient` or `CAPTUREFAB_EFFICIENCY` sets efficiency mode for a process and the camera workers it starts; `doctor` reports the mode in force and why.
 Auto is efficient with at most 2 CPU cores or 2 GiB of memory, or in the OS low-power mode.
 A headless build without a subcommand exits 5 and suggests `serve`.
 
