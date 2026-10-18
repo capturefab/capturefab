@@ -12,6 +12,8 @@ pub mod compatibility;
 pub mod context;
 pub mod dataset;
 pub mod destination;
+pub mod doctor;
+pub mod efficiency;
 mod engine;
 pub mod frame;
 pub mod genicam;
