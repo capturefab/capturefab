@@ -1,33 +1,63 @@
-//! Session-local, human-supervised automatic capture. The database is the session:
-//! raw sensor frames, decisions, settings and the bounded background model all
-//! live in one DuckDB file. No network service or download is needed. Frames are
-//! compared as embeddings from the bundled DINOv2 model (on the GPU when one is
-//! usable), or as a native color/edge descriptor in builds without it; each
-//! session records which one it learned.
+//! Session-local, human-supervised automatic capture. A session is a DuckDB
+//! database plus a `<name>.frames` folder beside it: the database holds
+//! decisions, settings, descriptors and the bounded background model, and each
+//! raw sensor frame is a file written through the storage ledger. Copy the
+//! database and its folder together. No network service or download is
+//! needed. Frames are compared as embeddings from the bundled DINOv2 model (on
+//! the GPU when one is usable), or as a native color/edge descriptor in builds
+//! without it; each session records which one it learned.
 #[cfg(feature = "dinov2")]
 pub mod dinov2;
 
-use crate::{frame, types::Frame};
-use anyhow::{Context, Result, ensure};
+use crate::{frame, storage, types::Frame};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use duckdb::{Config, Connection, OptionalExt, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::VecDeque,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    fs::File,
+    io::{self, Read, Write},
+    path::{Component, Path, PathBuf},
+    sync::{
+        Arc, Mutex, MutexGuard, OnceLock,
+        mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
+    },
+    thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const SCHEMA_VERSION: u32 = 2;
+/// 2 added the encoder; 3 keeps frames as files beside the database.
+const SCHEMA_VERSION: u32 = 3;
 const FEATURES: usize = 84;
-/// A background embedding that finishes this long after its frame is dropped:
-/// the scene has moved on, and pausing must not leave a late capture behind.
+/// A background embedding that finishes this long after its frame, and over
+/// twice as long as embeddings usually take, is dropped: the scene has moved
+/// on, as when a GPU missed its deadline. A computer whose every embedding is
+/// slower still decides on each.
 const STALE_SAMPLE: Duration = Duration::from_secs(2);
 const MAX_PENDING: u64 = 200;
 const MAX_STORED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 const MAX_BACKGROUND: usize = 64;
 const MAX_RECENT: usize = 32;
+/// Frames live in files, so DuckDB only ever holds small rows.
+const MEMORY_LIMIT: &str = "64MB";
+/// Sessions from schema 1 and 2 keep raw pixels in the database, with its old budget.
+const LEGACY_MEMORY_LIMIT: &str = "256MB";
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
+/// How long a storage refusal pauses suggestions before the next attempt.
+const STORAGE_RETRY: Duration = Duration::from_secs(60);
+/// How long suggestions wait after a frame failed to save for another
+/// reason, such as a ledger busy with another process's bookkeeping.
+const WRITE_RETRY: Duration = Duration::from_secs(5);
+/// How long a note stays in the status.
+const NOTE_LIFETIME: Duration = Duration::from_secs(60);
+const BUSY_NOTE: &str = "Skipped a suggestion while the previous capture was still being saved";
+/// The share of one core that embedding sampled frames on the CPU may use on
+/// average, normally and in efficiency mode. A GPU embeds at the camera's pace.
+const CPU_SHARE: f64 = 0.5;
+const EFFICIENT_CPU_SHARE: f64 = 0.2;
 const MODEL: &str = "Session exemplar kNN + background novelty";
 type Descriptor = Vec<f32>;
 
@@ -51,9 +81,12 @@ pub struct SessionStatus {
     /// Where embeddings run, for example "GPU: Apple M4 Max (Metal)" or "CPU".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accelerator: Option<String>,
-    /// Frames embedded per second over the last few seconds.
+    /// Frames embedded per second over the last few samples.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub samples_per_second: Option<f64>,
+    /// Why the latest suggestion was skipped or a capture was dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 fn native() -> String {
@@ -341,31 +374,38 @@ struct Throughput {
 impl Throughput {
     fn record(&mut self, now: Instant) {
         self.finished.push_back(now);
-        while self
-            .finished
-            .front()
-            .is_some_and(|t| now.saturating_duration_since(*t) > Duration::from_secs(3))
-        {
+        // Three seconds of samples, but the latest two for up to a minute,
+        // so sampling paced to the CPU still has a rate.
+        while self.finished.front().is_some_and(|t| {
+            let age = now.saturating_duration_since(*t);
+            age > Duration::from_secs(60)
+                || (age > Duration::from_secs(3) && self.finished.len() > 2)
+        }) {
             self.finished.pop_front();
         }
     }
     fn rate(&self) -> Option<f64> {
         let (first, last) = (self.finished.front()?, self.finished.back()?);
         let span = last.saturating_duration_since(*first).as_secs_f64();
-        (self.finished.len() >= 2
-            && span > 0.0
-            && Instant::now().saturating_duration_since(*last) < Duration::from_secs(1))
-        .then(|| (self.finished.len() - 1) as f64 / span)
+        let samples = self.finished.len().saturating_sub(1) as f64;
+        // Sampling has stopped once it misses twice its usual spacing.
+        let quiet = Duration::from_secs_f64((2.0 * span / samples.max(1.0)).max(1.0));
+        (samples >= 1.0 && span > 0.0 && last.elapsed() < quiet).then(|| samples / span)
     }
 }
 
 /// One encoder thread per DINOv2 session. At most one sampled frame is in
 /// flight, so the worker holds one extra frame copy and sampling slows to the
-/// encoder's speed instead of queueing.
+/// encoder's speed instead of queueing. On the CPU, sampling also rests after
+/// each frame, so embedding never takes over the computer.
 struct Embedder {
     jobs: Option<mpsc::SyncSender<Job>>,
-    done: mpsc::Receiver<Embedded>,
+    done: mpsc::Receiver<(Embedded, Duration)>,
     busy: bool,
+    /// When the CPU has rested long enough after the last sample.
+    rested: Option<Instant>,
+    /// How long samples usually take to embed, as a moving average.
+    usual: Option<Duration>,
     thread: Option<std::thread::JoinHandle<()>>,
     throughput: Arc<Mutex<Throughput>>,
 }
@@ -392,9 +432,17 @@ impl Embedder {
                 for job in inbox {
                     match job {
                         Job::Sample(frame, at) => {
+                            let (started, before) = (Instant::now(), process_cpu());
                             let feature = backend.describe(&encoder, &frame);
+                            let took = started.elapsed();
+                            let used = before
+                                .zip(process_cpu())
+                                .map(|(before, after)| after.saturating_sub(before));
+                            let cpu = backend.cpu_time(took, used);
+                            let rest = rest_after(cpu, took, cpu_share());
                             publish(&backend, feature.is_ok());
-                            if outbox.send((frame, at, Instant::now(), feature)).is_err() {
+                            let embedded = (frame, at, Instant::now(), feature);
+                            if outbox.send((embedded, rest)).is_err() {
                                 break;
                             }
                         }
@@ -411,6 +459,8 @@ impl Embedder {
             jobs: Some(jobs),
             done,
             busy: false,
+            rested: None,
+            usual: None,
             thread: Some(thread),
             throughput,
         })
@@ -428,6 +478,11 @@ impl Embedder {
         self.busy = true;
         Ok(())
     }
+    /// Whether a new sample must wait for the one in flight, or for the CPU
+    /// to rest after the last one.
+    fn waiting(&self, now: Instant) -> bool {
+        self.busy || self.rested.is_some_and(|rested| now < rested)
+    }
     fn describe(&self, frame: &Frame) -> Result<Descriptor> {
         let (reply, result) = mpsc::channel();
         self.send(Job::Manual(frame.clone(), reply))?;
@@ -435,10 +490,7 @@ impl Embedder {
     }
     fn finished(&mut self) -> Result<Option<Embedded>> {
         match self.done.try_recv() {
-            Ok(result) => {
-                self.busy = false;
-                Ok(Some(result))
-            }
+            Ok(result) => Ok(Some(self.landed(result))),
             Err(mpsc::TryRecvError::Empty) => Ok(None),
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.busy = false;
@@ -446,11 +498,23 @@ impl Embedder {
             }
         }
     }
+    fn landed(&mut self, (embedded, rest): (Embedded, Duration)) -> Embedded {
+        self.busy = false;
+        self.rested = Some(embedded.2 + rest);
+        let took = embedded.2.saturating_duration_since(embedded.1);
+        self.usual = Some(self.usual.map_or(took, |usual| (usual * 3 + took) / 4));
+        embedded
+    }
+    /// How long after its frame a result is stale.
+    fn stale_after(&self) -> Duration {
+        self.usual
+            .map_or(STALE_SAMPLE, |usual| STALE_SAMPLE.max(usual * 2))
+    }
     #[cfg(all(test, feature = "dinov2"))]
     fn wait(&mut self) -> Option<Embedded> {
         let result = self.busy.then(|| self.done.recv().ok()).flatten();
         self.busy = false;
-        result
+        result.map(|result| self.landed(result))
     }
 }
 
@@ -463,6 +527,52 @@ impl Drop for Embedder {
             let _ = thread.join();
         }
     }
+}
+
+/// The share of one core CPU embeddings may use now.
+fn cpu_share() -> f64 {
+    if crate::efficiency::efficient() {
+        EFFICIENT_CPU_SHARE
+    } else {
+        CPU_SHARE
+    }
+}
+
+/// How long sampling rests after an embedding that took `took` and used
+/// `cpu` of processor time, so that embedding averages `share` of one core.
+fn rest_after(cpu: Duration, took: Duration, share: f64) -> Duration {
+    cpu.div_f64(share).saturating_sub(took)
+}
+
+/// Threads a CPU forward pass may keep busy: matrixmultiply's pool takes
+/// MATMUL_NUM_THREADS, or one thread per physical core, at most four.
+/// Counting logical cores can only overstate the cost.
+fn cpu_threads() -> u32 {
+    static THREADS: OnceLock<u32> = OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("MATMUL_NUM_THREADS")
+            .ok()
+            .and_then(|threads| threads.trim().parse().ok())
+            .unwrap_or(crate::efficiency::host().cpu_cores as u32)
+            .clamp(1, 4)
+    })
+}
+
+/// Processor time this process has used.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn process_cpu() -> Option<Duration> {
+    let mut used = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime only writes the timespec it is given.
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut used) };
+    (status == 0).then(|| Duration::new(used.tv_sec as u64, used.tv_nsec as u32))
+}
+#[cfg(not(unix))]
+fn process_cpu() -> Option<Duration> {
+    None
 }
 
 /// Where the encoder thread computes embeddings. The GPU helper starts in the
@@ -533,6 +643,21 @@ impl Backend {
         encoder.describe(frame)
     }
 
+    /// Processor time of an embedding that just took `took`, while the
+    /// worker `used` this much: none on the GPU. On the CPU that counts every
+    /// thread of the forward pass, and other worker threads can only
+    /// overstate it; without a measurement every thread is assumed busy.
+    fn cpu_time(&self, took: Duration, used: Option<Duration>) -> Duration {
+        match self {
+            #[cfg(feature = "dinov2")]
+            Self::Gpu(_) => Duration::ZERO,
+            _ => {
+                let most = took.saturating_mul(cpu_threads());
+                used.map_or(most, |used| used.min(most))
+            }
+        }
+    }
+
     fn accelerator(&self) -> Option<String> {
         match self {
             Self::Cpu => Some("CPU".into()),
@@ -553,7 +678,8 @@ pub struct ReviewCapture {
 }
 
 pub struct CaptureSession {
-    db: Connection,
+    writer: Writer,
+    shared: Arc<Mutex<Shared>>,
     path: PathBuf,
     camera: String,
     encoder: Encoder,
@@ -574,6 +700,82 @@ pub struct CaptureSession {
     /// When auto capture was last paused or re-armed. A background embedding
     /// sampled before then belongs to a scene the user stopped watching.
     armed_at: Instant,
+    /// When storage last refused a suggested frame.
+    refused: Option<Instant>,
+    /// When a suggested frame last failed to save for another reason.
+    unsaved: Option<Instant>,
+}
+
+/// State shared by the camera thread and the writer. Counts are reserved when
+/// a capture is queued and released if its write fails, so the limits also
+/// cover frames still being written, and status never queries DuckDB.
+#[derive(Default)]
+struct Shared {
+    tally: Tally,
+    /// Tasks waiting for the writer; it runs one more while one waits.
+    queued: usize,
+    /// A queued write's failure, reported by the next sample.
+    failure: Option<anyhow::Error>,
+    /// The latest note and when it was made; it fades after NOTE_LIFETIME.
+    note: Option<(Instant, String)>,
+}
+
+impl Shared {
+    fn note(&mut self, note: String) {
+        self.note = Some((Instant::now(), note));
+    }
+}
+
+/// Context for a frame file storage could not save. Storage can recover,
+/// so a suggestion that fails this way is retried instead of pausing.
+#[derive(Debug)]
+struct FrameNotSaved;
+
+impl std::fmt::Display for FrameNotSaved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("save capture frame file")
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct Tally {
+    manual: u64,
+    kept: u64,
+    discarded: u64,
+    pending: u64,
+    bytes: u64,
+}
+
+impl Tally {
+    fn count(&mut self, label: &str) -> &mut u64 {
+        match label {
+            "manual" => &mut self.manual,
+            "kept" => &mut self.kept,
+            "discarded" => &mut self.discarded,
+            _ => &mut self.pending,
+        }
+    }
+    fn add(&mut self, label: &str, bytes: u64) {
+        *self.count(label) += 1;
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+    fn remove(&mut self, label: &str, bytes: u64) {
+        let count = self.count(label);
+        *count = count.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(bytes);
+    }
+}
+
+/// A capture handed to the writer; its counts are already reserved.
+struct Row {
+    id: u64,
+    created_ms: u64,
+    source: &'static str,
+    label: &'static str,
+    frame: Frame,
+    feature: Descriptor,
+    score: f64,
+    reason: String,
 }
 
 impl CaptureSession {
@@ -596,6 +798,19 @@ impl CaptureSession {
             "capture session requires a camera identity"
         );
         ensure!(camera.len() <= 1024, "camera identity is too long");
+        let path = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        if let Some(parent) = path.parent() {
+            crate::volumes::ensure_present(parent)?;
+        }
+        let frames = path.with_extension("frames");
+        ensure!(
+            frames != path,
+            "capture session file name must not end in .frames"
+        );
         if create {
             ensure!(
                 !path.exists(),
@@ -608,25 +823,35 @@ impl CaptureSession {
                 path.display()
             );
         }
-        let path = if path.is_absolute() {
-            path.to_owned()
-        } else {
-            std::env::current_dir()?.join(path)
-        };
         // Resolve a new session's encoder before creating its file, so a
         // missing or broken model leaves nothing behind.
         let created = create.then(|| new_encoder(encoder)).transpose()?;
+        if create {
+            // Claim the folder before the database, so sessions whose names
+            // differ only in extension never share one.
+            claim(&frames)?;
+        }
+        let session = Self::load(path, &frames, camera, created);
+        // A failed `new` leaves no folder behind to block the next attempt.
+        if create && session.is_err() {
+            let _ = std::fs::remove_dir(&frames);
+        }
+        session
+    }
+
+    fn load(path: PathBuf, frames: &Path, camera: &str, created: Option<Encoder>) -> Result<Self> {
         let config = Config::default()
-            .max_memory("256MB")?
+            .max_memory(MEMORY_LIMIT)?
             .threads(1)?
             .enable_autoload_extension(false)?;
         let db =
             Connection::open_with_flags(&path, config).context("open capture session DuckDB")?;
-        // Frames are BLOBs; never ask DuckDB to load extensions, read external
-        // data, or spill a second session data file beside the database.
+        // Never ask DuckDB to load extensions, read external data, or spill a
+        // second session data file beside the database.
         db.execute_batch("SET temp_directory = ''; SET enable_external_access = false;")?;
         if let Some(encoder) = &created {
-            let fingerprint = encoder.fingerprint();
+            // `data` holds pixels only in sessions from schema 1 and 2; newer
+            // rows name a file in the frames folder and its SHA-256.
             db.execute_batch(
                 "CREATE TABLE capture_session (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -643,7 +868,7 @@ impl CaptureSession {
                     frame_id UBIGINT NOT NULL, width UINTEGER NOT NULL, height UINTEGER NOT NULL,
                     pixel_format UINTEGER NOT NULL, timestamp_ns UBIGINT NOT NULL,
                     data BLOB, data_bytes UBIGINT NOT NULL, descriptor BLOB NOT NULL, score DOUBLE NOT NULL,
-                    reason VARCHAR NOT NULL, reviewed_ms UBIGINT
+                    reason VARCHAR NOT NULL, reviewed_ms UBIGINT, frame_path VARCHAR, frame_sha256 VARCHAR
                 );
                 CREATE TABLE background (id UINTEGER PRIMARY KEY, descriptor BLOB NOT NULL);"
             )?;
@@ -656,43 +881,36 @@ impl CaptureSession {
                     epoch_ms(),
                     encoder.name(),
                     encoder.dims() as u32,
-                    fingerprint
+                    encoder.fingerprint()
                 ],
             )?;
             db.execute_batch("CHECKPOINT")?;
         }
-        let version: u32 = db
-            .query_row(
-                "SELECT schema_version FROM capture_session WHERE singleton = 1",
-                [],
-                |r| r.get(0),
-            )
+        let (version, descriptor_version, stored_camera, enabled, sensitivity, cooldown_ms): (u32, u32, String, bool, f64, u64) = db.query_row(
+            "SELECT schema_version, descriptor_version, camera, enabled, sensitivity, cooldown_ms FROM capture_session WHERE singleton = 1", [],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))
             .context("not a CaptureFab capture session or missing session metadata")?;
         ensure!(
-            version == 1 || version == SCHEMA_VERSION,
+            (1..=SCHEMA_VERSION).contains(&version),
             "unsupported capture session schema version {version}"
         );
-        if version == 1 {
-            // Version 1 sessions predate encoder choice: all are native.
-            db.execute_batch(
-                "BEGIN TRANSACTION;
-                ALTER TABLE capture_session ADD COLUMN encoder VARCHAR DEFAULT 'native';
-                ALTER TABLE capture_session ADD COLUMN descriptor_dims UINTEGER DEFAULT 84;
-                ALTER TABLE capture_session ADD COLUMN model_fingerprint VARCHAR;
-                UPDATE capture_session SET schema_version = 2;
-                COMMIT;",
-            )
-            .context("upgrade capture session to schema version 2")?;
-        }
-        #[allow(clippy::type_complexity)]
-        let (descriptor_version, stored_camera, enabled, sensitivity, cooldown_ms, name, dims, fingerprint): (u32, String, bool, f64, u64, String, u32, Option<String>) = db.query_row(
-            "SELECT descriptor_version, camera, enabled, sensitivity, cooldown_ms, encoder, descriptor_dims, model_fingerprint FROM capture_session WHERE singleton = 1", [],
-            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)))
-            .context("not a CaptureFab capture session or missing session metadata")?;
         ensure!(
             stored_camera == camera,
             "capture session belongs to camera {stored_camera}, not {camera}"
         );
+        // Everything is checked before an older session is upgraded, so one
+        // this build refuses still opens in the version that made it.
+        let (name, dims, fingerprint): (String, u32, Option<String>) = if version == 1 {
+            // Version 1 sessions predate encoder choice: all are native.
+            ("native".into(), FEATURES as u32, None)
+        } else {
+            db.query_row(
+                "SELECT encoder, descriptor_dims, model_fingerprint FROM capture_session WHERE singleton = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .context("not a CaptureFab capture session or missing session metadata")?
+        };
         let encoder = match created {
             Some(encoder) => encoder,
             None => stored_encoder(&name, dims as usize, fingerprint.as_deref())?,
@@ -702,23 +920,12 @@ impl CaptureSession {
             "unsupported capture session descriptor version {descriptor_version}"
         );
         validate_settings(sensitivity, cooldown_ms)?;
-        let mut positive = load_descriptors(
-            &db,
-            &encoder,
-            "SELECT descriptor FROM captures WHERE label IN ('manual', 'kept') ORDER BY id DESC LIMIT 256",
-        )?;
-        let mut negative = load_descriptors(
-            &db,
-            &encoder,
-            "SELECT descriptor FROM captures WHERE label = 'discarded' ORDER BY id DESC LIMIT 256",
-        )?;
+        let (positive, negative) = examples(&db, &encoder)?;
         let background = load_descriptors(
             &db,
             &encoder,
             "SELECT descriptor FROM background ORDER BY id LIMIT 64",
         )?;
-        positive.reverse();
-        negative.reverse();
         let mut recent = Vec::new();
         {
             let mut statement = db.prepare("SELECT descriptor, created_ms FROM captures WHERE label <> 'discarded' ORDER BY id DESC LIMIT 32")?;
@@ -734,6 +941,51 @@ impl CaptureSession {
             db.query_row("SELECT MAX(id), MAX(created_ms) FROM captures", [], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?;
+        if version < SCHEMA_VERSION {
+            db.execute_batch(&format!("SET memory_limit = '{LEGACY_MEMORY_LIMIT}'"))?;
+            // Earlier sessions had no folder, so one by this name is another
+            // session's. The folder is created only once the upgrade is
+            // committed: an upgraded session that names no frame files claims
+            // a missing folder when resumed, so an interruption between the
+            // two leaves nothing that blocks it.
+            ensure!(
+                std::fs::symlink_metadata(frames).is_err(),
+                "capture session frames folder already exists: {}; it belongs to another session, so move it or rename this session",
+                frames.display()
+            );
+            upgrade(&db)?;
+            claim(frames)?;
+        } else {
+            let (files, blobs): (u64, u64) = db.query_row(
+                "SELECT COUNT(frame_path), COUNT(*) FILTER (WHERE frame_path IS NULL AND data_bytes > 0) FROM captures",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if blobs > 0 {
+                db.execute_batch(&format!("SET memory_limit = '{LEGACY_MEMORY_LIMIT}'"))?;
+            }
+            if !frames.is_dir() {
+                // Saving a frame would recreate the folder, and the next review
+                // would then take every saved frame for deleted.
+                ensure!(
+                    files == 0,
+                    "capture session frames folder {} is missing; copy it beside the database, or create an empty folder there to drop the frames it held",
+                    frames.display()
+                );
+                claim(frames)?;
+            }
+        }
+        let shared = Arc::new(Mutex::new(Shared {
+            tally: counts(&db)?,
+            ..Shared::default()
+        }));
+        let writer = Writer::spawn(Store {
+            db,
+            encoder: encoder.clone(),
+            frames: frames.to_owned(),
+            dirty_since: None,
+            shared: shared.clone(),
+        })?;
         let now = Instant::now();
         let started_ms = epoch_ms();
         let last_capture = last_ms
@@ -743,7 +995,8 @@ impl CaptureSession {
             .then(|| Embedder::spawn(encoder.clone()))
             .transpose()?;
         Ok(Self {
-            db,
+            writer,
+            shared,
             path,
             camera: stored_camera,
             encoder,
@@ -765,68 +1018,90 @@ impl CaptureSession {
             started_ms,
             blocked_storage: false,
             armed_at: now,
+            refused: None,
+            unsaved: None,
         })
     }
 
     pub fn configure(&mut self, enabled: bool, sensitivity: f64, cooldown_ms: u64) -> Result<()> {
         validate_settings(sensitivity, cooldown_ms)?;
-        self.db.execute("UPDATE capture_session SET enabled = ?, sensitivity = ?, cooldown_ms = ? WHERE singleton = 1", params![enabled, sensitivity, cooldown_ms])?;
+        self.writer.call(move |store| {
+            store.db.execute("UPDATE capture_session SET enabled = ?, sensitivity = ?, cooldown_ms = ? WHERE singleton = 1", params![enabled, sensitivity, cooldown_ms])?;
+            store.wrote();
+            Ok(())
+        })?;
         if !enabled || !self.enabled {
             self.armed_at = Instant::now();
         }
         self.enabled = enabled;
         self.sensitivity = sensitivity;
         self.cooldown_ms = cooldown_ms;
-        self.checkpoint()?;
+        // Changing settings is also how a user retries after freeing space.
+        self.retry_storage();
+        lock(&self.shared).note = None;
         Ok(())
     }
 
+    /// Let the next suggestion try storage again. Every queued write has
+    /// landed by now, so a failure one left behind is stale.
+    fn retry_storage(&mut self) {
+        lock(&self.shared).failure = None;
+        self.refused = None;
+        self.unsaved = None;
+        self.blocked_storage = false;
+    }
+
     pub fn status(&self) -> Result<SessionStatus> {
-        let (manual_count, kept_count, discarded_count, pending_count, bytes) = self.counts()?;
+        let shared = lock(&self.shared);
+        let tally = shared.tally;
+        let blocked_storage = self.blocked_storage || tally.bytes >= MAX_STORED_BYTES;
         let state = if !self.enabled {
             "paused"
-        } else if pending_count >= MAX_PENDING {
+        } else if tally.pending >= MAX_PENDING {
             "review_queue_full"
-        } else if self.blocked_storage || bytes >= MAX_STORED_BYTES {
+        } else if blocked_storage {
             "storage_full"
         } else if self.positive.is_empty() {
             "learning"
         } else {
             "watching"
         };
+        let throughput = self
+            .embedder
+            .as_ref()
+            .map(|e| e.throughput.lock().unwrap_or_else(|e| e.into_inner()));
         Ok(SessionStatus {
             path: self.path.to_string_lossy().into_owned(),
             camera: self.camera.clone(),
             enabled: self.enabled,
             sensitivity: self.sensitivity,
             cooldown_ms: self.cooldown_ms,
-            manual_count,
-            kept_count,
-            discarded_count,
-            pending_count,
-            blocked_storage: self.blocked_storage || bytes >= MAX_STORED_BYTES,
+            manual_count: tally.manual,
+            kept_count: tally.kept,
+            discarded_count: tally.discarded,
+            pending_count: tally.pending,
+            blocked_storage,
             state: state.into(),
             model: self.encoder.label(),
             encoder: self.encoder.name().into(),
-            accelerator: self.embedder.as_ref().and_then(|e| {
-                e.throughput
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .accelerator
-                    .clone()
+            accelerator: throughput.as_ref().and_then(|t| t.accelerator.clone()),
+            samples_per_second: throughput.as_ref().and_then(|t| t.rate()).map(|rate| {
+                // Paced CPU sampling below one per second keeps two decimals.
+                let scale = if rate < 1.0 { 100.0 } else { 10.0 };
+                (rate * scale).round() / scale
             }),
-            samples_per_second: self.embedder.as_ref().and_then(|e| {
-                e.throughput
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .rate()
-                    .map(|rate| (rate * 10.0).round() / 10.0)
-            }),
+            note: shared
+                .note
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < NOTE_LIFETIME)
+                .map(|(_, note)| note.clone()),
         })
     }
 
-    /// Evaluate at most four small previews per second. Automatic suggestions do
-    /// not become training examples until the user reviews them.
+    /// Sample frames on the encoder's grid. Automatic suggestions do not
+    /// become training examples until the user reviews them. Scoring stays
+    /// in memory; a suggestion is written by the session's writer, so
+    /// acquisition never waits for the disk.
     pub fn observe(&mut self, frame: &Frame) -> Result<Option<u64>> {
         self.observe_at(frame, Instant::now())
     }
@@ -843,7 +1118,7 @@ impl CaptureSession {
         if self
             .last_sample
             .is_some_and(|last| now + interval / 4 < last + interval)
-            || self.embedder.as_ref().is_some_and(|e| e.busy)
+            || self.embedder.as_ref().is_some_and(|e| e.waiting(now))
         {
             return Ok(captured);
         }
@@ -851,14 +1126,14 @@ impl CaptureSession {
             Some(last) if now.saturating_duration_since(last) < 2 * interval => last + interval,
             _ => now,
         });
-        if !self.has_room(frame)? {
+        if !self.has_room(frame, now)? {
             return Ok(captured);
         }
         match &mut self.embedder {
             Some(embedder) => embedder.submit(frame.clone(), now)?,
             None => {
                 let feature = self.encoder.describe(frame)?;
-                if let Some(id) = self.decide(frame, feature, now)? {
+                if let Some(id) = self.decide(Cow::Borrowed(frame), feature, now)? {
                     captured = Some(id);
                 }
             }
@@ -866,11 +1141,19 @@ impl CaptureSession {
         Ok(captured)
     }
 
-    /// Whether another pending capture fits the review queue and pixel budget.
-    fn has_room(&mut self, frame: &Frame) -> Result<bool> {
-        let (_, _, _, pending, bytes) = self.counts()?;
-        self.blocked_storage = bytes.saturating_add(frame.data.len() as u64) > MAX_STORED_BYTES;
-        Ok(pending < MAX_PENDING && !self.blocked_storage)
+    /// Whether another pending capture fits the review queue and pixel
+    /// budget, and storage is not holding suggestions back after a failed save.
+    fn has_room(&mut self, frame: &Frame, now: Instant) -> Result<bool> {
+        let tally = self.settle(now)?;
+        self.refused = self
+            .refused
+            .filter(|at| now.saturating_duration_since(*at) < STORAGE_RETRY);
+        self.unsaved = self
+            .unsaved
+            .filter(|at| now.saturating_duration_since(*at) < WRITE_RETRY);
+        self.blocked_storage = self.refused.is_some()
+            || tally.bytes.saturating_add(frame.data.len() as u64) > MAX_STORED_BYTES;
+        Ok(tally.pending < MAX_PENDING && !self.blocked_storage && self.unsaved.is_none())
     }
 
     /// Decide on a background embedding that has finished, on the frame it
@@ -888,7 +1171,7 @@ impl CaptureSession {
             .flatten()
         {
             Some((frame, sampled, finished, feature)) => {
-                self.decide_late(&frame, feature?, sampled, finished)
+                self.decide_late(frame, feature?, sampled, finished)
             }
             None => Ok(None),
         }
@@ -897,21 +1180,30 @@ impl CaptureSession {
     /// An embedding that took too long belongs to a scene that has moved on.
     fn decide_late(
         &mut self,
-        frame: &Frame,
+        frame: Frame,
         feature: Descriptor,
         sampled: Instant,
         finished: Instant,
     ) -> Result<Option<u64>> {
+        let stale_after = self
+            .embedder
+            .as_ref()
+            .map_or(STALE_SAMPLE, Embedder::stale_after);
         if sampled < self.armed_at
-            || finished.saturating_duration_since(sampled) > STALE_SAMPLE
-            || !self.has_room(frame)?
+            || finished.saturating_duration_since(sampled) > stale_after
+            || !self.has_room(&frame, finished)?
         {
             return Ok(None);
         }
-        self.decide(frame, feature, sampled)
+        self.decide(Cow::Owned(frame), feature, sampled)
     }
 
-    fn decide(&mut self, frame: &Frame, feature: Descriptor, now: Instant) -> Result<Option<u64>> {
+    fn decide(
+        &mut self,
+        frame: Cow<'_, Frame>,
+        feature: Descriptor,
+        now: Instant,
+    ) -> Result<Option<u64>> {
         let metric = self.encoder.metric();
         let (score, reason) = self.score(&feature);
         let now_ms = self.started_ms.saturating_add(
@@ -933,10 +1225,24 @@ impl CaptureSession {
         // background (minimum exact-match score is 0.90).
         let threshold = 0.90 - 0.35 * self.sensitivity;
         if !self.positive.is_empty() && !cooling && !duplicate && score >= threshold {
-            let id = self.insert(frame, &feature, "automatic", "pending", score, &reason)?;
+            // Copy the frame only when the writer can take it.
+            if !self.writer.ready() {
+                lock(&self.shared).note(BUSY_NOTE.into());
+                return Ok(None);
+            }
+            let row = self.row(
+                frame,
+                feature.clone(),
+                "automatic",
+                "pending",
+                score,
+                reason,
+            )?;
+            let id = row.id;
+            self.writer.post(move |store| store.insert(row))?;
+            lock(&self.shared).note = None;
             self.last_capture = Some(now);
             push_bounded(&mut self.recent, (feature, now_ms), MAX_RECENT);
-            self.checkpoint()?;
             return Ok(Some(id));
         }
         // Do not absorb a likely target into normal background. Persist only
@@ -947,11 +1253,11 @@ impl CaptureSession {
                 .background
                 .iter()
                 .all(|previous| self.encoder.distance(previous, &feature) >= metric.distinct);
-            if distinct {
-                self.db.execute(
-                    "INSERT INTO background VALUES (?, ?)",
-                    params![self.background.len() as u32, encode(&feature)],
-                )?;
+            // A busy writer skips the prototype; a later sample offers it again.
+            if distinct && self.writer.ready() {
+                let (id, bytes) = (self.background.len() as u32, encode(&feature));
+                self.writer
+                    .post(move |store| store.add_background(id, bytes))?;
                 self.background.push(feature);
             }
         }
@@ -965,152 +1271,115 @@ impl CaptureSession {
             Some(embedder) => embedder.describe(frame)?,
             None => self.encoder.describe(frame)?,
         };
-        let id = self.insert(
-            frame,
-            &feature,
+        let row = self.row(
+            Cow::Borrowed(frame),
+            feature.clone(),
             "manual",
             "manual",
             1.0,
-            "User-initiated capture: positive training example",
+            "User-initiated capture: positive training example".into(),
         )?;
-        self.reload_examples()?;
+        let id = row.id;
+        let (positive, negative) = self.writer.call(move |store| {
+            store.insert(row)?;
+            examples(&store.db, &store.encoder)
+        })?;
+        self.positive = positive;
+        self.negative = negative;
         push_bounded(&mut self.recent, (feature, epoch_ms()), MAX_RECENT);
         self.last_capture = Some(Instant::now());
-        self.checkpoint()?;
         Ok(id)
     }
 
-    /// A pending-only transaction prevents a double key press or stale review
-    /// card from relabeling a capture. Discarding releases raw pixels while
-    /// keeping the descriptor and negative decision for future learning.
+    /// Keeping changes only the label. Discarding deletes the frame file
+    /// through the storage ledger and keeps the descriptor and negative
+    /// decision for future learning.
     pub fn review(&mut self, id: u64, keep: bool) -> Result<()> {
-        let tx = self.db.transaction()?;
-        let bytes: Option<Vec<u8>> = tx
-            .query_row(
-                "SELECT descriptor FROM captures WHERE id = ? AND label = 'pending'",
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        self.encoder
-            .decode(&bytes.context("capture is no longer pending review")?)?;
-        let changed = tx.execute("UPDATE captures SET label = ?, reviewed_ms = ?, data = CASE WHEN ? THEN data ELSE NULL END, data_bytes = CASE WHEN ? THEN data_bytes ELSE 0 END WHERE id = ? AND label = 'pending'",
-            params![if keep { "kept" } else { "discarded" }, epoch_ms(), keep, keep, id])?;
-        ensure!(changed == 1, "capture is no longer pending review");
-        tx.commit()?;
-        self.reload_examples()?;
+        let (positive, negative) = self.writer.call(move |store| {
+            store.review(id, keep)?;
+            examples(&store.db, &store.encoder)
+        })?;
+        self.positive = positive;
+        self.negative = negative;
         if !keep {
-            self.blocked_storage = false;
+            self.retry_storage();
         }
-        self.checkpoint()?;
         Ok(())
     }
 
     pub fn next_review(&self) -> Result<Option<ReviewCapture>> {
-        self.load_review(None)
+        self.writer.call(|store| store.load_review(None))
     }
 
     pub fn review_capture(&self, id: u64) -> Result<Option<ReviewCapture>> {
-        self.load_review(Some(id))
+        self.writer.call(move |store| store.load_review(Some(id)))
     }
 
-    /// Flush DuckDB's recovery log into the session file before transferring it
-    /// or explicitly closing it. Callers can retain the live session on error.
-    pub fn checkpoint(&self) -> Result<()> {
-        self.db
-            .execute_batch("CHECKPOINT")
-            .context("checkpoint capture session into its portable DuckDB file")
+    /// Finish queued writes and checkpoint, so the database file is complete
+    /// without its WAL. The session closes even if this fails: DuckDB replays
+    /// the WAL when the session is resumed.
+    pub fn close(mut self) -> Result<()> {
+        self.writer.close()
     }
 
-    fn reload_examples(&mut self) -> Result<()> {
-        let mut positive = load_descriptors(
-            &self.db,
-            &self.encoder,
-            "SELECT descriptor FROM captures WHERE label IN ('manual', 'kept') ORDER BY id DESC LIMIT 256",
-        )?;
-        let mut negative = load_descriptors(
-            &self.db,
-            &self.encoder,
-            "SELECT descriptor FROM captures WHERE label = 'discarded' ORDER BY id DESC LIMIT 256",
-        )?;
-        positive.reverse();
-        negative.reverse();
-        self.positive = positive;
-        self.negative = negative;
-        Ok(())
-    }
-
-    fn load_review(&self, id: Option<u64>) -> Result<Option<ReviewCapture>> {
-        let result = self.db.query_row(
-            "SELECT id, frame_id, width, height, pixel_format, timestamp_ns, data, score, reason FROM captures
-             WHERE label = 'pending' AND (?::UBIGINT IS NULL OR id = ?::UBIGINT) ORDER BY id LIMIT 1",
-            params![id, id], |r| Ok(ReviewCapture { id: r.get(0)?, frame: Frame { id:r.get(1)?,width:r.get(2)?,height:r.get(3)?,pixel_format:r.get(4)?,timestamp_ns:r.get(5)?,data:r.get(6)? },score:r.get(7)?,reason:r.get(8)? })).optional()?;
-        if let Some(capture) = &result {
-            // Validate metadata before callers allocate a UI image for a file
-            // which may have been modified outside CaptureFab.
-            ensure!(
-                capture.frame.data.len() <= MAX_FRAME_BYTES,
-                "stored frame exceeds capture size limit"
-            );
-            descriptor(&capture.frame).context("corrupt capture frame in session")?;
-            ensure!(capture.score.is_finite(), "invalid stored capture score");
+    /// Apply the outcome of queued writes. A frame storage refused or could
+    /// not save holds suggestions back for a while; any other failure is
+    /// returned so the caller can pause.
+    fn settle(&mut self, now: Instant) -> Result<Tally> {
+        let mut shared = lock(&self.shared);
+        if let Some(error) = shared.failure.take() {
+            if crate::cli::error_code(&error).0 == "storage_full" {
+                self.refused = Some(now);
+            } else if error.downcast_ref::<FrameNotSaved>().is_some() {
+                self.unsaved = Some(now);
+            } else {
+                return Err(error);
+            }
+            shared.note(format!("{error:#}"));
         }
-        Ok(result)
+        Ok(shared.tally)
     }
 
-    fn counts(&self) -> Result<(u64, u64, u64, u64, u64)> {
-        Ok(self.db.query_row(
-            "SELECT COUNT(*) FILTER (WHERE label = 'manual'), COUNT(*) FILTER (WHERE label = 'kept'),
-                    COUNT(*) FILTER (WHERE label = 'discarded'), COUNT(*) FILTER (WHERE label = 'pending'),
-                    COALESCE(SUM(data_bytes), 0)::UBIGINT FROM captures", [],
-            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?)
-    }
-
-    fn insert(
+    /// Assign the next identifier and reserve the capture's counts.
+    fn row(
         &mut self,
-        frame: &Frame,
-        feature: &Descriptor,
-        source: &str,
-        label: &str,
+        frame: Cow<'_, Frame>,
+        feature: Descriptor,
+        source: &'static str,
+        label: &'static str,
         score: f64,
-        reason: &str,
-    ) -> Result<u64> {
+        reason: String,
+    ) -> Result<Row> {
         ensure!(
             frame.data.len() <= MAX_FRAME_BYTES,
             "frame exceeds 256 MiB session capture limit"
         );
-        let (_, _, _, _, bytes) = self.counts()?;
-        self.blocked_storage = bytes.saturating_add(frame.data.len() as u64) > MAX_STORED_BYTES;
-        ensure!(
-            !self.blocked_storage,
-            "capture session reached its 2 GiB pixel storage limit; start another session or discard pending captures"
-        );
+        let bytes = frame.data.len() as u64;
         let next_id = self
             .next_id
             .checked_add(1)
             .context("capture session identifier overflow")?;
-        self.db.execute(
-            "INSERT INTO captures VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
-            params![
-                self.next_id,
-                epoch_ms(),
-                source,
-                label,
-                frame.id,
-                frame.width,
-                frame.height,
-                frame.pixel_format,
-                frame.timestamp_ns,
-                &frame.data,
-                frame.data.len() as u64,
-                encode(feature),
-                score,
-                reason
-            ],
-        )?;
+        {
+            let mut shared = lock(&self.shared);
+            self.blocked_storage = shared.tally.bytes.saturating_add(bytes) > MAX_STORED_BYTES;
+            ensure!(
+                !self.blocked_storage,
+                "Storage full: capture session reached its 2 GiB pixel storage limit; start another session or discard pending captures"
+            );
+            shared.tally.add(label, bytes);
+        }
         let id = self.next_id;
         self.next_id = next_id;
-        Ok(id)
+        Ok(Row {
+            id,
+            created_ms: epoch_ms(),
+            source,
+            label,
+            frame: frame.into_owned(),
+            feature,
+            score,
+            reason,
+        })
     }
 
     fn score(&self, feature: &Descriptor) -> (f64, String) {
@@ -1157,12 +1426,461 @@ impl CaptureSession {
     }
 }
 
-impl Drop for CaptureSession {
-    fn drop(&mut self) {
-        // A cleanly closed session is one portable file, including all labels
-        // and raw pixels. DuckDB's WAL protects interrupted writes while open.
-        let _ = self.checkpoint();
+type Task = Box<dyn FnOnce(&mut Store) + Send>;
+
+/// The 'capturefab-autocapture' thread. It owns the DuckDB connection and runs
+/// every statement and frame write in order, off the camera thread.
+struct Writer {
+    tasks: Option<SyncSender<Task>>,
+    thread: Option<JoinHandle<Result<()>>>,
+    shared: Arc<Mutex<Shared>>,
+}
+
+impl Writer {
+    fn spawn(store: Store) -> Result<Self> {
+        let shared = store.shared.clone();
+        let (tasks, queue) = mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name("capturefab-autocapture".into())
+            .spawn(move || store.run(queue))
+            .context("start capture session writer")?;
+        Ok(Self {
+            tasks: Some(tasks),
+            thread: Some(thread),
+            shared,
+        })
     }
+
+    fn ready(&self) -> bool {
+        lock(&self.shared).queued == 0
+    }
+
+    /// Queue a task without waiting for it; its failure is reported by the
+    /// next sample. Only the camera thread queues tasks, so after `ready`
+    /// there is room.
+    fn post(&self, task: impl FnOnce(&mut Store) -> Result<()> + Send + 'static) -> Result<()> {
+        let tasks = self.tasks.as_ref().ok_or_else(stopped)?;
+        lock(&self.shared).queued += 1;
+        let task = Box::new(move |store: &mut Store| {
+            if let Err(error) = task(store) {
+                lock(&store.shared).failure.get_or_insert(error);
+            }
+        });
+        tasks.try_send(task).map_err(|error| {
+            lock(&self.shared).queued -= 1;
+            match error {
+                TrySendError::Full(_) => anyhow!("capture session writer is busy"),
+                TrySendError::Disconnected(_) => stopped(),
+            }
+        })
+    }
+
+    /// Run a task after those already queued and wait for its result.
+    fn call<T: Send + 'static>(
+        &self,
+        task: impl FnOnce(&mut Store) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let tasks = self.tasks.as_ref().ok_or_else(stopped)?;
+        let (reply, result) = mpsc::channel();
+        lock(&self.shared).queued += 1;
+        if tasks
+            .send(Box::new(move |store: &mut Store| {
+                let _ = reply.send(task(store));
+            }))
+            .is_err()
+        {
+            lock(&self.shared).queued -= 1;
+            return Err(stopped());
+        }
+        result.recv().map_err(|_| stopped())?
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.tasks.take();
+        match self.thread.take() {
+            Some(thread) => thread.join().map_err(|_| stopped())?,
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+fn stopped() -> anyhow::Error {
+    anyhow!("capture session writer stopped")
+}
+
+/// The writer's side of a session: its database connection and frames folder.
+struct Store {
+    db: Connection,
+    encoder: Encoder,
+    frames: PathBuf,
+    dirty_since: Option<Instant>,
+    shared: Arc<Mutex<Shared>>,
+}
+
+impl Store {
+    /// Run tasks until the session closes. The WAL makes each write durable;
+    /// checkpoints fold it into the database at most once a minute, and on close.
+    fn run(mut self, queue: mpsc::Receiver<Task>) -> Result<()> {
+        loop {
+            let task = match self.dirty_since {
+                None => queue.recv().ok(),
+                Some(since) => {
+                    match queue.recv_timeout(CHECKPOINT_INTERVAL.saturating_sub(since.elapsed())) {
+                        Ok(task) => Some(task),
+                        Err(RecvTimeoutError::Timeout) => {
+                            if self.checkpoint().is_err() {
+                                self.dirty_since = Some(Instant::now());
+                            }
+                            continue;
+                        }
+                        Err(RecvTimeoutError::Disconnected) => None,
+                    }
+                }
+            };
+            let Some(task) = task else {
+                return self.checkpoint();
+            };
+            lock(&self.shared).queued -= 1;
+            task(&mut self);
+        }
+    }
+
+    fn wrote(&mut self) {
+        self.dirty_since.get_or_insert_with(Instant::now);
+    }
+
+    fn checkpoint(&mut self) -> Result<()> {
+        self.db
+            .execute_batch("CHECKPOINT")
+            .context("checkpoint capture session database")?;
+        self.dirty_since = None;
+        Ok(())
+    }
+
+    /// Save the frame file, then its row, so a row never names a partial file.
+    /// A failure releases the counts reserved for the capture.
+    fn insert(&mut self, row: Row) -> Result<()> {
+        let (label, bytes) = (row.label, row.frame.data.len() as u64);
+        let result = self.save(&row);
+        if result.is_err() {
+            lock(&self.shared).tally.remove(label, bytes);
+        }
+        result
+    }
+
+    fn save(&mut self, row: &Row) -> Result<()> {
+        let (name, sha256) = self
+            .write_frame(row.id, &row.frame.data)
+            .context(FrameNotSaved)?;
+        let inserted = self.db.execute(
+            "INSERT INTO captures (id, created_ms, source, label, frame_id, width, height, pixel_format,
+                timestamp_ns, data_bytes, descriptor, score, reason, frame_path, frame_sha256)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                row.id,
+                row.created_ms,
+                row.source,
+                row.label,
+                row.frame.id,
+                row.frame.width,
+                row.frame.height,
+                row.frame.pixel_format,
+                row.frame.timestamp_ns,
+                row.frame.data.len() as u64,
+                encode(&row.feature),
+                row.score,
+                row.reason,
+                name,
+                sha256
+            ],
+        );
+        self.wrote();
+        if let Err(error) = inserted {
+            let _ = storage::remove(&self.frames.join(&name));
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    fn add_background(&mut self, id: u32, descriptor: Vec<u8>) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO background VALUES (?, ?)",
+            params![id, descriptor],
+        )?;
+        self.wrote();
+        Ok(())
+    }
+
+    /// Write a raw frame through the storage ledger, which applies the global
+    /// budget, volume checks and never-overwrite. Frames have no limits of
+    /// their own: any other request policy could only tighten the one the
+    /// user configured, and delete-oldest would then remove captures that
+    /// budget keeps. A name left by an interrupted session is skipped, not
+    /// replaced.
+    fn write_frame(&self, id: u64, data: &[u8]) -> Result<(String, String)> {
+        self.check_folder()?;
+        let policy = storage::configured_policy()?;
+        for attempt in 0..8 {
+            let name = match attempt {
+                0 => format!("{id:08}.raw"),
+                n => format!("{id:08}-{n}.raw"),
+            };
+            let mut writer = match storage::create_writer(
+                &self.frames.join(&name),
+                &policy,
+                data.len() as u64,
+            ) {
+                Ok(writer) => writer,
+                Err(error) if error.downcast_ref::<storage::OutputExists>().is_some() => continue,
+                Err(error) => return Err(error),
+            };
+            writer.write_all(data)?;
+            let sha256 = writer.sha256();
+            writer.finish()?;
+            return Ok((name, sha256));
+        }
+        bail!(
+            "no free frame file name for capture {id} in {}",
+            self.frames.display()
+        )
+    }
+
+    /// The folder must already exist. Writing never recreates a folder that
+    /// was moved away, so a review never takes its frames for deleted.
+    fn check_folder(&self) -> Result<()> {
+        crate::volumes::ensure_present(&self.frames)?;
+        ensure!(
+            self.frames.is_dir(),
+            "capture session frames folder {} is missing; keep it beside the database",
+            self.frames.display()
+        );
+        Ok(())
+    }
+
+    /// A pending-only transaction prevents a double key press or stale review
+    /// card from relabeling a capture.
+    fn review(&mut self, id: u64, keep: bool) -> Result<()> {
+        let tx = self.db.transaction()?;
+        let row: Option<(Vec<u8>, u64, Option<String>)> = tx
+            .query_row(
+                "SELECT descriptor, data_bytes, frame_path FROM captures WHERE id = ? AND label = 'pending'",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let (descriptor, bytes, frame_path) = row.context("capture is no longer pending review")?;
+        self.encoder.decode(&descriptor)?;
+        let file = frame_path
+            .map(|name| frame_file(&self.frames, &name))
+            .transpose()?;
+        let now = epoch_ms();
+        let changed = if keep {
+            tx.execute(
+                "UPDATE captures SET label = 'kept', reviewed_ms = ? WHERE id = ? AND label = 'pending'",
+                params![now, id],
+            )?
+        } else {
+            // Release the pixels: older rows keep them in `data`, newer rows
+            // in the file deleted below.
+            tx.execute(
+                "UPDATE captures SET label = 'discarded', reviewed_ms = ?, data = NULL, data_bytes = 0, frame_path = NULL, frame_sha256 = NULL WHERE id = ? AND label = 'pending'",
+                params![now, id],
+            )?
+        };
+        ensure!(changed == 1, "capture is no longer pending review");
+        tx.commit()?;
+        self.wrote();
+        {
+            let mut shared = lock(&self.shared);
+            shared.tally.remove("pending", if keep { 0 } else { bytes });
+            shared.tally.add(if keep { "kept" } else { "discarded" }, 0);
+        }
+        // Delete only once the decision is saved: a failed delete leaves a
+        // file the ledger still tracks, never a lost decision.
+        if let (false, Some(path)) = (keep, file) {
+            self.delete_frame(id, &path);
+        }
+        Ok(())
+    }
+
+    /// Delete a discarded capture's frame through the ledger. A file that
+    /// changed after saving, or cannot be deleted now, stays with a note.
+    fn delete_frame(&self, id: u64, path: &Path) {
+        let left = match storage::remove(path) {
+            Ok(removed) => (!removed && path.exists())
+                .then(|| "it changed after saving or was saved on another computer".into()),
+            Err(error) => Some(format!("{error:#}")),
+        };
+        if let Some(reason) = left {
+            lock(&self.shared).note(format!(
+                "Discarded capture {id} but left {} in place: {reason}",
+                path.display()
+            ));
+        }
+    }
+
+    fn load_review(&mut self, id: Option<u64>) -> Result<Option<ReviewCapture>> {
+        loop {
+            let row = self.db.query_row(
+                "SELECT id, frame_id, width, height, pixel_format, timestamp_ns, data, score, reason, data_bytes, frame_path, frame_sha256
+                 FROM captures WHERE label = 'pending' AND (?::UBIGINT IS NULL OR id = ?::UBIGINT) ORDER BY id LIMIT 1",
+                params![id, id],
+                |r| {
+                    let capture = ReviewCapture { id: r.get(0)?, frame: Frame { id:r.get(1)?,width:r.get(2)?,height:r.get(3)?,pixel_format:r.get(4)?,timestamp_ns:r.get(5)?,data:r.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default() },score:r.get(7)?,reason:r.get(8)? };
+                    Ok((capture, r.get::<_, u64>(9)?, r.get::<_, Option<String>>(10)?, r.get::<_, Option<String>>(11)?))
+                },
+            ).optional()?;
+            let Some((mut capture, bytes, frame_path, sha256)) = row else {
+                return Ok(None);
+            };
+            if let Some(name) = frame_path {
+                let path = frame_file(&self.frames, &name)?;
+                match self.read_frame(&path, bytes, sha256.as_deref())? {
+                    Ok(data) => capture.frame.data = data,
+                    Err(lost) => {
+                        self.forget(capture.id, bytes, &path, lost)?;
+                        continue;
+                    }
+                }
+            }
+            // Validate metadata before callers allocate a UI image for a file
+            // which may have been modified outside CaptureFab.
+            ensure!(
+                capture.frame.data.len() <= MAX_FRAME_BYTES,
+                "stored frame exceeds capture size limit"
+            );
+            descriptor(&capture.frame).context("corrupt capture frame in session")?;
+            ensure!(capture.score.is_finite(), "invalid stored capture score");
+            return Ok(Some(capture));
+        }
+    }
+
+    /// A pending frame's bytes, or why they are lost: storage retention or a
+    /// user deleted the file, or it no longer holds what was saved. A missing
+    /// folder or volume is an error, so it never empties the review queue.
+    fn read_frame(
+        &self,
+        path: &Path,
+        bytes: u64,
+        sha256: Option<&str>,
+    ) -> Result<Result<Vec<u8>, &'static str>> {
+        ensure!(
+            bytes <= MAX_FRAME_BYTES as u64,
+            "stored frame exceeds capture size limit"
+        );
+        self.check_folder()?;
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Err("was deleted")),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", path.display()));
+            }
+        };
+        let mut data = Vec::with_capacity(bytes as usize);
+        file.take(bytes + 1).read_to_end(&mut data)?;
+        if data.len() as u64 != bytes
+            || sha256 != Some(format!("{:x}", Sha256::digest(&data)).as_str())
+        {
+            return Ok(Err("changed after saving and was left in place"));
+        }
+        Ok(Ok(data))
+    }
+
+    /// Drop a pending capture whose frame is lost, so it cannot block the
+    /// review queue. Pending captures never train the model, so nothing
+    /// learned is lost.
+    fn forget(&mut self, id: u64, bytes: u64, path: &Path, lost: &str) -> Result<()> {
+        let removed = self.db.execute(
+            "DELETE FROM captures WHERE id = ? AND label = 'pending'",
+            params![id],
+        )?;
+        self.wrote();
+        ensure!(removed == 1, "capture is no longer pending review");
+        let mut shared = lock(&self.shared);
+        shared.tally.remove("pending", bytes);
+        shared.note(format!(
+            "Removed pending capture {id}: its frame file {} {lost}",
+            path.display()
+        ));
+        Ok(())
+    }
+}
+
+/// Schema 3 keeps frames as files beside the database; rows saved before
+/// keep their pixels in `data` and review exactly as before. Schema 1
+/// sessions predate encoder choice, so all of them are native.
+fn upgrade(db: &Connection) -> Result<()> {
+    db.execute_batch(&format!(
+        "BEGIN;
+         ALTER TABLE capture_session ADD COLUMN IF NOT EXISTS encoder VARCHAR DEFAULT 'native';
+         ALTER TABLE capture_session ADD COLUMN IF NOT EXISTS descriptor_dims UINTEGER DEFAULT {FEATURES};
+         ALTER TABLE capture_session ADD COLUMN IF NOT EXISTS model_fingerprint VARCHAR;
+         ALTER TABLE captures ADD COLUMN IF NOT EXISTS frame_path VARCHAR;
+         ALTER TABLE captures ADD COLUMN IF NOT EXISTS frame_sha256 VARCHAR;
+         UPDATE capture_session SET schema_version = {SCHEMA_VERSION} WHERE singleton = 1;
+         COMMIT;
+         CHECKPOINT;"
+    ))
+    .context("upgrade capture session to frame files")
+}
+
+/// Create a session's frames folder. It must not exist yet, which reserves
+/// the name, so a session never mixes another's frames into its own.
+fn claim(frames: &Path) -> Result<()> {
+    match std::fs::create_dir(frames) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => bail!(
+            "capture session frames folder already exists: {}; choose another session name",
+            frames.display()
+        ),
+        Err(error) => Err(error)
+            .with_context(|| format!("create capture session frames folder {}", frames.display())),
+    }
+}
+
+/// A stored frame name resolved inside the frames folder; a modified
+/// database cannot point outside it.
+fn frame_file(frames: &Path, name: &str) -> Result<PathBuf> {
+    let mut components = Path::new(name).components();
+    ensure!(
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none(),
+        "invalid frame file name in capture session"
+    );
+    Ok(frames.join(name))
+}
+
+fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
+    shared.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn counts(db: &Connection) -> Result<Tally> {
+    Ok(db.query_row(
+        "SELECT COUNT(*) FILTER (WHERE label = 'manual'), COUNT(*) FILTER (WHERE label = 'kept'),
+                COUNT(*) FILTER (WHERE label = 'discarded'), COUNT(*) FILTER (WHERE label = 'pending'),
+                COALESCE(SUM(data_bytes), 0)::UBIGINT FROM captures", [],
+        |r| Ok(Tally { manual: r.get(0)?, kept: r.get(1)?, discarded: r.get(2)?, pending: r.get(3)?, bytes: r.get(4)? }))?)
+}
+
+fn examples(db: &Connection, encoder: &Encoder) -> Result<(Vec<Descriptor>, Vec<Descriptor>)> {
+    let mut positive = load_descriptors(
+        db,
+        encoder,
+        "SELECT descriptor FROM captures WHERE label IN ('manual', 'kept') ORDER BY id DESC LIMIT 256",
+    )?;
+    let mut negative = load_descriptors(
+        db,
+        encoder,
+        "SELECT descriptor FROM captures WHERE label = 'discarded' ORDER BY id DESC LIMIT 256",
+    )?;
+    positive.reverse();
+    negative.reverse();
+    Ok((positive, negative))
 }
 
 fn validate_settings(sensitivity: f64, cooldown_ms: u64) -> Result<()> {
@@ -1279,6 +1997,39 @@ fn descriptor(frame: &Frame) -> Result<Descriptor> {
     feature[82] = (gradient_sum / n).clamp(0.0, 1.0);
     feature[83] = (frame.width as f64 / (f64::from(frame.width) + f64::from(frame.height))) as f32;
     Ok(feature)
+}
+
+#[cfg(test)]
+impl CaptureSession {
+    /// Run SQL on the writer's connection after every queued write lands.
+    fn sql<T: Send + 'static>(
+        &self,
+        query: impl FnOnce(&Connection) -> duckdb::Result<T> + Send + 'static,
+    ) -> T {
+        self.writer
+            .call(move |store| Ok(query(&store.db)?))
+            .unwrap()
+    }
+    /// Wait until every queued write has landed.
+    fn flush(&self) {
+        self.writer.call(|_| Ok(())).unwrap();
+    }
+    /// Recount after tests edit rows behind the session's back.
+    fn recount(&self) {
+        let tally = self.writer.call(|store| counts(&store.db)).unwrap();
+        lock(&self.shared).tally = tally;
+    }
+    /// Hold a write transaction open on another connection, which makes
+    /// DuckDB refuse to checkpoint until it is dropped.
+    pub(crate) fn block_checkpoints(&self) -> Connection {
+        self.sql(|db| {
+            let other = db.try_clone()?;
+            other.execute_batch(
+                "BEGIN; UPDATE capture_session SET cooldown_ms = cooldown_ms WHERE singleton = 1;",
+            )?;
+            Ok(other)
+        })
+    }
 }
 
 #[cfg(test)]

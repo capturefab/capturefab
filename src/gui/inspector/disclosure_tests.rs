@@ -265,11 +265,13 @@ fn active_automatic_sessions_prioritize_review_without_moving_editors_on_suggest
         encoder: "native".into(),
         accelerator: None,
         samples_per_second: None,
+        note: None,
     });
     let active = snapshot(&app, Tab::Capture, &mut tree, &renderer);
     assert_eq!(output_control(&active).0, output_id);
     let (review_id, review) = named(&active, "Review suggestions (0)");
     let review_bounds = review.bounds().unwrap();
+    let teach_bounds = named(&active, "Capture example").1.bounds();
     assert!(review_bounds.y1 < output_control(&active).1.bounds().unwrap().y0);
     assert!(
         review_bounds.y1 < 360.0,
@@ -281,6 +283,17 @@ fn active_automatic_sessions_prioritize_review_without_moving_editors_on_suggest
     assert_eq!(current_id, review_id);
     assert_eq!(review.bounds(), Some(review_bounds));
     assert_eq!(output_control(&suggestions).0, output_id);
+    // Notes appear and fade around suggestions without moving the actions.
+    app.snapshot.capture_session.as_mut().unwrap().note = Some(
+        "Discarded capture 12 but left /isolated/review.frames/00000012.raw in place: it changed after saving or was saved on another computer".into(),
+    );
+    let noted = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    assert_eq!(
+        named(&noted, "Review suggestions (3)").1.bounds(),
+        Some(review_bounds)
+    );
+    assert_eq!(named(&noted, "Capture example").1.bounds(), teach_bounds);
+    assert_eq!(output_control(&noted).0, output_id);
     app.snapshot.capture_session = None;
     let closed = snapshot(&app, Tab::Capture, &mut tree, &renderer);
     assert_eq!(output_control(&closed).0, output_id);

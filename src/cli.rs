@@ -649,7 +649,7 @@ pub enum WorkflowCommand {
 }
 #[derive(Debug, Subcommand)]
 pub enum CaptureSessionCommand {
-    /// Create a new camera-bound DuckDB session; existing files are never overwritten
+    /// Create a camera-bound DuckDB session and its .frames folder; existing files are never overwritten
     New {
         path: PathBuf,
         /// Image encoder: auto uses the bundled DINOv2 model, on the GPU when possible
@@ -2821,18 +2821,18 @@ fn schema() -> Value {
     contract["capture_session"] = json!({
         "cli":"--session NAME [--camera ID] capture-session new PATH.duckdb [--encoder auto|dinov2|native] | resume PATH.duckdb | close | teach | auto [--pause] [--sensitivity 0.5] [--cooldown-ms 2000] | review [--id ID] | keep ID | discard ID",
         "encoders":{
-            "auto":"default for new sessions: dinov2 when the build bundles it (release builds do), otherwise native",
-            "dinov2":"L2-normalized CLS embedding of Meta's DINOv2 ViT-S/14 (facebook/dinov2-small, Apache-2.0), bundled in the executable; nothing is downloaded. Frames are squashed to 224x224 and ImageNet-normalized, then embedded on the GPU (wgpu: Metal, Vulkan or DX12) in an isolated helper process, or on the CPU when no hardware GPU is usable, the helper fails or it misses its 2 s deadline. Sampling follows the camera at up to 30 frames per second; status reports accelerator and samples_per_second. CAPTUREFAB_DINOV2_GPU=0 forces the CPU",
+            "auto":"default for new sessions: dinov2 when the build bundles it (release builds do), otherwise native. It stays dinov2 on computers without a usable GPU, where DINOv2 runs paced on the CPU; choose native there for 4 Hz sampling",
+            "dinov2":"L2-normalized CLS embedding of Meta's DINOv2 ViT-S/14 (facebook/dinov2-small, Apache-2.0), bundled in the executable; nothing is downloaded. Frames are squashed to 224x224 and ImageNet-normalized, then embedded on the GPU (wgpu: Metal, Vulkan or DX12) in an isolated helper process, or on the CPU when no hardware GPU is usable, the helper fails or it misses its 2 s deadline. Sampling follows the camera at up to 30 frames per second on the GPU; on the CPU it rests after each frame so embedding averages at most half of one core (a fifth in efficiency mode). status reports accelerator and samples_per_second (two decimals below 1). CAPTUREFAB_DINOV2_GPU=0 forces the CPU",
             "native":"84-value spatial color/edge descriptor sampled at up to 4 frames per second",
             "persistence":"The encoder, descriptor dimensions and a SHA-256 fingerprint of the model weights and configuration are stored in the session. Resume fails if the running build bundles a different model; the encoder of an existing session never changes",
             "doctor":"doctor reports auto_capture.default_encoder and auto_capture.dinov2 {bundled,model,fingerprint,license,gpu:{available,adapter|reason}}"
         },
         "scope":"Camera-bound persistent controls; connect the camera in a GUI/serve session first. Temporary --direct workers are rejected.",
-        "storage":"One .duckdb file stores raw saved frames, descriptors, capture decisions, settings and background prototypes. New refuses existing paths; resume requires an existing compatible session for this camera. Close checkpoints the database. Discard removes raw pixels while retaining negative descriptors and the decision.",
+        "storage":"A session is NAME.duckdb plus a NAME.frames folder beside it. The database stores descriptors, capture decisions, settings, background prototypes and each frame's file name and SHA-256; each saved frame is a raw file in the folder, written through the storage budget (Storage full is exit 6). New refuses existing paths and an existing .frames folder; resume requires an existing compatible session for this camera, and its .frames folder while the database names frame files. Close checkpoints the database; copy the database and its .frames folder together. Keep only relabels; discard deletes the frame file if it is unchanged and retains negative descriptors and the decision. Sessions from earlier versions keep their frames inside the database and still review.",
         "paths":"CLI and RPC database paths resolve in the calling terminal; workflow database paths resolve beside the workflow file.",
         "learning":"Manual training captures and kept suggestions are positive examples; discarded suggestions are negative examples. Pending suggestions do not train the model. Scoring is a session-local nearest-example model with background novelty over the session's encoder; the encoder itself is never trained, and Capturefab downloads no weights.",
         "controls":"Auto capture is independent of auto exposure. auto enables acquisition; --pause pauses suggestions and keeps examples. Sensitivity and cooldown default to 0.5 and 2000ms on each auto command. Resume restores saved settings; hardware must be reconnected.",
-        "status":"status.capture_session and cameras[].capture_session ({...,encoder:\"dinov2\"|\"native\",model,accelerator?,samples_per_second?}); null when no capture database is open",
+        "status":"status.capture_session and cameras[].capture_session ({...,encoder:\"dinov2\"|\"native\",model,accelerator?,samples_per_second?,note?}); null when no capture database is open. note, when present, says why a suggestion was skipped (the previous frame was still being saved, or storage refused or could not save it) or why a pending capture left the queue (its frame file was deleted or changed); notes fade after a minute. A storage budget refusal is retried after 60 s, or at once after discard or auto; free space or raise the budget (storage configure), since every session shares it",
         "review":"Returns {capture:null|{id,score,reason,width,height,rgba},capture_session:...}; rgba is a base64-encoded 480x360-or-smaller RGBA preview. Review IDs address pending captures; stale or repeated decisions fail.",
         "limits":{"sensitivity":[0.0,1.0],"cooldown_ms":[250,3600000],"pending":200,"stored_pixel_bytes":2147483648_u64},
         "research":"docs/auto-capture-models.md"
@@ -3010,7 +3010,7 @@ fn schema() -> Value {
         "environment":crate::efficiency::ENV,
         "precedence":"--efficiency, then CAPTUREFAB_EFFICIENCY, then auto; an unknown CAPTUREFAB_EFFICIENCY value means auto",
         "auto":"efficient with at most 2 CPU cores, at most 2 GiB of memory, or the OS low-power or battery-saver mode; running on battery alone stays smooth",
-        "scope":"The process that parses it, such as the desktop window, serve or a direct command, and the camera workers it starts, which are told efficient whenever that process resolved efficient; a running session keeps its own setting, and its workers follow when it changes, for decoders they start afterwards. In workers, efficient decodes each live stream with one thread and picks a faster libx264 preset; the session polls its workers for status every 500 ms instead of 250 ms while a camera streams or a view watches, and every 2 s instead of 1 s otherwise. Captures and recordings keep every frame in every mode.",
+        "scope":"The process that parses it, such as the desktop window, serve or a direct command, and the camera workers it starts, which are told efficient whenever that process resolved efficient; a running session keeps its own setting, and its workers follow when it changes, for decoders they start afterwards and from the next embedding. In workers, efficient decodes each live stream with one thread, picks a faster libx264 preset and limits automatic capture's CPU embedding to a fifth of one core instead of half; the session polls its workers for status every 500 ms instead of 250 ms while a camera streams or a view watches, and every 2 s instead of 1 s otherwise. Captures and recordings keep every frame in every mode.",
         "status":"doctor --json efficiency {setting,efficient,reasons}"
     });
     contract["doctor"] = json!({
