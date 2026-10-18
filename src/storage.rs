@@ -44,6 +44,10 @@ const COMPACT_BYTES: u64 = if cfg!(test) { 64 * 1024 } else { 1024 * 1024 };
 /// always before retention, a Storage full refusal or a status report.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Expired files removed per save while the budget has room, so that a
+/// backlog, such as a new age limit or a machine that was off, cannot hold
+/// the lock for long. A full budget removes as many as it needs.
+const EXPIRED_BATCH: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -241,6 +245,8 @@ struct Locked {
     checked: bool,
     /// Memory matches the files on disk, so the next lock may reuse it.
     cacheable: bool,
+    #[cfg(test)]
+    commits: usize,
 }
 impl Drop for Locked {
     fn drop(&mut self) {
@@ -340,6 +346,8 @@ impl Manager {
             reconciled: None,
             checked: false,
             cacheable: false,
+            #[cfg(test)]
+            commits: 0,
         };
         result.load()?;
         result.reconcile(false)?;
@@ -429,6 +437,7 @@ impl Manager {
             reserve,
             written: 0,
             hash: Sha256::new(),
+            reread: true,
             failed: false,
             finalized: false,
         })
@@ -791,6 +800,10 @@ impl Locked {
         if self.dirty.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        {
+            self.commits += 1;
+        }
         if self.journal.is_some() {
             self.append()?;
             let snapshot = self
@@ -1068,11 +1081,12 @@ impl Locked {
             .position(|entry| entry.path == path && entry.lease.is_none())
             .ok_or_else(|| anyhow!("{} is not a finished Capturefab capture", path.display()))
     }
+    /// Remove one capture if it is still exactly the file recorded; the
+    /// caller commits.
     fn delete(&mut self, index: usize) -> Result<bool> {
         let entry = &self.ledger.entries[index];
         let Some(meta) = current_meta(entry, &mut HashSet::new())? else {
             self.remove(index);
-            self.persist()?;
             return Ok(true);
         };
         if !Self::removable(entry)
@@ -1084,7 +1098,6 @@ impl Locked {
             let entry = self.entry_mut(index);
             entry.changed = true;
             entry.bytes = meta.len();
-            self.persist()?;
             return Ok(false);
         }
         let recheck = current_meta(entry, &mut HashSet::new())?
@@ -1097,22 +1110,23 @@ impl Locked {
         );
         fs::remove_file(&entry.path).with_context(|| format!("retention cannot remove {}; check directory permissions or select a different output directory", entry.path.display()))?;
         self.remove(index);
-        self.persist()?;
         Ok(true)
     }
     fn make_room(&mut self, policy: &StoragePolicy, reserve: u64) -> Result<()> {
+        let mut expiry_due = true;
         loop {
             let allocated = self.allocated()?;
-            let expired = self
-                .ledger
-                .entries
-                .iter()
-                .position(|entry| self.expiring(entry, policy));
+            let expired = expiry_due
+                && self
+                    .ledger
+                    .entries
+                    .iter()
+                    .any(|entry| self.expiring(entry, policy));
             let full = allocated
                 .checked_add(reserve)
                 .is_none_or(|sum| sum > policy.max_bytes)
                 || self.ledger.entries.len() >= policy.max_files as usize;
-            if !full && expired.is_none() {
+            if !full && !expired {
                 return Ok(());
             }
             if !self.checked {
@@ -1127,30 +1141,65 @@ impl Locked {
                     self.ledger.entries.len(),
                     policy.max_bytes,
                     policy.max_files,
-                    if expired.is_some() {
-                        "; maximum age reached"
-                    } else {
-                        ""
-                    }
+                    if expired { "; maximum age reached" } else { "" }
                 );
             }
-            let candidate = self
-                .ledger
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| {
-                    Self::removable(entry) && (full || self.expired(entry, policy))
-                })
-                .min_by_key(|(_, entry)| entry.created)
-                .map(|(index, _)| index);
-            let Some(index) = candidate else {
+            let Some(victims) = self.victims(policy, reserve)? else {
+                if !self.ledger.entries.iter().any(Self::removable) {
+                    bail!(
+                        "Storage full: no unchanged, completed Capturefab files can be removed safely; active recordings and externally changed files are protected. Stop recordings, remove files yourself, or increase the storage limits"
+                    );
+                }
                 bail!(
-                    "Storage full: no unchanged, completed Capturefab files can be removed safely; active recordings and externally changed files are protected. Stop recordings, remove files yourself, or increase the storage limits"
+                    "Storage full: removing every unchanged, completed Capturefab file would still not make room, so none were removed; active recordings, files awaiting upload and externally changed files are protected. Stop recordings, remove files yourself, or increase the storage limits"
                 );
             };
-            self.delete(index)?;
+            self.delete_all(&victims)?;
+            expiry_due = false;
         }
+    }
+    /// The files to remove so that `reserve` more bytes and one more file fit:
+    /// the oldest removable ones, and up to EXPIRED_BATCH expired ones. None
+    /// when even removing all of them would not be enough, so that nothing is
+    /// deleted for a save that fails anyway.
+    fn victims(&self, policy: &StoragePolicy, reserve: u64) -> Result<Option<Vec<String>>> {
+        let mut candidates: Vec<&Entry> = self
+            .ledger
+            .entries
+            .iter()
+            .filter(|entry| Self::removable(entry))
+            .collect();
+        candidates.sort_by_key(|entry| entry.created);
+        let full = |allocated: u64, files: usize| {
+            allocated
+                .checked_add(reserve)
+                .is_none_or(|sum| sum > policy.max_bytes)
+                || files >= policy.max_files as usize
+        };
+        let (mut allocated, mut files) = (self.allocated()?, self.ledger.entries.len());
+        let mut victims = Vec::new();
+        for entry in candidates {
+            if !full(allocated, files)
+                && !(victims.len() < EXPIRED_BATCH && self.expired(entry, policy))
+            {
+                break;
+            }
+            victims.push(entry.id.clone());
+            allocated = allocated.saturating_sub(entry.bytes.max(entry.reserved));
+            files -= 1;
+        }
+        Ok((!full(allocated, files)).then_some(victims))
+    }
+    /// Remove verified files, then commit once for all of them.
+    fn delete_all(&mut self, ids: &[String]) -> Result<()> {
+        let result = ids.iter().try_for_each(|id| {
+            match self.ledger.entries.iter().position(|entry| &entry.id == id) {
+                Some(index) => self.delete(index).map(drop),
+                None => Ok(()),
+            }
+        });
+        self.persist()?;
+        result
     }
 }
 
@@ -1167,6 +1216,8 @@ pub struct StorageWriter {
     reserve: u64,
     written: u64,
     hash: Sha256,
+    /// Read the file back to confirm the streamed hash when finishing.
+    reread: bool,
     failed: bool,
     finalized: bool,
 }
@@ -1274,6 +1325,24 @@ impl StorageWriter {
                 self.path.display()
             );
         }
+        // Hash before taking the lock, so that reading back a long recording
+        // does not hold up other processes' saves. Under the lock, the same
+        // identity, length and time show that nothing touched it since.
+        let disappeared = || anyhow!("capture output disappeared: {}", self.path.display());
+        let changed = || {
+            anyhow!(
+                "capture output changed externally; preserving {} without enabling retention deletion",
+                self.path.display()
+            )
+        };
+        let hashed = fs::symlink_metadata(&self.path).map_err(|_| disappeared())?;
+        ensure!(self.ours(&hashed, None), changed());
+        let hash = self.sha256();
+        ensure!(
+            !self.reread || hash_file(&self.path)? == hash,
+            "capture content changed externally; preserving {} without enabling retention deletion",
+            self.path.display()
+        );
         let mut locked = self.manager.lock()?;
         let index = locked
             .ledger
@@ -1282,18 +1351,8 @@ impl StorageWriter {
             .position(|entry| entry.id == self.id)
             .ok_or_else(|| anyhow!("capture reservation disappeared from storage ledger"))?;
         let meta = current_meta(&locked.ledger.entries[index], &mut HashSet::new())?
-            .ok_or_else(|| anyhow!("capture output disappeared: {}", self.path.display()))?;
-        ensure!(
-            identity(&meta) == self.identity && meta.len() == self.written,
-            "capture output changed externally; preserving {} without enabling retention deletion",
-            self.path.display()
-        );
-        let hash = hash_file(&self.path)?;
-        ensure!(
-            hash == format!("{:x}", self.hash.clone().finalize()),
-            "capture content changed externally; preserving {} without enabling retention deletion",
-            self.path.display()
-        );
+            .ok_or_else(disappeared)?;
+        ensure!(self.ours(&meta, Some(&hashed)), changed());
         let entry = locked.entry_mut(index);
         entry.bytes = self.written;
         entry.reserved = 0;
@@ -1306,7 +1365,21 @@ impl StorageWriter {
         let _ = fs::remove_file(&self.lease_path);
         Ok(())
     }
+    /// Whether `meta` is still the file this writer created, at the length it
+    /// wrote and, when given, with the time it had when it was hashed.
+    fn ours(&self, meta: &Metadata, hashed: Option<&Metadata>) -> bool {
+        meta.is_file()
+            && !meta.file_type().is_symlink()
+            && identity(meta) == self.identity
+            && meta.len() == self.written
+            && hashed.is_none_or(|hashed| meta.modified().ok() == hashed.modified().ok())
+    }
     fn cleanup(&mut self) -> Result<()> {
+        // As in finalize, read the partial output before taking the lock.
+        let hashed = fs::symlink_metadata(&self.path)
+            .ok()
+            .filter(|meta| self.ours(meta, None));
+        let content = hashed.is_some() && hash_file(&self.path)? == self.sha256();
         let mut locked = self.manager.lock()?;
         if let Some(index) = locked
             .ledger
@@ -1315,9 +1388,10 @@ impl StorageWriter {
             .position(|entry| entry.id == self.id)
         {
             let entry = &locked.ledger.entries[index];
-            let owned = current_meta(entry, &mut HashSet::new())?
-                .is_some_and(|meta| identity(&meta) == self.identity && meta.len() == self.written);
-            if owned && hash_file(&self.path)? == format!("{:x}", self.hash.clone().finalize()) {
+            let owned = content
+                && current_meta(entry, &mut HashSet::new())?
+                    .is_some_and(|meta| self.ours(&meta, hashed.as_ref()));
+            if owned {
                 fs::remove_file(&self.path)?;
                 locked.remove(index);
             } else {
@@ -1374,6 +1448,9 @@ impl std::error::Error for OutputExists {}
 /// Save already encoded bytes as a new file.
 pub fn save_bytes(bytes: &[u8], path: &Path, policy: &StoragePolicy) -> Result<Stored> {
     let mut writer = create_writer(path, policy, bytes.len() as u64)?;
+    // The bytes are written in one call and finished at once, so the streamed
+    // hash stands for the file; retention still verifies it before deleting.
+    writer.reread = false;
     writer.write_all(bytes)?;
     let stored = Stored {
         bytes: writer.bytes_written(),
@@ -1416,7 +1493,9 @@ pub fn remove_uploaded(path: &Path) -> Result<bool> {
     let mut locked = Manager::global().lock()?;
     let index = locked.find(path)?;
     locked.entry_mut(index).pending_upload = false;
-    locked.delete(index)
+    let removed = locked.delete(index);
+    locked.persist()?;
+    removed
 }
 pub fn quota_status() -> Result<Value> {
     Manager::global().lock()?.status()
@@ -2060,7 +2139,16 @@ mod tests {
             manager.lock().unwrap().status().unwrap()["over_limit"],
             false
         );
-        // Protected files only stop a save the budget cannot hold.
+        // Protected files only stop a save the budget cannot hold, and then
+        // nothing is deleted for it.
+        let error = manager
+            .writer(&temp.path("huge"), &policy, 90)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("would still not make room"), "{error}");
+        assert!(temp.path("next").exists());
+        edit(&manager, "next", |entry| entry.pending_upload = true);
         let error = manager
             .writer(&temp.path("huge"), &policy, 90)
             .err()
@@ -2339,5 +2427,55 @@ mod tests {
         drop(held);
         fs::remove_file(manager.directory.join(SUMMARY)).unwrap();
         assert_eq!(read_usage(&manager.directory).unwrap(), None);
+    }
+    #[test]
+    fn retention_removes_a_full_budget_of_old_files_with_one_commit() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        populate(&manager, &temp, 2_000);
+        let mut locked = manager.lock().unwrap();
+        locked
+            .make_room(&policy(1 << 30, 2_000, "delete-oldest"), 1)
+            .unwrap();
+        assert_eq!(locked.ledger.entries.len(), 1_999);
+        assert_eq!(locked.commits, 1);
+        // An age limit removes at most a batch per save while there is room.
+        for index in 0..locked.ledger.entries.len() {
+            locked.entry_mut(index).created = now() - 100;
+        }
+        locked.persist().unwrap();
+        let mut policy = policy(1 << 30, 100_000, "delete-oldest");
+        policy.max_age_seconds = Some(10);
+        locked.commits = 0;
+        locked.make_room(&policy, 1).unwrap();
+        assert_eq!(locked.ledger.entries.len(), 1_999 - EXPIRED_BATCH);
+        assert_eq!(locked.commits, 1);
+        assert!(!temp.path("filler-0").exists());
+    }
+    #[test]
+    fn finishing_a_recording_reads_it_back_without_holding_the_lock() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        let size = 128 << 20;
+        let mut writer = manager
+            .writer(&temp.path("recording"), &policy(1 << 30, 10, "stop"), size)
+            .unwrap();
+        writer.write_all(&vec![7; size as usize]).unwrap();
+        let started = Instant::now();
+        let hash = hash_file(writer.path()).unwrap();
+        let hashing = started.elapsed();
+        // Another process holds the lock for longer than the read takes.
+        let held = manager.lock().unwrap();
+        let finishing = thread::spawn(move || writer.finish().map(|()| Instant::now()));
+        thread::sleep((hashing * 2 + Duration::from_millis(300)).min(Duration::from_secs(4)));
+        let released = Instant::now();
+        drop(held);
+        let finished = finishing.join().unwrap().unwrap();
+        assert!(
+            finished - released < hashing / 2,
+            "finishing took {:?} after the lock was released; reading back takes {hashing:?}",
+            finished - released
+        );
+        assert_eq!(manager.lock().unwrap().ledger.entries[0].sha256, Some(hash));
     }
 }
