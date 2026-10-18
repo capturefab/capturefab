@@ -1170,15 +1170,12 @@ impl Watch {
             .poll(Duration::from_secs(5), || Some(volumes::list()));
         #[cfg(feature = "uploads")]
         if !self.pinned && self.uploads_matter() {
-            // A long queue takes longer to read; look less often then, so
-            // status never keeps a core busy.
             let cost = self
                 .uploads
                 .value
                 .as_ref()
                 .map_or(Duration::ZERO, |(_, cost)| *cost);
-            self.uploads
-                .poll(Duration::from_secs(2).max(cost * 20), read_uploads);
+            self.uploads.poll(upload_poll(cost), read_uploads);
         }
     }
 
@@ -1213,6 +1210,15 @@ impl Watch {
             read_uploads()
         });
     }
+}
+
+/// How long to wait after an upload status read that took `cost`. A long
+/// queue takes longer to read, so look less often then and status never
+/// keeps a core busy; but a read can also have waited for another process
+/// to finish with the queue, so never wait long enough to look stale.
+#[cfg(feature = "uploads")]
+fn upload_poll(cost: Duration) -> Duration {
+    (cost * 20).clamp(Duration::from_secs(2), Duration::from_secs(10))
 }
 
 #[cfg(feature = "uploads")]
@@ -4712,6 +4718,16 @@ mod tests {
         let other = UploadLine::of(&offline, "archive", now);
         assert_eq!(other.summary, "All uploaded · 7 sent in total");
         assert_eq!((other.action, other.error), (None, None));
+    }
+
+    #[cfg(feature = "uploads")]
+    #[test]
+    fn upload_status_is_read_less_often_for_a_long_queue_but_stays_fresh() {
+        let ms = Duration::from_millis;
+        assert_eq!(upload_poll(ms(3)), Duration::from_secs(2));
+        assert_eq!(upload_poll(ms(250)), Duration::from_secs(5));
+        // Five seconds waiting on another process's fold is not a slow read.
+        assert_eq!(upload_poll(ms(5000)), Duration::from_secs(10));
     }
 
     #[test]
