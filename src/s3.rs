@@ -1206,7 +1206,13 @@ mod tests {
     }
 
     fn upload_file() -> (std::path::PathBuf, String) {
-        let path = std::env::temp_dir().join(format!("capturefab-s3-{}.bin", std::process::id()));
+        // Parallel upload tests must not truncate a file another test has
+        // already hashed and queued.
+        let path = std::env::temp_dir().join(format!(
+            "capturefab-s3-{}-{}.bin",
+            std::process::id(),
+            getrandom::u64().unwrap()
+        ));
         std::fs::write(&path, b"frame").unwrap();
         (path, hex(&Sha256::digest(b"frame")))
     }
