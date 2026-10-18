@@ -2224,6 +2224,12 @@ fn legacy_s3_upload_queue_lists_unchanged() {
     let rewritten: Value =
         serde_json::from_slice(&std::fs::read(dir.join("uploads.json")).unwrap()).unwrap();
     assert_eq!(rewritten["items"][0], item, "queue keeps the legacy shape");
+    assert_eq!(status["destinations"]["archive"]["failed"], 1);
+    let retried = json(&dir, &["--json", "uploads", "retry", "--now"]);
+    assert_eq!(retried["retried"], 1);
+    let status = json(&dir, &["--json", "uploads"]);
+    assert_eq!(status["destinations"]["archive"]["pending"], 1);
+    assert_eq!(status["items"][0]["bucket"], item["bucket"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2294,6 +2300,15 @@ fn doctor_reports_destination_features() {
     let text = schema.to_string();
     for command in ["add-ftp", "add-sftp", "probe_writes", "accept_host_key"] {
         assert!(text.contains(command), "{command}");
+    }
+    if cfg!(feature = "s3") {
+        assert!(schema["uploads"]["cli"].as_str().unwrap().contains("--now"));
+        assert!(
+            schema["uploads"]["status"]
+                .as_str()
+                .unwrap()
+                .contains("destinations")
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

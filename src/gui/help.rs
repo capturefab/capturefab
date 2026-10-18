@@ -98,7 +98,7 @@ impl Workbench {
     /// whether the word was taken; see `apply_scene`. Words: `help-more`
     /// (the guide with its connection notes open), and the destination
     /// sheet's `destinations-list`, `folder-editor`, `bucket-editor` and
-    /// `testing` (see `Picker::scene`).
+    /// `testing`, and `uploads-offline` (see `Picker::scene`).
     pub(super) fn scene_sheets(&mut self, word: &str, late: bool) -> bool {
         if late {
             return false;
@@ -114,7 +114,7 @@ impl Workbench {
                 self.sheets.more_turn.set(1.0);
                 true
             }
-            word => self.capture_to.scene(word),
+            word => self.capture_to.scene(word, &mut self.output),
         }
     }
 }
