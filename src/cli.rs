@@ -2863,7 +2863,8 @@ fn schema() -> Value {
     contract["jobs"] = json!({
         "in":"schedule result.job; jobs result.jobs; status jobs and cameras[].jobs",
         "fields":["id","status","output","count","captured","skipped","retries","first_at_ms","interval_ms","next_at_ms","last_file","error","destination?","context?"],
-        "statuses":["pending","running","complete","failed","cancelled"],
+        "status":"One of scheduling.states",
+        "next_at_ms":"Follows scheduling.interval",
         "saving":"Scheduled frames are encoded and saved on their own thread, which holds at most two frames, so acquisition, previews, recording and forwarding continue meanwhile.",
         "skipped":"Shots not taken because two earlier frames were still being saved. The job takes them at later intervals.",
         "retries":"Shots that failed for a reason that may pass, a busy storage ledger or a disk timeout, and are taken again at the next interval. error holds the message until a later shot saves.",
@@ -2960,7 +2961,7 @@ fn schema() -> Value {
             "unheld":"An item queued while the storage ledger was busy carries unheld:true until the uploader holds it back from retention, or finds the ledger no longer has the file"
         });
     }
-    contract["scheduling"] = json!({"cli":"capture --at RFC3339 | --delay 30s; --interval 10s -n 100","lifetime":"Schedules run while the GUI, serve session or direct CLI process remains running; jobs are not persisted across exit.","interval":"First time plus captured count times interval; zero interval captures consecutive frames. All frames must fall within 10 years. A past first timestamp starts immediately. Durations must resolve to whole milliseconds. Each job has a per-frame transport timeout.","states":["pending","running","complete","cancelled","failed"]});
+    contract["scheduling"] = json!({"cli":"capture --at RFC3339 | --delay 30s; --interval 10s -n 100","lifetime":"Schedules run while the GUI, serve session or direct CLI process remains running; jobs are not persisted across exit.","interval":"First time plus interval times the shots so far: captured, being saved, skipped and retried, so a skipped or retried shot moves the schedule one interval later; zero interval captures consecutive frames. All frames must fall within 10 years. A past first timestamp starts immediately. Durations must resolve to whole milliseconds. Each job has a per-frame transport timeout.","states":["pending","running","complete","cancelled","failed"]});
     contract["auto"] = json!({"cli":"--session NAME auto [--balance B] | manual [--revert]; capture|forward|serve --auto [--balance B]","default":"manual; connecting never enables auto mode and it ends on disconnect","balance":"0 favors image quality, 1 favors frame rate; quality, balanced and frame-rate mean 0, 0.5 and 1; omitted keeps the current value, initially 0.5","status":"status.auto and cameras[].auto; null in manual mode","strategies":["firmware","software","video-mode","none"],"states":["waiting","converging","stable","limited"],"settled":["stable","limited"],"manual":"Setting a feature in auto.managed switches that camera to manual first and the set result adds \"auto\":null; manual turns ExposureAuto, GainAuto and BalanceWhiteAuto off so values hold","persistence":"Camera settings written by auto mode remain after manual, like set; manual --revert, disconnect and session exit restore their previous values (best effort)","capture":"--set applies before --auto; capture saves once exposure settles or after min(timeout_ms/2, 3 s) and result.auto reports the state; with --session auto mode stays on afterwards"});
     contract["history"] = json!({
         "cli":"--session NAME [--camera ID] history | undo | redo",
@@ -4255,6 +4256,12 @@ mod tests {
             .map(|field| field.as_str().unwrap().trim_end_matches('?').to_owned())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(fields, job.as_object().unwrap().keys().cloned().collect());
+        // Skipped and retried shots each move next_at_ms one interval later.
+        let interval = schema()["scheduling"]["interval"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(interval.contains("skipped and retried"), "{interval}");
     }
     #[test]
     fn multiplayer_identity_and_observer_contract_validate_before_execution() {
