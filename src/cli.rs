@@ -28,7 +28,7 @@ pub struct Cli {
     /// Emit one versioned JSON result on stdout; diagnostics stay on stderr
     #[arg(long, global = true)]
     pub json: bool,
-    /// Camera/scanner ID, serial, IP, media source, sim:0, or sim:replay:PATH
+    /// Camera/scanner ID, serial, IP, media source, hub:NAME/CAMERA, sim:0, or sim:replay:PATH
     #[arg(
         short = 'c',
         long,
@@ -699,7 +699,7 @@ pub enum Command {
         #[command(flatten)]
         dataset: DatasetArg,
     },
-    /// Discover GigE Vision, USB3 Vision, ONVIF, host cameras and document scanners
+    /// Discover GigE Vision, USB3 Vision, ONVIF, host cameras, document scanners and cameras on saved hubs
     #[command(visible_aliases=["list","cameras"])]
     Discover,
     /// Host virtual GigE Vision, RTSP or ONVIF cameras using looping test data
@@ -865,6 +865,12 @@ pub enum Command {
         #[command(subcommand)]
         command: DestinationCommand,
     },
+    /// Save Home Assistant, Frigate, go2rtc and UniFi Protect servers and open their cameras as hub:NAME/CAMERA
+    #[command(visible_alias = "hubs")]
+    Hub {
+        #[command(subcommand)]
+        command: crate::hubs::command::HubCommand,
+    },
     /// List mounted external, removable and network volumes
     Volumes,
     /// Show and manage the queue of captures waiting for upload
@@ -893,6 +899,9 @@ pub enum Command {
         /// Built browser assets; defaults to web-client/dist when --listen is used
         #[arg(long, requires = "listen")]
         web_dir: Option<PathBuf>,
+        /// Let remote clients open cameras on saved hubs with this computer's hub secrets
+        #[arg(long, requires = "listen")]
+        allow_hubs: bool,
         #[command(flatten)]
         auto: AutoArgs,
         #[command(flatten)]
@@ -1418,6 +1427,10 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
             }
             None
         }
+        Some(Command::Hub { command }) => {
+            crate::hubs::command::prepare(command)?;
+            None
+        }
         Some(Command::Destination { command }) => {
             let name = match command {
                 DestinationCommand::List => None,
@@ -1746,7 +1759,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
     }
     let mut prepared = input(prepare(&cli))?;
     resolve_session(&mut cli)?;
+    // Hub commands never use --camera, so a stale CAPTUREFAB_CAMERA cannot
+    // block the commands that would fix it.
     if cli.session.is_none()
+        && !matches!(cli.command, Some(Command::Hub { .. }))
         && let Some(camera) = &cli.camera
     {
         crate::camera::validate_selector(camera)?;
@@ -1894,6 +1910,13 @@ pub fn run(mut cli: Cli) -> Result<()> {
         Some(Command::Destination { command }) => {
             return output(&cli, destination_command(command)?);
         }
+        Some(Command::Hub { command }) => {
+            let result = crate::hubs::command::run(
+                command,
+                std::time::Duration::from_millis(cli.timeout_ms),
+            )?;
+            return output(&cli, result);
+        }
         Some(Command::Volumes) => {
             return output(&cli, json!({"volumes": crate::volumes::list()}));
         }
@@ -1962,6 +1985,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             stream,
             listen,
             web_dir,
+            allow_hubs,
             auto,
             dataset,
         }) => {
@@ -1980,12 +2004,13 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 ipc::Server::start_with_kind(handle.clone(), name, ipc::SessionKind::Serve)?;
             let remote_server = listen
                 .map(|address| {
-                    crate::remote::Server::start(
+                    crate::remote::Server::start_with(
                         handle.clone(),
                         address,
                         web_dir
                             .clone()
                             .unwrap_or_else(|| PathBuf::from("web-client/dist")),
+                        *allow_hubs,
                     )
                 })
                 .transpose()?;
@@ -2391,7 +2416,12 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
         return write_json(&envelope);
     }
     let mut out = io::stdout().lock();
-    if matches!(&cli.command, Some(Command::Undo | Command::Redo)) {
+    if let Some(Command::Hub { command }) = &cli.command {
+        for warning in value["warnings"].as_array().into_iter().flatten() {
+            eprintln!("capturefab: {}", warning.as_str().unwrap_or_default());
+        }
+        write!(out, "{}", crate::hubs::command::human(command, &value))?;
+    } else if matches!(&cli.command, Some(Command::Undo | Command::Redo)) {
         let (verb, key) = if matches!(&cli.command, Some(Command::Undo)) {
             ("Undid", "undone")
         } else {
@@ -2663,7 +2693,7 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
 }
 fn doctor() -> Value {
     let interfaces=if_addrs::get_if_addrs().map(|items|items.into_iter().filter_map(|i|match i.addr{if_addrs::IfAddr::V4(a)=>Some(json!({"name":i.name,"ip":a.ip,"netmask":a.netmask,"broadcast":a.broadcast})),_=>None}).collect::<Vec<_>>()).unwrap_or_default();
-    json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"scanner":cfg!(feature="scanner"),"wgpu":cfg!(feature="gui"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox"),"s3":cfg!(feature="s3"),"ftp":cfg!(feature="ftp"),"sftp":cfg!(feature="sftp"),"parquet":cfg!(feature="parquet"),"modbus":cfg!(feature="modbus"),"mqtt":cfg!(feature="mqtt"),"opcua":cfg!(feature="opcua"),"mtconnect":cfg!(feature="mtconnect"),"dinov2":cfg!(feature="dinov2")},"auto_capture":crate::autocapture::doctor(),"signals":crate::signals::compiled_protocols(),"scanners":crate::scanner::doctor(),"jpeg":jpeg_backends(),"session_directory":ipc::session_dir(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox. Document scanning uses installed platform scanner drivers (SANE scanimage on Linux).","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}})
+    json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"scanner":cfg!(feature="scanner"),"wgpu":cfg!(feature="gui"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox"),"s3":cfg!(feature="s3"),"ftp":cfg!(feature="ftp"),"sftp":cfg!(feature="sftp"),"parquet":cfg!(feature="parquet"),"modbus":cfg!(feature="modbus"),"mqtt":cfg!(feature="mqtt"),"opcua":cfg!(feature="opcua"),"mtconnect":cfg!(feature="mtconnect"),"dinov2":cfg!(feature="dinov2"),"hubs":cfg!(feature="hubs"),"keychain":cfg!(feature="keychain")},"auto_capture":crate::autocapture::doctor(),"signals":crate::signals::compiled_protocols(),"scanners":crate::scanner::doctor(),"jpeg":jpeg_backends(),"session_directory":ipc::session_dir(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox. Document scanning uses installed platform scanner drivers (SANE scanimage on Linux).","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}})
 }
 /// JPEG encoders available to this build and host, best first.
 fn jpeg_backends() -> Value {
@@ -2825,10 +2855,11 @@ fn schema() -> Value {
         "analytics":"In-memory DuckDB collects independently of clients; at most 24 hours of time-series history and a fixed sample limit. Session counters survive camera disconnects and reset with the server process.",
         "outputs":"Capture paths and destinations belong to the server. Stdout captures are rejected.",
         "lifetime":"Browser disconnection leaves cameras and jobs running in the serve session. Jobs stop when the server exits.",
-        "network":"No remote listener unless --listen is given. Bind a Tailscale address, or loopback behind Tailscale Serve."
+        "network":"No remote listener unless --listen is given. Bind a Tailscale address, or loopback behind Tailscale Serve.",
+        "hubs":"Connecting a hub:NAME/CAMERA camera (or a discovered hub camera) is refused unless serve was started with --allow-hubs, because it would use this computer's hub secrets"
     });
     contract["selection"]["direct"] = json!(
-        "--camera ID|serial|IPv4|sim:NAME|RTSP/SRT/media URI|avfoundation:INDEX|v4l2:/dev/videoN|dshow:video=NAME|onvif:ENDPOINT|scanner:sane:DEVICE|scanner:wia:ID|scanner:ica:UUID"
+        "--camera ID|serial|IPv4|sim:NAME|RTSP/SRT/media URI|avfoundation:INDEX|v4l2:/dev/videoN|dshow:video=NAME|onvif:ENDPOINT|hub:NAME/CAMERA[?stream=MODE&fps=F]|scanner:sane:DEVICE|scanner:wia:ID|scanner:ica:UUID"
     );
     contract["selection"]["existing_session"] =
         json!("--session NAME [--camera ID] targets an existing visible GUI or headless worker");
@@ -2919,6 +2950,7 @@ fn schema() -> Value {
     commands.extend(crate::signals::rpc_examples());
     contract["dataset"] = crate::dataset::schema_contract();
     contract["signals"] = crate::signals::schema_contract();
+    contract["hubs"] = crate::hubs::schema_contract();
     contract
 }
 
@@ -3733,6 +3765,12 @@ pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
     {
         return ("usage", 2);
     }
+    if let Some(categorized) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::types::Categorized>())
+    {
+        return categorized.kind.code();
+    }
     let s = format!("{error:#}").to_ascii_lowercase();
     if s.contains("storage full") || s.contains("no space left") {
         ("storage_full", 6)
@@ -3745,6 +3783,10 @@ pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
         || s.contains("nodename nor servname")
         || s.contains("temporary failure in name resolution")
         || s.contains("no such host is known")
+        || s.contains("no route to host")
+        || s.contains("network is unreachable")
+        || s.contains("host is down")
+        || s.contains("is offline")
     {
         ("unavailable", 3)
     } else if s.contains("timed out")
@@ -4215,6 +4257,42 @@ mod tests {
                 "cannot reach the server: connecting on ftp://h:21: Connection refused (os error 61); fix the settings or save with --no-check"
             )),
             ("unavailable", 3)
+        );
+        for unreachable in [
+            "cannot reach hub home at http://10.0.0.9:8123: no route to host",
+            "cannot reach hub home at http://10.0.0.9:8123: network is unreachable",
+            "cannot reach hub home at http://10.0.0.9:8123: host is down",
+            "camera camera.porch on hub home is offline (HTTP 503)",
+        ] {
+            assert_eq!(
+                error_code(&anyhow::anyhow!("{unreachable}")),
+                ("unavailable", 3),
+                "{unreachable}"
+            );
+        }
+        // A category set where the error happened wins over words that
+        // happen to appear in a camera or hub name.
+        use crate::types::{Categorized, ErrorKind};
+        assert_eq!(
+            error_code(&Categorized::error(
+                ErrorKind::Unavailable,
+                "camera camera.disabled_porch timed out"
+            )),
+            ("unavailable", 3)
+        );
+        assert_eq!(
+            error_code(
+                &Categorized::error(ErrorKind::Timeout, "hub not_found did not answer")
+                    .context("connect")
+            ),
+            ("timeout", 4)
+        );
+        assert_eq!(
+            error_code(&crate::types::error_from_transport(
+                Some("unsupported"),
+                "camera hubs are unavailable".into()
+            )),
+            ("unsupported", 5)
         );
     }
     #[test]

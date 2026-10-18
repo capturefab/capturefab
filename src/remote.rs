@@ -68,12 +68,25 @@ struct Service {
     web_root: PathBuf,
     quitting: Arc<AtomicBool>,
     activity_waits: Arc<AtomicUsize>,
+    /// Whether clients may open hub cameras, which use this computer's hub
+    /// secrets.
+    allow_hubs: bool,
 }
 
 impl Server {
     /// Bind an explicit address. The CLI opts in with `--listen`; publishing on
     /// a tailnet uses the server's Tailscale address or a local HTTPS proxy.
     pub fn start(handle: SessionHandle, address: SocketAddr, web_root: PathBuf) -> Result<Self> {
+        Self::start_with(handle, address, web_root, false)
+    }
+    /// Like [`Server::start`]; `allow_hubs` lets clients connect hub
+    /// cameras (`serve --allow-hubs`).
+    pub fn start_with(
+        handle: SessionHandle,
+        address: SocketAddr,
+        web_root: PathBuf,
+        allow_hubs: bool,
+    ) -> Result<Self> {
         let web_root = validate_web_root(&web_root)?;
         let listener = TcpListener::bind(address).context("bind remote HTTP listener")?;
         let address = listener.local_addr()?;
@@ -84,6 +97,7 @@ impl Server {
             web_root,
             quitting: quitting.clone(),
             activity_waits: Arc::new(AtomicUsize::new(0)),
+            allow_hubs,
         });
         let active = Arc::new(AtomicUsize::new(0));
         let server_thread = thread::Builder::new()
@@ -393,6 +407,15 @@ fn validate_remote_command(command: &SessionCommand) -> Result<()> {
 }
 
 impl Service {
+    /// Whether `camera` names a hub camera, directly or as the ID or serial
+    /// of a discovered one.
+    fn opens_hub(&self, camera: &str) -> bool {
+        crate::hubs::is_source(camera)
+            || self.handle.snapshot().devices.iter().any(|device| {
+                crate::hubs::is_source(&device.id)
+                    && (device.id == camera || device.serial == camera)
+            })
+    }
     fn respond(&self, request: Request) -> Response {
         let (path, query) = request
             .target
@@ -540,6 +563,15 @@ impl Service {
         }
         if let Err(err) = validate_remote_command(&command.command) {
             return error(400, format!("{err:#}"));
+        }
+        if !self.allow_hubs
+            && let SessionCommand::Connect { camera, .. } = &command.command
+            && self.opens_hub(camera)
+        {
+            return error(
+                400,
+                "hub cameras cannot be opened through the remote API; start serve with --allow-hubs to allow it",
+            );
         }
         let actor = command.actor.unwrap_or_else(|| SessionActor {
             id: "http".into(),
@@ -856,9 +888,10 @@ fn success(result: impl serde::Serialize) -> Response {
     json_response(200, json!({"version": 1, "ok": true, "result": result}))
 }
 fn error(status: u16, message: impl Into<String>) -> Response {
+    let message = crate::hubs::scrub::scrub(&message.into()).into_owned();
     json_response(
         status,
-        json!({"version": 1, "ok": false, "error": {"message": message.into()}}),
+        json!({"version": 1, "ok": false, "error": {"message": message}}),
     )
 }
 fn json_response(status: u16, value: Value) -> Response {
@@ -977,6 +1010,37 @@ mod tests {
     }
 
     #[test]
+    fn hub_cameras_need_allow_hubs() {
+        let root = WebRoot::new();
+        let handle = SessionHandle::new();
+        let service = Service {
+            handle: handle.clone(),
+            web_root: root.0.clone(),
+            quitting: Arc::new(AtomicBool::new(false)),
+            activity_waits: Arc::new(AtomicUsize::new(0)),
+            allow_hubs: false,
+        };
+        let mut post = parse_headers(
+            "POST /api/command HTTP/1.1\r\nHost: camera:7878\r\nContent-Type: application/json",
+        )
+        .unwrap();
+        post.body = br#"{"version":1,"command":{"op":"connect","camera":"hub:home/camera.front_door","timeout_ms":1000}}"#.to_vec();
+        let refused = service.respond(post);
+        assert_eq!(refused.status, 400);
+        let body: Value = serde_json::from_slice(&refused.body).unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("--allow-hubs"),
+            "{body}"
+        );
+        assert!(service.opens_hub("HUB:home/x"));
+        assert!(!service.opens_hub("sim:0"));
+        handle.shutdown();
+    }
+
+    #[test]
     fn health_distinguishes_ready_session_from_shutdown() {
         let root = WebRoot::new();
         let handle = SessionHandle::new();
@@ -985,6 +1049,7 @@ mod tests {
             web_root: root.0.clone(),
             quitting: Arc::new(AtomicBool::new(false)),
             activity_waits: Arc::new(AtomicUsize::new(0)),
+            allow_hubs: false,
         };
         let ready = service.health();
         assert_eq!(ready.status, 200);
@@ -1019,6 +1084,7 @@ mod tests {
             web_root: root.0.clone(),
             quitting: Arc::new(AtomicBool::new(false)),
             activity_waits: Arc::new(AtomicUsize::new(0)),
+            allow_hubs: false,
         };
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1078,6 +1144,7 @@ mod tests {
             web_root: root.0.clone(),
             quitting: Arc::new(AtomicBool::new(false)),
             activity_waits: Arc::new(AtomicUsize::new(0)),
+            allow_hubs: false,
         };
         for (query, width, height) in [
             ("width=320", 320, 1040),

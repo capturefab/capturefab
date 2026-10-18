@@ -2157,6 +2157,8 @@ fn doctor_reports_destination_features() {
         ("s3", cfg!(feature = "s3")),
         ("ftp", cfg!(feature = "ftp")),
         ("sftp", cfg!(feature = "sftp")),
+        ("hubs", cfg!(feature = "hubs")),
+        ("keychain", cfg!(feature = "keychain")),
     ] {
         assert_eq!(
             doctor["features"][feature].as_bool(),

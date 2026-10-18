@@ -116,7 +116,7 @@ pub fn validate_name(name: &str) -> Result<()> {
     ensure!(
         !matches!(
             lower.as_str(),
-            "storage" | "storage-policy" | "destinations" | "uploads"
+            "storage" | "storage-policy" | "destinations" | "uploads" | "hubs"
         ),
         "session name is reserved for application bookkeeping; choose a different name"
     );
@@ -330,9 +330,10 @@ fn serve_client(
         Err(e) => {
             let mut error = json!({"message":format!("{e:#}")});
             // A request the caller must change keeps exit code 2 across the
-            // connection; its text alone may not say so.
-            if e.chain().any(|cause| cause.is::<crate::dataset::Usage>()) {
-                error["code"] = json!("usage");
+            // connection, and a categorized failure its category; the text
+            // alone may not say so.
+            if let Some(code) = crate::types::error_transport_code(&e) {
+                error["code"] = json!(code);
             }
             json!({"version":VERSION,"ok":false,"error":error})
         }
@@ -617,10 +618,10 @@ fn send_request_as(
             .as_str()
             .unwrap_or("session request failed")
             .to_owned();
-        if response["error"]["code"] == "usage" {
-            return Err(crate::dataset::Usage(message).into());
-        }
-        anyhow::bail!("{message}");
+        return Err(crate::types::error_from_transport(
+            response["error"]["code"].as_str(),
+            message,
+        ));
     }
     response
         .get("result")
@@ -1204,6 +1205,7 @@ mod tests {
         assert!(validate_name("Storage").is_err());
         assert!(validate_name("destinations").is_err());
         assert!(validate_name("uploads").is_err());
+        assert!(validate_name("Hubs").is_err());
         assert!(validate_name("com10").is_ok());
         assert!(validate_name("lpt0").is_ok());
     }

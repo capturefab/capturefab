@@ -446,7 +446,7 @@ impl SessionCommand {
                 validate_selector(camera)?;
                 validate_timeout(*timeout_ms)?;
                 maximum_cameras()?;
-                frame_capacity(false)?;
+                frame_capacity(FrameClass::Default)?;
             }
             Self::Select { camera } => validate_selector(camera)?,
             Self::Get { feature } | Self::Execute { feature } | Self::Set { feature, .. } => {
@@ -628,13 +628,22 @@ fn maximum_cameras() -> Result<usize> {
     );
     Ok(maximum)
 }
-fn frame_capacity(scanner: bool) -> Result<usize> {
+/// What a worker's frames look like, which sizes its shared ring.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FrameClass {
+    Default,
+    /// Hub cameras deliver RGB frames of whatever size the server sends;
+    /// 32 MiB slots hold 4096x2160.
+    Hub,
+    Scanner,
+}
+fn frame_capacity(class: FrameClass) -> Result<usize> {
     let capacity = env_usize(
         "CAPTUREFAB_FRAME_BYTES",
-        if scanner {
-            128 * 1024 * 1024
-        } else {
-            DEFAULT_CAPACITY
+        match class {
+            FrameClass::Scanner => 128 * 1024 * 1024,
+            FrameClass::Hub => 32 * 1024 * 1024,
+            FrameClass::Default => DEFAULT_CAPACITY,
         },
     )?;
     ensure!(
@@ -893,6 +902,10 @@ struct WorkerReply<'a> {
     result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// The error's category (`usage` or an `ErrorKind` code), so the parent
+    /// reports it with the same exit code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
     snapshot: &'a SessionSnapshot,
     /// Files saved since the previous reply, for the coordinator's dataset.
     #[serde(skip_serializing_if = "crate::dataset::SavedBatch::is_empty")]
@@ -905,6 +918,8 @@ struct ParentReply {
     result: Option<Value>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
     #[serde(default)]
     snapshot: Option<Value>,
     #[serde(default)]
@@ -946,8 +961,8 @@ pub(crate) fn spawn_helper(
 }
 
 impl Process {
-    fn spawn(scanner: bool) -> Result<Self> {
-        let capacity = frame_capacity(scanner)?;
+    fn spawn(class: FrameClass) -> Result<Self> {
+        let capacity = frame_capacity(class)?;
         let dir = crate::ipc::session_dir();
         crate::ipc::ensure_private_dir(&dir)?;
         let mut random = [0u8; 16];
@@ -1020,11 +1035,14 @@ impl Process {
                 Err(e) => eprintln!("capturefab: ignoring unreadable worker snapshot: {e}"),
             }
         }
-        ensure!(
-            reply.ok,
-            "{}",
-            reply.error.as_deref().unwrap_or("worker command failed")
-        );
+        if !reply.ok {
+            return Err(crate::types::error_from_transport(
+                reply.code.as_deref(),
+                reply
+                    .error
+                    .unwrap_or_else(|| "worker command failed".into()),
+            ));
+        }
         Ok(reply.result)
     }
     fn keep_saved(&mut self, batch: crate::dataset::SavedBatch) {
@@ -1261,6 +1279,44 @@ impl SessionHandle {
             drop(p);
             self.inner.dataset.record_saved(batch, gaps);
         }
+    }
+    /// The worker already showing hub camera `camera`, if any. One camera
+    /// has one worker, so asking for it with other options is refused rather
+    /// than replacing the stream others are using.
+    fn connected_hub_camera(&self, camera: &str) -> Result<Option<Value>> {
+        let Some(selector) = crate::hubs::Selector::parse(camera).ok() else {
+            return Ok(None);
+        };
+        let id = selector.id();
+        let Some((_, worker)) = self.workers().into_iter().find(|(key, _)| *key == id) else {
+            return Ok(None);
+        };
+        let p = worker.lock().unwrap_or_else(|e| e.into_inner());
+        let info = p
+            .snapshot
+            .connected
+            .clone()
+            .context("worker has no camera")?;
+        let address = info.address.clone().unwrap_or_else(|| info.id.clone());
+        if address != selector.address() {
+            let options = address
+                .split_once('?')
+                .map_or("default options".to_owned(), |(_, options)| {
+                    options.replace('&', ", ")
+                });
+            return Err(crate::types::Categorized::error(
+                crate::types::ErrorKind::Unavailable,
+                format!(
+                    "{id} is already connected ({options}); disconnect it before connecting with other options"
+                ),
+            ));
+        }
+        self.inner
+            .state
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .active_camera = Some(info.id.clone());
+        Ok(Some(json!({"connected":info,"worker_pid":p.child.id()})))
     }
     fn workers(&self) -> Vec<(String, Arc<Mutex<Process>>)> {
         self.inner
@@ -1895,8 +1951,11 @@ impl SessionHandle {
                     (1..=60000).contains(&timeout_ms),
                     "timeout must be 1..60000 milliseconds"
                 );
-                let (devices, warnings) =
-                    crate::camera::discover(Duration::from_millis(timeout_ms), simulated)?;
+                let (devices, warnings) = crate::camera::discover_with(
+                    Duration::from_millis(timeout_ms),
+                    simulated,
+                    true,
+                )?;
                 {
                     let mut state = self.inner.state.write().unwrap_or_else(|e| e.into_inner());
                     state.devices = devices.clone();
@@ -1915,6 +1974,24 @@ impl SessionHandle {
                     .connecting
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
+                // A discovered hub camera named by its serial opens by its
+                // address, so the worker never has to list hubs.
+                let camera = if crate::hubs::is_source(&camera) {
+                    camera
+                } else {
+                    self.snapshot()
+                        .devices
+                        .iter()
+                        .find(|device| {
+                            crate::hubs::is_source(&device.id)
+                                && (device.serial == camera || device.id == camera)
+                        })
+                        .map(|device| device.address.clone().unwrap_or_else(|| device.id.clone()))
+                        .unwrap_or(camera)
+                };
+                if let Some(connected) = self.connected_hub_camera(&camera)? {
+                    return Ok(connected);
+                }
                 if let Ok(w) = self.target(Some(&camera)) {
                     let p = w.lock().unwrap_or_else(|e| e.into_inner());
                     let info = p
@@ -1940,7 +2017,14 @@ impl SessionHandle {
                         device.transport == crate::types::Transport::Scanner
                             && (device.id == camera || device.serial == camera)
                     });
-                let mut p = Process::spawn(scanner)?;
+                let class = if scanner {
+                    FrameClass::Scanner
+                } else if crate::hubs::is_source(&camera) {
+                    FrameClass::Hub
+                } else {
+                    FrameClass::Default
+                };
+                let mut p = Process::spawn(class)?;
                 let result = p.call(SessionCommand::Connect { camera, timeout_ms })?;
                 let info = p
                     .snapshot
@@ -2232,17 +2316,39 @@ pub fn run_worker(path: &std::path::Path) -> Result<()> {
             };
             // One snapshot clone per reply, serialized straight to the pipe; the
             // clone keeps the state lock out of the blocking write.
-            let snapshot = handle.snapshot();
-            let (ok, result, error) = match result {
-                Ok(result) => (true, result, None),
-                Err(e) => (false, None, Some(format!("{e:#}"))),
+            let mut snapshot = handle.snapshot();
+            let (ok, result, error, code) = match result {
+                Ok(result) => (true, result, None, None),
+                Err(e) => (
+                    false,
+                    None,
+                    Some(format!("{e:#}")),
+                    crate::types::error_transport_code(&e),
+                ),
             };
+            // Hub secrets this worker holds never leave it, even in text a
+            // dependency produced.
+            let scrub = |text: &mut String| {
+                if let std::borrow::Cow::Owned(clean) = crate::hubs::scrub::scrub(text) {
+                    *text = clean;
+                }
+            };
+            let mut error = error;
+            if crate::hubs::scrub::active() {
+                error.iter_mut().for_each(scrub);
+                snapshot.last_error.iter_mut().for_each(scrub);
+                snapshot
+                    .logs
+                    .iter_mut()
+                    .for_each(|entry| scrub(&mut entry.message));
+            }
             serde_json::to_writer(
                 &mut output,
                 &WorkerReply {
                     ok,
                     result,
                     error,
+                    code,
                     snapshot: &snapshot,
                     saved: handle.take_saved(2048),
                 },

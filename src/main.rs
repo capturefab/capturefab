@@ -16,7 +16,10 @@ fn main() {
             .ok_or_else(|| anyhow::anyhow!("missing shared ring path"))
             .and_then(|p| capturefab::session::run_worker(std::path::Path::new(&p)));
         if let Err(e) = result {
-            eprintln!("capturefab worker: {e:#}");
+            eprintln!(
+                "capturefab worker: {}",
+                capturefab::hubs::scrub::scrub(&format!("{e:#}"))
+            );
             std::process::exit(1)
         }
         return;
@@ -76,9 +79,11 @@ fn main() {
         }
         let (code, exit) = cli::error_code(&error);
         let workflow_failure = error.downcast_ref::<capturefab::workflow::WorkflowFailure>();
+        // Classified first, then any registered hub secret is removed.
         let message = workflow_failure
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("{error:#}"));
+        let message = capturefab::hubs::scrub::scrub(&message).into_owned();
         if json_mode {
             let mut envelope =
                 json!({"version":1,"ok":false,"error":{"code":code,"message":message}});

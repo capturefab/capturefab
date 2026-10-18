@@ -566,6 +566,11 @@ fn connection_notes<'a>(p: &'static Palette) -> Element<'a, Message> {
             Some("sim:replay:PATH")
         ),
         note("Webcams", "Built-in and USB webcams.", Some(webcam_scheme())),
+        note(
+            "Hubs",
+            "Cameras from Home Assistant, Frigate, go2rtc and UniFi Protect, after you save the server with capturefab hub add-home-assistant (or add-frigate, add-go2rtc, add-unifi-protect).",
+            Some("hub:NAME/CAMERA")
+        ),
         note("GigE", "Use an address on the camera's subnet.", None).push(tip(
             step_button("Check network", None, "Check network", Some(Message::ScanNetwork), p),
             "Tunes connected GigE cameras for the available bandwidth and checks network adapters. Live previews may pause briefly.",

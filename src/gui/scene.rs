@@ -124,6 +124,9 @@ pub(super) struct Scene {
     /// Welcome discovery is display-only and never enumerates real devices.
     welcome: bool,
     searching: bool,
+    /// Cameras on saved hubs are in the camera list, as discovery finds
+    /// them (synthetic: no hub is contacted).
+    hubs: bool,
 }
 
 impl Scene {
@@ -139,6 +142,29 @@ impl Scene {
                     .map(crate::transport::simulator::info_named)
                     .collect()
             };
+        }
+        if self.hubs
+            && !snapshot
+                .devices
+                .iter()
+                .any(|d| crate::hubs::is_source(&d.id))
+        {
+            for (hub, camera, vendor, model) in [
+                ("home", "camera.front_door", "Home Assistant", "Front door"),
+                ("home", "camera.garage", "Home Assistant", "Garage"),
+                ("nvr", "driveway", "Frigate", "Driveway"),
+            ] {
+                let id = format!("hub:{hub}/{camera}");
+                snapshot.devices.push(crate::types::CameraInfo {
+                    id: id.clone(),
+                    transport: crate::types::Transport::Media,
+                    vendor: vendor.into(),
+                    model: model.into(),
+                    serial: format!("{hub}/{camera}"),
+                    address: Some(id),
+                    profile: Default::default(),
+                });
+            }
         }
         if self.forwarding.is_none() && !self.stopped {
             return;
@@ -185,7 +211,8 @@ impl Workbench {
     ///   auto mode), `forwarding` (the selected camera forwards to a URL),
     ///   `recording` (the selected camera records to a file, for 1:23)
     /// - `tags`: the capture tags filled in and open; `dataset`: the Dataset
-    ///   section open
+    ///   section open; `side-hub`: cameras from saved hubs in the camera
+    ///   list (with `welcome`, on the welcome cards)
     /// - review fixtures: `network`, `network-empty`, `network-error`,
     ///   `destinations-remove`, `bucket-editor-advanced`, `settings-credentials`,
     ///   `settings-credential-error`, `analytics-measurements`,
@@ -205,6 +232,7 @@ impl Workbench {
                 // run_capture connects no cameras. The snapshot supplies only
                 // built-in simulator cards, without real device discovery.
                 "welcome" => self.scene.welcome = true,
+                "side-hub" => self.scene.hubs = true,
                 "help" => self.help_open = true,
                 "analytics" => self.analytics.open = true,
                 "capture" => self.tab = Tab::Capture,

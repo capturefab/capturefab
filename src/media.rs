@@ -91,9 +91,16 @@ pub fn redact_url(url: &str) -> String {
                     "password"
                         | "passphrase"
                         | "passwd"
+                        | "pwd"
+                        | "pw"
                         | "token"
                         | "key"
+                        | "api_key"
+                        | "apikey"
                         | "auth"
+                        | "authsig"
+                        | "sig"
+                        | "signature"
                         | "secret"
                         | "access_token"
                         | "streamid"
@@ -440,8 +447,20 @@ pub(crate) fn command(exe: &Executable) -> Command {
         cmd.creation_flags(0x08000000);
     }
     cmd.stdin(Stdio::null());
+    // Camera hub secrets may live in the environment of the process that
+    // opens the camera; FFmpeg never needs them.
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with(HUB_SECRET_PREFIX))
+        {
+            cmd.env_remove(name);
+        }
+    }
     cmd
 }
+/// Environment variables that hold camera hub secrets start with this.
+pub(crate) const HUB_SECRET_PREFIX: &str = "CAPTUREFAB_HUB_";
 fn bounded_output(exe: &Executable, args: &[String], timeout: Duration) -> Result<(bool, String)> {
     let (success, output, _) = timed_output(exe, args, timeout)?;
     Ok((success, output))
@@ -667,6 +686,17 @@ struct Decoded {
     frames: VecDeque<Frame>,
     error: Option<String>,
 }
+/// The decoder has exited: every later read fails the same way until the
+/// source is opened again. The engine counts it as a transport error even when
+/// FFmpeg's reason mentions a timeout.
+#[derive(Debug)]
+pub(crate) struct StreamEnded(pub String);
+impl std::fmt::Display for StreamEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for StreamEnded {}
 struct DecoderQueue {
     state: Mutex<Decoded>,
     changed: Condvar,
@@ -829,11 +859,11 @@ impl Decoder {
             let mut id = 0;
             while !shared.stopped.load(Ordering::Relaxed) {
                 id += 1;
-                let result = read_ppm(
-                    &mut reader,
-                    id,
-                    epoch.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                );
+                // Stamp a frame when it has arrived, not when its wait began.
+                let result = read_ppm(&mut reader, id, 0).map(|mut frame| {
+                    frame.timestamp_ns = epoch.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    frame
+                });
                 let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
                 match result {
                     Ok(frame) => {
@@ -883,11 +913,12 @@ impl Decoder {
                 return Ok(frame);
             }
             if let Some(error) = &state.error {
-                bail!(
+                return Err(StreamEnded(format!(
                     "{}: {}",
                     redact_log(error, &self.source),
                     self.log.text(&self.source).trim()
-                );
+                ))
+                .into());
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             ensure!(
@@ -1583,24 +1614,105 @@ pub fn open_url(source: &str, timeout: Duration) -> Result<Box<dyn Backend>> {
     backend.launch()?;
     Ok(Box::new(backend))
 }
+fn backend_xml(native: bool, modes: &[Mode]) -> String {
+    let video_mode = if modes.is_empty() {
+        ""
+    } else {
+        "<pFeature>VideoMode</pFeature>"
+    };
+    let mut xml = format!(
+        "<RegisterDescription><Category Name='Root'><pFeature>Width</pFeature><pFeature>Height</pFeature><pFeature>PixelFormat</pFeature><pFeature>PayloadSize</pFeature><pFeature>AcquisitionFrameRate</pFeature><pFeature>AcquisitionStart</pFeature><pFeature>AcquisitionStop</pFeature>{video_mode}</Category>"
+    );
+    for (name, address) in [
+        ("Width", 0),
+        ("Height", 4),
+        ("PixelFormat", 8),
+        ("PayloadSize", 12),
+    ] {
+        let writable = native && matches!(name, "Width" | "Height");
+        let access = if writable { "RW" } else { "RO" };
+        let bounds = if writable {
+            "<Min>16</Min><Max>8192</Max><pIsLocked>IsAcquiring</pIsLocked>"
+        } else {
+            ""
+        };
+        xml.push_str(&format!("<Integer Name='{name}'><pValue>{name}Reg</pValue>{bounds}</Integer><IntReg Name='{name}Reg'><Address>{address}</Address><Length>4</Length><AccessMode>{access}</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>"));
+    }
+    let access = if native { "RW" } else { "RO" };
+    xml.push_str(&format!("<Float Name='AcquisitionFrameRate'><pValue>FrameRateReg</pValue><Min>0.1</Min><Max>240</Max><Unit>Hz</Unit><pIsLocked>IsAcquiring</pIsLocked></Float><FloatReg Name='FrameRateReg'><Address>20</Address><Length>8</Length><AccessMode>{access}</AccessMode><Endianess>LittleEndian</Endianess></FloatReg><Integer Name='IsAcquiring'><pValue>AcquiringReg</pValue></Integer><IntReg Name='AcquiringReg'><Address>16</Address><Length>4</Length><AccessMode>RO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"));
+    if !modes.is_empty() {
+        let entries = modes
+            .iter()
+            .enumerate()
+            .map(|(index, mode)| {
+                format!(
+                    "<EnumEntry Name='{}'><Value>{index}</Value></EnumEntry>",
+                    mode.label()
+                )
+            })
+            .collect::<String>();
+        xml.push_str(&format!("<Enumeration Name='VideoMode'><pValue>VideoModeReg</pValue>{entries}<pIsLocked>IsAcquiring</pIsLocked></Enumeration><IntReg Name='VideoModeReg'><Address>28</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>"));
+    }
+    xml.push_str("<Command Name='AcquisitionStart'><pValue>Control</pValue><CommandValue>1</CommandValue></Command><Command Name='AcquisitionStop'><pValue>Control</pValue><CommandValue>0</CommandValue></Command><IntReg Name='Control'><Address>16</Address><Length>4</Length><AccessMode>WO</AccessMode></IntReg></RegisterDescription>");
+    xml
+}
+/// The 32-byte register file every media-like source exposes: width,
+/// height, pixel format, payload size, acquisition state, frame rate and
+/// video mode.
+fn registers(width: u32, height: u32, running: bool, fps: f64, mode: u32) -> [u8; 32] {
+    let mut registers = [0u8; 32];
+    registers[0..4].copy_from_slice(&width.to_le_bytes());
+    registers[4..8].copy_from_slice(&height.to_le_bytes());
+    registers[8..12].copy_from_slice(&RGB8.to_le_bytes());
+    registers[12..16].copy_from_slice(&(width * height * 3).to_le_bytes());
+    registers[16..20].copy_from_slice(&(running as u32).to_le_bytes());
+    registers[20..28].copy_from_slice(&fps.to_le_bytes());
+    registers[28..32].copy_from_slice(&mode.to_le_bytes());
+    registers
+}
+fn register_range(registers: &[u8; 32], address: u64, length: usize) -> Result<Vec<u8>> {
+    let start = usize::try_from(address)?;
+    let end = start
+        .checked_add(length)
+        .context("media register range overflow")?;
+    Ok(registers
+        .get(start..end)
+        .context("unknown media register")?
+        .to_vec())
+}
+/// Registers of a read-only RGB8 source, such as a camera hub stream.
+#[cfg(feature = "hubs")]
+pub(crate) fn read_only_registers(
+    width: u32,
+    height: u32,
+    running: bool,
+    fps: f64,
+    address: u64,
+    length: usize,
+) -> Result<Vec<u8>> {
+    register_range(
+        &registers(width, height, running, fps, u32::MAX),
+        address,
+        length,
+    )
+}
+/// GenICam XML for a read-only RGB8 source over [`read_only_registers`]:
+/// Width, Height, PixelFormat, PayloadSize and AcquisitionFrameRate are read
+/// only; AcquisitionStart and AcquisitionStop write register 16.
+#[cfg(feature = "hubs")]
+pub(crate) fn read_only_xml() -> String {
+    backend_xml(false, &[])
+}
 impl RegisterIo for MediaBackend {
     fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
-        let mut registers = [0u8; 32];
-        registers[0..4].copy_from_slice(&self.width.to_le_bytes());
-        registers[4..8].copy_from_slice(&self.height.to_le_bytes());
-        registers[8..12].copy_from_slice(&RGB8.to_le_bytes());
-        registers[12..16].copy_from_slice(&(self.width * self.height * 3).to_le_bytes());
-        registers[16..20].copy_from_slice(&(self.running as u32).to_le_bytes());
-        registers[20..28].copy_from_slice(&self.fps.to_le_bytes());
-        registers[28..32].copy_from_slice(&self.mode.map_or(u32::MAX, |i| i as u32).to_le_bytes());
-        let start = usize::try_from(address)?;
-        let end = start
-            .checked_add(length)
-            .context("media register range overflow")?;
-        Ok(registers
-            .get(start..end)
-            .context("unknown media register")?
-            .to_vec())
+        let registers = registers(
+            self.width,
+            self.height,
+            self.running,
+            self.fps,
+            self.mode.map_or(u32::MAX, |i| i as u32),
+        );
+        register_range(&registers, address, length)
     }
     fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
         if address == 16 && data.len() == 4 {
@@ -1679,47 +1791,7 @@ impl RegisterIo for MediaBackend {
 }
 impl Backend for MediaBackend {
     fn xml(&mut self) -> Result<String> {
-        let video_mode = if self.modes.is_empty() {
-            ""
-        } else {
-            "<pFeature>VideoMode</pFeature>"
-        };
-        let mut xml = format!(
-            "<RegisterDescription><Category Name='Root'><pFeature>Width</pFeature><pFeature>Height</pFeature><pFeature>PixelFormat</pFeature><pFeature>PayloadSize</pFeature><pFeature>AcquisitionFrameRate</pFeature><pFeature>AcquisitionStart</pFeature><pFeature>AcquisitionStop</pFeature>{video_mode}</Category>"
-        );
-        for (name, address) in [
-            ("Width", 0),
-            ("Height", 4),
-            ("PixelFormat", 8),
-            ("PayloadSize", 12),
-        ] {
-            let writable = self.native && matches!(name, "Width" | "Height");
-            let access = if writable { "RW" } else { "RO" };
-            let bounds = if writable {
-                "<Min>16</Min><Max>8192</Max><pIsLocked>IsAcquiring</pIsLocked>"
-            } else {
-                ""
-            };
-            xml.push_str(&format!("<Integer Name='{name}'><pValue>{name}Reg</pValue>{bounds}</Integer><IntReg Name='{name}Reg'><Address>{address}</Address><Length>4</Length><AccessMode>{access}</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>"));
-        }
-        let access = if self.native { "RW" } else { "RO" };
-        xml.push_str(&format!("<Float Name='AcquisitionFrameRate'><pValue>FrameRateReg</pValue><Min>0.1</Min><Max>240</Max><Unit>Hz</Unit><pIsLocked>IsAcquiring</pIsLocked></Float><FloatReg Name='FrameRateReg'><Address>20</Address><Length>8</Length><AccessMode>{access}</AccessMode><Endianess>LittleEndian</Endianess></FloatReg><Integer Name='IsAcquiring'><pValue>AcquiringReg</pValue></Integer><IntReg Name='AcquiringReg'><Address>16</Address><Length>4</Length><AccessMode>RO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"));
-        if !self.modes.is_empty() {
-            let entries = self
-                .modes
-                .iter()
-                .enumerate()
-                .map(|(index, mode)| {
-                    format!(
-                        "<EnumEntry Name='{}'><Value>{index}</Value></EnumEntry>",
-                        mode.label()
-                    )
-                })
-                .collect::<String>();
-            xml.push_str(&format!("<Enumeration Name='VideoMode'><pValue>VideoModeReg</pValue>{entries}<pIsLocked>IsAcquiring</pIsLocked></Enumeration><IntReg Name='VideoModeReg'><Address>28</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>"));
-        }
-        xml.push_str("<Command Name='AcquisitionStart'><pValue>Control</pValue><CommandValue>1</CommandValue></Command><Command Name='AcquisitionStop'><pValue>Control</pValue><CommandValue>0</CommandValue></Command><IntReg Name='Control'><Address>16</Address><Length>4</Length><AccessMode>WO</AccessMode></IntReg></RegisterDescription>");
-        Ok(xml)
+        Ok(backend_xml(self.native, &self.modes))
     }
     fn start(&mut self, _: usize) -> Result<()> {
         if self.decoder.is_none() {
@@ -3096,6 +3168,30 @@ mod tests {
         assert!(info("rtsp://camera/live").is_ok());
         assert!(info("concat:secret|other").is_err());
         assert!(info("rtsp://camera/live\n-x").is_err());
+        // Vendor and signed-URL credentials (Foscam pwd, Blue Iris pw,
+        // Home Assistant authSig, API keys) never reach logs either.
+        assert_eq!(
+            redact_url(
+                "http://cam/cgi?usr=a&PWD=b&pw=c&api_key=d&ApiKey=e&authSig=f&sig=g&signature=h&stream=main&fps=5"
+            ),
+            "http://cam/cgi?usr=a&PWD=<redacted>&pw=<redacted>&api_key=<redacted>&ApiKey=<redacted>&authSig=<redacted>&sig=<redacted>&signature=<redacted>&stream=main&fps=5"
+        );
+    }
+    #[test]
+    fn ffmpeg_never_inherits_hub_secrets() {
+        let exe = Executable {
+            path: "ffmpeg".into(),
+            directory: None,
+        };
+        // SAFETY: tests that read this variable do not run concurrently with
+        // it, and no other thread depends on its absence.
+        unsafe { std::env::set_var("CAPTUREFAB_HUB_TEST_SECRET", "CANARY") };
+        let cmd = command(&exe);
+        unsafe { std::env::remove_var("CAPTUREFAB_HUB_TEST_SECRET") };
+        assert!(
+            cmd.get_envs()
+                .any(|(name, value)| { name == "CAPTUREFAB_HUB_TEST_SECRET" && value.is_none() })
+        );
     }
     #[test]
     fn backend_urls_lowercase_only_the_scheme_and_keep_credentials_redacted() {

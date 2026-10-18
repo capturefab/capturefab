@@ -1,6 +1,6 @@
 # capturefab
 
-Capture camera images, video, sensor values and PLC tags on the plant floor, and keep them ready for analysis. Capturefab is a native desktop app and a scriptable CLI for manufacturing and process engineers who work on OT networks. It connects GigE Vision, USB3 Vision, webcams, RTSP/ONVIF cameras and document scanners; reads Modbus TCP, MQTT, OPC UA and MTConnect sources; and catalogs every saved file and sample in one DuckDB dataset. An export gives Parquet or CSV files plus a `README.md` and `manifest.json` that a notebook, a BI tool or an AI assistant such as Claude, ChatGPT or Gemini can read without more explanation.
+Capture camera images, video, sensor values and PLC tags on the plant floor, and keep them ready for analysis. Capturefab is a native desktop app and a scriptable CLI for manufacturing and process engineers who work on OT networks. It connects GigE Vision, USB3 Vision, webcams, RTSP/ONVIF cameras, document scanners and the cameras saved in Home Assistant, Frigate, go2rtc or UniFi Protect; reads Modbus TCP, MQTT, OPC UA and MTConnect sources; and catalogs every saved file and sample in one DuckDB dataset. An export gives Parquet or CSV files plus a `README.md` and `manifest.json` that a notebook, a BI tool or an AI assistant such as Claude, ChatGPT or Gemini can read without more explanation.
 
 Everything runs on the local computer, with no cloud service. Files are never overwritten: captures get new names from templates such as `{camera}-{datetime}-{seq}.png`. Open `capturefab` to discover cameras, select a device, inspect its settings, and capture. The same executable runs headless and lets scripts or coding agents control an already visible GUI session.
 
@@ -14,7 +14,7 @@ Download the matching desktop or headless binary from [GitHub Releases](https://
 
 ```sh
 capturefab                         # desktop; follows system light/dark mode
-capturefab discover                # network, USB3 Vision and host cameras
+capturefab discover                # network, USB3 Vision, host and saved hub cameras
 capturefab native                  # USB webcams, built-in webcams, capture cards
 capturefab compatibility GX85       # connection guidance for a Lumix GX85
 capturefab --camera sim:0 capture -o first.png
@@ -428,6 +428,42 @@ capturefab --camera 'onvif://admin:password@192.168.1.10/onvif/device_service' c
 
 Forwarding uses a bounded latest-frame queue and probes an encoder before selecting it. Candidates, in order, are the vendor encoders (Apple VideoToolbox, NVIDIA NVENC including AV1, NVIDIA Jetson through its GStreamer `nvv4l2h264enc`/`nvv4l2h265enc`/`nvv4l2av1enc` elements, AMD AMF, Intel QSV, VAAPI), then cross-vendor Vulkan Video (`h264_vulkan`, `hevc_vulkan`, `av1_vulkan`), Windows Media Foundation and Linux V4L2, where the build and host drivers support them; software H.264/HEVC is the fallback. On Jetson the GStreamer encoder runs as a separate process and FFmpeg remuxes and delivers its stream. `--encoder` selects explicitly and `--hwaccel` controls decoding for new direct, GUI or `serve` workers; existing sessions retain their decoding setting. Hardware availability is established by a real probe, not chipset branding. Frames reach FFmpeg in their sensor format (gray, 10/12/16-bit gray, Bayer or packed RGB), handed from the camera worker to the writer thread without a copy, so color conversion runs in FFmpeg's SIMD scaler or the encoder hardware rather than on the camera thread; NVENC and AMF receive packed RGB for color sources and convert it on the GPU when their probe accepts that input. See [FFmpeg builds](docs/ffmpeg-build.md). `.mkv`, fragmented `.mp4`/`.mov`, `.ts` and suitable `.webm` recordings use a bounded Rust writer. Serve HLS through MediaMTX rather than local files outside the retention manager.
 
+## Cameras from Home Assistant, Frigate, go2rtc and UniFi Protect
+
+A **hub** is a saved Home Assistant, Frigate, go2rtc or UniFi Protect server. Save it once with `capturefab hub add-…`; its cameras then appear in `discover` (after local cameras) and in the GUI camera list, and open as `hub:NAME/CAMERA` wherever `--camera` takes a source. Capturefab reads frames from the hub, through its HTTP API or RTSP restream, and never contacts the cameras behind it.
+
+```sh
+capturefab hub add-home-assistant home --url http://homeassistant.local:8123 --secret-stdin < token.txt
+capturefab hub add-frigate nvr --url http://nvr.local:5000
+capturefab hub add-go2rtc streams --url http://go2rtc.local:1984
+capturefab hub add-unifi-protect protect --url https://192.168.1.1 --secret-stdin --accept-certificate < api-key.txt
+capturefab hub list
+capturefab hub cameras home                 # IDs to use with --camera
+capturefab hub test home
+capturefab --camera 'hub:home/camera.front_door' capture -o front.png
+capturefab --camera 'hub:home/camera.porch?stream=snapshot' capture --interval 1m -n 60 -o porch
+capturefab hub remove home --forget-secret
+```
+
+| Hub | Camera ID | Streams (auto first) |
+| --- | --- | --- |
+| Home Assistant | `hub:NAME/camera.ENTITY` | `mjpeg`, `snapshot` |
+| Frigate | `hub:NAME/CAMERA` (the camera name) | `rtsp` (Frigate's restream), `snapshot`; also `mjpeg` |
+| go2rtc | `hub:NAME/STREAM` | `rtsp`, `snapshot`; also `mjpeg` for JPEG sources |
+| UniFi Protect | `hub:NAME/CAMERA_ID` (24 hexadecimal digits) | `snapshot` |
+
+`hub` (alias `hubs`) has `list`, `cameras [NAME]`, `test NAME`, `add-home-assistant` (alias `add-ha`), `add-frigate`, `add-go2rtc`, `add-unifi-protect` (alias `add-unifi`) and `remove NAME [--forget-secret]`. Each `add-…` takes `NAME --url URL`, checks that the server answers and accepts the secret (`--no-check` saves without contacting it), and replaces a hub with the same name. Frigate uses `http://HOST:5000` without a user, or `https://HOST:8971` with `--user U` and a password; `--rtsp-port` (default 8554) names its restream port. go2rtc takes `--user U` with a password when its API has one. UniFi Protect needs `https://CONSOLE` and an API key from **Settings > Control Plane > Integrations**.
+
+Selectors are `hub:NAME/CAMERA[?stream=auto|mjpeg|snapshot|rtsp&fps=F]`; quote them, because shells treat `?` and `&` specially. `stream=auto` (the default) tries the streams in the order above when connecting and keeps the first that delivers a frame. `fps` sets the polling rate of `stream=snapshot`: 0.01–2 per second for Home Assistant and go2rtc (default 1), up to 5 for Frigate (default 1), and up to 1 for UniFi Protect (default 0.5); Frigate's `stream=mjpeg` takes a whole `fps` from 1 to 10. Percent-encode characters in CAMERA other than `A-Z a-z 0-9 - . _ ~` as `%XX`. The camera ID is `hub:NAME/CAMERA` without options and its serial is `NAME/CAMERA`. Disconnect a connected hub camera before connecting it again with other options.
+
+Secrets never go into Capturefab's files or commands; `hubs.json` in the session directory records only where each one comes from. `--secret-stdin` reads the long-lived access token (Home Assistant: **Profile > Security**), password (Frigate, go2rtc) or API key (UniFi Protect) and keeps it in the operating system's credential store (service `capturefab-hub`, one entry per hub and server), where the GUI, `serve` and the CLI all find it. `--secret-env CAPTUREFAB_HUB_HOME_TOKEN` saves only the variable's name (`CAPTUREFAB_HUB_` followed by 1–48 of `A-Z`, `0-9` and `_`); the variable is read by the process that opens or lists the camera (a GUI or `serve` session for the cameras it discovers and connects; the CLI for `hub` commands and direct `--camera` commands), and it must also be set where you add the hub unless you use `--no-check`. A GUI started from the Dock, Finder or Start menu does not see shell variables, so use `--secret-stdin` for the desktop app. Builds without the credential store, such as the headless release set, take `--secret-env` only. Re-adding a keychain hub for the same server without a secret option keeps its saved secret. FFmpeg never inherits `CAPTUREFAB_HUB_*` variables. Give Home Assistant the token of a dedicated non-admin user: the token carries that user's access. A secret the server refuses is recorded, and discovery skips that hub, without sending the secret again, until `hub test NAME` succeeds; Home Assistant bans an address after repeated failed logins.
+
+`https://` hubs trust the operating system's certificates. For a self-signed certificate (UniFi consoles, and Frigate's port 8971 by default), `--accept-certificate` trusts the certificate the server presents when the hub is saved and prints its fingerprint, so confirm it with the administrator; it conflicts with `--no-check`. `--certificate SHA256:AB:CD:…` (as `openssl x509 -noout -fingerprint -sha256` prints it) pins a known certificate, and `--tls-server-name NAME` checks a trusted certificate against NAME when the URL uses an IP address; use one of the three. A pinned certificate that changes stops the camera and names both fingerprints. Over `http://`, a token or password crosses the network unencrypted and the CLI warns; Frigate passwords are only sent over `https://`.
+
+`serve --listen` refuses to connect hub cameras for remote clients, because they would use this computer's hub secrets, unless it was started with `--allow-hubs`.
+
+JPEG and PNG stills and MJPEG are fetched and decoded in the camera worker; RTSP restreams are decoded by FFmpeg and opened without a password, so Frigate's restream port and go2rtc's RTSP server must allow unauthenticated reading. The first frame can take up to 12 s (15 s for an RTSP restream); `--timeout-ms` only lengthens that wait. Home Assistant's MJPEG stream sends nothing while the image is unchanged; use `stream=snapshot` for static scenes and time-lapses. Hub camera settings are read-only; change them in the hub. `HTTP_PROXY` and `HTTPS_PROXY` are ignored. Hub cameras get a 32 MiB frame ring per slot, enough for 4096×2160 RGB frames; `CAPTUREFAB_FRAME_BYTES` overrides it. Streams reconnect automatically with backoff; a refused secret or certificate stops acquisition. Exit codes: 2 for invalid names, URLs, flags or selectors; 3 when a hub or camera is not found, offline or unreachable; 4 for a timeout; 5 when hubs or the credential store are not compiled into the build; 1 for a refused secret or certificate or an unexpected answer. `schema --json` describes each kind in `result.hubs`. Compatibility with particular hub versions and cameras has not been validated.
+
 ## Debugging and limits
 
 `features`, `get`, `set`, `execute`, `xml`, `memory read`, `memory write` and `doctor` expose camera state and transport diagnostics. Raw register writes are advanced operations; settings apply sequentially and a later failure does not undo earlier successful settings. Camera feature access, bounds and availability are evaluated live.
@@ -443,16 +479,16 @@ Single-component image conversion also accepts `Coord3D_C8`, `Coord3D_C16`, `Con
 ```sh
 cargo build --release                              # Rust desktop; bundles FFmpeg when supplied
 cargo build --release --no-default-features \
-  --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,parquet,modbus,mqtt,opcua,mtconnect,dinov2   # headless release set
+  --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,parquet,modbus,mqtt,opcua,mtconnect,dinov2,hubs   # headless release set
 cargo test
 cargo clippy --all-features --all-targets -- -D warnings
 ```
 
-Default features add S3, FTP/FTPS and SFTP destinations (`s3`, `ftp`, `sftp`), Parquet and JSON dataset exports (`parquet`) the `modbus`, `mqtt`, `opcua` and `mtconnect` signal protocols, and bundled DINOv2 embeddings for automatic capture (`dinov2`: wgpu compute shaders with a CPU fallback; `python3 scripts/fetch-dinov2.py` supplies the pinned weights that release builds embed); `doctor --json` lists what a binary has. The headless release set above leaves out the network upload destinations, and a build without `parquet` exports CSV only. The `jpeg` feature, enabled in both builds above, compiles libjpeg-turbo from source and needs a C compiler and CMake, plus NASM on x86 for its SIMD code. Source development builds can use `CAPTUREFAB_FFMPEG=/absolute/path/to/ffmpeg`. Release builds embed `CAPTUREFAB_FFMPEG_BINARY`, or the automatic path `target/ffmpeg/<target>/bin/ffmpeg[.exe]`. `CAPTUREFAB_FFMPEG_LICENSE` embeds the matching notice. The source build script pins and checksums FFmpeg, SRT, OpenSSL and x264, and includes source/license/build metadata with distributed binaries.
+Default features add S3, FTP/FTPS and SFTP destinations (`s3`, `ftp`, `sftp`), Parquet and JSON dataset exports (`parquet`), the `modbus`, `mqtt`, `opcua` and `mtconnect` signal protocols, bundled DINOv2 embeddings for automatic capture (`dinov2`: wgpu compute shaders with a CPU fallback; `python3 scripts/fetch-dinov2.py` supplies the pinned weights that release builds embed), and cameras from Home Assistant, Frigate, go2rtc and UniFi Protect (`hubs`). The destinations and the desktop's AI provider keys bring the OS credential store (`keychain`); `doctor --json` lists what a binary has. The headless release set above leaves out the network upload destinations and the credential store, so its hubs read secrets from `--secret-env` only, and a build without `parquet` exports CSV only. The `jpeg` feature, enabled in both builds above, compiles libjpeg-turbo from source and needs a C compiler and CMake, plus NASM on x86 for its SIMD code. Source development builds can use `CAPTUREFAB_FFMPEG=/absolute/path/to/ffmpeg`. Release builds embed `CAPTUREFAB_FFMPEG_BINARY`, or the automatic path `target/ffmpeg/<target>/bin/ffmpeg[.exe]`. `CAPTUREFAB_FFMPEG_LICENSE` embeds the matching notice. The source build script pins and checksums FFmpeg, SRT, OpenSSL and x264, and includes source/license/build metadata with distributed binaries.
 
 The release tooling uses SemVer, a cross-platform build matrix, checksums, authenticated signing, actual rendered GUI and terminal screenshots, GitHub Releases and a static site on Cloudflare Workers with an Atom feed. Build tools are development dependencies; they are not runtime dependencies. Platform-specific signing credentials are optional configuration, not keys fabricated by this repository. See the release scripts and workflows for the exact configured build matrix.
 
-Local automated verification includes public CLI calls, isolated camera subprocesses, shared-memory cleanup, concurrent acquisition, scheduling, retention, ONVIF HTTP/auth mocks and media decoding/encoding. Aravis is used only as an independent test simulator/reference, never linked into Capturefab.
+Local automated verification includes public CLI calls, isolated camera subprocesses, shared-memory cleanup, concurrent acquisition, scheduling, retention, ONVIF HTTP/auth mocks, camera hub HTTP/TLS fakes and media decoding/encoding. Aravis is used only as an independent test simulator/reference, never linked into Capturefab.
 
 ## License
 

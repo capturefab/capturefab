@@ -404,6 +404,10 @@ pub(super) fn redact_address(value: &str) -> String {
 /// `address` without its scheme, credentials, query or fragment: the host,
 /// any port, and the path. Safe to show, as `redact_address` is.
 pub(super) fn short_address(address: &str) -> String {
+    if crate::hubs::is_source(address) {
+        // hub:NAME/CAMERA, without the prefix and any options.
+        return address[4..].split(['?', '#']).next().unwrap_or("").into();
+    }
     let rest = address.strip_prefix("onvif:").unwrap_or(address);
     let rest = rest
         .strip_prefix("//")
@@ -538,6 +542,18 @@ pub(super) fn sample_feature(name: &str, kind: &str, value: serde_json::Value) -
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn hub_addresses_show_hub_and_camera_without_options() {
+        assert_eq!(
+            short_address("hub:home/camera.front_door?stream=snapshot&fps=0.5"),
+            "home/camera.front_door"
+        );
+        assert_eq!(short_address("HUB:nvr/driveway"), "nvr/driveway");
+        assert!(crate::gui::prefs::storable(
+            "hub:home/camera.front_door?stream=snapshot"
+        ));
+    }
 
     #[test]
     fn spans_read_in_the_largest_whole_unit() {

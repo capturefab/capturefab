@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Capturefab is an MIT-licensed Rust camera workbench: one binary that is both an iced desktop app (no subcommand) and a scriptable CLI. It implements GigE Vision, USB3 Vision and GenICam natively in Rust; webcams, RTSP/SRT/ONVIF, files, decoding and encoding go through a bundled FFmpeg executable (not linked). Aravis is currently used only as an external test reference.
+Capturefab is an MIT-licensed Rust camera workbench: one binary that is both an iced desktop app (no subcommand) and a scriptable CLI. It implements GigE Vision, USB3 Vision and GenICam natively in Rust; webcams, RTSP/SRT/ONVIF, files, decoding and encoding go through a bundled FFmpeg executable (not linked), except JPEG/PNG stills and MJPEG from camera hubs, which are decoded in the camera worker with libjpeg-turbo/png. Aravis is currently used only as an external test reference.
 
 ## Vendor and native dependencies
 
@@ -19,8 +19,8 @@ FFmpeg stays a separate executable. Never enable nonfree FFmpeg components: the 
 ## Commands
 
 ```sh
-cargo build                                                   # desktop (default features: gui, usb, scanner, jpeg, nvjpeg, vaapi, videotoolbox, s3, ftp, sftp, parquet, modbus, mqtt, opcua, mtconnect, dinov2)
-cargo build --release --no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,parquet,modbus,mqtt,opcua,mtconnect,dinov2  # headless
+cargo build                                                   # desktop (default features: gui, usb, scanner, jpeg, nvjpeg, vaapi, videotoolbox, s3, ftp, sftp, parquet, modbus, mqtt, opcua, mtconnect, dinov2, hubs)
+cargo build --release --no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,parquet,modbus,mqtt,opcua,mtconnect,dinov2,hubs  # headless
 cargo test
 cargo test --test cli                                         # end-to-end binary tests (tests/cli.rs)
 cargo test --lib storage::                                    # unit tests in one module
@@ -51,6 +51,8 @@ FFmpeg: `build.rs` embeds `CAPTUREFAB_FFMPEG_BINARY` when set at build time, and
 **Storage.** All captures and recordings go through `storage.rs`: an OS-locked (`fs2`) ledger in the session dir enforcing a global byte/file budget (default 10 GiB / 10,000 files), per-recording max size, reservations, and safe deletion (identity + SHA-256 checks). Write output via `storage::save` / `create_writer`, never directly. Existing output files must never be overwritten.
 
 **Destinations and uploads.** `destination.rs` holds named folder and S3 destinations (no secrets) in the session dir; captures, schedules and recordings resolve `--destination` to a local path and, for buckets, queue the finished file in `upload.rs` (a locked, persistent queue drained by whichever GUI/`serve`/CLI process holds `uploader.lock`). `s3.rs` is a SigV4 client over `ureq`/rustls with conditional writes; secrets come from the OS keychain (`keyring`) or the AWS credential chain. Queued files are held back from retention in the storage ledger until uploaded. `volumes.rs` lists external drives and refuses writes under an unmounted mount point. All of it is behind the `s3` feature except folders and volumes.
+
+**Hubs.** `hubs/` saves Home Assistant, Frigate, go2rtc and UniFi Protect servers so their cameras open as `hub:NAME/CAMERA` (a selector names a saved hub and camera, never a host or credential). `hubs.json` in the session dir holds no secrets (`registry.rs`); secrets live in the OS keychain (service `capturefab-hub`, account `KIND:NAME@ORIGIN` including any user and base path, so a changed URL never reads another server's secret; `keychain` feature) or in a `CAPTUREFAB_HUB_*` variable, and are resolved in the process that opens or lists the camera (`secret.rs`, zeroized and registered with `scrub.rs`; `media::command` strips those variables from FFmpeg). Hub listing for `discover` runs only in the coordinator (`discovery.rs`, cached); a worker only opens the one hub camera it owns. In the worker, `hubs::connect` builds the kind's sources and the frame pump (`pump.rs`, one thread per camera) fetches over the hand-rolled HTTP/1.1 + rustls client (`http.rs`, `tls.rs`), decodes JPEG/PNG stills and MJPEG parts (`image.rs`, `multipart.rs`) and reconnects with backoff; RTSP restreams go through FFmpeg (`sources.rs`). Hub errors are `types::Categorized`, which `cli::error_code` maps by category before reading message text. Selector parsing and the saved records build without the `hubs` feature; the network clients need it.
 
 ## CLI contract
 
