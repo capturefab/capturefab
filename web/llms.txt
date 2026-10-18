@@ -23,6 +23,7 @@ Use the built-in simulators to try commands without camera or PLC hardware.
 - [Source and build guide](https://github.com/capturefab/capturefab): Rust source, build instructions and MIT license.
 - [FFmpeg build notes](https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md): Media dependencies, corresponding source and build provenance.
 - [Remote control](https://github.com/capturefab/capturefab/blob/main/docs/remote-control.md): Local browser interface and HTTP activity observation.
+- [Line computer guide](https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md): Headless `serve` as a Linux service on a Raspberry Pi, Jetson or industrial PC: archive choice, camera permissions, systemd, storage budget and efficiency mode.
 
 ## Examine the installed version
 
@@ -121,6 +122,7 @@ Activity responses contain `{revision,activity}` inside the versioned result.
 These read-only calls bypass camera queues and create no Activity entries.
 RPC supports `{"op":"activity","after":12,"timeout_ms":20000}`.
 HTTP observers use `/api/activity?after=REV&timeout_ms=20000`; the maximum timeout is 25000 ms.
+HTTP previews: `/api/preview?camera=ID&format=jpeg` (PNG by default); send the returned `ETag` as `If-None-Match` to get 304 while the frame is unchanged.
 All observers wake on shared command and scheduled-job changes.
 See the agent instructions for actor fields, log timestamps and HTTP command envelopes.
 

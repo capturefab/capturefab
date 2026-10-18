@@ -45,7 +45,7 @@ Commands work from bash, zsh, fish, PowerShell, tmux, Ghostty, Warp, Claude Code
 
 ## Plant-floor data for analysis
 
-A typical shift: open the desktop app (or `serve` on a headless line computer), connect the cameras, add the line's PLC or sensor sources, fill in the **Capture tags** (Line, Station, Part, Lot, Note), and capture or record. Each saved image and recording gets a row in the dataset, with its time, camera, path, SHA-256, destination and tags. Samples from every source go into the same file. The `captures_with_signals` view joins each capture with the latest value of every tag at that moment. At the end, `dataset export` writes an analysis bundle to a new folder.
+A typical shift: open the desktop app (or `serve` on a headless [line computer](docs/line-computer.md)), connect the cameras, add the line's PLC or sensor sources, fill in the **Capture tags** (Line, Station, Part, Lot, Note), and capture or record. Each saved image and recording gets a row in the dataset, with its time, camera, path, SHA-256, destination and tags. Samples from every source go into the same file. The `captures_with_signals` view joins each capture with the latest value of every tag at that moment. At the end, `dataset export` writes an analysis bundle to a new folder.
 
 ```sh
 capturefab serve --name line1 --dataset plant.duckdb
@@ -148,7 +148,7 @@ Relative capture and recording paths resolve beside the workflow file; stdin wor
 
 ## Remote browser control
 
-Build the WebAssembly client with `./web-client/build.sh`, then run a headless server with `capturefab serve --name remote --listen 100.101.102.103:8787 --web-dir web-client/dist`. Open the server URL from another laptop on the same tailnet to discover cameras, edit settings, preview frames and set up captures or schedules. Anyone who can reach the listener can control captures; tailnet policy and the host firewall provide the access boundary. Capture files and jobs stay on the server; the local CLI can control the same session. See [remote setup and Tailscale HTTPS](docs/remote-control.md).
+Release executables have the WebAssembly browser client built in. Run a headless server with `capturefab serve --name remote --listen 100.101.102.103:8787` and open the server URL from another laptop on the same tailnet to discover cameras, edit settings, preview frames and set up captures or schedules. Anyone who can reach the listener can control captures; tailnet policy and the host firewall provide the access boundary. Capture files and jobs stay on the server; the local CLI can control the same session. Each tab costs the server one JPEG encode per new frame, shared with every other tab, and nothing while the frame is unchanged or the tab is hidden. Source builds build the client with `./web-client/build.sh` and either the `embedded-web` feature or `--web-dir web-client/dist`. See [remote setup and Tailscale HTTPS](docs/remote-control.md), and the [line computer guide](docs/line-computer.md) to run it as a service on a Raspberry Pi, Jetson or industrial PC: the headless archive, camera permissions, a systemd unit, the storage budget and efficiency mode.
 
 ## Session analytics
 
@@ -475,12 +475,12 @@ Single-component image conversion also accepts `Coord3D_C8`, `Coord3D_C16`, `Con
 ```sh
 cargo build --release                              # Rust desktop; bundles FFmpeg when supplied
 cargo build --release --no-default-features \
-  --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,parquet,modbus,mqtt,opcua,mtconnect,dinov2   # headless release set
+  --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,s3,ftp,sftp,parquet,modbus,mqtt,opcua,mtconnect,dinov2   # headless release set
 cargo test
 cargo clippy --all-features --all-targets -- -D warnings
 ```
 
-Default features add S3, FTP/FTPS and SFTP destinations (`s3`, `ftp`, `sftp`), Parquet and JSON dataset exports (`parquet`) the `modbus`, `mqtt`, `opcua` and `mtconnect` signal protocols, and bundled DINOv2 embeddings for automatic capture (`dinov2`: wgpu compute shaders with a CPU fallback; `python3 scripts/fetch-dinov2.py` supplies the pinned weights that release builds embed); `doctor --json` lists what a binary has. The headless release set above leaves out the network upload destinations, and a build without `parquet` exports CSV only. The `jpeg` feature, enabled in both builds above, compiles libjpeg-turbo from source and needs a C compiler and CMake, plus NASM on x86 for its SIMD code. Source development builds can use `CAPTUREFAB_FFMPEG=/absolute/path/to/ffmpeg`. Release builds embed `CAPTUREFAB_FFMPEG_BINARY`, or the automatic path `target/ffmpeg/<target>/bin/ffmpeg[.exe]`. `CAPTUREFAB_FFMPEG_LICENSE` embeds the matching notice. The source build script pins and checksums FFmpeg, SRT, OpenSSL and x264, and includes source/license/build metadata with distributed binaries.
+Default features add S3, FTP/FTPS and SFTP destinations (`s3`, `ftp`, `sftp`), Parquet and JSON dataset exports (`parquet`) the `modbus`, `mqtt`, `opcua` and `mtconnect` signal protocols, and bundled DINOv2 embeddings for automatic capture (`dinov2`: wgpu compute shaders with a CPU fallback; `python3 scripts/fetch-dinov2.py` supplies the pinned weights that release builds embed); `doctor --json` lists what a binary has. Both release sets upload to S3, FTP and SFTP destinations, and a build without `parquet` exports CSV only. Release builds also add `embedded-web` once `./web-client/build.sh` has built the browser client, so `serve --listen` needs no `--web-dir`. The `jpeg` feature, enabled in both builds above, compiles libjpeg-turbo from source and needs a C compiler and CMake, plus NASM on x86 for its SIMD code. Source development builds can use `CAPTUREFAB_FFMPEG=/absolute/path/to/ffmpeg`. Release builds embed `CAPTUREFAB_FFMPEG_BINARY`, or the automatic path `target/ffmpeg/<target>/bin/ffmpeg[.exe]`. `CAPTUREFAB_FFMPEG_LICENSE` embeds the matching notice. The source build script pins and checksums FFmpeg, SRT, OpenSSL and x264, and includes source/license/build metadata with distributed binaries.
 
 The release tooling uses SemVer, a cross-platform build matrix, checksums, authenticated signing, actual rendered GUI and terminal screenshots, GitHub Releases and a static site on Cloudflare Workers with an Atom feed. Build tools are development dependencies; they are not runtime dependencies. Platform-specific signing credentials are optional configuration, not keys fabricated by this repository. See the release scripts and workflows for the exact configured build matrix.
 

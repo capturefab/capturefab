@@ -20,9 +20,11 @@ import uuid
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
+LINE_COMPUTER = re.search(r'^repository\s*=\s*"([^"]+)"', (ROOT / 'Cargo.toml').read_text(), re.M)[1] + '/blob/main/docs/line-computer.md'
 SEMVER = re.compile(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?')
-TARGETS = [(os_, arch, variant) for os_, arches in [('linux', ['x86_64', 'aarch64', 'armv7']), ('macos', ['x86_64', 'aarch64']), ('windows', ['x86_64', 'aarch64'])] for arch in arches for variant in ['desktop', 'headless']]
-FEATURES = {'desktop': ['--features', 'wgpu'], 'headless': ['--no-default-features', '--features', 'usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,parquet,modbus,mqtt,opcua,mtconnect,dinov2']}
+# No 32-bit ARM: Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS.
+TARGETS = [(os_, arch, variant) for os_, arches in [('linux', ['x86_64', 'aarch64']), ('macos', ['x86_64', 'aarch64']), ('windows', ['x86_64', 'aarch64'])] for arch in arches for variant in ['desktop', 'headless']]
+FEATURES = {'desktop': ['--features', 'wgpu'], 'headless': ['--no-default-features', '--features', 'usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,s3,ftp,sftp,parquet,modbus,mqtt,opcua,mtconnect,dinov2']}
 # The oldest systems release executables must start on: glibc 2.28 (RHEL,
 # Rocky and Alma 8, Debian 10, Ubuntu 18.10 and newer) and the macOS
 # deployment targets. Windows executables must not need the Visual C++
@@ -262,6 +264,25 @@ MEDIA = [('FFMPEG', 'ffmpeg', 'GPL-3.0-or-later', 'https://ffmpeg.org/'), ('X264
          ('NV_HEADERS', 'nv-codec-headers', 'MIT', 'https://github.com/FFmpeg/nv-codec-headers'), ('VULKAN_HEADERS', 'Vulkan-Headers', 'Apache-2.0 OR MIT', 'https://github.com/KhronosGroup/Vulkan-Headers'),
          ('LIBVPL', 'libvpl', 'MIT', 'https://github.com/intel/libvpl'), ('AMF', 'AMF', 'MIT', 'https://github.com/GPUOpen-LibrariesAndSDKs/AMF')]
 
+WEB_CLIENT = ROOT / 'web-client'
+
+def web_dist():
+    """The browser client web-client/build.sh built, or None. Release builds
+    embed it when it exists (the embedded-web feature), so `serve --listen`
+    needs no --web-dir."""
+    dist = WEB_CLIENT / 'dist'
+    return dist if all((dist / name).is_file() for name in ('index.html', 'capturefab_web_bg.wasm')) else None
+
+def web_metadata():
+    return json.loads(run(['cargo', 'metadata', '--format-version', '1', '--locked', '--filter-platform', 'wasm32-unknown-unknown', '--manifest-path', WEB_CLIENT / 'Cargo.toml'], cwd=ROOT, capture_output=True, text=True).stdout)
+
+def cargo_features(variant, web):
+    """The variant's cargo feature flags, plus embedded-web with a built client."""
+    flags = list(FEATURES[variant])
+    if web:
+        flags[-1] += ',embedded-web'
+    return flags
+
 DINOV2_SCRIPT = ROOT / 'scripts' / 'fetch-dinov2.py'
 DINOV2_DIR = ROOT / 'target' / 'models' / 'dinov2-small'
 
@@ -279,10 +300,8 @@ def dinov2_weights():
         raise RuntimeError(f'{model} does not match the pinned DINOv2 weights')
     return model
 
-def cyclonedx(metadata, lock, recipe, ver, repository, serial):
-    """A CycloneDX 1.6 SBOM for every platform of a release: the Rust crates
-    linked with all features, with Cargo.lock checksums, and the media
-    payload components pinned by the FFmpeg build recipe."""
+def crate_components(metadata, lock):
+    """CycloneDX components for the crates a package links, with Cargo.lock checksums."""
     checksums = dict(((m[1], m[2]), m[3]) for m in re.finditer(r'\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"\n(?:source = "[^"]*"\n)?(?:checksum = "([0-9a-f]{64})")?', lock))
     packages, linked = linked_packages(metadata)
     crates = []
@@ -294,6 +313,18 @@ def cyclonedx(metadata, lock, recipe, ver, repository, serial):
         if checksums.get((package['name'], package['version'])):
             item['hashes'] = [dict(alg='SHA-256', content=checksums[(package['name'], package['version'])])]
         crates.append(item)
+    return crates
+
+def cyclonedx(metadata, lock, recipe, ver, repository, serial, web=None):
+    """A CycloneDX 1.6 SBOM for every platform of a release: the Rust crates
+    linked with all features, with Cargo.lock checksums, those of the browser
+    client when `web` holds its metadata and lock file, and the media payload
+    components pinned by the FFmpeg build recipe."""
+    crates = crate_components(metadata, lock)
+    if web:
+        known = {item['bom-ref'] for item in crates}
+        crates += [item for item in crate_components(*web) if item['bom-ref'] not in known]
+        crates.sort(key=lambda item: (item['name'], item['version']))
     pinned = dict(re.findall(r'^([A-Z0-9_]+)=(\S+)$', recipe, re.M))
     media = []
     for prefix, name, license_, url in MEDIA:
@@ -317,14 +348,15 @@ def cyclonedx(metadata, lock, recipe, ver, repository, serial):
             'components': crates + media + models,
             'dependencies': [dict(ref='capturefab', dependsOn=[c['bom-ref'] for c in crates] + ['media:ffmpeg', 'model:dinov2-small']), dict(ref='media:ffmpeg', dependsOn=[m['bom-ref'] for m in media if m['bom-ref'] != 'media:ffmpeg'])]}
 
-def sbom(output, ver, repository):
+def sbom(output, ver, repository, web=False):
     metadata = run(['cargo', 'metadata', '--format-version', '1', '--locked', '--all-features'], cwd=ROOT, capture_output=True, text=True).stdout
-    document = cyclonedx(json.loads(metadata), (ROOT / 'Cargo.lock').read_text(), (ROOT / 'scripts' / 'build-ffmpeg.sh').read_text(), ver, repository, uuid.uuid4())
+    web = (web_metadata(), (WEB_CLIENT / 'Cargo.lock').read_text()) if web else None
+    document = cyclonedx(json.loads(metadata), (ROOT / 'Cargo.lock').read_text(), (ROOT / 'scripts' / 'build-ffmpeg.sh').read_text(), ver, repository, uuid.uuid4(), web)
     path = output / f'capturefab-{ver}-sbom.cdx.json'
     path.write_text(json.dumps(document, indent=1) + '\n')
     return path
 
-def license_notices(metadata):
+def license_notices(metadata, title='Rust crates compiled into this Capturefab executable and their license texts.'):
     packages, linked = linked_packages(metadata)
     texts = {}
     for package in sorted((packages[i] for i in linked), key=lambda p: (p['name'], p['version'])):
@@ -338,11 +370,13 @@ def license_notices(metadata):
             if 'MPL-2.0' in (package.get('license') or ''):
                 label += f"; source: {package.get('repository') or 'https://crates.io/crates/' + package['name']}"
             texts.setdefault(text, []).append(label)
-    return 'Rust crates compiled into this Capturefab executable and their license texts.\n' + ''.join(f'\n===== {", ".join(names)} =====\n\n{text}\n' for text, names in texts.items())
+    return f'{title}\n' + ''.join(f'\n===== {", ".join(names)} =====\n\n{text}\n' for text, names in texts.items())
 
-def notices(target, variant):
+def notices(target, variant, web=False):
     metadata = run(['cargo', 'metadata', '--format-version', '1', '--locked', '--filter-platform', target, *FEATURES[variant]], cwd=ROOT, capture_output=True, text=True).stdout
     text = license_notices(json.loads(metadata))
+    if web:
+        text += '\n' + license_notices(web_metadata(), 'Rust crates compiled into the browser client (web-client) built into this executable for serve --listen, and their license texts.')
     pins = dinov2_pins()
     dinov2_weights()
     text += f"\n===== DINOv2 ViT-S/14 model weights ({pins['REPOSITORY']}@{pins['REVISION']}, Apache-2.0), embedded for automatic capture =====\n\n{(DINOV2_DIR / 'LICENSE').read_text(encoding='utf-8').strip()}\n"
@@ -430,6 +464,8 @@ def package(args, binary, variant):
         check_compatibility(executable, args.os, args.arch)
     if not embeds(binary, ffmpeg):
         raise ValueError(f'{binary} does not embed {ffmpeg}')
+    web = web_dist()
+    browser = bool(web) and embeds(binary, web / 'capturefab_web_bg.wasm')
     if not args.skip_smoke:
         smoke(binary)
     output = Path(args.output)
@@ -454,8 +490,13 @@ def package(args, binary, variant):
         shutil.copy2(ROOT / 'LICENSE', stage / 'LICENSE')
         shutil.copytree(Path(args.ffmpeg_bundle) / 'licenses', stage / 'media-licenses')
         shutil.copy2(Path(args.ffmpeg_bundle) / 'build-manifest.txt', stage / 'media-build-manifest.txt')
-        (stage / 'THIRD-PARTY-LICENSES.txt').write_text(notices(args.target, variant), encoding='utf-8')
-        (stage / 'README.txt').write_text(f'Capturefab {args.version}\n{args.os}/{args.arch}; {variant}\nRun capturefab --help for CLI usage. Desktop builds open the GUI with no arguments.\nFFmpeg is embedded; no separately installed media executable or camera SDK is required.\nPlatform signature: {signed}. Verify the download against the release SHA256SUMS.\nLicenses: LICENSE (Capturefab), THIRD-PARTY-LICENSES.txt (Rust crates and bundled fonts), media-licenses/ (FFmpeg payload).\nCorresponding source: the release source and media-sources archives.\n')
+        (stage / 'THIRD-PARTY-LICENSES.txt').write_text(notices(args.target, variant, browser), encoding='utf-8')
+        readme = f'Capturefab {args.version}\n{args.os}/{args.arch}; {variant}\nRun capturefab --help for CLI usage. Desktop builds open the GUI with no arguments. capturefab doctor checks this computer.\nFFmpeg is embedded; no separately installed media executable or camera SDK is required.\nPlatform signature: {signed}. Verify the download against the release SHA256SUMS.\nLicenses: LICENSE (Capturefab), THIRD-PARTY-LICENSES.txt (Rust crates and bundled fonts), media-licenses/ (FFmpeg payload).\nCorresponding source: the release source and media-sources archives.\n'
+        if browser:
+            readme += 'Remote browser: capturefab serve --name line1 --listen TAILNET-IP:8787 serves the browser interface. Anyone who can reach that address can control the cameras; bind it to a Tailscale or loopback address.\n'
+        if args.os == 'linux':
+            readme += f'Run it as a service on a Raspberry Pi, Jetson or industrial PC: {LINE_COMPUTER}\n'
+        (stage / 'README.txt').write_text(readme)
         if args.os == 'macos' and variant == 'desktop':
             app = stage / 'Capturefab.app' / 'Contents'
             (app / 'MacOS').mkdir(parents=True)
@@ -502,7 +543,8 @@ def package(args, binary, variant):
                 gatekeeper(app.parent)
                 archive_tree(stage, path, stem)
             signed = 'apple-notarized'
-    return record(path, args.os, args.arch, variant, target=args.target, platform_signature=signed, validation='cross-compiled' if args.skip_smoke else 'native-smoke-passed')
+    extra = dict(browser_client=True) if browser else {}
+    return record(path, args.os, args.arch, variant, target=args.target, platform_signature=signed, validation='cross-compiled' if args.skip_smoke else 'native-smoke-passed', **extra)
 
 def media_sources(args):
     output = Path(args.output)
@@ -591,8 +633,11 @@ def build(args):
             if args.binary:
                 binary = Path(args.binary).resolve()
             else:
-                command = ['cargo', 'build', '--locked', '--release', '--target', args.target, *FEATURES[variant]]
+                web = web_dist()
+                command = ['cargo', 'build', '--locked', '--release', '--target', args.target, *cargo_features(variant, web)]
                 env = dict(os.environ, CAPTUREFAB_DINOV2_WEIGHTS=str(dinov2_weights()), CAPTUREFAB_FFMPEG_BINARY=str((Path(args.ffmpeg_bundle) / 'bin' / ('ffmpeg.exe' if args.os == 'windows' else 'ffmpeg')).resolve()), CAPTUREFAB_FFMPEG_LICENSE=str((Path(args.ffmpeg_bundle) / 'licenses/NOTICE.txt').resolve()))
+                if web:
+                    env['CAPTUREFAB_WEB_DIST'] = str(web.resolve())
                 run(command, cwd=ROOT, env=env)
                 binary = (ROOT / os.environ.get('CARGO_TARGET_DIR', 'target') / args.target / 'release' / ('capturefab.exe' if args.os == 'windows' else 'capturefab')).resolve()
             assets.append(package(args, binary, variant))
@@ -640,7 +685,7 @@ def assemble(args):
         raise ValueError('no verified build assets found; refusing to create a release')
     assets = [successes.get(key) or dict(os=key[0], arch=key[1], variant=key[2], name=f'capturefab-{ver}-{key[0]}-{key[1]}-{key[2]}', available=False, reason=failures.get(key, 'Not built for this release')) for key in TARGETS]
     source = source_archive(output, ver)
-    bill = sbom(output, ver, args.repository)
+    bill = sbom(output, ver, args.repository, any(item.get('browser_client') for item in successes.values()))
     signature = 'SHA256SUMS.asc' if args.gpg_key else None
     release = dict(version=ver, date=dt.datetime.now(dt.timezone.utc).date().isoformat(), url=f'https://github.com/{args.repository}/releases/tag/v{ver}', checksums_url=link(args.download_base, 'SHA256SUMS'), source_url=link(args.download_base, source.name), sbom_url=link(args.download_base, bill.name), assets=assets)
     if signature:
@@ -671,7 +716,7 @@ def main():
     build_parser.add_argument('--version')
     build_parser.add_argument('--target', required=True)
     build_parser.add_argument('--os', choices=['linux', 'macos', 'windows'], required=True)
-    build_parser.add_argument('--arch', choices=['x86_64', 'aarch64', 'armv7'], required=True)
+    build_parser.add_argument('--arch', choices=['x86_64', 'aarch64'], required=True)
     build_parser.add_argument('--variants', default='desktop,headless')
     build_parser.add_argument('--ffmpeg-bundle', required=True)
     build_parser.add_argument('--binary', help='package an already built release executable (one --variants value)')

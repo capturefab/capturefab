@@ -118,12 +118,20 @@ pub fn validate_secret(secret: &str) -> Result<()> {
     Ok(())
 }
 
+/// A credential store that failed, with what works without one: a server
+/// with no desktop login has no Secret Service (it needs a D-Bus session).
+fn store_failed(action: &str, error: keyring::Error) -> anyhow::Error {
+    anyhow!(
+        "cannot {action} the OS credential store: {error}; without one, as on a server with no desktop login, use --password-env (CAPTUREFAB_FTP_PASSWORD or CAPTUREFAB_SFTP_PASSWORD), an SFTP --key-file, or S3 --env or --profile (the AWS credential chain)"
+    )
+}
+
 /// Store a secret in the OS credential store.
 pub(crate) fn store_secret(service: &str, account: &str, secret: &str) -> Result<()> {
     validate_secret(secret)?;
     keyring::Entry::new(service, account)
         .and_then(|entry| entry.set_password(secret))
-        .map_err(|e| anyhow!("cannot save the secret in the OS credential store: {e}"))
+        .map_err(|e| store_failed("save the secret in", e))
 }
 
 /// Read a secret. A missing entry is `None`; a locked or unavailable store is
@@ -132,7 +140,7 @@ pub(crate) fn read_secret(service: &str, account: &str) -> Result<Option<String>
     match keyring::Entry::new(service, account).and_then(|entry| entry.get_password()) {
         Ok(secret) => Ok(Some(secret)),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => bail!("cannot read the secret from the OS credential store: {e}"),
+        Err(e) => Err(store_failed("read the secret from", e)),
     }
 }
 
@@ -308,6 +316,24 @@ pub(crate) fn token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_failed_credential_store_names_what_works_without_one() {
+        let error = store_failed("save the secret in", keyring::Error::NoDefaultStore);
+        let message = format!("{error:#}");
+        for alternative in [
+            "CAPTUREFAB_FTP_PASSWORD",
+            "CAPTUREFAB_SFTP_PASSWORD",
+            "--key-file",
+            "--env or --profile",
+        ] {
+            assert!(message.contains(alternative), "{message}");
+        }
+        assert_eq!(
+            crate::cli::error_code(&error),
+            ("operation_failed", 1),
+            "{message}"
+        );
+    }
 
     #[test]
     fn stdin_secrets_keep_bytes_and_bound_reads() {

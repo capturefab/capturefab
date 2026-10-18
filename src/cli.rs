@@ -904,7 +904,8 @@ pub enum Command {
         /// Serve the WASM remote workbench on this address (e.g. 100.64.0.1:8787)
         #[arg(long)]
         listen: Option<SocketAddr>,
-        /// Built browser assets; defaults to web-client/dist when --listen is used
+        /// Built browser assets; defaults to the client built into this executable,
+        /// then a web folder beside it, then web-client/dist
         #[arg(long, requires = "listen")]
         web_dir: Option<PathBuf>,
         #[command(flatten)]
@@ -1510,11 +1511,7 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
         }) => {
             ipc::validate_name(name)?;
             if listen.is_some() {
-                crate::remote::validate_web_root(
-                    web_dir
-                        .as_deref()
-                        .unwrap_or(std::path::Path::new("web-client/dist")),
-                )?;
+                crate::remote::web_root(web_dir.as_deref())?;
             }
             None
         }
@@ -2002,13 +1999,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 ipc::Server::start_with_kind(handle.clone(), name, ipc::SessionKind::Serve)?;
             let remote_server = listen
                 .map(|address| {
-                    crate::remote::Server::start(
-                        handle.clone(),
-                        address,
-                        web_dir
-                            .clone()
-                            .unwrap_or_else(|| PathBuf::from("web-client/dist")),
-                    )
+                    let web_root = crate::remote::web_root(web_dir.as_deref())?;
+                    crate::remote::Server::start(handle.clone(), address, web_root)
                 })
                 .transpose()?;
             // A persistent session uploads what its cameras queue.
@@ -2019,11 +2011,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 ready["remote_url"] = json!(format!("http://{}/", server.local_addr()));
             }
             output(&cli, ready)?;
-            let stopped = Arc::new(AtomicBool::new(false));
-            let flag = stopped.clone();
+            let (stop, stopped) = std::sync::mpsc::channel();
             let h = handle.clone();
             ctrlc::set_handler(move || {
-                flag.store(true, Ordering::Relaxed);
+                let _ = stop.send(());
                 h.shutdown();
             })
             .context("install signal handler")?;
@@ -2031,9 +2022,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
             if !cli.json {
                 crate::doctor::print_warnings();
             }
-            while !stopped.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(100));
-            }
+            // Blocks until Ctrl-C rather than waking to check for it.
+            let _ = stopped.recv();
             #[cfg(feature = "uploads")]
             crate::upload::fold();
             return Ok(());
@@ -2710,7 +2700,7 @@ fn doctor() -> Value {
 /// What this build supports and where it runs; `doctor` adds the host checks.
 fn build_report() -> Value {
     let interfaces=if_addrs::get_if_addrs().map(|items|items.into_iter().filter_map(|i|match i.addr{if_addrs::IfAddr::V4(a)=>Some(json!({"name":i.name,"ip":a.ip,"netmask":a.netmask,"broadcast":a.broadcast})),_=>None}).collect::<Vec<_>>()).unwrap_or_default();
-    json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"scanner":cfg!(feature="scanner"),"wgpu":cfg!(feature="gui"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox"),"s3":cfg!(feature="s3"),"ftp":cfg!(feature="ftp"),"sftp":cfg!(feature="sftp"),"parquet":cfg!(feature="parquet"),"modbus":cfg!(feature="modbus"),"mqtt":cfg!(feature="mqtt"),"opcua":cfg!(feature="opcua"),"mtconnect":cfg!(feature="mtconnect"),"dinov2":cfg!(feature="dinov2")},"auto_capture":crate::autocapture::doctor(),"signals":crate::signals::compiled_protocols(),"scanners":crate::scanner::doctor(),"jpeg":jpeg_backends(),"session_directory":ipc::runtime_dir(),"runtime_directory":ipc::runtime_dir(),"state_directory":ipc::state_dir(),"cache_directory":ipc::cache_dir(),"ring_backing":crate::shared_memory::backing(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox. Document scanning uses installed platform scanner drivers (SANE scanimage on Linux).","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}})
+    json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"scanner":cfg!(feature="scanner"),"wgpu":cfg!(feature="gui"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox"),"s3":cfg!(feature="s3"),"ftp":cfg!(feature="ftp"),"sftp":cfg!(feature="sftp"),"parquet":cfg!(feature="parquet"),"modbus":cfg!(feature="modbus"),"mqtt":cfg!(feature="mqtt"),"opcua":cfg!(feature="opcua"),"mtconnect":cfg!(feature="mtconnect"),"dinov2":cfg!(feature="dinov2"),"embedded_web":crate::remote::embedded()},"auto_capture":crate::autocapture::doctor(),"signals":crate::signals::compiled_protocols(),"scanners":crate::scanner::doctor(),"jpeg":jpeg_backends(),"session_directory":ipc::runtime_dir(),"runtime_directory":ipc::runtime_dir(),"state_directory":ipc::state_dir(),"cache_directory":ipc::cache_dir(),"ring_backing":crate::shared_memory::backing(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox. Document scanning uses installed platform scanner drivers (SANE scanimage on Linux).","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}})
 }
 /// JPEG encoders available to this build and host, best first.
 fn jpeg_backends() -> Value {
@@ -2893,10 +2883,10 @@ fn schema() -> Value {
         "Network streams reconnect after FFmpeg exits, backing off from 1 s to 30 s until the stream stays up for 10 s; frame waits meanwhile time out (exit 4), and five credential rejections (401/403) in a row stop acquisition, while a missing path (404) keeps being retried. Local video files play at their frame rate in live view and recordings unless PlaybackSpeed=Fastest, and captures that start acquisition read them as fast as they ask. Local files and http(s) URLs naming a video file stop with 'Video file finished'."
     );
     contract["remote"] = json!({
-        "start":"serve --listen HOST:PORT [--web-dir web-client/dist]",
+        "start":"serve --listen HOST:PORT [--web-dir DIR]",
         "authentication":"Network access controls: anyone who can reach the listener can control the session. No HTTP login or token.",
-        "browser":"Rust WASM client built with web-client/build.sh; same-origin HTTP API",
-        "routes":{"GET /api/session":"SessionSnapshot", "GET /api/activity?after=REV&timeout_ms=20000":"{revision,activity}; waits for shared actions and job progress", "POST /api/command":"{version:1,camera?:ID,actor?:{id,name,kind},command:SessionCommand}", "GET /api/preview?camera=ID":"bounded PNG preview", "GET /api/destinations":"saved destination names and locations", "GET /api/storage":"global quota status", "GET, HEAD /health":"plain JSON readiness, uptime, camera counts and analytics health (200 ready, 503 unavailable)", "GET, HEAD /metrics":"Prometheus text exposition", "GET, HEAD /api/analytics":"AnalyticsSnapshot for the current session", "GET, HEAD /api/analytics.svg":"Plotters SVG acquisition dashboard", "GET, HEAD /api/signals?history=0|1":"{sources,persisting,dropped,sink_error}; history=1 adds recent points per tag"},
+        "browser":"Rust WASM client built with web-client/build.sh; same-origin HTTP API. Without --web-dir, serve uses the client built into the executable (release builds; doctor features.embedded_web), then a web folder beside the executable, then web-client/dist in the working directory",
+        "routes":{"GET /api/session":"SessionSnapshot", "GET /api/activity?after=REV&timeout_ms=20000":"{revision,activity}; waits for shared actions and job progress", "POST /api/command":"{version:1,camera?:ID,actor?:{id,name,kind},command:SessionCommand}", "GET /api/preview?camera=ID&format=png|jpeg":"newest frame scaled to fit 1280x720: Gray PNG for gray images, RGB PNG otherwise, or JPEG with format=jpeg where the build has the jpeg feature (Content-Type says which); 204 before the first frame. ETag names the frame and format; If-None-Match with it answers 304", "GET /api/destinations":"saved destination names and locations", "GET /api/storage":"global quota status", "GET, HEAD /health":"plain JSON readiness, uptime, camera counts and analytics health (200 ready, 503 unavailable)", "GET, HEAD /metrics":"Prometheus text exposition", "GET, HEAD /api/analytics":"AnalyticsSnapshot for the current session", "GET, HEAD /api/analytics.svg":"Plotters SVG acquisition dashboard", "GET, HEAD /api/signals?history=0|1":"{sources,persisting,dropped,sink_error}; history=1 adds recent points per tag"},
         "result":"JSON APIs use the versioned ok/result/error envelope; /health returns plain JSON",
         "analytics":"In-memory DuckDB collects independently of clients, starting with the first connected camera: one sample per second of all cameras together, so 24 hours of time-series history for any camera count within a fixed sample limit; samples counts those samples, and seconds with no camera store nothing. Missed-frame charts and percentages count lost frames: totals and cameras add lost and preview_skipped, cameras and points add lost and lost_percent, and dropped/drop_percent keep the status meaning. /metrics adds capturefab_{session,camera}_lost_frames_total and capturefab_{session,camera}_preview_skipped_frames_total. Session counters survive camera disconnects and reset with the server process.",
         "outputs":"Capture paths and destinations belong to the server. Stdout captures are rejected.",

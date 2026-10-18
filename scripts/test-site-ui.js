@@ -132,7 +132,12 @@ function openPage(options = {}) {
 
 async function downloads() {
   const latest = published.releases.find((release) => release.version === published.latest);
-  const page = openPage({ platform: 'MacIntel', userAgent: 'Macintosh; Intel Mac OS X' });
+  // One build of the latest release left unpublished, to check unavailable selections.
+  const partial = structuredClone(published);
+  const missing = partial.releases.find((release) => release.version === partial.latest).assets
+    .find((asset) => asset.os === 'windows' && asset.arch === 'x86_64' && asset.variant === 'headless');
+  missing.available = false;
+  const page = openPage({ platform: 'MacIntel', userAgent: 'Macintosh; Intel Mac OS X', manifest: partial });
   await page.settle();
   assert.equal(page.ids.get('os-select').value, 'macos');
   assert.equal(page.ids.get('arch-select').value, '', 'Mac user agents must not guess Intel on Apple silicon');
@@ -151,11 +156,28 @@ async function downloads() {
   assert.match(page.ids.get('install-hint').textContent, /terminal/);
   page.change('os-select', 'windows');
   assert.ok(page.ids.get('install-hint').textContent.includes('.\\capturefab.exe --help'), 'PowerShell instructions must retain the relative-path backslash');
-  page.change('arch-select', 'armv7');
+  page.change('arch-select', 'x86_64');
   assert.equal(page.ids.get('primary-download').hidden, true, 'Unavailable selections must clear a previous link');
   assert.equal(page.ids.get('primary-download').href, '');
   assert.equal(page.ids.get('verify-box').hidden, true);
   assert.equal(page.ids.get('install-hint').hidden, true);
+
+  page.change('os-select', 'linux');
+  assert.match(page.ids.get('platform-hint').textContent, /dpkg --print-architecture/, 'Linux needs a check that tells a 32-bit OS from a 64-bit one');
+  assert.doesNotMatch(page.ids.get('platform-hint').textContent, /ARMv7/);
+
+  for (const options of [
+    { platform: 'Linux armv7l', userAgent: 'X11; Linux armv7l' },
+    { userAgentData: { platform: 'Linux', getHighEntropyValues: async () => ({ architecture: 'arm', bitness: '32' }) } }
+  ]) {
+    const armhf = openPage(options);
+    await armhf.settle();
+    assert.equal(armhf.ids.get('os-select').value, 'linux');
+    assert.equal(armhf.ids.get('arch-select').value, '', 'There is no 32-bit ARM build to select');
+    assert.match(armhf.ids.get('platform-hint').textContent, /32-bit ARM.*64-bit Raspberry Pi OS.*dpkg --print-architecture/, 'A 32-bit ARM browser must learn how to get a usable system');
+    armhf.change('arch-select', 'aarch64');
+    assert.doesNotMatch(armhf.ids.get('platform-hint').textContent, /This browser runs/);
+  }
 
   const offline = openPage({ fetchError: true });
   await offline.settle();

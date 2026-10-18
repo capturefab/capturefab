@@ -174,6 +174,80 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual((components['media:x264']['version'], components['media:ffmpeg']['hashes'][0]['content']), ('abc', 'f' * 64))
         self.assertEqual(bom['dependencies'][1], dict(ref='media:ffmpeg', dependsOn=['media:x264']))
 
+    def test_sbom_adds_the_browser_client_crates_once(self):
+        def metadata(root, names):
+            return dict(resolve=dict(root=root, nodes=[dict(id=root, deps=[dict(pkg=n, dep_kinds=[dict(kind=None)]) for n in names])] + [dict(id=n, deps=[]) for n in names]),
+                        packages=[dict(id=i, name=i, version='1.0.0', license='MIT') for i in [root, *names]])
+        lock = '[[package]]\nname = "wasm-bindgen"\nversion = "1.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "' + 'd' * 64 + '"\n'
+        bom = release.cyclonedx(metadata('app', ['serde', 'zip']), '', '', '1.2.3', 'owner/repo', '00000000-0000-0000-0000-000000000000',
+                                (metadata('client', ['serde', 'wasm-bindgen']), lock))
+        crates = [c['bom-ref'] for c in bom['components'] if c['type'] == 'library']
+        self.assertEqual(crates, ['pkg:cargo/serde@1.0.0', 'pkg:cargo/wasm-bindgen@1.0.0', 'pkg:cargo/zip@1.0.0'])
+        self.assertEqual(bom['components'][1]['hashes'], [dict(alg='SHA-256', content='d' * 64)])
+        self.assertIn('pkg:cargo/wasm-bindgen@1.0.0', bom['dependencies'][0]['dependsOn'])
+
+    def test_build_embeds_the_browser_client_once_it_is_built_and_headless_uploads(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            source = temp / 'media-sources.tar.gz'
+            source.write_bytes(b'source')
+            dist = temp / 'web-client-dist'
+            builds = []
+            def run(command, **kwargs):
+                builds.append((command, kwargs['env']))
+            args = SimpleNamespace(version=release.version(), target='aarch64-unknown-linux-gnu', os='linux', arch='aarch64', variants='desktop,headless',
+                                   ffmpeg_bundle=temp / 'bundle', binary=None, repackage=False, output=temp / 'out')
+            for web in [dist, None]:
+                builds.clear()
+                with mock.patch.object(release, 'run', side_effect=run), mock.patch.object(release, 'web_dist', return_value=web), \
+                        mock.patch.object(release, 'dinov2_weights', return_value=temp / 'model.safetensors'), \
+                        mock.patch.object(release, 'package', return_value={}), mock.patch.object(release, 'media_sources', return_value=source):
+                    release.build(args)
+                self.assertEqual(len(builds), 2)
+                for command, env in builds:
+                    features = command[-1].split(',')
+                    self.assertEqual('embedded-web' in features, web is not None, command)
+                    self.assertEqual(env.get('CAPTUREFAB_WEB_DIST'), str(dist.resolve()) if web else None)
+                self.assertIn('wgpu', builds[0][0][-1].split(','))
+                self.assertIn('--no-default-features', builds[1][0])
+                # Headless line computers upload too.
+                self.assertTrue({'s3', 'ftp', 'sftp'} <= set(builds[1][0][-1].split(',')))
+
+    def test_package_records_and_licenses_an_embedded_browser_client(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            bundle = temp / 'bundle'
+            (bundle / 'bin').mkdir(parents=True)
+            (bundle / 'licenses').mkdir()
+            (bundle / 'licenses' / 'NOTICE.txt').write_text('notice')
+            (bundle / 'build-manifest.txt').write_text('manifest')
+            ffmpeg = self.elf(['GLIBC_2.17']) + os.urandom(70000)
+            (bundle / 'bin' / 'ffmpeg').write_bytes(ffmpeg)
+            dist = temp / 'web-client-dist'
+            dist.mkdir()
+            wasm = b'\0asm' + os.urandom(4000)
+            (dist / 'index.html').write_text('<!doctype html>')
+            (dist / 'capturefab_web_bg.wasm').write_bytes(wasm)
+            args = SimpleNamespace(os='linux', arch='aarch64', target='aarch64-unknown-linux-gnu', version='1.2.3', ffmpeg_bundle=bundle, output=temp / 'out', skip_smoke=True)
+            licensed = []
+            def notices(target, variant, web=False):
+                licensed.append(web)
+                return 'crate licenses'
+            items, readmes = [], []
+            with mock.patch.object(release, 'notices', side_effect=notices), mock.patch.object(release, 'web_dist', return_value=dist):
+                for name, payload in [('embedded', ffmpeg + wasm), ('plain', ffmpeg)]:
+                    binary = temp / name
+                    binary.write_bytes(self.elf(['GLIBC_2.17']) + payload)
+                    items.append(release.package(args, binary, 'headless'))
+                    with tarfile.open(temp / 'out' / items[-1]['name']) as archive:
+                        readmes.append(archive.extractfile('capturefab-1.2.3-linux-aarch64-headless/README.txt').read().decode())
+            self.assertEqual([item.get('browser_client') for item in items], [True, None])
+            self.assertEqual(licensed, [True, False])
+            self.assertIn('serve --name line1 --listen', readmes[0])
+            self.assertNotIn('--listen', readmes[1])
+            for readme in readmes:
+                self.assertIn('https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md', readme)
+
     def test_set_version_raises_cargo_toml_and_lock_only_forward(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -519,6 +593,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(assets[('linux', 'x86_64', 'headless')]['url'], f'https://example.invalid/v1.2.3/{asset.name}')
             self.assertEqual(assets[('linux', 'x86_64', 'desktop')]['reason'], 'cargo exited with status 101')
             self.assertEqual(assets[('macos', 'aarch64', 'desktop')]['reason'], 'Not built for this release')
+            self.assertNotIn(('linux', 'armv7', 'desktop'), assets)
             self.assertEqual((entry['checksums_url'], entry['source_url']), ('https://example.invalid/v1.2.3/SHA256SUMS', 'https://example.invalid/v1.2.3/capturefab-1.2.3-source.tar.gz'))
             self.assertNotIn('checksums_signature_url', entry)
             sums = {name: digest for digest, name in (line.split('  ') for line in (output / 'SHA256SUMS').read_text().splitlines())}

@@ -999,12 +999,15 @@ type Reply = Receiver<Result<Value>>;
 struct Feed {
     counters: RingCounters,
     frames: Mutex<FrameFeed>,
+    /// The worker process writing the ring; frame ids start over in a new one.
+    worker: u32,
 }
 impl Feed {
-    fn new(ring: SharedRing) -> Self {
+    fn new(ring: SharedRing, worker: u32) -> Self {
         Self {
             counters: ring.counters(),
             frames: Mutex::new(FrameFeed { ring, latest: None }),
+            worker,
         }
     }
 }
@@ -1295,11 +1298,12 @@ impl Process {
         ring.passed();
         let input = child.stdin.take().context("worker stdin")?;
         let output = BufReader::new(child.stdout.take().context("worker stdout")?);
+        let feed = Arc::new(Feed::new(ring, child.id()));
         Ok(Self {
             child,
             input,
             output,
-            feed: Arc::new(Feed::new(ring)),
+            feed,
             report: Report::new(),
             reply: Vec::new(),
             quiet: false,
@@ -1887,8 +1891,18 @@ impl SessionHandle {
     /// first poll may return a keep-alive frame up to a second old (see
     /// `shared_memory`).
     pub fn latest_frame_for(&self, id: &str) -> Option<Arc<Frame>> {
+        Some(self.latest_frame_tagged(id)?.1)
+    }
+    /// `latest_frame_for` with a tag naming the frame: the worker's pid above
+    /// the ring sequence it was published under. Unlike the camera's frame
+    /// ids, which start over with a worker and repeat for scanned pages, it
+    /// changes with every frame.
+    pub fn latest_frame_tagged(&self, id: &str) -> Option<(u64, Arc<Frame>)> {
         let feed = self.feed(id)?;
-        locked(&feed.frames).poll(true)
+        let mut frames = locked(&feed.frames);
+        let frame = frames.poll(true)?;
+        let sequence = frames.ring.taken_sequence().unwrap_or(0);
+        Some(((u64::from(feed.worker) << 32) | u64::from(sequence), frame))
     }
     /// When the frame a camera's feed last returned is a downscaled preview
     /// of a frame larger than its ring, the width, height and pixel format
@@ -2875,12 +2889,10 @@ impl SessionHandle {
     pub(crate) fn fed(capacity: usize) -> (Self, SharedRing) {
         let writer = SharedRing::create(&std::env::temp_dir(), capacity).unwrap();
         let handle = Self::new();
-        handle
-            .inner
-            .feeds
-            .write()
-            .unwrap()
-            .insert("cam".into(), Arc::new(Feed::new(writer.reader().unwrap())));
+        handle.inner.feeds.write().unwrap().insert(
+            "cam".into(),
+            Arc::new(Feed::new(writer.reader().unwrap(), 0)),
+        );
         handle.inner.state.write().unwrap().active_camera = Some("cam".into());
         (handle, writer)
     }

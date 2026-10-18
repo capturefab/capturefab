@@ -131,7 +131,7 @@ capturefab --session line1 dataset export -o exports/line1-shift-b</code></pre><
             <tr><td>Windows</td><td>Extract the <code>.zip</code> file. Open <code>capturefab.exe</code> from the extracted folder. In PowerShell, run <code>.\capturefab.exe</code> from that folder.</td></tr>
             <tr><td>Linux</td><td>Extract the <code>.tar.gz</code> file. Open a terminal in the extracted folder. Run <code>./capturefab</code>. If necessary, set executable permission with <code>chmod +x ./capturefab</code>.</td></tr>
           </tbody></table></div>
-          <p>The extracted executable also provides the CLI. Add its directory to your <code>PATH</code> to use the shorter commands in these guides. A headless build opens no desktop window. Use an explicit subcommand such as <code>doctor --json</code> or <code>serve</code>.</p>
+          <p>The extracted executable also provides the CLI. Add its directory to your <code>PATH</code> to use the shorter commands in these guides. A headless build opens no desktop window. Use an explicit subcommand such as <code>doctor --json</code> or <code>serve</code>. To run <code>serve</code> as a service on a Raspberry Pi, Jetson or industrial PC and use it from a laptop's browser, follow the <a href="https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md">line computer guide</a>.</p>
           <div class="table-scroll"><table><caption>Minimum operating system versions</caption><thead><tr><th scope="col">Build</th><th scope="col">Minimum requirement</th></tr></thead><tbody>
             <tr><td>macOS ARM64</td><td>macOS 11.0</td></tr>
             <tr><td>macOS x64</td><td>macOS 10.15</td></tr>
@@ -139,7 +139,7 @@ capturefab --session line1 dataset export -o exports/line1-shift-b</code></pre><
             <tr><td>Windows ARM64</td><td>Windows 11 on ARM</td></tr>
             <tr><td>Linux x64 and ARM64</td><td>glibc 2.28; examples include Debian 10, RHEL 8 and Jetson Linux R34.</td></tr>
           </tbody></table></div>
-          <p>These minimums also apply to the included FFmpeg executable. A separate Visual C++ redistributable is not necessary for Windows builds. The release workflow does not provide Linux ARMv7 builds. See the <a href="https://github.com/capturefab/capturefab/blob/main/docs/release.md#targets-and-compatibility">release target details</a> for build requirements.</p>
+          <p>These minimums also apply to the included FFmpeg executable. A separate Visual C++ redistributable is not necessary for Windows builds. There is no 32-bit ARM build: on Linux, <code>dpkg --print-architecture</code> prints <code>arm64</code> for the ARM64 build, while <code>armhf</code>, such as 32-bit Raspberry Pi OS, needs the 64-bit OS, which Raspberry Pi 3 and later run. <code>uname -m</code> prints <code>aarch64</code> on both. See the <a href="https://github.com/capturefab/capturefab/blob/main/docs/release.md#targets-and-compatibility">release target details</a> for build requirements.</p>
           <p>Release builds include a separate FFmpeg executable. Separate Aravis, FFmpeg, libusb, vendor SDK and Python installations are not necessary. The operating system must have suitable graphics and camera drivers. Document scanners have additional <a href="#scanners">driver requirements</a>.</p>
           <div class="code-wrap"><pre><code>capturefab --version
 capturefab doctor --json

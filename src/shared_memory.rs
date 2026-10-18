@@ -659,6 +659,11 @@ impl SharedRing {
     pub fn preview_of(&self) -> Option<(u32, u32, u32)> {
         self.taken?.source
     }
+    /// The sequence the frame last taken was published under, new for every
+    /// frame this ring publishes, whatever ids the camera gives its frames.
+    pub fn taken_sequence(&self) -> Option<u32> {
+        Some(self.taken?.sequence)
+    }
     /// The frame last taken is the newest the writer was offered, rather
     /// than a keep-alive with newer frames skipped since.
     pub fn fresh(&self) -> bool {
