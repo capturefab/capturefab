@@ -46,6 +46,8 @@ const COMPACT_BYTES: u64 = if cfg!(test) { 64 * 1024 } else { 1024 * 1024 };
 /// always before retention, a Storage full refusal or a status report.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Lock timeouts a saved file waits through to be recorded in the ledger.
+const COMMIT_TRIES: u32 = 3;
 /// Expired files removed per save while the budget has room, so that a
 /// backlog, such as a new age limit or a machine that was off, cannot hold
 /// the lock for long. A full budget removes as many as it needs.
@@ -1516,6 +1518,27 @@ impl StorageWriter {
         self.finalized = true;
         result
     }
+    /// Finish a file whose bytes are all written. Its name is now taken, so
+    /// a caller that saved again would find its own file in the way: a busy
+    /// ledger is waited out up to `tries` times, and is then reported as a
+    /// saved file left unrecorded rather than as busy.
+    fn commit(mut self, tries: u32) -> Result<()> {
+        let mut result = self.finalize();
+        for _ in 1..tries {
+            if !result.as_ref().is_err_and(is_busy) {
+                break;
+            }
+            result = self.finalize();
+        }
+        self.finalized = true;
+        match result {
+            Err(error) if is_busy(&error) && !self.failed => Err(anyhow!(
+                "capture {} is saved, but the storage manager stayed busy and did not record it; the file is kept and never deleted by retention",
+                self.path.display()
+            )),
+            result => result,
+        }
+    }
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -1689,7 +1712,7 @@ pub fn save_bytes(bytes: &[u8], path: &Path, policy: &StoragePolicy) -> Result<S
         bytes: writer.bytes_written(),
         sha256: writer.sha256(),
     };
-    writer.finish()?;
+    writer.commit(COMMIT_TRIES)?;
     Ok(stored)
 }
 pub fn save_hashed(
@@ -1866,6 +1889,55 @@ mod tests {
             "{error:#}"
         );
         assert!(!is_busy(&anyhow!("lock storage manager")));
+    }
+    /// A saved file whose ledger record waits behind another process's lock.
+    fn saved_shot(temp: &Temp) -> (StorageWriter, PathBuf, File) {
+        let manager = temp.manager();
+        let path = temp.path("shot.raw");
+        let mut writer = manager.writer(&path, &policy(1024, 10, "stop"), 4).unwrap();
+        writer.reread = false;
+        writer.write_all(b"shot").unwrap();
+        let held = File::open(manager.directory.join("storage.lock")).unwrap();
+        held.lock_exclusive().unwrap();
+        (writer, path, held)
+    }
+    #[test]
+    fn a_saved_file_waits_out_a_ledger_busy_only_for_its_record() {
+        let temp = Temp::new();
+        let (writer, path, held) = saved_shot(&temp);
+        let release = thread::spawn(move || {
+            thread::sleep(LOCK_TIMEOUT + Duration::from_millis(500));
+            drop(held);
+        });
+        let started = Instant::now();
+        writer.commit(2).unwrap();
+        assert!(started.elapsed() >= LOCK_TIMEOUT);
+        release.join().unwrap();
+        let locked = temp.manager().lock().unwrap();
+        let entry = &locked.ledger.entries[locked.find(&path).unwrap()];
+        assert_eq!(entry.bytes, 4);
+        assert!(entry.sha256.is_some() && !entry.changed);
+    }
+    #[test]
+    fn a_saved_file_the_ledger_stays_too_busy_to_record_is_kept_and_not_busy() {
+        let temp = Temp::new();
+        let (writer, path, held) = saved_shot(&temp);
+        let error = writer.commit(1).unwrap_err();
+        drop(held);
+        // Saving again would only find this file in the way.
+        assert!(!is_busy(&error), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("is saved, but the storage manager stayed busy"),
+            "{error:#}"
+        );
+        assert_eq!(crate::cli::error_code(&error), ("operation_failed", 1));
+        assert_eq!(fs::read(&path).unwrap(), b"shot");
+        // The next manager reclaims the reservation and keeps the file out of
+        // retention, since its content was never recorded.
+        let locked = temp.manager().lock().unwrap();
+        let entry = &locked.ledger.entries[locked.find(&path).unwrap()];
+        assert_eq!(entry.bytes, 4);
+        assert!(entry.changed && entry.sha256.is_none());
     }
     fn completed(manager: &Manager, path: &Path, policy: &StoragePolicy, data: &[u8]) {
         let mut writer = manager.writer(path, policy, data.len() as u64).unwrap();
