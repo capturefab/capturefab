@@ -727,7 +727,7 @@ impl Client {
         if size > MULTIPART_THRESHOLD {
             return self.upload_parts(path, key, sha256, size);
         }
-        let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let mut file = open(path)?;
         let mut body: Box<dyn Read> = if size <= BUFFERED_PUT {
             Box::new(std::io::Cursor::new(read_queued(file, size, sha256, path)?))
         } else {
@@ -754,7 +754,7 @@ impl Client {
     /// Upload in parts, hashing the file as they are read: completion waits
     /// for the whole hash, and a changed file aborts the upload instead.
     fn upload_parts(&self, path: &Path, key: &str, sha256: &str, size: u64) -> Result<()> {
-        let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let mut file = open(path)?;
         if self.condition().is_none() {
             self.ensure_free(key)?;
         }
@@ -900,6 +900,18 @@ impl crate::transfer::Uploader for Client {
         ))
     }
 }
+
+/// Open a file to upload; tests count the bytes read from it.
+fn open(path: &Path) -> Result<Opened> {
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    #[cfg(test)]
+    let file = tests::Counted(file);
+    Ok(file)
+}
+#[cfg(not(test))]
+type Opened = File;
+#[cfg(test)]
+type Opened = tests::Counted<File>;
 
 /// A queued file read whole, unless it is no longer exactly the queued bytes.
 fn read_queued(reader: impl Read, size: u64, sha256: &str, path: &Path) -> Result<Vec<u8>> {
@@ -1342,31 +1354,43 @@ mod tests {
         assert!(!seen[1].contains("if-none-match"), "{seen:?}");
     }
 
-    /// Counts the bytes read through it.
-    struct Counted<R>(R, std::rc::Rc<std::cell::Cell<u64>>);
+    thread_local! {
+        /// Bytes this thread has read from files it uploads.
+        static READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Counts the bytes read through it in `READ`.
+    pub(super) struct Counted<R>(pub(super) R);
     impl<R: Read> Read for Counted<R> {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
             let read = self.0.read(buffer)?;
-            self.1.set(self.1.get() + read as u64);
+            READ.set(READ.get() + read as u64);
             Ok(read)
+        }
+    }
+    impl<R: Seek> Seek for Counted<R> {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(to)
         }
     }
 
     #[test]
     fn a_small_upload_reads_its_file_once() {
-        let path = Path::new("/staged/a.png");
-        let sha = hex(&Sha256::digest(b"frame"));
-        let read = std::rc::Rc::new(std::cell::Cell::new(0));
-        let reader = Counted(&b"frame"[..], read.clone());
-        assert_eq!(read_queued(reader, 5, &sha, path).unwrap(), b"frame");
-        assert_eq!(read.get(), 5);
+        let (bucket, seen) = scripted(&[200]);
+        let (path, sha) = upload_file();
+        READ.set(0);
+        client(&bucket)
+            .upload(&path, "line-1/a.png", &sha, 5)
+            .unwrap();
+        assert_eq!(READ.get(), 5);
+        assert!(seen.lock().unwrap()[0].starts_with("PUT /camera-archive/line-1/a.png"));
+        let staged = Path::new("/staged/a.png");
         for (bytes, size) in [(&b"frame!"[..], 5), (b"fram", 5), (b"frane", 5)] {
-            let error = read_queued(bytes, size, &sha, path).unwrap_err();
+            let error = read_queued(bytes, size, &sha, staged).unwrap_err();
             assert!(!retryable(&error) && error.to_string().contains("changed"));
         }
         // A changed file is refused before anything is sent.
         let (bucket, seen) = scripted(&[200]);
-        let (path, _) = upload_file();
         let error = client(&bucket)
             .upload(&path, "line-1/a.png", &"0".repeat(64), 5)
             .unwrap_err();
@@ -1391,9 +1415,11 @@ mod tests {
         assert!(seen[1].starts_with("PUT /camera-archive/line-1/a.bin?partNumber=1&uploadId=u1"));
         assert!(seen[2].starts_with("DELETE /camera-archive/line-1/a.bin?uploadId=u1"));
         let (bucket, seen) = scripted_with(&[(200, started), (200, ""), (200, "<Done/>")]);
+        READ.set(0);
         client(&bucket)
             .upload_parts(&path, "line-1/a.bin", &sha, 5)
             .unwrap();
+        assert_eq!(READ.get(), 5, "one pass hashes and sends the parts");
         assert!(
             seen.lock().unwrap()[2].starts_with("POST /camera-archive/line-1/a.bin?uploadId=u1")
         );
