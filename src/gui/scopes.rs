@@ -157,6 +157,9 @@ pub struct FocusMeter {
     sharp: bool,
     /// How many times the region came back into focus after leaving it.
     locks: u64,
+    /// The scores on show are of the region before it moved; the next score
+    /// starts afresh.
+    moved: bool,
 }
 
 impl FocusMeter {
@@ -165,6 +168,7 @@ impl FocusMeter {
         self.peak = previous.peak;
         self.sharp = previous.sharp;
         self.locks = previous.locks;
+        self.moved = previous.moved;
     }
     pub fn new(open: bool, region: [f32; 4], metric: Metric) -> Self {
         Self {
@@ -175,7 +179,15 @@ impl FocusMeter {
             peak: Sharpness::default(),
             sharp: false,
             locks: 0,
+            moved: false,
         }
+    }
+
+    /// Move the region. Its scores stay on show until the next one replaces
+    /// them, so a drag scored a few times a second never reads blank.
+    pub fn move_to(&mut self, region: Rectangle) {
+        self.region = region;
+        self.moved = !self.history.is_empty();
     }
 
     pub fn saved_region(&self) -> [f32; 4] {
@@ -196,6 +208,9 @@ impl FocusMeter {
     }
 
     pub fn record(&mut self, score: Sharpness) {
+        if self.moved {
+            self.reset();
+        }
         let settled = self.history.len() >= SETTLE;
         if self.history.len() == HISTORY {
             self.history.pop_front();
@@ -220,6 +235,7 @@ impl FocusMeter {
         self.history.clear();
         self.peak = Sharpness::default();
         self.sharp = false;
+        self.moved = false;
     }
 
     pub fn latest(&self) -> Option<f32> {
@@ -1326,6 +1342,35 @@ mod tests {
         assert_eq!(score(1203.4), "1203");
         assert_eq!(score(12_345.0), "12.3k");
         assert_eq!(percent(0.0004), "<0.1%");
+    }
+
+    #[test]
+    fn a_moved_region_keeps_its_score_on_show_until_the_next_one() {
+        let mut meter = FocusMeter::new(true, DEFAULT_REGION, Metric::Tenengrad);
+        let record = |meter: &mut FocusMeter, tenengrad| {
+            meter.record(Sharpness {
+                tenengrad,
+                ..Sharpness::default()
+            })
+        };
+        let region = |x| Rectangle::new(Point::new(x, 0.25), Size::new(0.2, 0.2));
+        meter.move_to(region(0.1));
+        assert!(!meter.moved, "nothing on show to replace");
+        record(&mut meter, 40.0);
+        record(&mut meter, 30.0);
+        meter.move_to(region(0.3));
+        meter.move_to(region(0.5));
+        assert_eq!(meter.region, region(0.5));
+        assert_eq!((meter.latest(), meter.share()), (Some(30.0), Some(0.75)));
+        // The next score is the new region's first, and its own peak.
+        record(&mut meter, 10.0);
+        assert_eq!((meter.latest(), meter.share()), (Some(10.0), Some(1.0)));
+        assert_eq!(meter.trace(), [10.0]);
+        record(&mut meter, 5.0);
+        assert_eq!(meter.share(), Some(0.5));
+        meter.move_to(region(0.1));
+        meter.reset();
+        assert!(!meter.moved && meter.latest().is_none());
     }
 
     #[test]

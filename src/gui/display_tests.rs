@@ -89,7 +89,39 @@ fn scopes_measure_a_stream_at_their_own_pace() {
     writer.write(&frame(31), false).unwrap();
     bench.now += Duration::from_millis(1);
     bench.update_frames();
-    assert_eq!(bench.measured, (Some(bench.now), Some(bench.now)));
+    let now = Measured {
+        at: Some(bench.now),
+        frame: Some(31),
+    };
+    assert_eq!(bench.measured, (now, now));
+    bench.handle.shutdown();
+}
+
+#[test]
+fn scopes_measure_the_frame_a_stream_stops_on() {
+    let (mut bench, mut writer) = bench();
+    bench.exposure_open = true;
+    bench.focus.open = true;
+    // The second frame comes too soon for either scope, and is the last.
+    for id in 1..=2 {
+        writer.write(&frame(id), false).unwrap();
+        bench.now += Duration::from_micros(33_333);
+        bench.update_frames();
+    }
+    assert_eq!(bench.measured.0.frame, Some(1));
+    assert_eq!(bench.measured.1.frame, Some(1));
+    // Ticks measure it once each scope is due, and once only.
+    let mut changes = (0, 0);
+    for _ in 0..12 {
+        bench.now += Duration::from_micros(33_333);
+        let before = bench.measured;
+        bench.update_frames();
+        changes.0 += usize::from(bench.measured.0 != before.0);
+        changes.1 += usize::from(bench.measured.1 != before.1);
+    }
+    assert_eq!(changes, (1, 1));
+    assert_eq!(bench.measured.0.frame, Some(2));
+    assert_eq!(bench.measured.1.frame, Some(2));
     bench.handle.shutdown();
 }
 
@@ -101,35 +133,46 @@ fn dragging_the_focus_region_scores_only_focus_and_once_more_on_release() {
     writer.write(&frame(1), false).unwrap();
     bench.update_frames();
     let histogram = bench.measured.0;
-    assert!(histogram.is_some());
+    assert!(histogram.at.is_some());
     let region = |x| iced::Rectangle::new(iced::Point::new(x, 0.25), Size::new(0.2, 0.2));
+    let scored = |bench: &Workbench| bench.measured.1.frame == Some(1);
     // Messages read the clock, so "scored just now" is a time to come.
-    let just = Some(Instant::now() + Duration::from_secs(60));
-    // Moves within a frame's time of the last score are not scored.
-    bench.measured.1 = just;
+    let just = Instant::now() + Duration::from_secs(60);
+    // Moves within a frame's time of the last score are not scored, and
+    // leave that score on show.
+    bench.measured.1.at = Some(just);
     let _ = bench.update(Message::FocusRegion(region(0.1)));
-    assert_eq!(bench.measured.1, just);
-    assert_eq!(
-        bench.focus.latest(),
-        None,
-        "moving resets the region's scores"
+    assert_eq!(bench.measured.1.at, Some(just));
+    assert!(!scored(&bench));
+    assert!(
+        bench.focus.latest().is_some(),
+        "the last score stays on show"
     );
-    bench.measured.1 = None;
+    bench.measured.1.at = None;
     let _ = bench.update(Message::FocusRegion(region(0.3)));
-    assert!(bench.measured.1.is_some_and(|at| Some(at) != just));
-    assert!(bench.focus.latest().is_some());
-    bench.measured.1 = just;
+    assert!(scored(&bench) && bench.measured.1.at != Some(just));
+    bench.measured.1.at = Some(just);
     let _ = bench.update(Message::FocusRegion(region(0.5)));
-    assert_eq!(bench.focus.latest(), None);
-    // Letting go scores where it landed.
+    assert!(!scored(&bench) && bench.focus.latest().is_some());
+    // Held still, the region is scored on the first tick a frame's time on.
+    let tick = just + FOCUS_EVERY;
+    bench.now = tick;
+    bench.update_frames();
+    assert_eq!(bench.measured.1.at, Some(tick));
+    assert!(scored(&bench));
+    // Letting go scores where it landed, at once, unless scored there.
     let _ = bench.update(Message::FocusRegionEnd);
-    assert!(bench.measured.1.is_some_and(|at| Some(at) != just));
-    assert!(bench.focus.latest().is_some());
+    assert_eq!(bench.measured.1.at, Some(tick));
+    bench.measured.1.at = Some(just);
+    let _ = bench.update(Message::FocusRegion(region(0.6)));
+    bench.measured.1.at = Some(Instant::now());
+    let _ = bench.update(Message::FocusRegionEnd);
+    assert!(scored(&bench));
     assert_eq!(bench.measured.0, histogram, "the histogram never changed");
     // A click right after moves the region without a drag, and is scored.
     let _ = bench.update(Message::FocusRegionStart);
     let _ = bench.update(Message::FocusRegion(region(0.7)));
-    assert!(bench.focus.latest().is_some());
+    assert!(scored(&bench));
     bench.handle.shutdown();
 }
 

@@ -537,6 +537,21 @@ struct CameraPreview {
     error: Option<String>,
 }
 
+/// When a scope last measured a frame of the stream, and which.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Measured {
+    at: Option<Instant>,
+    frame: Option<u64>,
+}
+
+impl Measured {
+    /// Whether `frame` is due a measurement: one not yet measured, no sooner
+    /// than `every` after the last.
+    fn due(self, frame: u64, now: Instant, every: Duration) -> bool {
+        self.frame != Some(frame) && self.at.is_none_or(|at| now >= at + every)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Tab {
@@ -887,8 +902,8 @@ struct Workbench {
     exposure_open: bool,
     focus_camera: bool,
     exposure: Option<frame::Exposure>,
-    /// When the histogram and the focus score last measured a new frame.
-    measured: (Option<Instant>, Option<Instant>),
+    /// What the histogram and the focus score last measured.
+    measured: (Measured, Measured),
     /// The focus region and its scores.
     focus: scopes::FocusMeter,
     shown: Option<Shown>,
@@ -1106,7 +1121,7 @@ impl Workbench {
             exposure_open: prefs.exposure_open,
             focus_camera: false,
             exposure: None,
-            measured: (None, None),
+            measured: (Measured::default(), Measured::default()),
             focus: scopes::FocusMeter::new(
                 prefs.focus_open,
                 prefs.focus_region,
@@ -2037,6 +2052,9 @@ impl Workbench {
         let limits = self.main_limits(&frame);
         let fresh = Some(frame.id) != self.frame_id;
         if !fresh && Some(limits) == self.frame_limits {
+            // A frame the scopes passed over while paced, such as the last
+            // before a stream stopped, once each is due.
+            self.measure(&frame, true);
             return;
         }
         // The first frame of a camera, or of a new view of it, measures at once.
@@ -2116,10 +2134,10 @@ impl Workbench {
         preview::Limits::shown(frame, zoom * self.main_scale(), most)
     }
 
-    /// Update the open scopes from a new `frame`; `paced` while frames
-    /// stream, so each scope measures no more often than it needs. A frame
-    /// they cannot measure still shows; presenting it reports any real
-    /// decoding problem.
+    /// Update the open scopes from `frame`; `paced` while frames stream, so
+    /// each scope measures no more often than it needs, and each frame once.
+    /// A frame they cannot measure still shows; presenting it reports any
+    /// real decoding problem.
     fn measure(&mut self, frame: &crate::types::Frame, paced: bool) {
         if !self.intensity_image() || self.camera_kind() == CameraKind::LineScan {
             self.exposure = None;
@@ -2127,10 +2145,12 @@ impl Workbench {
             return;
         }
         let now = self.now;
-        let due =
-            |last: Option<Instant>, every| !paced || last.is_none_or(|last| now >= last + every);
+        let due = |measured: Measured, every| !paced || measured.due(frame.id, now, every);
         if self.exposure_open && due(self.measured.0, EXPOSURE_EVERY) {
-            self.measured.0 = Some(now);
+            self.measured.0 = Measured {
+                at: Some(now),
+                frame: Some(frame.id),
+            };
             self.exposure = frame::exposure(frame).ok();
         }
         if due(self.measured.1, FOCUS_EVERY) {
@@ -2140,10 +2160,15 @@ impl Workbench {
 
     /// Score the focus region of `frame`, when it is open.
     fn measure_focus(&mut self, frame: &crate::types::Frame) {
-        if self.focus.open
-            && let Ok(score) = frame::sharpness(frame, self.focus.pixels(frame.width, frame.height))
-        {
-            self.measured.1 = Some(self.now);
+        if !self.focus.open {
+            return;
+        }
+        // A frame that cannot be scored is not tried again.
+        self.measured.1 = Measured {
+            at: Some(self.now),
+            frame: Some(frame.id),
+        };
+        if let Ok(score) = frame::sharpness(frame, self.focus.pixels(frame.width, frame.height)) {
             self.focus.record(score);
         }
     }
@@ -2156,12 +2181,14 @@ impl Workbench {
         }
     }
 
-    /// Score the latest frame's focus region again after it moved; the
-    /// histogram does not depend on it.
-    fn remeasure_focus(&mut self) {
+    /// Score the latest frame's focus region after it moved, unless scored
+    /// since or within `every` of the last score; the histogram does not
+    /// depend on it.
+    fn remeasure_focus(&mut self, every: Duration) {
         if self.intensity_image()
             && self.camera_kind() != CameraKind::LineScan
             && let Some(frame) = self.selected_frame()
+            && self.measured.1.due(frame.id, self.now, every)
         {
             self.measure_focus(&frame);
         }
@@ -3167,25 +3194,20 @@ impl Workbench {
             Message::ToggleExposure => self.toggle_exposure(),
             Message::ToggleFocusRegion => self.toggle_focus_region(),
             Message::FocusRegion(region) => {
-                self.focus.region = region;
-                self.focus.reset();
-                // At most once a frame while dragging; the release scores the
-                // region it lands on.
-                if self
-                    .measured
-                    .1
-                    .is_none_or(|last| self.now >= last + FOCUS_EVERY)
-                {
-                    self.remeasure_focus();
-                }
+                self.focus.move_to(region);
+                // The frame shown is unscored for the new region: scored at
+                // most once a frame's time while dragging, here or on the next
+                // tick, and where it lands on release.
+                self.measured.1.frame = None;
+                self.remeasure_focus(FOCUS_EVERY);
             }
             Message::FocusRegionStart => {
                 self.break_history_group();
                 // A new press scores its first region at once, such as a click
                 // that moves the region without a drag.
-                self.measured.1 = None;
+                self.measured.1 = Measured::default();
             }
-            Message::FocusRegionEnd => self.remeasure_focus(),
+            Message::FocusRegionEnd => self.remeasure_focus(Duration::ZERO),
             Message::AdjustExposure => return self.adjust_exposure(),
             Message::OverviewScrolled(offset) => {
                 self.grid_scroll = offset;
