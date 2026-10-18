@@ -766,10 +766,6 @@ impl Active {
 fn cores() -> usize {
     thread::available_parallelism().map_or(1, |cores| cores.get())
 }
-/// Efficient mode trades decoding and encoding headroom for less CPU.
-fn efficient() -> bool {
-    std::env::var("CAPTUREFAB_EFFICIENCY").is_ok_and(|mode| mode.eq_ignore_ascii_case("efficient"))
-}
 /// FFmpeg's default frame threading runs cores + 1 threads per stream, each
 /// holding frames and adding latency; share the cores between live streams.
 fn decoder_threads(cores: usize, streams: usize, efficient: bool) -> usize {
@@ -1202,7 +1198,7 @@ impl Decoder {
             Active::NONE
         } else {
             let (active, streams) = Active::claim("decode");
-            let threads = decoder_threads(cores(), streams, efficient());
+            let threads = decoder_threads(cores(), streams, crate::efficiency::efficient());
             cmd.args(["-threads", &threads.to_string()]);
             active
         };
@@ -3753,7 +3749,13 @@ impl Forwarder {
                 let (claimed, recordings) = Active::claim("encode");
                 active = claimed;
                 let cores = (cores() / recordings).max(1);
-                let preset = x264_preset(width, height, self.config.fps, cores, efficient());
+                let preset = x264_preset(
+                    width,
+                    height,
+                    self.config.fps,
+                    cores,
+                    crate::efficiency::efficient(),
+                );
                 cmd.args(["-preset", preset, "-threads", &cores.to_string()]);
                 if encoder == "libx264" {
                     // Rate control by the frames' times rather than `fps`, so
