@@ -162,8 +162,15 @@ fn with_lock<T>(f: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
     f(&dir)
 }
 
+/// Files written to the queue directory, so tests can prove idle paths
+/// write nothing.
+#[cfg(test)]
+static WRITES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Write `bytes` to `dir/name` atomically, readable only by this user.
 fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    #[cfg(test)]
+    WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temp = dir.join(format!("{name}.{}.tmp", std::process::id()));
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -179,26 +186,46 @@ fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Run `update` on the queue under an exclusive lock, persisting the result.
+/// Run `update` on the queue under an exclusive lock, persisting the result
+/// when it changed anything.
 fn with_queue<T>(update: impl FnOnce(&mut Queue) -> Result<T>) -> Result<T> {
     with_lock(|dir| with_queue_locked(dir, update))
 }
 
 fn with_queue_locked<T>(dir: &Path, update: impl FnOnce(&mut Queue) -> Result<T>) -> Result<T> {
+    let (mut queue, read) = read_queue(dir)?;
+    let result = update(&mut queue)?;
+    // An idle uploader and status displays change nothing; writing only real
+    // changes keeps them off the disk.
+    let bytes = serde_json::to_vec(&queue)?;
+    if bytes != read {
+        write_private(dir, "uploads.json", &bytes)?;
+    }
+    Ok(result)
+}
+
+/// The queue and its bytes as last written, without creating the file. The
+/// caller holds `uploads.lock`.
+fn read_queue(dir: &Path) -> Result<(Queue, Vec<u8>)> {
     let path = dir.join("uploads.json");
-    let mut queue = match fs::read(&path) {
+    let (queue, bytes) = match fs::read(&path) {
         Ok(bytes) => {
             ensure!(
                 bytes.len() <= 256 * 1024 * 1024,
                 "upload queue is too large (maximum 256 MiB)"
             );
-            serde_json::from_slice(&bytes)
-                .with_context(|| format!("invalid upload queue {}", path.display()))?
+            let queue: Queue = serde_json::from_slice(&bytes)
+                .with_context(|| format!("invalid upload queue {}", path.display()))?;
+            (queue, bytes)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Queue {
-            version: 1,
-            ..Queue::default()
-        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let queue = Queue {
+                version: 1,
+                ..Queue::default()
+            };
+            let bytes = serde_json::to_vec(&queue)?;
+            (queue, bytes)
+        }
         Err(e) => return Err(e).context("read the upload queue"),
     };
     ensure!(queue.version == 1, "unsupported upload queue version");
@@ -212,9 +239,7 @@ fn with_queue_locked<T>(dir: &Path, update: impl FnOnce(&mut Queue) -> Result<T>
             .with_context(|| format!("invalid queued upload {}", item.id))?;
         ensure!(ids.insert(&item.id), "duplicate upload ID {}", item.id);
     }
-    let result = update(&mut queue)?;
-    write_private(dir, "uploads.json", &serde_json::to_vec(&queue)?)?;
-    Ok(result)
+    Ok((queue, bytes))
 }
 
 /// A verified upload, as recorded in the completed log.
@@ -384,7 +409,7 @@ pub fn status() -> Result<Value> {
     let active = uploader_active();
     with_lock(|dir| {
         let completed = read_completed(dir).unwrap_or_default();
-        let mut value = with_queue_locked(dir, queue_status)?;
+        let mut value = queue_status(&read_queue(dir)?.0)?;
         value["uploader_running"] = json!(active);
         value["completed_seq"] = json!(completed.seq);
         value["recent_completed"] =
@@ -393,7 +418,7 @@ pub fn status() -> Result<Value> {
     })
 }
 
-fn queue_status(queue: &mut Queue) -> Result<Value> {
+fn queue_status(queue: &Queue) -> Result<Value> {
     let count = |state| queue.items.iter().filter(|i| i.state == state).count();
     let waiting_bytes: u64 = queue
         .items
@@ -680,9 +705,9 @@ pub fn drain(timeout: Duration) -> Result<Value> {
     start();
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let busy = with_queue(|queue| {
+        let busy = with_lock(|dir| {
             let now = now();
-            Ok(queue.items.iter().any(|i| {
+            Ok(read_queue(dir)?.0.items.iter().any(|i| {
                 i.state == State::Uploading || (i.state == State::Pending && i.next_attempt <= now)
             }))
         })?;
@@ -697,6 +722,7 @@ pub fn drain(timeout: Duration) -> Result<Value> {
 mod tests {
     use super::*;
     use crate::destination::{FtpServer, FtpTls, NoOverwrite, SecretSource};
+    use std::sync::atomic::Ordering;
 
     fn bucket() -> Bucket {
         Bucket {
@@ -841,15 +867,7 @@ mod tests {
         if !isolated("enqueue_dedups_by_path_returns_existing_id") {
             return;
         }
-        let dir = crate::ipc::session_dir().join("staged");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("shot.png");
-        crate::storage::save_bytes(
-            b"0123456789",
-            &path,
-            &crate::storage::StoragePolicy::default(),
-        )
-        .unwrap();
+        let path = staged("shot.png");
         let id = enqueue("line", &ftp(), &path, "shot.png").unwrap();
         assert_eq!(enqueue("line", &ftp(), &path, "shot.png").unwrap(), id);
         assert!(enqueue("line", &ftp(), &path, "other.png").is_err());
@@ -858,6 +876,61 @@ mod tests {
         assert_eq!(status["pending"], 1);
         assert_eq!(status["items"][0]["remote"]["kind"], "ftp");
         assert_eq!(status["completed_seq"], 0);
+    }
+
+    /// A file's identity and version: inode (on Unix), size and
+    /// modification time.
+    fn version(path: &Path) -> (u64, u64, SystemTime) {
+        let meta = fs::metadata(path).unwrap();
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(&meta);
+        #[cfg(not(unix))]
+        let inode = 0;
+        (inode, meta.len(), meta.modified().unwrap())
+    }
+
+    fn staged(name: &str) -> PathBuf {
+        let dir = crate::ipc::session_dir().join("staged");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        crate::storage::save_bytes(
+            b"0123456789",
+            &path,
+            &crate::storage::StoragePolicy::default(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn status_and_an_idle_uploader_write_nothing() {
+        if !isolated("status_and_an_idle_uploader_write_nothing") {
+            return;
+        }
+        let queue = crate::ipc::session_dir().join("uploads.json");
+        status().unwrap();
+        assert!(!queue.exists(), "status creates no queue");
+        enqueue("line", &ftp(), &staged("shot.png"), "shot.png").unwrap();
+        // Its next attempt is an hour away, so the uploader has nothing to do.
+        with_queue(|queue| {
+            queue.items[0].next_attempt = now() + 3600;
+            Ok(())
+        })
+        .unwrap();
+        let (before, writes) = (version(&queue), WRITES.load(Ordering::Relaxed));
+        status().unwrap();
+        start();
+        let owner = || *OWNER.get().unwrap().lock().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !owner() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(owner(), "this process uploads");
+        // More than two idle passes of the uploader.
+        thread::sleep(Duration::from_millis(4500));
+        assert_eq!(status().unwrap()["pending"], 1);
+        assert_eq!(WRITES.load(Ordering::Relaxed), writes);
+        assert_eq!(version(&queue), before);
     }
 
     #[test]
