@@ -3756,7 +3756,9 @@ impl Forwarder {
                 let preset = x264_preset(width, height, self.config.fps, cores, efficient());
                 cmd.args(["-preset", preset, "-threads", &cores.to_string()]);
                 if encoder == "libx264" {
-                    cmd.args(["-tune", "zerolatency"]);
+                    // Rate control by the frames' times rather than `fps`, so
+                    // a camera slower than `fps` still gets the bitrate asked.
+                    cmd.args(["-tune", "zerolatency", "-x264-params", "force-cfr=0"]);
                 }
             } else if encoder.ends_with("_videotoolbox") {
                 cmd.args(["-realtime", "1"]);
@@ -4866,6 +4868,7 @@ for i in 1 2; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
     /// Run the calling test again in a child process with its own session
     /// directory, since recordings reserve storage in its ledger. True in
     /// the child, which does the work.
+    #[cfg(unix)]
     fn in_own_session(test: &str) -> bool {
         if std::env::var_os("CAPTUREFAB_OWN_SESSION_TEST").is_some() {
             return true;
@@ -4922,7 +4925,8 @@ esac"#,
                 "-use_wallclock_as_timestamps 1 -i pipe:0",
                 "-fps_mode vfr",
                 "-preset ",
-                "-threads "
+                "-threads ",
+                "-x264-params force-cfr=0"
             ]),
             1
         );
@@ -5603,7 +5607,13 @@ esac"#
         let output = dir.join("gap.mkv");
         let mut forward = Forwarder::new(ForwardConfig {
             output: output.to_string_lossy().into(),
-            ..stream("libx264", 30.0)
+            codec: "h264".into(),
+            encoder: "libx264".into(),
+            fps: 30.0,
+            bitrate: "4M".into(),
+            storage: Default::default(),
+            max_file_bytes: default_recording_cap(),
+            destination: None,
         })
         .unwrap();
         let (width, height) = (1280usize, 720usize);
