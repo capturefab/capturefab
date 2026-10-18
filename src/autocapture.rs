@@ -31,8 +31,10 @@ use std::{
 /// 2 added the encoder; 3 keeps frames as files beside the database.
 const SCHEMA_VERSION: u32 = 3;
 const FEATURES: usize = 84;
-/// A background embedding that finishes this long after its frame is dropped:
-/// the scene has moved on, and pausing must not leave a late capture behind.
+/// A background embedding that finishes this long after its frame, and over
+/// twice as long as embeddings usually take, is dropped: the scene has moved
+/// on, as when a GPU missed its deadline. A computer whose every embedding is
+/// slower still decides on each.
 const STALE_SAMPLE: Duration = Duration::from_secs(2);
 const MAX_PENDING: u64 = 200;
 const MAX_STORED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -402,6 +404,8 @@ struct Embedder {
     busy: bool,
     /// When the CPU has rested long enough after the last sample.
     rested: Option<Instant>,
+    /// How long samples usually take to embed, as a moving average.
+    usual: Option<Duration>,
     thread: Option<std::thread::JoinHandle<()>>,
     throughput: Arc<Mutex<Throughput>>,
 }
@@ -456,6 +460,7 @@ impl Embedder {
             done,
             busy: false,
             rested: None,
+            usual: None,
             thread: Some(thread),
             throughput,
         })
@@ -496,7 +501,14 @@ impl Embedder {
     fn landed(&mut self, (embedded, rest): (Embedded, Duration)) -> Embedded {
         self.busy = false;
         self.rested = Some(embedded.2 + rest);
+        let took = embedded.2.saturating_duration_since(embedded.1);
+        self.usual = Some(self.usual.map_or(took, |usual| (usual * 3 + took) / 4));
         embedded
+    }
+    /// How long after its frame a result is stale.
+    fn stale_after(&self) -> Duration {
+        self.usual
+            .map_or(STALE_SAMPLE, |usual| STALE_SAMPLE.max(usual * 2))
     }
     #[cfg(all(test, feature = "dinov2"))]
     fn wait(&mut self) -> Option<Embedded> {
@@ -1166,8 +1178,12 @@ impl CaptureSession {
         sampled: Instant,
         finished: Instant,
     ) -> Result<Option<u64>> {
+        let stale_after = self
+            .embedder
+            .as_ref()
+            .map_or(STALE_SAMPLE, Embedder::stale_after);
         if sampled < self.armed_at
-            || finished.saturating_duration_since(sampled) > STALE_SAMPLE
+            || finished.saturating_duration_since(sampled) > stale_after
             || !self.has_room(&frame, finished)?
         {
             return Ok(None);

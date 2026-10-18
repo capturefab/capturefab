@@ -1208,6 +1208,54 @@ mod dinov2_sessions {
         assert!(settle(&mut session, later + Duration::from_millis(100)).is_some());
     }
 
+    /// Land a background result for `frame` as if its embedding took `took`.
+    fn land(
+        session: &mut CaptureSession,
+        frame: &Frame,
+        sampled: Instant,
+        took: Duration,
+    ) -> Option<u64> {
+        let embedder = session.embedder.as_mut().unwrap();
+        let feature = embedder.describe(frame);
+        let finished = sampled + took;
+        let (frame, sampled, finished, feature) =
+            embedder.landed(((frame.clone(), sampled, finished, feature), Duration::ZERO));
+        let id = session
+            .decide_late(frame, feature.unwrap(), sampled, finished)
+            .unwrap();
+        session.flush();
+        id
+    }
+
+    #[test]
+    fn a_computer_whose_every_embedding_is_slow_still_captures() {
+        let file = SessionFile::new();
+        let mut session = create(&file, Some(EncoderChoice::Dinov2));
+        let target = color([220, 40, 40]);
+        session.manual(&target).unwrap();
+        ready(&mut session);
+        let t = Instant::now() + Duration::from_secs(31);
+        // Each embedding takes three seconds, as on a small CPU.
+        for n in 0..2 {
+            session.last_capture = None;
+            session.recent.clear();
+            let sampled = t + Duration::from_secs(10 * n);
+            assert!(
+                land(&mut session, &target, sampled, Duration::from_secs(3)).is_some(),
+                "sample {n} is decided on"
+            );
+        }
+        // One far slower than usual belongs to a scene that has moved on.
+        session.last_capture = None;
+        session.recent.clear();
+        let sampled = t + Duration::from_secs(20);
+        assert_eq!(
+            land(&mut session, &target, sampled, Duration::from_secs(12)),
+            None
+        );
+        assert_eq!(session.status().unwrap().pending_count, 2);
+    }
+
     #[test]
     fn a_single_triggered_frame_is_captured_without_a_later_frame() {
         let file = SessionFile::new();

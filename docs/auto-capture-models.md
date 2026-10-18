@@ -160,7 +160,10 @@ the rest. GPU embeddings are not paced. In the same sessions the worker used
 other heavy work, and 50% (2.1 samples per second) in the VM; in efficiency
 mode, 21% and 24%. A slower computer samples less often: if an embedding costs
 one second of processor time, half a core allows one sample every two seconds
-and efficiency mode one every five.
+and efficiency mode one every five. A result is dropped as stale only when it
+arrives over 2 s after its frame and over twice as long as embeddings usually
+take, as when the GPU misses its deadline, so a computer whose every embedding
+takes seconds still decides on each sample.
 
 **Why `auto` keeps DINOv2 without a GPU.** A session's encoder never changes,
 but whether a GPU helps is only known at run time: the helper can fail to
