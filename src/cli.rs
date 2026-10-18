@@ -2809,7 +2809,7 @@ fn schema() -> Value {
         "auto probes encoders at the frame size and remembers results for the FFmpeg build until reboot; an auto encoder that exits in its first seconds is replaced once by the next in a new file; a codec with no working encoder fails before recording with unsupported (exit 5) and names the working codecs"
     );
     contract["forwarding"]["sources"] = json!(
-        "Network streams reconnect after FFmpeg exits, backing off from 1 s to 30 s; frame waits meanwhile time out (exit 4), and three refusals in a row (rejected credentials, missing path) stop acquisition. Video files play at their frame rate unless PlaybackSpeed=Fastest and stop with 'Video file finished'."
+        "Network streams reconnect after FFmpeg exits, backing off from 1 s to 30 s; frame waits meanwhile time out (exit 4), and five refusals in a row (rejected credentials, missing path) stop acquisition. Video files play at their frame rate unless PlaybackSpeed=Fastest and stop with 'Video file finished'."
     );
     contract["remote"] = json!({
         "start":"serve --listen HOST:PORT [--web-dir web-client/dist]",

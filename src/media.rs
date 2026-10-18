@@ -1860,8 +1860,9 @@ pub fn stream_end(error: &anyhow::Error) -> Option<StreamEnd> {
 }
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
-/// Launches the server refuses in a row before reconnecting stops.
-const MAX_REFUSED: u32 = 3;
+/// Launches the server refuses in a row before reconnecting stops; some
+/// cameras answer 404 for a while as they boot.
+const MAX_REFUSED: u32 = 5;
 /// Reopening a network stream, with backoff from 1 s to 30 s between launches.
 struct Reconnect {
     /// The launch in progress or due next, from 1 in each outage.
@@ -2413,8 +2414,8 @@ pub struct ForwardStats {
     /// encoder cannot keep up. `dropped` includes them.
     #[serde(default)]
     pub late: u64,
-    /// No new camera frame for 2 s or more. A recording repeats nothing
-    /// meanwhile; the gap shows on its wall-clock timeline.
+    /// No new camera frame for 2 s or more; nothing new reaches the encoder
+    /// meanwhile.
     #[serde(default)]
     pub stalled: bool,
     pub encoder: String,
@@ -3740,7 +3741,7 @@ impl Forwarder {
         let process = self.process.as_mut().unwrap();
         ensure!(
             frame.width == process.width && frame.height == process.height,
-            "the camera's resolution changed from {}x{} to {}x{}, so this recording stopped; start a new one to continue",
+            "the camera's resolution changed from {}x{} to {}x{}; start a new recording to continue",
             process.width,
             process.height,
             frame.width,
@@ -3748,7 +3749,7 @@ impl Forwarder {
         );
         ensure!(
             frame.pixel_format == process.raw.pixel_format,
-            "the camera's pixel format changed, so this recording stopped; start a new one to continue"
+            "the camera's pixel format changed; start a new recording to continue"
         );
         // An encoder that died at start leaves a broken pipe behind; falling
         // back to the next one comes first.
@@ -4251,18 +4252,23 @@ esac"#,
             assert_eq!(stream_end(&waiting), None);
             assert!(format!("{waiting}").contains(&format!("(attempt {attempt}): timed out")));
         }
-        // An unrelated failure resets the count; backoff keeps doubling.
+        // An unrelated failure resets the count; backoff keeps doubling
+        // up to its limit.
         camera.lost("media stream ended: Connection refused".into());
         let backoff = camera.reconnect.as_ref().unwrap().backoff;
         assert_eq!(backoff, Duration::from_secs(16));
-        for _ in 0..2 {
+        for _ in 1..MAX_REFUSED {
             assert_eq!(stream_end(&camera.lost(refusal.into())), None);
         }
+        assert_eq!(
+            camera.reconnect.as_ref().unwrap().backoff,
+            RECONNECT_BACKOFF_MAX
+        );
         let abandoned = camera.lost(refusal.into());
         assert_eq!(stream_end(&abandoned), Some(StreamEnd::Abandoned));
         assert!(
             format!("{abandoned}")
-                .starts_with("stopped reconnecting to rtsp://camera/live after 6 attempts")
+                .starts_with("stopped reconnecting to rtsp://camera/live after 8 attempts")
         );
         assert!(camera.reconnect.is_none());
     }
@@ -4462,6 +4468,26 @@ esac"#,
             ]),
             1
         );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn a_resolution_change_stops_the_recording_with_a_reason() {
+        let _fake = Fake::new(
+            "resize",
+            r#"case "$*" in
+*-encoders*) printf ' V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*) cat > /dev/null ;;
+esac"#,
+        );
+        let mut forward = Forwarder::new(stream("libx264", 30.0)).unwrap();
+        forward.push(tiny(8, 4)).unwrap();
+        let error = forward.push(tiny(16, 8)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the camera's resolution changed from 8x4 to 16x8; start a new recording to continue"
+        );
+        forward.stop().unwrap();
     }
     #[test]
     #[cfg(unix)]

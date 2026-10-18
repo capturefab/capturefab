@@ -209,7 +209,7 @@ Native locators accept `?size=WIDTHxHEIGHT&fps=RATE`. Inspect `features` for adv
 
 Media inputs and forwarding use bundled FFmpeg in release builds. Inspect `capturefab ffmpeg --json` to see the actual build's protocols and encoders. SRT support depends on the bundled FFmpeg configuration. `--hwaccel` configures decoding in new direct, GUI or `serve` workers; an existing session retains its setting. `--hwaccel auto` decodes in software on ARM Linux and on hosts where no FFmpeg hardware decoder initializes.
 
-Network stream sources (RTSP, SRT, RTMP, HTTP, UDP, TCP, RTP) reconnect when their stream ends, backing off from 1 s to 30 s. Meanwhile acquisition keeps running, `last_error` reads `Stream lost; reconnecting to ...` and frame waits time out (exit 4); three refusals in a row (rejected credentials or a missing stream path) stop acquisition. A video file source plays at its own frame rate and stops with the `Video file finished` log entry; `--set PlaybackSpeed=Fastest` decodes every frame as fast as possible.
+Network stream sources (RTSP, SRT, RTMP, HTTP, UDP, TCP, RTP) reconnect when their stream ends, backing off from 1 s to 30 s. Meanwhile acquisition keeps running, `last_error` reads `Stream lost; reconnecting to ...` and frame waits time out (exit 4); five refusals in a row (rejected credentials or a missing stream path) stop acquisition. A video file source plays at its own frame rate and stops with the `Video file finished` log entry; `--set PlaybackSpeed=Fastest` decodes every frame as fast as possible.
 
 ## Scan documents
 
