@@ -7,12 +7,25 @@
 //! start or stop anything, and their results are bounded and redacted for
 //! whoever reads them: `redact::for_output` for people and command-line
 //! callers, `redact::for_model` for AI providers.
+mod arguments;
+pub mod capture;
+pub mod check;
 pub mod context;
+pub mod control;
+pub mod destinations;
+pub mod exec;
 pub mod fields;
+pub mod plan;
 pub mod read;
 pub mod redact;
 pub mod risk;
 pub mod schema;
+pub mod values;
+pub use check::{check, check_plan, check_plan_with};
+pub use exec::{
+    ApplyError, CheckFailure, Checked, EmptySecrets, Executor, Op, PlanFailure, PlanState,
+    Progress, RunFacts, SecretSource, StepOutcome, apply, classify,
+};
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -129,6 +142,22 @@ static CATALOG: &[ToolSpec] = &[
     read::GET_CAMERA_FEATURES,
     read::INSPECT_FRAME,
     read::WAIT_FOR,
+    control::CONNECT_CAMERA,
+    control::START_LIVE_VIEW,
+    control::STOP_LIVE_VIEW,
+    control::SET_CAMERA_FEATURES,
+    control::SET_CAMERA_ROI,
+    control::SET_AUTO_EXPOSURE,
+    control::RUN_CAMERA_COMMAND,
+    control::UNDO_CAMERA_CHANGE,
+    capture::CAPTURE_PHOTOS,
+    capture::START_RECORDING,
+    capture::STOP_RECORDING,
+    capture::SCHEDULE_CAPTURES,
+    capture::CANCEL_JOB,
+    capture::STREAM_TO_URL,
+    destinations::CREATE_FOLDER_DESTINATION,
+    destinations::CREATE_S3_DESTINATION,
 ];
 
 pub fn catalog() -> &'static [ToolSpec] {
@@ -341,9 +370,9 @@ pub fn parse_args<T: DeserializeOwned>(spec: &ToolSpec, args: &Value) -> Result<
     if !issues.is_empty() {
         return Err(issues);
     }
-    serde_json::from_value(args).map_err(|error| {
+    arguments::parse(args).map_err(|(field, error)| {
         vec![Issue::usage(
-            None,
+            field.as_deref(),
             format!(
                 "The arguments do not match the {} schema: {error}.",
                 spec.name

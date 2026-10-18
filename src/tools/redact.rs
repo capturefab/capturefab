@@ -29,7 +29,7 @@ pub fn for_output(mut value: Value) -> Value {
 /// `text` with the credentials of every URL in it removed: user info,
 /// credential query parameters and RTMP stream keys.
 pub fn for_output_text(text: &str) -> String {
-    words(&hide_userinfo(text), &|word| {
+    hide_access_key_ids(&words(&hide_userinfo(text), &|word| {
         if word.contains("://") {
             map_urls(word, &|url| rtmp_key(&crate::media::redact_url(url)))
         } else if word.contains('?') {
@@ -37,7 +37,7 @@ pub fn for_output_text(text: &str) -> String {
         } else {
             word.to_owned()
         }
-    })
+    }))
 }
 
 /// An error message for people: `for_output_text`, after hiding every
@@ -196,7 +196,7 @@ fn hide_secret_fields(value: &mut Value) {
         Value::Array(values) => values.iter_mut().for_each(hide_secret_fields),
         Value::Object(fields) => {
             for (key, value) in fields {
-                if SECRET_FIELDS.contains(&key.as_str()) {
+                if SECRET_FIELDS.contains(&key.as_str()) || key == "access_key_id" {
                     *value = Value::String("<redacted>".into());
                 } else {
                     hide_secret_fields(value);
@@ -363,8 +363,9 @@ mod tests {
         assert!(text.contains("rtsp://<redacted>@10.0.0.9/stream"));
         assert!(text.contains("passphrase=<redacted>&latency=200"));
         assert!(text.contains("rtmp://a.rtmp.youtube.com/live2/<redacted>"));
-        // People may see their own identifiers and paths.
-        assert!(text.contains(PLANTED[3]) && text.contains(PLANTED[4]));
+        // Paths remain useful to local callers; access key IDs do not
+        // belong in dry runs, diagnostics or execution reports.
+        assert!(!text.contains(PLANTED[3]) && text.contains(PLANTED[4]));
         assert_eq!(
             for_output_text("forwarding to rtmps://h/app/inst/KEY123, then stopped."),
             "forwarding to rtmps://h/app/<redacted>, then stopped."

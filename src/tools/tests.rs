@@ -462,7 +462,11 @@ fn assert_clean(text: &str) {
 
 #[test]
 fn catalog_lists_the_observe_tools_with_their_sessions() {
-    let names: Vec<_> = catalog().iter().map(|spec| spec.name).collect();
+    let names: Vec<_> = catalog()
+        .iter()
+        .filter(|spec| spec.kind == ToolKind::Read)
+        .map(|spec| spec.name)
+        .collect();
     assert_eq!(
         names,
         [
@@ -476,12 +480,12 @@ fn catalog_lists_the_observe_tools_with_their_sessions() {
             "wait_for"
         ]
     );
-    for spec in catalog() {
+    for spec in catalog().iter().filter(|spec| spec.kind == ToolKind::Read) {
         assert_eq!((spec.kind, spec.risk), (ToolKind::Read, Risk::Observe));
     }
     let offline: Vec<_> = catalog()
         .iter()
-        .filter(|spec| !spec.needs_session)
+        .filter(|spec| !spec.needs_session && spec.kind == ToolKind::Read)
         .map(|spec| spec.name)
         .collect();
     assert_eq!(

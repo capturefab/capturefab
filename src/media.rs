@@ -109,6 +109,24 @@ pub fn redact_url(url: &str) -> String {
             .join("&");
         result = format!("{path}?{params}");
     }
+    // RTMP publishes use the path after the application name as a stream
+    // key. Redact it here as well as in tool output so worker status,
+    // activity and FFmpeg diagnostics never expose a typed stream password.
+    if let Some((protocol, rest)) = result.split_once("://")
+        && (protocol.eq_ignore_ascii_case("rtmp") || protocol.eq_ignore_ascii_case("rtmps"))
+        && let Some(path) = rest.find('/')
+    {
+        let start = protocol.len() + 3 + path + 1;
+        let end = result[start..]
+            .find(['?', '#'])
+            .map_or(result.len(), |offset| start + offset);
+        if let Some(slash) = result[start..end].find('/') {
+            let key = start + slash + 1;
+            if key < end {
+                result.replace_range(key..end, "<redacted>");
+            }
+        }
+    }
     result
 }
 fn redact_log(message: &str, source: &str) -> String {
@@ -3317,6 +3335,16 @@ mod tests {
         assert_eq!(
             redact_url("srt://host:8890?passphrase=secret&mode=caller"),
             "srt://host:8890?passphrase=<redacted>&mode=caller"
+        );
+        assert_eq!(
+            redact_url("RTMPS://user:pass@host/app/instance/KEY?token=SECRET&fps=30"),
+            "RTMPS://<redacted>@host/app/<redacted>?token=<redacted>&fps=30"
+        );
+        assert_eq!(redact_url("rtmp://host/app/"), "rtmp://host/app/");
+        assert_eq!(redact_url("rtmp://host/app"), "rtmp://host/app");
+        assert_eq!(
+            redact_url("rtmp://host/app/<redacted>"),
+            "rtmp://host/app/<redacted>"
         );
         assert!(info("rtsp://camera/live").is_ok());
         assert!(info("concat:secret|other").is_err());

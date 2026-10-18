@@ -416,6 +416,15 @@ pub fn run_read(
     if spec.needs_session && !host.has_session() {
         return Err(vec![Issue::usage(None, needs_session(spec.name))]);
     }
+    preflight_for(ctx, call, opts.origin, opts.max_wait).map_err(|issues| {
+        issues
+            .into_iter()
+            .map(|issue| Issue {
+                message: opts.origin.redact_text(&issue.message),
+                ..issue
+            })
+            .collect::<Vec<_>>()
+    })?;
     let output = match spec.name {
         "get_overview" => parse_args::<NoArgs>(spec, &call.args).map(|_| overview(ctx).into()),
         "list_cameras" => parse_args(spec, &call.args)
@@ -454,6 +463,69 @@ pub fn run_read(
                 ..issue
             })
             .collect()),
+    }
+}
+
+/// Check an observation without contacting a host, discovering devices or
+/// waiting. Dry runs use the same typed argument and state validation as
+/// execution; caller-specific wait limits are applied again by `run_read`.
+pub(crate) fn preflight(ctx: &Context, call: &ToolCall) -> Result<(), Vec<Issue>> {
+    preflight_for(ctx, call, Origin::Cli, MAX_WAIT)
+}
+
+fn preflight_for(
+    ctx: &Context,
+    call: &ToolCall,
+    origin: Origin,
+    max_wait: Duration,
+) -> Result<(), Vec<Issue>> {
+    let Some(spec) = super::spec(&call.tool).filter(|spec| spec.kind == ToolKind::Read) else {
+        return Err(vec![Issue::usage(
+            None,
+            "Choose an observation tool from tools list.",
+        )]);
+    };
+    if spec.needs_session && !ctx.session {
+        return Err(vec![Issue::usage(None, needs_session(spec.name))]);
+    }
+    match spec.name {
+        "get_overview" | "list_destinations" | "get_storage" => {
+            parse_args::<NoArgs>(spec, &call.args).map(|_| ())
+        }
+        "list_cameras" => {
+            let args: ListCamerasArgs = parse_args(spec, &call.args)?;
+            if args.discover && !ctx.session {
+                return Err(vec![Issue::usage(
+                    Some("discover"),
+                    "Open a session to discover cameras.",
+                )]);
+            }
+            Ok(())
+        }
+        "list_jobs" => {
+            let args: ListJobsArgs = parse_args(spec, &call.args)?;
+            args.camera.as_deref().map_or(Ok(()), |camera| {
+                connected_camera(ctx, "camera", camera, origin)
+                    .map(|_| ())
+                    .map_err(|issue| vec![issue])
+            })
+        }
+        "get_camera_features" => {
+            let args: FeaturesArgs = parse_args(spec, &call.args)?;
+            connected_camera(ctx, "camera", &args.camera, origin)
+                .map(|_| ())
+                .map_err(|issue| vec![issue])
+        }
+        "inspect_frame" => {
+            let args: InspectArgs = parse_args(spec, &call.args)?;
+            prepare_inspect(ctx, &args, origin).map(|_| ())
+        }
+        "wait_for" => {
+            let args: WaitArgs = parse_args(spec, &call.args)?;
+            let wait = prepare_wait(ctx, &args, origin, max_wait)?;
+            validate_wait_state(&ctx.snapshot, args.until, wait.camera.as_deref(), wait.job)
+        }
+        _ => unreachable!("catalog observation has no preflight"),
     }
 }
 
@@ -814,14 +886,20 @@ fn feature_entry(feature: &FeatureInfo, auto: Option<&AutoStatus>) -> Value {
     entry
 }
 
-fn inspect_frame(
-    host: &dyn ToolHost,
-    ctx: &Context,
-    args: InspectArgs,
-    opts: &ReadOptions,
-) -> Result<ToolOutput, Vec<Issue>> {
+struct PreparedInspect<'a> {
+    camera: &'a CameraSnapshot,
+    fresh: u32,
+    edge: u32,
+    region: Option<[f64; 4]>,
+}
+
+fn prepare_inspect<'a>(
+    ctx: &'a Context,
+    args: &InspectArgs,
+    origin: Origin,
+) -> Result<PreparedInspect<'a>, Vec<Issue>> {
     let mut issues = Vec::new();
-    let camera = connected_camera(ctx, "camera", &args.camera, opts.origin)
+    let camera = connected_camera(ctx, "camera", &args.camera, origin)
         .map_err(|issue| issues.push(issue))
         .ok();
     let fresh = args
@@ -865,12 +943,32 @@ fn inspect_frame(
             "A document scanner cannot be inspected without scanning a page; use capture_photos to scan one.",
         )]);
     }
+    Ok(PreparedInspect {
+        camera,
+        fresh: fresh as u32,
+        edge: edge as u32,
+        region,
+    })
+}
+
+fn inspect_frame(
+    host: &dyn ToolHost,
+    ctx: &Context,
+    args: InspectArgs,
+    opts: &ReadOptions,
+) -> Result<ToolOutput, Vec<Issue>> {
+    let PreparedInspect {
+        camera,
+        fresh,
+        edge,
+        region,
+    } = prepare_inspect(ctx, &args, opts.origin)?;
     let include = args.include_image.unwrap_or(true);
     let send = include && opts.allow_images && edge > 0;
     let command = SessionCommand::Frame {
-        fresh: fresh as u32,
+        fresh,
         timeout_ms: FRAME_WAIT_MS,
-        max_dimension: if send { edge as u32 } else { 0 },
+        max_dimension: if send { edge } else { 0 },
         format: crate::inspect::PreviewFormat::Auto,
         region,
     };
@@ -947,12 +1045,19 @@ fn decode_image(image: &Value) -> Option<(&'static str, Arc<[u8]>)> {
     (!data.is_empty()).then(|| (mime, Arc::from(data)))
 }
 
-fn wait_for(
-    host: &dyn ToolHost,
+struct PreparedWait {
+    camera: Option<String>,
+    timeout: u64,
+    frames: u64,
+    job: u64,
+}
+
+fn prepare_wait(
     ctx: &Context,
-    args: WaitArgs,
-    opts: &ReadOptions,
-) -> Result<Value, Vec<Issue>> {
+    args: &WaitArgs,
+    origin: Origin,
+    max_wait: Duration,
+) -> Result<PreparedWait, Vec<Issue>> {
     let mut issues = Vec::new();
     let timeout = match parse_duration_field(&args.timeout) {
         Ok(ms) if ms < 1_000 => {
@@ -972,12 +1077,12 @@ fn wait_for(
             ));
             0
         }
-        Ok(ms) if ms > opts.max_wait.as_millis() as u64 => {
+        Ok(ms) if ms > max_wait.as_millis() as u64 => {
             issues.push(Issue::usage(
                 Some("timeout"),
                 format!(
                     "Choose a timeout of at most {}, the time this task has left.",
-                    format_duration(opts.max_wait.as_millis() as u64)
+                    format_duration(max_wait.as_millis() as u64)
                 ),
             ));
             0
@@ -993,7 +1098,7 @@ fn wait_for(
         Until::Frames | Until::AutoSettled | Until::RecordingStopped
     );
     let camera = match &args.camera {
-        Some(camera) => connected_camera(ctx, "camera", camera, opts.origin)
+        Some(camera) => connected_camera(ctx, "camera", camera, origin)
             .map_err(|issue| issues.push(issue))
             .ok()
             .map(|camera| camera.info.id.clone()),
@@ -1045,9 +1150,53 @@ fn wait_for(
     if !issues.is_empty() {
         return Err(issues);
     }
+    Ok(PreparedWait {
+        camera,
+        timeout,
+        frames,
+        job,
+    })
+}
+
+fn validate_wait_state(
+    snapshot: &SessionSnapshot,
+    until: Until,
+    camera: Option<&str>,
+    job: u64,
+) -> Result<(), Vec<Issue>> {
+    match until {
+        Until::Frames if !find(snapshot, camera).is_some_and(|state| state.streaming) => {
+            Err(vec![Issue::usage(
+                Some("camera"),
+                "This camera is not streaming, so no frames arrive; call \
+                 start_live_view first, or wait for something else.",
+            )])
+        }
+        Until::JobDone if job_in(snapshot, camera, job).is_none() => Err(vec![Issue::error(
+            Some("job_id"),
+            format!("There is no job {job}; list_jobs shows job IDs."),
+            IssueCode::Unavailable,
+        )]),
+        _ => Ok(()),
+    }
+}
+
+fn wait_for(
+    host: &dyn ToolHost,
+    ctx: &Context,
+    args: WaitArgs,
+    opts: &ReadOptions,
+) -> Result<Value, Vec<Issue>> {
+    let PreparedWait {
+        camera,
+        timeout,
+        frames,
+        job,
+    } = prepare_wait(ctx, &args, opts.origin, opts.max_wait)?;
     let failed =
         |error: anyhow::Error| vec![Issue::failed(&error, &json!([args.camera]), opts.origin)];
     let first = host.snapshot().map_err(failed)?;
+    validate_wait_state(&first, args.until, camera.as_deref(), job)?;
     let ours = host.actor_id();
     let mut watch = Watch {
         until: args.until,
@@ -1063,28 +1212,10 @@ fn wait_for(
             .unwrap_or(0),
         ours,
     };
-    match args.until {
-        Until::Frames => {
-            let state = find(&first, camera.as_deref());
-            match state {
-                Some(state) if state.streaming => watch.frames_from = state.frames,
-                _ => {
-                    return Err(vec![Issue::usage(
-                        Some("camera"),
-                        "This camera is not streaming, so no frames arrive; call \
-                         start_live_view first, or wait for something else.",
-                    )]);
-                }
-            }
-        }
-        Until::JobDone if job_in(&first, camera.as_deref(), job).is_none() => {
-            return Err(vec![Issue::error(
-                Some("job_id"),
-                format!("There is no job {job}; list_jobs shows job IDs."),
-                IssueCode::Unavailable,
-            )]);
-        }
-        _ => {}
+    if args.until == Until::Frames {
+        watch.frames_from = find(&first, camera.as_deref())
+            .expect("validated streaming camera")
+            .frames;
     }
     let started = Instant::now();
     let deadline = started + Duration::from_millis(timeout);
@@ -1564,4 +1695,153 @@ fn pointer_list<'a>(value: &'a mut Value, path: &str) -> &'a mut Vec<Value> {
         .pointer_mut(path)
         .and_then(Value::as_array_mut)
         .expect("largest_list returns a list's pointer")
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+    use crate::tools::tests::{SCANNER, fixture_context, fixture_snapshot};
+
+    fn call(tool: &str, args: Value) -> ToolCall {
+        ToolCall {
+            tool: tool.into(),
+            args,
+        }
+    }
+
+    fn wait(camera: Option<&str>, until: &str) -> Value {
+        json!({"camera":camera,"until":until,"timeout":"1s","frames":null,"job_id":null})
+    }
+
+    #[test]
+    fn every_observation_has_a_pure_preflight() {
+        let ctx = fixture_context(fixture_snapshot());
+        let calls = [
+            call("get_overview", json!({})),
+            call(
+                "list_cameras",
+                json!({"discover":true,"include_simulated":false}),
+            ),
+            call("list_destinations", json!({})),
+            call("get_storage", json!({})),
+            call("list_jobs", json!({"camera":"sim:0"})),
+            call(
+                "get_camera_features",
+                json!({"camera":"sim:0","search":null,"names":null}),
+            ),
+            call(
+                "inspect_frame",
+                json!({"camera":"sim:0","fresh":null,"max_dimension":null,"region":null,"include_image":null}),
+            ),
+            call("wait_for", wait(None, "time")),
+        ];
+        for call in calls {
+            assert!(preflight(&ctx, &call).is_ok(), "{}", call.tool);
+        }
+    }
+
+    #[test]
+    fn inspection_preflight_checks_every_bound_and_refuses_scanners() {
+        let ctx = fixture_context(fixture_snapshot());
+        let invalid = call(
+            "inspect_frame",
+            json!({
+                "camera":"sim:0", "fresh":11, "max_dimension":255,
+                "region":{"x":0.9,"y":0.0,"width":0.2,"height":1.0}, "include_image":null,
+            }),
+        );
+        let issues = preflight(&ctx, &invalid).unwrap_err();
+        for field in ["fresh", "max_dimension", "region"] {
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.field.as_deref() == Some(field)),
+                "{field}"
+            );
+        }
+        let scanner = call(
+            "inspect_frame",
+            json!({"camera":SCANNER,"fresh":null,"max_dimension":null,"region":null,"include_image":null}),
+        );
+        assert!(
+            preflight(&ctx, &scanner).unwrap_err()[0]
+                .message
+                .contains("document scanner")
+        );
+    }
+
+    #[test]
+    fn wait_preflight_checks_conditions_and_live_state_without_waiting() {
+        let ctx = fixture_context(fixture_snapshot());
+        for (args, field) in [
+            (wait(None, "frames"), "camera"),
+            (
+                {
+                    let mut args = wait(Some("sim:0"), "frames");
+                    args["frames"] = json!(1001);
+                    args
+                },
+                "frames",
+            ),
+            (
+                {
+                    let mut args = wait(None, "job_done");
+                    args["job_id"] = json!(99);
+                    args
+                },
+                "job_id",
+            ),
+            (
+                {
+                    let mut args = wait(None, "time");
+                    args["timeout"] = json!("11m");
+                    args
+                },
+                "timeout",
+            ),
+            (
+                {
+                    let mut args = wait(Some("FaceTime HD Camera"), "frames");
+                    args["frames"] = json!(1);
+                    args
+                },
+                "camera",
+            ),
+        ] {
+            let issues = preflight(&ctx, &call("wait_for", args)).unwrap_err();
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.field.as_deref() == Some(field)),
+                "{field}: {issues:?}"
+            );
+        }
+        let mut args = wait(Some("sim:0"), "job_done");
+        args["job_id"] = json!(7);
+        assert!(preflight(&ctx, &call("wait_for", args)).is_ok());
+    }
+
+    #[test]
+    fn preflight_checks_session_and_camera_requirements() {
+        let mut ctx = fixture_context(fixture_snapshot());
+        let camera = call(
+            "get_camera_features",
+            json!({"camera":"gige:192.168.1.20","search":null,"names":null}),
+        );
+        assert_eq!(
+            preflight(&ctx, &camera).unwrap_err()[0].message,
+            "Connect the camera first; propose connect_camera."
+        );
+        ctx.session = false;
+        assert!(preflight(&ctx, &call("get_overview", json!({}))).is_ok());
+        let discover = call(
+            "list_cameras",
+            json!({"discover":true,"include_simulated":false}),
+        );
+        assert_eq!(
+            preflight(&ctx, &discover).unwrap_err()[0].message,
+            "Open a session to discover cameras."
+        );
+        assert!(preflight(&ctx, &call("list_jobs", json!({"camera":null}))).is_err());
+    }
 }
