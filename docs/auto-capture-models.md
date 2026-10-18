@@ -147,17 +147,20 @@ frame (roughly 7-10 samples per second). Sampling uses a fixed grid of up to
 30 per second that tolerates frames arriving a quarter interval early, so
 camera jitter does not halve the rate. Slower GPUs have not been measured.
 
-**CPU pacing.** Keeping one frame in flight on the CPU held a core busy all
-the time: about 90% of one core for a CPU-only session on the simulator, and
-everything a Raspberry Pi has. Sampling now rests after each CPU embedding, so
-that the worker's processor time during embeddings averages at most half of
-one core, or a fifth in efficiency mode. The worker's processor time counts
-every thread of the forward pass, and anything else the worker does meanwhile
-can only lengthen the rest. GPU embeddings are not paced. In the same session
-the worker used 38% of one core at 1.1 samples per second, and 21% in
-efficiency mode, on an M4 Max shared with other heavy work. A slower computer
-samples less often: if an embedding costs one second of processor time, half
-a core allows one sample every two seconds and efficiency mode one every five.
+**CPU pacing.** Keeping one frame in flight on the CPU held the worker busy
+all the time: a CPU-only session on the simulator used about 90% of one core
+on an M4 Max and 170% in a six-core Linux arm64 VM, where the forward pass
+spreads over several threads; a Raspberry Pi would give it everything it has.
+Sampling now rests after each CPU embedding, so that the worker's processor
+time during embeddings averages at most half of one core, or a fifth in
+efficiency mode. The worker's processor time counts every thread of the
+forward pass, and anything else the worker does meanwhile can only lengthen
+the rest. GPU embeddings are not paced. In the same sessions the worker used
+38% of one core (1.1 samples per second) on the Mac, which was shared with
+other heavy work, and 50% (2.1 samples per second) in the VM; in efficiency
+mode, 21% and 24%. A slower computer samples less often: if an embedding costs
+one second of processor time, half a core allows one sample every two seconds
+and efficiency mode one every five.
 
 **Why `auto` keeps DINOv2 without a GPU.** A session's encoder never changes,
 but whether a GPU helps is only known at run time: the helper can fail to
