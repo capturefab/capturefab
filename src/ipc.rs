@@ -1035,6 +1035,8 @@ mod tests {
         }
     }
 
+    // XDG paths are absolute only on Unix.
+    #[cfg(unix)]
     #[test]
     fn the_runtime_directory_is_the_same_with_or_without_xdg_runtime_dir() {
         let login = Some(PathBuf::from("/run/user/1000"));
@@ -1059,6 +1061,7 @@ mod tests {
         assert_eq!(runtime_dir_in(&relative, login), expected);
     }
 
+    #[cfg(unix)]
     #[test]
     fn linux_keeps_state_out_of_the_runtime_directory() {
         let shell = env(&[("XDG_RUNTIME_DIR", "/run/user/1000"), ("HOME", "/home/pi")]);
@@ -1078,13 +1081,10 @@ mod tests {
             state_dir_in(&shell, false),
             PathBuf::from("/run/user/1000/capturefab")
         );
-        assert_eq!(state_dir_in(&service, false), session_dir_in(&service));
-        if !cfg!(windows) {
-            assert_eq!(
-                session_dir_in(&service),
-                PathBuf::from("/home/pi/.cache/capturefab/sessions")
-            );
-        }
+        assert_eq!(
+            state_dir_in(&service, false),
+            PathBuf::from("/home/pi/.cache/capturefab/sessions")
+        );
     }
 
     #[test]
