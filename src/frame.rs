@@ -253,13 +253,17 @@ fn convert_to<'a, P: Copy + Default + Send + 'a>(
 }
 
 /// Threads for CPU-bound per-pixel work: one below half a megapixel, where
-/// spawning costs more than it saves, else up to eight cores, always leaving
-/// one for the camera workers and the window.
+/// spawning costs more than it saves, else `spare_cores`.
 pub(crate) fn worker_threads(pixels: usize) -> usize {
     if pixels < 512 * 1024 {
         return 1;
     }
-    std::thread::available_parallelism().map_or(1, |n| (n.get() - 1).clamp(1, 8))
+    spare_cores(std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+/// Up to eight of a computer's `cores`, always leaving one for the camera
+/// workers and the window.
+fn spare_cores(cores: usize) -> usize {
+    cores.saturating_sub(1).clamp(1, 8)
 }
 fn is_bayer(pixel_format: u32) -> bool {
     matches!(pixel_format, 0x0108_0008..=0x0108_000b)
@@ -1502,8 +1506,9 @@ mod tests {
     #[test]
     fn conversions_leave_a_core_free() {
         assert_eq!(worker_threads(1000), 1);
+        assert_eq!([1, 2, 4, 8, 9, 16].map(spare_cores), [1, 1, 3, 7, 8, 8]);
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-        assert!(worker_threads(64 << 20) <= (cores - 1).clamp(1, 8));
+        assert_eq!(worker_threads(64 << 20), spare_cores(cores));
     }
     #[test]
     fn direct_conversions_match_rgb() {
