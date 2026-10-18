@@ -2203,8 +2203,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                         );
                     }
                 }
-                client.call(SessionCommand::StopForward)?;
+                let stopped = client.call(SessionCommand::StopForward)?;
                 let mut result = result;
+                result["stopped"] = stopped;
                 wait_for_uploads(&cli, saved.as_deref(), &mut result)?;
                 output(&cli, result)?;
                 return Ok(());
@@ -2800,6 +2801,7 @@ fn schema() -> Value {
     contract["capture"]["result"] = json!({
         "capture":"{files:[path],frames:[{id,width,height,pixel_format,timestamp_ns,bytes,wall_ms,file?}],count,context?,destination?,queued_uploads?,queued?:[{file,upload_id,key,url}]}",
         "record":"{forwarding,since_ms,path?}; path is the local recording file",
+        "stop_forward":"{forwarding:null,stats:{accepted,written,dropped,late,stalled,encoder,error,recording?}|null}; record --duration adds it as stopped. late counts frames lost while the encoder was still busy (dropped includes them); stalled means no new camera frame for 2 s",
         "status":"forwarding_since_ms per camera and at the top level while forwarding"
     });
     contract["status"] = json!({
@@ -2864,6 +2866,15 @@ fn schema() -> Value {
         "compatibility":"Old entries omit timestamp. Unknown or malformed optional timestamp metadata is treated as unavailable; legacy diagnostics remain readable. Desktop/browser format valid instants in the viewer's local zone; copied desktop logs include a dated numeric offset. The original three fields and version-1 envelope remain unchanged."
     });
     contract["forwarding"] = json!({"cli":"record|forward -o OUTPUT [--duration 30s] [--on-exists fail|number] [--context KEY=VALUE]...; a local file output accepts the capture placeholders","duration":"Works with direct workers and persistent sessions. A duration keeps the CLI alive and stops the encoder at the deadline or Ctrl-C. Without duration, persistent session forwarding returns immediately; direct forwarding runs until Ctrl-C.","request_timeout":"--request-timeout controls a session request deadline, not recording duration; a timed-out request may still complete in the session. Inspect status before retrying writes."});
+    contract["forwarding"]["timeline"] = json!(
+        "Each new frame goes to FFmpeg once, at most --fps a second, and keeps the time FFmpeg read it, so a recording lasts as long as it ran and a camera stall leaves a gap; streams repeat the last frame at --fps while the camera stalls. A recording whose encoder fails or must be stopped keeps the video it wrote"
+    );
+    contract["forwarding"]["encoders"] = json!(
+        "auto probes encoders at the frame size and remembers working ones for the FFmpeg build until reboot, failures for 5 minutes and timed-out probes not at all; an auto encoder that exits in the first seconds of a local recording, before writing video, is replaced once by the next in a new file; a codec with no working encoder fails before recording with unsupported (exit 5) and names the working codecs"
+    );
+    contract["forwarding"]["sources"] = json!(
+        "Network streams reconnect after FFmpeg exits, backing off from 1 s to 30 s until the stream stays up for 10 s; frame waits meanwhile time out (exit 4), and five credential rejections (401/403) in a row stop acquisition, while a missing path (404) keeps being retried. Local video files play at their frame rate in live view and recordings unless PlaybackSpeed=Fastest, and captures that start acquisition read them as fast as they ask. Local files and http(s) URLs naming a video file stop with 'Video file finished'."
+    );
     contract["remote"] = json!({
         "start":"serve --listen HOST:PORT [--web-dir web-client/dist]",
         "authentication":"Network access controls: anyone who can reach the listener can control the session. No HTTP login or token.",

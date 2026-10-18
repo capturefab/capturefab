@@ -140,6 +140,10 @@ libc = "0.2"
 [target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }
 
+[build-dependencies]
+# Digest of the embedded FFmpeg, which names its extracted copy.
+sha2 = "0.10"
+
 [dev-dependencies]
 # Exercises the same semantic value/transition consumer as native adapters.
 accesskit_consumer = "0.31"

@@ -74,7 +74,7 @@ pub fn rgb(frame: &Frame) -> Result<Vec<u8>> {
 pub fn rgba(frame: &Frame) -> Result<Vec<u8>> {
     Ok(convert(frame, |[r, g, b]| [r, g, b, 255])?.into_flattened())
 }
-fn checked_pixels(frame: &Frame) -> Result<usize> {
+pub(crate) fn checked_pixels(frame: &Frame) -> Result<usize> {
     let pixels = (frame.width as usize)
         .checked_mul(frame.height as usize)
         .ok_or_else(|| anyhow::anyhow!("image size overflow"))?;

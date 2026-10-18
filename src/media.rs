@@ -346,7 +346,23 @@ pub fn info(url: &str) -> Result<CameraInfo> {
 }
 pub(crate) struct Executable {
     path: PathBuf,
+    /// This process's own copy, removed when its last user drops it.
     directory: Option<PathBuf>,
+    /// Probe results kept beside a shared copy, valid for its build and boot.
+    probes: Option<PathBuf>,
+    /// Held shared while this process may run the shared copy, so another
+    /// build's cleanup leaves it in place.
+    _in_use: Option<fs::File>,
+}
+impl Executable {
+    fn external(path: PathBuf) -> Self {
+        Self {
+            path,
+            directory: None,
+            probes: None,
+            _in_use: None,
+        }
+    }
 }
 impl Drop for Executable {
     fn drop(&mut self) {
@@ -356,43 +372,247 @@ impl Drop for Executable {
         }
     }
 }
-static EXECUTABLE: OnceLock<Mutex<Weak<Executable>>> = OnceLock::new();
+const EMBEDDED_SHA256: &str = env!("CAPTUREFAB_FFMPEG_SHA256");
+const FFMPEG_NAME: &str = if cfg!(windows) {
+    "ffmpeg.exe"
+} else {
+    "ffmpeg"
+};
+#[derive(Default)]
+struct Extracted {
+    /// The copy in the user's cache, kept for the life of the process.
+    shared: Option<Arc<Executable>>,
+    /// A fallback copy in the temporary directory, removed once no decoder
+    /// or encoder holds it.
+    private: Weak<Executable>,
+    /// The cache failed this process once, so it uses private copies.
+    uncached: bool,
+}
+static EXECUTABLE: OnceLock<Mutex<Extracted>> = OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    /// A stand-in FFmpeg for the current test thread.
+    static FAKE_FFMPEG: std::cell::RefCell<Option<Arc<Executable>>> =
+        const { std::cell::RefCell::new(None) };
+}
 pub(crate) fn executable() -> Result<Arc<Executable>> {
+    #[cfg(test)]
+    if let Some(fake) = FAKE_FFMPEG.with_borrow(Clone::clone) {
+        return Ok(fake);
+    }
     if let Some(path) = std::env::var_os("CAPTUREFAB_FFMPEG") {
         ensure!(
             !path.is_empty(),
             "CAPTUREFAB_FFMPEG must be an executable path"
         );
-        return Ok(Arc::new(Executable {
-            path: PathBuf::from(path),
-            directory: None,
-        }));
+        return Ok(Arc::new(Executable::external(PathBuf::from(path))));
     }
     if let Some(path) = option_env!("CAPTUREFAB_LOCAL_FFMPEG")
         .map(PathBuf::from)
         .filter(|path| path.is_file())
     {
-        return Ok(Arc::new(Executable {
-            path,
-            directory: None,
-        }));
+        return Ok(Arc::new(Executable::external(path)));
     }
     ensure!(
         !EMBEDDED.is_empty(),
         "this development build has no embedded FFmpeg; rebuild with CAPTUREFAB_FFMPEG_BINARY pointing to a target-compatible static FFmpeg, or set CAPTUREFAB_FFMPEG to an executable path"
     );
-    let mut cached = EXECUTABLE
-        .get_or_init(|| Mutex::new(Weak::new()))
+    let mut extracted = EXECUTABLE
+        .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if let Some(existing) = cached.upgrade() {
-        return Ok(existing);
+    // Another process can remove or replace the shared copy, so its owner,
+    // mode and length are checked again before each use.
+    if let Some(shared) = &extracted.shared
+        && trusted(&shared.path, EMBEDDED.len()).is_ok()
+    {
+        return Ok(shared.clone());
     }
-    let mut nonce = [0u8; 16];
-    getrandom::fill(&mut nonce)
-        .map_err(|e| anyhow!("cannot generate FFmpeg extraction nonce: {e}"))?;
-    let suffix = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let directory = std::env::temp_dir().join(format!("capturefab-ffmpeg-{suffix}"));
+    if let Some(private) = extracted.private.upgrade() {
+        return Ok(private);
+    }
+    if !extracted.uncached {
+        let shared = cache_dir()
+            .context("no user cache directory")
+            .and_then(|root| cached_copy(&root, EMBEDDED, EMBEDDED_SHA256))
+            .and_then(|copy| {
+                ensure!(
+                    runs(&copy),
+                    "the cache directory does not allow running programs"
+                );
+                Ok(copy)
+            });
+        match shared {
+            Ok(copy) => return Ok(extracted.shared.insert(Arc::new(copy)).clone()),
+            // A read-only, foreign or noexec cache directory still leaves
+            // FFmpeg usable from the temporary directory.
+            Err(_) => extracted.uncached = true,
+        }
+    }
+    let copy = Arc::new(private_copy(EMBEDDED)?);
+    extracted.private = Arc::downgrade(&copy);
+    Ok(copy)
+}
+/// The system lets this user start `exe`: a home directory mounted noexec,
+/// or an execution policy, can refuse what the temporary directory allows.
+fn runs(exe: &Executable) -> bool {
+    match command(exe)
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            true
+        }
+        // Anything else, such as a copy another thread still holds open for
+        // writing, is for the real launch to report.
+        Err(error) => error.kind() != std::io::ErrorKind::PermissionDenied,
+    }
+}
+/// The per-user cache: ~/Library/Caches on macOS, %LOCALAPPDATA% on Windows,
+/// and $XDG_CACHE_HOME or ~/.cache elsewhere.
+fn cache_dir() -> Option<PathBuf> {
+    // Tests never touch the user's cache.
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join("capturefab-test-cache"));
+    }
+    let home = || std::env::var_os("HOME").filter(|home| !home.is_empty());
+    if cfg!(target_os = "macos") {
+        return home().map(|home| PathBuf::from(home).join("Library/Caches/capturefab"));
+    }
+    if cfg!(windows) {
+        return std::env::var_os("LOCALAPPDATA")
+            .filter(|dir| !dir.is_empty())
+            .map(|dir| PathBuf::from(dir).join("capturefab").join("cache"));
+    }
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| home().map(|home| PathBuf::from(home).join(".cache")))
+        .map(|dir| dir.join("capturefab"))
+}
+/// The shared copy of `bytes` under `root`, named by its digest. It is
+/// written once, under a lock, to a new file that is renamed into place;
+/// an existing copy is checked against the digest before this process
+/// first runs it.
+fn cached_copy(root: &std::path::Path, bytes: &[u8], digest: &str) -> Result<Executable> {
+    ensure!(digest.len() == 64, "bundled FFmpeg has no digest");
+    private_dir(root)?;
+    let dir = root.join(format!("ffmpeg-{}", &digest[..16]));
+    let in_use = hold(&dir)?;
+    let path = dir.join(FFMPEG_NAME);
+    let intact = || {
+        trusted(&path, bytes.len()).is_ok() && sha256_file(&path).ok().as_deref() == Some(digest)
+    };
+    if !intact() {
+        let extracting = lock_file(&dir.join("extract.lock"))?;
+        fs2::FileExt::lock_exclusive(&extracting)?;
+        // Another process may have finished the copy while this one waited.
+        if !intact() {
+            let temporary = dir.join(format!("{FFMPEG_NAME}.{}.tmp", nonce()?));
+            let written = write_new(&temporary, bytes, true).and_then(|()| {
+                // Windows cannot rename over an existing file.
+                #[cfg(windows)]
+                let _ = fs::remove_file(&path);
+                Ok(fs::rename(&temporary, &path)?)
+            });
+            if let Err(error) = written {
+                let _ = fs::remove_file(&temporary);
+                return Err(error.context("cannot extract bundled FFmpeg"));
+            }
+            // A file system that ignores modes would fail every later check.
+            trusted(&path, bytes.len())?;
+        }
+    }
+    prune(root, &dir);
+    Ok(Executable {
+        path,
+        directory: None,
+        probes: Some(dir.join("probes.json")),
+        _in_use: Some(in_use),
+    })
+}
+/// Lock the copy in `dir` shared. Another build's cleanup may move the
+/// directory away while this process waits for the lock, so the lock must
+/// still be the one in `dir` once it is held.
+fn hold(dir: &std::path::Path) -> Result<fs::File> {
+    let path = dir.join("in-use.lock");
+    for _ in 0..3 {
+        private_dir(dir)?;
+        let lock = lock_file(&path)?;
+        fs2::FileExt::lock_shared(&lock)?;
+        if same_file(&lock, &path) {
+            return Ok(lock);
+        }
+    }
+    bail!("the FFmpeg cache directory keeps changing")
+}
+#[cfg(unix)]
+fn same_file(file: &fs::File, path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), fs::metadata(path)) {
+        (Ok(open), Ok(named)) => (open.dev(), open.ino()) == (named.dev(), named.ino()),
+        _ => false,
+    }
+}
+/// Windows does not move a directory while a file in it is open.
+#[cfg(not(unix))]
+fn same_file(_: &fs::File, path: &std::path::Path) -> bool {
+    path.exists()
+}
+/// Remove copies left by other builds that no process is using. A copy in
+/// use, or one Windows will not delete while it runs, stays.
+fn prune(root: &std::path::Path, keep: &std::path::Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if dir == keep || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        // Left by a cleanup that was cut short.
+        if name.starts_with("removed-") {
+            let _ = fs::remove_dir_all(&dir);
+            continue;
+        }
+        if !name.starts_with("ffmpeg-") {
+            continue;
+        }
+        let Ok(lock) = lock_file(&dir.join("in-use.lock")) else {
+            continue;
+        };
+        if fs2::FileExt::try_lock_exclusive(&lock).is_ok() {
+            discard(root, &dir, lock);
+        }
+    }
+}
+/// Delete an unused copy. It is moved aside while still locked, so a process
+/// of that build starting now finds no copy rather than one about to go.
+#[cfg(unix)]
+fn discard(root: &std::path::Path, dir: &std::path::Path, _lock: fs::File) {
+    let Ok(nonce) = nonce() else {
+        return;
+    };
+    let removed = root.join(format!("removed-{nonce}"));
+    if fs::rename(dir, &removed).is_ok() {
+        let _ = fs::remove_dir_all(&removed);
+    }
+}
+/// Windows moves no directory with an open file in it, and deletes no copy
+/// that is running.
+#[cfg(not(unix))]
+fn discard(_: &std::path::Path, dir: &std::path::Path, lock: fs::File) {
+    drop(lock);
+    let _ = fs::remove_dir_all(dir);
+}
+/// A fallback copy private to this process, in a new temporary directory.
+fn private_copy(bytes: &[u8]) -> Result<Executable> {
+    let directory = std::env::temp_dir().join(format!("capturefab-ffmpeg-{}", nonce()?));
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -402,35 +622,232 @@ pub(crate) fn executable() -> Result<Arc<Executable>> {
     builder
         .create(&directory)
         .context("cannot create private FFmpeg directory")?;
-    let path = directory.join(if cfg!(windows) {
-        "ffmpeg.exe"
-    } else {
-        "ffmpeg"
-    });
-    let result = (|| -> Result<()> {
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o700);
-        }
-        let mut file = options.open(&path)?;
-        file.write_all(EMBEDDED)?;
-        file.sync_all()?;
-        Ok(())
-    })();
-    if let Err(error) = result {
+    let path = directory.join(FFMPEG_NAME);
+    if let Err(error) = write_new(&path, bytes, true) {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&directory);
         return Err(error.context("cannot extract bundled FFmpeg"));
     }
-    let executable = Arc::new(Executable {
+    Ok(Executable {
         path,
         directory: Some(directory),
-    });
-    *cached = Arc::downgrade(&executable);
-    Ok(executable)
+        probes: None,
+        _in_use: None,
+    })
+}
+/// A private file that did not exist before. It is not synced: a copy cut
+/// short by a crash fails validation and is written again.
+fn write_new(path: &std::path::Path, bytes: &[u8], executable: bool) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(if executable { 0o700 } else { 0o600 });
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
+    options.open(path)?.write_all(bytes)?;
+    Ok(())
+}
+fn nonce() -> Result<String> {
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce)
+        .map_err(|e| anyhow!("cannot generate FFmpeg extraction nonce: {e}"))?;
+    Ok(nonce.iter().map(|b| format!("{b:02x}")).collect())
+}
+/// Create `dir` for this user alone, or accept it when it already is.
+fn private_dir(dir: &std::path::Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)?;
+    let meta = fs::symlink_metadata(dir)?;
+    ensure!(meta.is_dir(), "{} is not a directory", dir.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        ensure!(
+            meta.uid() == effective_uid(),
+            "{} belongs to another user",
+            dir.display()
+        );
+        if meta.mode() & 0o077 != 0 {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+/// A regular file of the expected length that only this user can change.
+fn trusted(path: &std::path::Path, length: usize) -> Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    ensure!(
+        meta.is_file() && meta.len() == length as u64,
+        "extracted FFmpeg is missing or incomplete"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            meta.uid() == effective_uid() && meta.mode() & 0o022 == 0,
+            "extracted FFmpeg is writable by another user"
+        );
+    }
+    Ok(())
+}
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    // SAFETY: geteuid has no preconditions and always succeeds.
+    unsafe { geteuid() }
+}
+fn lock_file(path: &std::path::Path) -> Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    Ok(options.open(path)?)
+}
+fn sha256_file(path: &std::path::Path) -> Result<String> {
+    use sha2::Digest;
+    let mut file = fs::File::open(path)?;
+    let mut hash = sha2::Sha256::new();
+    let mut bytes = vec![0u8; 1 << 20];
+    loop {
+        let read = file.read(&mut bytes)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&bytes[..read]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+/// One of this user's live decoders or software encoders on the host,
+/// counted through lock files in the cache that holders keep locked; a
+/// process that dies releases its slot.
+struct Active {
+    _slot: Option<fs::File>,
+}
+impl Active {
+    const NONE: Self = Self { _slot: None };
+    const SLOTS: usize = 32;
+    /// Claim a slot of `kind`, and count the active ones, this one included.
+    fn claim(kind: &str) -> (Self, usize) {
+        let Some(dir) = cache_dir()
+            .map(|root| root.join("active"))
+            .filter(|dir| private_dir(dir).is_ok())
+        else {
+            return (Self::NONE, 1);
+        };
+        let mut mine = None;
+        let mut others = 0;
+        for slot in 0..Self::SLOTS {
+            let Ok(file) = lock_file(&dir.join(format!("{kind}-{slot}.lock"))) else {
+                break;
+            };
+            if fs2::FileExt::try_lock_exclusive(&file).is_err() {
+                others += 1;
+            } else if mine.is_none() {
+                mine = Some(file);
+            }
+        }
+        (Self { _slot: mine }, others + 1)
+    }
+}
+fn cores() -> usize {
+    thread::available_parallelism().map_or(1, |cores| cores.get())
+}
+/// Efficient mode trades decoding and encoding headroom for less CPU.
+fn efficient() -> bool {
+    std::env::var("CAPTUREFAB_EFFICIENCY").is_ok_and(|mode| mode.eq_ignore_ascii_case("efficient"))
+}
+/// FFmpeg's default frame threading runs cores + 1 threads per stream, each
+/// holding frames and adding latency; share the cores between live streams.
+fn decoder_threads(cores: usize, streams: usize, efficient: bool) -> usize {
+    if efficient {
+        1
+    } else {
+        (cores / streams.max(1)).clamp(1, 4)
+    }
+}
+/// x264's preset for a recording: faster as the pixel rate per available
+/// core rises, and one step faster in Efficient mode.
+fn x264_preset(width: u32, height: u32, fps: f64, cores: usize, efficient: bool) -> &'static str {
+    const PRESETS: [&str; 3] = ["veryfast", "superfast", "ultrafast"];
+    let per_core = width as f64 * height as f64 * fps / cores.max(1) as f64;
+    let step = if per_core <= 12e6 {
+        0
+    } else if per_core <= 24e6 {
+        1
+    } else {
+        2
+    };
+    PRESETS[(step + efficient as usize).min(2)]
+}
+/// The configured decoding acceleration. `auto` becomes `none` where it
+/// would find nothing, since trying costs every decoder launch a device set-up.
+fn decode_acceleration(exe: &Executable) -> Result<String> {
+    let acceleration = hwaccel();
+    validate_hwaccel(&acceleration)?;
+    Ok(match acceleration.as_str() {
+        "off" => "none".into(),
+        "auto" if !hwaccel_available(exe) => "none".into(),
+        _ => acceleration,
+    })
+}
+/// ARM Linux boards have nothing the bundled FFmpeg decodes with; other
+/// hosts ask once per boot whether `-hwaccel auto` initializes a device.
+fn hwaccel_available(exe: &Executable) -> bool {
+    if cfg!(all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "arm")
+    )) {
+        return false;
+    }
+    let found = probed(
+        exe,
+        |probes| probes.hwaccel,
+        |probes, found| probes.hwaccel = Some(found),
+        || {
+            // One black 64x64 baseline H.264 frame.
+            const CLIP: [u8; 65] = [
+                0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, 0x0a, 0xd9, 0x04, 0x26, 0xc0, 0x44, 0x00,
+                0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0x08, 0x3c, 0x48, 0x99, 0x20, 0x00,
+                0x00, 0x00, 0x01, 0x68, 0xcb, 0x83, 0xcb, 0x20, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84,
+                0x05, 0x7f, 0xff, 0xff, 0x0f, 0x45, 0x00, 0x01, 0x42, 0xdf, 0x27, 0x27, 0x27, 0x5d,
+                0x75, 0xd7, 0x5d, 0x75, 0xd7, 0x5d, 0x75, 0xd7, 0x80,
+            ];
+            let args = [
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "verbose",
+                "-hwaccel",
+                "auto",
+                "-f",
+                "h264",
+                "-i",
+                "pipe:0",
+                "-f",
+                "null",
+                "-",
+            ]
+            .map(str::to_string);
+            let (_, log, timed_out) = timed_output(exe, &args, &CLIP, Duration::from_secs(5))?;
+            Ok((!timed_out).then(|| log.contains("Using auto hwaccel type")))
+        },
+    );
+    // An FFmpeg that cannot run or finish the probe keeps `auto`.
+    found.ok().flatten().unwrap_or(true)
 }
 pub(crate) fn command(exe: &Executable) -> Command {
     let mut cmd = Command::new(&exe.path);
@@ -443,20 +860,29 @@ pub(crate) fn command(exe: &Executable) -> Command {
     cmd
 }
 fn bounded_output(exe: &Executable, args: &[String], timeout: Duration) -> Result<(bool, String)> {
-    let (success, output, _) = timed_output(exe, args, timeout)?;
+    let (success, output, _) = timed_output(exe, args, &[], timeout)?;
     Ok((success, output))
 }
+/// Run FFmpeg with a deadline, feeding it `input` when there is any.
 fn timed_output(
     exe: &Executable,
     args: &[String],
+    input: &[u8],
     timeout: Duration,
 ) -> Result<(bool, String, bool)> {
-    let mut child = command(exe)
+    let mut command = command(exe);
+    if !input.is_empty() {
+        command.stdin(Stdio::piped());
+    }
+    let mut child = command
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("cannot launch FFmpeg")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input);
+    }
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let reader = |mut input: Box<dyn Read + Send>| {
@@ -552,7 +978,7 @@ pub fn native_devices_with_timeout(timeout: Duration) -> Result<Value> {
             },
         ]
         .map(str::to_string);
-        let (_, listing, timed_out) = timed_output(&exe, &args, timeout)?;
+        let (_, listing, timed_out) = timed_output(&exe, &args, &[], timeout)?;
         ensure!(
             !timed_out,
             "native camera discovery timed out after {} s; check camera permissions and host drivers, or retry with a larger --timeout-ms",
@@ -656,9 +1082,8 @@ impl Log {
                 }
                 let mut stored = log.bytes.lock().unwrap_or_else(|e| e.into_inner());
                 stored.extend(&buffer[..count]);
-                while stored.len() > MAX_LOG {
-                    stored.pop_front();
-                }
+                let excess = stored.len().saturating_sub(MAX_LOG);
+                stored.drain(..excess);
             }
         })
     }
@@ -680,6 +1105,11 @@ struct Decoder {
     log: Arc<Log>,
     _exe: Arc<Executable>,
     source: String,
+    /// Why FFmpeg's output ended, formatted once with its log.
+    failure: Option<String>,
+    status: Option<std::process::ExitStatus>,
+    /// This stream's share of the host's live decoders.
+    _active: Active,
 }
 fn ppm_token(reader: &mut impl BufRead) -> Result<Vec<u8>> {
     let mut token = Vec::new();
@@ -761,11 +1191,21 @@ impl Decoder {
         let exe = executable()?;
         let mut cmd = command(&exe);
         cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
-        let acceleration = hwaccel();
-        validate_hwaccel(&acceleration)?;
-        if !matches!(acceleration.as_str(), "none" | "off") {
-            cmd.args(["-hwaccel", &acceleration]);
+        let configured = |name: &str| options.iter().any(|option| option == name);
+        if !configured("-hwaccel") {
+            let acceleration = decode_acceleration(&exe)?;
+            if acceleration != "none" {
+                cmd.args(["-hwaccel", &acceleration]);
+            }
         }
+        let active = if configured("-threads") {
+            Active::NONE
+        } else {
+            let (active, streams) = Active::claim("decode");
+            let threads = decoder_threads(cores(), streams, efficient());
+            cmd.args(["-threads", &threads.to_string()]);
+            active
+        };
         let input = match native_input(source)? {
             Some((format, input)) => {
                 cmd.args(["-f", format]);
@@ -872,22 +1312,23 @@ impl Decoder {
             log,
             _exe: exe,
             source: source.into(),
+            failure: None,
+            status: None,
+            _active: active,
         })
     }
     fn next(&mut self, timeout: Duration) -> Result<Frame> {
         let deadline = Instant::now() + timeout;
-        let mut state = self.queue.state.lock().unwrap_or_else(|e| e.into_inner());
+        let queue = self.queue.clone();
+        let mut state = queue.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(frame) = state.frames.pop_front() {
-                self.queue.changed.notify_all();
+                queue.changed.notify_all();
                 return Ok(frame);
             }
-            if let Some(error) = &state.error {
-                bail!(
-                    "{}: {}",
-                    redact_log(error, &self.source),
-                    self.log.text(&self.source).trim()
-                );
+            if let Some(error) = state.error.clone() {
+                drop(state);
+                bail!("{}", self.fail(&error));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             ensure!(
@@ -895,13 +1336,48 @@ impl Decoder {
                 "media frame capture timed out: {}",
                 redact_url(&self.source)
             );
-            state = self
-                .queue
+            state = queue
                 .changed
                 .wait_timeout(state, remaining)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
+    }
+    /// Why the stream ended, formatted the first time it is asked for. FFmpeg
+    /// gets a moment to exit first, so the log it leaves is complete.
+    fn fail(&mut self, error: &str) -> &str {
+        if self.failure.is_none() {
+            let deadline = Instant::now() + Duration::from_millis(200);
+            loop {
+                self.status = self.child.try_wait().ok().flatten();
+                if self.status.is_some() || Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            if self.status.is_some()
+                && let Some(thread) = self.log_thread.take()
+            {
+                let _ = thread.join();
+            }
+            let (error, log) = (redact_log(error, &self.source), self.log.text(&self.source));
+            self.failure = Some(match log.trim() {
+                "" => error,
+                log => format!("{error}: {log}"),
+            });
+        }
+        self.failure.as_deref().unwrap_or_default()
+    }
+    /// FFmpeg's output has ended, as the last frame error reported.
+    fn ended(&self) -> bool {
+        self.failure.is_some()
+    }
+    /// FFmpeg exited successfully, for example at the end of a file.
+    fn succeeded(&mut self) -> bool {
+        if self.status.is_none() {
+            self.status = self.child.try_wait().ok().flatten();
+        }
+        self.status.is_some_and(|status| status.success())
     }
     fn stop(&mut self) {
         self.queue.stopped.store(true, Ordering::Relaxed);
@@ -941,6 +1417,8 @@ impl ReplayDecoder {
             "-xerror".into(),
             "-hwaccel".into(),
             "none".into(),
+            "-threads".into(),
+            "1".into(),
         ];
         if image {
             // Literal still names must not be interpreted as image2 patterns.
@@ -990,6 +1468,8 @@ impl ReplayDecoder {
             "-xerror",
             "-hwaccel",
             "none",
+            "-threads",
+            "1",
             "-f",
             "concat",
             "-safe",
@@ -1009,7 +1489,7 @@ impl ReplayDecoder {
         if let Some(fps) = fps {
             filter.push_str(&format!(",fps={fps}"));
         }
-        vec!["-vf".into(), filter, "-threads".into(), "1".into()]
+        vec!["-vf".into(), filter, "-filter_threads".into(), "1".into()]
     }
     fn spawn(
         path: &std::path::Path,
@@ -1425,8 +1905,211 @@ struct MediaBackend {
     modes: Vec<Mode>,
     mode: Option<usize>,
     formats: Vec<String>,
+    /// Set while a network stream is being reopened after FFmpeg exited.
+    reconnect: Option<Reconnect>,
+    /// A video file plays at its own frame rate, like a camera, unless
+    /// PlaybackSpeed asks for every frame as fast as it decodes.
+    paced: bool,
+    /// Whether this acquisition's first frame was asked for on demand, by a
+    /// capture, rather than taken by a live view; unknown until then.
+    on_demand: Option<bool>,
+}
+/// How a media source's stream ended, for callers that act on the end rather
+/// than on the wording of its error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamEnd {
+    /// FFmpeg exited and the network source is being reopened. The message
+    /// says "timed out", so a caller waiting for a frame keeps waiting.
+    Lost,
+    /// A video file played to its end.
+    Finished,
+    /// The server rejected the credentials of several reopenings in a row.
+    Abandoned,
+}
+#[derive(Debug)]
+struct Ended {
+    end: StreamEnd,
+    message: String,
+}
+impl std::fmt::Display for Ended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for Ended {}
+/// The stream end a frame error reports, if it reports one.
+pub fn stream_end(error: &anyhow::Error) -> Option<StreamEnd> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<Ended>())
+        .map(|ended| ended.end)
+}
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Launches in a row whose credentials the server rejects before
+/// reconnecting stops.
+const MAX_REFUSED: u32 = 5;
+/// A stream that stays up this long ends its outage; one that drops again
+/// sooner keeps backing off.
+const STEADY: Duration = Duration::from_secs(10);
+/// Reopening a network stream, with backoff from 1 s to 30 s between launches.
+struct Reconnect {
+    /// The launch in progress or due next, from 1 in each outage.
+    attempt: u32,
+    retry_at: Instant,
+    backoff: Duration,
+    /// Launches in a row that ended with rejected credentials.
+    refused: u32,
+    /// When frames came back, while the stream has not yet stayed up for
+    /// `STEADY`.
+    resumed: Option<Instant>,
+}
+impl Reconnect {
+    fn new() -> Self {
+        Self {
+            attempt: 1,
+            retry_at: Instant::now() + RECONNECT_BACKOFF,
+            backoff: RECONNECT_BACKOFF * 2,
+            refused: 0,
+            resumed: None,
+        }
+    }
+    fn retry_later(&mut self) {
+        self.attempt += 1;
+        self.retry_at = Instant::now() + self.backoff;
+        self.backoff = (self.backoff * 2).min(RECONNECT_BACKOFF_MAX);
+    }
+    fn waiting(&self, source: &str) -> anyhow::Error {
+        anyhow!(
+            "reconnecting to {} (attempt {}): timed out",
+            redact_url(source),
+            self.attempt
+        )
+    }
+}
+/// FFmpeg's wording when the server rejects the credentials, which asking
+/// again cannot fix. A missing stream path can: a relay such as MediaMTX
+/// answers 404 while its camera is away.
+fn refused(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    ["401 ", "403 ", "unauthorized", "forbidden"]
+        .iter()
+        .any(|text| reason.contains(text))
 }
 impl MediaBackend {
+    /// Network streams are reopened when FFmpeg exits; files and local
+    /// devices report their end instead.
+    fn reconnects(&self) -> bool {
+        scheme(&self.source)
+            .is_some_and(|s| !matches!(s.as_str(), "file" | "avfoundation" | "v4l2" | "dshow"))
+    }
+    /// The next frame within `timeout`. A network stream whose FFmpeg exited
+    /// is relaunched with backoff, and the wait for the next launch fits in
+    /// `timeout`, so a caller polling for frames never spins.
+    fn decode(&mut self, timeout: Duration) -> Result<Frame> {
+        let deadline = Instant::now() + timeout;
+        let (reconnects, file, clip) = (self.reconnects(), self.file(), self.clip());
+        loop {
+            if let Some(decoder) = self.decoder.as_mut() {
+                let error = match decoder.next(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(frame) => {
+                        self.delivered();
+                        return Ok(frame);
+                    }
+                    Err(error) => error,
+                };
+                if !decoder.ended() {
+                    return Err(match &self.reconnect {
+                        Some(reconnect) if reconnect.resumed.is_none() => {
+                            reconnect.waiting(&self.source)
+                        }
+                        _ => error,
+                    });
+                }
+                if (file || clip) && decoder.succeeded() {
+                    let name = if file {
+                        local_file_path(&self.source)?.display().to_string()
+                    } else {
+                        redact_url(&self.source)
+                    };
+                    return Err(Ended {
+                        end: StreamEnd::Finished,
+                        message: format!("video file finished: {name}"),
+                    }
+                    .into());
+                }
+                if !reconnects {
+                    return Err(error);
+                }
+                self.decoder = None;
+                return Err(self.lost(format!("{error:#}")));
+            }
+            let reconnect = self.reconnect.as_mut().context("media decoder stopped")?;
+            let wait = reconnect.retry_at.saturating_duration_since(Instant::now());
+            if !wait.is_zero() {
+                thread::sleep(wait.min(deadline.saturating_duration_since(Instant::now())));
+                if Instant::now() < reconnect.retry_at {
+                    return Err(reconnect.waiting(&self.source));
+                }
+            }
+            match Decoder::spawn_configured(&self.source, self.timeout, &self.input_options()) {
+                Ok(decoder) => self.decoder = Some(decoder),
+                Err(error) => return Err(self.lost(format!("{error:#}"))),
+            }
+        }
+    }
+    /// A frame arrived: an outage ends once the stream has stayed up for
+    /// `STEADY`.
+    fn delivered(&mut self) {
+        if let Some(reconnect) = &mut self.reconnect
+            && reconnect.resumed.get_or_insert_with(Instant::now).elapsed() >= STEADY
+        {
+            self.reconnect = None;
+        }
+    }
+    /// The network stream's FFmpeg exited: schedule the next launch, or
+    /// stop once the server has rejected the credentials several times in a
+    /// row. A loss is reported when the stream was up, and the backoff of
+    /// an outage carries on until the stream stays up.
+    fn lost(&mut self, reason: String) -> anyhow::Error {
+        let url = redact_url(&self.source);
+        let attempt = match self.reconnect.as_mut() {
+            None => self.reconnect.insert(Reconnect::new()).attempt,
+            // Frames came back, then stopped before the stream settled.
+            Some(reconnect) if reconnect.resumed.is_some() => {
+                (reconnect.resumed, reconnect.refused) = (None, 0);
+                reconnect.retry_later();
+                reconnect.attempt
+            }
+            Some(reconnect) => {
+                reconnect.refused = if refused(&reason) {
+                    reconnect.refused + 1
+                } else {
+                    0
+                };
+                if reconnect.refused >= MAX_REFUSED {
+                    let attempts = reconnect.attempt;
+                    self.reconnect = None;
+                    return Ended {
+                        end: StreamEnd::Abandoned,
+                        message: format!(
+                            "stopped reconnecting to {url} after {attempts} attempts ({reason})"
+                        ),
+                    }
+                    .into();
+                }
+                reconnect.retry_later();
+                return reconnect.waiting(&self.source);
+            }
+        };
+        Ended {
+            end: StreamEnd::Lost,
+            message: format!(
+                "reconnecting to {url} (attempt {attempt}): timed out after the stream ended ({reason})"
+            ),
+        }
+        .into()
+    }
     fn configure(&mut self, options: NativeOptions) -> Result<()> {
         self.fps = options.fps.unwrap_or(30.0);
         if let Some((width, height)) = options.size {
@@ -1471,7 +2154,31 @@ impl MediaBackend {
             listed.join(", ")
         )
     }
+    fn file(&self) -> bool {
+        matches!(scheme(&self.source).as_deref(), None | Some("file"))
+    }
+    /// An http(s) URL naming a video file rather than a live stream: it
+    /// finishes like a local file instead of reconnecting.
+    fn clip(&self) -> bool {
+        const VIDEO: [&str; 10] = [
+            "mp4", "m4v", "mov", "mkv", "webm", "avi", "mpg", "mpeg", "wmv", "ogv",
+        ];
+        let path = self.source.split(['?', '#']).next().unwrap_or_default();
+        matches!(scheme(&self.source).as_deref(), Some("http" | "https"))
+            && path
+                .rsplit('/')
+                .next()
+                .and_then(|name| name.rsplit_once('.'))
+                .is_some_and(|(_, extension)| {
+                    VIDEO
+                        .iter()
+                        .any(|video| extension.eq_ignore_ascii_case(video))
+                })
+    }
     fn input_options(&self) -> Vec<String> {
+        if self.file() && self.paced && self.on_demand != Some(true) {
+            return vec!["-readrate".into(), "1".into()];
+        }
         if !self.native {
             return Vec::new();
         }
@@ -1575,6 +2282,9 @@ pub fn open_url(source: &str, timeout: Duration) -> Result<Box<dyn Backend>> {
         modes: Vec::new(),
         mode: None,
         formats: Vec::new(),
+        reconnect: None,
+        paced: true,
+        on_demand: None,
     };
     if let Some(options) = options {
         (backend.modes, backend.formats) = probe(&backend.source);
@@ -1585,7 +2295,7 @@ pub fn open_url(source: &str, timeout: Duration) -> Result<Box<dyn Backend>> {
 }
 impl RegisterIo for MediaBackend {
     fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
-        let mut registers = [0u8; 32];
+        let mut registers = [0u8; 36];
         registers[0..4].copy_from_slice(&self.width.to_le_bytes());
         registers[4..8].copy_from_slice(&self.height.to_le_bytes());
         registers[8..12].copy_from_slice(&RGB8.to_le_bytes());
@@ -1593,6 +2303,7 @@ impl RegisterIo for MediaBackend {
         registers[16..20].copy_from_slice(&(self.running as u32).to_le_bytes());
         registers[20..28].copy_from_slice(&self.fps.to_le_bytes());
         registers[28..32].copy_from_slice(&self.mode.map_or(u32::MAX, |i| i as u32).to_le_bytes());
+        registers[32..36].copy_from_slice(&(self.paced as u32).to_le_bytes());
         let start = usize::try_from(address)?;
         let end = start
             .checked_add(length)
@@ -1604,6 +2315,16 @@ impl RegisterIo for MediaBackend {
     }
     fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
         if address == 16 && data.len() == 4 {
+            return Ok(());
+        }
+        if address == 32 && data.len() == 4 && self.file() {
+            ensure!(
+                !self.running,
+                "stop acquisition before changing the playback speed"
+            );
+            self.paced = u32::from_le_bytes(data.try_into()?) != 0;
+            self.decoder.take();
+            self.first = None;
             return Ok(());
         }
         ensure!(
@@ -1674,15 +2395,18 @@ impl RegisterIo for MediaBackend {
         }
         self.decoder.take();
         self.first = None;
+        self.reconnect = None;
         Ok(())
     }
 }
 impl Backend for MediaBackend {
     fn xml(&mut self) -> Result<String> {
-        let video_mode = if self.modes.is_empty() {
-            ""
-        } else {
+        let video_mode = if !self.modes.is_empty() {
             "<pFeature>VideoMode</pFeature>"
+        } else if self.file() {
+            "<pFeature>PlaybackSpeed</pFeature>"
+        } else {
+            ""
         };
         let mut xml = format!(
             "<RegisterDescription><Category Name='Root'><pFeature>Width</pFeature><pFeature>Height</pFeature><pFeature>PixelFormat</pFeature><pFeature>PayloadSize</pFeature><pFeature>AcquisitionFrameRate</pFeature><pFeature>AcquisitionStart</pFeature><pFeature>AcquisitionStop</pFeature>{video_mode}</Category>"
@@ -1717,26 +2441,43 @@ impl Backend for MediaBackend {
                 })
                 .collect::<String>();
             xml.push_str(&format!("<Enumeration Name='VideoMode'><pValue>VideoModeReg</pValue>{entries}<pIsLocked>IsAcquiring</pIsLocked></Enumeration><IntReg Name='VideoModeReg'><Address>28</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>"));
+        } else if self.file() {
+            xml.push_str("<Enumeration Name='PlaybackSpeed'><ToolTip>RealTime plays the file at its frame rate in live view and recordings, while captures read it as fast as they ask; Fastest always decodes every frame as fast as possible</ToolTip><EnumEntry Name='RealTime'><Value>1</Value></EnumEntry><EnumEntry Name='Fastest'><Value>0</Value></EnumEntry><pValue>PlaybackReg</pValue><pIsLocked>IsAcquiring</pIsLocked></Enumeration><IntReg Name='PlaybackReg'><Address>32</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>");
         }
         xml.push_str("<Command Name='AcquisitionStart'><pValue>Control</pValue><CommandValue>1</CommandValue></Command><Command Name='AcquisitionStop'><pValue>Control</pValue><CommandValue>0</CommandValue></Command><IntReg Name='Control'><Address>16</Address><Length>4</Length><AccessMode>WO</AccessMode></IntReg></RegisterDescription>");
         Ok(xml)
     }
     fn start(&mut self, _: usize) -> Result<()> {
+        self.on_demand = None;
         if self.decoder.is_none() {
             self.launch()?;
         }
         self.running = true;
         Ok(())
     }
+    /// A capture that asks for frames before a live view takes any reads a
+    /// paced file as fast as it asks, like frames from a triggered camera;
+    /// the file starts again unpaced.
+    fn request_frame(&mut self) -> Result<()> {
+        if self.on_demand.is_none() {
+            self.on_demand = Some(true);
+            if self.file() && self.paced {
+                (self.decoder, self.first) = (None, None);
+                self.decoder = Some(Decoder::spawn_configured(
+                    &self.source,
+                    self.timeout,
+                    &self.input_options(),
+                )?);
+            }
+        }
+        Ok(())
+    }
     fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
         ensure!(self.running, "media acquisition has not started");
-        let frame = if let Some(frame) = self.first.take() {
-            frame
-        } else {
-            self.decoder
-                .as_mut()
-                .context("media decoder stopped")?
-                .next(timeout)?
+        self.on_demand.get_or_insert(false);
+        let frame = match self.first.take() {
+            Some(frame) => frame,
+            None => self.decode(timeout)?,
         };
         self.width = frame.width;
         self.height = frame.height;
@@ -1746,6 +2487,7 @@ impl Backend for MediaBackend {
         self.running = false;
         self.decoder.take();
         self.first = None;
+        self.reconnect = None;
         Ok(())
     }
 }
@@ -1817,6 +2559,14 @@ pub struct ForwardStats {
     pub accepted: u64,
     pub written: u64,
     pub dropped: u64,
+    /// Frames replaced while FFmpeg was still taking an earlier one: the
+    /// encoder cannot keep up. `dropped` includes them.
+    #[serde(default)]
+    pub late: u64,
+    /// No new camera frame for 2 s or more; nothing new reaches the encoder
+    /// meanwhile.
+    #[serde(default)]
+    pub stalled: bool,
     pub encoder: String,
     pub error: Option<String>,
     /// The finished local recording, set once its file is complete.
@@ -1834,6 +2584,71 @@ struct WriterQueue {
     accepted: AtomicU64,
     written: AtomicU64,
     dropped: AtomicU64,
+    late: AtomicU64,
+    /// The writer is blocked handing a frame to FFmpeg.
+    busy: AtomicBool,
+    /// Writing the encoded recording failed, for example on a full disk.
+    output_failed: AtomicBool,
+    epoch: Instant,
+    /// When the newest frame arrived, in milliseconds since `epoch`.
+    arrived_ms: AtomicU64,
+}
+/// Without a new frame for this long a recording counts as stalled.
+const STALL: Duration = Duration::from_secs(2);
+/// A recording this small holds at most its container's header, no video.
+const HEADER_BYTES: u64 = 4096;
+impl WriterQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(WriterState {
+                latest: None,
+                error: None,
+            }),
+            changed: Condvar::new(),
+            running: AtomicBool::new(true),
+            accepted: AtomicU64::new(0),
+            written: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            late: AtomicU64::new(0),
+            busy: AtomicBool::new(false),
+            output_failed: AtomicBool::new(false),
+            epoch: Instant::now(),
+            arrived_ms: AtomicU64::new(0),
+        }
+    }
+    fn stalled(&self) -> bool {
+        let arrived = Duration::from_millis(self.arrived_ms.load(Ordering::Relaxed));
+        self.epoch.elapsed().saturating_sub(arrived) >= STALL
+    }
+    /// Wait until `slot` and a new frame. With `repeat` the slot alone is
+    /// enough, and `Some(None)` asks for the previous frame again. `None`
+    /// once the writer stops.
+    fn take(&self, slot: Instant, repeat: bool) -> Option<Option<Vec<u8>>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if !self.running.load(Ordering::Acquire) {
+                return None;
+            }
+            let ready = repeat || state.latest.is_some();
+            let wait = slot.saturating_duration_since(Instant::now());
+            if ready && wait.is_zero() {
+                return Some(state.latest.take());
+            }
+            let wait = if ready { wait } else { Duration::from_secs(1) };
+            state = self
+                .changed
+                .wait_timeout(state, wait)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+    fn fail(&self, error: String) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .error
+            .get_or_insert(error);
+    }
 }
 struct EncoderProcess {
     child: Child,
@@ -1853,6 +2668,9 @@ struct EncoderProcess {
     encoder: String,
     /// When the recording file was reserved, UTC Unix milliseconds.
     started_ms: u64,
+    spawned: Instant,
+    /// This recording's share of the host's software encodes.
+    _active: Active,
 }
 struct EncodedOutput {
     storage: crate::storage::StorageWriter,
@@ -1867,6 +2685,9 @@ pub struct Forwarder {
     /// The recording file, created when its name was picked so no other
     /// writer can take the name before the first frame.
     reserved: Option<crate::storage::StorageWriter>,
+    /// An automatically chosen encoder that exited early; the recording
+    /// falls back once to the next candidate.
+    failed: Option<String>,
 }
 fn codec_family(codec: &str) -> Result<&'static str> {
     match codec {
@@ -1910,30 +2731,228 @@ pub fn validate_encoder(codec: &str, encoder: &str) -> Result<()> {
 pub fn validate_bitrate(bitrate: &str) -> Result<()> {
     bits_per_second(bitrate).map(|_| ())
 }
-fn select_encoder(exe: &Executable, config: &ForwardConfig) -> Result<String> {
-    let family = codec_family(&config.codec)?;
-    if config.encoder != "auto" {
-        validate_encoder(&config.codec, &config.encoder)?;
-        if jetson_encoder(&config.encoder) {
-            ensure!(
-                probe_jetson(&config.encoder),
-                "forwarding encoder {} is unavailable or cannot encode on this device",
-                config.encoder
-            );
-        } else {
-            let (_, available) = bounded_output(
-                exe,
-                &["-hide_banner".into(), "-encoders".into()],
-                Duration::from_secs(5),
-            )?;
-            validate_encoder_listing(&available, &config.encoder, family)?;
+/// What probing one FFmpeg found: remembered for the process and, beside a
+/// shared extracted copy, for the rest of the boot. A missing, corrupt or
+/// older file is ignored and the probes run again.
+#[derive(Default, Serialize, Deserialize)]
+struct Probes {
+    #[serde(default)]
+    boot: String,
+    /// `ffmpeg -encoders` output.
+    #[serde(default)]
+    listing: Option<String>,
+    /// Test encodes by encoder, input and size, such as `h264_nvenc yuv 1920x1080`.
+    #[serde(default)]
+    encoders: std::collections::BTreeMap<String, Found>,
+    /// Whether any decoding acceleration initialized.
+    #[serde(default)]
+    hwaccel: Option<Found>,
+}
+/// A probe's answer and when it was found, in UTC Unix milliseconds.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct Found {
+    works: bool,
+    at_ms: u64,
+}
+/// How long a failed probe is believed: a busy device, for example one with
+/// all its encode sessions in use, can refuse once and work soon after.
+const FAILURE_KEPT: Duration = Duration::from_secs(300);
+impl Found {
+    fn now(works: bool) -> Self {
+        Self {
+            works,
+            at_ms: crate::scheduling::now_ms(),
         }
-        return Ok(config.encoder.clone());
     }
-    // Vendor encoders first, then cross-vendor Vulkan Video, then software.
-    // Every candidate must be present in the FFmpeg build and pass a real
-    // test encode on this machine before it is chosen.
-    let candidates: Vec<&str> = match (family, std::env::consts::OS) {
+    /// The answer, unless it is a failure found too long ago.
+    fn current(self) -> Option<bool> {
+        let age = crate::scheduling::now_ms().checked_sub(self.at_ms);
+        (self.works || age.is_some_and(|age| age < FAILURE_KEPT.as_millis() as u64))
+            .then_some(self.works)
+    }
+    /// The later of two answers.
+    fn newer(self, other: Option<Self>) -> Self {
+        other
+            .filter(|other| other.at_ms > self.at_ms)
+            .unwrap_or(self)
+    }
+}
+static PROBES: OnceLock<Mutex<std::collections::HashMap<PathBuf, Probes>>> = OnceLock::new();
+fn with_probes<T>(exe: &Executable, read: impl FnOnce(&mut Probes) -> T) -> T {
+    let mut memo = PROBES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    read(
+        memo.entry(exe.path.clone())
+            .or_insert_with(|| load_probes(exe)),
+    )
+}
+/// A remembered probe answer of `exe`, or the answer of running the probe.
+/// A probe that cannot tell, for example because it timed out, returns
+/// `None`, which is not remembered.
+fn probed(
+    exe: &Executable,
+    get: impl FnOnce(&Probes) -> Option<Found>,
+    set: impl FnOnce(&mut Probes, Found),
+    run: impl FnOnce() -> Result<Option<bool>>,
+) -> Result<Option<bool>> {
+    if let Some(works) = with_probes(exe, |probes| get(probes)).and_then(Found::current) {
+        return Ok(Some(works));
+    }
+    // Probe unlocked: a test encode can take seconds.
+    let works = run()?;
+    if let Some(works) = works {
+        remember(exe, |probes| set(probes, Found::now(works)));
+    }
+    Ok(works)
+}
+fn remember(exe: &Executable, change: impl FnOnce(&mut Probes)) {
+    with_probes(exe, |probes| {
+        change(probes);
+        save_probes(exe, probes);
+    })
+}
+fn load_probes(exe: &Executable) -> Probes {
+    let stored = exe
+        .probes
+        .as_ref()
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<Probes>(&bytes).ok());
+    stored
+        .filter(|probes| boot_id().is_some_and(|boot| boot == probes.boot))
+        .unwrap_or_default()
+}
+fn save_probes(exe: &Executable, probes: &mut Probes) {
+    let (Some(path), Some(boot)) = (&exe.probes, boot_id()) else {
+        return;
+    };
+    // Keep what other processes found since this one read the file.
+    let stored = load_probes(exe);
+    probes.boot = boot.to_owned();
+    probes.listing = probes.listing.take().or(stored.listing);
+    probes.hwaccel = probes
+        .hwaccel
+        .map(|found| found.newer(stored.hwaccel))
+        .or(stored.hwaccel);
+    for (key, found) in stored.encoders {
+        let mine = probes.encoders.entry(key).or_insert(found);
+        *mine = mine.newer(Some(found));
+    }
+    let Ok(bytes) = serde_json::to_vec(probes) else {
+        return;
+    };
+    let Ok(nonce) = nonce() else {
+        return;
+    };
+    let temporary = path.with_extension(format!("{nonce}.tmp"));
+    if write_new(&temporary, &bytes, false).is_err() || fs::rename(&temporary, path).is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+}
+/// Identifies this boot, so remembered probes do not outlive a driver or
+/// hardware change. Without one, probes are remembered by the process only.
+fn boot_id() -> Option<&'static str> {
+    static BOOT: OnceLock<Option<String>> = OnceLock::new();
+    BOOT.get_or_init(|| {
+        let id = if cfg!(target_os = "linux") {
+            fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()
+        } else if cfg!(target_os = "macos") {
+            Command::new("/usr/sbin/sysctl")
+                .args(["-n", "kern.boottime"])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        } else {
+            None
+        };
+        id.map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+    })
+    .as_deref()
+}
+fn encoder_listing(exe: &Executable) -> Result<String> {
+    if let Some(listing) = with_probes(exe, |probes| probes.listing.clone()) {
+        return Ok(listing);
+    }
+    let (ok, listing) = bounded_output(
+        exe,
+        &["-hide_banner".into(), "-encoders".into()],
+        Duration::from_secs(5),
+    )?;
+    ensure!(ok, "FFmpeg could not list its encoders");
+    remember(exe, |probes| probes.listing = Some(listing.clone()));
+    Ok(listing)
+}
+fn listed(listing: &str, encoder: &str) -> bool {
+    listing
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some(encoder))
+}
+fn probe_key(encoder: &str, input: EncoderInput, width: u32, height: u32) -> String {
+    let input = match input {
+        EncoderInput::Yuv => "yuv",
+        EncoderInput::Rgb => "rgb",
+    };
+    format!("{encoder} {input} {width}x{height}")
+}
+/// One test frame at the recording's size: hardware encoders have size
+/// limits that a small probe would pass. A probe that timed out counts as a
+/// failure for this choice only.
+fn encoder_works(
+    exe: &Executable,
+    encoder: &str,
+    input: EncoderInput,
+    width: u32,
+    height: u32,
+) -> Result<bool> {
+    let key = probe_key(encoder, input, width, height);
+    let works = probed(
+        exe,
+        |probes| probes.encoders.get(&key).copied(),
+        |probes, found| {
+            probes.encoders.insert(key.clone(), found);
+        },
+        || probe_encoder(exe, encoder, input, width, height),
+    )?;
+    Ok(works.unwrap_or(false))
+}
+fn jetson_works(exe: &Executable, encoder: &str) -> Result<bool> {
+    let key = format!("{encoder} gstreamer");
+    let works = probed(
+        exe,
+        |probes| probes.encoders.get(&key).copied(),
+        |probes, found| {
+            probes.encoders.insert(key.clone(), found);
+        },
+        || Ok(probe_jetson(encoder)),
+    )?;
+    Ok(works.unwrap_or(false))
+}
+/// The encoder is in this FFmpeg build, or is a Jetson GStreamer element,
+/// and encodes a test frame of this size.
+fn usable(exe: &Executable, encoder: &str, width: u32, height: u32) -> Result<bool> {
+    if jetson_encoder(encoder) {
+        return jetson_works(exe, encoder);
+    }
+    // One that just failed the small check frame has no device here.
+    let small = probe_key(encoder, EncoderInput::Yuv, PROBE_SIZE.0, PROBE_SIZE.1);
+    let failed = with_probes(exe, |probes| probes.encoders.get(&small).copied())
+        .and_then(Found::current)
+        == Some(false);
+    Ok(listed(&encoder_listing(exe)?, encoder)
+        && !failed
+        && encoder_works(exe, encoder, EncoderInput::Yuv, width, height)?)
+}
+/// The size probed before a recording's first frame says its real size.
+const PROBE_SIZE: (u32, u32) = (640, 480);
+/// Encoders to try for a codec on this OS: vendor encoders first, then
+/// cross-vendor Vulkan Video, then software.
+fn encoder_candidates(family: &str) -> Vec<&'static str> {
+    match (family, std::env::consts::OS) {
         ("h264", "macos") => vec!["h264_videotoolbox", "libx264"],
         ("hevc", "macos") => vec!["hevc_videotoolbox", "libx265"],
         ("av1", "macos") => vec!["libsvtav1", "libaom-av1"],
@@ -1995,31 +3014,77 @@ fn select_encoder(exe: &Executable, config: &ForwardConfig) -> Result<String> {
         ("h264", _) => vec!["libx264"],
         ("hevc", _) => vec!["libx265"],
         _ => vec!["av1_nvenc", "libsvtav1", "libaom-av1"],
-    };
-    let (_, available) = bounded_output(
-        exe,
-        &["-hide_banner".into(), "-encoders".into()],
-        Duration::from_secs(5),
-    )?;
-    for candidate in candidates {
-        if jetson_encoder(candidate) {
-            if probe_jetson(candidate) {
-                return Ok(candidate.into());
-            }
-            continue;
+    }
+}
+/// Every candidate must be in the FFmpeg build and pass a real test encode
+/// at the recording's size before it is chosen. `skip` holds encoders that
+/// already failed this recording.
+fn select_encoder(
+    exe: &Executable,
+    config: &ForwardConfig,
+    (width, height): (u32, u32),
+    skip: &[String],
+) -> Result<String> {
+    let family = codec_family(&config.codec)?;
+    if config.encoder != "auto" {
+        validate_encoder(&config.codec, &config.encoder)?;
+        if jetson_encoder(&config.encoder) {
+            ensure!(
+                jetson_works(exe, &config.encoder)?,
+                "forwarding encoder {} is unavailable or cannot encode on this device",
+                config.encoder
+            );
+        } else {
+            validate_encoder_listing(&encoder_listing(exe)?, &config.encoder, family)?;
         }
-        if !available
-            .lines()
-            .any(|line| line.split_whitespace().nth(1) == Some(candidate))
+        return Ok(config.encoder.clone());
+    }
+    for candidate in encoder_candidates(family) {
+        if !skip.iter().any(|failed| failed == candidate) && usable(exe, candidate, width, height)?
         {
-            continue;
-        }
-        if probe_encoder(exe, candidate, EncoderInput::Yuv)? {
             return Ok(candidate.into());
         }
     }
-    bail!(
-        "no usable {family} encoder found in bundled FFmpeg; choose --encoder explicitly or provide a build with a software encoder"
+    bail!("{}", unsupported_codec(exe, family, Some((width, height))))
+}
+/// Before a recording starts, refuse a codec no encoder here can produce.
+fn check_codec(config: &ForwardConfig) -> Result<()> {
+    // Without FFmpeg, or when probing itself fails, the first frame reports why.
+    let Ok(exe) = executable() else {
+        return Ok(());
+    };
+    let family = codec_family(&config.codec)?;
+    if config.encoder != "auto"
+        || encoder_candidates(family)
+            .iter()
+            .any(|candidate| usable(&exe, candidate, PROBE_SIZE.0, PROBE_SIZE.1).unwrap_or(true))
+    {
+        return Ok(());
+    }
+    bail!("{}", unsupported_codec(&exe, family, None))
+}
+/// Says which codecs do work, since the bundled FFmpeg has no software HEVC
+/// or AV1 encoder and many hosts have no hardware one either.
+fn unsupported_codec(exe: &Executable, family: &str, size: Option<(u32, u32)>) -> String {
+    let working = ["h264", "hevc", "av1"]
+        .into_iter()
+        .filter(|&other| {
+            other != family
+                && encoder_candidates(other).iter().any(|candidate| {
+                    usable(exe, candidate, PROBE_SIZE.0, PROBE_SIZE.1).unwrap_or(false)
+                })
+        })
+        .collect::<Vec<_>>();
+    let at = size.map_or_else(String::new, |(width, height)| {
+        format!(" at {width}x{height}")
+    });
+    format!(
+        "{family} recording{at} is not supported on this host: no {family} encoder in FFmpeg works here; working codecs: {}. Choose another codec, or an installed encoder with --encoder",
+        if working.is_empty() {
+            "none".to_owned()
+        } else {
+            working.join(", ")
+        }
     )
 }
 
@@ -2104,8 +3169,9 @@ fn jetson_framerate(fps: f64) -> Result<(u32, u32)> {
         "Jetson forwarding FPS {fps} cannot be represented exactly with 32-bit fraction fields; choose a simpler frame rate or a different encoder"
     )
 }
-/// Run a helper tool briefly; true when it exits successfully in time.
-fn tool_succeeds(program: &str, args: &[&str], timeout: Duration) -> bool {
+/// Run a helper tool briefly: whether it succeeded, or `None` when it had to
+/// be stopped at the deadline.
+fn tool_succeeds(program: &str, args: &[&str], timeout: Duration) -> Option<bool> {
     let Ok(mut child) = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -2113,47 +3179,50 @@ fn tool_succeeds(program: &str, args: &[&str], timeout: Duration) -> bool {
         .stderr(Stdio::null())
         .spawn()
     else {
-        return false;
+        return Some(false);
     };
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) => return Some(status.success()),
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                return None;
             }
         }
     }
 }
 /// The element exists and encodes a short test clip on this device; Orin,
 /// for example, lists the AV1 element but has no AV1 encoder.
-fn probe_jetson(encoder: &str) -> bool {
-    cfg!(target_os = "linux")
-        && tool_succeeds("gst-inspect-1.0", &[encoder], Duration::from_secs(5))
-        && tool_succeeds(
-            "gst-launch-1.0",
-            &[
-                "-q",
-                "videotestsrc",
-                "num-buffers=3",
-                "!",
-                "video/x-raw,width=640,height=480,format=I420",
-                "!",
-                "nvvidconv",
-                "!",
-                "video/x-raw(memory:NVMM),format=NV12",
-                "!",
-                encoder,
-                "!",
-                jetson_parser(encoder),
-                "!",
-                "fakesink",
-            ],
-            Duration::from_secs(10),
-        )
+fn probe_jetson(encoder: &str) -> Option<bool> {
+    if !cfg!(target_os = "linux")
+        || !tool_succeeds("gst-inspect-1.0", &[encoder], Duration::from_secs(5))?
+    {
+        return Some(false);
+    }
+    tool_succeeds(
+        "gst-launch-1.0",
+        &[
+            "-q",
+            "videotestsrc",
+            "num-buffers=3",
+            "!",
+            "video/x-raw,width=640,height=480,format=I420",
+            "!",
+            "nvvidconv",
+            "!",
+            "video/x-raw(memory:NVMM),format=NV12",
+            "!",
+            encoder,
+            "!",
+            jetson_parser(encoder),
+            "!",
+            "fakesink",
+        ],
+        Duration::from_secs(10),
+    )
 }
 /// Bits per second from a bitrate like `4M`, `2500k` or `800000`.
 fn bits_per_second(bitrate: &str) -> Result<u64> {
@@ -2247,37 +3316,53 @@ fn hardware_rgb_input(encoder: &str) -> bool {
 /// Choose the encoder input for a source. RGB input is used only when the
 /// encoder accepts it on this machine, so a driver without it keeps the YUV
 /// path instead of falling back to software encoding.
-fn encoder_input(exe: &Executable, encoder: &str, color: bool) -> Result<EncoderInput> {
-    if color && hardware_rgb_input(encoder) && probe_encoder(exe, encoder, EncoderInput::Rgb)? {
+fn encoder_input(
+    exe: &Executable,
+    encoder: &str,
+    color: bool,
+    (width, height): (u32, u32),
+) -> Result<EncoderInput> {
+    if color
+        && hardware_rgb_input(encoder)
+        && encoder_works(exe, encoder, EncoderInput::Rgb, width, height)?
+    {
         Ok(EncoderInput::Rgb)
     } else {
         Ok(EncoderInput::Yuv)
     }
 }
-fn probe_encoder(exe: &Executable, candidate: &str, input: EncoderInput) -> Result<bool> {
-    {
-        let mut args = [
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=size=640x480:rate=1",
-            "-frames:v",
-            "1",
-            "-c:v",
-            candidate,
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-        args.extend(encoder_device_options(candidate));
-        args.extend(encoder_output_options(candidate, input));
-        args.extend(["-f".into(), "null".into(), "-".into()]);
-        Ok(bounded_output(exe, &args, Duration::from_secs(3))?.0)
-    }
+fn probe_encoder(
+    exe: &Executable,
+    candidate: &str,
+    input: EncoderInput,
+    width: u32,
+    height: u32,
+) -> Result<Option<bool>> {
+    let mut args = [
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("color=size={width}x{height}:rate=1"),
+        "-frames:v",
+        "1",
+        "-c:v",
+        candidate,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    args.extend(encoder_device_options(candidate));
+    args.extend(encoder_output_options(candidate, input));
+    args.extend(["-f".into(), "null".into(), "-".into()]);
+    // Large sensors take longer to encode even once.
+    let pixels = width as u64 * height as u64;
+    let timeout = Duration::from_secs(3) + Duration::from_millis(pixels / 10_000);
+    let (works, _, timed_out) = timed_output(exe, &args, &[], timeout)?;
+    Ok((!timed_out).then_some(works))
 }
 fn encoder_device_options(encoder: &str) -> Vec<String> {
     if encoder.ends_with("_vaapi") {
@@ -2501,6 +3586,7 @@ impl RawInput {
 impl Forwarder {
     pub fn new(mut config: ForwardConfig) -> Result<Self> {
         config.validate()?;
+        check_codec(&config)?;
         let destination = match config.destination.as_deref() {
             Some(name) => {
                 ensure!(
@@ -2520,6 +3606,7 @@ impl Forwarder {
             final_stats: ForwardStats::default(),
             destination,
             reserved: None,
+            failed: None,
         })
     }
     /// Use an output the caller already resolved against `destination`
@@ -2530,13 +3617,19 @@ impl Forwarder {
         destination: Option<crate::destination::Resolved>,
         reserved: Option<crate::storage::StorageWriter>,
     ) -> Result<Self> {
-        config.validate()?;
+        if let Err(error) = config.validate().and_then(|()| check_codec(&config)) {
+            if let Some(reserved) = reserved {
+                reserved.abort().context("remove unused recording output")?;
+            }
+            return Err(error);
+        }
         Ok(Self {
             config,
             process: None,
             final_stats: ForwardStats::default(),
             destination,
             reserved,
+            failed: None,
         })
     }
     /// The local file this forwarder records to, if it records.
@@ -2554,14 +3647,17 @@ impl Forwarder {
         let recording = recording_output(&self.config.output)?;
         let local = recording.is_some();
         let exe = executable()?;
-        let encoder = select_encoder(&exe, &self.config)?;
+        let skip = self.failed.as_slice();
+        let encoder = select_encoder(&exe, &self.config, (width, height), skip)?;
         let jetson = jetson_encoder(&encoder).then_some(if raw.color {
             JetsonInput::Rgba
         } else {
             JetsonInput::I420
         });
+        let fps = self.config.fps.to_string();
         let mut cmd = command(&exe);
         let mut stage = None;
+        let mut active = Active::NONE;
         if let Some(input) = jetson {
             let (fps_numerator, fps_denominator) = jetson_framerate(self.config.fps)?;
             let gop = ((self.config.fps * 2.0).round().max(1.0) as u32).to_string();
@@ -2618,8 +3714,13 @@ impl Forwarder {
                 "copy",
             ]);
         } else {
-            let input = encoder_input(&exe, &encoder, raw.color)?;
+            let input = encoder_input(&exe, &encoder, raw.color, (width, height))?;
             cmd.args(encoder_device_options(&encoder));
+            // Each frame is stamped when FFmpeg reads it and keeps that time
+            // in the output, so the file lasts as long as the recording did
+            // even when frames arrive late, slower than `fps`, or not at all
+            // for a while. Repeating frames instead would make FFmpeg encode
+            // a whole outage's worth of copies at once when frames return.
             cmd.args([
                 "-hide_banner",
                 "-loglevel",
@@ -2632,7 +3733,9 @@ impl Forwarder {
                 "-video_size",
                 &format!("{width}x{height}"),
                 "-framerate",
-                &self.config.fps.to_string(),
+                &fps,
+                "-use_wallclock_as_timestamps",
+                "1",
                 "-i",
                 "pipe:0",
                 "-an",
@@ -2644,10 +3747,19 @@ impl Forwarder {
                 &((self.config.fps * 2.0).round().max(1.0) as u32).to_string(),
             ]);
             cmd.args(encoder_output_options(&encoder, input));
-            if encoder == "libx264" {
-                cmd.args(["-preset", "veryfast", "-tune", "zerolatency"]);
-            } else if encoder == "libx265" {
-                cmd.args(["-preset", "veryfast"]);
+            cmd.args(["-fps_mode", "vfr"]);
+            if matches!(encoder.as_str(), "libx264" | "libx265") {
+                // Concurrent software recordings share the cores.
+                let (claimed, recordings) = Active::claim("encode");
+                active = claimed;
+                let cores = (cores() / recordings).max(1);
+                let preset = x264_preset(width, height, self.config.fps, cores, efficient());
+                cmd.args(["-preset", preset, "-threads", &cores.to_string()]);
+                if encoder == "libx264" {
+                    // Rate control by the frames' times rather than `fps`, so
+                    // a camera slower than `fps` still gets the bitrate asked.
+                    cmd.args(["-tune", "zerolatency", "-x264-params", "force-cfr=0"]);
+                }
             } else if encoder.ends_with("_videotoolbox") {
                 cmd.args(["-realtime", "1"]);
             }
@@ -2702,17 +3814,7 @@ impl Forwarder {
             None => (child.stdin.take().context("FFmpeg stdin")?, None),
         };
         let log_thread = log.collect(child.stderr.take().unwrap());
-        let queue = Arc::new(WriterQueue {
-            state: Mutex::new(WriterState {
-                latest: None,
-                error: None,
-            }),
-            changed: Condvar::new(),
-            running: AtomicBool::new(true),
-            accepted: AtomicU64::new(0),
-            written: AtomicU64::new(0),
-            dropped: AtomicU64::new(0),
-        });
+        let queue = Arc::new(WriterQueue::new());
         let output_thread = storage.map(|mut storage| {
             let mut output = child.stdout.take().expect("piped encoded output");
             let shared = queue.clone();
@@ -2721,12 +3823,8 @@ impl Forwarder {
                     .err()
                     .map(|error| format!("write bounded recording: {error}"));
                 if let Some(error) = &error {
-                    shared
-                        .state
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .error
-                        .get_or_insert_with(|| error.clone());
+                    shared.fail(error.clone());
+                    shared.output_failed.store(true, Ordering::Release);
                     shared.running.store(false, Ordering::Release);
                     shared.changed.notify_all();
                 }
@@ -2737,45 +3835,42 @@ impl Forwarder {
         });
         let shared = queue.clone();
         let interval = Duration::from_secs_f64(1.0 / self.config.fps);
+        // FFmpeg stamps a recording's frames itself, so it gets each new
+        // frame once, at most one per slot, and a stall leaves a gap.
+        // GStreamer stamps frames by count, so the Jetson writer sends one on
+        // every slot, repeating the last until the camera stalls. A stream's
+        // receivers may drop a silent publisher, so it gets the last picture
+        // on every slot throughout.
+        let (repeat, through_stalls) = (jetson.is_some() || !local, !local);
         let writer = thread::spawn(move || {
-            let mut last = None;
             let mut next = Instant::now();
-            while shared.running.load(Ordering::Acquire) {
-                let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-                while shared.running.load(Ordering::Acquire)
-                    && (last.is_none() && state.latest.is_none() || Instant::now() < next)
-                {
-                    let timeout = if last.is_none() {
-                        Duration::from_secs(1)
-                    } else {
-                        next.saturating_duration_since(Instant::now())
-                    };
-                    state = shared
-                        .changed
-                        .wait_timeout(state, timeout)
-                        .unwrap_or_else(|e| e.into_inner())
-                        .0;
+            let mut last = None;
+            loop {
+                let again = repeat && last.is_some() && (through_stalls || !shared.stalled());
+                let Some(fresh) = shared.take(next, again) else {
+                    break;
+                };
+                if fresh.is_some() {
+                    last = fresh;
                 }
-                if !shared.running.load(Ordering::Acquire) {
+                let Some(bytes) = &last else {
+                    continue;
+                };
+                shared.busy.store(true, Ordering::Relaxed);
+                let written = input.write_all(bytes);
+                shared.busy.store(false, Ordering::Relaxed);
+                if let Err(e) = written {
+                    shared.fail(format!("FFmpeg input failed: {e}"));
                     break;
                 }
-                if let Some(latest) = state.latest.take() {
-                    last = Some(latest)
+                shared.written.fetch_add(1, Ordering::Relaxed);
+                if !repeat {
+                    last = None;
                 }
-                drop(state);
-                if let Some(bytes) = &last {
-                    if let Err(e) = input.write_all(bytes) {
-                        shared
-                            .state
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .error
-                            .get_or_insert_with(|| format!("FFmpeg input failed: {e}"));
-                        break;
-                    }
-                    shared.written.fetch_add(1, Ordering::Relaxed);
-                }
-                next = Instant::now() + interval;
+                // Slots stay on a fixed grid; a writer that fell behind skips
+                // the slots it missed instead of catching up in a burst.
+                let now = Instant::now();
+                next = (next + interval).max(now.checked_sub(interval).unwrap_or(now));
             }
             // Closing stdin lets FFmpeg flush its muxer and finalize files.
             drop(input);
@@ -2798,8 +3893,58 @@ impl Forwarder {
             stage_log,
             encoder,
             started_ms,
+            spawned: Instant::now(),
+            _active: active,
         });
         Ok(())
+    }
+    /// An automatically chosen encoder that exits within its first seconds
+    /// of a local recording, before writing any video, usually rejected this
+    /// frame size or ran out of hardware sessions. Its file is removed and
+    /// the recording starts again, once, in a new file with the next
+    /// candidate. One that had written video ends the recording and keeps
+    /// it. A stream's early exit is more likely its server's doing, and a
+    /// failed write the disk's.
+    fn fall_back(&mut self, status: std::process::ExitStatus) -> Result<bool> {
+        let Some(process) = self.process.as_ref() else {
+            return Ok(false);
+        };
+        if status.success()
+            || self.config.encoder != "auto"
+            || self.failed.is_some()
+            || process.output_thread.is_none()
+            || process.queue.output_failed.load(Ordering::Acquire)
+            || process.spawned.elapsed() > Duration::from_secs(10)
+        {
+            return Ok(false);
+        }
+        self.final_stats = self.stats();
+        let mut process = self.process.take().expect("encoder process");
+        let encoder = process.encoder.clone();
+        let (width, height, raw) = (process.width, process.height, process.raw);
+        let finished = finish(&mut process);
+        match finished.1 {
+            Some(output) if output.storage.bytes_written() <= HEADER_BYTES => output
+                .storage
+                .abort()
+                .context("remove failed recording output")?,
+            Some(_) => {
+                self.settle(process, finished)?;
+                bail!("FFmpeg forwarding exited ({status})");
+            }
+            None => {}
+        }
+        if let Ok(exe) = executable() {
+            remember(&exe, |probes| {
+                probes.encoders.insert(
+                    probe_key(&encoder, EncoderInput::Yuv, width, height),
+                    Found::now(false),
+                );
+            });
+        }
+        self.failed = Some(encoder);
+        self.spawn(width, height, raw)?;
+        Ok(true)
     }
     /// Queue a frame for encoding; it is owned so its buffer moves to the
     /// writer thread without a copy.
@@ -2814,12 +3959,24 @@ impl Forwarder {
         let process = self.process.as_mut().unwrap();
         ensure!(
             frame.width == process.width && frame.height == process.height,
-            "forwarding source dimensions changed; restart forwarding"
+            "the camera's resolution changed from {}x{} to {}x{}; start a new recording to continue",
+            process.width,
+            process.height,
+            frame.width,
+            frame.height
         );
         ensure!(
             frame.pixel_format == process.raw.pixel_format,
-            "forwarding source pixel format changed; restart forwarding"
+            "the camera's pixel format changed; start a new recording to continue"
         );
+        // An encoder that died at start leaves a broken pipe behind; falling
+        // back to the next one comes first.
+        if let Some(status) = process.child.try_wait()?
+            && self.fall_back(status)?
+        {
+            return self.push(frame);
+        }
+        let process = self.process.as_mut().unwrap();
         let stored_error = process
             .queue
             .state
@@ -2831,16 +3988,6 @@ impl Forwarder {
             bail!("{error}: {}", process.log.text(&self.config.output).trim());
         }
         if let Some(status) = process.child.try_wait()? {
-            let stored_error = process
-                .queue
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .error
-                .clone();
-            if let Some(error) = stored_error {
-                bail!("{error}: {}", process.log.text(&self.config.output).trim());
-            }
             bail!(
                 "FFmpeg forwarding exited ({status}): {}",
                 process.log.text(&self.config.output).trim()
@@ -2863,25 +4010,27 @@ impl Forwarder {
                 data
             }
         };
-        let mut state = process
-            .queue
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let queue = &process.queue;
+        let mut state = queue.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(error) = &state.error {
             bail!("{error}: {}", process.log.text(&self.config.output).trim());
         }
         ensure!(
-            process.queue.running.load(Ordering::Acquire),
+            queue.running.load(Ordering::Acquire),
             "FFmpeg forwarding writer stopped"
         );
         let replaced = state.latest.replace(bytes).is_some();
-        process.queue.accepted.fetch_add(1, Ordering::Relaxed);
+        queue.accepted.fetch_add(1, Ordering::Relaxed);
+        let arrived = queue.epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        queue.arrived_ms.store(arrived, Ordering::Relaxed);
         if replaced {
-            process.queue.dropped.fetch_add(1, Ordering::Relaxed);
+            queue.dropped.fetch_add(1, Ordering::Relaxed);
+            if queue.busy.load(Ordering::Relaxed) {
+                queue.late.fetch_add(1, Ordering::Relaxed);
+            }
         }
         drop(state);
-        process.queue.changed.notify_one();
+        queue.changed.notify_one();
         Ok(!replaced)
     }
     pub fn stats(&self) -> ForwardStats {
@@ -2890,6 +4039,8 @@ impl Forwarder {
                 accepted: p.queue.accepted.load(Ordering::Relaxed),
                 written: p.queue.written.load(Ordering::Relaxed),
                 dropped: p.queue.dropped.load(Ordering::Relaxed),
+                late: p.queue.late.load(Ordering::Relaxed),
+                stalled: p.queue.stalled(),
                 encoder: p.encoder.clone(),
                 error: p
                     .queue
@@ -2913,79 +4064,26 @@ impl Forwarder {
         let Some(mut process) = self.process.take() else {
             return Ok(());
         };
-        process.queue.running.store(false, Ordering::Release);
-        process.queue.changed.notify_all();
-        // A GStreamer stage must drain the hardware encoder before FFmpeg sees EOF.
-        let grace = if process.stage.is_some() { 6 } else { 3 };
-        let deadline = Instant::now() + Duration::from_secs(grace);
-        let mut shutdown_error = None;
-        let status = loop {
-            match process.child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) => {}
-                Err(error) => {
-                    shutdown_error =
-                        Some(format!("cannot inspect FFmpeg forwarding process: {error}"));
-                    let _ = process.child.kill();
-                    let _ = process.child.wait();
-                    break None;
-                }
-            }
-            if Instant::now() >= deadline {
-                let _ = process.child.kill();
-                let _ = process.child.wait();
-                break None;
-            }
-            thread::sleep(Duration::from_millis(10));
-        };
-        if let Some(mut stage) = process.stage.take() {
-            // FFmpeg has exited; the encoder stage normally already has too.
-            if !matches!(stage.try_wait(), Ok(Some(_))) {
-                let _ = stage.kill();
-            }
-            let _ = stage.wait();
-        }
-        if let Some(thread) = process.stage_log.take() {
-            let _ = thread.join();
-        }
-        if let Some(thread) = process.writer.take()
-            && thread.join().is_err()
-        {
-            shutdown_error
-                .get_or_insert_with(|| "FFmpeg input writer terminated unexpectedly".to_owned());
-        }
-        let mut recording = None;
-        if let Some(thread) = process.output_thread.take() {
-            match thread.join() {
-                Ok(output) => recording = Some(output),
-                Err(_) => {
-                    shutdown_error.get_or_insert_with(|| {
-                        "FFmpeg recording writer terminated unexpectedly".to_owned()
-                    });
-                }
-            }
-        }
-        let mut error = process
-            .queue
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .error
-            .clone();
-        if error.is_none() {
-            error = shutdown_error;
-        }
-        if let Some(thread) = process.log_thread.take() {
-            let _ = thread.join();
-        }
+        let finished = finish(&mut process);
+        self.settle(process, finished)
+    }
+    /// Keep or remove the recording of a finished encoder process, and say
+    /// how it ended.
+    fn settle(&mut self, process: EncoderProcess, finished: Finished) -> Result<()> {
+        let (status, recording, mut error) = finished;
         self.final_stats.written = process.queue.written.load(Ordering::Relaxed);
         if let Some(output) = recording {
+            // Video the encoder wrote stays even when it failed or had to be
+            // stopped, since every recording container plays up to its last
+            // complete part; a full disk or size limit fails the file itself.
+            let kept = output.error.is_none() && output.storage.bytes_written() > HEADER_BYTES;
             if error.is_none() {
                 error = output.error;
             }
-            let valid = status.as_ref().is_some_and(|status| status.success())
-                && error.is_none()
-                && output.storage.bytes_written() > 0;
+            let valid = kept
+                || status.as_ref().is_some_and(|status| status.success())
+                    && error.is_none()
+                    && output.storage.bytes_written() > 0;
             let path = output.storage.path().to_path_buf();
             let (bytes, sha256) = (output.storage.bytes_written(), output.storage.sha256());
             let result = if valid {
@@ -3052,6 +4150,80 @@ impl Forwarder {
         Ok(())
     }
 }
+/// How an encoder process ended: its exit status (`None` when it had to be
+/// killed), the recording output its writer holds, and the first error any
+/// of its threads reported.
+type Finished = (
+    Option<std::process::ExitStatus>,
+    Option<EncodedOutput>,
+    Option<String>,
+);
+/// Stop an encoder process and its threads.
+fn finish(process: &mut EncoderProcess) -> Finished {
+    process.queue.running.store(false, Ordering::Release);
+    process.queue.changed.notify_all();
+    // A GStreamer stage must drain the hardware encoder before FFmpeg sees EOF.
+    let grace = if process.stage.is_some() { 6 } else { 3 };
+    let deadline = Instant::now() + Duration::from_secs(grace);
+    let mut shutdown_error = None;
+    let status = loop {
+        match process.child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(error) => {
+                shutdown_error = Some(format!("cannot inspect FFmpeg forwarding process: {error}"));
+                let _ = process.child.kill();
+                let _ = process.child.wait();
+                break None;
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = process.child.kill();
+            let _ = process.child.wait();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    if let Some(mut stage) = process.stage.take() {
+        // FFmpeg has exited; the encoder stage normally already has too.
+        if !matches!(stage.try_wait(), Ok(Some(_))) {
+            let _ = stage.kill();
+        }
+        let _ = stage.wait();
+    }
+    if let Some(thread) = process.stage_log.take() {
+        let _ = thread.join();
+    }
+    if let Some(thread) = process.writer.take()
+        && thread.join().is_err()
+    {
+        shutdown_error
+            .get_or_insert_with(|| "FFmpeg input writer terminated unexpectedly".to_owned());
+    }
+    let mut recording = None;
+    if let Some(thread) = process.output_thread.take() {
+        match thread.join() {
+            Ok(output) => recording = Some(output),
+            Err(_) => {
+                shutdown_error.get_or_insert_with(|| {
+                    "FFmpeg recording writer terminated unexpectedly".to_owned()
+                });
+            }
+        }
+    }
+    let error = process
+        .queue
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .error
+        .clone()
+        .or(shutdown_error);
+    if let Some(thread) = process.log_thread.take() {
+        let _ = thread.join();
+    }
+    (status, recording, error)
+}
 impl Drop for Forwarder {
     fn drop(&mut self) {
         let _ = self.stop();
@@ -3062,6 +4234,934 @@ impl Drop for Forwarder {
 mod tests {
     use super::*;
     use crate::genicam::NodeMap;
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "capturefab-media-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    /// A stand-in for FFmpeg on this test thread: a shell script that can
+    /// keep notes in `$dir`.
+    #[cfg(unix)]
+    struct Fake {
+        dir: PathBuf,
+    }
+    #[cfg(unix)]
+    impl Fake {
+        fn new(name: &str, body: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = temp_dir(name);
+            let path = dir.join("ffmpeg");
+            let script = format!("#!/bin/sh\ndir='{}'\n{body}\n", dir.display());
+            fs::write(&path, script).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            FAKE_FFMPEG.set(Some(Arc::new(Executable::external(path))));
+            Self { dir }
+        }
+        fn read(&self, name: &str) -> String {
+            fs::read_to_string(self.dir.join(name)).unwrap_or_default()
+        }
+        /// Launches whose arguments contain every one of `parts`.
+        fn launches(&self, parts: &[&str]) -> usize {
+            self.read("argv")
+                .lines()
+                .filter(|line| parts.iter().all(|part| line.contains(part)))
+                .count()
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            FAKE_FFMPEG.set(None);
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+    const PAYLOAD: &[u8] = b"#!/bin/sh\necho stand-in for FFmpeg\n";
+    fn digest(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        format!("{:x}", sha2::Sha256::digest(bytes))
+    }
+    #[test]
+    #[cfg(unix)]
+    fn bundled_ffmpeg_is_extracted_once_and_shared() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let base = temp_dir("cache");
+        let root = base.join("capturefab");
+        let digest = digest(PAYLOAD);
+        // Concurrent first uses produce one complete copy.
+        let copies = thread::scope(|scope| {
+            let workers = (0..8)
+                .map(|_| scope.spawn(|| cached_copy(&root, PAYLOAD, &digest).unwrap()))
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let path = copies[0].path.clone();
+        assert!(copies.iter().all(|copy| copy.path == path));
+        assert_eq!(fs::read(&path).unwrap(), PAYLOAD);
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        for dir in [&root, &path.parent().unwrap().to_path_buf()] {
+            assert_eq!(
+                fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let leftovers = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter(|entry| {
+                let name = entry.as_ref().unwrap().file_name();
+                name.to_string_lossy().ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+        // A later use reuses the file instead of writing it again, and the
+        // copy outlives its users.
+        drop(copies);
+        let again = cached_copy(&root, PAYLOAD, &digest).unwrap();
+        let reused = fs::metadata(&again.path).unwrap();
+        assert_eq!(
+            (reused.ino(), reused.mtime(), reused.mtime_nsec()),
+            (meta.ino(), meta.mtime(), meta.mtime_nsec())
+        );
+        drop(again);
+        assert!(path.exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn tampered_or_loosened_copies_fail_validation_and_are_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = temp_dir("tamper");
+        let root = base.join("capturefab");
+        let digest = digest(PAYLOAD);
+        let path = cached_copy(&root, PAYLOAD, &digest).unwrap().path.clone();
+        // Same length, different bytes: only the digest notices.
+        let mut tampered = PAYLOAD.to_vec();
+        tampered[16] ^= 1;
+        fs::write(&path, &tampered).unwrap();
+        assert!(trusted(&path, PAYLOAD.len()).is_ok());
+        cached_copy(&root, PAYLOAD, &digest).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), PAYLOAD);
+        // Writable by others, or cut short: the check before each use fails.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o722)).unwrap();
+        assert!(trusted(&path, PAYLOAD.len()).is_err());
+        cached_copy(&root, PAYLOAD, &digest).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        fs::write(&path, &PAYLOAD[..10]).unwrap();
+        assert!(trusted(&path, PAYLOAD.len()).is_err());
+        cached_copy(&root, PAYLOAD, &digest).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), PAYLOAD);
+        fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn copies_of_other_builds_are_removed_unless_in_use() {
+        let base = temp_dir("prune");
+        let root = base.join("capturefab");
+        let (busy, idle) = (
+            root.join("ffmpeg-0000000000000001"),
+            root.join("ffmpeg-0000000000000002"),
+        );
+        for dir in [&busy, &idle] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join(FFMPEG_NAME), b"old").unwrap();
+        }
+        // Left by a cleanup that was cut short.
+        let leftover = root.join("removed-0123");
+        fs::create_dir_all(&leftover).unwrap();
+        let holder = lock_file(&busy.join("in-use.lock")).unwrap();
+        fs2::FileExt::lock_shared(&holder).unwrap();
+        let copy = cached_copy(&root, PAYLOAD, &digest(PAYLOAD)).unwrap();
+        assert!(busy.exists() && !idle.exists() && copy.path.exists());
+        let names = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names.iter().all(|name| name.starts_with("ffmpeg-")));
+        fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn a_copy_removed_while_waiting_for_its_lock_is_extracted_again() {
+        let base = temp_dir("prune-race");
+        let root = base.join("capturefab");
+        let dir = root.join(format!("ffmpeg-{}", &digest(PAYLOAD)[..16]));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(FFMPEG_NAME), PAYLOAD).unwrap();
+        // Another build's cleanup holds the copy's lock.
+        let cleanup = lock_file(&dir.join("in-use.lock")).unwrap();
+        fs2::FileExt::lock_exclusive(&cleanup).unwrap();
+        let copy = thread::scope(|scope| {
+            let starting = scope.spawn(|| cached_copy(&root, PAYLOAD, &digest(PAYLOAD)));
+            thread::sleep(Duration::from_millis(200));
+            discard(&root, &dir, cleanup);
+            starting.join().unwrap().unwrap()
+        });
+        // The copy this process holds is in place, not the one removed.
+        assert_eq!(fs::read(&copy.path).unwrap(), PAYLOAD);
+        assert!(same_file(
+            copy._in_use.as_ref().unwrap(),
+            &dir.join("in-use.lock")
+        ));
+        fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn copies_the_system_will_not_start_are_detected() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("noexec");
+        let path = dir.join(FFMPEG_NAME);
+        fs::write(&path, PAYLOAD).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(runs(&Executable::external(path.clone())));
+        // What a noexec mount or an execution policy reports.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!runs(&Executable::external(path)));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn extracted_copy_is_reused_by_another_process() {
+        use std::os::unix::fs::MetadataExt;
+        if let Some(root) = std::env::var_os("CAPTUREFAB_TEST_EXTRACT_ROOT") {
+            let copy = cached_copy(std::path::Path::new(&root), PAYLOAD, &digest(PAYLOAD)).unwrap();
+            println!("inode {}", fs::metadata(&copy.path).unwrap().ino());
+            return;
+        }
+        let base = temp_dir("shared");
+        let root = base.join("capturefab");
+        let copy = cached_copy(&root, PAYLOAD, &digest(PAYLOAD)).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "media::tests::extracted_copy_is_reused_by_another_process",
+                "--nocapture",
+            ])
+            .env("CAPTUREFAB_TEST_EXTRACT_ROOT", &root)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        let inode = fs::metadata(&copy.path).unwrap().ino();
+        assert!(stdout.contains(&format!("inode {inode}\n")), "{stdout}");
+        fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn dropped_network_stream_reconnects_with_backoff_without_spinning() {
+        let fake = Fake::new(
+            "reconnect",
+            r#"case "$*" in *rtsp*) ;; *) exit 0 ;; esac
+n=$(($(cat "$dir/launches" 2>/dev/null || echo 0) + 1)); echo $n > "$dir/launches"
+frame() { printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; }
+case $n in
+1) frame; exit 0 ;;
+2) echo 'Connection refused' >&2; exit 1 ;;
+*) while frame; do sleep 0.05; done ;;
+esac"#,
+        );
+        let mut camera = open_url(
+            "rtsp://user:secret@127.0.0.1:9/live",
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        camera.start(12).unwrap();
+        assert_eq!(
+            camera.next_frame(Duration::from_millis(100)).unwrap().width,
+            2
+        );
+        let lost = camera.next_frame(Duration::from_millis(100)).unwrap_err();
+        assert_eq!(stream_end(&lost), Some(StreamEnd::Lost));
+        let message = format!("{lost:#}");
+        assert!(
+            message.starts_with(
+                "reconnecting to rtsp://<redacted>@127.0.0.1:9/live (attempt 1): timed out"
+            ),
+            "{message}"
+        );
+        assert_eq!(crate::cli::error_code(&lost).1, 4);
+        // Until a relaunch is due, each poll waits out its budget instead of
+        // failing at once; the first relaunch is refused, the next streams.
+        let started = Instant::now();
+        let mut polls = 0u128;
+        let frame = loop {
+            match camera.next_frame(Duration::from_millis(100)) {
+                Ok(frame) => break frame,
+                Err(error) => {
+                    assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+                    assert!(!format!("{error:#}").contains("secret"));
+                    assert_eq!(stream_end(&error), None);
+                    polls += 1;
+                }
+            }
+            assert!(started.elapsed() < Duration::from_secs(10));
+        };
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(2500), "{elapsed:?}");
+        assert!(
+            polls <= elapsed.as_millis() / 80 + 2,
+            "{polls} polls in {elapsed:?}"
+        );
+        assert_eq!(frame.width, 2);
+        assert_eq!(fake.read("launches").trim(), "3");
+        camera.stop().unwrap();
+    }
+    #[test]
+    fn reconnecting_stops_after_repeated_refusals() {
+        let mut camera = native("rtsp://camera/live", Vec::new());
+        camera.native = false;
+        let lost = camera.lost("media stream ended: 401 Unauthorized".into());
+        assert_eq!(stream_end(&lost), Some(StreamEnd::Lost));
+        let refusal = "media stream ended: method DESCRIBE failed: 401 Unauthorized";
+        for attempt in 2..=3 {
+            let waiting = camera.lost(refusal.into());
+            assert_eq!(stream_end(&waiting), None);
+            assert!(format!("{waiting}").contains(&format!("(attempt {attempt}): timed out")));
+        }
+        // An unrelated failure resets the count; backoff keeps doubling
+        // up to its limit.
+        camera.lost("media stream ended: Connection refused".into());
+        let backoff = camera.reconnect.as_ref().unwrap().backoff;
+        assert_eq!(backoff, Duration::from_secs(16));
+        for _ in 1..MAX_REFUSED {
+            assert_eq!(stream_end(&camera.lost(refusal.into())), None);
+        }
+        assert_eq!(
+            camera.reconnect.as_ref().unwrap().backoff,
+            RECONNECT_BACKOFF_MAX
+        );
+        let abandoned = camera.lost(refusal.into());
+        assert_eq!(stream_end(&abandoned), Some(StreamEnd::Abandoned));
+        assert!(
+            format!("{abandoned}")
+                .starts_with("stopped reconnecting to rtsp://camera/live after 8 attempts")
+        );
+        assert!(camera.reconnect.is_none());
+        // A relay answers 404 while its camera is away: keep trying.
+        camera.lost("media stream ended: Connection refused".into());
+        for _ in 0..MAX_REFUSED * 4 {
+            let missing = "media stream ended: method DESCRIBE failed: 404 Not Found";
+            assert_eq!(stream_end(&camera.lost(missing.into())), None);
+        }
+        assert_eq!(
+            camera.reconnect.as_ref().unwrap().backoff,
+            RECONNECT_BACKOFF_MAX
+        );
+    }
+    #[test]
+    fn a_stream_that_drops_again_soon_keeps_backing_off() {
+        let mut camera = native("rtsp://camera/live", Vec::new());
+        camera.native = false;
+        let first = camera.lost("media stream ended".into());
+        assert_eq!(stream_end(&first), Some(StreamEnd::Lost));
+        // One frame, then the stream ends again: reported, with the backoff
+        // carried on instead of starting again from 1 s.
+        camera.delivered();
+        assert!(camera.reconnect.is_some());
+        let again = camera.lost("media stream ended".into());
+        assert_eq!(stream_end(&again), Some(StreamEnd::Lost));
+        assert!(
+            format!("{again}").contains("(attempt 2): timed out"),
+            "{again}"
+        );
+        let reconnect = camera.reconnect.as_ref().unwrap();
+        assert_eq!(reconnect.backoff, Duration::from_secs(4));
+        assert!(reconnect.retry_at > Instant::now() + Duration::from_secs(1));
+        // A stream that stays up ends the outage.
+        camera.delivered();
+        camera.reconnect.as_mut().unwrap().resumed = Instant::now().checked_sub(STEADY);
+        camera.delivered();
+        assert!(camera.reconnect.is_none());
+        let fresh = camera.lost("media stream ended".into());
+        assert!(
+            format!("{fresh}").contains("(attempt 1): timed out"),
+            "{fresh}"
+        );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn video_files_play_in_real_time_and_finish() {
+        let fake = Fake::new(
+            "file",
+            r#"echo "$*" >> "$dir/argv"
+case "$*" in *clip.mkv*) ;; *) exit 0 ;; esac
+for i in 1 2 3; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
+        );
+        let clip = fake.dir.join("clip.mkv");
+        fs::write(&clip, b"").unwrap();
+        let mut camera = open_url(clip.to_str().unwrap(), Duration::from_secs(2)).unwrap();
+        let argv = fake.read("argv");
+        let launch = argv.lines().find(|line| line.contains("clip.mkv")).unwrap();
+        let input = launch.find(" -i ").unwrap();
+        assert!(
+            launch.find("-readrate 1").is_some_and(|at| at < input),
+            "{launch}"
+        );
+        assert!(
+            launch.find("-threads ").is_some_and(|at| at < input),
+            "{launch}"
+        );
+        let nodes = NodeMap::parse(&camera.xml().unwrap()).unwrap();
+        assert_eq!(
+            nodes.get(camera.as_mut(), "PlaybackSpeed").unwrap(),
+            "RealTime"
+        );
+        camera.start(12).unwrap();
+        for _ in 0..3 {
+            camera.next_frame(Duration::from_secs(2)).unwrap();
+        }
+        for _ in 0..2 {
+            let finished = camera.next_frame(Duration::from_secs(2)).unwrap_err();
+            assert_eq!(stream_end(&finished), Some(StreamEnd::Finished));
+            assert!(format!("{finished}").starts_with("video file finished"));
+        }
+        // Fastest decodes every frame unpaced, for extraction.
+        camera.stop().unwrap();
+        nodes
+            .set(camera.as_mut(), "PlaybackSpeed", "Fastest")
+            .unwrap();
+        camera.start(12).unwrap();
+        camera.next_frame(Duration::from_secs(2)).unwrap();
+        let relaunch = fake.read("argv");
+        assert!(!relaunch.lines().last().unwrap().contains("-readrate"));
+        camera.stop().unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn captures_read_video_files_as_fast_as_they_ask() {
+        let fake = Fake::new(
+            "on-demand",
+            r#"case "$*" in *clip.mkv*) echo "$*" >> "$dir/argv" ;; *) exit 0 ;; esac
+for i in 1 2 3; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
+        );
+        let clip = fake.dir.join("clip.mkv");
+        fs::write(&clip, b"").unwrap();
+        let mut camera = open_url(clip.to_str().unwrap(), Duration::from_secs(2)).unwrap();
+        let paced = |line: &str| line.contains("-readrate 1");
+        // A capture's own start: the file starts again unpaced, once.
+        camera.start(12).unwrap();
+        for _ in 0..3 {
+            camera.request_frame().unwrap();
+            camera.next_frame(Duration::from_secs(2)).unwrap();
+        }
+        let launches = fake.read("argv");
+        let launches = launches.lines().collect::<Vec<_>>();
+        assert_eq!(launches.len(), 2, "{launches:?}");
+        assert!(paced(launches[0]) && !paced(launches[1]), "{launches:?}");
+        camera.stop().unwrap();
+        // Captures during a live view keep its pace.
+        camera.start(12).unwrap();
+        camera.next_frame(Duration::from_secs(2)).unwrap();
+        camera.request_frame().unwrap();
+        camera.next_frame(Duration::from_secs(2)).unwrap();
+        let launches = fake.read("argv");
+        assert_eq!(launches.lines().count(), 3, "{launches}");
+        assert!(paced(launches.lines().last().unwrap()), "{launches}");
+        camera.stop().unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn http_video_files_finish_and_http_streams_reconnect() {
+        let _fake = Fake::new(
+            "http",
+            r#"case "$*" in *127.0.0.1*) ;; *) exit 0 ;; esac
+for i in 1 2; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
+        );
+        for (url, end) in [
+            (
+                "http://127.0.0.1:9/media/clip.MP4?token=1",
+                StreamEnd::Finished,
+            ),
+            ("http://127.0.0.1:9/video.mjpg", StreamEnd::Lost),
+            ("http://127.0.0.1:9/", StreamEnd::Lost),
+        ] {
+            let mut camera = open_url(url, Duration::from_secs(2)).unwrap();
+            camera.start(12).unwrap();
+            for _ in 0..2 {
+                camera.next_frame(Duration::from_secs(2)).unwrap();
+            }
+            let ended = camera.next_frame(Duration::from_secs(2)).unwrap_err();
+            assert_eq!(stream_end(&ended), Some(end), "{url}: {ended:#}");
+            if end == StreamEnd::Finished {
+                assert_eq!(
+                    format!("{ended}"),
+                    "video file finished: http://127.0.0.1:9/media/clip.MP4?token=<redacted>"
+                );
+            }
+            camera.stop().unwrap();
+        }
+    }
+    #[test]
+    #[cfg(unix)]
+    fn replay_decoders_limit_threads_on_the_decoder() {
+        let fake = Fake::new("replay", r#"echo "$*" >> "$dir/argv""#);
+        let clip = fake.dir.join("clip.mkv");
+        fs::write(&clip, b"").unwrap();
+        let decoder = ReplayDecoder::open(&clip, 64, 48, 30.0, false, Duration::from_millis(200));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fake.read("argv").is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(decoder);
+        let launch = fake.read("argv");
+        let input = launch.find(" -i ").unwrap();
+        assert!(
+            launch.find("-threads 1").is_some_and(|at| at < input),
+            "{launch}"
+        );
+        assert!(
+            launch
+                .find("-filter_threads 1")
+                .is_some_and(|at| at > input),
+            "{launch}"
+        );
+        assert_eq!(launch.matches("-threads ").count(), 1, "{launch}");
+        assert!(launch.contains("-hwaccel none"), "{launch}");
+    }
+    #[test]
+    fn decoders_and_software_encoders_are_sized_to_the_host() {
+        assert_eq!(decoder_threads(16, 1, false), 4);
+        assert_eq!(decoder_threads(8, 3, false), 2);
+        assert_eq!(decoder_threads(4, 6, false), 1);
+        assert_eq!(decoder_threads(16, 1, true), 1);
+        // 1080p30 is 62 Mpx/s.
+        assert_eq!(x264_preset(1920, 1080, 30.0, 14, false), "veryfast");
+        assert_eq!(x264_preset(1920, 1080, 30.0, 4, false), "superfast");
+        assert_eq!(x264_preset(1920, 1080, 30.0, 2, false), "ultrafast");
+        assert_eq!(x264_preset(1920, 1080, 30.0, 14, true), "superfast");
+        assert_eq!(x264_preset(3840, 2160, 30.0, 2, true), "ultrafast");
+    }
+    #[test]
+    #[cfg(unix)]
+    fn auto_hwaccel_is_dropped_where_no_device_initializes() {
+        for (log, expected) in [
+            ("", "none"),
+            (
+                "[dec:h264] Using auto hwaccel type videotoolbox with new default device.",
+                "auto",
+            ),
+        ] {
+            let _fake = Fake::new("hwaccel", &format!("cat > /dev/null; echo '{log}' >&2"));
+            let exe = executable().unwrap();
+            let arm_linux = cfg!(all(
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "arm")
+            ));
+            let expected = if arm_linux { "none" } else { expected };
+            if hwaccel() == "auto" {
+                assert_eq!(decode_acceleration(&exe).unwrap(), expected, "{log}");
+            }
+        }
+    }
+    #[test]
+    fn probe_results_persist_for_the_boot_and_ignore_corrupt_files() {
+        let Some(boot) = boot_id() else {
+            return;
+        };
+        let dir = temp_dir("probes");
+        let path = dir.join("probes.json");
+        let exe = Executable {
+            path: dir.join("ffmpeg"),
+            directory: None,
+            probes: Some(path.clone()),
+            _in_use: None,
+        };
+        remember(&exe, |probes| {
+            probes
+                .encoders
+                .insert("libx264 yuv 64x48".into(), Found::now(true));
+        });
+        // Another process starts from the file.
+        let stored = load_probes(&exe);
+        assert_eq!(stored.boot, boot);
+        let found = stored.encoders.get("libx264 yuv 64x48").copied();
+        assert_eq!(found.and_then(Found::current), Some(true));
+        let mut previous = stored;
+        previous.boot = "an earlier boot".into();
+        fs::write(&path, serde_json::to_vec(&previous).unwrap()).unwrap();
+        assert!(load_probes(&exe).encoders.is_empty());
+        fs::write(&path, b"{not json").unwrap();
+        assert!(load_probes(&exe).encoders.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn failed_probes_expire_and_timed_out_probes_are_not_remembered() {
+        let dir = temp_dir("probe-failures");
+        let exe = Executable {
+            path: dir.join("ffmpeg"),
+            directory: None,
+            probes: Some(dir.join("probes.json")),
+            _in_use: None,
+        };
+        // The answer, and whether the probe ran to give it.
+        let probe = |key: &str, answer: Option<bool>| {
+            let mut ran = false;
+            let works = probed(
+                &exe,
+                |probes| probes.encoders.get(key).copied(),
+                |probes, found| {
+                    probes.encoders.insert(key.into(), found);
+                },
+                || {
+                    ran = true;
+                    Ok(answer)
+                },
+            )
+            .unwrap();
+            (works, ran)
+        };
+        // A probe that timed out tells nothing, so it runs again next time.
+        assert_eq!(probe("slow", None), (None, true));
+        assert_eq!(probe("slow", Some(true)), (Some(true), true));
+        assert_eq!(probe("slow", None), (Some(true), false));
+        // A failure is believed for a while, then probed again.
+        assert_eq!(probe("busy", Some(false)), (Some(false), true));
+        assert_eq!(probe("busy", Some(true)), (Some(false), false));
+        with_probes(&exe, |probes| {
+            probes.encoders.get_mut("busy").unwrap().at_ms -= FAILURE_KEPT.as_millis() as u64;
+        });
+        assert_eq!(probe("busy", Some(true)), (Some(true), true));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(unix)]
+    fn tiny(width: u32, height: u32) -> Frame {
+        Frame {
+            id: 1,
+            width,
+            height,
+            pixel_format: RGB8,
+            timestamp_ns: 0,
+            data: vec![7; (width * height * 3) as usize],
+        }
+    }
+    #[cfg(unix)]
+    fn stream(encoder: &str, fps: f64) -> ForwardConfig {
+        ForwardConfig {
+            output: "tcp://127.0.0.1:9".into(),
+            codec: "h264".into(),
+            encoder: encoder.into(),
+            fps,
+            bitrate: "1M".into(),
+            storage: Default::default(),
+            max_file_bytes: default_recording_cap(),
+            destination: None,
+        }
+    }
+    #[cfg(unix)]
+    fn recording(path: &std::path::Path, encoder: &str) -> ForwardConfig {
+        ForwardConfig {
+            output: path.to_string_lossy().into(),
+            ..stream(encoder, 30.0)
+        }
+    }
+    /// Run the calling test again in a child process with its own session
+    /// directory, since recordings reserve storage in its ledger. True in
+    /// the child, which does the work.
+    #[cfg(unix)]
+    fn in_own_session(test: &str) -> bool {
+        if std::env::var_os("CAPTUREFAB_OWN_SESSION_TEST").is_some() {
+            return true;
+        }
+        let dir = temp_dir("session").join("session");
+        crate::ipc::ensure_private_dir(&dir).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("media::tests::{test}"), "--nocapture"])
+            .env("CAPTUREFAB_SESSION_DIR", &dir)
+            .env("CAPTUREFAB_OWN_SESSION_TEST", "1")
+            .output()
+            .unwrap();
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+    #[test]
+    #[cfg(unix)]
+    fn recordings_get_each_new_frame_once_on_the_wall_clock() {
+        if !in_own_session("recordings_get_each_new_frame_once_on_the_wall_clock") {
+            return;
+        }
+        let fake = Fake::new(
+            "unique",
+            r#"echo "$*" >> "$dir/argv"
+case "$*" in
+*-encoders*) printf ' V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*) cat ;;
+esac"#,
+        );
+        let output = fake.dir.join("unique.mkv");
+        let mut forward = Forwarder::new(recording(&output, "libx264")).unwrap();
+        for _ in 0..3 {
+            forward.push(tiny(8, 4)).unwrap();
+            thread::sleep(Duration::from_millis(200));
+        }
+        assert_eq!(forward.stats().written, 3);
+        assert!(!forward.stats().stalled);
+        thread::sleep(STALL);
+        assert!(forward.stats().stalled);
+        assert_eq!(forward.stats().written, 3);
+        forward.stop().unwrap();
+        // No repeated frames reach FFmpeg, and nothing fills the stall: the
+        // output keeps the time each frame arrived.
+        assert_eq!(fs::read(&output).unwrap().len(), 3 * 8 * 4 * 3);
+        assert_eq!(
+            fake.launches(&[
+                "-use_wallclock_as_timestamps 1 -i pipe:0",
+                "-fps_mode vfr",
+                "-preset ",
+                "-threads ",
+                "-x264-params force-cfr=0"
+            ]),
+            1
+        );
+        assert!(!fake.read("argv").contains(" -r "));
+    }
+    #[test]
+    #[cfg(unix)]
+    fn streams_get_the_last_frame_again_through_a_stall() {
+        let fake = Fake::new(
+            "repeat",
+            r#"case "$*" in
+*-encoders*) printf ' V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*) cat > "$dir/encoded" ;;
+esac"#,
+        );
+        let mut forward = Forwarder::new(stream("libx264", 20.0)).unwrap();
+        forward.push(tiny(8, 4)).unwrap();
+        thread::sleep(STALL + Duration::from_millis(500));
+        let stats = forward.stats();
+        // About 50 slots: receivers keep getting a picture.
+        assert!(stats.stalled && stats.written >= 30, "{stats:?}");
+        forward.stop().unwrap();
+        let sent = fake.read("encoded").len() as u64;
+        assert!(sent >= stats.written * 8 * 4 * 3, "{sent}");
+    }
+    #[test]
+    #[cfg(unix)]
+    fn a_recording_keeps_its_video_when_ffmpeg_must_be_stopped() {
+        if !in_own_session("a_recording_keeps_its_video_when_ffmpeg_must_be_stopped") {
+            return;
+        }
+        let fake = Fake::new(
+            "stuck",
+            r#"case "$*" in
+*-encoders*) printf ' V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*) head -c 10000 /dev/zero; cat > /dev/null; exec sleep 30 ;;
+esac"#,
+        );
+        let output = fake.dir.join("stuck.mkv");
+        let mut forward = Forwarder::new(recording(&output, "libx264")).unwrap();
+        forward.push(tiny(8, 4)).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let error = forward.stop().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("shutdown timed out"),
+            "{error:#}"
+        );
+        assert_eq!(forward.stats().recording.unwrap().bytes, 10_000);
+        assert_eq!(fs::read(&output).unwrap().len(), 10_000);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn a_resolution_change_stops_the_recording_with_a_reason() {
+        let _fake = Fake::new(
+            "resize",
+            r#"case "$*" in
+*-encoders*) printf ' V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*) cat > /dev/null ;;
+esac"#,
+        );
+        let mut forward = Forwarder::new(stream("libx264", 30.0)).unwrap();
+        forward.push(tiny(8, 4)).unwrap();
+        let error = forward.push(tiny(16, 8)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the camera's resolution changed from 8x4 to 16x8; start a new recording to continue"
+        );
+        forward.stop().unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn encoder_probes_run_once_per_process() {
+        let first = encoder_candidates("h264")[0];
+        let fake = Fake::new(
+            "memo",
+            &format!(
+                r#"echo "$*" >> "$dir/argv"
+case "$*" in
+*-encoders*) printf ' V....D {first} first (codec h264)\n V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*) cat > /dev/null ;;
+esac"#
+            ),
+        );
+        let mut probes = 0;
+        for _ in 0..3 {
+            let mut forward = Forwarder::new(stream("auto", 30.0)).unwrap();
+            forward.push(tiny(16, 16)).unwrap();
+            forward.stop().unwrap();
+            assert_eq!(forward.stats().encoder, first);
+            if probes == 0 {
+                probes = fake.launches(&["-f null"]);
+            }
+        }
+        // One listing, and one probe for each encoder, input and size; later
+        // recordings only launch their encoder.
+        assert_eq!(fake.launches(&["-encoders"]), 1);
+        assert_eq!(fake.launches(&["size=640x480", "-f null"]), 1);
+        assert!(fake.launches(&["size=16x16", "-f null"]) >= 1);
+        assert_eq!(fake.launches(&["-f null"]), probes);
+        assert_eq!(fake.launches(&["pipe:0"]), 3);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn codecs_without_a_working_encoder_fail_before_recording() {
+        let _fake = Fake::new(
+            "unsupported",
+            r#"case "$*" in
+*-encoders*) printf ' V....D libx264 x264 (codec h264)\n V....D hevc_bogus bogus (codec hevc)\n' ;;
+*"-c:v hevc_bogus"*) exit 1 ;;
+esac"#,
+        );
+        let mut config = stream("auto", 30.0);
+        config.codec = "hevc".into();
+        let error = Forwarder::new(config).err().unwrap();
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with("hevc recording is not supported on this host"),
+            "{message}"
+        );
+        assert!(message.contains("working codecs: h264."), "{message}");
+        assert_eq!(crate::cli::error_code(&error), ("unsupported", 5));
+    }
+    #[test]
+    #[cfg(unix)]
+    fn a_stream_whose_encoder_exits_does_not_fall_back() {
+        let first = encoder_candidates("h264")[0];
+        let fake = Fake::new(
+            "stream-exit",
+            &format!(
+                r#"echo "$*" >> "$dir/argv"
+case "$*" in
+*-encoders*) printf ' V....D {first} first (codec h264)\n V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*) echo 'Connection refused' >&2; exit 1 ;;
+esac"#
+            ),
+        );
+        let mut forward = Forwarder::new(stream("auto", 30.0)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while forward.push(tiny(16, 16)).is_ok() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(30));
+        }
+        let _ = forward.stop();
+        assert_eq!(fake.launches(&["pipe:0"]), 1);
+        assert_eq!(fake.launches(&["-c:v libx264", "pipe:0"]), 0);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn an_encoder_that_exits_at_start_falls_back_once_to_a_new_file() {
+        if !in_own_session("an_encoder_that_exits_at_start_falls_back_once_to_a_new_file") {
+            return;
+        }
+        let first = encoder_candidates("h264")[0];
+        let fake = Fake::new(
+            "fallback",
+            &format!(
+                r#"echo "$*" >> "$dir/argv"
+case "$*" in
+*-encoders*) printf ' V....D {first} first (codec h264)\n V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*"-c:v {first}"*) printf 'partial' ; exit 1 ;;
+*"-c:v libx264"*) [ -e "$dir/x264-fails" ] && exit 1; cat ;;
+esac"#
+            ),
+        );
+        let output = fake.dir.join("clip.mkv");
+        let mut config = stream("auto", 30.0);
+        config.output = output.to_string_lossy().into();
+        let mut forward = Forwarder::new(config.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while forward.stats().encoder != "libx264" || forward.stats().written < 2 {
+            assert!(Instant::now() < deadline, "{:?}", forward.stats());
+            forward.push(tiny(16, 16)).unwrap();
+            thread::sleep(Duration::from_millis(30));
+        }
+        forward.stop().unwrap();
+        // The failed encoder's bytes never reach the new file.
+        let written = forward.stats().written as usize;
+        assert_eq!(fs::read(&output).unwrap().len(), written * 16 * 16 * 3);
+        assert_eq!(fake.launches(&[&format!("-c:v {first}"), "pipe:0"]), 1);
+        assert_eq!(fake.launches(&["-c:v libx264", "pipe:0"]), 1);
+        // A second early exit is reported instead of trying again.
+        fs::write(fake.dir.join("x264-fails"), b"").unwrap();
+        config.output = fake.dir.join("again.mkv").to_string_lossy().into();
+        let mut forward = Forwarder::new(config).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while forward.push(tiny(32, 32)).is_ok() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(30));
+        }
+        let _ = forward.stop();
+        assert_eq!(fake.launches(&[&format!("-c:v {first}"), "pipe:0"]), 2);
+        assert_eq!(fake.launches(&["-c:v libx264", "pipe:0"]), 2);
+        assert!(!fake.dir.join("again.mkv").exists());
+    }
+    #[test]
+    #[cfg(unix)]
+    fn an_encoder_that_fails_after_writing_video_keeps_it_instead_of_falling_back() {
+        if !in_own_session(
+            "an_encoder_that_fails_after_writing_video_keeps_it_instead_of_falling_back",
+        ) {
+            return;
+        }
+        let first = encoder_candidates("h264")[0];
+        let fake = Fake::new(
+            "late-failure",
+            &format!(
+                r#"echo "$*" >> "$dir/argv"
+case "$*" in
+*-encoders*) printf ' V....D {first} first (codec h264)\n V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*"-c:v {first}"*) head -c 10000 /dev/zero; exit 1 ;;
+*) cat ;;
+esac"#
+            ),
+        );
+        let output = fake.dir.join("late.mkv");
+        let mut forward = Forwarder::new(recording(&output, "auto")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while forward.push(tiny(16, 16)).is_ok() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(30));
+        }
+        forward.stop().unwrap();
+        let stats = forward.stats();
+        assert!(stats.error.is_some(), "{stats:?}");
+        assert_eq!(stats.recording.unwrap().bytes, 10_000);
+        assert_eq!(fs::read(&output).unwrap().len(), 10_000);
+        assert_eq!(fake.launches(&["-c:v libx264", "pipe:0"]), 0);
+    }
     #[test]
     fn ppm_preserves_whitespace_pixels_and_multiple_frames() {
         let mut bytes = b"P6\n2 1\n255\n".to_vec();
@@ -3390,6 +5490,173 @@ mod tests {
         fs::remove_dir(dir).unwrap();
     }
     #[test]
+    #[ignore = "requires FFmpeg with libx264; loads every core for about 10 s"]
+    fn ffmpeg_recording_lasts_as_long_as_the_wall_clock_under_load() {
+        let dir = temp_dir("timeline");
+        let output = dir.join("load.mkv");
+        let busy = Arc::new(AtomicBool::new(true));
+        let hogs = (0..cores() * 2)
+            .map(|_| {
+                let busy = busy.clone();
+                thread::spawn(move || {
+                    let mut x = 1u64;
+                    while busy.load(Ordering::Relaxed) {
+                        x = std::hint::black_box(x.wrapping_mul(6364136223846793005) + 1);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut forward = Forwarder::new(ForwardConfig {
+            output: output.to_string_lossy().into(),
+            codec: "h264".into(),
+            encoder: "libx264".into(),
+            fps: 30.0,
+            bitrate: "8M".into(),
+            storage: Default::default(),
+            max_file_bytes: default_recording_cap(),
+            destination: None,
+        })
+        .unwrap();
+        let (width, height) = (1920usize, 1080usize);
+        // Moving content keeps the encoder busy.
+        let pictures = (0..8u8)
+            .map(|shift| {
+                (0..width * height * 3)
+                    .map(|i| (i / 3 % width) as u8 ^ (i / (3 * width)) as u8 ^ (shift * 32))
+                    .collect::<Vec<u8>>()
+            })
+            .collect::<Vec<_>>();
+        let interval = Duration::from_secs_f64(1.0 / 30.0);
+        let mut next = Instant::now();
+        let mut started = None;
+        for id in 0u64.. {
+            forward
+                .push(Frame {
+                    id,
+                    width: width as u32,
+                    height: height as u32,
+                    pixel_format: RGB8,
+                    timestamp_ns: 0,
+                    data: pictures[id as usize % pictures.len()].clone(),
+                })
+                .unwrap();
+            // The recording starts when FFmpeg takes its first frame.
+            if started.is_none() && forward.stats().written > 0 {
+                started = Some(Instant::now());
+            }
+            if started.is_some_and(|started| started.elapsed() >= Duration::from_secs(10)) {
+                break;
+            }
+            next += interval;
+            thread::sleep(next.saturating_duration_since(Instant::now()));
+        }
+        let wall = started.unwrap().elapsed().as_secs_f64();
+        let stats = forward.stats();
+        forward.stop().unwrap();
+        busy.store(false, Ordering::Relaxed);
+        for hog in hogs {
+            hog.join().unwrap();
+        }
+        let (frames, duration) = recorded(&output);
+        eprintln!(
+            "wall {wall:.3} s, file {duration:.3} s, frames {frames}, accepted {}, written {}, late {}",
+            stats.accepted, stats.written, stats.late
+        );
+        assert!(
+            (duration - wall).abs() / wall < 0.02,
+            "{duration} vs {wall}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+    /// A recording's frame count and the seconds its packets span.
+    fn recorded(path: &std::path::Path) -> (usize, f64) {
+        let exe = executable().unwrap();
+        let args = ["-hide_banner", "-i", path.to_str().unwrap()]
+            .into_iter()
+            .chain(["-c", "copy", "-f", "framecrc", "-"])
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let (ok, log) = bounded_output(&exe, &args, Duration::from_secs(60)).unwrap();
+        assert!(ok, "{log}");
+        let base = log
+            .lines()
+            .find_map(|line| line.strip_prefix("#tb 0: "))
+            .and_then(|base| base.split_once('/'))
+            .map(|(num, den)| {
+                num.trim().parse::<f64>().unwrap() / den.trim().parse::<f64>().unwrap()
+            })
+            .unwrap();
+        // stream, dts, pts, duration, size, checksum
+        let packets = log
+            .lines()
+            .filter(|line| line.starts_with("0,"))
+            .map(|line| {
+                let fields = line.split(',').map(str::trim).collect::<Vec<_>>();
+                let number = |index: usize| fields[index].parse::<f64>().unwrap();
+                (number(2), number(2) + number(3))
+            })
+            .collect::<Vec<_>>();
+        let start = packets.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+        let end = packets.iter().map(|p| p.1).fold(0.0, f64::max);
+        (packets.len(), (end - start) * base)
+    }
+    #[test]
+    #[ignore = "requires FFmpeg with libx264"]
+    fn ffmpeg_recording_leaves_a_gap_for_a_stall_and_stops_at_once() {
+        let dir = temp_dir("gap");
+        let output = dir.join("gap.mkv");
+        let mut forward = Forwarder::new(ForwardConfig {
+            output: output.to_string_lossy().into(),
+            codec: "h264".into(),
+            encoder: "libx264".into(),
+            fps: 30.0,
+            bitrate: "4M".into(),
+            storage: Default::default(),
+            max_file_bytes: default_recording_cap(),
+            destination: None,
+        })
+        .unwrap();
+        let (width, height) = (1280usize, 720usize);
+        let push = |forward: &mut Forwarder, id: u64| {
+            forward
+                .push(Frame {
+                    id,
+                    width: width as u32,
+                    height: height as u32,
+                    pixel_format: RGB8,
+                    timestamp_ns: 0,
+                    data: vec![(id * 8) as u8; width * height * 3],
+                })
+                .unwrap();
+            thread::sleep(Duration::from_secs_f64(1.0 / 30.0));
+        };
+        let started = Instant::now();
+        for id in 0..30 {
+            push(&mut forward, id);
+        }
+        // The camera is gone for 8 s, then returns.
+        thread::sleep(Duration::from_secs(8));
+        let resumed = Instant::now();
+        for id in 30..60 {
+            push(&mut forward, id);
+        }
+        let catching_up = resumed.elapsed();
+        let wall = started.elapsed().as_secs_f64();
+        let stopping = Instant::now();
+        forward.stop().unwrap();
+        let stopped = stopping.elapsed();
+        let (frames, duration) = recorded(&output);
+        eprintln!(
+            "wall {wall:.3} s, file {duration:.3} s, frames {frames}, resumed in {catching_up:?}, stopped in {stopped:?}"
+        );
+        // Each frame once, the outage a gap rather than copies to encode.
+        assert!(frames <= 60, "{frames}");
+        assert!((duration - wall).abs() < 0.5, "{duration} vs {wall}");
+        assert!(catching_up < Duration::from_secs(2), "{catching_up:?}");
+        assert!(stopped < Duration::from_secs(2), "{stopped:?}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     #[ignore = "requires FFmpeg and permission to bind localhost sockets"]
     fn ffmpeg_stalled_network_input_times_out_and_cancels() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3499,6 +5766,12 @@ mod tests {
     #[test]
     #[ignore = "requires FFmpeg"]
     fn ffmpeg_local_recording_reservation_is_bounded_and_removed_on_failure() {
+        // A full disk is not an encoder failure, so auto does not fall back.
+        for encoder in ["libx264", "auto"] {
+            bounded_recording_is_removed_on_failure(encoder);
+        }
+    }
+    fn bounded_recording_is_removed_on_failure(encoder: &str) {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3507,7 +5780,7 @@ mod tests {
         let mut forward = Forwarder::new(ForwardConfig {
             output: path.to_string_lossy().into(),
             codec: "h264".into(),
-            encoder: "libx264".into(),
+            encoder: encoder.into(),
             fps: 30.0,
             bitrate: "1M".into(),
             storage: Default::default(),
@@ -3529,8 +5802,10 @@ mod tests {
             let _ = forward.push(frame.clone());
             thread::sleep(Duration::from_millis(20));
         }
+        let encoder = forward.stats().encoder;
         let error = forward.stop().unwrap_err().to_string();
         assert!(error.contains("Storage full"), "{error}");
+        assert_eq!(forward.stats().encoder, encoder);
         assert!(
             !path.exists(),
             "over-limit partial recordings must be removed"
@@ -3675,6 +5950,9 @@ Error opening input files: Input/output error
             modes,
             mode: None,
             formats: Vec::new(),
+            reconnect: None,
+            paced: true,
+            on_demand: None,
         }
     }
     #[test]
@@ -3883,14 +6161,12 @@ Error opening input files: Input/output error
     #[test]
     #[cfg(unix)]
     fn discovery_command_distinguishes_timeout_from_expected_nonzero_exit() {
-        let exe = Executable {
-            path: "/bin/sh".into(),
-            directory: None,
-        };
+        let exe = Executable::external("/bin/sh".into());
         let start = Instant::now();
         let (success, _, timed_out) = timed_output(
             &exe,
             &["-c".into(), "exec sleep 5".into()],
+            &[],
             Duration::from_millis(50),
         )
         .unwrap();
@@ -3900,6 +6176,7 @@ Error opening input files: Input/output error
         let (success, log, timed_out) = timed_output(
             &exe,
             &["-c".into(), "echo devices; exit 1".into()],
+            &[],
             Duration::from_secs(2),
         )
         .unwrap();
