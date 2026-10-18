@@ -1,6 +1,6 @@
 //! Camera hubs: saved Home Assistant, Frigate, go2rtc and UniFi Protect
 //! servers whose cameras open as `hub:NAME/CAMERA`. The saved settings
-//! (`hubs.json` in the session directory) never hold secrets; tokens and
+//! (`hubs.json` in the state directory) never hold secrets; tokens and
 //! passwords come from the OS credential store or a `CAPTUREFAB_HUB_*`
 //! environment variable in the process that opens or lists the camera.
 //!

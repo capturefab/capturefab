@@ -310,6 +310,15 @@ struct RtspSession {
     last: Instant,
 }
 
+#[cfg(all(test, unix))]
+pub(crate) fn rtsp_session_for_test(backend: Box<dyn Backend>, label: &str) -> impl FrameSession {
+    RtspSession {
+        backend,
+        label: label.into(),
+        last: Instant::now(),
+    }
+}
+
 impl FrameSession for RtspSession {
     fn next(&mut self, cx: &Cx) -> Result<Next, Failure> {
         loop {
@@ -322,10 +331,15 @@ impl FrameSession for RtspSession {
                     return Ok(Next::Frame(frame));
                 }
                 Err(error)
-                    if error
-                        .chain()
-                        .any(|cause| cause.is::<crate::media::StreamEnded>()) =>
+                    if crate::media::stream_end(&error).is_some()
+                        || error
+                            .chain()
+                            .any(|cause| cause.is::<crate::media::StreamEnded>()) =>
                 {
+                    // MediaBackend reports network decoder exits as a
+                    // stream end. Hand that failure to the pump, which
+                    // owns hub cancellation and reconnect backoff, before
+                    // MediaBackend runs its own reconnect loop.
                     return Err(Failure::transient(
                         ErrorKind::OperationFailed,
                         format!("the RTSP restream of {} ended", self.label),

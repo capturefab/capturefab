@@ -476,6 +476,24 @@ fn hub_cameras_capture_from_mjpeg_and_snapshots() {
         &snapshot,
     ]);
     assert!(out.join("s-0002.png").exists());
+    // Stdout captures retrieve the forced full-size frame from the worker's
+    // anonymous ring even though no live preview is watching it.
+    let stdout = bench.run(&[
+        "--camera",
+        "hub:home/camera.garage?stream=snapshot&fps=2",
+        "capture",
+        "-n",
+        "1",
+        "-f",
+        "png",
+        "-o",
+        "-",
+    ]);
+    assert!(stdout.status.success(), "{:?}", stdout.stderr);
+    let image = png::Decoder::new(std::io::Cursor::new(&stdout.stdout))
+        .read_info()
+        .unwrap();
+    assert_eq!((image.info().width, image.info().height), (64, 36));
     let (exit, _, message) = bench.fails(&["--camera", "hub:home/camera.attic", "info"]);
     assert_eq!(exit, 3, "{message}");
     assert!(message.contains("not found on hub home"), "{message}");

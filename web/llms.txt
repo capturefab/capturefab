@@ -53,7 +53,8 @@ Binary image stdout, raw XML, completions, help and version output use their com
 
 Plain `doctor` checks the host and prints a fix for each warning.
 `doctor --json` adds `host`, `efficiency`, `paths`, `limits`, `graphics` and `checks` (`{id,level,message,fix}`).
-`doctor --json` reports `runtime_directory` (sessions; `session_directory` is the same) and `state_directory` (settings, destinations, upload queue, storage ledger); on Linux state is in `~/.local/state/capturefab` and survives reboots, and state an older version left in another folder moves there once or is named by the `old_state` check.
+`doctor --json` reports `runtime_directory` (sessions; `session_directory` is the same) and `state_directory` (settings, saved hubs and destinations, upload queue, storage ledger); on Linux state is in `~/.local/state/capturefab` and survives reboots, and state an older version left in another folder moves there once or is named by the `old_state` check.
+`cache_directory` holds extracted FFmpeg, encoder probes and Linux dataset staging; `CAPTUREFAB_CACHE_DIR` overrides it.
 `--efficiency auto|smooth|efficient` or `CAPTUREFAB_EFFICIENCY` sets efficiency mode for a process and the camera workers it starts, over Settings > Performance, which only the desktop window reads; `doctor` reports the mode in force and why.
 Workers follow a change in their session's mode for decoders they start afterwards; efficient halves how often a session polls its workers for status.
 Auto is efficient with at most 2 CPU cores or 2 GiB of memory, in the OS low-power mode, or on a desktop hint such as software rendering or a preview falling behind.

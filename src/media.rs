@@ -4565,6 +4565,53 @@ esac"#,
         camera.stop().unwrap();
     }
     #[test]
+    #[cfg(all(unix, feature = "hubs"))]
+    fn hub_restreams_return_decoder_exits_to_their_pump() {
+        use crate::hubs::pump::{Cx, FrameSession, Next};
+        use crate::types::ErrorKind;
+
+        let fake = Fake::new(
+            "hub-reconnect",
+            r#"case "$*" in *rtsp*) ;; *) exit 0 ;; esac
+echo launch >> "$dir/launches"
+printf 'P6\n2 2\n255\n'
+head -c 12 /dev/zero
+echo 'Error during demuxing: Operation timed out' >&2
+exit 1"#,
+        );
+        let mut backend = open_url("rtsp://127.0.0.1:9/live", Duration::from_secs(2)).unwrap();
+        backend.start(12).unwrap();
+        let mut session = crate::hubs::sources::rtsp_session_for_test(backend, "hub:test/live");
+        let cx = Cx::new();
+        let Next::Frame(frame) = session.next(&cx).unwrap() else {
+            panic!("restream did not deliver its first frame");
+        };
+        assert_eq!((frame.width, frame.height), (2, 2));
+
+        let started = Instant::now();
+        let failure = match session.next(&cx) {
+            Err(failure) => failure,
+            Ok(_) => panic!("ended restream did not return its failure"),
+        };
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(failure.kind, ErrorKind::OperationFailed);
+        assert_eq!(failure.message, "the RTSP restream of hub:test/live ended");
+        // An ordinary transient failure takes the pump's reconnect backoff;
+        // it must not run MediaBackend's reconnect loop inside the pump.
+        assert!(!failure.permanent && !failure.quiet);
+        assert_eq!(fake.read("launches").lines().count(), 1);
+
+        cx.cancel.cancel();
+        let started = Instant::now();
+        let cancelled = match session.next(&cx) {
+            Err(failure) => failure,
+            Ok(_) => panic!("cancelled restream kept reading"),
+        };
+        assert_eq!(cancelled.message, "cancelled");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(fake.read("launches").lines().count(), 1);
+    }
+    #[test]
     fn reconnecting_stops_after_repeated_refusals() {
         let mut camera = native("rtsp://camera/live", Vec::new());
         camera.native = false;
@@ -5254,10 +5301,7 @@ esac"#
     }
     #[test]
     fn ffmpeg_never_inherits_hub_secrets() {
-        let exe = Executable {
-            path: "ffmpeg".into(),
-            directory: None,
-        };
+        let exe = Executable::external("ffmpeg".into());
         // SAFETY: tests that read this variable do not run concurrently with
         // it, and no other thread depends on its absence.
         unsafe { std::env::set_var("CAPTUREFAB_HUB_TEST_SECRET", "CANARY") };
