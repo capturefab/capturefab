@@ -999,3 +999,36 @@ fn browser_capture_schedule_preview_and_local_cli_share_a_session() {
         1
     );
 }
+
+#[test]
+fn frame_inspection_over_http_returns_measurements_and_an_image() {
+    let fixture = Fixture::start();
+    fixture.command(
+        None,
+        json!({"op":"connect","camera":"sim:0","timeout_ms":2000}),
+    );
+    let inspected = fixture.command(
+        Some("sim:0"),
+        json!({"op":"frame","fresh":1,"max_dimension":128}),
+    );
+    assert_eq!(inspected["frame"]["source"], "grab");
+    assert_eq!(inspected["image"]["mime"], "image/jpeg");
+    assert_eq!(inspected["image"]["width"], 128);
+    assert!(inspected["image"]["base64"].as_str().unwrap().len() > 100);
+    assert!(inspected["exposure"]["mean"].as_f64().unwrap() > 0.0);
+    let origin = format!("http://{}", fixture.address);
+    for (command, status) in [
+        (json!({"op":"frame","max_dimension":1}), 400),
+        (json!({"op":"grab","timeout_ms":1000}), 409),
+    ] {
+        let body = json!({"version":1,"camera":"sim:0","command":command});
+        let response = fixture.http(
+            "POST",
+            "/api/command",
+            Some(&origin),
+            &serde_json::to_vec(&body).unwrap(),
+        );
+        assert_eq!(response.status, status, "{command}");
+        assert_eq!(response.json()["ok"], false);
+    }
+}

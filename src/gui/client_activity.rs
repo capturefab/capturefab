@@ -663,6 +663,7 @@ fn matches_job(entry: &SessionActivity, job: &Job) -> bool {
         Job::SignalStart => entry.operation == "signal_start",
         Job::SignalStop => entry.operation == "signal_stop",
         Job::Set(feature) => entry.operation == "set" && entry.feature.as_ref() == Some(feature),
+        Job::SetMany => entry.operation == "set_many",
         Job::Execute(feature) => {
             entry.operation == "execute" && entry.feature.as_ref() == Some(feature)
         }

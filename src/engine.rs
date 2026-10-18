@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::session::{LogEntry, SessionCommand, SessionSnapshot};
+use crate::session::{FeatureValue, LogEntry, SessionCommand, SessionSnapshot};
 mod history;
 mod network_defaults;
 #[cfg(test)]
@@ -182,11 +182,17 @@ impl WorkerHandle {
             message,
         );
     }
-    /// Publish the latest frame. With a shared ring the frame is copied into
-    /// it and handed back, so a consumer such as the forwarder can take its
-    /// buffer; without one it is retained here.
+    /// Publish the latest frame and let auto capture observe it. With a
+    /// shared ring the frame is copied into it and handed back, so a
+    /// consumer such as the forwarder can take its buffer; without one it is
+    /// retained here.
     fn record(&self, frame: Frame) -> Option<Frame> {
         self.observe_capture(&frame);
+        self.publish_frame(frame)
+    }
+    /// Publish a frame without showing it to auto capture: an inspection
+    /// must not add captures or background to a capture session.
+    fn publish_frame(&self, frame: Frame) -> Option<Frame> {
         if let Some(ring) = &self.ring
             && let Err(e) = ring.lock().unwrap_or_else(|e| e.into_inner()).write(&frame)
         {
@@ -316,6 +322,9 @@ fn camera_mut(camera: &mut Option<Camera>) -> Result<&mut Camera> {
         .as_mut()
         .context("no camera connected; select --camera or use connect in a session")
 }
+/// The whole error of a `Grab` that received no frame before its deadline.
+/// The coordinator explains it; every other failure keeps its own cause.
+pub(crate) const GRAB_TIMEOUT: &str = "frame timeout";
 fn timed_out(e: &anyhow::Error) -> bool {
     let message = format!("{e:#}").to_ascii_lowercase();
     message.contains("timeout") || message.contains("timed out")
@@ -348,6 +357,90 @@ fn next_frame(
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Let auto exposure settle on a camera that has just started, publishing
+/// the frames it meters, for at most half of `timeout` and 3 s. False when
+/// it had not settled by then. Auto capture observes those frames when
+/// `observe` is set.
+fn settle_auto(
+    h: &WorkerHandle,
+    c: &mut Camera,
+    auto: &mut Option<AutoController>,
+    timeout: Duration,
+    observe: bool,
+) -> Result<bool> {
+    // Refresh the controller's streaming state before testing convergence:
+    // a previously stable acquisition must settle again after a restart.
+    if let Some(a) = auto.as_mut() {
+        a.tick(c, Instant::now());
+        publish_auto(h, a);
+    }
+    let until = Instant::now() + (timeout / 2).min(Duration::from_secs(3));
+    while auto.as_ref().is_some_and(|a| !a.converged()) {
+        let Some(frame) = next_frame(h, c, auto, until)? else {
+            return Ok(false);
+        };
+        let _ = if observe {
+            h.record(frame)
+        } else {
+            h.publish_frame(frame)
+        };
+    }
+    Ok(true)
+}
+
+/// Write `values` in order, each as Set would: later values may depend on
+/// earlier ones (a selector, then the value it selects). `checkpoint` runs
+/// just before each write, with the bank that write changes selected, so
+/// camera history can record the value it replaces.
+fn set_many(
+    h: &WorkerHandle,
+    camera: &mut Option<Camera>,
+    auto: &mut Option<AutoController>,
+    values: &[FeatureValue],
+    mut checkpoint: impl FnMut(&mut Camera, &str) -> Result<()>,
+) -> Result<Value> {
+    let mut switched = false;
+    let written = (|| -> Result<Vec<Value>> {
+        let mut written = Vec::with_capacity(values.len());
+        for FeatureValue { feature, value } in values {
+            camera_mut(camera)?.validate_set(feature, value)?;
+            if auto.as_ref().is_some_and(|a| a.manages(feature)) {
+                release_auto(h, auto, camera, false)?;
+                switched = true;
+                h.log(
+                    "info",
+                    format!("Switched to manual mode because {feature} was set"),
+                );
+            } else if let Some(a) = auto.as_mut() {
+                a.invalidate();
+            }
+            let c = camera_mut(camera)?;
+            checkpoint(c, feature)?;
+            c.set(feature, value)?;
+            written.push(json!({"name":feature,"value":c.get(feature)?}));
+        }
+        Ok(written)
+    })();
+    refresh(h, camera, true);
+    let written = written?;
+    h.log(
+        "info",
+        format!(
+            "Set {}",
+            values
+                .iter()
+                .map(|v| format!("{} = {}", v.feature, v.value))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    );
+    let mut reply = json!({"values":written});
+    if switched {
+        reply["auto"] = Value::Null;
+    }
+    Ok(reply)
 }
 
 /// Add a line to the worker's log; an error also becomes its `last_error`.
@@ -651,6 +744,38 @@ fn process_plain(
             stopped?;
             Ok(value)
         }
+        SessionCommand::Grab { timeout_ms } => {
+            let c = camera_mut(camera)?;
+            ensure!(
+                !c.is_scanner(),
+                "a document scanner cannot be inspected without scanning a page"
+            );
+            let duration = timeout(timeout_ms)?;
+            let was_streaming = c.is_streaming();
+            c.start()?;
+            // Capture without a file, name, capture-session example,
+            // auto-capture observation or log line: the frame only reaches
+            // the shared ring.
+            let result = (|| -> Result<Value> {
+                let settled =
+                    was_streaming || auto.is_none() || settle_auto(h, c, auto, duration, false)?;
+                c.request_frame()?;
+                let frame =
+                    next_frame(h, c, auto, Instant::now() + duration)?.context(GRAB_TIMEOUT)?;
+                let mut value = json!({"frame":frame});
+                if !settled {
+                    value["auto_settled"] = json!(false);
+                }
+                let _ = h.publish_frame(frame);
+                Ok(value)
+            })();
+            let stopped = if !was_streaming { c.stop() } else { Ok(()) };
+            refresh(h, camera, false);
+            let value = result?;
+            stopped?;
+            Ok(value)
+        }
+        SessionCommand::Frame { .. } => anyhow::bail!("frames belong to the coordinator"),
         SessionCommand::CaptureReview { id } => {
             use base64::Engine;
             let guard = h.capture_session.lock().unwrap_or_else(|e| e.into_inner());
@@ -941,6 +1066,8 @@ fn process_plain(
             }
             Ok(reply)
         }
+        // Camera history checkpoints each write; see `set_many`.
+        SessionCommand::SetMany { values } => set_many(h, camera, auto, &values, |_, _| Ok(())),
         SessionCommand::Execute { feature } => {
             if auto.is_some() && matches!(feature.as_str(), "UserSetLoad" | "UserSetDefault") {
                 release_auto(h, auto, camera, false)?;
@@ -1166,24 +1293,11 @@ fn process_plain(
                 let mut frames = Vec::new();
                 let mut status = None;
                 let mut queued = Vec::new();
-                if !was_streaming && auto.is_some() {
-                    // Refresh the controller's streaming state before testing convergence:
-                    // a previously stable acquisition must settle again after a restart.
-                    if let Some(a) = auto.as_mut() {
-                        a.tick(c, Instant::now());
-                        publish_auto(h, a);
-                    }
-                    let until = Instant::now() + (duration / 2).min(Duration::from_secs(3));
-                    while auto.as_ref().is_some_and(|a| !a.converged()) {
-                        let Some(frame) = next_frame(h, c, auto, until)? else {
-                            h.log(
-                                "warn",
-                                "Auto exposure had not settled; capturing anyway".into(),
-                            );
-                            break;
-                        };
-                        let _ = h.record(frame);
-                    }
+                if !was_streaming && auto.is_some() && !settle_auto(h, c, auto, duration, true)? {
+                    h.log(
+                        "warn",
+                        "Auto exposure had not settled; capturing anyway".into(),
+                    );
                 }
                 let label = crate::naming::camera_label(&c.info);
                 let plan = crate::naming::Plan::new(&resolved.output, count, &format);
@@ -1695,6 +1809,9 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
             rx.recv_timeout(Duration::from_millis(100)).ok()
         };
         if let Some(e) = envelope {
+            // An inspection's failure is its caller's to report: a slow or
+            // triggered camera must not fill the log or set `last_error`.
+            let inspection = matches!(e.command, SessionCommand::Grab { .. });
             let result = process(
                 &h,
                 &mut camera,
@@ -1705,7 +1822,9 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
                 &mut scheduled_stream,
                 e.command,
             );
-            if let Err(err) = &result {
+            if let Err(err) = &result
+                && !inspection
+            {
                 h.log("error", format!("{err:#}"));
             }
             let _ = e.reply.send(result);
@@ -2356,6 +2475,179 @@ mod tests {
     fn auto(h: &WorkerHandle, balance: Option<f64>) -> Result<Value> {
         h.request(SessionCommand::Auto { balance })
     }
+    fn set(h: &WorkerHandle, feature: &str, value: &str) {
+        h.request(SessionCommand::Set {
+            feature: feature.into(),
+            value: value.into(),
+        })
+        .unwrap();
+    }
+    fn grab(h: &WorkerHandle) -> Value {
+        h.request(SessionCommand::Grab { timeout_ms: 2000 })
+            .unwrap()
+    }
+    /// What an inspection of the camera's newest frame would measure.
+    fn measured(h: &WorkerHandle) -> crate::inspect::Measurements {
+        let frame = h.latest_frame().unwrap();
+        let kind = h.snapshot().connected.unwrap().profile.kind;
+        crate::inspect::measure(&frame, kind, [0, 0, frame.width, frame.height])
+    }
+    #[test]
+    fn grab_publishes_one_frame_and_leaves_a_stopped_camera_stopped() {
+        let dir = temp_dir("grab");
+        let path = dir.join("ring.shm");
+        let ring = crate::shared_memory::SharedRing::create(&path, 1024 * 1024).unwrap();
+        let mut reader = crate::shared_memory::SharedRing::open(&path).unwrap();
+        let h = WorkerHandle::with_ring(Arc::new(Mutex::new(ring)));
+        connect(&h, "1000");
+        let history = h.snapshot().history.entries.len();
+        assert!(!h.snapshot().streaming);
+        let grabbed = grab(&h);
+        assert_eq!(grabbed["frame"]["width"], 128);
+        assert!(grabbed.get("auto_settled").is_none(), "{grabbed}");
+        assert!(grabbed.get("files").is_none() && grabbed.get("camera_change").is_none());
+        let snapshot = h.snapshot();
+        assert!(!snapshot.streaming);
+        assert_eq!(snapshot.frames, 1);
+        assert_eq!(snapshot.history.entries.len(), history);
+        assert!(
+            !snapshot
+                .logs
+                .iter()
+                .any(|entry| entry.message.starts_with("Captured"))
+        );
+        // Exactly one frame reached the ring, and nothing else was written.
+        assert_eq!(reader.sequence(), 1);
+        let frame = reader.take_latest().unwrap().unwrap();
+        assert_eq!(grabbed["frame"]["id"], frame.id);
+        assert_eq!(
+            (frame.width, frame.height, frame.data.len()),
+            (128, 128, 128 * 128)
+        );
+        assert!(h.take_saved(10).is_empty());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        // A streaming camera keeps streaming.
+        h.request(SessionCommand::Start).unwrap();
+        grab(&h);
+        assert!(h.snapshot().streaming);
+        h.shutdown();
+        drop(reader);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn grab_settles_auto_exposure_on_a_stopped_camera_first() {
+        let h = WorkerHandle::new();
+        connect(&h, "1000");
+        auto(&h, None).unwrap();
+        let grabbed = grab(&h);
+        // Frames metered while settling are published too.
+        assert!(h.snapshot().frames >= 1);
+        assert!(!h.snapshot().streaming);
+        if grabbed.get("auto_settled").is_some() {
+            assert_eq!(grabbed["auto_settled"], false);
+        } else {
+            assert!(h.snapshot().auto.unwrap().state != "converging");
+        }
+        h.shutdown();
+    }
+    #[test]
+    fn grab_frames_never_reach_auto_capture() {
+        let dir = temp_dir("grab-auto-capture");
+        let h = WorkerHandle::new();
+        connect(&h, "1000");
+        h.request(SessionCommand::CaptureSessionOpen {
+            path: dir.join("session.duckdb").to_string_lossy().into_owned(),
+            create: true,
+            encoder: Some(crate::autocapture::EncoderChoice::Native),
+        })
+        .unwrap();
+        // Enabling auto capture starts the camera; it stays armed when stopped.
+        h.request(SessionCommand::AutoCapture {
+            enabled: true,
+            sensitivity: 0.5,
+            cooldown_ms: 250,
+        })
+        .unwrap();
+        h.request(SessionCommand::Stop).unwrap();
+        let sampled = || {
+            h.capture_session
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .sampled_at()
+        };
+        let before = sampled();
+        // Past the sampling interval, so an observed frame would be sampled.
+        std::thread::sleep(Duration::from_millis(300));
+        grab(&h);
+        assert_eq!(sampled(), before);
+        // Nor do the frames auto exposure meters while it settles.
+        auto(&h, None).unwrap();
+        grab(&h);
+        assert!(h.snapshot().frames >= 2);
+        assert_eq!(sampled(), before);
+        assert!(h.snapshot().capture_session.unwrap().enabled);
+        h.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn failed_grabs_leave_the_log_and_last_error_alone() {
+        let h = WorkerHandle::new();
+        let logs = h.snapshot().logs.len();
+        // Without a camera, a grab fails like a missed frame would.
+        assert!(h.request(SessionCommand::Grab { timeout_ms: 10 }).is_err());
+        let snapshot = h.snapshot();
+        assert_eq!(snapshot.logs.len(), logs);
+        assert!(snapshot.last_error.is_none());
+        // Other failures are still the worker's to log.
+        assert!(
+            h.request(SessionCommand::Get {
+                feature: "Width".into()
+            })
+            .is_err()
+        );
+        let snapshot = h.snapshot();
+        assert_eq!(snapshot.logs.len(), logs + 1);
+        assert!(snapshot.last_error.unwrap().contains("no camera connected"));
+        h.shutdown();
+    }
+    #[test]
+    fn exposure_measurements_follow_exposure_time_on_the_simulator() {
+        let h = WorkerHandle::new();
+        connect(&h, "2500");
+        let mut means = Vec::new();
+        for exposure in ["2500", "10000", "40000"] {
+            set(&h, "ExposureTime", exposure);
+            grab(&h);
+            means.push(measured(&h).exposure.unwrap());
+        }
+        assert!(means[0].mean < means[1].mean && means[1].mean < means[2].mean);
+        assert!((0.3..0.6).contains(&means[1].mean), "{:?}", means[1]);
+        assert!(means[2].highlights > 0.3, "{:?}", means[2]);
+        assert!(means[0].mean < 0.25, "{:?}", means[0]);
+        h.shutdown();
+    }
+    #[test]
+    fn microscope_focus_scores_peak_at_the_specimen() {
+        let h = WorkerHandle::new();
+        h.request(SessionCommand::Connect {
+            camera: "sim:microscope".into(),
+            timeout_ms: 100,
+        })
+        .unwrap();
+        set(&h, "Width", "256");
+        set(&h, "Height", "192");
+        let tenengrad = |position: &str| {
+            set(&h, "FocusPosition", position);
+            grab(&h);
+            measured(&h).focus.unwrap().tenengrad
+        };
+        let sharp = tenengrad("50");
+        let (near, far) = (tenengrad("20"), tenengrad("80"));
+        assert!(sharp > near && sharp > far, "{sharp} {near} {far}");
+        h.shutdown();
+    }
 
     #[test]
     fn software_auto_exposure_converges_inside_the_balance_caps() {
@@ -2570,6 +2862,30 @@ mod tests {
             on_exists: Default::default(),
             context: Default::default(),
         }
+    }
+
+    #[test]
+    fn grab_refuses_scanners_and_frames_belong_to_the_coordinator() {
+        let h = WorkerHandle::new();
+        let (mut camera, requests, _) = scanner(Duration::ZERO);
+        let error = scanner_command(&h, &mut camera, SessionCommand::Grab { timeout_ms: 1000 })
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "a document scanner cannot be inspected without scanning a page"
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 0);
+        assert!(!camera.as_ref().unwrap().is_streaming());
+        let frame = SessionCommand::Frame {
+            fresh: 1,
+            timeout_ms: 1000,
+            max_dimension: 0,
+            format: Default::default(),
+            region: None,
+        };
+        let error = scanner_command(&h, &mut camera, frame).unwrap_err();
+        assert_eq!(error.to_string(), "frames belong to the coordinator");
+        h.shutdown();
     }
 
     #[test]

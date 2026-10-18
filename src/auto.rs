@@ -71,7 +71,9 @@ fn range(low: f64, high: f64) -> Option<[f64; 2]> {
     (low.is_finite() && high.is_finite()).then_some([low, high])
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Brightness at the camera's native bit depth, 0–1: the mean luminance and
+/// the 99th percentile of each sample's brightest channel.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Meter {
     pub mean: f64,
     pub p99: f64,

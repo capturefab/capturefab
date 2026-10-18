@@ -14,6 +14,24 @@ use std::{
 const MAX_XML: usize = 32 * 1024 * 1024;
 const MAX_DEPTH: usize = 64;
 
+/// Features a camera cannot change while it streams: the image's geometry
+/// and format.
+pub fn stream_locked(name: &str) -> bool {
+    matches!(
+        name,
+        "Width"
+            | "Height"
+            | "OffsetX"
+            | "OffsetY"
+            | "PixelFormat"
+            | "BinningHorizontal"
+            | "BinningVertical"
+            | "DecimationHorizontal"
+            | "DecimationVertical"
+            | "VideoMode"
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeatureInfo {
     pub name: String,
@@ -1834,6 +1852,21 @@ fn exact_i64(v: f64) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn image_geometry_and_format_are_locked_while_streaming() {
+        for name in [
+            "Width",
+            "OffsetY",
+            "PixelFormat",
+            "BinningVertical",
+            "VideoMode",
+        ] {
+            assert!(stream_locked(name), "{name}");
+        }
+        for name in ["ExposureTime", "Gain", "AcquisitionFrameRate", "WidthMax"] {
+            assert!(!stream_locked(name), "{name}");
+        }
+    }
     #[derive(Default)]
     struct Memory {
         bytes: BTreeMap<u64, u8>,

@@ -558,6 +558,7 @@ impl Workbench {
                     && matches!(
                         pending.job,
                         Job::Set(_)
+                            | Job::SetMany
                             | Job::AutoOn
                             | Job::AutoOff
                             | Job::Balance
@@ -685,6 +686,7 @@ impl Workbench {
                 matches!(
                     pending.job,
                     Job::Set(_)
+                        | Job::SetMany
                         | Job::NetworkScan
                         | Job::AutoOn
                         | Job::AutoOff
@@ -1099,6 +1101,45 @@ mod tests {
         command(SessionCommand::Disconnect);
         sync(&mut app);
         assert!(app.history_label(true).is_none());
+    }
+
+    #[test]
+    fn set_many_changes_from_rpc_join_the_window_history_and_replay_by_token() {
+        let worker = crate::engine::WorkerHandle::new();
+        worker
+            .request(SessionCommand::Connect {
+                camera: "sim:0".into(),
+                timeout_ms: 1000,
+            })
+            .unwrap();
+        let changed = worker
+            .request(SessionCommand::SetMany {
+                values: [("Gain", "3"), ("Width", "128")]
+                    .into_iter()
+                    .map(|(feature, value)| crate::session::FeatureValue {
+                        feature: feature.into(),
+                        value: value.into(),
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        let token = changed["camera_change"]["token"].as_str().unwrap();
+        let mut app = bench();
+        let snapshot = worker.snapshot();
+        let mut camera = liveness::streaming_camera(0, 0, 0.0);
+        camera.info = snapshot.connected.unwrap();
+        camera.history = snapshot.history;
+        let id = camera.info.id.clone();
+        app.snapshot.cameras = vec![camera];
+        app.sync_camera_history();
+        assert_eq!(app.history_label(true), Some("Set Gain, Width"));
+        let _ = app.replay_history(true);
+        let replay = app.pending.last().unwrap();
+        assert_eq!(replay.job, Job::SetMany);
+        assert_eq!(replay.camera.as_deref(), Some(id.as_str()));
+        assert_eq!(replay.history_token.as_deref(), Some(token));
+        assert_eq!(replay.history_replay, Some(true));
+        worker.shutdown();
     }
 
     #[test]

@@ -99,6 +99,8 @@ capturefab --session bench start
 capturefab --session bench stop
 ```
 
+Agents can look at a camera without saving files. RPC `{"op":"frame","fresh":1,"max_dimension":1024}` returns the camera's newest frame after the commands sent before it: exposure, auto-meter and focus measurements, and a JPEG preview of at most 1.5 MiB as base64. A stopped camera acquires one frame and stays stopped; `region` crops the full-resolution frame. `{"op":"set_many","values":[{"feature":"ExposureTime","value":"8000"},{"feature":"Gain","value":"6"}]}` writes several features as one change: a failure restores all of them, and `undo` reverts them together. `schema --json` describes `frame` in `result.frame` and `set_many` in `result.writes`, with examples of both in `result.rpc.commands`.
+
 ## Automatic capture and review
 
 A capture session is one portable `.duckdb` file, bound to a camera. Create or resume a session in the desktop capture controls, take a few examples, then enable **Auto capture**. User-initiated captures teach the session what matters. Review suggested frames with **Keep** or **Discard**; every decision updates the session model. Pending suggestions do not train themselves. The review card supports quick decisions while live acquisition continues.

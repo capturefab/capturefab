@@ -1,6 +1,7 @@
 //! Multi-camera coordinator: one isolated process per camera, shared-memory pixels.
 mod activity;
 mod log;
+pub use crate::shared_memory::FrameMeta;
 use crate::{
     genicam::FeatureInfo,
     shared_memory::{DEFAULT_CAPACITY, SharedRing},
@@ -55,6 +56,11 @@ pub enum SessionCommand {
     Set {
         feature: String,
         value: String,
+    },
+    /// Write several features in order as one camera change: a failure
+    /// restores every value, and success records one undo checkpoint.
+    SetMany {
+        values: Vec<FeatureValue>,
     },
     Execute {
         feature: String,
@@ -148,6 +154,29 @@ pub enum SessionCommand {
         id: u64,
     },
     Status,
+    /// Newest frame of one camera as a bounded preview plus measurements.
+    /// Never saves files or changes settings; a stopped camera acquires one
+    /// frame (`Grab`) and stays stopped.
+    Frame {
+        /// Frames to wait for after the request; 0 accepts the newest.
+        #[serde(default = "crate::inspect::default_fresh")]
+        fresh: u32,
+        #[serde(default = "crate::inspect::default_wait_ms")]
+        timeout_ms: u64,
+        /// The preview's longest edge in pixels; 0 returns measurements only.
+        #[serde(default = "crate::inspect::default_edge")]
+        max_dimension: u32,
+        #[serde(default)]
+        format: crate::inspect::PreviewFormat,
+        /// A normalized x, y, width, height crop of the full-resolution
+        /// frame, also the focus region.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<[f64; 4]>,
+    },
+    /// Worker-only: acquire one frame into the shared ring without saving it.
+    Grab {
+        timeout_ms: u64,
+    },
     /// Observe session-wide participant activity, optionally waiting for a change.
     Activity {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -260,6 +289,15 @@ pub enum SessionCommand {
     /// Signal source status.
     Signals,
 }
+/// One feature assignment of `SetMany`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeatureValue {
+    pub feature: String,
+    pub value: String,
+}
+/// Most values one `SetMany` writes.
+pub const MAX_SET_MANY: usize = 32;
 /// Deserialize JSON control messages without accepting ignored fields on
 /// Serde's internally tagged unit variants or duplicate object fields.
 pub fn deserialize_command<'de, D: serde::Deserializer<'de>>(
@@ -455,14 +493,25 @@ impl SessionCommand {
             }
             Self::Select { camera } => validate_selector(camera)?,
             Self::Get { feature } | Self::Execute { feature } | Self::Set { feature, .. } => {
-                ensure!(
-                    !feature.is_empty()
-                        && !feature
-                            .chars()
-                            .any(|c| c.is_whitespace() || c.is_control() || c == '='),
-                    "feature name must be nonempty and contain no whitespace, control characters or '='"
-                );
+                validate_feature(feature)?;
             }
+            Self::SetMany { values } => {
+                ensure!(
+                    (1..=MAX_SET_MANY).contains(&values.len()),
+                    "set_many takes 1..32 feature values"
+                );
+                for value in values {
+                    validate_feature(&value.feature)?;
+                }
+            }
+            Self::Frame {
+                fresh,
+                timeout_ms,
+                max_dimension,
+                region,
+                ..
+            } => crate::inspect::validate(*fresh, *timeout_ms, *max_dimension, *region)?,
+            Self::Grab { timeout_ms } => validate_timeout(*timeout_ms)?,
             Self::ReplayCameraChange { token, .. } => {
                 ensure!(
                     !token.is_empty() && !token.chars().any(char::is_control),
@@ -613,6 +662,9 @@ pub fn default_request_timeout(command: &SessionCommand) -> Duration {
             .saturating_mul(u64::from(*count))
             .saturating_add(60_000),
         SessionCommand::CaptureExample { timeout_ms } => timeout_ms.saturating_add(60_000),
+        // Waiting for the camera's turn, or starting a stopped camera and
+        // settling its auto exposure, can outlast the frame wait itself.
+        SessionCommand::Frame { timeout_ms, .. } => timeout_ms.saturating_add(15_000),
         SessionCommand::DatasetExport { .. } => 600_000,
         SessionCommand::DatasetQuery { timeout_ms, .. } => (if *timeout_ms == 0 {
             30_000
@@ -634,6 +686,16 @@ pub fn validate_timeout(timeout_ms: u64) -> Result<()> {
 }
 pub fn validate_selector(camera: &str) -> Result<()> {
     crate::camera::validate_selector_shape(camera)
+}
+fn validate_feature(feature: &str) -> Result<()> {
+    ensure!(
+        !feature.is_empty()
+            && !feature
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || c == '='),
+        "feature name must be nonempty and contain no whitespace, control characters or '='"
+    );
+    Ok(())
 }
 fn validate_memory(address: u64, length: usize) -> Result<()> {
     ensure!(
@@ -917,26 +979,48 @@ type Reply = Receiver<Result<Value>>;
 struct FrameFeed {
     ring: SharedRing,
     latest: Option<Arc<Frame>>,
+    /// The ring sequence number and publish time of `latest`.
+    latest_seq: u32,
+    latest_received_ms: u64,
 }
 impl FrameFeed {
+    fn new(ring: SharedRing) -> Self {
+        Self {
+            ring,
+            latest: None,
+            latest_seq: 0,
+            latest_received_ms: 0,
+        }
+    }
     fn poll(&mut self) -> Option<Arc<Frame>> {
         // Overwrite the cached frame in place when no consumer still holds it,
         // so steady-state streaming reuses one pixel allocation.
-        let updated = match self.latest.as_mut().and_then(Arc::get_mut) {
+        let taken = match self.latest.as_mut().and_then(Arc::get_mut) {
             Some(frame) => self.ring.take_latest_into(frame),
             None => {
                 let mut frame = Frame::default();
-                let updated = self.ring.take_latest_into(&mut frame);
-                if matches!(updated, Ok(true)) {
+                let taken = self.ring.take_latest_into(&mut frame);
+                if matches!(taken, Ok(Some(_))) {
                     self.latest = Some(Arc::new(frame));
                 }
-                updated
+                taken
             }
         };
-        if let Err(e) = updated {
-            eprintln!("capturefab: ignoring unreadable shared frame: {e:#}");
+        match taken {
+            Ok(Some(meta)) => {
+                self.latest_seq = meta.seq;
+                self.latest_received_ms = meta.received_ms;
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("capturefab: ignoring unreadable shared frame: {e:#}"),
         }
         self.latest.clone()
+    }
+    fn latest_meta(&self) -> FrameMeta {
+        FrameMeta {
+            seq: self.latest_seq,
+            received_ms: self.latest_received_ms,
+        }
     }
 }
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1033,7 +1117,7 @@ impl Process {
             child,
             input,
             output,
-            feed: Arc::new(Mutex::new(FrameFeed { ring, latest: None })),
+            feed: Arc::new(Mutex::new(FrameFeed::new(ring))),
             snapshot: SessionSnapshot::default(),
             saved: Vec::new(),
             saved_camera: None,
@@ -1149,6 +1233,8 @@ struct Coordinator {
     /// Set when `shutdown` has finished; later callers wait for it.
     shut_down: (Mutex<bool>, Condvar),
     pending: AtomicUsize,
+    /// Frame inspections in progress; they wait outside the action slots.
+    inspecting: AtomicUsize,
     connecting: Mutex<()>,
     command_order: Mutex<BTreeMap<CommandTarget, Weak<CommandOrder>>>,
     poller: OnceLock<std::thread::Thread>,
@@ -1168,19 +1254,41 @@ impl Drop for Coordinator {
     }
 }
 /// Holds one of the bounded command slots; released even if the command panics.
-struct PendingSlot(Arc<Coordinator>);
+/// Frame inspections count against their own bound, so observing never
+/// takes a slot from camera actions.
+struct PendingSlot {
+    inner: Arc<Coordinator>,
+    inspection: bool,
+}
 impl PendingSlot {
-    fn acquire(inner: &Arc<Coordinator>) -> Result<Self> {
+    fn acquire(inner: &Arc<Coordinator>, inspection: bool) -> Result<Self> {
+        let slot = Self {
+            inner: inner.clone(),
+            inspection,
+        };
         // Count first; dropping the guard undoes the increment when full.
-        let previous = inner.pending.fetch_add(1, Ordering::AcqRel);
-        let slot = Self(inner.clone());
-        ensure!(previous < MAX_PENDING, "camera command queue is full");
+        let previous = slot.counter().fetch_add(1, Ordering::AcqRel);
+        if inspection {
+            ensure!(
+                previous < MAX_INSPECTIONS,
+                "too many frame inspections are waiting; retry when one returns"
+            );
+        } else {
+            ensure!(previous < MAX_PENDING, "camera command queue is full");
+        }
         Ok(slot)
+    }
+    fn counter(&self) -> &AtomicUsize {
+        if self.inspection {
+            &self.inner.inspecting
+        } else {
+            &self.inner.pending
+        }
     }
 }
 impl Drop for PendingSlot {
     fn drop(&mut self) {
-        self.0.pending.fetch_sub(1, Ordering::AcqRel);
+        self.counter().fetch_sub(1, Ordering::AcqRel);
     }
 }
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1245,6 +1353,10 @@ impl Drop for CommandTurn {
     }
 }
 const MAX_PENDING: usize = 32;
+/// How often a frame inspection looks for a new frame in a camera's ring.
+const FRAME_POLL: Duration = Duration::from_millis(5);
+/// Each inspection may hold a full-resolution frame and its conversions.
+const MAX_INSPECTIONS: usize = 8;
 const STATUS_POLL: Duration = Duration::from_millis(250);
 #[derive(Clone)]
 pub struct SessionHandle {
@@ -1267,6 +1379,7 @@ impl SessionHandle {
                 quitting: AtomicBool::new(false),
                 shut_down: (Mutex::new(false), Condvar::new()),
                 pending: AtomicUsize::new(0),
+                inspecting: AtomicUsize::new(0),
                 connecting: Mutex::new(()),
                 command_order: Mutex::new(BTreeMap::new()),
                 poller: OnceLock::new(),
@@ -1451,18 +1564,99 @@ impl SessionHandle {
             .map(|feed| u64::from(locked(feed).ring.sequence()))
             .fold(0, u64::wrapping_add)
     }
+    /// The ring sequence number of camera `id`'s newest published frame,
+    /// read or not; pass it to `wait_frame` to wait for later frames.
+    pub fn frame_sequence_for(&self, id: &str) -> Option<u32> {
+        let feed = self.feed(id)?;
+        Some(locked(&feed).ring.sequence())
+    }
+    /// Wait until camera `id` publishes a frame at least `fresh` frames after
+    /// ring position `after_seq` (from `frame_sequence_for`), and return it
+    /// with its position and publish time. `fresh` 0 accepts the newest
+    /// frame. Fails at `deadline`, and as soon as the camera has stopped
+    /// streaming with no such frame left in its ring.
+    pub fn wait_frame(
+        &self,
+        id: &str,
+        after_seq: u32,
+        fresh: u32,
+        deadline: Instant,
+    ) -> Result<(Arc<Frame>, FrameMeta)> {
+        let window = deadline.saturating_duration_since(Instant::now());
+        self.await_frame(id, after_seq, fresh, deadline)?
+            .with_context(|| no_new_frame(id, window))
+    }
+    /// `wait_frame`, with None at the deadline.
+    fn await_frame(
+        &self,
+        id: &str,
+        after_seq: u32,
+        fresh: u32,
+        deadline: Instant,
+    ) -> Result<Option<(Arc<Frame>, FrameMeta)>> {
+        let id = self.camera_id(id);
+        let feed = self.feed(&id).with_context(|| {
+            format!(
+                "camera '{}' not connected in this session",
+                crate::media::redact_url(&id)
+            )
+        })?;
+        loop {
+            // The feed lock is released before the worker's is tried below.
+            {
+                let mut feed = locked(&feed);
+                if let Some(frame) = feed.poll() {
+                    let meta = feed.latest_meta();
+                    let ahead = meta.seq.wrapping_sub(after_seq);
+                    if ahead < u32::MAX / 2 && ahead >= fresh {
+                        return Ok(Some((frame, meta)));
+                    }
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            ensure!(!self.is_shutting_down(), "session is shutting down");
+            if let Some(error) = self.stopped_streaming(&id) {
+                anyhow::bail!(
+                    "{} stopped streaming{}",
+                    crate::media::redact_url(&id),
+                    error.map(|error| format!(": {error}")).unwrap_or_default()
+                );
+            }
+            std::thread::sleep(FRAME_POLL.min(deadline - now));
+        }
+    }
+    /// Some(last error) when camera `id`'s worker last reported that it is
+    /// not streaming. None while it streams, and while it is busy, since its
+    /// report then may be out of date.
+    fn stopped_streaming(&self, id: &str) -> Option<Option<String>> {
+        let w = self
+            .inner
+            .workers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .cloned()?;
+        let p = w.try_lock().ok()?;
+        (!p.snapshot.streaming).then(|| p.snapshot.last_error.clone())
+    }
     fn feed(&self, id: &str) -> Option<Arc<Mutex<FrameFeed>>> {
+        // Serials and addresses known from snapshots resolve without the
+        // worker, so a busy camera still has frames.
+        let id = self.camera_id(id);
         let feeds = self
             .inner
             .feeds
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(feed) = feeds.get(id) {
+        if let Some(feed) = feeds.get(&id) {
             return Some(feed.clone());
         }
         drop(feeds);
-        // Serial or address selectors resolve through the worker table.
-        let w = self.target(Some(id)).ok()?;
+        // Other selectors resolve through the worker table.
+        let w = self.target(Some(&id)).ok()?;
         let p = w.try_lock().ok()?;
         Some(p.feed.clone())
     }
@@ -1586,6 +1780,10 @@ impl SessionHandle {
             !self.inner.quitting.load(Ordering::Relaxed),
             "session is shutting down"
         );
+        ensure!(
+            !matches!(command, SessionCommand::Grab { .. }),
+            "grab is reserved for camera workers; use frame to inspect a camera"
+        );
         // Observers remain responsive even when every action slot is occupied.
         // Observations never wait for a command gate or a busy worker's pipe.
         if matches!(
@@ -1596,7 +1794,8 @@ impl SessionHandle {
             let _ = tx.send(self.process(target.as_deref(), command, origin, actor));
             return Ok(rx);
         }
-        let slot = PendingSlot::acquire(&self.inner)?;
+        let inspection = matches!(command, SessionCommand::Frame { .. });
+        let slot = PendingSlot::acquire(&self.inner, inspection)?;
         let target = target.or_else(|| {
             if matches!(
                 &command,
@@ -1642,7 +1841,11 @@ impl SessionHandle {
                 } else {
                     h.process(target.as_deref(), command, origin, actor)
                 };
-                if let Err(e) = &result {
+                // An inspection's failure is its caller's to report; a slow
+                // or triggered camera must not fill the session log.
+                if let Err(e) = &result
+                    && !inspection
+                {
                     let mut s = h.inner.state.write().unwrap_or_else(|e| e.into_inner());
                     let message = activity::redact(&format!("{e:#}"));
                     s.last_error = Some(message.clone());
@@ -1945,6 +2148,20 @@ impl SessionHandle {
                 self.store_snapshot();
                 Ok(serde_json::to_value(self.snapshot())?)
             }
+            SessionCommand::Frame {
+                fresh,
+                timeout_ms,
+                max_dimension,
+                format,
+                region,
+            } => self.inspect_frame(
+                target,
+                fresh,
+                Duration::from_millis(timeout_ms),
+                max_dimension,
+                format,
+                region,
+            ),
             SessionCommand::Discover {
                 timeout_ms,
                 simulated,
@@ -2139,6 +2356,85 @@ impl SessionHandle {
             }
         }
     }
+    /// Answer `Frame`. The camera's command turn is held, so the frame
+    /// follows any change submitted before it, but the worker's lock is not:
+    /// status and previews continue while it waits.
+    fn inspect_frame(
+        &self,
+        target: Option<&str>,
+        fresh: u32,
+        timeout: Duration,
+        max_dimension: u32,
+        format: crate::inspect::PreviewFormat,
+        region: Option<[f64; 4]>,
+    ) -> Result<Value> {
+        let deadline = Instant::now() + timeout;
+        let w = self.target(target)?;
+        let (info, streaming, feed) = {
+            let p = locked(&w);
+            let info = p
+                .snapshot
+                .connected
+                .clone()
+                .context("worker has no camera")?;
+            (info, p.snapshot.streaming, p.feed.clone())
+        };
+        ensure!(
+            info.transport != crate::types::Transport::Scanner,
+            "a document scanner cannot be inspected without scanning a page"
+        );
+        let start = locked(&feed).ring.sequence();
+        // A stopped camera acquires one frame, which is new by definition.
+        let (source, fresh, notes) = if streaming {
+            ("live", fresh, Vec::new())
+        } else {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let grab = SessionCommand::Grab {
+                timeout_ms: u64::try_from(remaining.as_millis())
+                    .unwrap_or(u64::MAX)
+                    .clamp(1, 60_000),
+            };
+            let (grabbed, (batch, gaps)) = {
+                let mut p = locked(&w);
+                (p.call(grab), p.take_saved())
+            };
+            self.inner.dataset.record_saved(batch, gaps);
+            self.store_snapshot();
+            let grabbed = grabbed.map_err(|error| grab_failed(error, &info.id, timeout))?;
+            let notes = if grabbed["auto_settled"] == false {
+                vec!["auto exposure had not settled when this frame was taken".to_owned()]
+            } else {
+                Vec::new()
+            };
+            ("grab", 1, notes)
+        };
+        let (frame, meta) = self
+            .await_frame(&info.id, start, fresh, deadline)?
+            .with_context(|| no_new_frame(&info.id, timeout))?;
+        let mut reply = serde_json::to_value(crate::inspect::inspect(
+            &frame,
+            info.profile.kind,
+            region,
+            max_dimension,
+            format,
+        )?)?;
+        if let Some(measured) = reply["notes"].as_array_mut() {
+            measured.extend(notes.into_iter().map(Value::from));
+        }
+        reply["camera"] = json!(crate::media::redact_url(&info.id));
+        reply["frame"] = json!({
+            "id": frame.id,
+            "seq": meta.seq,
+            "width": frame.width,
+            "height": frame.height,
+            "pixel_format": crate::inspect::pixel_format_label(frame.pixel_format),
+            "timestamp_ns": frame.timestamp_ns,
+            "age_ms": crate::scheduling::now_ms().saturating_sub(meta.received_ms),
+            "source": source,
+            "waited_frames": meta.seq.wrapping_sub(start),
+        });
+        Ok(reply)
+    }
     fn store_snapshot(&self) {
         let mut snapshot = self.snapshot();
         self.inner.analytics.observe(&snapshot);
@@ -2254,6 +2550,27 @@ impl SessionHandle {
     }
 }
 
+/// Why an inspection has no frame; "timed out" makes the CLI exit 4.
+fn no_new_frame(camera: &str, wait: Duration) -> String {
+    // Rounded up, so a deadline set for 3 s just before reads "3 s".
+    let ms = u64::try_from(wait.as_micros().div_ceil(1000)).unwrap_or(u64::MAX);
+    format!(
+        "no new frame from {} within {} (timed out); a triggered camera needs TriggerSoftware",
+        crate::media::redact_url(camera),
+        crate::scheduling::format_duration(ms)
+    )
+}
+
+/// Explain a `Grab` that received no frame in time; any other failure, a
+/// transport timeout included, keeps its own diagnostic.
+fn grab_failed(error: anyhow::Error, camera: &str, wait: Duration) -> anyhow::Error {
+    if format!("{error:#}") == crate::engine::GRAB_TIMEOUT {
+        anyhow::anyhow!(no_new_frame(camera, wait))
+    } else {
+        error
+    }
+}
+
 /// Hidden mode: stdio controls, separate publisher, mmap frame transfer.
 pub fn run_worker(path: &std::path::Path) -> Result<()> {
     let ring = Arc::new(Mutex::new(SharedRing::open(path)?));
@@ -2361,6 +2678,11 @@ mod tests {
             Duration::from_secs(15)
         );
         assert_eq!(timeout(r#"{"op":"status"}"#), Duration::from_secs(60));
+        assert_eq!(timeout(r#"{"op":"frame"}"#), Duration::from_secs(18));
+        assert_eq!(
+            timeout(r#"{"op":"frame","timeout_ms":10000}"#),
+            Duration::from_secs(25)
+        );
         assert_eq!(
             default_request_timeout(&SessionCommand::Disconnect),
             Duration::from_secs(60)
@@ -2707,6 +3029,77 @@ mod tests {
         assert!(SessionCommand::from_json_slice(br#"{"op":"status"} {}"#).is_err());
     }
     #[test]
+    fn frame_and_set_many_have_strict_shapes_and_documented_defaults() {
+        let SessionCommand::Frame {
+            fresh,
+            timeout_ms,
+            max_dimension,
+            format,
+            region,
+        } = SessionCommand::from_json_slice(br#"{"op":"frame"}"#).unwrap()
+        else {
+            panic!("not a frame")
+        };
+        assert_eq!(
+            (fresh, timeout_ms, max_dimension, format, region),
+            (1, 3000, 1024, crate::inspect::PreviewFormat::Auto, None)
+        );
+        let full = br#"{"op":"frame","fresh":0,"timeout_ms":50,"max_dimension":0,"format":"png","region":[0.0,0.5,1.0,0.5]}"#;
+        let command = SessionCommand::from_json_slice(full).unwrap();
+        command.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&command).unwrap(),
+            serde_json::from_slice::<Value>(full).unwrap()
+        );
+        let bare = SessionCommand::from_json_slice(br#"{"op":"frame"}"#).unwrap();
+        assert!(serde_json::to_value(bare).unwrap().get("region").is_none());
+        for invalid in [
+            r#"{"op":"frame","unknown":1}"#,
+            r#"{"op":"frame","fresh":1,"fresh":2}"#,
+            r#"{"op":"frame","format":"gif"}"#,
+            r#"{"op":"frame","region":[0,0,1]}"#,
+            r#"{"op":"frame","fresh":-1}"#,
+            r#"{"op":"grab"}"#,
+            r#"{"op":"set_many"}"#,
+            r#"{"op":"set_many","values":[{"feature":"Gain"}]}"#,
+            r#"{"op":"set_many","values":[{"feature":"Gain","value":"1","unit":"dB"}]}"#,
+            r#"{"op":"set_many","values":[{"feature":"Gain","feature":"Gamma","value":"1"}]}"#,
+        ] {
+            assert!(
+                SessionCommand::from_json_slice(invalid.as_bytes()).is_err(),
+                "{invalid}"
+            );
+        }
+        let values = |count: usize| SessionCommand::SetMany {
+            values: (0..count)
+                .map(|i| FeatureValue {
+                    feature: if i % 2 == 0 {
+                        "BalanceRatioSelector"
+                    } else {
+                        "BalanceRatio"
+                    }
+                    .into(),
+                    value: i.to_string(),
+                })
+                .collect(),
+        };
+        // The same feature may repeat: selectors address several banks.
+        values(MAX_SET_MANY).validate().unwrap();
+        for invalid in [values(0), values(MAX_SET_MANY + 1)] {
+            assert_eq!(
+                invalid.validate().unwrap_err().to_string(),
+                "set_many takes 1..32 feature values"
+            );
+        }
+        let parsed = SessionCommand::from_json_slice(
+            br#"{"op":"set_many","values":[{"feature":"ExposureTime","value":"8000"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(&parsed, SessionCommand::SetMany { values } if values[0] == FeatureValue { feature: "ExposureTime".into(), value: "8000".into() })
+        );
+    }
+    #[test]
     fn invalid_command_values_are_rejected_before_queueing() {
         let handle = SessionHandle::new();
         for command in [
@@ -2744,6 +3137,23 @@ mod tests {
                 data: vec![],
             },
             SessionCommand::CancelJob { id: 0 },
+            SessionCommand::Frame {
+                fresh: 11,
+                timeout_ms: 3000,
+                max_dimension: 1024,
+                format: Default::default(),
+                region: None,
+            },
+            SessionCommand::Frame {
+                fresh: 1,
+                timeout_ms: 3000,
+                max_dimension: 1024,
+                format: Default::default(),
+                region: Some([0.5, 0.5, 0.5, f64::INFINITY]),
+            },
+            SessionCommand::SetMany { values: Vec::new() },
+            // Valid, but only camera workers acquire frames without a reader.
+            SessionCommand::Grab { timeout_ms: 1000 },
         ] {
             assert!(handle.submit(command).is_err());
         }
@@ -2892,6 +3302,59 @@ mod tests {
             2,
             "status polling creates no history entries"
         );
+    }
+
+    #[test]
+    fn frame_inspections_wait_their_turn_outside_the_action_queue() {
+        let handle = SessionHandle::new();
+        let frame = || SessionCommand::Frame {
+            fresh: 1,
+            timeout_ms: 50,
+            max_dimension: 0,
+            format: Default::default(),
+            region: None,
+        };
+        let running = handle
+            .command_turn(Some("camera-a"), &width_command())
+            .unwrap();
+        running.wait();
+        let actions: Vec<_> = (0..MAX_PENDING)
+            .map(|_| handle.submit_to("camera-a", width_command()).unwrap())
+            .collect();
+        assert!(handle.submit_to("camera-a", width_command()).is_err());
+        // A full action queue does not refuse an inspection, but the
+        // inspection still waits for the camera's earlier commands.
+        let inspections: Vec<_> = (0..MAX_INSPECTIONS)
+            .map(|_| handle.submit_to("camera-a", frame()).unwrap())
+            .collect();
+        assert!(
+            handle
+                .submit_to("camera-a", frame())
+                .unwrap_err()
+                .to_string()
+                .contains("too many frame inspections")
+        );
+        assert!(matches!(
+            inspections[0].recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(handle.snapshot().activity.len(), MAX_PENDING);
+        drop(running);
+        for reply in actions.into_iter().chain(inspections) {
+            assert!(reply.recv_timeout(Duration::from_secs(2)).unwrap().is_err());
+        }
+        // Inspections are observations: no activity and no session log line.
+        let logs = handle.snapshot().logs.len();
+        let error = handle.request_to("camera-a", frame()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "camera 'camera-a' not connected in this session"
+        );
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.logs.len(), logs);
+        assert_eq!(snapshot.activity.len(), MAX_PENDING);
+        assert_eq!(handle.inner.inspecting.load(Ordering::Acquire), 0);
+        handle.shutdown();
     }
 
     #[test]
@@ -3094,10 +3557,7 @@ mod tests {
                 .as_nanos()
         ));
         let mut writer = SharedRing::create(&path, 4096).unwrap();
-        let mut feed = FrameFeed {
-            ring: SharedRing::open(&path).unwrap(),
-            latest: None,
-        };
+        let mut feed = FrameFeed::new(SharedRing::open(&path).unwrap());
         let frame = |id: u64| Frame {
             id,
             width: 4,
@@ -3124,5 +3584,117 @@ mod tests {
         drop(third);
         // Without a newer frame the cached one is returned unchanged.
         assert_eq!(feed.poll().unwrap().id, 3);
+    }
+
+    #[test]
+    fn frame_feeds_track_ring_sequence_and_wait_for_fresh_frames() {
+        let path = std::env::temp_dir().join(format!(
+            "capturefab-feed-seq-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut writer = SharedRing::create(&path, 4096).unwrap();
+        let handle = SessionHandle::new();
+        handle.inner.feeds.write().unwrap().insert(
+            "sim:feed".into(),
+            Arc::new(Mutex::new(FrameFeed::new(SharedRing::open(&path).unwrap()))),
+        );
+        let frame = |id: u64| Frame {
+            id,
+            width: 4,
+            height: 4,
+            pixel_format: crate::types::MONO8,
+            timestamp_ns: 0,
+            data: vec![id as u8; 16],
+        };
+        let soon = || Instant::now() + Duration::from_millis(50);
+        assert_eq!(handle.frame_sequence_for("sim:feed"), Some(0));
+        assert_eq!(handle.frame_sequence_for("sim:unknown"), None);
+        // No frame at all: even fresh 0 waits for one, and fails as a timeout.
+        let error = handle.wait_frame("sim:feed", 0, 0, soon()).unwrap_err();
+        assert_eq!(crate::cli::error_code(&error), ("timeout", 4), "{error}");
+        assert!(
+            error
+                .to_string()
+                .starts_with("no new frame from sim:feed within "),
+            "{error}"
+        );
+        let before = crate::scheduling::now_ms();
+        for id in 1..=5 {
+            writer.write(&frame(id)).unwrap();
+        }
+        let start = handle.frame_sequence_for("sim:feed").unwrap();
+        assert_eq!(start, 5);
+        // The newest frame counts for fresh 0, not for fresh 1.
+        let (newest, meta) = handle.wait_frame("sim:feed", start, 0, soon()).unwrap();
+        assert_eq!((newest.id, meta.seq), (5, 5));
+        assert!((before..=crate::scheduling::now_ms()).contains(&meta.received_ms));
+        assert!(handle.wait_frame("sim:feed", start, 1, soon()).is_err());
+        // A frame published while waiting satisfies it.
+        let publisher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            for id in 6..=7 {
+                writer.write(&frame(id)).unwrap();
+            }
+            writer
+        });
+        let (fresh, meta) = handle
+            .wait_frame(
+                "sim:feed",
+                start,
+                2,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        assert!(meta.seq >= start + 2, "{meta:?}");
+        assert_eq!(u64::from(meta.seq), fresh.id);
+        let _writer = publisher.join().unwrap();
+        // Fresh frames are counted from the given position, cached or not.
+        assert_eq!(
+            handle
+                .wait_frame("sim:feed", start, 2, soon())
+                .unwrap()
+                .1
+                .seq,
+            7
+        );
+        let error = handle.wait_frame("sim:feed", 7, 1, soon()).unwrap_err();
+        assert!(error.to_string().contains("(timed out)"), "{error}");
+        let error = handle
+            .wait_frame("sim:gone", 0, 0, soon())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "camera 'sim:gone' not connected in this session");
+        assert_eq!(
+            no_new_frame("rtsp://user:secret@cam/live", Duration::from_millis(3000)),
+            "no new frame from rtsp://<redacted>@cam/live within 3 s (timed out); a triggered camera needs TriggerSoftware"
+        );
+        handle.shutdown();
+    }
+
+    #[test]
+    fn only_a_grab_deadline_reads_as_a_missing_frame() {
+        let wait = Duration::from_millis(3000);
+        let missed = grab_failed(anyhow::anyhow!(crate::engine::GRAB_TIMEOUT), "sim:0", wait);
+        assert_eq!(missed.to_string(), no_new_frame("sim:0", wait));
+        assert_eq!(crate::cli::error_code(&missed), ("timeout", 4));
+        // Transport timeouts keep their diagnostic and their exit code.
+        for cause in [
+            "GVCP command 0x0080 timed out after 200ms (three attempts); check camera address, network and firewall",
+            "USB camera control acknowledgement timed out",
+        ] {
+            let error = grab_failed(anyhow::anyhow!(cause), "sim:0", wait);
+            assert_eq!(format!("{error:#}"), cause);
+            assert_eq!(crate::cli::error_code(&error), ("timeout", 4));
+        }
+        let refused = grab_failed(
+            anyhow::anyhow!("camera payload exceeds 256 MiB limit"),
+            "sim:0",
+            wait,
+        );
+        assert_eq!(refused.to_string(), "camera payload exceeds 256 MiB limit");
     }
 }

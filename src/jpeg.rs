@@ -78,11 +78,18 @@ pub fn encode_with_backend(frame: &Frame) -> Result<(Vec<u8>, Backend)> {
     Ok((software(&Raster::new(frame)?)?, Backend::TurboJpeg))
 }
 
-#[cfg(feature = "jpeg")]
 pub fn software(raster: &Raster) -> Result<Vec<u8>> {
+    software_quality(raster, QUALITY)
+}
+
+/// libjpeg-turbo at a chosen quality (1–100), for previews that trade
+/// detail for size; stills use `software` and the fixed `QUALITY`.
+#[cfg(feature = "jpeg")]
+pub fn software_quality(raster: &Raster, quality: i32) -> Result<Vec<u8>> {
     use turbojpeg::{Compressor, Image, PixelFormat, Subsamp};
+    anyhow::ensure!((1..=100).contains(&quality), "JPEG quality must be 1..100");
     let mut compressor = Compressor::new()?;
-    compressor.set_quality(QUALITY)?;
+    compressor.set_quality(quality)?;
     let (format, subsamp) = if raster.channels == 1 {
         (PixelFormat::GRAY, Subsamp::Gray)
     } else {
@@ -99,7 +106,7 @@ pub fn software(raster: &Raster) -> Result<Vec<u8>> {
 }
 
 #[cfg(not(feature = "jpeg"))]
-pub fn software(_: &Raster) -> Result<Vec<u8>> {
+pub fn software_quality(_: &Raster, _: i32) -> Result<Vec<u8>> {
     bail!("JPEG is unsupported in this build; rebuild with --features jpeg or capture png")
 }
 
@@ -331,6 +338,22 @@ mod tests {
             // Component count in SOF0: 1 for gray, 3 for color.
             let sof = jpeg.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
             assert_eq!(jpeg[sof + 9], raster.channels as u8);
+        }
+    }
+    #[cfg(feature = "jpeg")]
+    #[test]
+    fn lower_quality_makes_smaller_jpegs_and_out_of_range_quality_fails() {
+        let raster = Raster::new(&frame(RGB8, 64, 48, 3)).unwrap();
+        let fine = software_quality(&raster, 92).unwrap();
+        let coarse = software_quality(&raster, 65).unwrap();
+        assert!(well_formed(&coarse, 64, 48));
+        assert!(coarse.len() < fine.len());
+        assert_eq!(
+            software(&raster).unwrap(),
+            software_quality(&raster, QUALITY).unwrap()
+        );
+        for quality in [0, 101] {
+            assert!(software_quality(&raster, quality).is_err());
         }
     }
 }

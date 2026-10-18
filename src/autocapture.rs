@@ -825,6 +825,12 @@ impl CaptureSession {
         })
     }
 
+    /// When the last frame was sampled, for tests of what reaches a session.
+    #[cfg(test)]
+    pub(crate) fn sampled_at(&self) -> Option<Instant> {
+        self.last_sample
+    }
+
     /// Evaluate at most four small previews per second. Automatic suggestions do
     /// not become training examples until the user reviews them.
     pub fn observe(&mut self, frame: &Frame) -> Result<Option<u64>> {

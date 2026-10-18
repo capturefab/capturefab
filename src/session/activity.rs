@@ -323,6 +323,8 @@ impl Activity {
             SessionCommand::Status
                 | SessionCommand::Activity { .. }
                 | SessionCommand::Get { .. }
+                | SessionCommand::Frame { .. }
+                | SessionCommand::Grab { .. }
                 | SessionCommand::Jobs
                 | SessionCommand::Features
                 | SessionCommand::Xml
@@ -497,6 +499,21 @@ fn describe(command: &SessionCommand) -> (&'static str, String) {
         Disconnect => ("disconnect", "Disconnect camera".into()),
         Get { feature } => ("get", format!("Read {feature}")),
         Set { feature, value } => ("set", format!("Set {feature} = {value}")),
+        SetMany { values } => (
+            "set_many",
+            if values.len() <= 3 {
+                format!(
+                    "Set {}",
+                    values
+                        .iter()
+                        .map(|v| format!("{} = {}", v.feature, v.value))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            } else {
+                format!("Set {} feature values", values.len())
+            },
+        ),
         Execute { feature } => ("execute", format!("Execute {feature}")),
         Start => ("start", "Start acquisition".into()),
         Stop => ("stop", "Stop acquisition".into()),
@@ -573,6 +590,8 @@ fn describe(command: &SessionCommand) -> (&'static str, String) {
         Jobs => ("jobs", "Read capture jobs".into()),
         CancelJob { id } => ("cancel_job", format!("Cancel capture job {id}")),
         Status => ("status", "Read session status".into()),
+        Frame { .. } => ("frame", "Inspect frame".into()),
+        Grab { .. } => ("grab", "Acquire one frame".into()),
         Activity { .. } => ("activity", "Read session activity".into()),
         Features => ("features", "Read camera features".into()),
         Xml => ("xml", "Read GenICam XML".into()),
@@ -804,6 +823,14 @@ mod tests {
                 address: 0,
                 length: 4,
             },
+            SessionCommand::Frame {
+                fresh: 1,
+                timeout_ms: 3000,
+                max_dimension: 1024,
+                format: Default::default(),
+                region: None,
+            },
+            SessionCommand::Grab { timeout_ms: 1000 },
         ] {
             assert!(
                 activity
@@ -811,6 +838,20 @@ mod tests {
                     .is_none()
             );
         }
+        assert_eq!(
+            describe(&SessionCommand::Frame {
+                fresh: 0,
+                timeout_ms: 1,
+                max_dimension: 0,
+                format: Default::default(),
+                region: None,
+            }),
+            ("frame", "Inspect frame".into())
+        );
+        assert_eq!(
+            describe(&SessionCommand::Grab { timeout_ms: 1 }),
+            ("grab", "Acquire one frame".into())
+        );
         assert_eq!(activity.wait(3, Duration::from_millis(5)), 3);
     }
     #[test]
@@ -1052,6 +1093,20 @@ mod tests {
                 .len()
                 <= 4096
         );
+    }
+    #[test]
+    fn set_many_labels_list_short_writes_and_count_long_ones() {
+        let label = |count: usize| {
+            let values = (0..count)
+                .map(|i| super::super::FeatureValue {
+                    feature: format!("F{i}"),
+                    value: i.to_string(),
+                })
+                .collect();
+            describe(&SessionCommand::SetMany { values })
+        };
+        assert_eq!(label(2), ("set_many", "Set F0 = 0, F1 = 1".into()));
+        assert_eq!(label(5), ("set_many", "Set 5 feature values".into()));
     }
     #[test]
     fn forward_labels_say_what_they_record_and_for_how_long() {

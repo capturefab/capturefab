@@ -442,6 +442,7 @@ impl Pending {
             Job::DatasetExport => "Exporting dataset",
             Job::SignalStart => "Starting data source",
             Job::SignalStop => "Stopping data source",
+            Job::SetMany => "Setting features",
             Job::Set(feature) => return format!("Setting {}", words(feature)),
             Job::Execute(feature) => return format!("Executing {}", words(feature)),
         };
@@ -495,6 +496,9 @@ enum Job {
     SignalStop,
     /// Write a feature, by name.
     Set(String),
+    /// Write several features as one camera change. The desktop only
+    /// replays these, for changes made over RPC.
+    SetMany,
     /// Run a command feature, by name.
     Execute(String),
 }

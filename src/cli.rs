@@ -2831,7 +2831,7 @@ fn schema() -> Value {
         "waiting_observers":{"private_ipc":8,"http":32,"capacity":"Waiting observers reserve capacity for commands; extra waits fail explicitly and can be retried."}
     });
     contract["writes"] = json!(
-        "Camera operations are ordered per camera across GUI, browser and IPC participants; different cameras run independently. Concurrent scheduled jobs on the same camera share acquisition. Multiple set assignments apply sequentially; failures may leave earlier assignments applied."
+        "Camera operations are ordered per camera across GUI, browser and IPC participants; different cameras run independently. Concurrent scheduled jobs on the same camera share acquisition. Multiple set assignments apply sequentially; failures may leave earlier assignments applied. RPC set_many writes 1..32 {feature, value} pairs in order as one camera change: a failure restores every value it wrote, and success returns one camera_change token that undoes them together."
     );
     contract["logs"] = json!({
         "snapshot":"status.logs; GET /api/session result.logs",
@@ -2916,7 +2916,19 @@ fn schema() -> Value {
         "conflicts":"Replay checks current camera state before changing it. A conflicting or failed replay reports an error and retains the history entry.",
         "effects":"Captures, uploads, recordings, schedules, connection changes, arbitrary commands and raw memory writes cannot be reversed by camera history. Stopping a stream with schedules or forwarding is also excluded. Scanner settings are reversible; scanner acquisition, including Start and Stop, may move or consume physical pages and cannot be undone or replayed."
     });
+    contract["frame"] = json!({
+        "rpc":"{\"op\":\"frame\"} through rpc, IPC or POST /api/command on a running session; --camera or the request's camera picks the camera",
+        "behavior":"Read-only: the newest frame of one camera as measurements and a bounded preview. It never saves files, uses storage or changes settings, and runs after commands sent to that camera before it. A stopped camera acquires one frame and stays stopped; document scanners are refused.",
+        "fields":{"fresh":"0..10 frames published after the request, default 1 (2 after a change on real hardware); 0 accepts the newest frame","timeout_ms":"1..10000, default 3000","max_dimension":"0 for measurements only, or 64..2048: the preview's longest edge, default 1024","format":"auto (JPEG; PNG in builds without the jpeg feature), jpeg or png","region":"optional normalized [x, y, width, height] crop of the full-resolution frame, also the focus region"},
+        "result":{"camera":"camera ID","frame":"{id, seq, width, height, pixel_format, timestamp_ns, age_ms, source: live|grab, waited_frames}","region":"{x, y, width, height, normalized}; Bayer crops widen to whole 2x2 quads","exposure":"{mean, p01, p50, p99, shadows, highlights, histogram16, channels: {red, green, blue} or null}, 0..1; null for depth, thermal and line-scan cameras","auto_meter":"{mean, p99} at native bit depth, or null","focus":"{laplacian, tenengrad, brenner, variance}: compare values for one region of one camera; or null","notes":"advisory text (clipped highlights, crushed shadows, dark or bright mean) and why a measurement is missing","image":"{mime, width, height, bytes, base64}, area-averaged to max_dimension and at most 1.5 MiB; null when max_dimension is 0"},
+        "errors":"No frame in time fails with \"no new frame from CAMERA within N (timed out)\" (exit 4); a triggered camera needs TriggerSoftware. A camera that stops streaming fails with its last error."
+    });
     let commands = contract["rpc"]["commands"].as_array_mut().unwrap();
+    commands.extend([
+        json!({"op":"frame","fresh":1,"max_dimension":1024}),
+        json!({"op":"frame","fresh":2,"timeout_ms":5000,"max_dimension":512,"format":"png","region":[0.25,0.25,0.5,0.5]}),
+        json!({"op":"set_many","values":[{"feature":"ExposureTime","value":"8000"},{"feature":"Gain","value":"6"}]}),
+    ]);
     commands.push(json!({"op":"activity","after":12,"timeout_ms":20000}));
     commands.extend([
         json!({"op":"network_scan","timeout_ms":1000}),
@@ -4280,11 +4292,18 @@ mod tests {
                 "signal_read",
                 "signal_browse",
                 "signal_start",
-                "signal_stop"
+                "signal_stop",
+                "frame",
+                "set_many"
             ]
             .iter()
             .all(|op| commands.iter().any(|c| c["op"] == *op))
         );
+        // Grab belongs to camera workers; sessions refuse it.
+        assert!(!commands.iter().any(|c| c["op"] == "grab"));
+        assert!(contract["frame"]["fields"]["max_dimension"].is_string());
+        // README and agents.md point to these for set_many.
+        assert!(contract["writes"].as_str().unwrap().contains("set_many"));
         // A timed recording reserves enough for its whole duration.
         let timed = commands
             .iter()
@@ -4439,6 +4458,52 @@ mod tests {
         ])
         .unwrap();
         assert!(prepare(&excessive).is_err());
+    }
+    #[test]
+    fn frame_inspection_errors_keep_their_exit_codes() {
+        // Bad values are usage errors, never timeouts, whatever their wording.
+        for invalid in [
+            r#"{"op":"frame","fresh":11}"#,
+            r#"{"op":"frame","timeout_ms":0}"#,
+            r#"{"op":"frame","timeout_ms":10001}"#,
+            r#"{"op":"frame","max_dimension":32}"#,
+            r#"{"op":"frame","region":[0.5,0.5,0.6,0.1]}"#,
+            r#"{"op":"set_many","values":[]}"#,
+            r#"{"op":"set_many","values":[{"feature":"Exposure Time","value":"1"}]}"#,
+            r#"{"op":"grab","timeout_ms":0}"#,
+        ] {
+            let error = SessionCommand::from_json_slice(invalid.as_bytes())
+                .unwrap()
+                .validate()
+                .unwrap_err();
+            assert_eq!(
+                error_code(&error),
+                ("operation_failed", 1),
+                "{invalid}: {error}"
+            );
+            // `rpc` reports a command that fails validation as usage.
+            let usage = input::<()>(Err(error)).unwrap_err();
+            assert_eq!(error_code(&usage), ("usage", 2));
+        }
+        assert_eq!(
+            error_code(&anyhow::anyhow!(
+                "no new frame from sim:0 within 3 s (timed out); a triggered camera needs TriggerSoftware"
+            )),
+            ("timeout", 4)
+        );
+        for failure in [
+            "a document scanner cannot be inspected without scanning a page",
+            "sim:0 stopped streaming: Shared frame buffer: frame exceeds shared-memory capacity",
+            "grab is reserved for camera workers; use frame to inspect a camera",
+            "preview image exceeds the size limit; request a smaller max_dimension",
+            "too many frame inspections are waiting; retry when one returns",
+        ] {
+            assert_eq!(
+                error_code(&anyhow::anyhow!("{failure}")),
+                ("operation_failed", 1),
+                "{failure}"
+            );
+        }
     }
     #[test]
     fn error_codes() {

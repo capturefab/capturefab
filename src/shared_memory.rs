@@ -1,5 +1,7 @@
 //! Three-slot, single-producer/single-consumer frame ring shared across processes.
 //! Slot ownership uses acquire/release AtomicU32 transitions; pixels never travel in JSON.
+//! Each slot's metadata records the frame's ring sequence number and when the
+//! worker published it, so readers can tell frames taken after a change.
 use crate::types::Frame;
 use anyhow::{Result, ensure};
 use memmap2::MmapMut;
@@ -11,12 +13,22 @@ use std::{
 const HEADER: usize = 64;
 const META: usize = 64;
 const SLOTS: usize = 3;
-const MAGIC: &[u8; 8] = b"CFABRNG1";
+const MAGIC: &[u8; 8] = b"CFABRNG2";
 const FREE: u32 = 0;
 const WRITING: u32 = 1;
 const READY: u32 = 2;
 const READING: u32 = 3;
 pub const DEFAULT_CAPACITY: usize = 16 * 1024 * 1024;
+
+/// Where a frame sits in its ring: the sequence number the writer gave it,
+/// one more than the frame published before it, and when the worker
+/// published it, in UTC Unix milliseconds. Device timestamps come from each
+/// camera's own clock; these compare with the host's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameMeta {
+    pub seq: u32,
+    pub received_ms: u64,
+}
 
 pub struct SharedRing {
     map: MmapMut,
@@ -150,6 +162,7 @@ impl SharedRing {
         self.map[b + 24..b + 28].copy_from_slice(&frame.pixel_format.to_le_bytes());
         self.map[b + 28..b + 32].copy_from_slice(&(frame.data.len() as u32).to_le_bytes());
         self.map[b + 32..b + 40].copy_from_slice(&frame.timestamp_ns.to_le_bytes());
+        self.map[b + 40..b + 48].copy_from_slice(&crate::scheduling::now_ms().to_le_bytes());
         self.map[b + META..b + META + frame.data.len()].copy_from_slice(&frame.data);
         self.atomic(b).store(READY, Ordering::Release);
         self.atomic(16).store(seq, Ordering::Release);
@@ -157,11 +170,12 @@ impl SharedRing {
     }
     pub fn take_latest(&mut self) -> Result<Option<Frame>> {
         let mut frame = Frame::default();
-        Ok(self.take_latest_into(&mut frame)?.then_some(frame))
+        Ok(self.take_latest_into(&mut frame)?.map(|_| frame))
     }
-    /// Copy the newest ready frame into `frame`, reusing its pixel allocation.
-    /// Returns false, leaving `frame` untouched, when no new frame is ready.
-    pub fn take_latest_into(&mut self, frame: &mut Frame) -> Result<bool> {
+    /// Copy the newest ready frame into `frame`, reusing its pixel allocation,
+    /// and return its sequence number and publish time. Returns None, leaving
+    /// `frame` untouched, when no new frame is ready.
+    pub fn take_latest_into(&mut self, frame: &mut Frame) -> Result<Option<FrameMeta>> {
         let mut newest: Option<(usize, u32)> = None;
         // Claim before inspecting non-atomic metadata. A writer may reclaim READY slots.
         for i in 0..SLOTS {
@@ -182,11 +196,11 @@ impl SharedRing {
                 }
             }
         }
-        let Some((slot, _)) = newest else {
-            return Ok(false);
+        let Some((slot, seq)) = newest else {
+            return Ok(None);
         };
         let b = self.base(slot);
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<u64> {
             let length = u32::from_le_bytes(self.map[b + 28..b + 32].try_into()?) as usize;
             ensure!(length <= self.capacity, "corrupt ring frame length");
             frame.id = u64::from_le_bytes(self.map[b + 8..b + 16].try_into()?);
@@ -198,11 +212,11 @@ impl SharedRing {
             frame
                 .data
                 .extend_from_slice(&self.map[b + META..b + META + length]);
-            Ok(())
+            Ok(u64::from_le_bytes(self.map[b + 40..b + 48].try_into()?))
         })();
         // Release the slot even when the metadata was corrupt.
         self.atomic(b).store(FREE, Ordering::Release);
-        result.map(|()| true)
+        result.map(|received_ms| Some(FrameMeta { seq, received_ms }))
     }
 }
 impl Drop for SharedRing {
@@ -246,6 +260,17 @@ mod tests {
         f.data = vec![0; 4097];
         assert!(writer.write(&f).is_err());
         drop(reader);
+        // A worker from a build without publish times refuses this ring.
+        let mut previous = std::fs::read(&path).unwrap();
+        previous[..8].copy_from_slice(b"CFABRNG1");
+        let old = path.with_extension("old");
+        std::fs::write(&old, previous).unwrap();
+        let refused = SharedRing::open(&old).err().unwrap();
+        assert!(
+            refused.to_string().contains("version mismatch"),
+            "{refused}"
+        );
+        std::fs::remove_file(old).unwrap();
         drop(writer);
         assert!(!path.exists());
     }
@@ -266,7 +291,7 @@ mod tests {
             ..Frame::default()
         };
         let buffer = frame.data.as_ptr();
-        assert!(!reader.take_latest_into(&mut frame).unwrap());
+        assert!(reader.take_latest_into(&mut frame).unwrap().is_none());
         assert_eq!((frame.id, frame.data.len()), (0, 0));
         for id in 1..=3 {
             let sent = Frame {
@@ -277,8 +302,11 @@ mod tests {
                 timestamp_ns: id * 10,
                 data: vec![id as u8; 32],
             };
+            let before = crate::scheduling::now_ms();
             assert!(writer.write(&sent).unwrap());
-            assert!(reader.take_latest_into(&mut frame).unwrap());
+            let meta = reader.take_latest_into(&mut frame).unwrap().unwrap();
+            assert_eq!(meta.seq, id as u32);
+            assert!((before..=crate::scheduling::now_ms()).contains(&meta.received_ms));
             assert_eq!(
                 (frame.id, frame.width, frame.height, frame.timestamp_ns),
                 (id, 8, 4, id * 10)
@@ -286,7 +314,7 @@ mod tests {
             assert_eq!(frame.data, sent.data);
             assert_eq!(frame.data.as_ptr(), buffer);
         }
-        assert!(!reader.take_latest_into(&mut frame).unwrap());
+        assert!(reader.take_latest_into(&mut frame).unwrap().is_none());
         assert_eq!(frame.id, 3);
     }
 }

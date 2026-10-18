@@ -19,6 +19,7 @@ pub mod frame;
 pub mod genicam;
 #[cfg(feature = "gui")]
 pub mod gui;
+pub mod inspect;
 pub mod ipc;
 pub mod jpeg;
 pub mod media;

@@ -3104,3 +3104,175 @@ fn dataset_with_signals_asof() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Agents inspect frames through a session: a stopped camera acquires one
+/// frame and stays stopped, a live one waits for frames published after the
+/// request, regions crop the full-resolution frame, and nothing is saved.
+#[test]
+fn rpc_frame_inspects_stopped_and_live_cameras_without_saving() {
+    use base64::Engine;
+    use std::io::Write;
+    let root = temp_root("frame-rpc");
+    let dir = root.join("sessions");
+    let cwd = root.join("server");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let _fixture = Fixture {
+        child: serve_at(&dir, &cwd, "frame-ci"),
+        dir: root.clone(),
+    };
+    let rpc = |request: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+            .env_remove("CAPTUREFAB_SESSION")
+            .env_remove("CAPTUREFAB_CAMERA")
+            .env("CAPTUREFAB_SESSION_DIR", &dir)
+            .args([
+                "--json",
+                "--session",
+                "frame-ci",
+                "--camera",
+                "sim:0",
+                "rpc",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(request.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let response: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{request}: {error}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        (out.status.code(), response)
+    };
+    let ok = |request: &str| {
+        let (code, response) = rpc(request);
+        assert_eq!(code, Some(0), "{request}: {response}");
+        response["result"].clone()
+    };
+    let session = |args: &[&str]| {
+        json(
+            &dir,
+            &[
+                &["--json", "--session", "frame-ci", "--camera", "sim:0"],
+                args,
+            ]
+            .concat(),
+        )
+    };
+    json(
+        &dir,
+        &["--json", "--session", "frame-ci", "connect", "sim:0"],
+    );
+
+    let grabbed = ok(r#"{"op":"frame","max_dimension":256}"#);
+    assert_eq!(grabbed["camera"], "sim:0");
+    assert_eq!(grabbed["frame"]["source"], "grab");
+    assert_eq!(grabbed["frame"]["pixel_format"], "Mono8");
+    assert_eq!(grabbed["frame"]["width"], 640);
+    assert_eq!(grabbed["frame"]["height"], 480);
+    let mean = grabbed["exposure"]["mean"].as_f64().unwrap();
+    assert!((0.3..0.6).contains(&mean), "{grabbed}");
+    let image = &grabbed["image"];
+    assert_eq!(image["mime"], "image/jpeg");
+    assert_eq!(image["width"], 256);
+    assert_eq!(image["height"], 192);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(image["base64"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(bytes.len() as u64, image["bytes"].as_u64().unwrap());
+    assert!(capturefab::jpeg::well_formed(&bytes, 256, 192));
+    let status = session(&["status"]);
+    assert_eq!(status["streaming"], false);
+    assert!(
+        status["activity"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["operation"] != "frame"),
+        "inspections are observations"
+    );
+
+    session(&["start"]);
+    let live = ok(r#"{"op":"frame","fresh":2,"max_dimension":0}"#);
+    assert_eq!(live["frame"]["source"], "live");
+    assert!(
+        live["frame"]["waited_frames"].as_u64().unwrap() >= 2,
+        "{live}"
+    );
+    assert!(live["frame"]["seq"].as_u64() > grabbed["frame"]["seq"].as_u64());
+    assert!(live["frame"]["age_ms"].as_u64().unwrap() < 5000);
+    assert!(live["image"].is_null());
+
+    let region =
+        ok(r#"{"op":"frame","region":[0.25,0.25,0.5,0.5],"max_dimension":2048,"format":"png"}"#);
+    assert_eq!(
+        region["region"],
+        serde_json::json!({"x":160,"y":120,"width":320,"height":240,"normalized":[0.25,0.25,0.5,0.5]})
+    );
+    assert_eq!(region["image"]["mime"], "image/png");
+    assert_eq!(region["image"]["width"], 320);
+    assert_eq!(region["image"]["height"], 240);
+    assert!(region["focus"]["tenengrad"].as_f64().unwrap() > 0.0);
+
+    // One undoable change; the next fresh frame shows it, and undo restores it.
+    let changed = ok(
+        r#"{"op":"set_many","values":[{"feature":"ExposureTime","value":"40000"},{"feature":"Gain","value":"0"}]}"#,
+    );
+    assert_eq!(changed["values"][0]["name"], "ExposureTime");
+    let token = changed["camera_change"]["token"].as_str().unwrap();
+    let bright = ok(r#"{"op":"frame","max_dimension":0}"#);
+    assert!(
+        bright["exposure"]["highlights"].as_f64().unwrap() > 0.2,
+        "{bright}"
+    );
+    assert!(
+        bright["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|note| note.as_str().unwrap().starts_with("highlights clipped")),
+        "{bright}"
+    );
+    ok(&format!(
+        r#"{{"op":"replay_camera_change","token":"{token}","undo":true}}"#
+    ));
+    let restored = ok(r#"{"op":"frame","max_dimension":0}"#);
+    assert!(
+        (restored["exposure"]["mean"].as_f64().unwrap() - mean).abs() < 0.1,
+        "{restored}"
+    );
+    assert_eq!(std::fs::read_dir(&cwd).unwrap().count(), 0, "nothing saved");
+
+    let (code, invalid) = rpc(r#"{"op":"frame","fresh":11}"#);
+    assert_eq!(code, Some(2), "{invalid}");
+    assert_eq!(invalid["error"]["code"], "usage");
+    assert!(
+        invalid["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("fresh frames must be 0..10")
+    );
+    let (code, grab) = rpc(r#"{"op":"grab","timeout_ms":1000}"#);
+    assert_eq!(code, Some(1), "{grab}");
+    // Thirty frames a second cannot bring ten new ones within 200 ms.
+    let (code, slow) = rpc(r#"{"op":"frame","fresh":10,"timeout_ms":200}"#);
+    assert_eq!(code, Some(4), "{slow}");
+    assert_eq!(slow["error"]["code"], "timeout");
+    assert!(
+        slow["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("no new frame from sim:0 within 200 ms (timed out)"),
+        "{slow}"
+    );
+    assert_eq!(session(&["status"])["streaming"], true);
+}

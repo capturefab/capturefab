@@ -233,21 +233,22 @@ fn addresses(camera: &mut Camera, feature: &str, all_banks: bool) -> Result<Vec<
     Ok(addresses)
 }
 
+/// Checkpoint the camera before a change. `all` takes every configuration
+/// value; `written` adds the features the change writes, even ones the
+/// feature tree does not list, at their selected banks.
 fn capture(
     camera: &mut Camera,
     auto: &Option<AutoController>,
-    feature: Option<&str>,
+    all: bool,
+    written: &[&str],
 ) -> Result<Configuration> {
-    let all = feature.is_none();
     let mut names = camera
         .features()
         .into_iter()
         .filter(|feature| feature.value.is_some() && camera.is_configuration_value(&feature.name))
         .map(|feature| feature.name)
         .collect::<BTreeSet<_>>();
-    if let Some(feature) = feature {
-        names.insert(feature.into());
-    }
+    names.extend(written.iter().map(|&feature| feature.to_owned()));
     if all {
         if let Some(controller) = auto {
             names.extend(controller.status().managed.iter().cloned());
@@ -288,6 +289,22 @@ fn capture(
         values,
         auto: auto.clone(),
     })
+}
+
+/// Add what a write of `feature` is about to replace, at the banks selected
+/// now, to the checkpoint taken before a SetMany: an earlier value of the
+/// same SetMany may have switched a selector to a bank it did not read.
+fn extend(camera: &mut Camera, before: &mut Configuration, feature: &str) -> Result<()> {
+    for address in addresses(camera, feature, false)? {
+        if let std::collections::btree_map::Entry::Vacant(entry) = before.values.entry(address) {
+            entry.insert(
+                camera
+                    .get(feature)
+                    .with_context(|| format!("read {feature} for undo"))?,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn capture_at(
@@ -629,12 +646,14 @@ pub(super) fn process(
         }
         _ => {}
     }
-    let eligible = matches!(
-        command,
-        SessionCommand::Set { .. } | SessionCommand::Auto { .. } | SessionCommand::Manual { .. }
-    ) || !busy
-        && !scanner
-        && matches!(command, SessionCommand::Start | SessionCommand::Stop);
+    let eligible =
+        matches!(
+            command,
+            SessionCommand::Set { .. }
+                | SessionCommand::SetMany { .. }
+                | SessionCommand::Auto { .. }
+                | SessionCommand::Manual { .. }
+        ) || !busy && !scanner && matches!(command, SessionCommand::Start | SessionCommand::Stop);
     if !eligible {
         let boundary = matches!(
             command,
@@ -679,15 +698,29 @@ pub(super) fn process(
     let id = c.info.id.clone();
     let stream = matches!(command, SessionCommand::Start | SessionCommand::Stop);
     let before_stream = c.is_streaming();
-    let feature = match &command {
-        SessionCommand::Set { feature, .. } if auto.is_none() => Some(feature.as_str()),
-        _ => None,
+    // Only a plain Set names the one value it changes. Otherwise every
+    // configuration value is captured, so a failed SetMany restores all of
+    // them, and the written features are added even when unlisted.
+    let (all, written) = match &command {
+        SessionCommand::Set { feature, .. } => (auto.is_some(), vec![feature.as_str()]),
+        SessionCommand::SetMany { values } => (
+            true,
+            values.iter().map(|value| value.feature.as_str()).collect(),
+        ),
+        _ => (true, Vec::new()),
     };
-    let before = if stream {
+    let set_many = matches!(command, SessionCommand::SetMany { .. });
+    let mut before = if stream {
         None
     } else {
-        match capture(c, auto, feature) {
+        match capture(c, auto, all, &written) {
             Ok(before) => Some(before),
+            // Its values must be restorable together, so it writes none.
+            Err(error) if set_many => {
+                return Err(error.context(
+                    "set_many changed nothing: the values it would replace could not be read",
+                ));
+            }
             Err(error) => {
                 // A write-only control is still useful. Its previous state
                 // cannot be reconstructed, so report that accurately instead
@@ -710,6 +743,19 @@ pub(super) fn process(
     };
     let label = match &command {
         SessionCommand::Set { feature, .. } => format!("Set {feature}"),
+        SessionCommand::SetMany { values } => {
+            let mut names = Vec::new();
+            for value in values {
+                if !names.contains(&value.feature.as_str()) {
+                    names.push(value.feature.as_str());
+                }
+            }
+            if names.len() <= 3 {
+                format!("Set {}", names.join(", "))
+            } else {
+                format!("Set {} features", names.len())
+            }
+        }
         SessionCommand::Auto { .. } if auto.is_some() => "Change auto balance".into(),
         SessionCommand::Auto { .. } => "Enable auto mode".into(),
         SessionCommand::Manual { .. } => "Switch to manual mode".into(),
@@ -717,16 +763,24 @@ pub(super) fn process(
         SessionCommand::Stop => "Stop stream".into(),
         _ => unreachable!(),
     };
-    let result = process_plain(
-        h,
-        camera,
-        forwarder,
-        auto,
-        jobs,
-        next_job,
-        scheduled_stream,
-        command.clone(),
-    );
+    let result = match (&command, before.as_mut()) {
+        // Each write first records the bank it is about to change.
+        (SessionCommand::SetMany { values }, Some(before)) => {
+            super::set_many(h, camera, auto, values, |camera, feature| {
+                extend(camera, before, feature)
+            })
+        }
+        _ => process_plain(
+            h,
+            camera,
+            forwarder,
+            auto,
+            jobs,
+            next_job,
+            scheduled_stream,
+            command.clone(),
+        ),
+    };
     let mut result = match result {
         Ok(result) => result,
         Err(error) => {
@@ -777,6 +831,7 @@ pub(super) fn process(
     if let Some(checkpoint) = checkpoint {
         let (kind, feature) = match &command {
             SessionCommand::Set { feature, .. } => ("set", Some(feature.clone())),
+            SessionCommand::SetMany { .. } => ("set_many", None),
             SessionCommand::Auto { .. } if label == "Change auto balance" => ("balance", None),
             SessionCommand::Auto { .. } => ("auto", None),
             SessionCommand::Manual { .. } => ("manual", None),
@@ -823,6 +878,72 @@ mod tests {
             value: value.into(),
         })
         .unwrap()
+    }
+
+    fn set_many(h: &WorkerHandle, values: &[(&str, &str)]) -> Result<Value> {
+        h.request(SessionCommand::SetMany {
+            values: values
+                .iter()
+                .map(|(feature, value)| crate::session::FeatureValue {
+                    feature: (*feature).into(),
+                    value: (*value).into(),
+                })
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn set_many_fails_restores_and_undoes_as_one_change() {
+        let h = connected();
+        let (exposure, width) = (get(&h, "ExposureTime"), get(&h, "Width"));
+        let entries = h.snapshot().history.entries.len();
+        // The second value is out of range after the first was written.
+        assert!(set_many(&h, &[("ExposureTime", "5000"), ("Width", "99999")]).is_err());
+        assert_eq!(get(&h, "ExposureTime"), exposure);
+        assert_eq!(get(&h, "Width"), width);
+        assert_eq!(h.snapshot().history.entries.len(), entries);
+        let changed = set_many(&h, &[("ExposureTime", "5000"), ("Width", "256")]).unwrap();
+        assert_eq!(changed["values"][0]["name"], "ExposureTime");
+        assert_eq!(changed["values"][0]["value"].as_f64(), Some(5000.0));
+        assert_eq!(changed["values"][1], json!({"name":"Width","value":256}));
+        assert_eq!(changed["camera_change"]["label"], "Set ExposureTime, Width");
+        let token = changed["camera_change"]["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let history = h.snapshot().history;
+        assert_eq!(history.entries.len(), entries + 1);
+        let entry = history.entries.last().unwrap();
+        assert_eq!(
+            (entry.kind.as_str(), entry.feature.as_deref()),
+            ("set_many", None)
+        );
+        let replay = |undo| {
+            h.request(SessionCommand::ReplayCameraChange {
+                token: token.clone(),
+                undo,
+            })
+            .unwrap()
+        };
+        replay(true);
+        assert_eq!(get(&h, "ExposureTime"), exposure);
+        assert_eq!(get(&h, "Width"), width);
+        replay(false);
+        assert_eq!(get(&h, "ExposureTime").as_f64(), Some(5000.0));
+        assert_eq!(get(&h, "Width"), 256);
+        // Many features are counted rather than listed.
+        let many = set_many(
+            &h,
+            &[
+                ("Width", "128"),
+                ("Height", "128"),
+                ("Gain", "1"),
+                ("ExposureTime", "6000"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(many["camera_change"]["label"], "Set 4 features");
+        h.shutdown();
     }
 
     #[test]
@@ -1206,6 +1327,122 @@ mod tests {
         assert_eq!(camera.as_mut().unwrap().get("BankSelector").unwrap(), "B");
         camera.as_mut().unwrap().set("BankSelector", "A").unwrap();
         assert_eq!(camera.as_mut().unwrap().get("Setting").unwrap(), 20);
+        h.shutdown();
+    }
+
+    #[test]
+    fn set_many_restores_and_undoes_every_bank_it_selects() {
+        let h = WorkerHandle::new();
+        let mut camera = Some(
+            Camera::from_backend(crate::transport::simulator::info(), Box::new(Banks)).unwrap(),
+        );
+        let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
+        let (mut next, mut scheduled) = (1, false);
+        let mut run = |camera: &mut Option<Camera>, command| {
+            process(
+                &h,
+                camera,
+                &mut forwarder,
+                &mut auto,
+                &mut jobs,
+                &mut next,
+                &mut scheduled,
+                command,
+            )
+        };
+        let many = |values: &[(&str, &str)]| SessionCommand::SetMany {
+            values: values
+                .iter()
+                .map(|(feature, value)| crate::session::FeatureValue {
+                    feature: (*feature).into(),
+                    value: (*value).into(),
+                })
+                .collect(),
+        };
+        // Bank A holds 10 and bank B 11; A is selected.
+        let banks = |camera: &mut Option<Camera>| {
+            let camera = camera.as_mut().unwrap();
+            let selected = camera.get("BankSelector").unwrap();
+            let mut values = Vec::new();
+            for bank in ["A", "B"] {
+                camera.set("BankSelector", bank).unwrap();
+                values.push(camera.get("Setting").unwrap());
+            }
+            camera
+                .set("BankSelector", selected.as_str().unwrap())
+                .unwrap();
+            (selected, values)
+        };
+        let initial = (json!("A"), vec![json!(10), json!(11)]);
+        assert_eq!(banks(&mut camera), initial);
+        // A failure after switching banks restores the bank it wrote too.
+        assert!(
+            run(
+                &mut camera,
+                many(&[("BankSelector", "B"), ("Setting", "99"), ("Setting", "x")]),
+            )
+            .is_err()
+        );
+        assert_eq!(banks(&mut camera), initial);
+        // So does one after writing an unlisted feature directly.
+        assert!(
+            run(
+                &mut camera,
+                many(&[("BValue", "42"), ("Setting", "20"), ("Setting", "x")])
+            )
+            .is_err()
+        );
+        assert_eq!(banks(&mut camera), initial);
+        assert!(h.snapshot().history.entries.is_empty());
+        // Success records every bank written, even with the selector put back.
+        let changed = run(
+            &mut camera,
+            many(&[
+                ("Setting", "20"),
+                ("BankSelector", "B"),
+                ("Setting", "99"),
+                ("BankSelector", "A"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(banks(&mut camera), (json!("A"), vec![json!(20), json!(99)]));
+        let token = changed["camera_change"]["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let switched = run(
+            &mut camera,
+            many(&[("BankSelector", "B"), ("Setting", "7")]),
+        )
+        .unwrap()["camera_change"]["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(banks(&mut camera), (json!("B"), vec![json!(20), json!(7)]));
+        run(
+            &mut camera,
+            SessionCommand::ReplayCameraChange {
+                token: switched,
+                undo: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(banks(&mut camera), (json!("A"), vec![json!(20), json!(99)]));
+        run(
+            &mut camera,
+            SessionCommand::ReplayCameraChange {
+                token: token.clone(),
+                undo: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(banks(&mut camera), initial);
+        run(
+            &mut camera,
+            SessionCommand::ReplayCameraChange { token, undo: false },
+        )
+        .unwrap();
+        assert_eq!(banks(&mut camera), (json!("A"), vec![json!(20), json!(99)]));
         h.shutdown();
     }
 

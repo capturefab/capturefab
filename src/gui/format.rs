@@ -223,23 +223,7 @@ pub(super) fn range_text(feature: &FeatureInfo) -> String {
     }
 }
 
-/// Features a camera cannot change while it streams: the image's geometry
-/// and format.
-pub(super) fn stream_locked(name: &str) -> bool {
-    matches!(
-        name,
-        "Width"
-            | "Height"
-            | "OffsetX"
-            | "OffsetY"
-            | "PixelFormat"
-            | "BinningHorizontal"
-            | "BinningVertical"
-            | "DecimationHorizontal"
-            | "DecimationVertical"
-            | "VideoMode"
-    )
-}
+pub(super) use crate::genicam::stream_locked;
 
 /// Where a feature sorts within its group: in the order a camera is set up,
 /// then everything else.

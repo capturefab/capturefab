@@ -393,6 +393,10 @@ fn outcome(job: &Job, value: &Value) -> Option<(String, Option<String>, Level)> 
             }
             done(text)
         }
+        Job::SetMany => done(match value["values"].as_array() {
+            Some(values) => format!("Set {}", plural(values.len() as u64, "feature", "features")),
+            None => "Features set".into(),
+        }),
         // AcquisitionStart and Stop report the stream: the status pill shows it.
         Job::Execute(_) if value["streaming"].is_boolean() => None,
         Job::Execute(feature) => done(format!(
@@ -436,6 +440,7 @@ fn failure(job: &Job) -> String {
         Job::DatasetExport => "Could not export the dataset",
         Job::SignalStart => "Could not start the data source",
         Job::SignalStop => "Could not stop the data source",
+        Job::SetMany => "Could not set the features",
         Job::Set(feature) => return format!("Could not set {}", words(feature)),
         Job::Execute(feature) => return format!("Could not execute {}", words(feature)),
     };

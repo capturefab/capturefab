@@ -47,6 +47,7 @@ impl Change {
     ) -> Option<Self> {
         let job = match entry.kind.as_str() {
             "set" => Job::Set(entry.feature.clone()?),
+            "set_many" => Job::SetMany,
             "auto" => Job::AutoOn,
             "manual" => Job::AutoOff,
             "balance" => Job::Balance,
@@ -307,6 +308,33 @@ mod tests {
         assert_eq!(change.camera, "sim:1");
         assert_eq!(change.token, "worker-4");
         assert_eq!(change.label(), "Set Gain");
+    }
+
+    #[test]
+    fn status_entries_of_every_reversible_kind_become_changes() {
+        let entry = |kind: &str, feature: Option<&str>| crate::session::CameraHistoryEntry {
+            token: format!("worker-{kind}"),
+            label: "Set Gain, Width".into(),
+            applied: true,
+            created_at_ms: 0,
+            last_changed_at_us: 5,
+            feature: feature.map(Into::into),
+            kind: kind.into(),
+        };
+        let change = Change::from_status("sim:0", &entry("set_many", None)).unwrap();
+        assert_eq!(change.job, Job::SetMany);
+        assert_eq!(
+            (change.camera(), change.token(), change.label().as_str()),
+            ("sim:0", "worker-set_many", "Set Gain, Width")
+        );
+        assert_eq!(
+            Change::from_status("sim:0", &entry("set", Some("Gain")))
+                .unwrap()
+                .job,
+            Job::Set("Gain".into())
+        );
+        assert!(Change::from_status("sim:0", &entry("set", None)).is_none());
+        assert!(Change::from_status("sim:0", &entry("capture", None)).is_none());
     }
 
     #[test]

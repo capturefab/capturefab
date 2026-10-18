@@ -293,7 +293,7 @@ fn bayer_bounded(frame: &Frame, pattern: [usize; 4], x: usize, y: usize) -> [u8;
 }
 /// Bytes per pixel of a convertible format, after validating dimensions and
 /// that the frame holds a complete image.
-fn validated_bytes_per_pixel(frame: &Frame) -> Result<usize> {
+pub(crate) fn validated_bytes_per_pixel(frame: &Frame) -> Result<usize> {
     let pixels = checked_pixels(frame)?;
     let (bytes, name) = match frame.pixel_format {
         MONO8 | 0x0108_00b1 | 0x0108_00c6 => (1, "8-bit scalar"),
@@ -413,7 +413,7 @@ pub fn exposure(frame: &Frame) -> Result<Exposure> {
 /// How sharp a region is by four common focus measures, each larger when
 /// sharper, in 8-bit luminance units. Absolute values depend on the scene;
 /// compare them while focusing on one subject.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
 pub struct Sharpness {
     /// Variance of the 4-neighbour Laplacian.
     pub laplacian: f32,

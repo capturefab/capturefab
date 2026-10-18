@@ -79,6 +79,10 @@ Persistent `start` and `auto` controls act on a connected camera; use `connect I
 Binary stdout captures use a temporary worker and cannot use `--session`.
 Camera control can be exclusive, so use the existing session for an open camera.
 
+RPC `{"op":"frame","fresh":1,"max_dimension":1024}` returns a camera's newest frame with exposure and focus measurements and a base64 JPEG preview.
+It saves nothing; a stopped camera acquires one frame and stays stopped.
+RPC `{"op":"set_many","values":[{"feature":"ExposureTime","value":"8000"}]}` writes several features as one undoable change.
+
 `--timeout-ms` limits each frame or transport operation to 1–60000 ms.
 `--request-timeout 5m` limits the full session request.
 Its default depends on the capture count.
