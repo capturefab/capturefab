@@ -92,8 +92,9 @@ Environment=XDG_RUNTIME_DIR=/run/user/1000
 # Relative capture paths land in the account's home folder.
 WorkingDirectory=~
 ExecStart=/usr/local/bin/capturefab serve --name line1 --listen 100.101.102.103:8787
-# serve stops cleanly on SIGINT: recordings are finished and the upload queue saved.
-KillSignal=SIGINT
+# systemctl stop sends SIGTERM to serve alone; serve then finishes recordings,
+# saves the upload queue and stops its camera workers itself.
+KillMode=mixed
 TimeoutStopSec=45
 Restart=on-failure
 RestartSec=5
@@ -111,7 +112,7 @@ journalctl -u capturefab-line1 -f
 
 `Wants=` and `After=user@1000.service` start the service once logind has made `/run/user/1000`. If no login needs to reach the session with `--session`, the service can keep a runtime folder of its own instead: replace the `XDG_RUNTIME_DIR` line with `RuntimeDirectory=capturefab`, `RuntimeDirectoryMode=0700` and `Environment=XDG_RUNTIME_DIR=/run/capturefab`, and leave out `user@1000.service`. The browser and its API still reach it through `--listen`, and state stays in `~/.local/state/capturefab`.
 
-Keep `KillSignal=SIGINT`: systemd's default SIGTERM ends `serve` without that cleanup. `Restart=on-failure` also retries when the Tailscale address is not up yet at boot. To connect a camera and start streaming when the service starts, put the camera before the command: `capturefab --camera ID serve --name line1 --stream ...`. Camera connections and schedules belong to the running process and do not survive a restart; reapply a [workflow file](../README.md#repeatable-workflows) to set them up again.
+`serve` stops on SIGTERM, SIGHUP and Ctrl-C alike. Keep `KillMode=mixed`: by default systemd signals every process of the service at once, so a camera worker would end before `serve` could finish its recording. With `mixed`, systemd kills whatever is still running once `serve` exits, and everything after `TimeoutStopSec`. `Restart=on-failure` also retries when the Tailscale address is not up yet at boot. To connect a camera and start streaming when the service starts, put the camera before the command: `capturefab --camera ID serve --name line1 --stream ...`. Camera connections and schedules belong to the running process and do not survive a restart; reapply a [workflow file](../README.md#repeatable-workflows) to set them up again.
 
 Over SSH, as the same account, every CLI command can use the running session:
 

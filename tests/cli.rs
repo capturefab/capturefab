@@ -1816,6 +1816,178 @@ fn a_new_session_sweeps_ring_files_a_killed_one_left() {
     assert!(ring_files(&dir).is_empty());
 }
 
+/// Send `signal` to `child` and wait up to 30 s for it to exit.
+#[cfg(unix)]
+fn signal_and_wait(child: &mut Child, signal: i32) -> std::process::ExitStatus {
+    // SAFETY: kill only sends a signal to the child this test spawned.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        assert!(std::time::Instant::now() < deadline, "still running");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Whether process `pid` still exists, within a few seconds for its
+/// parent to reap it.
+#[cfg(unix)]
+fn process_lives(pid: i32) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        // SAFETY: signal 0 only checks that the process exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        if std::time::Instant::now() >= deadline {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// `systemctl stop` sends SIGTERM, and a closed terminal SIGHUP: serve then
+/// shuts down as it does on Ctrl-C. Its camera workers stop, the upload
+/// queue's journal is folded into the queue, the session's descriptor goes
+/// and it exits successfully.
+#[test]
+#[cfg(unix)]
+fn serve_shuts_down_cleanly_on_sigterm_and_sighup() {
+    for (signal, name) in [(libc::SIGTERM, "term"), (libc::SIGHUP, "hup")] {
+        let root = temp_root(&format!("signal-{name}"));
+        let (dir, staging) = (root.join("sessions"), root.join("staging"));
+        std::fs::create_dir_all(&root).unwrap();
+        let env = [
+            ("CAPTUREFAB_STAGING_DIR", staging.to_str().unwrap()),
+            ("CAPTUREFAB_FTP_PASSWORD", "secret"),
+        ];
+        let mut serve = serve_with(&dir, &root, name, &env);
+        json(&dir, &["--json", "--session", name, "connect", "sim:0"]);
+        json(&dir, &["--json", "--session", name, "start"]);
+        let status = json(&dir, &["--json", "--session", name, "status"]);
+        let worker = status["cameras"][0]["worker_pid"].as_i64().unwrap() as i32;
+        assert!(process_lives(worker));
+        if cfg!(feature = "ftp") {
+            // A capture whose upload stays queued: nothing listens on port 1.
+            json_env(
+                &dir,
+                &env,
+                &[
+                    "--json",
+                    "destination",
+                    "add-ftp",
+                    "down",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "1",
+                    "--user",
+                    "cam",
+                    "--plain",
+                    "--password-env",
+                    "--no-check",
+                ],
+            );
+            json_env(
+                &dir,
+                &env,
+                &[
+                    "--json",
+                    "--session",
+                    name,
+                    "--camera",
+                    "sim:0",
+                    "capture",
+                    "-o",
+                    "queued.png",
+                    "--destination",
+                    "down",
+                ],
+            );
+            assert!(dir.join("uploads.journal").is_file());
+        }
+        let descriptor = dir.join(format!("{name}.json"));
+        assert!(descriptor.is_file());
+        let exit = signal_and_wait(&mut serve, signal);
+        assert!(exit.success(), "{name}: {exit:?}");
+        assert!(!descriptor.exists(), "{name}: the descriptor is removed");
+        assert!(!process_lives(worker), "{name}: the camera worker exits");
+        if cfg!(feature = "ftp") {
+            assert!(!dir.join("uploads.journal").exists(), "{name}: folded");
+            let queue: Value =
+                serde_json::from_slice(&std::fs::read(dir.join("uploads.json")).unwrap()).unwrap();
+            assert_eq!(queue["items"].as_array().unwrap().len(), 1, "{queue}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// A recording that runs when serve gets SIGTERM is finished: complete on
+/// disk and in the storage ledger, with nothing left reserved.
+#[test]
+#[cfg(unix)]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn serve_finishes_a_recording_on_sigterm() {
+    let root = temp_root("signal-recording");
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut serve = serve_at(&dir, &root, "rec");
+    json(&dir, &["--json", "--session", "rec", "connect", "sim:rec"]);
+    json(
+        &dir,
+        &["--json", "--session", "rec", "set", "Width=64", "Height=64"],
+    );
+    // An MP4 is unreadable until FFmpeg writes its index at the end.
+    let clip = root.join("clip.mp4");
+    json(
+        &dir,
+        &[
+            "--json",
+            "--session",
+            "rec",
+            "record",
+            "-o",
+            clip.to_str().unwrap(),
+            "--encoder",
+            "libx264",
+            "--fps",
+            "10",
+            "--max-file-size",
+            "8MiB",
+        ],
+    );
+    let start = std::time::Instant::now();
+    loop {
+        let status = json(&dir, &["--json", "--session", "rec", "status"]);
+        if status["forwarding"].is_string() && start.elapsed().as_secs() >= 1 {
+            break;
+        }
+        assert!(start.elapsed().as_secs() < 10, "recording failed to start");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let exit = signal_and_wait(&mut serve, libc::SIGTERM);
+    assert!(exit.success(), "{exit:?}");
+    let storage = json(&dir, &["--json", "storage"]);
+    assert_eq!(storage["files"], 1, "{storage}");
+    assert_eq!(storage["active_reservations"], 0, "{storage}");
+    assert_eq!(storage["reserved_bytes"], 0, "{storage}");
+    let ffmpeg = std::env::var("CAPTUREFAB_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
+    let decoded = Command::new(ffmpeg)
+        .args(["-v", "error", "-i"])
+        .arg(&clip)
+        .args(["-f", "null", "-"])
+        .output()
+        .unwrap();
+    assert!(
+        decoded.status.success() && decoded.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&decoded.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // ---------------------------------------------------------------------------
 // Network destinations (FTP, SFTP, S3 presets) and the upload queue.
 

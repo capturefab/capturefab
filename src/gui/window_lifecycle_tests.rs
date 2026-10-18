@@ -155,6 +155,22 @@ fn main_context_is_intact(app: &Workbench) {
 }
 
 #[test]
+fn a_quit_signal_quits_on_the_next_tick_as_the_quit_command_does() {
+    let mut app = app();
+    app.quit_signal.store(true, Ordering::Release);
+    let mut stream = iced_runtime::task::into_stream(app.update(Message::Tick))
+        .expect("quitting flushes preferences");
+    assert!(matches!(app.closing, Some(CloseTarget::Quit)));
+    assert!(!app.quit_signal.load(Ordering::Acquire), "heard once");
+    let Some(RuntimeAction::Output(message @ Message::PrefsFlushed(Ok(())))) =
+        iced::futures::executor::block_on(stream.next())
+    else {
+        panic!("a quit signal must flush preferences first");
+    };
+    assert_eq!(effects(app.update(message)).last(), Some(&Effect::Exit));
+}
+
+#[test]
 fn live_window_open_activation_and_main_close_keep_their_normal_tasks() {
     let mut app = app();
     let main = app.main_window;

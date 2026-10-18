@@ -95,7 +95,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, TryRecvError},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -137,6 +137,23 @@ pub fn run(handle: SessionHandle, session_label: String, simulated: bool) -> Res
     run_capture(handle, session_label, simulated, None, 0)
 }
 
+/// Quit on SIGINT, SIGTERM or SIGHUP as the Quit command does, so the
+/// session finishes its recordings, folds the upload queue and removes its
+/// descriptor: `requested` tells the next tick. A second signal exits at
+/// once, in case the window cannot quit.
+fn quit_on_signal(requested: Arc<AtomicBool>) {
+    let again = AtomicBool::new(false);
+    let installed = ctrlc::set_handler(move || {
+        if again.swap(true, Ordering::AcqRel) {
+            std::process::exit(130);
+        }
+        requested.store(true, Ordering::Release);
+    });
+    if let Err(error) = installed {
+        eprintln!("capturefab: a quit signal will end the window at once: {error}");
+    }
+}
+
 pub fn run_capture(
     handle: SessionHandle,
     session_label: String,
@@ -149,6 +166,8 @@ pub fn run_capture(
             "Window closed before the renderer screenshot was saved".into()
         })));
     let app_outcome = outcome.clone();
+    let quit_signal = Arc::new(AtomicBool::new(false));
+    quit_on_signal(quit_signal.clone());
     let screenshot_sequence = screenshot
         .as_ref()
         .map(|_| scene::ScreenshotSequence::from_env())
@@ -221,6 +240,7 @@ pub fn run_capture(
         );
         app.main_window = main_window;
         app.focused_window = main_window;
+        app.quit_signal = quit_signal.clone();
         app.key_window = Some(main_window);
         app.width = window_size.width / app.ui_scale.factor();
         app.height = window_size.height / app.ui_scale.factor();
@@ -934,6 +954,9 @@ struct Workbench {
     saved: Option<Prefs>,
     prefs_saver: prefs::Saver,
     closing: Option<CloseTarget>,
+    /// SIGINT, SIGTERM or SIGHUP asked the window to quit; see
+    /// `quit_on_signal`.
+    quit_signal: Arc<AtomicBool>,
     close_error: Option<CloseError>,
     prefs_changed: Option<Instant>,
     now: Instant,
@@ -1148,6 +1171,7 @@ impl Workbench {
             saved,
             prefs_saver: prefs::Saver::new(),
             closing: None,
+            quit_signal: Arc::default(),
             close_error: None,
             prefs_changed: None,
             now,
@@ -1868,6 +1892,9 @@ impl Workbench {
     }
 
     fn tick(&mut self) -> Task<Message> {
+        if self.quit_signal.swap(false, Ordering::AcqRel) {
+            return self.close(CloseTarget::Quit);
+        }
         if self.shot_staged() {
             let task = self.screenshot_tick();
             // The shot is saved: take the frames held back meanwhile now,

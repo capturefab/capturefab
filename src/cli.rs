@@ -1808,12 +1808,14 @@ pub fn run(mut cli: Cli) -> Result<()> {
             #[cfg(feature = "gui")]
             {
                 crate::gui::run_capture(
-                    handle,
+                    handle.clone(),
                     name.into(),
                     cli.simulate,
                     screenshot,
                     demo_cameras,
                 )?;
+                // Recordings finish first, as they may queue uploads.
+                handle.shutdown();
                 #[cfg(feature = "uploads")]
                 crate::upload::fold();
                 return Ok(());
@@ -2011,6 +2013,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 ready["remote_url"] = json!(format!("http://{}/", server.local_addr()));
             }
             output(&cli, ready)?;
+            // Ctrl-C, SIGTERM from `systemctl stop` or SIGHUP from a closed
+            // terminal.
             let (stop, stopped) = std::sync::mpsc::channel();
             let h = handle.clone();
             ctrlc::set_handler(move || {
@@ -2022,8 +2026,11 @@ pub fn run(mut cli: Cli) -> Result<()> {
             if !cli.json {
                 crate::doctor::print_warnings();
             }
-            // Blocks until Ctrl-C rather than waking to check for it.
+            // Blocks until a signal rather than waking to check for it.
             let _ = stopped.recv();
+            // Waits for the handler's shutdown: a recording to a bucket
+            // queues its upload as it finishes, before the queue is folded.
+            handle.shutdown();
             #[cfg(feature = "uploads")]
             crate::upload::fold();
             return Ok(());
