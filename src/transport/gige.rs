@@ -973,8 +973,8 @@ impl Backend for GigE {
             if remaining.is_zero() {
                 break;
             }
-            let wait = remaining.min(POLL);
-            if (wait < POLL) != (stream.timeout < POLL) {
+            let wait = stream.wait(remaining);
+            if wait != stream.timeout {
                 stream.socket.set_read_timeout(Some(wait))?;
                 stream.timeout = wait;
             }
@@ -1242,6 +1242,26 @@ struct Stream {
     assembler: Assembler,
 }
 impl Stream {
+    /// How long the next receive may block. A frame in flight needs the
+    /// assembler polled every `POLL` for resends and expiry; with none, the
+    /// socket waits out the caller's timeout instead of waking every `POLL`.
+    /// Each change is a system call, so a timeout close enough is kept.
+    fn wait(&self, remaining: Duration) -> Duration {
+        if self.assembler.frames.is_empty() {
+            if self.timeout.abs_diff(remaining) <= POLL {
+                self.timeout
+            } else {
+                remaining
+            }
+        } else {
+            let wait = remaining.min(POLL);
+            if self.timeout > POLL || (wait < POLL) != (self.timeout < POLL) {
+                wait
+            } else {
+                self.timeout
+            }
+        }
+    }
     fn flush(&mut self) {
         for (block, extended, first, last) in self.assembler.requests.drain(..) {
             self.request_id = self.request_id.wrapping_add(1).max(1);
@@ -2969,6 +2989,30 @@ mod tests {
             (stats.resend_requested, stats.incomplete_frames),
             (before, 0)
         );
+    }
+    #[test]
+    fn an_idle_stream_sleeps_until_the_timeout_and_polls_a_frame_in_flight() {
+        let (fake, mut gige) = streaming(|camera| {
+            camera.registers.insert(GVCP_CAPABILITY, 0x4);
+        });
+        let timeout = |gige: &GigE| gige.stream.as_ref().unwrap().timeout;
+        // Waiting for a trigger: one receive for the whole timeout.
+        let started = Instant::now();
+        assert!(gige.next_frame(Duration::from_millis(100)).is_err());
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(timeout(&gige) > POLL * 8, "{:?}", timeout(&gige));
+        // A frame still arriving is in flight: back to polling for resends.
+        fake.send(1, false, &[4, 5, 6, 7]);
+        assert!(gige.next_frame(Duration::from_millis(5)).is_err());
+        assert!(timeout(&gige) <= POLL, "{:?}", timeout(&gige));
+        let camera = fake.camera.lock().unwrap();
+        for packet in &camera.frames[&1][4..] {
+            fake.stream.send_to(packet, camera.destination()).unwrap();
+        }
+        drop(camera);
+        assert_eq!(gige.next_frame(Duration::from_secs(1)).unwrap().id, 1);
+        assert!(gige.next_frame(Duration::from_millis(100)).is_err());
+        assert!(timeout(&gige) > POLL * 8, "{:?}", timeout(&gige));
     }
     #[test]
     fn fake_camera_unavailable_packets_abandon_the_frame() {
