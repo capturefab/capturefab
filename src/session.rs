@@ -1118,12 +1118,15 @@ impl Drop for Process {
     fn drop(&mut self) {
         let _ = self.input.write_all(b"{\"shutdown\":true}\n");
         let _ = self.input.flush();
+        // An idle worker exits within a few milliseconds of being told to.
         let deadline = Instant::now() + Duration::from_secs(3);
+        let mut wait = Duration::from_millis(1);
         while Instant::now() < deadline {
             if self.child.try_wait().ok().flatten().is_some() {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(wait);
+            wait = (wait * 2).min(Duration::from_millis(20));
         }
         let _ = self.child.kill();
         let _ = self.child.wait();

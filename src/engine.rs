@@ -51,7 +51,8 @@ impl Counters {
 }
 #[derive(Clone)]
 pub struct WorkerHandle {
-    sender: SyncSender<Envelope>,
+    /// Commands for the camera thread; `None` only wakes it.
+    sender: SyncSender<Option<Envelope>>,
     state: Arc<RwLock<SessionSnapshot>>,
     counters: Arc<Counters>,
     frame: Arc<RwLock<Option<Frame>>>,
@@ -157,7 +158,7 @@ impl WorkerHandle {
         );
         let (reply, rx) = mpsc::channel();
         self.sender
-            .try_send(Envelope { command, reply })
+            .try_send(Some(Envelope { command, reply }))
             .context("camera command queue is full or closed")?;
         Ok(rx)
     }
@@ -168,10 +169,16 @@ impl WorkerHandle {
     }
     pub fn shutdown(&self) {
         self.quitting.store(true, Ordering::Relaxed);
+        self.wake();
         let thread = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(thread) = thread {
             let _ = thread.join();
         }
+    }
+    /// Have the camera thread look at its jobs and the quit flag now rather
+    /// than when its wait ends. A full queue wakes it anyway.
+    fn wake(&self) {
+        let _ = self.sender.try_send(None);
     }
     fn cancelled(&self) -> bool {
         self.quitting.load(Ordering::Relaxed)
@@ -252,6 +259,23 @@ impl WorkerHandle {
         let capacity = ring.capacity();
         drop(ring);
         self.note_ring(published, bytes, capacity);
+    }
+    /// Whether the ring holds back a frame it has yet to publish.
+    fn holding(&self) -> bool {
+        self.ring.as_ref().is_some_and(|ring| {
+            ring.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .held_bytes()
+                .is_some()
+        })
+    }
+    /// Whether an auto capture session is open; it may have embeddings to
+    /// finish while no frames arrive.
+    fn capturing(&self) -> bool {
+        self.capture_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
     /// Log a frame the ring could not take as it was, once while that keeps
     /// happening rather than for every frame.
@@ -1572,11 +1596,13 @@ fn tick_jobs(
     auto: bool,
 ) {
     let now = crate::scheduling::now_ms();
+    let mut changed = false;
     for job in jobs.iter_mut().filter(|j| j.info.active()) {
         if job.info.next_at_ms > now {
             continue;
         }
         if job.deadline.is_none() {
+            changed = true;
             let result = (|| -> Result<bool> {
                 let c = camera_mut(camera)?;
                 let stopped = !c.is_streaming();
@@ -1610,6 +1636,7 @@ fn tick_jobs(
                 .then(|| Instant::now() + (timeout / 2).min(Duration::from_secs(3)));
         }
         if job.deadline.is_some_and(|d| Instant::now() >= d) {
+            changed = true;
             job.info.status = "failed".into();
             job.info.error = Some("frame timeout".into());
             h.log(
@@ -1623,7 +1650,15 @@ fn tick_jobs(
             let _ = c.stop();
         }
         *started = false;
+        changed = true;
     }
+    if changed {
+        jobs_changed(h, camera, jobs);
+    }
+}
+/// Publish changed jobs. Scanners also read their features again, since a
+/// scan changes them.
+fn jobs_changed(h: &WorkerHandle, camera: &mut Option<Camera>, jobs: &mut Vec<Scheduled>) {
     trim_jobs(jobs);
     sync_jobs(h, jobs);
     let scanner = camera.as_ref().is_some_and(Camera::is_scanner);
@@ -1733,7 +1768,44 @@ fn output_path(output: &str, count: u32, index: u32, format: &str) -> PathBuf {
     }
 }
 
-fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
+/// The longest the camera thread waits while it receives no frames.
+/// Commands and shutdown wake it sooner.
+const IDLE: Duration = Duration::from_secs(1);
+/// How often a frame the ring holds back, or a capture session's background
+/// work, is looked at while no frames arrive.
+const TICK: Duration = Duration::from_millis(100);
+/// How long the camera thread may wait for a command while it receives no
+/// frames: until the next job is due or a requested frame times out.
+fn idle_wait(h: &WorkerHandle, jobs: &[Scheduled]) -> Duration {
+    if h.holding() || h.capturing() {
+        return TICK;
+    }
+    let now = Instant::now();
+    let now_ms = crate::scheduling::now_ms();
+    jobs.iter()
+        .filter(|job| job.info.active())
+        .map(|job| match job.deadline {
+            Some(deadline) => deadline.saturating_duration_since(now),
+            None => Duration::from_millis(job.info.next_at_ms.saturating_sub(now_ms)),
+        })
+        .fold(IDLE, Duration::min)
+}
+/// Publish the stream state and transport counters when they change, which
+/// for GigE is with every frame.
+fn sync_stream(h: &WorkerHandle, camera: &Option<Camera>) {
+    let streaming = camera.as_ref().is_some_and(Camera::is_streaming);
+    let transport = camera.as_ref().and_then(Camera::stats);
+    let current = {
+        let s = h.state.read().unwrap_or_else(|e| e.into_inner());
+        s.streaming == streaming && s.transport == transport
+    };
+    if !current {
+        let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
+        s.streaming = streaming;
+        s.transport = transport;
+    }
+}
+fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
     let mut camera: Option<Camera> = None;
     let mut forwarder: Option<(Forwarder, f64)> = None;
     let mut auto: Option<AutoController> = None;
@@ -1752,9 +1824,9 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
         let envelope = if receiving {
             rx.try_recv().ok()
         } else {
-            rx.recv_timeout(Duration::from_millis(100)).ok()
+            rx.recv_timeout(idle_wait(&h, &jobs)).ok()
         };
-        if let Some(e) = envelope {
+        if let Some(e) = envelope.flatten() {
             let result = process(
                 &h,
                 &mut camera,
@@ -1788,6 +1860,7 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
         }
         h.poll_capture();
         h.flush_ring();
+        sync_stream(&h, &camera);
         let scheduled_scan = jobs.iter().any(|j| j.info.active() && j.deadline.is_some());
         if let Some(c) = camera
             .as_mut()
@@ -2300,6 +2373,89 @@ mod tests {
             )));
         h.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// A job armed for the next frame, saving two raw files into `dir`.
+    fn armed(id: u64, dir: &Path) -> Scheduled {
+        let output = dir
+            .join(format!("job{id}-{{frame}}.raw"))
+            .to_string_lossy()
+            .into_owned();
+        Scheduled {
+            info: crate::scheduling::CaptureJob {
+                id,
+                status: "running".into(),
+                output: output.clone(),
+                destination: None,
+                count: 2,
+                captured: 0,
+                first_at_ms: 0,
+                interval_ms: 60_000,
+                next_at_ms: 0,
+                last_file: None,
+                error: None,
+                context: Default::default(),
+            },
+            resolved: crate::destination::resolve(None, &output).unwrap(),
+            plan: crate::naming::Plan::new(&output, 2, "raw"),
+            timeout_ms: 1000,
+            format: "raw".into(),
+            storage: Default::default(),
+            deadline: Some(Instant::now() + Duration::from_secs(10)),
+            warm: None,
+            camera: "camera".into(),
+            on_exists: Default::default(),
+            next: None,
+        }
+    }
+    fn small_frame(id: u64) -> Frame {
+        Frame {
+            id,
+            width: 8,
+            height: 8,
+            pixel_format: crate::types::MONO8,
+            timestamp_ns: id,
+            data: vec![id as u8; 64],
+        }
+    }
+    #[test]
+    fn an_idle_worker_waits_for_its_next_job_or_a_second() {
+        let writer = crate::shared_memory::SharedRing::create(&std::env::temp_dir(), 4096).unwrap();
+        let h = WorkerHandle::with_ring(Arc::new(Mutex::new(writer)));
+        assert_eq!(idle_wait(&h, &[]), IDLE);
+        let dir = temp_dir("idle");
+        let mut job = armed(1, &dir);
+        job.deadline = None;
+        job.info.next_at_ms = crate::scheduling::now_ms() + 300;
+        let wait = idle_wait(&h, std::slice::from_ref(&job));
+        assert!(wait > Duration::from_millis(200) && wait <= Duration::from_millis(300));
+        // A requested frame times out sooner.
+        job.deadline = Some(Instant::now() + Duration::from_millis(50));
+        assert!(idle_wait(&h, std::slice::from_ref(&job)) <= Duration::from_millis(50));
+        // A frame the ring holds back keeps the short tick, so it is
+        // published once a reader turns up.
+        h.record(small_frame(1), false);
+        h.record(small_frame(2), false);
+        assert_eq!(idle_wait(&h, &[]), TICK);
+        h.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn shutdown_wakes_an_idle_worker_at_once() {
+        let fastest = (0..3)
+            .map(|_| {
+                let h = WorkerHandle::new();
+                h.request(SessionCommand::Connect {
+                    camera: "sim:0".into(),
+                    timeout_ms: 100,
+                })
+                .unwrap();
+                let started = Instant::now();
+                h.shutdown();
+                started.elapsed()
+            })
+            .min()
+            .unwrap();
+        assert!(fastest < Duration::from_millis(30), "{fastest:?}");
     }
     #[test]
     fn numbered_scanner_capture_uses_one_page() {
