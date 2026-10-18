@@ -30,7 +30,7 @@ struct Uniforms {
     shift: i32,
     cfa: vec4<i32>,
     // x: the target is sRGB, so output linear light.
-    // y: packed RGB/BGR holds four bytes per texel rather than one.
+    // y: texels in a row of folded packed RGB/BGR.
     flags: vec4<i32>,
 };
 
@@ -84,19 +84,18 @@ fn channel(c: i32) -> vec3<u32> {
     return select(vec3<u32>(0u), vec3<u32>(1u), vec3<bool>(c == 0, c == 1, c == 2));
 }
 
-// The three bytes of packed pixel p, one per texel or four to a texel.
+// The three bytes of packed pixel p: the frame's bytes in order, four to a
+// texel, folded into rows of u.flags.y texels.
 fn packed(p: vec2<i32>) -> vec3<u32> {
-    let x = p.x * 3;
-    if (u.flags.y == 0) {
-        return vec3<u32>(texel(vec2<i32>(x, p.y)), texel(vec2<i32>(x + 1, p.y)), texel(vec2<i32>(x + 2, p.y)));
-    }
-    let word = x >> 2;
-    let last = u.size.x * 3 / 4 - 1;
-    let a = textureLoad(frame, vec2<i32>(word, p.y), 0);
-    let b = textureLoad(frame, vec2<i32>(min(word + 1, last), p.y), 0);
+    let at = (p.y * u.size.x + p.x) * 3;
+    let fold = u.flags.y;
+    let word = at >> 2;
+    let next = min(word + 1, (u.size.x * u.size.y * 3 - 1) >> 2);
+    let a = textureLoad(frame, vec2<i32>(word % fold, word / fold), 0);
+    let b = textureLoad(frame, vec2<i32>(next % fold, next / fold), 0);
     var bytes = array<u32, 8>(a.r, a.g, a.b, a.a, b.r, b.g, b.b, b.a);
-    let at = x & 3;
-    return vec3<u32>(bytes[at], bytes[at + 1], bytes[at + 2]);
+    let i = at & 3;
+    return vec3<u32>(bytes[i], bytes[i + 1], bytes[i + 2]);
 }
 
 // Exactly frame::convert for one pixel: unpacked mono is shifted and clamped;
@@ -180,26 +179,22 @@ const BAYER: i32 = 3;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Layout {
     format: wgpu::TextureFormat,
-    /// Texels per pixel along a row: 3 for packed RGB/BGR bytes.
-    texels: u32,
     bytes_per_texel: u32,
-    /// Packed RGB/BGR bytes four to a texel, which takes rows a third as
-    /// wide as one byte per texel, so 1080p fits a 2048-texel limit and 4K
-    /// an 8192 one. Rows must then be whole texels: widths divisible by 4.
-    words: bool,
+    /// Packed RGB/BGR: the frame's bytes in order, four to a texel, folded
+    /// into rows as wide as a texture allows. Any width fits, wider than the
+    /// texture itself, up to four bytes for every texel it can hold.
+    folded: bool,
     kind: i32,
     shift: i32,
     cfa: [i32; 4],
 }
 
 impl Layout {
-    /// The layout of `width`-pixel rows of `pixel_format`.
-    fn of(pixel_format: u32, width: u32) -> Option<Self> {
+    fn of(pixel_format: u32) -> Option<Self> {
         let gray = |format, bytes_per_texel, shift| Self {
             format,
-            texels: 1,
             bytes_per_texel,
-            words: false,
+            folded: false,
             kind: 0,
             shift,
             cfa: [0; 4],
@@ -208,17 +203,10 @@ impl Layout {
         let wide = |shift| {
             cfg!(target_endian = "little").then(|| gray(wgpu::TextureFormat::R16Uint, 2, shift))
         };
-        let packed = |kind| match width.is_multiple_of(4) {
-            true => Self {
-                words: true,
-                kind,
-                ..gray(wgpu::TextureFormat::Rgba8Uint, 4, 0)
-            },
-            false => Self {
-                texels: 3,
-                kind,
-                ..gray(wgpu::TextureFormat::R8Uint, 1, 0)
-            },
+        let packed = |kind| Self {
+            folded: true,
+            kind,
+            ..gray(wgpu::TextureFormat::Rgba8Uint, 4, 0)
         };
         match pixel_format {
             MONO8 | 0x0108_00b1 | 0x0108_00c6 => Some(gray(wgpu::TextureFormat::R8Uint, 1, 0)),
@@ -236,13 +224,29 @@ impl Layout {
         }
     }
 
-    /// Texels in a `width`-pixel row.
-    fn row(&self, width: u32) -> u32 {
-        if self.words {
-            width / 4 * 3
+    /// The texture a `width` × `height` frame takes, if its sides fit in
+    /// `max` texels.
+    fn extent(&self, (width, height): (u32, u32), max: u32) -> Option<(u32, u32)> {
+        let (width, height) = if self.folded {
+            let bytes = self.bytes((width, height));
+            // The shader counts bytes in 32-bit integers.
+            if i32::try_from(bytes).is_err() {
+                return None;
+            }
+            let words = (bytes as u64).div_ceil(4);
+            let row = words.clamp(1, u64::from(max.max(1)));
+            (row, words.div_ceil(row))
         } else {
-            width.saturating_mul(self.texels)
-        }
+            (u64::from(width), u64::from(height))
+        };
+        let side = |v: u64| u32::try_from(v).ok().filter(|&v| v <= max);
+        Some((side(width)?, side(height)?))
+    }
+
+    /// Bytes of a `width` × `height` frame.
+    fn bytes(&self, (width, height): (u32, u32)) -> usize {
+        let per_pixel = if self.folded { 3 } else { self.bytes_per_texel };
+        width as usize * height as usize * per_pixel as usize
     }
 }
 
@@ -340,19 +344,23 @@ impl GpuFrames {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The largest texture side frames are decoded in, while the GPU
+    /// decodes them at all.
+    pub fn texture_side(&self) -> Option<u32> {
+        self.limit().filter(|_| !self.disabled)
+    }
+
     /// Whether this frame can be shown without CPU conversion.
     pub fn accepts(&self, frame: &Frame) -> bool {
-        let Some(max) = self.limit().filter(|_| !self.disabled) else {
+        let Some(max) = self.texture_side() else {
             return false;
         };
-        Layout::of(frame.pixel_format, frame.width).is_some_and(|layout| {
-            let row = layout.row(frame.width);
+        let size = (frame.width, frame.height);
+        Layout::of(frame.pixel_format).is_some_and(|layout| {
             frame.width > 0
                 && frame.height > 0
-                && row <= max
-                && frame.height <= max
-                && frame.data.len()
-                    >= (row * layout.bytes_per_texel) as usize * frame.height as usize
+                && layout.extent(size, max).is_some()
+                && frame.data.len() >= layout.bytes(size)
         })
     }
 
@@ -649,7 +657,16 @@ impl shader::Primitive for Primitive {
             kind: slot.layout.kind,
             shift: slot.layout.shift,
             cfa: slot.layout.cfa,
-            flags: [i32::from(pipeline.srgb), i32::from(slot.layout.words), 0, 0],
+            flags: [
+                i32::from(pipeline.srgb),
+                if slot.layout.folded {
+                    slot.storage.0 as i32
+                } else {
+                    0
+                },
+                0,
+                0,
+            ],
         };
         queue.write_buffer(&slot.uniforms, 0, bytemuck::bytes_of(&uniforms));
         if !slot.once {
@@ -725,16 +742,17 @@ impl Pipeline {
         key: &str,
         frame: &Frame,
     ) -> Result<(), String> {
-        let layout =
-            Layout::of(frame.pixel_format, frame.width).ok_or("unsupported pixel format")?;
-        let (width, height) = (layout.row(frame.width), frame.height);
-        let row = width * layout.bytes_per_texel;
+        let layout = Layout::of(frame.pixel_format).ok_or("unsupported pixel format")?;
+        let size = (frame.width, frame.height);
+        let (width, height) = layout
+            .extent(size, device.limits().max_texture_dimension_2d)
+            .ok_or("frame too large for a texture")?;
+        let row = (width * layout.bytes_per_texel) as usize;
         let pixels = frame
             .data
-            .get(..row as usize * height as usize)
+            .get(..layout.bytes(size))
             .ok_or("truncated frame")?;
         let storage = (width, height, layout.format);
-        let size = (frame.width, frame.height);
         if self
             .slots
             .get(key)
@@ -771,25 +789,42 @@ impl Pipeline {
         }
         let slot = self.slots.get_mut(key).ok_or("missing slot")?;
         slot.layout = layout;
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &slot.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(row),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+        let write = |y: usize, rows: &[u8]| {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &slot.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: y as u32,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                rows,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row as u32),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height: (rows.len() / row) as u32,
+                    depth_or_array_layers: 1,
+                },
+            );
+        };
+        // Whole rows, then what a folded frame leaves of its last row, padded.
+        let whole = pixels.len() / row;
+        let (rows, rest) = pixels.split_at(whole * row);
+        if whole > 0 {
+            write(0, rows);
+        }
+        if !rest.is_empty() {
+            let mut last = vec![0; row];
+            last[..rest.len()].copy_from_slice(rest);
+            write(whole, &last);
+        }
         Ok(())
     }
 }
@@ -814,25 +849,27 @@ mod tests {
         ] {
             assert!(crate::frame::convertible(format), "{format:#x}");
             if cfg!(target_endian = "little") {
-                assert!(Layout::of(format, 37).is_some(), "{format:#x}");
+                assert!(Layout::of(format).is_some(), "{format:#x}");
             }
         }
-        // Packed rows take four bytes to a texel when they are whole texels.
-        let odd = Layout::of(RGB8, 37).unwrap();
-        assert_eq!((odd.texels, odd.words, odd.row(37)), (3, false, 111));
-        let even = Layout::of(0x0218_0015, 3840).unwrap();
-        assert_eq!(
-            (even.words, even.bytes_per_texel, even.row(3840)),
-            (true, 4, 2880)
-        );
-        assert!(!Layout::of(MONO8, 3840).unwrap().words);
+        // Packed bytes fold four to a texel into rows as wide as allowed, so
+        // 1080p fits a 2048-texel limit and 4K an 8192 one.
+        let packed = Layout::of(0x0218_0015).unwrap();
+        assert_eq!(packed.extent((37, 23), 2048), Some((639, 1)));
+        assert_eq!(packed.extent((1920, 1080), 2048), Some((2048, 760)));
+        assert_eq!(packed.extent((3840, 2160), 8192), Some((8192, 760)));
+        assert_eq!(packed.extent((3840, 2160), 2048), None);
+        // Others take a texel a pixel.
+        let mono = Layout::of(MONO8).unwrap();
+        assert_eq!(mono.extent((2048, 1536), 2048), Some((2048, 1536)));
+        assert_eq!(mono.extent((2049, 1536), 2048), None);
         assert_eq!(std::mem::size_of::<Uniforms>(), 64);
     }
 
     #[test]
     fn only_bayer_near_full_size_is_decoded_once() {
-        let bayer = Layout::of(0x0108_0009, 1920).unwrap();
-        let mono = Layout::of(MONO8, 1920).unwrap();
+        let bayer = Layout::of(0x0108_0009).unwrap();
+        let mono = Layout::of(MONO8).unwrap();
         assert!(decode_once(bayer, (1920, 1080), 1920.0 * 1080.0));
         assert!(decode_once(bayer, (1920, 1080), 960.0 * 540.0));
         assert!(!decode_once(bayer, (4000, 3000), 320.0 * 240.0));
@@ -852,9 +889,8 @@ mod tests {
 
     /// Renders every supported format through the real pipeline at 1:1, both
     /// decoded once and directly, and compares each pixel with
-    /// `frame::convert`: packed rows one byte and four bytes to a texel, a
-    /// row wider than a third of the texture limit, and frames shrunk for
-    /// overview tiles. Skipped without a GPU.
+    /// `frame::convert`, including packed rows folded over several texture
+    /// rows and frames shrunk for the GPU. Skipped without a GPU.
     #[test]
     fn gpu_decode_matches_cpu_conversion() {
         use futures::executor::block_on;
@@ -909,13 +945,13 @@ mod tests {
             (0x0108_000a, 1, 0xff),
             (0x0108_000b, 1, 0xff),
         ];
-        // Odd sizes exercise the edges of the Bayer neighborhood and row
-        // padding; a width divisible by four packs RGB four bytes to a texel.
+        // Odd and even sizes exercise the edges of the Bayer neighborhood, row
+        // padding, and packed pixels split across texels.
         for size in [(37, 23), (36, 23)] {
             for direct_only in [false, true] {
                 for (pixel_format, bytes, mask) in formats {
                     let frame = frame(pixel_format, size, bytes, mask);
-                    let bayer = Layout::of(pixel_format, size.0).unwrap().kind == BAYER;
+                    let bayer = Layout::of(pixel_format).unwrap().kind == BAYER;
                     let worst = render(&mut pipeline, (&device, &queue), &frame, direct_only);
                     assert_eq!(pipeline.slots["test"].once, bayer && !direct_only);
                     assert!(
@@ -925,12 +961,16 @@ mod tests {
                 }
             }
         }
-        // Wider than a byte-per-texel row of the texture limit allows.
+        // Packed rows wider than a third of the texture limit, folded over
+        // several texture rows and a part of one.
         let max = device.limits().max_texture_dimension_2d;
-        let wide = frame(RGB8, ((max / 3 + 4) / 4 * 4, 3), 3, 0xff);
-        assert!(GpuFrames::default().accepts(&wide));
-        assert!(wide.width * 3 > max);
-        assert!(render(&mut pipeline, (&device, &queue), &wide, true) <= 1);
+        for pixel_format in [RGB8, 0x0218_0015] {
+            let wide = frame(pixel_format, (max - 3, 3), 3, 0xff);
+            assert!(GpuFrames::default().accepts(&wide));
+            let worst = render(&mut pipeline, (&device, &queue), &wide, true);
+            assert!(worst <= 1, "{pixel_format:#010x} folded: off by {worst}");
+            assert_eq!(pipeline.slots["test"].storage.1, 3);
+        }
         // Overview tiles shrink color and mono frames to RGB8 and Mono8.
         for (pixel_format, bytes, mask, factor) in [
             (0x0108_0009, 1, 0xff, 4),

@@ -1988,17 +1988,14 @@ impl Workbench {
             };
             let tile = grid.map_or(Size::new(640.0, 480.0), |grid| grid.tile);
             let native = Size::new(frame.width as f32, frame.height as f32);
+            let most = if crate::efficiency::efficient() {
+                EFFICIENT_SIDE
+            } else {
+                TILE_SIDE
+            };
             let limits = preview::Limits {
-                size: preview::shown_bounds(
-                    &frame,
-                    preview::fit_scale(tile, native) * scale,
-                    if crate::efficiency::efficient() {
-                        EFFICIENT_SIDE
-                    } else {
-                        TILE_SIDE
-                    },
-                ),
                 shrink_for_gpu: true,
+                ..preview::Limits::shown(&frame, preview::fit_scale(tile, native) * scale, most)
             };
             let preview = self.previews.entry(id.clone()).or_default();
             let fresh = preview.frame_id != Some(frame.id);
@@ -2116,10 +2113,7 @@ impl Workbench {
         } else {
             u32::MAX
         };
-        preview::Limits {
-            size: preview::shown_bounds(frame, zoom * self.main_scale(), most),
-            shrink_for_gpu: false,
-        }
+        preview::Limits::shown(frame, zoom * self.main_scale(), most)
     }
 
     /// Update the open scopes from a new `frame`; `paced` while frames

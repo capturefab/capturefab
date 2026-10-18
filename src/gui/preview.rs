@@ -90,11 +90,29 @@ pub struct Limits {
     /// Frames larger than this each way are shrunk on the CPU; see
     /// `frame::preview_rgba`.
     pub size: (u32, u32),
-    /// Shrink frames the GPU could decode whole too, as overview tiles do: a
-    /// small texture filters cleanly where the shader would point-sample a
-    /// large one, and uploads a fraction of the bytes. The main view keeps
-    /// whole frames on the GPU, so zooming in needs no new upload.
+    /// Shown at 1:1 or closer, so every pixel must be exact: a frame too
+    /// large for a GPU texture is then converted whole on the CPU rather
+    /// than shrunk to fit one.
+    pub exact: bool,
+    /// Shrink frames the GPU could decode whole too, when shown at under half
+    /// their size, as overview tiles of large sensors are: a small texture
+    /// filters cleanly where the shader would point-sample a large one, and
+    /// uploads a fraction of the bytes. The main view keeps whole frames on
+    /// the GPU, so zooming in needs no new upload.
     pub shrink_for_gpu: bool,
+}
+
+impl Limits {
+    /// For a view showing `frame` at `scale` physical pixels per frame
+    /// pixel, keeping no more than `most` on a side when shrunk; see
+    /// `shown_bounds`.
+    pub fn shown(frame: &Frame, scale: f32, most: u32) -> Self {
+        Self {
+            size: shown_bounds(frame, scale, most),
+            exact: scale >= 1.0,
+            shrink_for_gpu: false,
+        }
+    }
 }
 
 /// What a view showing `frame` at `scale` physical pixels per frame pixel
@@ -111,8 +129,8 @@ pub fn shown_bounds(frame: &Frame, scale: f32, most: u32) -> (u32, u32) {
 
 /// Show `frame` under `key`, decoded by the GPU when the renderer supports
 /// its format, otherwise converted on the CPU into RGBA bytes. A frame too
-/// large for a GPU texture is shrunk to `limits` and then decoded by the GPU
-/// when that fits, so a view at 1:1 is the only one that converts it whole.
+/// large for a GPU texture is shrunk to `limits`, and to what a texture
+/// holds, for the GPU to decode, so only an `exact` view converts it whole.
 pub fn present(
     gpu: &GpuFrames,
     shown: &mut Option<Shown>,
@@ -123,8 +141,18 @@ pub fn present(
     // Placed at the full frame size, so a shrunk frame still places like it.
     let size = Size::new(frame.width as f32, frame.height as f32);
     let whole = gpu.accepts(&frame);
-    let small = (!whole || limits.shrink_for_gpu)
-        .then(|| crate::frame::shrink_to(&frame, limits.size))
+    // Shrunk frames are RGB8 or Mono8, which a texture holds as large as its
+    // side each way.
+    let bounds = match gpu.texture_side() {
+        Some(side) if !whole && !limits.exact => (limits.size.0.min(side), limits.size.1.min(side)),
+        _ => limits.size,
+    };
+    // The GPU filters a whole frame cleanly down to half its size; below
+    // that it would point-sample it.
+    let small_view = limits.size.0.saturating_mul(2) < frame.width
+        && limits.size.1.saturating_mul(2) < frame.height;
+    let small = (!whole || (limits.shrink_for_gpu && small_view))
+        .then(|| crate::frame::shrink_to(&frame, bounds))
         .flatten();
     let decoded = match small {
         Some(small) if gpu.accepts(&small) => Ok(Arc::new(small)),
@@ -204,6 +232,7 @@ mod tests {
         let placed = |shown: &Option<Shown>| shown.as_ref().map(Shown::size);
         let half = Limits {
             size: (1224, 1024),
+            exact: false,
             shrink_for_gpu: false,
         };
         // The main view hands the GPU a frame it takes whole as it is.
@@ -213,24 +242,53 @@ mod tests {
         assert!(Arc::ptr_eq(&gpu.pending("main").unwrap(), &bayer));
         assert!(matches!(shown, Some(Shown::Gpu { .. })));
         assert_eq!(placed(&shown), Some(native));
-        // A tile shrinks it first, to colors the GPU filters cleanly.
-        let tile = Limits {
+        // So does a tile at half size, which the GPU filters well...
+        let tile = |size| Limits {
+            size,
+            exact: false,
             shrink_for_gpu: true,
-            ..half
         };
-        present(&gpu, &mut shown, "tile", bayer.clone(), tile).unwrap();
+        present(&gpu, &mut shown, "tile", bayer.clone(), tile((1224, 1024))).unwrap();
+        assert!(Arc::ptr_eq(&gpu.pending("tile").unwrap(), &bayer));
+        // ...but a smaller tile shrinks it first, to colors it filters cleanly.
+        present(&gpu, &mut shown, "tile", bayer.clone(), tile((612, 512))).unwrap();
         let small = gpu.pending("tile").unwrap();
         assert_eq!(
             (small.width, small.height, small.pixel_format),
-            (1224, 1024, RGB8)
+            (612, 512, RGB8)
         );
         assert_eq!(placed(&shown), Some(native));
-        // Too large for a texture: shrunk for the GPU, but whole on the CPU at 1:1.
+        // Too large for a texture: shrunk for the GPU, to what the view shows
+        // or what a texture holds, but whole on the CPU at 1:1.
         let downlevel = GpuFrames::limited(2048);
         present(&downlevel, &mut shown, "main", bayer.clone(), half).unwrap();
         assert_eq!(downlevel.pending("main").unwrap().width, 1224);
+        let most = Limits {
+            size: (2448, 2048),
+            ..half
+        };
+        present(&downlevel, &mut shown, "main", bayer.clone(), most).unwrap();
+        assert_eq!(downlevel.pending("main").unwrap().width, 1224);
+        let rgb = |width, height| Frame {
+            width,
+            height,
+            pixel_format: RGB8,
+            data: vec![90; (width * height * 3) as usize],
+            ..Frame::default()
+        };
+        assert!(downlevel.accepts(&rgb(1920, 1080)));
+        let uhd = Arc::new(rgb(3840, 2160));
+        assert!(!downlevel.accepts(&uhd));
+        let fitted = Limits {
+            size: (3840, 2160),
+            ..half
+        };
+        present(&downlevel, &mut shown, "main", uhd, fitted).unwrap();
+        let small = downlevel.pending("main").unwrap();
+        assert_eq!((small.width, small.height), (1920, 1080));
         let every = Limits {
             size: (2448, 2048),
+            exact: true,
             shrink_for_gpu: false,
         };
         present(&downlevel, &mut shown, "main", bayer.clone(), every).unwrap();
