@@ -144,10 +144,10 @@ impl Facts {
         let session = crate::ipc::session_dir();
         let usage = ledger_usage(&session);
         let working_directory = Place::of(std::env::current_dir().unwrap_or_else(|_| ".".into()));
-        let captures = match usage.as_ref().and_then(|usage| usage.latest.clone()) {
-            Some(folder) => Place::of(folder),
-            None => working_directory.clone(),
-        };
+        let captures = capture_place(
+            usage.as_ref().and_then(|usage| usage.latest.clone()),
+            &working_directory,
+        );
         Self {
             efficiency: efficiency::current(),
             graphics: None,
@@ -496,6 +496,16 @@ fn storage_budget(session: &Path) -> u64 {
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|policy| policy["policy"]["max_bytes"].as_u64())
         .unwrap_or_else(|| crate::storage::StoragePolicy::default().max_bytes)
+}
+
+/// The newest capture's folder while it exists, else the working directory:
+/// a folder that is gone, or on a drive that is not mounted, would report
+/// another disk's free space under its name.
+fn capture_place(latest: Option<PathBuf>, working_directory: &Place) -> Place {
+    latest
+        .map(Place::of)
+        .filter(|place| place.exists)
+        .unwrap_or_else(|| working_directory.clone())
 }
 
 /// The fields of storage.json `doctor` needs.
@@ -935,6 +945,13 @@ mod tests {
         );
         std::fs::write(dir.join("storage.json"), "{").unwrap();
         assert_eq!(ledger_usage(&dir), None, "unreadable means unknown");
+        // Free space is measured in the newest capture's folder while it
+        // exists, else in the working directory.
+        let working = place("/home/pi", "ext4", 6 << 30);
+        assert_eq!(capture_place(Some(dir.clone()), &working).path, dir);
+        let unmounted = dir.join("unmounted/drive");
+        assert_eq!(capture_place(Some(unmounted), &working), working);
+        assert_eq!(capture_place(None, &working), working);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
