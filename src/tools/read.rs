@@ -331,11 +331,12 @@ pub struct Image {
 }
 
 /// What one user turn has already done, so repeated calls reuse it: a
-/// discovery runs at most once per turn (a second only to add simulators),
-/// however often the model asks. Make a new one for each user turn.
+/// discovery runs at most once per turn, however often the model asks.
+/// Its cached discovery includes simulators, which each caller can filter
+/// out. Make a new one for each user turn.
 #[derive(Debug, Default)]
 pub struct TurnCache {
-    discoveries: Mutex<Vec<(bool, Value)>>,
+    discovery: Mutex<Option<Result<Value, String>>>,
 }
 
 impl TurnCache {
@@ -343,22 +344,22 @@ impl TurnCache {
         Self::default()
     }
 
-    fn discovery(&self, simulated: bool) -> Option<Value> {
-        self.discoveries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            // A discovery with simulators covers one without: listing
-            // filters them out.
-            .find(|(with, _)| *with || !simulated)
-            .map(|(_, reply)| reply.clone())
-    }
-
-    fn remember(&self, simulated: bool, reply: Value) {
-        self.discoveries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((simulated, reply));
+    fn discover(
+        &self,
+        discover: impl FnOnce() -> anyhow::Result<Value>,
+    ) -> anyhow::Result<(Value, bool)> {
+        let mut cached = self.discovery.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(reply) = cached.as_ref() {
+            return reply
+                .clone()
+                .map(|reply| (reply, true))
+                .map_err(anyhow::Error::msg);
+        }
+        let reply = discover().map_err(|error| format!("{error:#}"));
+        *cached = Some(reply.clone());
+        reply
+            .map(|reply| (reply, false))
+            .map_err(anyhow::Error::msg)
     }
 }
 
@@ -578,26 +579,22 @@ fn list_cameras(
                 "Open a session to discover cameras.",
             )]);
         }
-        let cached = opts
-            .turn
-            .and_then(|turn| turn.discovery(args.include_simulated));
-        let reused = cached.is_some();
-        let reply = match cached {
-            Some(reply) => reply,
-            None => {
-                let command = SessionCommand::Discover {
+        let discover = || {
+            host.execute(
+                None,
+                SessionCommand::Discover {
                     timeout_ms: DISCOVER_MS,
-                    simulated: args.include_simulated,
-                };
-                let reply = host
-                    .execute(None, command)
-                    .map_err(|error| vec![Issue::failed(&error, &Value::Null, opts.origin)])?;
-                if let Some(turn) = opts.turn {
-                    turn.remember(args.include_simulated, reply.clone());
-                }
-                reply
-            }
+                    // A cached discovery must also answer a later call
+                    // which includes simulators without searching twice.
+                    simulated: opts.turn.is_some() || args.include_simulated,
+                },
+            )
         };
+        let (reply, reused) = match opts.turn {
+            Some(turn) => turn.discover(discover),
+            None => discover().map(|reply| (reply, false)),
+        }
+        .map_err(|error| vec![Issue::failed(&error, &Value::Null, opts.origin)])?;
         let devices: Vec<CameraInfo> =
             serde_json::from_value(reply["devices"].clone()).unwrap_or_default();
         let mut discovery = json!({"ran": true, "reused": reused, "warnings": reply["warnings"]});
@@ -701,12 +698,10 @@ fn curated(name: &str) -> bool {
     CURATED.contains(&name) || CURATED_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
-/// Hidden from tools: managed features, and nodes without a value except
-/// the commands `run_camera_command` may run.
+/// Hidden from observation: managed features and nodes without a value.
+/// Camera commands have their own allowlisted action tool.
 fn hidden(feature: &FeatureInfo) -> bool {
-    risk::managed_name(&feature.name)
-        || (risk::not_a_value(&feature.kind)
-            && !(feature.kind == "Command" && risk::command_allowed(&feature.name)))
+    risk::managed_name(&feature.name) || risk::not_a_value(&feature.kind)
 }
 
 fn camera_features(

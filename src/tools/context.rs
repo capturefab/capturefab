@@ -351,8 +351,7 @@ impl DestinationInfo {
                 remote.kind().to_ascii_uppercase(),
                 remote.kind()
             )),
-            Some(_) => None,
-            None => sources.volume_problem(&root),
+            _ => sources.volume_problem(&root),
         };
         Self {
             name: destination.name.clone(),

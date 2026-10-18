@@ -571,6 +571,27 @@ fn cameras_resolve_by_id_selector_name_and_reduced_id() {
 }
 
 #[test]
+fn reduced_camera_ids_still_require_an_unambiguous_match() {
+    let mut snapshot = fixture_snapshot();
+    snapshot.devices.push(info(
+        "onvif:http://10.0.0.5/another/device_service",
+        Transport::Media,
+        "Second lobby camera",
+        None,
+    ));
+    let ctx = fixture_context(snapshot);
+    let issue = resolve_camera(&ctx, "camera", "onvif:http://10.0.0.5", true).unwrap_err();
+    assert_eq!(issue.field.as_deref(), Some("camera"));
+    assert!(issue.message.starts_with("More than one camera answers"));
+    assert_eq!(
+        resolve_camera(&ctx, "camera", "Second lobby camera", true),
+        Ok(CameraRef::Discovered(
+            "onvif:http://10.0.0.5/another/device_service".into()
+        ))
+    );
+}
+
+#[test]
 fn overview_is_redacted_for_models_and_people() {
     let ctx = fixture_context(fixture_snapshot());
     let host = FakeHost::new(fixture_snapshot());
@@ -795,6 +816,65 @@ fn list_cameras_discovers_once_per_turn_and_filters_simulators() {
 }
 
 #[test]
+fn adding_simulators_reuses_the_turns_first_discovery() {
+    let ctx = fixture_context(fixture_snapshot());
+    let host = FakeHost::new(fixture_snapshot());
+    let cancel = AtomicBool::new(false);
+    let turn = TurnCache::new();
+    let mut opts = ReadOptions::new(Origin::Assistant, &cancel);
+    opts.turn = Some(&turn);
+    let first = run(
+        &host,
+        &ctx,
+        "list_cameras",
+        json!({"discover": true, "include_simulated": false}),
+        &opts,
+    )
+    .unwrap();
+    let later = run(
+        &host,
+        &ctx,
+        "list_cameras",
+        json!({"discover": true, "include_simulated": true}),
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(host.ops(), ["discover"]);
+    assert_eq!(first.value["discovery"]["reused"], false);
+    assert_eq!(later.value["discovery"]["reused"], true);
+    assert!(
+        first.value["discovered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|device| device["id"] != "sim:2")
+    );
+    assert!(
+        later.value["discovered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|device| device["id"] == "sim:2")
+    );
+}
+
+#[test]
+fn a_failed_discovery_is_not_retried_during_the_same_turn() {
+    let ctx = fixture_context(fixture_snapshot());
+    let host = FakeHost::new(fixture_snapshot())
+        .reply("discover", Err("The discovery helper exited.".into()));
+    let cancel = AtomicBool::new(false);
+    let turn = TurnCache::new();
+    let mut opts = ReadOptions::new(Origin::Assistant, &cancel);
+    opts.turn = Some(&turn);
+    let args = json!({"discover": true, "include_simulated": false});
+    let first = run(&host, &ctx, "list_cameras", args.clone(), &opts).unwrap_err();
+    let later = run(&host, &ctx, "list_cameras", args, &opts).unwrap_err();
+    assert_eq!(first, later);
+    assert_eq!(host.ops(), ["discover"]);
+}
+
+#[test]
 fn destinations_and_storage_report_budget_and_locations() {
     let ctx = fixture_context(fixture_snapshot());
     let host = FakeHost::new(fixture_snapshot()).without_session();
@@ -907,8 +987,7 @@ fn camera_features_list_curated_controls_and_hide_managed_ones() {
             "Width",
             "Height",
             "PixelFormat",
-            "AcquisitionFrameRate",
-            "TriggerSoftware"
+            "AcquisitionFrameRate"
         ]
     );
     let exposure = &curated["features"][0];
@@ -936,7 +1015,13 @@ fn camera_features_list_curated_controls_and_hide_managed_ones() {
     assert_eq!(search["features"][0]["name"], "DeviceTemperature");
     assert_eq!(search["features"][0]["writable"], false);
     let everything = features(json!({"camera": "sim:0", "search": "", "names": null})).to_string();
-    for hidden in ["GevSCDA", "TLParamsLocked", "UserSetSave", "LutValueReg"] {
+    for hidden in [
+        "GevSCDA",
+        "TLParamsLocked",
+        "UserSetSave",
+        "LutValueReg",
+        "TriggerSoftware",
+    ] {
         assert!(!everything.contains(hidden), "{hidden}");
     }
     let webcam = features(json!({"camera": "FaceTime HD Camera", "search": null, "names": null}));
@@ -1502,6 +1587,7 @@ fn issue_codes_follow_the_cli_exit_codes() {
 /// `Context::gather`'s inputs, fixed.
 struct FakeSources {
     destinations: Vec<Destination>,
+    missing_volume: Option<PathBuf>,
 }
 
 impl Sources for FakeSources {
@@ -1543,6 +1629,9 @@ impl Sources for FakeSources {
     }
 
     fn volume_problem(&self, path: &Path) -> Option<String> {
+        if self.missing_volume.as_deref() == Some(path) {
+            return Some("The staging volume is disconnected.".into());
+        }
         path.starts_with("/Volumes/Gone").then(|| {
             "external volume /Volumes/Gone is not mounted; reconnect it or choose another destination"
                 .into()
@@ -1565,6 +1654,7 @@ fn gathering_reads_destinations_storage_and_encoders_without_secrets() {
         no_overwrite: Default::default(),
     };
     let sources = FakeSources {
+        missing_volume: None,
         destinations: vec![
             Destination {
                 name: "line-1".into(),
@@ -1653,6 +1743,7 @@ fn destinations_of_kinds_this_build_lacks_carry_a_problem() {
     };
     let sources = FakeSources {
         destinations: Vec::new(),
+        missing_volume: None,
     };
     let s3 = Destination {
         name: "archive".into(),
@@ -1674,6 +1765,20 @@ fn destinations_of_kinds_this_build_lacks_carry_a_problem() {
     );
     assert!(info.insecure);
     assert!(!compiled.supports("ftp") && compiled.supports("folder"));
+
+    let compiled = Compiled {
+        s3: true,
+        ..compiled
+    };
+    let sources = FakeSources {
+        destinations: Vec::new(),
+        missing_volume: Some(s3.local_root()),
+    };
+    let info = DestinationInfo::new(&s3, &compiled, &sources);
+    assert_eq!(
+        info.problem.as_deref(),
+        Some("The staging volume is disconnected.")
+    );
 }
 
 #[test]

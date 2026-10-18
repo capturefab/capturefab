@@ -15,9 +15,13 @@ use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 /// Keys `for_model` leaves out wherever they appear: identifiers that tell a
 /// provider about the user's accounts, hardware or network.
 const MODEL_DROPPED: [&str; 4] = ["access_key_id", "profile", "serial", "address"];
+/// UI-only Secret fields must never survive serialization, even when a
+/// caller accidentally puts them in a value before redacting it.
+const SECRET_FIELDS: [&str; 2] = ["secret", "password"];
 
 /// `value` with URL credentials and stream keys removed from every string.
 pub fn for_output(mut value: Value) -> Value {
+    hide_secret_fields(&mut value);
     map_strings(&mut value, &output_string);
     value
 }
@@ -178,8 +182,26 @@ fn drop_keys(value: &mut Value) {
     match value {
         Value::Array(values) => values.iter_mut().for_each(drop_keys),
         Value::Object(fields) => {
-            fields.retain(|key, _| !MODEL_DROPPED.contains(&key.as_str()));
+            fields.retain(|key, _| {
+                !MODEL_DROPPED.contains(&key.as_str()) && !SECRET_FIELDS.contains(&key.as_str())
+            });
             fields.values_mut().for_each(drop_keys);
+        }
+        _ => {}
+    }
+}
+
+fn hide_secret_fields(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(hide_secret_fields),
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if SECRET_FIELDS.contains(&key.as_str()) {
+                    *value = Value::String("<redacted>".into());
+                } else {
+                    hide_secret_fields(value);
+                }
+            }
         }
         _ => {}
     }
@@ -409,6 +431,24 @@ mod tests {
             "a file selector is shortened after its scheme"
         );
         assert_eq!(shorten_home("/Users/ann/x", None), "/Users/ann/x");
+    }
+
+    #[test]
+    fn ui_only_secret_fields_never_reach_output_or_models() {
+        let value = json!({
+            "password": "stream-password",
+            "nested": [{"secret": "aws-secret", "token": "camera-undo-token"}],
+        });
+        let output = for_output(value.clone());
+        assert_eq!(output["password"], "<redacted>");
+        assert_eq!(output["nested"][0]["secret"], "<redacted>");
+        let model = for_model(value);
+        assert!(model.get("password").is_none());
+        assert!(model["nested"][0].get("secret").is_none());
+        assert_eq!(model["nested"][0]["token"], "camera-undo-token");
+        for text in [output.to_string(), model.to_string()] {
+            assert!(!text.contains("stream-password") && !text.contains("aws-secret"));
+        }
     }
 
     #[test]

@@ -431,7 +431,15 @@ pub fn resolve_camera(
         snapshot
             .devices
             .iter()
-            .filter(|device| same(&device.id) && connected_device(ctx, device).is_none())
+            .filter(|device| {
+                connected_device(ctx, device).is_none()
+                    && (same(&device.id)
+                        || device
+                            .address
+                            .as_deref()
+                            .is_some_and(|address| same(address) || same(without_query(address)))
+                        || (!device.serial.is_empty() && device.serial.eq_ignore_ascii_case(text)))
+            })
             .map(|device| CameraRef::Discovered(device.id.clone()))
             .collect()
     } else {
@@ -589,7 +597,10 @@ pub fn parse_duration_field(text: &str) -> Result<u64, String> {
             .unwrap_or(rest.len());
         let unit = &rest[..unit_end];
         rest = rest[unit_end..].trim_start();
-        if number.is_empty() || number.chars().all(|c| c == '.') {
+        if number.is_empty()
+            || number.chars().all(|c| c == '.')
+            || number.bytes().filter(|byte| *byte == b'.').count() > 1
+        {
             return Err(format!(
                 "Write the duration as a number and a unit, {EXAMPLE}."
             ));
@@ -657,4 +668,32 @@ pub fn format_duration_field(millis: u64) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod core_review_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_zero_duration_components_are_rejected() {
+        for text in ["1h0..0s", "1h..s", "0..1s", "1h0.0.0s"] {
+            assert!(parse_duration_field(text).is_err(), "{text}");
+        }
+        assert_eq!(parse_duration_field("1h0.0s").unwrap(), 3_600_000);
+    }
+
+    #[test]
+    fn discovered_selectors_and_serials_resolve_to_the_device_id() {
+        let mut ctx = tests::fixture_context(tests::fixture_snapshot());
+        let device = &mut ctx.snapshot.devices[0];
+        device.id = "discovered-camera".into();
+        device.address = Some("gige:10.11.12.13".into());
+        device.serial = "serial-123".into();
+        for selector in ["gige:10.11.12.13", "SERIAL-123"] {
+            assert_eq!(
+                resolve_camera(&ctx, "camera", selector, true).unwrap(),
+                CameraRef::Discovered("discovered-camera".into())
+            );
+        }
+    }
 }
