@@ -126,7 +126,15 @@ capturefab storage configure --max-space 12GiB
 capturefab storage --json
 ```
 
-When the budget is full, captures stop with a `storage_full` error (exit 6) rather than deleting anything. If losing the oldest captures is acceptable, for example because the line computer uploads everything to a server, `--on-full delete-oldest` deletes them instead; files still waiting to upload are kept. Upload destinations on a computer without a desktop login need `--password-env`, an SFTP `--key-file` or S3 `--env` or `--profile`, because no OS credential store runs there; see [copy files to a server](plant-floor.md#7-copy-files-to-a-server). Set the variables they read with `Environment=` lines in the unit.
+When the budget is full, captures stop with a `storage_full` error (exit 6) rather than deleting anything. If losing the oldest captures is acceptable, for example because the line computer uploads everything to a server, `--on-full delete-oldest` deletes them instead; files still waiting to upload are kept. Upload destinations on a computer without a desktop login need `--password-env`, an SFTP `--key-file` or S3 `--env` or `--profile`, because no OS credential store runs there; see [copy files to a server](plant-floor.md#7-copy-files-to-a-server). An SFTP key, or an AWS profile in the service account's `~/.aws/credentials`, stays in a file only that account reads. Give the service a password or AWS keys from a file only root reads, not with `Environment=` lines: every account can read unit files, and their `Environment=` through `systemctl show`.
+
+```sh
+sudo install -d -m 700 /etc/capturefab
+sudo install -m 600 /dev/null /etc/capturefab/line1.env
+sudoedit /etc/capturefab/line1.env
+```
+
+Put one `NAME=value` per line in it, such as `CAPTUREFAB_SFTP_PASSWORD=...`, or `AWS_ACCESS_KEY_ID=...` and `AWS_SECRET_ACCESS_KEY=...`, then add `EnvironmentFile=/etc/capturefab/line1.env` to the unit's `[Service]` section and restart the service. systemd reads the file before it switches to `User=`.
 
 ## 7. Efficiency mode
 
