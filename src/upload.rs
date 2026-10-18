@@ -41,6 +41,8 @@ const MAX_COMPLETED: usize = 1000;
 /// Connections idle this long are closed; at most this many are kept.
 const CLIENT_IDLE: Duration = Duration::from_secs(60);
 const MAX_CLIENTS: usize = 16;
+/// How often an idle uploader looks for files other processes queued.
+const POLL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -349,6 +351,16 @@ impl Uploads {
             replayed: 0,
             folded: bytes + logged,
         })
+    }
+
+    /// When the next waiting upload is due, in Unix seconds.
+    fn next_due_at(&self) -> Option<u64> {
+        self.queue
+            .items
+            .iter()
+            .filter(|i| i.state == State::Pending)
+            .map(|i| i.next_attempt)
+            .min()
     }
 
     /// Whether `journal` is the one replayed so far, perhaps longer.
@@ -886,8 +898,7 @@ fn run() {
         let item = match with_queue(next_due) {
             Ok(Some(item)) => item,
             Ok(None) | Err(_) => {
-                let guard = WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
-                let _ = WAKE.1.wait_timeout(guard, Duration::from_secs(2));
+                idle();
                 continue;
             }
         };
@@ -899,6 +910,42 @@ fn run() {
             // A client with stale credentials or a dropped connection is
             // rebuilt on the next attempt.
             clients.remove(&client_key(&item));
+        }
+    }
+}
+
+/// Wait while nothing is due: until the next upload is, this process
+/// queues or retries one, or the queue files change. Another process's
+/// change is noticed with a look at the files every `POLL`, without
+/// reading or locking them.
+fn idle() {
+    let cached = UPLOADS.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some((due, dir, seen)) = cached
+        .as_ref()
+        .map(|u| (u.next_due_at(), u.dir.clone(), u.seen))
+    else {
+        drop(cached);
+        thread::sleep(POLL);
+        return;
+    };
+    drop(cached);
+    let stamp = |name| Stamp::read(&dir.join(name)).ok().flatten();
+    loop {
+        let now = now();
+        let wait = match due {
+            Some(due) if due <= now => return,
+            Some(due) => POLL.min(Duration::from_secs(due - now)),
+            None => POLL,
+        };
+        let guard = WAKE.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let woken = !WAKE
+            .1
+            .wait_timeout(guard, wait)
+            .unwrap_or_else(PoisonError::into_inner)
+            .1
+            .timed_out();
+        if woken || (stamp(QUEUE_FILE), stamp(JOURNAL_FILE)) != seen {
+            return;
         }
     }
 }
@@ -1252,6 +1299,30 @@ mod tests {
         path
     }
 
+    /// Start this process's uploader and wait until it holds the lock.
+    fn start_uploading() {
+        start();
+        assert!(
+            eventually(Duration::from_secs(10), || *OWNER
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()),
+            "this process uploads"
+        );
+    }
+
+    fn eventually(limit: Duration, done: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while !done() {
+            if Instant::now() > deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        true
+    }
+
     #[test]
     fn status_and_an_idle_uploader_write_nothing() {
         if !isolated("status_and_an_idle_uploader_write_nothing") {
@@ -1264,13 +1335,7 @@ mod tests {
         back_off_first();
         let (before, writes) = (versions(), WRITTEN.load(Ordering::Relaxed));
         status().unwrap();
-        start();
-        let owner = || *OWNER.get().unwrap().lock().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !owner() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert!(owner(), "this process uploads");
+        start_uploading();
         // More than two idle passes of the uploader.
         thread::sleep(Duration::from_millis(4500));
         assert_eq!(status().unwrap()["pending"], 1);
@@ -1380,6 +1445,32 @@ mod tests {
                 .map(|i| i.id)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn an_idle_uploader_wakes_for_other_processes_and_due_retries() {
+        if !isolated("an_idle_uploader_wakes_for_other_processes_and_due_retries") {
+            return;
+        }
+        start_uploading();
+        let attempts = || status().unwrap()["items"][0]["attempts"].as_u64();
+        // Queued as another process would, without waking this one's
+        // uploader. Its file is missing, so the attempt fails for good.
+        put(items(0..1));
+        assert!(eventually(Duration::from_secs(6), || attempts() == Some(1)));
+        // A retry due in three seconds starts then, not before.
+        with_queue(|uploads| {
+            let item = Item {
+                state: State::Pending,
+                next_attempt: now() + 3,
+                ..uploads.queue.items[0].clone()
+            };
+            Ok(((), Change::put(vec![item])))
+        })
+        .unwrap();
+        thread::sleep(Duration::from_secs(1));
+        assert_eq!(attempts(), Some(1));
+        assert!(eventually(Duration::from_secs(8), || attempts() == Some(2)));
     }
 
     #[test]
