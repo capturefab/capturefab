@@ -1642,7 +1642,9 @@ impl Store {
             };
             writer.write_all(data)?;
             let sha256 = writer.sha256();
-            writer.finish()?;
+            // A busy ledger is waited out here: saving the frame again later
+            // would leave this file unrecorded beside the new one.
+            writer.finish_written()?;
             return Ok((name, sha256));
         }
         bail!(

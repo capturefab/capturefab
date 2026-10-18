@@ -1537,6 +1537,15 @@ impl StorageWriter {
         self.finalized = true;
         result
     }
+    /// Finish bytes written in one call just before, as `save_bytes` does:
+    /// the streamed hash stands for the file (retention still verifies it
+    /// before deleting), and a busy ledger is waited out, for a caller that
+    /// would otherwise save the same data again under another name, such as
+    /// an automatic capture's frame.
+    pub fn finish_written(mut self) -> Result<()> {
+        self.reread = false;
+        self.commit(COMMIT_TRIES)
+    }
     /// Finish a file whose bytes are all written. Its name is now taken, so
     /// a caller that saved again would find its own file in the way: a busy
     /// ledger is waited out up to `tries` times, and is then reported as a
@@ -1723,15 +1732,12 @@ impl std::error::Error for OutputExists {}
 /// Save already encoded bytes as a new file.
 pub fn save_bytes(bytes: &[u8], path: &Path, policy: &StoragePolicy) -> Result<Stored> {
     let mut writer = create_writer(path, policy, bytes.len() as u64)?;
-    // The bytes are written in one call and finished at once, so the streamed
-    // hash stands for the file; retention still verifies it before deleting.
-    writer.reread = false;
     writer.write_all(bytes)?;
     let stored = Stored {
         bytes: writer.bytes_written(),
         sha256: writer.sha256(),
     };
-    writer.commit(COMMIT_TRIES)?;
+    writer.finish_written()?;
     Ok(stored)
 }
 pub fn save_hashed(
