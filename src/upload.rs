@@ -1118,7 +1118,8 @@ fn run() {
         let item = match with_queue(next_due) {
             Ok(Some(item)) => item,
             Ok(None) | Err(_) => {
-                idle(hold_at);
+                let close_at = clients.values().map(|(_, used)| *used + CLIENT_IDLE).min();
+                idle(hold_at, close_at);
                 continue;
             }
         };
@@ -1135,10 +1136,11 @@ fn run() {
 }
 
 /// Wait while nothing is due: until the next upload is, `hold_at` passes
-/// with files queued unheld, this process queues or retries one, or the
-/// queue files change. Another process's change is noticed with a look at
-/// the files every `POLL`, without reading or locking them.
-fn idle(hold_at: Instant) {
+/// with files queued unheld, `close_at` passes to close idle connections,
+/// this process queues or retries one, or the queue files change. Another
+/// process's change is noticed with a look at the files every `POLL`,
+/// without reading or locking them.
+fn idle(hold_at: Instant, close_at: Option<Instant>) {
     let cached = UPLOADS.lock().unwrap_or_else(PoisonError::into_inner);
     let Some((due, unheld, dir, seen)) = cached.as_ref().map(|u| {
         let unheld = u.queue.items.iter().any(|i| i.unheld);
@@ -1149,6 +1151,7 @@ fn idle(hold_at: Instant) {
         return;
     };
     drop(cached);
+    let until = unheld.then_some(hold_at).into_iter().chain(close_at).min();
     let stamp = |name| Stamp::read(&dir.join(name)).ok().flatten();
     loop {
         let now = now();
@@ -1157,8 +1160,8 @@ fn idle(hold_at: Instant) {
             Some(due) => POLL.min(Duration::from_secs(due - now)),
             None => POLL,
         };
-        if unheld {
-            let left = hold_at.saturating_duration_since(Instant::now());
+        if let Some(until) = until {
+            let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return;
             }
@@ -1958,6 +1961,25 @@ mod tests {
         queue(3..4);
         let status = drain(Duration::from_secs(30)).unwrap();
         assert_eq!(attempts(&status), [1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn an_idle_uploader_wakes_to_close_idle_connections() {
+        if !isolated("an_idle_uploader_wakes_to_close_idle_connections") {
+            return;
+        }
+        // Nothing is queued, so only the connections' deadline ends the wait.
+        status().unwrap();
+        let (done, waited) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let now = Instant::now();
+            idle(
+                now + Duration::from_secs(60),
+                Some(now + Duration::from_millis(300)),
+            );
+            let _ = done.send(());
+        });
+        assert!(waited.recv_timeout(Duration::from_secs(5)).is_ok());
     }
 
     #[test]
