@@ -376,6 +376,7 @@ pub(super) fn streaming_camera(frames: u64, dropped: u64, fps: f64) -> CameraSna
         stale: false,
         error_logged: None,
         forwarding_since_ms: None,
+        forwarding_until_ms: None,
     }
 }
 

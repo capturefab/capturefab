@@ -92,6 +92,7 @@ VARIANTS = (
 EXTRA_STATES = (
     Scene("active-forwarding", "forward,forwarding,noscopes", "Active stream forwarding and its Stop action"),
     Scene("active-recording", "forward,recording,noscopes", "Active local recording and its Stop action"),
+    Scene("timed-recording", "forward,recording,timed,noscopes", "Timed local recording with its time left and end time"),
     Scene("destinations-empty", "destinations,noscopes", "Empty destination manager and creation actions"),
     Scene("bucket-testing", "bucket-editor,testing,noscopes", "Pending destination connectivity test with pinned actions"),
     Scene("discovery-pending", "welcome,searching", "Synthetic pending camera discovery without hardware enumeration"),

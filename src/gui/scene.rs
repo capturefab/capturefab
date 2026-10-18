@@ -115,6 +115,8 @@ pub(super) struct Scene {
     forwarding: Option<String>,
     /// When that forward started, UTC Unix milliseconds.
     forwarding_since_ms: Option<u64>,
+    /// When the session stops that forward by itself, if it does.
+    forwarding_until_ms: Option<u64>,
     /// The selected camera reports that it stopped streaming.
     stopped: bool,
     /// Turn on auto mode on every camera as the streams start.
@@ -152,12 +154,14 @@ impl Scene {
             if self.forwarding.is_some() {
                 camera.forwarding = self.forwarding.clone();
                 camera.forwarding_since_ms = self.forwarding_since_ms;
+                camera.forwarding_until_ms = self.forwarding_until_ms;
             }
             camera.streaming &= !self.stopped;
         }
         if self.forwarding.is_some() {
             snapshot.forwarding = self.forwarding.clone();
             snapshot.forwarding_since_ms = self.forwarding_since_ms;
+            snapshot.forwarding_until_ms = self.forwarding_until_ms;
         }
         snapshot.streaming &= !self.stopped;
     }
@@ -183,7 +187,8 @@ impl Workbench {
     ///   `copied` (the session command was just copied), `stalled` (the
     ///   selected camera's frames stopped arriving), `auto` (every camera in
     ///   auto mode), `forwarding` (the selected camera forwards to a URL),
-    ///   `recording` (the selected camera records to a file, for 1:23)
+    ///   `recording` (the selected camera records to a file, for 1:23),
+    ///   `timed` (with `recording`: the session stops it after 1 h)
     /// - `tags`: the capture tags filled in and open; `dataset`: the Dataset
     ///   section open
     /// - review fixtures: `network`, `network-empty`, `network-error`,
@@ -278,6 +283,10 @@ impl Workbench {
                     self.scene.forwarding = Some(prefs::default_record_output());
                     self.scene.forwarding_since_ms = Some(epoch_ms().saturating_sub(83_000));
                     self.scene.late.push("recording-file".into());
+                }
+                "timed" => {
+                    let since = epoch_ms().saturating_sub(83_000);
+                    self.scene.forwarding_until_ms = Some(since + 3_600_000);
                 }
                 "tags" => {
                     self.tags = prefs::CaptureTags {

@@ -35,8 +35,8 @@ class ReviewMatrixTests(unittest.TestCase):
 
     def test_all_matrix_combines_both_complete_matrices_without_duplicate_artifacts(self):
         cases = REVIEW.select_cases(all_screens=True)
-        self.assertEqual(len(cases), 95)
-        self.assertEqual(len({case[0] for case in cases}), 95)
+        self.assertEqual(len(cases), 96)
+        self.assertEqual(len({case[0] for case in cases}), 96)
         self.assertEqual({case[0] for case in cases}, {case[0] for case in REVIEW.matrix()} | {case[0] for case in REVIEW.matrix(True)} | {case[0] for case in REVIEW.extra_state_matrix()})
         self.assertEqual(len(REVIEW.select_cases(only=["welcome-light", "line-features-light"], all_screens=True)), 2)
 

@@ -176,14 +176,11 @@ impl WorkerHandle {
                 .is_some_and(|r| r.lock().unwrap_or_else(|e| e.into_inner()).cancelled())
     }
     fn log(&self, level: &str, message: String) {
-        let mut s = self.state.write().unwrap_or_else(|e| e.into_inner());
-        if level == "error" {
-            s.last_error = Some(message.clone());
-        }
-        s.logs.push(LogEntry::now_utc(level, message));
-        if s.logs.len() > 200 {
-            s.logs.remove(0);
-        }
+        push_log(
+            &mut self.state.write().unwrap_or_else(|e| e.into_inner()),
+            level,
+            message,
+        );
     }
     /// Publish the latest frame. With a shared ring the frame is copied into
     /// it and handed back, so a consumer such as the forwarder can take its
@@ -353,48 +350,110 @@ fn next_frame(
     }
 }
 
+/// Add a line to the worker's log; an error also becomes its `last_error`.
+fn push_log(s: &mut SessionSnapshot, level: &str, message: String) {
+    if level == "error" {
+        s.last_error = Some(message.clone());
+    }
+    s.logs.push(LogEntry::now_utc(level, message));
+    if s.logs.len() > 200 {
+        s.logs.remove(0);
+    }
+}
+
 fn stop_forward(
     h: &WorkerHandle,
     forwarder: &mut Option<(Forwarder, f64)>,
     auto: &mut Option<AutoController>,
 ) -> Result<()> {
-    {
-        let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
-        s.forwarding = None;
-        s.forwarding_since_ms = None;
-    }
+    end_forward(h, forwarder, auto, |_| None)
+}
+/// Stop the forward, and log the line `report` makes of how it ended (a
+/// level and message) in the same step that clears the forwarding state: a
+/// status never shows the forward gone without the error it ended with, nor
+/// still running with that error.
+fn end_forward(
+    h: &WorkerHandle,
+    forwarder: &mut Option<(Forwarder, f64)>,
+    auto: &mut Option<AutoController>,
+    report: impl FnOnce(&Result<()>) -> Option<(&'static str, String)>,
+) -> Result<()> {
     if let Some(a) = auto.as_mut() {
         a.set_forward_fps(None)?;
     }
     let meta = h.recording.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let Some((mut f, _)) = forwarder.take() else {
-        return Ok(());
+    let stopped = match forwarder.take() {
+        Some((mut f, _)) => {
+            let stopped = f.stop();
+            // A finished file is reported even when stopping reported an error.
+            if let Some(file) = f.stats().recording {
+                let context = meta.map(|m| m.context).unwrap_or_default();
+                h.push_saved(crate::dataset::SavedFile {
+                    seq: 0,
+                    wall_ms: file.started_ms,
+                    path: absolute_path(std::path::Path::new(&file.path)),
+                    bytes: file.bytes,
+                    sha256: Some(file.sha256),
+                    destination: file.destination,
+                    object_key: file.object_key,
+                    remote_url: file.remote_url,
+                    upload_id: file.upload_id,
+                    context,
+                    item: crate::dataset::SavedItem::Recording {
+                        started_ms: file.started_ms,
+                        ended_ms: file.ended_ms,
+                        codec: file.codec,
+                        encoder: file.encoder,
+                        fps: file.fps,
+                    },
+                });
+            }
+            stopped
+        }
+        None => Ok(()),
     };
-    let stopped = f.stop();
-    // A finished file is reported even when stopping reported an error.
-    if let Some(file) = f.stats().recording {
-        let context = meta.map(|m| m.context).unwrap_or_default();
-        h.push_saved(crate::dataset::SavedFile {
-            seq: 0,
-            wall_ms: file.started_ms,
-            path: absolute_path(std::path::Path::new(&file.path)),
-            bytes: file.bytes,
-            sha256: Some(file.sha256),
-            destination: file.destination,
-            object_key: file.object_key,
-            remote_url: file.remote_url,
-            upload_id: file.upload_id,
-            context,
-            item: crate::dataset::SavedItem::Recording {
-                started_ms: file.started_ms,
-                ended_ms: file.ended_ms,
-                codec: file.codec,
-                encoder: file.encoder,
-                fps: file.fps,
-            },
-        });
+    // Last: whoever sees the forward gone (a client waiting out a timed
+    // recording, say) finds its file finished and reported.
+    let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
+    if let Some((level, message)) = report(&stopped) {
+        push_log(&mut s, level, message);
     }
+    s.forwarding = None;
+    s.forwarding_since_ms = None;
+    s.forwarding_until_ms = None;
     stopped
+}
+/// The requested length of a timed recording or forward whose end time has
+/// come at `now_ms` (UTC Unix milliseconds), or `None` while it should run on.
+fn forward_due(state: &SessionSnapshot, now_ms: u64) -> Option<u64> {
+    let until = state.forwarding_until_ms.filter(|until| now_ms >= *until)?;
+    Some(until.saturating_sub(state.forwarding_since_ms.unwrap_or(until)))
+}
+/// Stop a timed recording or forward once its end time has come, the way
+/// stop-forward does, so a recording is committed, cataloged and queued for
+/// upload whether or not the client that started it is still there.
+fn finish_timed_forward(
+    h: &WorkerHandle,
+    forwarder: &mut Option<(Forwarder, f64)>,
+    auto: &mut Option<AutoController>,
+    now_ms: u64,
+) {
+    let due = forward_due(&h.state.read().unwrap_or_else(|e| e.into_inner()), now_ms);
+    let (Some(duration_ms), Some((f, _))) = (due, forwarder.as_ref()) else {
+        return;
+    };
+    let what = if f.recording_path().is_some() {
+        "Recording"
+    } else {
+        "Forwarding"
+    };
+    let length = crate::scheduling::format_duration(duration_ms);
+    let _ = end_forward(h, forwarder, auto, |stopped| {
+        Some(match stopped {
+            Ok(()) => ("info", format!("{what} finished after {length}")),
+            Err(e) => ("error", format!("{what} stopped after {length}: {e:#}")),
+        })
+    });
 }
 /// Pick a free name for a recording template under its destination and
 /// create the file, moving to the next free name when another writer (another
@@ -695,6 +754,7 @@ fn process_plain(
             destination,
             on_exists,
             context,
+            duration_ms,
         } => {
             ensure!(
                 !camera_mut(camera)?.is_scanner(),
@@ -739,13 +799,19 @@ fn process_plain(
             }
             refresh(h, camera, false);
             let since_ms = crate::scheduling::now_ms();
+            // The worker loop stops a timed forward at this wall-clock time.
+            let until_ms = duration_ms.map(|duration| since_ms.saturating_add(duration));
             let shown = crate::media::redact_url(&output);
             {
                 let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
                 s.forwarding = Some(shown.clone());
                 s.forwarding_since_ms = Some(since_ms);
+                s.forwarding_until_ms = until_ms;
             }
             let mut value = json!({"forwarding":shown,"since_ms":since_ms});
+            if let Some(until_ms) = until_ms {
+                value["until_ms"] = json!(until_ms);
+            }
             if let Some(path) = f_path {
                 value["path"] = json!(path);
                 *h.recording.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -1655,6 +1721,9 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
             forwarder.is_some(),
             auto.is_some(),
         );
+        if forwarder.is_some() {
+            finish_timed_forward(&h, &mut forwarder, &mut auto, crate::scheduling::now_ms());
+        }
         if let (Some(controller), Some(c)) = (auto.as_mut(), camera.as_mut())
             && controller.tick(c, Instant::now())
         {
@@ -1680,8 +1749,10 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
                         (forwarder.as_mut(), h.record(frame).or(retained))
                         && let Err(e) = f.push(frame)
                     {
-                        h.log("error", format!("Forwarding stopped: {e:#}"));
-                        let _ = stop_forward(&h, &mut forwarder, &mut auto);
+                        let message = format!("Forwarding stopped: {e:#}");
+                        let _ = end_forward(&h, &mut forwarder, &mut auto, |_| {
+                            Some(("error", message))
+                        });
                     }
                     rate_count += 1;
                     consecutive_errors = 0;
@@ -1821,6 +1892,7 @@ mod tests {
             destination: None,
             on_exists: Default::default(),
             context: Default::default(),
+            duration_ms: None,
         };
         let mut paths = Vec::new();
         let handles: Vec<_> = (0..2).map(|_| WorkerHandle::new()).collect();
@@ -1840,6 +1912,190 @@ mod tests {
             let _ = h.request(SessionCommand::StopForward);
             h.shutdown();
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+    fn timed_forward(output: &Path, duration_ms: Option<u64>) -> SessionCommand {
+        SessionCommand::Forward {
+            output: output.to_string_lossy().into_owned(),
+            codec: "h264".into(),
+            encoder: "libx264".into(),
+            fps: 10.0,
+            bitrate: "1M".into(),
+            storage: Default::default(),
+            max_file_bytes: 8 << 20,
+            destination: None,
+            on_exists: Default::default(),
+            context: Default::default(),
+            duration_ms,
+        }
+    }
+    #[test]
+    fn timed_forwards_keep_their_end_time_until_stopped() {
+        // The deadline falls due at its end time, never before.
+        let state = |since, until| SessionSnapshot {
+            forwarding: Some("clip.mkv".into()),
+            forwarding_since_ms: since,
+            forwarding_until_ms: until,
+            ..Default::default()
+        };
+        assert_eq!(forward_due(&state(Some(1000), None), u64::MAX), None);
+        assert_eq!(forward_due(&state(Some(1000), Some(4600)), 4599), None);
+        assert_eq!(
+            forward_due(&state(Some(1000), Some(4600)), 4600),
+            Some(3600)
+        );
+        assert_eq!(
+            forward_due(&state(Some(1000), Some(4600)), 9000),
+            Some(3600)
+        );
+        assert_eq!(forward_due(&state(None, Some(4600)), 4600), Some(0));
+        // Commands run here without the worker loop, so no frame reaches the
+        // encoder: FFmpeg, which starts with the first frame, is not needed,
+        // and only these commands or the deadline end the forward.
+        let root = temp_dir("timed-forward");
+        let h = WorkerHandle::new();
+        let mut camera = None;
+        let mut forwarder = None;
+        let mut auto = None;
+        let mut run =
+            |camera: &mut Option<Camera>, forwarder: &mut Option<(Forwarder, f64)>, command| {
+                process(
+                    &h,
+                    camera,
+                    forwarder,
+                    &mut auto,
+                    &mut Vec::new(),
+                    &mut 1,
+                    &mut false,
+                    command,
+                )
+            };
+        let connect = || SessionCommand::Connect {
+            camera: "sim:0".into(),
+            timeout_ms: 100,
+        };
+        run(&mut camera, &mut forwarder, connect()).unwrap();
+        let hour = Some(3_600_000);
+        // Stop-forward, stop and disconnect each clear the end time.
+        for (name, stop) in [
+            ("stop-forward", SessionCommand::StopForward),
+            ("stop", SessionCommand::Stop),
+            ("disconnect", SessionCommand::Disconnect),
+        ] {
+            let output = root.join(format!("{name}.mkv"));
+            let reply = run(&mut camera, &mut forwarder, timed_forward(&output, hour)).unwrap();
+            let since = reply["since_ms"].as_u64().unwrap();
+            assert_eq!(reply["until_ms"].as_u64(), Some(since + 3_600_000));
+            let snapshot = h.snapshot();
+            assert_eq!(
+                (snapshot.forwarding_since_ms, snapshot.forwarding_until_ms),
+                (Some(since), Some(since + 3_600_000)),
+                "{name}"
+            );
+            run(&mut camera, &mut forwarder, stop).unwrap();
+            let snapshot = h.snapshot();
+            assert!(forwarder.is_none(), "{name}");
+            assert_eq!(
+                (
+                    snapshot.forwarding,
+                    snapshot.forwarding_since_ms,
+                    snapshot.forwarding_until_ms
+                ),
+                (None, None, None),
+                "{name}"
+            );
+            assert_eq!(snapshot.last_error, None, "{name}");
+            if camera.is_none() {
+                run(&mut camera, &mut forwarder, connect()).unwrap();
+            }
+        }
+        let reply = run(
+            &mut camera,
+            &mut forwarder,
+            timed_forward(&root.join("untimed.mkv"), None),
+        )
+        .unwrap();
+        assert!(reply.get("until_ms").is_none(), "{reply}");
+        assert_eq!(h.snapshot().forwarding_until_ms, None);
+        finish_timed_forward(&h, &mut forwarder, &mut None, u64::MAX);
+        assert!(forwarder.is_some(), "a forward without a duration runs on");
+        run(&mut camera, &mut forwarder, SessionCommand::StopForward).unwrap();
+        // At its end time the worker ends a timed forward as stop-forward
+        // does, and says so in the step that clears it.
+        let reply = run(
+            &mut camera,
+            &mut forwarder,
+            timed_forward(&root.join("due.mkv"), Some(90_000)),
+        )
+        .unwrap();
+        let until = reply["until_ms"].as_u64().unwrap();
+        finish_timed_forward(&h, &mut forwarder, &mut None, until - 1);
+        assert!(forwarder.is_some(), "not before its end time");
+        finish_timed_forward(&h, &mut forwarder, &mut None, until);
+        assert!(forwarder.is_none());
+        let snapshot = h.snapshot();
+        assert_eq!(
+            (snapshot.forwarding, snapshot.forwarding_until_ms),
+            (None, None)
+        );
+        assert_eq!(snapshot.last_error, None);
+        assert_eq!(
+            snapshot.logs.last().map(|entry| entry.message.as_str()),
+            Some("Recording finished after 1 min 30 s")
+        );
+        h.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    #[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+    fn a_timed_recording_ends_itself_and_commits_its_file() {
+        let root = temp_dir("timed-recording");
+        let output = root.join("clip.mkv");
+        let h = WorkerHandle::new();
+        connect(&h, "1000");
+        let reply = h.request(timed_forward(&output, Some(1000))).unwrap();
+        let until = reply["until_ms"].as_u64().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let ended = loop {
+            let snapshot = h.snapshot();
+            if snapshot.forwarding.is_none() {
+                break snapshot;
+            }
+            assert!(Instant::now() < deadline, "the recording never ended");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(crate::scheduling::now_ms() >= until);
+        // Once the forward is gone, its file is finished and reported.
+        let batch = h.take_saved(10);
+        assert_eq!(batch.items.len(), 1);
+        assert!(matches!(
+            batch.items[0].item,
+            crate::dataset::SavedItem::Recording { .. }
+        ));
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().len(),
+            batch.items[0].bytes
+        );
+        // The first status that shows it gone already says how it ended.
+        assert_eq!(
+            (ended.forwarding_since_ms, ended.forwarding_until_ms),
+            (None, None)
+        );
+        assert!(
+            ended
+                .logs
+                .iter()
+                .any(|entry| entry.message == "Recording finished after 1 s"),
+            "{:?}",
+            ended.logs
+        );
+        assert_eq!(ended.last_error, None);
+        // Nothing is left to stop.
+        assert_eq!(
+            h.request(SessionCommand::StopForward).unwrap()["forwarding"],
+            Value::Null
+        );
+        h.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }
     #[test]

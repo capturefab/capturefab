@@ -1356,11 +1356,17 @@ struct NativeOptions {
     size: Option<(u32, u32)>,
     fps: Option<f64>,
 }
-fn native_source(source: &str) -> Result<(String, Option<NativeOptions>)> {
-    if !matches!(
-        scheme(source).as_deref(),
+/// Whether `selector` names a camera the operating system attaches to this
+/// computer (`avfoundation:`, `v4l2:` or `dshow:`), such as a webcam, rather
+/// than a network stream, a file or a machine-vision camera.
+pub fn is_host_camera(selector: &str) -> bool {
+    matches!(
+        scheme(selector).as_deref(),
         Some("avfoundation" | "v4l2" | "dshow")
-    ) {
+    )
+}
+fn native_source(source: &str) -> Result<(String, Option<NativeOptions>)> {
+    if !is_host_camera(source) {
         return Ok((source.into(), None));
     }
     let (base, query) = source.split_once('?').unwrap_or((source, ""));
@@ -1909,6 +1915,52 @@ pub fn validate_encoder(codec: &str, encoder: &str) -> Result<()> {
 
 pub fn validate_bitrate(bitrate: &str) -> Result<()> {
     bits_per_second(bitrate).map(|_| ())
+}
+/// The bytes a recording at `bitrate` (such as `4M`) writes in `duration_ms`:
+/// bits per second times seconds, over 8, rounded up. Encoders overshoot and
+/// containers add a little; `recording_reservation` allows for both.
+pub fn estimate_recording_bytes(bitrate: &str, duration_ms: u64) -> Result<u64> {
+    Ok(estimated_bytes(bits_per_second(bitrate)?, duration_ms))
+}
+/// The `max_file_bytes` to reserve for a recording at `bitrate` that lasts
+/// `duration_ms`: the estimate plus 25% and 16 MiB, rounded up to a whole
+/// MiB. A recording that outgrows its reservation is lost, so err high.
+pub fn recording_reservation(bitrate: &str, duration_ms: u64) -> Result<u64> {
+    Ok(reservation_bytes(bits_per_second(bitrate)?, duration_ms))
+}
+/// The longest recording at `bitrate`, in whole minutes (as milliseconds,
+/// at most 10 years), whose `recording_reservation` fits in
+/// `max_file_bytes`; 0 when not even one minute fits.
+pub fn max_duration_for(bitrate: &str, max_file_bytes: u64) -> Result<u64> {
+    const MINUTE: u64 = 60_000;
+    let bits = bits_per_second(bitrate)?;
+    let fits = |minutes: u64| reservation_bytes(bits, minutes * MINUTE) <= max_file_bytes;
+    // The reservation grows with the duration: find the last minute that
+    // fits. `low` is 0 or a count of minutes that fits.
+    let (mut low, mut high) = (0, crate::scheduling::MAX_DURATION_MS / MINUTE);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if fits(middle) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Ok(low * MINUTE)
+}
+fn estimated_bytes(bits_per_second: u64, duration_ms: u64) -> u64 {
+    let bits = u128::from(bits_per_second) * u128::from(duration_ms);
+    // Bit-milliseconds over 8 bits per byte and 1000 ms per second.
+    u64::try_from(bits.div_ceil(8000)).unwrap_or(u64::MAX)
+}
+fn reservation_bytes(bits_per_second: u64, duration_ms: u64) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    let estimate = estimated_bytes(bits_per_second, duration_ms);
+    estimate
+        .saturating_add(estimate.div_ceil(4))
+        .saturating_add(16 * MIB)
+        .div_ceil(MIB)
+        .saturating_mul(MIB)
 }
 fn select_encoder(exe: &Executable, config: &ForwardConfig) -> Result<String> {
     let family = codec_family(&config.codec)?;
@@ -3603,6 +3655,75 @@ mod tests {
         let mut invalid = config;
         invalid.fps = f64::NAN;
         assert!(Forwarder::new(invalid).is_err());
+    }
+    #[test]
+    fn recording_sizes_are_estimated_and_reserved_with_headroom() {
+        const MIB: u64 = 1024 * 1024;
+        let hour = 3_600_000;
+        // 4 Mbit/s for an hour is 1.8 GB, far above the default 512 MiB cap.
+        assert_eq!(estimate_recording_bytes("4M", hour).unwrap(), 1_800_000_000);
+        assert_eq!(estimate_recording_bytes("1", 1).unwrap(), 1);
+        assert_eq!(estimate_recording_bytes("4M", 0).unwrap(), 0);
+        assert_eq!(
+            estimate_recording_bytes("4294967295", crate::scheduling::MAX_DURATION_MS).unwrap(),
+            169_423_574_885_865_000
+        );
+        assert!(estimate_recording_bytes("4MM", hour).is_err());
+        // 1.8 GB plus 25% and 16 MiB is 2,266,777,216 bytes: 2162 MiB, rounded up.
+        let reserved = recording_reservation("4M", hour).unwrap();
+        assert_eq!(reserved, 2162 * MIB);
+        assert!(reserved >= 1_800_000_000 / 4 * 5 + 16 * MIB);
+        assert_eq!(recording_reservation("4M", 0).unwrap(), 16 * MIB);
+        assert_eq!(recording_reservation("1", 1).unwrap(), 17 * MIB);
+        assert_eq!(
+            recording_reservation("4294967295", crate::scheduling::MAX_DURATION_MS).unwrap() % MIB,
+            0
+        );
+        assert!(recording_reservation("", hour).is_err());
+    }
+    #[test]
+    fn the_longest_recording_that_fits_is_in_whole_minutes() {
+        let minute = 60_000;
+        // 4 Mbit/s reserves about 36 MiB a minute plus 16 MiB.
+        let longest = max_duration_for("4M", default_recording_cap()).unwrap();
+        assert_eq!(longest, 13 * minute);
+        assert!(recording_reservation("4M", longest).unwrap() <= default_recording_cap());
+        assert!(recording_reservation("4M", longest + minute).unwrap() > default_recording_cap());
+        let hour = recording_reservation("4M", 60 * minute).unwrap();
+        assert_eq!(max_duration_for("4M", hour).unwrap(), 60 * minute);
+        assert_eq!(max_duration_for("4M", hour - 1).unwrap(), 59 * minute);
+        // Not even a minute: the 16 MiB margin alone, or nothing.
+        assert_eq!(max_duration_for("4M", 16 * 1024 * 1024).unwrap(), 0);
+        assert_eq!(max_duration_for("4M", 0).unwrap(), 0);
+        assert_eq!(
+            max_duration_for("1", u64::MAX).unwrap(),
+            crate::scheduling::MAX_DURATION_MS
+        );
+        assert!(max_duration_for("fast", u64::MAX).is_err());
+    }
+    #[test]
+    fn host_cameras_are_named_by_their_operating_system_scheme() {
+        for selector in [
+            "avfoundation:FaceTime HD Camera",
+            "avfoundation:0",
+            "AVFoundation:1?fps=30",
+            "v4l2:/dev/video0",
+            "dshow:video=Integrated Camera",
+        ] {
+            assert!(is_host_camera(selector), "{selector}");
+        }
+        for selector in [
+            "sim:0",
+            "rtsp://camera/live",
+            "file:clip.mp4",
+            "clip.mp4",
+            "C:/video/clip.mp4",
+            "gige:192.168.1.20",
+            "scanner:sane:x",
+            "",
+        ] {
+            assert!(!is_host_camera(selector), "{selector}");
+        }
     }
     #[test]
     fn explicit_encoders_must_be_installed_video_encoders_for_the_selected_codec() {

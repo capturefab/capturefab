@@ -184,6 +184,11 @@ pub enum SessionCommand {
         /// Tags such as line, station, part, lot and note.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         context: crate::context::Context,
+        /// Stop after this many milliseconds. The camera's worker ends the
+        /// recording or stream itself, as stop-forward would, so it ends on
+        /// time even when the client that started it has gone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     StopForward,
     /// Open or create the session's dataset catalog (one .duckdb file).
@@ -537,7 +542,15 @@ impl SessionCommand {
                 destination,
                 on_exists,
                 context,
+                duration_ms,
             } => {
+                // The range `record --duration` has always accepted.
+                ensure!(
+                    duration_ms.is_none_or(|duration| {
+                        (1..=crate::scheduling::MAX_DURATION_MS).contains(&duration)
+                    }),
+                    "recording duration must be 1 ms to 10 years"
+                );
                 crate::naming::validate_request(output, 1, *on_exists, context)?;
                 crate::media::ForwardConfig {
                     output: output.clone(),
@@ -654,6 +667,17 @@ fn camera_log(entry: &LogEntry, camera: &str) -> LogEntry {
         ..entry.clone()
     }
 }
+/// When `camera` last logged an error, in UTC Unix milliseconds, from a
+/// session log whose camera lines `camera_log` tagged. `last_error` alone
+/// cannot tell the same error logged again from the one before.
+pub fn camera_error_logged_ms(logs: &[LogEntry], camera: &str) -> Option<u64> {
+    let tag = activity::redact(&format!("[{camera}] "));
+    logs.iter()
+        .filter(|entry| entry.level == "error" && entry.message.starts_with(&tag))
+        .filter_map(|entry| entry.timestamp)
+        .map(|timestamp| u64::try_from(timestamp.unix_ms()).unwrap_or(0))
+        .max()
+}
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CameraHistoryStatus {
     pub undo: Option<String>,
@@ -690,6 +714,10 @@ pub struct CameraSnapshot {
     /// When the current recording or forward started, UTC Unix milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding_since_ms: Option<u64>,
+    /// When the worker stops a timed recording or forward, UTC Unix
+    /// milliseconds; unset when it runs until stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarding_until_ms: Option<u64>,
     #[serde(default)]
     pub jobs: Vec<crate::scheduling::CaptureJob>,
     #[serde(default)]
@@ -744,6 +772,10 @@ pub struct SessionSnapshot {
     /// When the current recording or forward started, UTC Unix milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding_since_ms: Option<u64>,
+    /// When the worker stops a timed recording or forward, UTC Unix
+    /// milliseconds; unset when it runs until stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarding_until_ms: Option<u64>,
     #[serde(default)]
     pub jobs: Vec<crate::scheduling::CaptureJob>,
     #[serde(default)]
@@ -785,6 +817,7 @@ fn project_selected(state: &mut SessionSnapshot) {
         state.fps = camera.fps;
         state.forwarding = camera.forwarding.clone();
         state.forwarding_since_ms = camera.forwarding_since_ms;
+        state.forwarding_until_ms = camera.forwarding_until_ms;
         state.jobs = camera.jobs.clone();
         state.auto = camera.auto.clone();
         state.capture_session = camera.capture_session.clone();
@@ -801,6 +834,7 @@ fn project_selected(state: &mut SessionSnapshot) {
         state.fps = 0.0;
         state.forwarding = None;
         state.forwarding_since_ms = None;
+        state.forwarding_until_ms = None;
         state.jobs.clear();
         state.auto = None;
         state.capture_session = None;
@@ -1302,6 +1336,7 @@ impl SessionHandle {
                         worker_pid: p.child.id(),
                         forwarding: s.forwarding.clone(),
                         forwarding_since_ms: s.forwarding_since_ms,
+                        forwarding_until_ms: s.forwarding_until_ms,
                         jobs: s.jobs.clone(),
                         auto: s.auto.clone(),
                         capture_session: s.capture_session.clone(),
@@ -2305,6 +2340,72 @@ mod tests {
         assert_eq!((interval_ms, tags.len()), (1000, 0));
         let snapshot = serde_json::to_value(SessionSnapshot::default()).unwrap();
         assert!(snapshot.get("dataset").is_none() && snapshot.get("signals").is_none());
+        assert!(snapshot.get("forwarding_until_ms").is_none());
+        // A forward without a duration keeps its old shape both ways.
+        let old = br#"{"op":"forward","output":"a.mkv","codec":"h264","encoder":"auto","fps":30,"bitrate":"4M"}"#;
+        let command = SessionCommand::from_json_slice(old).unwrap();
+        assert!(matches!(
+            command,
+            SessionCommand::Forward {
+                duration_ms: None,
+                ..
+            }
+        ));
+        assert!(
+            serde_json::to_value(&command)
+                .unwrap()
+                .get("duration_ms")
+                .is_none()
+        );
+        let mut timed = serde_json::to_value(&command).unwrap();
+        timed["duration_ms"] = json!(3_600_000);
+        let command = SessionCommand::from_json_slice(timed.to_string().as_bytes()).unwrap();
+        assert!(matches!(
+            command,
+            SessionCommand::Forward {
+                duration_ms: Some(3_600_000),
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&command).unwrap(), timed);
+        let camera: CameraSnapshot = serde_json::from_value(json!({
+            "info": crate::transport::simulator::info_named("sim:0"), "features": [],
+            "streaming": true, "frames": 1, "dropped": 0, "fps": 30.0, "last_error": null,
+            "worker_pid": 1, "forwarding": "a.mkv", "forwarding_since_ms": 5
+        }))
+        .unwrap();
+        assert_eq!(camera.forwarding_until_ms, None);
+    }
+    #[test]
+    fn recording_duration_matches_the_cli_duration_range() {
+        let forward = |duration_ms| SessionCommand::Forward {
+            output: "clip.mkv".into(),
+            codec: "h264".into(),
+            encoder: "auto".into(),
+            fps: 30.0,
+            bitrate: "4M".into(),
+            storage: Default::default(),
+            max_file_bytes: crate::media::default_recording_cap(),
+            destination: None,
+            on_exists: Default::default(),
+            context: Default::default(),
+            duration_ms,
+        };
+        let max = crate::scheduling::MAX_DURATION_MS;
+        for duration in [None, Some(1), Some(500), Some(3_600_000), Some(max)] {
+            forward(duration).validate().unwrap();
+        }
+        for duration in [0, max + 1, u64::MAX] {
+            let error = forward(Some(duration)).validate().unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "recording duration must be 1 ms to 10 years"
+            );
+        }
+        // `record --duration 500ms` has always worked and must keep working.
+        forward(Some(crate::scheduling::parse_duration("500ms").unwrap()))
+            .validate()
+            .unwrap();
     }
     fn cached_camera(id: &str, frames: u64) -> CameraSnapshot {
         CameraSnapshot {
@@ -2326,7 +2427,8 @@ mod tests {
             ring_dropped: 0,
             stale: true,
             error_logged: None,
-            forwarding_since_ms: None,
+            forwarding_since_ms: Some(frames * 1000),
+            forwarding_until_ms: Some(frames * 1000 + 60_000),
         }
     }
     #[test]
@@ -2342,10 +2444,18 @@ mod tests {
         assert_eq!(snapshot.connected.as_ref().unwrap().id, "sim:1");
         assert_eq!(snapshot.frames, 20);
         assert_eq!(snapshot.forwarding.as_deref(), Some("sim:1.mp4"));
+        assert_eq!(
+            (snapshot.forwarding_since_ms, snapshot.forwarding_until_ms),
+            (Some(20_000), Some(80_000))
+        );
         snapshot.active_camera = None;
         project_selected(&mut snapshot);
         assert!(
             snapshot.connected.is_none() && !snapshot.streaming && snapshot.forwarding.is_none()
+        );
+        assert_eq!(
+            (snapshot.forwarding_since_ms, snapshot.forwarding_until_ms),
+            (None, None)
         );
         assert_eq!(
             (snapshot.frames, snapshot.received_bytes, snapshot.fps),
@@ -2406,6 +2516,41 @@ mod tests {
         merge_session_metadata(&mut in_flight, &current);
         assert_eq!(in_flight.logs.len(), 2);
         assert_eq!(in_flight.logs[1].timestamp, later.timestamp);
+    }
+    #[test]
+    fn a_cameras_newest_error_is_found_by_its_tag_and_time() {
+        let at = |unix_ms, level, message| LogEntry {
+            timestamp: LogTimestamp::new(unix_ms, 0),
+            ..LogEntry::legacy("12:30:00", level, message)
+        };
+        let logs = [
+            camera_log(
+                &at(1_000, "error", "Forwarding stopped: no FFmpeg"),
+                "sim:0",
+            ),
+            camera_log(
+                &at(3_000, "error", "Forwarding stopped: no FFmpeg"),
+                "sim:0",
+            ),
+            camera_log(&at(2_000, "error", "Capture failed"), "sim:0"),
+            camera_log(&at(4_000, "info", "Recording finished"), "sim:0"),
+            camera_log(&at(5_000, "error", "Capture failed"), "sim:00"),
+            camera_log(
+                &at(6_000, "error", "rtsp://user:pw@cam/a"),
+                "rtsp://user:pw@cam/a",
+            ),
+            at(7_000, "error", "A session line"),
+            camera_log(&LogEntry::legacy("12:30:09", "error", "No time"), "sim:0"),
+        ];
+        // The repeat of an error counts; lines without a time do not.
+        assert_eq!(camera_error_logged_ms(&logs, "sim:0"), Some(3_000));
+        assert_eq!(camera_error_logged_ms(&logs[..6], "sim:00"), Some(5_000));
+        assert_eq!(
+            camera_error_logged_ms(&logs[..6], "rtsp://user:pw@cam/a"),
+            Some(6_000)
+        );
+        assert_eq!(camera_error_logged_ms(&logs, "sim:1"), None);
+        assert_eq!(camera_error_logged_ms(&[], "sim:0"), None);
     }
     #[test]
     fn addressed_status_preserves_camera_fields_and_includes_actual_session_selection() {

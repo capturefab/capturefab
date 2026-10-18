@@ -781,7 +781,7 @@ pub enum Command {
         fps: f64,
         #[arg(long, default_value = "4M")]
         bitrate: String,
-        /// Stop after this duration, e.g. 30s or 5m; omitted runs until Ctrl-C in direct mode
+        /// Stop after this duration, e.g. 30s or 5m; the session ends the recording itself and the CLI waits for it. Omitted runs until Ctrl-C in direct mode
         #[arg(long, value_parser = parse_duration_text)]
         duration: Option<String>,
         /// Bounded maximum size of a local recording file
@@ -1637,9 +1637,11 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
             ..
         }) => {
             let context = crate::context::from_pairs(context)?;
-            if let Some(duration) = duration {
-                crate::scheduling::parse_duration(duration)?;
-            }
+            // The session ends a timed recording itself; the CLI waits on it.
+            let duration_ms = duration
+                .as_deref()
+                .map(crate::scheduling::parse_duration)
+                .transpose()?;
             Some(SessionCommand::Forward {
                 output: output.clone(),
                 codec: codec.clone(),
@@ -1654,6 +1656,7 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
                 destination: destination.clone(),
                 on_exists: *on_exists,
                 context,
+                duration_ms,
             })
         }
         Some(Command::Dataset { .. }) => prepare_dataset(cli)?,
@@ -2145,14 +2148,25 @@ pub fn run(mut cli: Cli) -> Result<()> {
             dataset,
             ..
         } => {
-            let until = duration
+            let duration_ms = duration
                 .as_deref()
                 .map(crate::scheduling::parse_duration)
-                .transpose()?
-                .map(Duration::from_millis);
+                .transpose()?;
             dataset.apply(&client)?;
             auto.apply(&client)?;
-            let result = client.call(prepared.clone().unwrap())?;
+            // The camera's newest error before the recording: one after it
+            // means the recording failed, even before a status shows it.
+            let errors = match (duration_ms, &client.local) {
+                (None, _) => ErrorMark::default(),
+                (Some(_), Some(h)) => ErrorMark::of(&ForwardStatus::of_snapshot(&h.snapshot())),
+                (Some(_), None) => ErrorMark::of(&ForwardStatus::of_status(
+                    &client.call(SessionCommand::Status)?,
+                )),
+            };
+            let mut result = client.call(prepared.clone().unwrap())?;
+            // The session ends a timed recording at its end time; the CLI
+            // waits for that, and stops it only on Ctrl-C or as a fallback.
+            let mut timed = duration_ms.map(|ms| TimedRecording::new(ms, &result, errors));
             if cli.session.is_none() {
                 if !cli.json {
                     eprintln!(
@@ -2162,28 +2176,45 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 }
                 let epoch = std::time::Instant::now();
                 let h = client.local.as_ref().unwrap();
-                while until.is_none_or(|d| epoch.elapsed() < d) {
+                loop {
                     std::thread::sleep(Duration::from_millis(100));
                     if h.is_shutting_down() {
                         return Ok(());
                     }
                     let state = h.snapshot();
-                    if state.forwarding.is_none() {
-                        anyhow::bail!(
+                    let next = match &mut timed {
+                        Some(timed) => timed.next(
+                            ForwardStatus::of_snapshot(&state),
+                            crate::scheduling::now_ms(),
+                            epoch.elapsed(),
+                            false,
+                        ),
+                        None if state.forwarding.is_some() => RecordingWait::Wait,
+                        None => RecordingWait::Failed,
+                    };
+                    match next {
+                        RecordingWait::Wait => {}
+                        RecordingWait::Finished => {
+                            result["stopped"] = TimedRecording::finished();
+                            break;
+                        }
+                        RecordingWait::Stop => {
+                            result["stopped"] = client.call(SessionCommand::StopForward)?;
+                            break;
+                        }
+                        RecordingWait::Failed => anyhow::bail!(
                             "{}",
                             state
                                 .last_error
                                 .unwrap_or_else(|| "forwarding stopped".into())
-                        );
+                        ),
                     }
                 }
-                client.call(SessionCommand::StopForward)?;
-                let mut result = result;
                 wait_for_uploads(&cli, saved.as_deref(), &mut result)?;
                 output(&cli, result)?;
                 return Ok(());
             }
-            if let Some(until) = until {
+            if let Some(mut timed) = timed {
                 let stopped = Arc::new(AtomicBool::new(false));
                 let flag = stopped.clone();
                 ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed))
@@ -2195,21 +2226,34 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     );
                 }
                 let epoch = std::time::Instant::now();
-                while epoch.elapsed() < until && !stopped.load(Ordering::Relaxed) {
+                loop {
                     std::thread::sleep(Duration::from_millis(100));
                     let state = client.call(SessionCommand::Status)?;
-                    if state["forwarding"].is_null() {
-                        anyhow::bail!(
+                    match timed.next(
+                        ForwardStatus::of_status(&state),
+                        crate::scheduling::now_ms(),
+                        epoch.elapsed(),
+                        stopped.load(Ordering::Relaxed),
+                    ) {
+                        RecordingWait::Wait => {}
+                        // Never stop-forward here: another participant may
+                        // already record on this camera.
+                        RecordingWait::Finished => {
+                            result["stopped"] = TimedRecording::finished();
+                            break;
+                        }
+                        RecordingWait::Stop => {
+                            result["stopped"] = client.call(SessionCommand::StopForward)?;
+                            break;
+                        }
+                        RecordingWait::Failed => anyhow::bail!(
                             "{}",
                             state["last_error"]
                                 .as_str()
                                 .unwrap_or("forwarding stopped before its duration elapsed")
-                        );
+                        ),
                     }
                 }
-                let finished = client.call(SessionCommand::StopForward)?;
-                let mut result = result;
-                result["stopped"] = finished;
                 return output(&cli, result);
             }
             result
@@ -2758,8 +2802,8 @@ fn schema() -> Value {
     });
     contract["capture"]["result"] = json!({
         "capture":"{files:[path],frames:[{id,width,height,pixel_format,timestamp_ns,bytes,wall_ms,file?}],count,context?,destination?,queued_uploads?,queued?:[{file,upload_id,key,url}]}",
-        "record":"{forwarding,since_ms,path?}; path is the local recording file",
-        "status":"forwarding_since_ms per camera and at the top level while forwarding"
+        "record":"{forwarding,since_ms,until_ms?,path?,stopped?}; path is the local recording file; until_ms is when the session stops a timed recording; with --duration, stopped is {forwarding:null,by:\"duration\"} when the session ended it on time, else the stop-forward result",
+        "status":"forwarding_since_ms per camera and at the top level while forwarding, and forwarding_until_ms while a timed recording or forward runs"
     });
     contract["capture_session"] = json!({
         "cli":"--session NAME [--camera ID] capture-session new PATH.duckdb [--encoder auto|dinov2|native] | resume PATH.duckdb | close | teach | auto [--pause] [--sensitivity 0.5] [--cooldown-ms 2000] | review [--id ID] | keep ID | discard ID",
@@ -2815,7 +2859,7 @@ fn schema() -> Value {
         "timestamp":{"optional":true,"unix_ms":"signed Unix milliseconds (absolute UTC instant)","utc_offset_seconds":"producer offset used for the legacy time string, seconds east of UTC (-86399..86399)"},
         "compatibility":"Old entries omit timestamp. Unknown or malformed optional timestamp metadata is treated as unavailable; legacy diagnostics remain readable. Desktop/browser format valid instants in the viewer's local zone; copied desktop logs include a dated numeric offset. The original three fields and version-1 envelope remain unchanged."
     });
-    contract["forwarding"] = json!({"cli":"record|forward -o OUTPUT [--duration 30s] [--on-exists fail|number] [--context KEY=VALUE]...; a local file output accepts the capture placeholders","duration":"Works with direct workers and persistent sessions. A duration keeps the CLI alive and stops the encoder at the deadline or Ctrl-C. Without duration, persistent session forwarding returns immediately; direct forwarding runs until Ctrl-C.","request_timeout":"--request-timeout controls a session request deadline, not recording duration; a timed-out request may still complete in the session. Inspect status before retrying writes."});
+    contract["forwarding"] = json!({"cli":"record|forward -o OUTPUT [--duration 30s] [--on-exists fail|number] [--context KEY=VALUE]...; a local file output accepts the capture placeholders","duration":"Works with direct workers and persistent sessions. The CLI sends duration_ms: the camera worker stops the encoder at since_ms + duration_ms (wall clock), commits and catalogs the file, and the CLI stays alive until then. Ctrl-C stops it early. A recording that stops early or with a new camera error fails the command with that error. Without duration, persistent session forwarding returns immediately; direct forwarding runs until Ctrl-C.","duration_ms":"RPC and workflow forward commands accept duration_ms (1 ms to 10 years); the session ends the recording or stream itself, even after the client that started it exits. Size max_file_bytes for the whole duration: a recording that outgrows it is lost.","request_timeout":"--request-timeout controls a session request deadline, not recording duration; a timed-out request may still complete in the session. Inspect status before retrying writes."});
     contract["remote"] = json!({
         "start":"serve --listen HOST:PORT [--web-dir web-client/dist]",
         "authentication":"Network access controls: anyone who can reach the listener can control the session. No HTTP login or token.",
@@ -2897,7 +2941,7 @@ fn schema() -> Value {
         json!({"op":"network_scan","timeout_ms":1000}),
         json!({"op":"optimize_network","bytes_per_second":100000000}),
     ]);
-    commands.extend([json!({"op":"select","camera":"sim:0"}),json!({"op":"jobs"}),json!({"op":"cancel_job","id":1}),json!({"op":"schedule","output":"timelapse","count":10,"timeout_ms":2000,"format":"png","first_at_ms":crate::scheduling::now_ms()+60000,"interval_ms":10000,"storage":crate::storage::StoragePolicy::default()}),json!({"op":"forward","output":"rtsp://localhost:8554/camera","codec":"h264","encoder":"auto","fps":30,"bitrate":"4M","storage":crate::storage::StoragePolicy::default(),"max_file_bytes":crate::media::default_recording_cap()}),json!({"op":"stop_forward"}),json!({"op":"auto","balance":0.5}),json!({"op":"manual"})]);
+    commands.extend([json!({"op":"select","camera":"sim:0"}),json!({"op":"jobs"}),json!({"op":"cancel_job","id":1}),json!({"op":"schedule","output":"timelapse","count":10,"timeout_ms":2000,"format":"png","first_at_ms":crate::scheduling::now_ms()+60000,"interval_ms":10000,"storage":crate::storage::StoragePolicy::default()}),json!({"op":"forward","output":"rtsp://localhost:8554/camera","codec":"h264","encoder":"auto","fps":30,"bitrate":"4M","storage":crate::storage::StoragePolicy::default(),"max_file_bytes":crate::media::default_recording_cap()}),json!({"op":"forward","output":"video/run-{seq}.mkv","codec":"h264","encoder":"auto","fps":30,"bitrate":"4M","storage":crate::storage::StoragePolicy::default(),"max_file_bytes":crate::media::recording_reservation("4M",3_600_000).expect("a valid bitrate"),"on_exists":"number","duration_ms":3_600_000}),json!({"op":"stop_forward"}),json!({"op":"auto","balance":0.5}),json!({"op":"manual"})]);
     commands.extend([
         json!({"op":"undo"}),
         json!({"op":"redo"}),
@@ -3253,6 +3297,158 @@ fn log_options(cli: &Cli) -> Result<crate::signals::log::LogOptions> {
         policy: storage.policy()?,
         progress: !cli.json,
     })
+}
+
+/// How close to its end time a timed recording may stop and still count as
+/// finished on time, and how long past the requested duration the CLI waits
+/// for the session to end it before it sends stop-forward itself.
+const RECORDING_GRACE: Duration = Duration::from_secs(2);
+
+/// What `record`/`forward --duration` does after one look at the status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordingWait {
+    /// The recording runs on; look again.
+    Wait,
+    /// The session ended the recording at its end time. Nothing is left to
+    /// stop, and stop-forward could stop a newer recording on that camera.
+    Finished,
+    /// Ctrl-C, or the CLI's own timer ended while still recording: send
+    /// stop-forward.
+    Stop,
+    /// The recording stopped before its duration elapsed, or with an error.
+    Failed,
+}
+
+/// What one status says about the camera's forward.
+#[derive(Clone, Copy)]
+struct ForwardStatus<'a> {
+    forwarding: bool,
+    /// `forwarding_since_ms`: when the forward it reports started.
+    since_ms: Option<u64>,
+    last_error: Option<&'a str>,
+    /// When the camera last logged an error (UTC Unix ms), which tells the
+    /// same error logged again from the one before.
+    error_logged_ms: Option<u64>,
+}
+impl<'a> ForwardStatus<'a> {
+    /// The selected camera in this process's own session.
+    fn of_snapshot(state: &'a crate::session::SessionSnapshot) -> Self {
+        Self {
+            forwarding: state.forwarding.is_some(),
+            since_ms: state.forwarding_since_ms,
+            last_error: state.last_error.as_deref(),
+            error_logged_ms: state
+                .connected
+                .as_ref()
+                .and_then(|camera| crate::session::camera_error_logged_ms(&state.logs, &camera.id)),
+        }
+    }
+    /// The addressed camera in a session's `status` reply.
+    fn of_status(state: &'a Value) -> Self {
+        let logs =
+            <Vec<crate::session::LogEntry> as serde::Deserialize>::deserialize(&state["logs"])
+                .unwrap_or_default();
+        Self {
+            forwarding: !state["forwarding"].is_null(),
+            since_ms: state["forwarding_since_ms"].as_u64(),
+            last_error: state["last_error"].as_str(),
+            error_logged_ms: state["connected"]["id"]
+                .as_str()
+                .and_then(|camera| crate::session::camera_error_logged_ms(&logs, camera)),
+        }
+    }
+}
+
+/// The camera's newest error as one status shows it.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ErrorMark {
+    text: Option<String>,
+    logged_ms: Option<u64>,
+}
+impl ErrorMark {
+    fn of(status: &ForwardStatus) -> Self {
+        Self {
+            text: status.last_error.map(str::to_owned),
+            logged_ms: status.error_logged_ms,
+        }
+    }
+    /// Whether `status` shows an error logged after this one: another
+    /// error, or the same one again. A line that has left the bounded log
+    /// is not a new error.
+    fn newer_in(&self, status: &ForwardStatus) -> bool {
+        status.last_error != self.text.as_deref() || status.error_logged_ms > self.logged_ms
+    }
+}
+
+/// A timed recording or forward that the CLI waits on.
+struct TimedRecording {
+    /// The requested duration, timed by the CLI from the forward reply.
+    duration: Duration,
+    /// When the session ends it (the reply's `until_ms`, UTC Unix ms).
+    until_ms: Option<u64>,
+    /// When it started (the reply's `since_ms`), which tells it from a
+    /// recording started later on the same camera.
+    since_ms: Option<u64>,
+    /// The camera's newest error from before the recording started, then
+    /// as of the last status that showed it running. A newer one once it
+    /// has stopped means it failed, and a failed recording's file is
+    /// discarded. This holds for a recording that fails before any status
+    /// shows it running, as one does when FFmpeg cannot start.
+    errors: ErrorMark,
+}
+impl TimedRecording {
+    fn new(duration_ms: u64, reply: &Value, errors: ErrorMark) -> Self {
+        Self {
+            duration: Duration::from_millis(duration_ms),
+            until_ms: reply["until_ms"].as_u64(),
+            since_ms: reply["since_ms"].as_u64(),
+            errors,
+        }
+    }
+    /// The `stopped` result of a recording the session ended on time.
+    fn finished() -> Value {
+        json!({"forwarding": null, "by": "duration"})
+    }
+    /// Decide from a `status` read at `now_ms` (UTC Unix ms), `elapsed`
+    /// after the forward reply.
+    fn next(
+        &mut self,
+        status: ForwardStatus,
+        now_ms: u64,
+        elapsed: Duration,
+        interrupted: bool,
+    ) -> RecordingWait {
+        let ours = status.forwarding
+            && match (status.since_ms, self.since_ms) {
+                (Some(reported), Some(started)) => reported == started,
+                _ => true,
+            };
+        if !ours {
+            let grace = RECORDING_GRACE.as_millis() as u64;
+            let on_time = self
+                .until_ms
+                .is_some_and(|until| now_ms.saturating_add(grace) >= until);
+            return if on_time && !self.errors.newer_in(&status) {
+                RecordingWait::Finished
+            } else {
+                RecordingWait::Failed
+            };
+        }
+        // An error while it still runs did not end it. The worker logs the
+        // error that ends a forward in the step that clears it.
+        self.errors = ErrorMark::of(&status);
+        // When the session keeps the end time, give it the grace to act
+        // first; stop-forward is then only a fallback.
+        let timer = match self.until_ms {
+            Some(_) => self.duration.saturating_add(RECORDING_GRACE),
+            None => self.duration,
+        };
+        if interrupted || elapsed >= timer {
+            RecordingWait::Stop
+        } else {
+            RecordingWait::Wait
+        }
+    }
 }
 
 /// A direct CLI capture to a network destination uploads before exiting, so
@@ -4108,7 +4304,107 @@ mod tests {
             .iter()
             .all(|op| commands.iter().any(|c| c["op"] == *op))
         );
+        // A timed recording reserves enough for its whole duration.
+        let timed = commands
+            .iter()
+            .find(|c| c["op"] == "forward" && c["duration_ms"].is_u64())
+            .expect("a timed forward example");
+        assert!(
+            timed["max_file_bytes"].as_u64().unwrap()
+                >= crate::media::estimate_recording_bytes(
+                    timed["bitrate"].as_str().unwrap(),
+                    timed["duration_ms"].as_u64().unwrap()
+                )
+                .unwrap()
+        );
         assert_eq!(contract["auto"]["settled"], json!(["stable", "limited"]));
+    }
+    #[test]
+    fn timed_recordings_end_in_the_session_and_stop_forward_is_a_fallback() {
+        use RecordingWait::{Failed, Finished, Stop, Wait};
+        let since = 1_000_000;
+        let reply = json!({"forwarding":"clip.mkv","since_ms":since,"until_ms":since + 30_000});
+        let earlier = Some("an earlier failure");
+        let logged = Some(since - 5_000);
+        let status = |forwarding, since_ms, last_error, error_logged_ms| ForwardStatus {
+            forwarding,
+            since_ms,
+            last_error,
+            error_logged_ms,
+        };
+        // The camera's error from before the recording started.
+        let before = ErrorMark::of(&status(false, None, earlier, logged));
+        let recording = status(true, Some(since), earlier, logged);
+        let stopped = status(false, None, earlier, logged);
+        let s = Duration::from_secs;
+        let mut timed = TimedRecording::new(30_000, &reply, before.clone());
+        // Still recording: wait out the duration and the session's grace.
+        assert_eq!(timed.next(recording, since + 10_000, s(10), false), Wait);
+        let unknown_start = status(true, None, earlier, logged);
+        assert_eq!(
+            timed.next(unknown_start, since + 31_000, s(31), false),
+            Wait
+        );
+        assert_eq!(timed.next(recording, since + 32_000, s(32), false), Stop);
+        // Ctrl-C stops it at once.
+        assert_eq!(timed.next(recording, since + 1_000, s(1), true), Stop);
+        // The session ended it on time, or just before: nothing to stop. An
+        // error from before the recording does not count against it.
+        for now in [since + 28_000, since + 30_000, since + 45_000] {
+            assert_eq!(timed.next(stopped, now, s(30), false), Finished);
+        }
+        assert_eq!(timed.next(stopped, since + 30_000, s(30), true), Finished);
+        // Another participant's newer recording is not this one to stop.
+        let newer = status(true, Some(since + 30_500), earlier, logged);
+        assert_eq!(timed.next(newer, since + 31_000, s(33), false), Finished);
+        // Stopped early, or with a new error, is a failure: the file may be gone.
+        assert_eq!(timed.next(stopped, since + 27_999, s(28), false), Failed);
+        let early = status(true, Some(since + 5_000), None, None);
+        assert_eq!(timed.next(early, since + 6_000, s(6), false), Failed);
+        let full = Some("Forwarding stopped: Storage full");
+        let storage_full = status(false, None, full, Some(since + 29_000));
+        assert_eq!(
+            timed.next(storage_full, since + 29_500, s(29), false),
+            Failed
+        );
+        assert_eq!(
+            timed.next(storage_full, since + 30_000, s(30), false),
+            Failed
+        );
+        // The same error logged again is a new error, and a line that has
+        // left the bounded log is not.
+        let again = status(false, None, earlier, Some(since + 29_000));
+        assert_eq!(timed.next(again, since + 30_000, s(30), false), Failed);
+        let trimmed = status(false, None, earlier, None);
+        assert_eq!(timed.next(trimmed, since + 30_000, s(30), false), Finished);
+        // An error while it still ran did not end it.
+        let mut noted = TimedRecording::new(30_000, &reply, before.clone());
+        let busy = Some("Shared frame buffer: busy");
+        let warned = status(true, Some(since), busy, Some(since + 10_000));
+        assert_eq!(noted.next(warned, since + 10_000, s(10), false), Wait);
+        let ended = status(false, None, busy, Some(since + 10_000));
+        assert_eq!(noted.next(ended, since + 30_000, s(30), false), Finished);
+        // A short recording can fail, or end, before any status shows it
+        // running (FFmpeg starts with the first frame). Only an error
+        // logged since it started tells the two apart, even the same one.
+        let one_second = json!({"since_ms":since,"until_ms":since + 1_000});
+        let short = || TimedRecording::new(1_000, &one_second, before.clone());
+        let at = since + 300;
+        assert_eq!(short().next(stopped, at, s(0), false), Finished);
+        let no_ffmpeg = Some("Forwarding stopped: no FFmpeg");
+        let failed = status(false, None, no_ffmpeg, Some(since + 50));
+        assert_eq!(short().next(failed, at, s(0), false), Failed);
+        let retried = status(false, None, earlier, Some(since + 50));
+        assert_eq!(short().next(retried, at, s(0), false), Failed);
+        // Without the session's end time, the CLI's own timer ends it.
+        let untimed_reply = json!({"since_ms":since});
+        let mut untimed = TimedRecording::new(30_000, &untimed_reply, before);
+        assert_eq!(untimed.next(recording, since, s(30), false), Stop);
+        assert_eq!(untimed.next(stopped, since + 40_000, s(40), false), Failed);
+        assert_eq!(
+            TimedRecording::finished(),
+            json!({"forwarding":null,"by":"duration"})
+        );
     }
     #[test]
     fn multiplayer_identity_and_observer_contract_validate_before_execution() {

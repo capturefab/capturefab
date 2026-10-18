@@ -70,7 +70,10 @@ global `--camera`; unset `CAPTUREFAB_CAMERA` when using workflows.
 CLI conveniences are expressed as separate commands: `--set Width=640` becomes
 a `set` step; `--auto` becomes an `auto` step. Workflow capture formats are
 explicit, durations/timestamps use numeric milliseconds, and storage sizes use
-numeric bytes. There is no workflow `wait` or `duration` field.
+numeric bytes. There is no workflow `wait` step. A `forward` step can carry
+`duration_ms` (1 ms to 10 years), the CLI's `--duration`: the session then ends
+that recording or stream by itself, as `stop-forward` would, even after Apply
+exits.
 
 ## Choose source and output paths
 
@@ -129,6 +132,7 @@ edit camera selectors and output names before applying to hardware.
 | [scanner-feeder.json](../examples/workflows/scanner-feeder.json) | Configure resolution, grayscale and feeder mode, then save five pages with a 60-second deadline per page |
 | [start-recording.json](../examples/workflows/start-recording.json) | Start local H.264 recording with a 64 MiB file cap and a 512 MiB requested storage ceiling |
 | [stop-recording.json](../examples/workflows/stop-recording.json) | Finish that recording, then stop its camera acquisition |
+| [timed-recording.json](../examples/workflows/timed-recording.json) | Record a numbered H.264 file for one minute; the session ends it, so it needs no stop file |
 | [plant-line.json](../examples/workflows/plant-line.json) | Open a dataset, start a simulated line's signals, add a note and save one tagged, numbered capture |
 
 ```sh
@@ -149,18 +153,30 @@ requests the pages. No PDF assembly or OCR is included.
 
 The recording start/stop files are separate because workflow commands execute
 without a delay. Applying them consecutively finishes the recording immediately.
-Apply the stop file when ready, or use a timed CLI recording:
+Apply the stop file when ready, give the `forward` step a `duration_ms` as
+timed-recording.json does, or use a timed CLI recording:
 
 ```sh
 capturefab --session bench --camera sim:recording record -o video/run-2.mkv --duration 30s --max-file-size 64MiB --json
 ```
 
-`--duration` works with sessions and direct workers. The CLI stays alive and stops
-the encoder at the deadline or Ctrl-C. Without it, a session recording returns
+`--duration` works with sessions and direct workers. The CLI sends it as
+`duration_ms`, and the camera's worker stops the encoder at `until_ms` (in the
+reply, and as `forwarding_until_ms` in `status`), then commits and catalogs the
+file. The CLI stays alive until then and reports
+`"stopped": {"forwarding": null, "by": "duration"}`; it never stops a recording
+that another participant started on that camera afterwards. A recording that
+stops early or with a new camera error fails the command with that error. Ctrl-C
+stops the recording early. Without a duration, a session recording returns
 immediately and continues until stopped; a direct command remains in the
-foreground. The per-file cap remains enforced regardless of elapsed time. Hitting
-it stops recording and reports a storage error. Encoder support depends on the
-FFmpeg build and host; `ffmpeg --json` and `doctor --json` describe availability.
+foreground. Acquisition keeps running after a recording ends; stop it separately
+when done.
+
+The per-file cap remains enforced regardless of elapsed time. Hitting it stops
+recording, removes the partial file and reports a storage error, so size
+`--max-file-size` (`max_file_bytes`) for the whole duration: at `4M`, about
+36 MiB per minute plus 16 MiB of margin. Encoder support depends on the FFmpeg
+build and host; `ffmpeg --json` and `doctor --json` describe availability.
 
 ## Log signals and catalog captures
 

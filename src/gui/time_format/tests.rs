@@ -237,3 +237,24 @@ fn raw_timestamp_identity_survives_front_eviction_and_prunes_when_closed_or_empt
     );
     assert!(collect(&app, &mut tree).is_empty());
 }
+#[test]
+fn local_times_name_their_date_unless_it_is_today() {
+    use chrono::Datelike;
+    let noon = |days| {
+        let date = Local::now().date_naive() + chrono::Days::new(days);
+        let at = date
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .earliest()
+            .unwrap();
+        (at.timestamp_millis() as u64, date.year().to_string())
+    };
+    let (today, year) = noon(0);
+    let time = local_time(today).unwrap();
+    assert!(!time.is_empty() && !time.contains(&year), "{time}");
+    let (later, year) = noon(3);
+    let time = local_time(later).unwrap();
+    assert!(time.contains(&year), "{time}");
+    assert!(local_time(u64::MAX).is_none());
+}

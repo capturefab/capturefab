@@ -188,6 +188,73 @@ fn responsive_toolbar_keeps_capture_and_session_actions_visible_and_clickable() 
 }
 
 #[test]
+fn a_timed_recording_counts_down_beside_its_stop_button() {
+    let renderer = renderer();
+    for native_width in [900.0, 1280.0] {
+        for scale in prefs::UiScale::ALL {
+            let mut app = bench();
+            app.width = native_width / scale.factor();
+            app.ui_scale = scale;
+            app.focus_camera = true;
+            // Two hours from 1:23 ago: the widest time left, "1:58:37 left".
+            let since = epoch_ms().saturating_sub(83_000);
+            app.snapshot.forwarding = Some("/tmp/capturefab-clip.mp4".into());
+            app.snapshot.forwarding_since_ms = Some(since);
+            app.snapshot.forwarding_until_ms = Some(since + 7_200_000);
+            let size = Size::new(app.main_width(), TOOLBAR);
+            let viewport = Rectangle::with_size(size);
+            let mut view = app.toolbar(Palette::of(false));
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, size),
+            );
+            let mut geometry = Geometry::default();
+            view.as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut geometry);
+            let at = format!("{native_width}, {scale}");
+            let (_, stop) = geometry
+                .controls
+                .iter()
+                .find(|(label, _)| label == "Stop recording")
+                .unwrap_or_else(|| panic!("Stop recording is available at {at}"));
+            let (left, pill) = geometry
+                .labels
+                .iter()
+                .find(|(label, _)| label.ends_with(" left"))
+                .unwrap_or_else(|| panic!("the time left shows at {at}: {:?}", geometry.labels));
+            assert!(left.starts_with("1:58:"), "{left}");
+            for (what, bounds) in [("Stop recording", stop), (left.as_str(), pill)] {
+                assert!(
+                    inside(*bounds, viewport),
+                    "{what} clips at {at}: {bounds:?}"
+                );
+            }
+            assert!(
+                pill.x >= stop.x + stop.width,
+                "the pill follows Stop at {at}"
+            );
+            let (native, _, _) = accessibility::snapshot_widget(
+                view.as_widget_mut(),
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+            );
+            assert!(
+                native.nodes.iter().any(|(_, node)| {
+                    node.label() == Some(left.as_str())
+                        && node.description().is_some_and(|text| {
+                            text.starts_with("Records for 2 h; stops by itself at")
+                        })
+                }),
+                "the time left is named and says when the recording stops"
+            );
+        }
+    }
+}
+
+#[test]
 fn responsive_toolbar_reveals_labels_before_duplicate_edit_actions() {
     let renderer = renderer();
     for (width, labels, history) in [

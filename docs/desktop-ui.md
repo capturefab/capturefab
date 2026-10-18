@@ -103,16 +103,17 @@ available width and current palette; appearance and size changes refresh their
 rendering. Compact welcome content scrolls while keeping onboarding actions
 visible. Video places its start action before the optional encoding editors.
 
-The combined native renderer matrix contains 95 views: baseline screen families
+The combined native renderer matrix contains 96 views: baseline screen families
 in both appearances, 900×620 compact views at Larger interface size, explicit
 scrolled and error fixtures, and purpose-specific camera views. These cover
 area-scan, line-scan, depth, microscope, thermal, scanner and unknown profiles;
 scanner and unknown profiles use synthetic display fixtures over an isolated
-simulator. Additional states include active recording and forwarding, empty
-destinations, pending discovery and destination tests, failed connections,
-unapplied feature drafts and automatic exposure. An actual-widget Settings test
-checks the body, credential actions and pinned footer at Standard, Large and
-Larger interface sizes. The current library run reports 919 passed and 11 ignored.
+simulator. Additional states include active recording and forwarding, a timed
+recording with its time left and end time, empty destinations, pending discovery
+and destination tests, failed connections, unapplied feature drafts and
+automatic exposure. An actual-widget Settings test checks the body, credential
+actions and pinned footer at Standard, Large and Larger interface sizes. The
+current library run reports 919 passed and 11 ignored.
 
 With the desktop binary built and Pillow available, reproduce the review with:
 

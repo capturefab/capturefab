@@ -142,6 +142,17 @@ pub(super) fn activity(entry: &SessionActivity) -> Labels {
         })
 }
 
+/// A moment, UTC Unix milliseconds, in the viewer's local time as the
+/// activity log shows it, after its date when that is not today.
+pub(super) fn local_time(unix_ms: u64) -> Option<String> {
+    let labels = instant(i64::try_from(unix_ms).ok()?)?;
+    Some(if labels.day.key == Some(Local::now().date_naive()) {
+        labels.compact
+    } else {
+        format!("{} {}", labels.day.label, labels.compact)
+    })
+}
+
 fn instant(unix_ms: i64) -> Option<Labels> {
     let local = local_instant(unix_ms)?;
     let copy = local.to_rfc3339_opts(SecondsFormat::Millis, false);

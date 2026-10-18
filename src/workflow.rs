@@ -451,6 +451,67 @@ mod tests {
     }
 
     #[test]
+    fn a_recording_step_carries_its_duration_for_the_session_to_keep() {
+        let hour = 3_600_000;
+        let mut timed = forward("clip.mkv");
+        timed["duration_ms"] = json!(hour);
+        timed["max_file_bytes"] = json!(crate::media::recording_reservation("4M", hour).unwrap());
+        let workflow =
+            parse(json!({"version":1,"steps":[{"camera":"sim:0","command":timed}]})).unwrap();
+        assert!(matches!(
+            workflow.steps[0].command,
+            SessionCommand::Forward {
+                duration_ms: Some(3_600_000),
+                ..
+            }
+        ));
+        assert_eq!(workflow.plan()["steps"][0]["command"]["duration_ms"], hour);
+        // Checked like `record --duration`, before any step runs.
+        for duration in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("1h"),
+            json!(crate::scheduling::MAX_DURATION_MS + 1),
+        ] {
+            let mut invalid = forward("clip.mkv");
+            invalid["duration_ms"] = duration.clone();
+            assert!(
+                parse(json!({"version":1,"steps":[{"command":invalid}]})).is_err(),
+                "{duration}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_examples_validate_and_timed_recordings_fit_their_reservation() {
+        let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/workflows");
+        let mut timed = 0;
+        for entry in std::fs::read_dir(&folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let workflow = load(&path).unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
+            for step in &workflow.steps {
+                if let SessionCommand::Forward {
+                    bitrate,
+                    max_file_bytes,
+                    duration_ms: Some(duration_ms),
+                    ..
+                } = &step.command
+                {
+                    let reservation =
+                        crate::media::recording_reservation(bitrate, *duration_ms).unwrap();
+                    assert!(*max_file_bytes >= reservation, "{}", path.display());
+                    timed += 1;
+                }
+            }
+        }
+        assert!(timed > 0, "an example records for a set time");
+    }
+
+    #[test]
     fn resolves_local_outputs_and_preserves_urls_and_destination_names() {
         let base = std::env::temp_dir().join("capturefab-workflow-path-tests");
         let mut schedule = capture("scheduled/shot-{frame}.png");

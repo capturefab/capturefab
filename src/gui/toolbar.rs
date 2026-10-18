@@ -19,6 +19,8 @@ const CAPTURE_NAME_ROOM: f32 = 100.0;
 const RECORD_ROOM: f32 = 96.0;
 /// Room the elapsed-time pill beside a recording's Stop button takes.
 const PILL_ROOM: f32 = 60.0;
+/// Room that pill takes when it counts down a timed recording, "1:02:03 left".
+const TIMED_PILL_ROOM: f32 = 112.0;
 /// A compact notice still keeps its details and dismiss actions visible.
 const MIN_STATUS: f32 = 128.0;
 /// The room a warning or error is given before the toolbar's extras: its
@@ -63,6 +65,44 @@ fn fold_home(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
         Some(rest) if rest.as_os_str().is_empty() => "~".into(),
         Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
         None => path.display().to_string(),
+    }
+}
+
+/// Whole seconds on a clock face: "04:07", "1:02:03".
+fn clock_face(seconds: u64) -> String {
+    if seconds >= 3600 {
+        format!(
+            "{}:{:02}:{:02}",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        )
+    } else {
+        format!("{:02}:{:02}", seconds / 60, seconds % 60)
+    }
+}
+
+/// What the pill beside a recording's Stop button reads at `now`: how long
+/// it has recorded since `since`, or, when the session stops it by itself at
+/// `until`, the time left, rounded up so it reaches zero only at the end.
+/// UTC Unix milliseconds.
+fn recording_clock(now: u64, since: u64, until: Option<u64>) -> String {
+    match until {
+        Some(until) => format!(
+            "{} left",
+            clock_face(until.saturating_sub(now).div_ceil(1000))
+        ),
+        None => clock_face(now.saturating_sub(since) / 1000),
+    }
+}
+
+/// The tooltip and accessible description of a timed recording's pill: how
+/// long it records and when, in the viewer's local time, it stops by itself.
+fn recording_ends(since: u64, until: u64) -> String {
+    let length = crate::scheduling::format_duration(until.saturating_sub(since));
+    match time_format::local_time(until) {
+        Some(end) => format!("Records for {length}; stops by itself at {end}"),
+        None => format!("Records for {length}, then stops by itself"),
     }
 }
 
@@ -373,12 +413,7 @@ impl Workbench {
             } else {
                 0.0
             } + if record {
-                RECORD_ROOM
-                    + if self.recording_here() {
-                        PILL_ROOM
-                    } else {
-                        0.0
-                    }
+                RECORD_ROOM + self.recording_pill_room()
             } else {
                 0.0
             };
@@ -535,7 +570,7 @@ impl Workbench {
     }
 
     /// Record or Stop for the selected camera, with how long it has been
-    /// recording beside it.
+    /// recording beside it, or how long it has left when it has a duration.
     fn record_button(&self, p: &'static Palette) -> Option<Element<'_, Message>> {
         if !self.record_shown() {
             return None;
@@ -593,29 +628,47 @@ impl Workbench {
         .spacing(6)
         .align_y(Alignment::Center);
         if recording && let Some(since) = self.snapshot.forwarding_since_ms {
-            let seconds = epoch_ms().saturating_sub(since) / 1000;
-            let elapsed = if seconds >= 3600 {
-                format!(
-                    "{}:{:02}:{:02}",
-                    seconds / 3600,
-                    seconds / 60 % 60,
-                    seconds % 60
-                )
-            } else {
-                format!("{:02}:{:02}", seconds / 60, seconds % 60)
-            };
-            content = content.push(
-                container(
-                    text(elapsed)
-                        .font(style::MONO)
-                        .size(style::SMALL)
-                        .color(p.ink(p.danger)),
-                )
-                .padding([2, 8])
-                .style(style::pill(p.danger)),
-            );
+            let until = self.snapshot.forwarding_until_ms;
+            let clock = recording_clock(epoch_ms(), since, until);
+            let pill: Element<'_, Message> = container(
+                text(clock.clone())
+                    .font(style::MONO)
+                    .size(style::SMALL)
+                    .color(p.ink(p.danger)),
+            )
+            .padding([2, 8])
+            .style(style::pill(p.danger))
+            .into();
+            content = content.push(match until {
+                // A timed recording also says when it stops by itself.
+                Some(until) => {
+                    let ends = recording_ends(since, until);
+                    tip_above(
+                        accessibility::label_description(
+                            pill,
+                            clock,
+                            ends.clone(),
+                            accessibility::Role::Label,
+                            None,
+                        ),
+                        ends,
+                    )
+                }
+                None => pill,
+            });
         }
         Some(content.into())
+    }
+
+    /// Room the pill beside the selected camera's recording takes, if any.
+    fn recording_pill_room(&self) -> f32 {
+        if !self.recording_here() {
+            0.0
+        } else if self.snapshot.forwarding_until_ms.is_some() {
+            TIMED_PILL_ROOM
+        } else {
+            PILL_ROOM
+        }
     }
 
     /// Whether `pending` shows its progress where it was asked for, on
@@ -1345,5 +1398,28 @@ mod tests {
         assert!(!bench.welcome_says(&other), "not what the callout says");
         bench.snapshot.connected = Some(liveness::streaming_camera(0, 0, 0.0).info);
         assert!(!bench.welcome_says(&notice), "no callout once connected");
+    }
+
+    #[test]
+    fn recordings_show_time_recorded_or_time_left() {
+        let since = 1_000_000;
+        assert_eq!(recording_clock(since + 247_900, since, None), "04:07");
+        assert_eq!(recording_clock(since + 3_723_000, since, None), "1:02:03");
+        let hour = Some(since + 3_600_000);
+        assert_eq!(recording_clock(since, since, hour), "1:00:00 left");
+        // Rounded up: it reads zero only once the end time comes.
+        assert_eq!(
+            recording_clock(since + 3_599_001, since, hour),
+            "00:01 left"
+        );
+        assert_eq!(
+            recording_clock(since + 3_600_000, since, hour),
+            "00:00 left"
+        );
+        assert_eq!(
+            recording_clock(since + 9_000_000, since, hour),
+            "00:00 left"
+        );
+        assert!(recording_ends(since, since + 5_400_000).starts_with("Records for 1 h 30 min"));
     }
 }

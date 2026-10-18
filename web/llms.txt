@@ -128,8 +128,11 @@ All scheduled frames must occur within 10 years.
 Keep the GUI, headless session or direct command active for the schedule lifetime.
 
 `record` is an alias for `forward`.
-`record --duration 30s` keeps the CLI active and stops the encoder at the deadline or Ctrl-C.
+`record --duration 30s` keeps the CLI active until the camera worker stops the encoder at the deadline.
+Ctrl-C stops the encoder early.
 This works with temporary workers and persistent sessions.
+RPC and workflow `forward` commands use `duration_ms` for the same limit.
+Set the maximum file size for the full duration; a recording that gets to its limit is lost.
 Without a duration, a session command returns immediately and records until `stop-forward`.
 A direct recording command stays active until Ctrl-C.
 
@@ -169,6 +172,8 @@ A directory output continues its `frame-NNNNNN` numbers.
 Read saved names from `result.files` and `result.frames[].file`.
 `frames[].wall_ms` is UTC milliseconds.
 A recording result gives the resolved file in `path` and the start time in `since_ms`.
+A timed recording result also gives the stop time in `until_ms`; `status` shows it in `forwarding_until_ms`.
+When the session stops a timed recording on time, `record --duration` returns `"stopped":{"forwarding":null,"by":"duration"}`.
 The desktop saves to `~/Capturefab/{date}/{camera}-{datetime}-{seq}.png` by default.
 
 ## Read sensors and PLCs
@@ -259,7 +264,8 @@ Local `file:`, `sim:replay:` and existing media inputs use those directories too
 Steps stop at the first failure and keep earlier effects.
 Read `error.details.completed`, `completed_steps` and `failed_step` before recovery.
 Schedules and encoders continue in the session after Apply exits.
-Workflow commands have no duration or wait field; use timed CLI recording or separate start/stop files.
+Workflow commands have no wait step.
+For a timed recording, set `duration_ms` on the `forward` step, or use separate start/stop files.
 
 ## Change camera settings
 

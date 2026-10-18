@@ -28,10 +28,15 @@ fn cmd(dir: &PathBuf, args: &[&str]) -> std::process::Output {
 }
 
 fn serve_at(dir: &PathBuf, cwd: &PathBuf, name: &str) -> Child {
+    serve_env(dir, cwd, name, &[])
+}
+
+fn serve_env(dir: &PathBuf, cwd: &PathBuf, name: &str, env: &[(&str, &str)]) -> Child {
     let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
         .env_remove("CAPTUREFAB_SESSION")
         .env_remove("CAPTUREFAB_CAMERA")
         .env("CAPTUREFAB_SESSION_DIR", dir)
+        .envs(env.iter().copied())
         .current_dir(cwd)
         .args(["--json", "serve", "--name", name])
         .stdout(Stdio::piped())
@@ -403,6 +408,60 @@ fn json(dir: &PathBuf, args: &[&str]) -> Value {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], true);
     v["result"].clone()
+}
+
+/// A short timed recording that fails before any status shows it running
+/// fails the command with the camera's error, even when that error repeats
+/// the camera's last one. FFmpeg is missing here on purpose; the encoder
+/// fails with the first frame, after the forward reply.
+#[test]
+fn a_short_timed_recording_that_cannot_start_fails() {
+    let root = temp_root("record-cannot-start");
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let missing = root.join("no-ffmpeg");
+    let env = [("CAPTUREFAB_FFMPEG", missing.to_str().unwrap())];
+    let output = root.join("clip.mkv");
+    let record = |camera: Option<&str>| {
+        let mut args = vec!["--json"];
+        args.extend(
+            camera
+                .map(|camera| ["--camera", camera])
+                .into_iter()
+                .flatten(),
+        );
+        args.extend([
+            "record",
+            "-o",
+            output.to_str().unwrap(),
+            "--duration",
+            "1s",
+            "--fps",
+            "10",
+            "--max-file-size",
+            "8MiB",
+        ]);
+        let out = cmd_env(&dir, &env, &args);
+        let reply: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        assert!(
+            !out.status.success() && reply["ok"] == false,
+            "{reply}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let message = reply["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.starts_with("Forwarding stopped: "), "{reply}");
+        assert!(!output.exists());
+    };
+    // A temporary worker.
+    record(Some("sim:0"));
+    // A session, twice: the second failure logs the same error again.
+    let _fixture = Fixture {
+        child: serve_env(&dir, &root, "cannot-start", &env),
+        dir: root.clone(),
+    };
+    json(&dir, &["--json", "connect", "sim:0"]);
+    record(None);
+    record(None);
 }
 
 #[test]

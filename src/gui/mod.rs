@@ -2183,6 +2183,8 @@ impl Workbench {
             destination: self.record_to.selected.clone(),
             on_exists: crate::naming::OnExists::Number,
             context: tags::context(&self.tags),
+            // The Video panel and Record button run until stopped.
+            duration_ms: None,
         }
     }
 

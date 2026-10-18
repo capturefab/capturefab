@@ -588,11 +588,20 @@ fn describe(command: &SessionCommand) -> (&'static str, String) {
             output,
             codec,
             destination,
+            duration_ms,
             ..
         } => (
             "forward",
             format!(
-                "Forward / record {codec} → {}",
+                "{} {codec}{} → {}",
+                if crate::media::is_recording(output) {
+                    "Record"
+                } else {
+                    "Forward"
+                },
+                duration_ms
+                    .map(|ms| format!(" for {}", crate::scheduling::format_duration(ms)))
+                    .unwrap_or_default(),
                 output_label(output, destination)
             ),
         ),
@@ -1043,5 +1052,43 @@ mod tests {
                 .len()
                 <= 4096
         );
+    }
+    #[test]
+    fn forward_labels_say_what_they_record_and_for_how_long() {
+        let forward = |output: &str, destination: Option<&str>, duration_ms| {
+            let activity = Arc::new(Activity::default());
+            let command = SessionCommand::Forward {
+                output: output.into(),
+                codec: "h264".into(),
+                encoder: "auto".into(),
+                fps: 30.0,
+                bitrate: "4M".into(),
+                storage: Default::default(),
+                max_file_bytes: crate::media::default_recording_cap(),
+                destination: destination.map(Into::into),
+                on_exists: Default::default(),
+                context: Default::default(),
+                duration_ms,
+            };
+            let entry = activity.begin(ActivityOrigin::Client, Some("sim:0"), &command);
+            let label = activity.snapshot().activity[0].label.clone();
+            drop(entry);
+            label
+        };
+        assert_eq!(
+            forward("line1/run.mp4", None, Some(3_600_000)),
+            "Record h264 for 1 h → line1/run.mp4"
+        );
+        assert_eq!(
+            forward("run.mkv", Some("archive"), Some(90_000)),
+            "Record h264 for 1 min 30 s → archive / run.mkv"
+        );
+        assert_eq!(forward("run.mkv", None, None), "Record h264 → run.mkv");
+        let stream = forward("rtsp://user:secret@nvr/live", None, Some(30_000));
+        assert!(
+            stream.starts_with("Forward h264 for 30 s → rtsp://"),
+            "{stream}"
+        );
+        assert!(!stream.contains("secret"), "{stream}");
     }
 }
