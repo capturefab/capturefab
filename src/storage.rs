@@ -6,15 +6,17 @@
 //! per changed entry, appended and made durable with fdatasync. A save appends a
 //! few hundred bytes instead of rewriting every entry, and each process keeps
 //! the parsed ledger and reads only the records appended since its last lock.
-//! Records are numbered and the snapshot names the last one it includes.
-//! Compaction writes a new snapshot and then starts a new journal, once the
-//! journal is over COMPACT_BYTES and larger than the snapshot, so the bytes
-//! written per save stay constant however many files are kept. A crash between
-//! those two steps leaves records that loading skips by number. A crash during
-//! an append leaves an unterminated last line, which the next locker truncates;
-//! any other unreadable record fails closed. Version 2 marks this format, so
-//! older binaries refuse the ledger as unsupported instead of ignoring the
-//! journal; a version 1 ledger is converted on its first lock.
+//! Records are numbered and the snapshot names the last one it includes; the
+//! rare changes outside entries, such as marking a disk where removals freed no
+//! space, write a new snapshot instead. Compaction writes a new snapshot and
+//! then starts a new journal, once the journal is over COMPACT_BYTES and larger
+//! than the snapshot, so the bytes written per save stay constant however many
+//! files are kept. A crash between those two steps leaves records that loading
+//! skips by number. A crash during an append leaves an unterminated last line,
+//! which the next locker truncates; any other unreadable record fails closed.
+//! Version 2 marks this format, so older binaries refuse the ledger as
+//! unsupported instead of ignoring the journal; a version 1 ledger is converted
+//! on its first lock.
 use crate::types::Frame;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use fs2::FileExt;
@@ -176,6 +178,11 @@ struct Ledger {
     #[serde(default)]
     sequence: u64,
     entries: Vec<Entry>,
+    /// Disks, by device number, where removing files to keep the free-space
+    /// floor did not free space, for example while a snapshot held it. Saves
+    /// there remove nothing more for space until one fits without it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    stalled: Vec<u64>,
 }
 impl Default for Ledger {
     fn default() -> Self {
@@ -183,6 +190,7 @@ impl Default for Ledger {
             version: LEDGER_VERSION,
             sequence: 0,
             entries: Vec::new(),
+            stalled: Vec::new(),
         }
     }
 }
@@ -403,7 +411,7 @@ impl Manager {
                 return Err(OutputExists(path).into());
             }
         }
-        locked.make_room(&policy, reserve, &base)?;
+        locked.make_room(&policy, reserve, &base, device(&base))?;
         let id = nonce()?;
         let lease_name = format!("storage-{id}.lease");
         let lease_path = locked.directory.join(&lease_name);
@@ -583,18 +591,30 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
         .find(|dir| dir.exists())
         .and_then(available)
 }
-/// Whether `entry` lives on the disk `disk` describes. Without device numbers
-/// every entry counts, which can only refuse a save sooner.
-fn on_disk(entry: &Entry, disk: Option<&Metadata>) -> bool {
+/// The device number of the disk holding `path`. Windows identities carry
+/// none, so there files on different drives cannot be told apart.
+fn device(path: &Path) -> Option<u64> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        disk.is_none_or(|disk| disk.dev() == entry.identity.device)
+        fs::metadata(path).ok().map(|meta| meta.dev())
     }
     #[cfg(not(unix))]
     {
-        let _ = (entry, disk);
-        true
+        let _ = path;
+        None
+    }
+}
+/// Whether `entry` lives on disk `device`, or None when that is unknown.
+fn on_disk(entry: &Entry, device: Option<u64>) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        device.map(|device| device == entry.identity.device)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (entry, device);
+        None
     }
 }
 /// The persisted policy. It is only ever replaced whole, by rename, so it can
@@ -1194,12 +1214,22 @@ impl Locked {
         self.remove(index);
         Ok(true)
     }
-    fn make_room(&mut self, policy: &StoragePolicy, reserve: u64, base: &Path) -> Result<()> {
+    /// Make room for a `reserve`-byte save in `base`, on disk `device`.
+    fn make_room(
+        &mut self,
+        policy: &StoragePolicy,
+        reserve: u64,
+        base: &Path,
+        device: Option<u64>,
+    ) -> Result<()> {
         // Expired files beyond one batch, and space on the disk beyond one
         // round of removals, wait for later saves: freeing disk space can
         // fail to show, for example while a snapshot holds the blocks.
         let mut expiry_due = true;
-        let mut disk_due = true;
+        // The disk's shortfall before the round of removals for it, and the
+        // bytes that round removed from it.
+        let mut round: Option<(u64, u64)> = None;
+        let mut removed = false;
         loop {
             let allocated = self.allocated()?;
             let expired = expiry_due
@@ -1212,7 +1242,10 @@ impl Locked {
                 .checked_add(reserve)
                 .is_none_or(|sum| sum > policy.max_bytes)
                 || self.ledger.entries.len() >= policy.max_files as usize;
-            let (short, free) = self.shortfall(base, reserve);
+            let (short, free) = self.shortfall(base, device, reserve);
+            if short == 0 {
+                self.stall(device, false);
+            }
             if !full && !expired && short == 0 {
                 return Ok(());
             }
@@ -1231,42 +1264,88 @@ impl Locked {
                     if expired { "; maximum age reached" } else { "" }
                 );
             }
-            let low = || {
+            let low = |stalled: bool| {
                 anyhow!(
-                    "Storage full: {} needs at least 512 MiB free on its disk after this {reserve}-byte save, and {free} bytes are free; free some space, lower --max-file-size, or choose another output folder",
-                    base.display()
+                    "Storage full: {} needs at least 512 MiB free on its disk after this {reserve}-byte save, and {free} bytes are free{}; free some space, lower --max-file-size, or choose another output folder",
+                    base.display(),
+                    if stalled {
+                        "; removing old captures there did not free space, perhaps because a snapshot still holds it, so none are removed until a save fits"
+                    } else {
+                        ""
+                    }
                 )
             };
-            ensure!(short == 0 || (policy.on_full != "stop" && disk_due), low());
-            let Some(victims) = self.victims(policy, reserve, base, short)? else {
-                ensure!(full, low());
+            if short > 0 {
+                // When not even a tenth of what the round removed shows as
+                // free space, later rounds would only lose more files. A
+                // tenth allows for compressed files freeing less than their
+                // length.
+                if let Some((before, freed)) = round
+                    && before.saturating_sub(short).saturating_mul(10) < freed
+                {
+                    self.stall(device, true);
+                }
+                // Without device numbers, files on other drives could be
+                // removed for nothing, so none are.
+                let stalled = device.is_some_and(|device| self.ledger.stalled.contains(&device));
+                ensure!(
+                    policy.on_full != "stop" && round.is_none() && device.is_some() && !stalled,
+                    low(stalled)
+                );
+            }
+            let Some(victims) = self.victims(policy, reserve, device, short)? else {
+                ensure!(full, low(false));
                 if !self.ledger.entries.iter().any(Self::removable) {
                     bail!(
                         "Storage full: no unchanged, completed Capturefab files can be removed safely; active recordings and externally changed files are protected. Stop recordings, remove files yourself, or increase the storage limits"
                     );
                 }
                 bail!(
-                    "Storage full: removing every unchanged, completed Capturefab file would still not make room, so none were removed; active recordings, files awaiting upload and externally changed files are protected. Stop recordings, remove files yourself, or increase the storage limits"
+                    "Storage full: removing every unchanged, completed Capturefab file would still not make room, so {} removed; active recordings, files awaiting upload and externally changed files are protected. Stop recordings, remove files yourself, or increase the storage limits",
+                    if removed { "no more were" } else { "none were" }
                 );
             };
-            self.delete_all(&victims)?;
+            let files = self.ledger.entries.len();
+            let freed = self.delete_all(&victims, device)?;
+            removed |= self.ledger.entries.len() < files;
             expiry_due = false;
-            disk_due &= short == 0;
+            if short > 0 {
+                round = Some((short, freed));
+            }
         }
     }
-    /// Bytes to free on `base`'s disk so that `reserve` more, and the rest of
-    /// every live reservation there, still leave FREE_SPACE_FLOOR; and the
-    /// free space. Nothing when the file system does not report its size.
-    fn shortfall(&self, base: &Path, reserve: u64) -> (u64, u64) {
+    /// Record whether removing files frees space on disk `device`. This is
+    /// rare, so it writes a new snapshot rather than a kind of record; if
+    /// that fails, it costs at most one more round of removals.
+    fn stall(&mut self, device: Option<u64>, stalled: bool) {
+        let Some(device) = device else {
+            return;
+        };
+        if self.ledger.stalled.contains(&device) == stalled {
+            return;
+        }
+        if stalled {
+            self.ledger.stalled.push(device);
+        } else {
+            self.ledger.stalled.retain(|&other| other != device);
+        }
+        let _ = self.compact();
+    }
+    /// Bytes to free on disk `device`, which holds `base`, so that `reserve`
+    /// more, and the rest of every live reservation there, still leave
+    /// FREE_SPACE_FLOOR; and the free space. Nothing when the file system
+    /// does not report its size.
+    fn shortfall(&self, base: &Path, device: Option<u64>, reserve: u64) -> (u64, u64) {
         let Some(free) = available(base) else {
             return (0, 0);
         };
-        let disk = fs::metadata(base).ok();
+        // A reservation on an unknown disk counts, which can only refuse a
+        // save sooner.
         let promised: u64 = self
             .ledger
             .entries
             .iter()
-            .filter(|entry| entry.lease.is_some() && on_disk(entry, disk.as_ref()))
+            .filter(|entry| entry.lease.is_some() && on_disk(entry, device) != Some(false))
             .map(|entry| entry.reserved.saturating_sub(entry.bytes))
             .sum();
         let needed = FREE_SPACE_FLOOR
@@ -1275,15 +1354,15 @@ impl Locked {
         (needed.saturating_sub(free), free)
     }
     /// The files to remove so that `reserve` more bytes and one more file fit
-    /// and `short` bytes are freed on `base`'s disk: the oldest removable ones,
-    /// and up to EXPIRED_BATCH expired ones. None when even removing all of
-    /// them would not be enough, so that nothing is deleted for a save that
+    /// and `short` bytes are freed on disk `device`: the oldest removable
+    /// ones, and up to EXPIRED_BATCH expired ones. None when even removing all
+    /// of them would not be enough, so that nothing is deleted for a save that
     /// fails anyway.
     fn victims(
         &self,
         policy: &StoragePolicy,
         reserve: u64,
-        base: &Path,
+        device: Option<u64>,
         mut short: u64,
     ) -> Result<Option<Vec<String>>> {
         let mut candidates: Vec<&Entry> = self
@@ -1299,11 +1378,10 @@ impl Locked {
                 .is_none_or(|sum| sum > policy.max_bytes)
                 || files >= policy.max_files as usize
         };
-        let disk = fs::metadata(base).ok();
         let (mut allocated, mut files) = (self.allocated()?, self.ledger.entries.len());
         let mut victims = Vec::new();
         for entry in candidates {
-            let here = on_disk(entry, disk.as_ref());
+            let here = on_disk(entry, device) == Some(true);
             if !full(allocated, files)
                 && !(short > 0 && here)
                 && !(victims.len() < EXPIRED_BATCH && self.expired(entry, policy))
@@ -1319,16 +1397,27 @@ impl Locked {
         }
         Ok((!full(allocated, files) && short == 0).then_some(victims))
     }
-    /// Remove verified files, then commit once for all of them.
-    fn delete_all(&mut self, ids: &[String]) -> Result<()> {
+    /// Remove verified files, then commit once for all of them. Returns the
+    /// bytes removed from disk `device`.
+    fn delete_all(&mut self, ids: &[String], device: Option<u64>) -> Result<u64> {
+        let mut freed = 0;
         let result = ids.iter().try_for_each(|id| {
-            match self.ledger.entries.iter().position(|entry| &entry.id == id) {
-                Some(index) => self.delete(index).map(drop),
-                None => Ok(()),
+            let Some(index) = self.ledger.entries.iter().position(|entry| &entry.id == id) else {
+                return Ok(());
+            };
+            let entry = &self.ledger.entries[index];
+            let bytes = if on_disk(entry, device) == Some(true) {
+                entry.bytes
+            } else {
+                0
+            };
+            if self.delete(index)? {
+                freed += bytes;
             }
+            Ok(())
         });
         self.persist()?;
-        result
+        result.map(|()| freed)
     }
 }
 
@@ -2292,6 +2381,31 @@ mod tests {
         assert!(error.contains("Storage full: no unchanged"), "{error}");
     }
     #[test]
+    fn a_save_that_still_cannot_fit_says_whether_files_were_removed_for_it() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        let policy = policy(20, 10, "delete-oldest");
+        for (name, data) in [("a", &[1; 8][..]), ("b", &[2; 8]), ("c", &[3; 2])] {
+            completed(&manager, &temp.path(name), &policy, data);
+        }
+        // The same length and time with other content: only its hash shows
+        // that b changed, once it is about to be removed.
+        let b = temp.path("b");
+        let modified = fs::metadata(&b).unwrap().modified().unwrap();
+        let mut file = OpenOptions::new().write(true).open(&b).unwrap();
+        file.write_all(&[9; 8]).unwrap();
+        file.set_modified(modified).unwrap();
+        drop(file);
+        let error = manager
+            .writer(&temp.path("large"), &policy, 18)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("so no more were removed"), "{error}");
+        assert!(!temp.path("a").exists() && temp.path("c").exists());
+        assert_eq!(fs::read(&b).unwrap(), [9; 8]);
+    }
+    #[test]
     fn stop_policy_with_an_age_limit_stops_only_for_removable_files() {
         let temp = Temp::new();
         let manager = temp.manager();
@@ -2640,7 +2754,12 @@ mod tests {
         let base = fs::canonicalize(&temp.0).unwrap();
         // A lowered file limit leaves 1,901 files to remove for this save.
         locked
-            .make_room(&policy(1 << 30, 100, "delete-oldest"), 1, &base)
+            .make_room(
+                &policy(1 << 30, 100, "delete-oldest"),
+                1,
+                &base,
+                device(&base),
+            )
             .unwrap();
         assert_eq!(locked.ledger.entries.len(), 99);
         assert_eq!(locked.commits, 1);
@@ -2653,7 +2772,7 @@ mod tests {
         let mut policy = policy(1 << 30, 100_000, "delete-oldest");
         policy.max_age_seconds = Some(10);
         locked.commits = 0;
-        locked.make_room(&policy, 1, &base).unwrap();
+        locked.make_room(&policy, 1, &base, device(&base)).unwrap();
         assert_eq!(locked.ledger.entries.len(), 99 - EXPIRED_BATCH);
         assert_eq!(locked.commits, 1);
     }
@@ -2732,6 +2851,74 @@ mod tests {
             "{error:#}"
         );
         assert!(temp.path("second").exists() && temp.path("user").exists());
+        AVAILABLE.set(None);
+    }
+    /// A disk whose free space stays just under what a save needs, however
+    /// many files are removed, as while a snapshot holds their blocks.
+    fn held_disk(_: &Path) -> u64 {
+        FREE_SPACE_FLOOR + 10
+    }
+    fn roomy_disk(_: &Path) -> u64 {
+        1 << 40
+    }
+    #[test]
+    fn removals_that_free_no_space_stop_until_a_save_fits_again() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        let oldest = policy(1 << 30, 100, "delete-oldest");
+        AVAILABLE.set(Some(roomy_disk));
+        for index in 0..5 {
+            completed(
+                &manager,
+                &temp.path(&format!("kept-{index}")),
+                &oldest,
+                &[1; 60],
+            );
+        }
+        AVAILABLE.set(Some(held_disk));
+        for attempt in 0..5 {
+            // Each save from a new process, as in a scripted loop.
+            forget(&manager);
+            let error = manager
+                .writer(&temp.path(&format!("new-{attempt}")), &oldest, 60)
+                .err()
+                .unwrap();
+            assert!(
+                format!("{error:#}").contains("did not free space"),
+                "{error:#}"
+            );
+            assert_eq!(crate::cli::error_code(&error), ("storage_full", 6));
+        }
+        let kept = (0..5)
+            .filter(|index| temp.path(&format!("kept-{index}")).exists())
+            .count();
+        assert_eq!(kept, 4, "one round of removals, then none");
+        // A save that fits lets later ones remove files for space again.
+        AVAILABLE.set(Some(roomy_disk));
+        completed(&manager, &temp.path("fits"), &oldest, &[2; 60]);
+        AVAILABLE.set(Some(held_disk));
+        assert!(manager.writer(&temp.path("next"), &oldest, 60).is_err());
+        assert!(!temp.path("kept-1").exists() && temp.path("kept-2").exists());
+        AVAILABLE.set(None);
+    }
+    #[test]
+    fn files_are_not_removed_for_space_where_disks_cannot_be_told_apart() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        let oldest = policy(1 << 30, 100, "delete-oldest");
+        completed(&manager, &temp.path("kept"), &oldest, &[1; 60]);
+        let base = fs::canonicalize(&temp.0).unwrap();
+        AVAILABLE.set(Some(small_disk));
+        let mut locked = manager.lock().unwrap();
+        // As on Windows, where the oldest file could be on another drive.
+        let error = locked.make_room(&oldest, 60, &base, None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("needs at least 512 MiB free"),
+            "{error:#}"
+        );
+        assert!(temp.path("kept").exists());
+        locked.make_room(&oldest, 60, &base, device(&base)).unwrap();
+        assert!(!temp.path("kept").exists());
         AVAILABLE.set(None);
     }
 }
