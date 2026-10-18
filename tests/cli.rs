@@ -2440,6 +2440,21 @@ fn headless_build_without_a_command_explains_serve() {
     );
     // It fails before creating a session, which would create the directory.
     assert!(!dir.exists());
+    // Asked for JSON, or for a session, it is still unsupported.
+    let out = cmd(&dir, &["--json"]);
+    assert_eq!(out.status.code(), Some(5));
+    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(reply["error"]["code"], "unsupported", "{reply}");
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("capturefab serve --name bench"),
+        "{reply}"
+    );
+    let out = cmd(&dir, &["--session", "bench"]);
+    assert_eq!(out.status.code(), Some(5));
+    assert!(!dir.exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

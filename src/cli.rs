@@ -1771,15 +1771,17 @@ pub fn run(mut cli: Cli) -> Result<()> {
     crate::efficiency::configure(cli.efficiency);
     match &cli.command {
         None | Some(Command::Gui { .. }) => {
+            // Before a session, IPC server and uploader start for nothing,
+            // and before the checks below, so a headless build is
+            // `unsupported` with or without --json or --session.
+            if let Some(error) = window_unavailable(cfg!(feature = "gui"), display_available()) {
+                return Err(error);
+            }
             ensure!(
                 cli.session.is_none(),
                 "use an explicit command with --session, such as status"
             );
             ensure!(!cli.json, "choose a CLI command when using --json");
-            // Before a session, IPC server and uploader start for nothing.
-            if let Some(error) = window_unavailable(cfg!(feature = "gui"), display_available()) {
-                return Err(error);
-            }
             let (name, screenshot, demo_cameras, dataset) = match &cli.command {
                 Some(Command::Gui {
                     name,
