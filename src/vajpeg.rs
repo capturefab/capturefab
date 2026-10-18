@@ -28,6 +28,7 @@ pub static VAAPI: Kind = Kind {
     argument: "__vajpeg",
     variable: "CAPTUREFAB_VAAPI_JPEG",
     platform: cfg!(target_os = "linux"),
+    present: || !devices().is_empty(),
     // libva prints driver information on stderr; keep errors only.
     environment: &[("LIBVA_MESSAGING_LEVEL", "1")],
     accelerator: OnceLock::new(),

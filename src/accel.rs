@@ -10,9 +10,12 @@
 //!
 //! Driver start-up costs far more than one CPU encode, so a helper starts in
 //! the background on first use; frames are encoded on the CPU until it
-//! reports ready. The parent converts each frame directly into a private
-//! shared-memory file that the helper maps, and the helper writes the JPEG
-//! after the pixels; the pipes carry one JSON line each way.
+//! reports ready. A helper unused for a minute is stopped, releasing its
+//! driver context and buffers, and the next capture starts it again. Hosts
+//! without the device nodes never start one. The parent converts each frame
+//! directly into a private shared-memory file that the helper maps, and the
+//! helper writes the JPEG after the pixels; the pipes carry one JSON line
+//! each way.
 use crate::jpeg::{monochrome, well_formed};
 use crate::types::Frame;
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -20,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     io::{BufRead, BufReader, Read, Write},
     process::{Child, Command, Stdio},
-    sync::{Mutex, OnceLock, PoisonError, mpsc},
+    sync::{Arc, Mutex, OnceLock, PoisonError, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -35,6 +38,9 @@ pub struct Kind {
     pub variable: &'static str,
     /// Whether this platform can have the hardware at all.
     pub platform: bool,
+    /// Whether this host has the hardware's device nodes, a cheap check
+    /// before starting a helper.
+    pub present: fn() -> bool,
     /// Extra environment for the helper process.
     pub environment: &'static [(&'static str, &'static str)],
     pub(crate) accelerator: OnceLock<Accelerator>,
@@ -111,13 +117,16 @@ enum State {
     Ready(Helper),
     Disabled,
 }
+/// A helper with no request for this long is stopped.
+const IDLE: Duration = Duration::from_secs(60);
 /// A helper executable and the state of its helper process.
 pub(crate) struct Accelerator {
     kind: &'static Kind,
     executable: std::path::PathBuf,
     /// Minimum per-request deadline; healthy hardware needs milliseconds.
     deadline: Duration,
-    state: Mutex<State>,
+    idle: Duration,
+    state: Arc<Mutex<State>>,
 }
 fn helper_executable() -> std::path::PathBuf {
     std::env::var_os("CAPTUREFAB_EXECUTABLE")
@@ -178,6 +187,8 @@ struct Helper {
     shared: Option<Shared>,
     /// What the helper reported when it became ready.
     version: String,
+    /// When the helper last took a request, or became ready.
+    used: Instant,
 }
 impl Helper {
     fn start(kind: &Kind, executable: &std::path::Path) -> Result<Self> {
@@ -234,6 +245,7 @@ impl Helper {
             results,
             shared: None,
             version,
+            used: Instant::now(),
         })
     }
 }
@@ -274,6 +286,9 @@ pub fn probe(kind: &'static Kind) -> Result<String> {
     if !kind.wanted() {
         bail!("{}", kind.unavailable());
     }
+    if !(kind.present)() {
+        bail!("no {} device found on this host", kind.name);
+    }
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let _ = sender.send(Helper::start(kind, &helper_executable()).map(|helper| {
@@ -295,8 +310,35 @@ impl Accelerator {
             kind,
             executable,
             deadline,
-            state: Mutex::new(State::Idle),
+            idle: IDLE,
+            state: Arc::new(Mutex::new(State::Idle)),
         }
+    }
+    /// Stop the ready helper once it has gone `idle` without a request.
+    fn watch_idle(&self) {
+        let (state, idle) = (Arc::downgrade(&self.state), self.idle);
+        let _ = thread::Builder::new()
+            .name("capturefab-jpeg-idle".into())
+            .spawn(move || {
+                loop {
+                    let Some(state) = state.upgrade() else {
+                        return;
+                    };
+                    let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+                    let State::Ready(helper) = &*state else {
+                        return;
+                    };
+                    let unused = helper.used.elapsed();
+                    if unused >= idle {
+                        if let State::Ready(helper) = std::mem::replace(&mut *state, State::Idle) {
+                            abandon(helper.child);
+                        }
+                        return;
+                    }
+                    drop(state);
+                    thread::sleep(idle - unused);
+                }
+            });
     }
     fn disable(&self, state: &mut State, reason: &str) {
         eprintln!(
@@ -310,6 +352,10 @@ impl Accelerator {
     fn encode(&self, frame: &Frame) -> Option<Vec<u8>> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         match &*state {
+            State::Idle if !(self.kind.present)() => {
+                *state = State::Disabled;
+                return None;
+            }
             State::Idle => {
                 let (sender, receiver) = mpsc::channel();
                 let (kind, executable) = (self.kind, self.executable.clone());
@@ -327,7 +373,10 @@ impl Accelerator {
                 return None;
             }
             State::Starting(receiver) => match receiver.try_recv() {
-                Ok(Ok(helper)) => *state = State::Ready(helper),
+                Ok(Ok(helper)) => {
+                    *state = State::Ready(helper);
+                    self.watch_idle();
+                }
                 Ok(Err(error)) => {
                     // Unavailable hosts are the common case; say so once, quietly.
                     if !error.contains("not found") {
@@ -351,6 +400,7 @@ impl Accelerator {
         let State::Ready(helper) = &mut *state else {
             return None;
         };
+        helper.used = Instant::now();
         match exchange(self.kind, helper, frame, self.deadline) {
             Ok(jpeg) => jpeg,
             Err(reason) => {
@@ -546,6 +596,7 @@ mod tests {
         argument: "__fake",
         variable: "CAPTUREFAB_FAKE_JPEG",
         platform: true,
+        present: || true,
         environment: &[],
         accelerator: OnceLock::new(),
     };
@@ -650,6 +701,76 @@ mod tests {
             );
             let _ = std::fs::remove_file(path);
         }
+    }
+    #[test]
+    fn hosts_without_the_device_skip_the_helper() {
+        static ABSENT: Kind = Kind {
+            name: "absent",
+            argument: "__absent",
+            variable: "CAPTUREFAB_ABSENT_JPEG",
+            platform: true,
+            present: || false,
+            environment: &[],
+            accelerator: OnceLock::new(),
+        };
+        let marker = std::env::temp_dir().join(format!(
+            "capturefab-accel-started-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let path = script("absent", &format!("touch '{}'", marker.display()));
+        let accelerator = Accelerator::new(&ABSENT, path.clone(), Duration::from_millis(500));
+        assert!(accelerator.encode(&frame()).is_none());
+        assert!(matches!(
+            *accelerator.state.lock().unwrap(),
+            State::Disabled
+        ));
+        thread::sleep(Duration::from_millis(100));
+        assert!(!marker.exists());
+        assert!(
+            probe(&ABSENT)
+                .unwrap_err()
+                .to_string()
+                .contains("no absent device")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+    #[test]
+    fn idle_helpers_stop_and_restart_on_the_next_capture() {
+        let path = script(
+            "idle",
+            "echo '{\"ok\":true}'; while read line; do echo '{\"ok\":false,\"unsupported\":true}'; done",
+        );
+        let mut accelerator = Accelerator::new(&FAKE, path.clone(), Duration::from_millis(500));
+        accelerator.idle = Duration::from_millis(300);
+        assert!(settle(&accelerator).is_none());
+        assert!(matches!(
+            *accelerator.state.lock().unwrap(),
+            State::Ready(_)
+        ));
+        // Requests keep it alive past its idle time.
+        for _ in 0..4 {
+            thread::sleep(Duration::from_millis(100));
+            accelerator.encode(&frame());
+        }
+        assert!(matches!(
+            *accelerator.state.lock().unwrap(),
+            State::Ready(_)
+        ));
+        thread::sleep(Duration::from_millis(600));
+        assert!(matches!(*accelerator.state.lock().unwrap(), State::Idle));
+        // The next capture uses the CPU while the helper starts again.
+        assert!(accelerator.encode(&frame()).is_none());
+        assert!(matches!(
+            *accelerator.state.lock().unwrap(),
+            State::Starting(_)
+        ));
+        assert!(settle(&accelerator).is_none());
+        assert!(matches!(
+            *accelerator.state.lock().unwrap(),
+            State::Ready(_)
+        ));
+        let _ = std::fs::remove_file(path);
     }
     #[test]
     fn unsupported_requests_keep_the_helper() {

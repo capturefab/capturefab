@@ -20,9 +20,20 @@ pub static NVJPEG: Kind = Kind {
     argument: "__nvjpeg",
     variable: "CAPTUREFAB_NVJPEG",
     platform: !cfg!(target_os = "macos"),
+    present: || nvidia_nodes(std::path::Path::new("/dev")),
     environment: &[],
     accelerator: OnceLock::new(),
 };
+
+/// NVIDIA driver nodes: a discrete GPU's `nvidiactl`, or Jetson's `nvmap`,
+/// `nvhost-ctrl-gpu` or `nvgpu`. Names vary between driver releases, so a
+/// host is skipped only when none exists; hosts without /dev always try.
+fn nvidia_nodes(dev: &std::path::Path) -> bool {
+    !cfg!(unix)
+        || ["nvidiactl", "nvmap", "nvhost-ctrl-gpu", "nvgpu"]
+            .iter()
+            .any(|node| dev.join(node).exists())
+}
 
 /// Encode on the GPU when the helper is ready; `None` means use the CPU.
 pub fn encode(frame: &Frame) -> Option<Vec<u8>> {
@@ -456,5 +467,24 @@ impl Drop for Encoder {
                 (api.destroy)(self.handle);
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[test]
+    fn helper_is_skipped_without_nvidia_device_nodes() {
+        let dev = std::env::temp_dir().join(format!(
+            "capturefab-nvidia-nodes-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(dev.join("null"), b"").unwrap();
+        assert!(!super::nvidia_nodes(&dev));
+        // Jetson exposes its integrated GPU without nvidiactl.
+        std::fs::write(dev.join("nvmap"), b"").unwrap();
+        assert!(super::nvidia_nodes(&dev));
+        std::fs::remove_dir_all(dev).unwrap();
     }
 }
