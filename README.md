@@ -423,6 +423,28 @@ capturefab --camera 'onvif://admin:password@192.168.1.10/onvif/device_service' c
 
 Forwarding uses a bounded latest-frame queue and probes an encoder before selecting it. Candidates, in order, are the vendor encoders (Apple VideoToolbox, NVIDIA NVENC including AV1, NVIDIA Jetson through its GStreamer `nvv4l2h264enc`/`nvv4l2h265enc`/`nvv4l2av1enc` elements, AMD AMF, Intel QSV, VAAPI), then cross-vendor Vulkan Video (`h264_vulkan`, `hevc_vulkan`, `av1_vulkan`), Windows Media Foundation and Linux V4L2, where the build and host drivers support them; software H.264/HEVC is the fallback. On Jetson the GStreamer encoder runs as a separate process and FFmpeg remuxes and delivers its stream. `--encoder` selects explicitly and `--hwaccel` controls decoding for new direct, GUI or `serve` workers; existing sessions retain their decoding setting. Hardware availability is established by a real probe, not chipset branding. Frames reach FFmpeg in their sensor format (gray, 10/12/16-bit gray, Bayer or packed RGB), handed from the camera worker to the writer thread without a copy, so color conversion runs in FFmpeg's SIMD scaler or the encoder hardware rather than on the camera thread; NVENC and AMF receive packed RGB for color sources and convert it on the GPU when their probe accepts that input. See [FFmpeg builds](docs/ffmpeg-build.md). `.mkv`, fragmented `.mp4`/`.mov`, `.ts` and suitable `.webm` recordings use a bounded Rust writer. Serve HLS through MediaMTX rather than local files outside the retention manager.
 
+## Host checks and efficiency mode
+
+`capturefab doctor` checks this computer and prints one line per check, with a copyable fix under each warning:
+
+- **Efficiency mode**: the setting in force and why.
+- **GPU** (desktop builds): the adapter the desktop window would get, asked in a helper process with a 3-second limit. A software rasterizer such as llvmpipe is a warning.
+- **Session state**: settings, saved destinations, the upload queue, the storage ledger and camera frame buffers live in the session directory. On Linux it is under `/run/user`, a tmpfs that is fast and spares SD cards but is cleared at reboot. Without `XDG_RUNTIME_DIR`, which system services often lack, frame buffers fall back to `~/.cache` on disk; doctor shows the line to add.
+- **GigE receive buffer** (Linux): `net.core.rmem_max` caps every socket buffer, and the usual 208 KiB loses packets from larger frames. The fix raises it now and keeps it in `/etc/sysctl.d`.
+- **USB3 Vision access** (Linux): a connected camera whose `/dev/bus/usb` node this user cannot open, with a udev rule.
+- **Storage budget**: the [storage budget](#bounded-storage-and-retention) against the free space where relative capture paths land.
+
+`serve` prints the warnings on one line when it starts. `doctor --json` keeps its existing keys and adds `host` (CPU cores, memory, battery, low-power mode), `efficiency`, `paths` (file system type, RAM-backed, free space), `limits` (`rmem_max` and `usbfs_memory_mb` on Linux), `graphics` and `checks` (`{id,level,message,fix}`).
+
+Efficiency mode is `auto` (the default), `smooth` or `efficient`. Efficient mode lowers preview and polling work on small computers; captures and recordings keep every frame. Auto chooses efficient with at most two CPU cores or 2 GiB of memory, in macOS Low Power Mode, Windows battery saver or the Linux `low-power` power profile, or while the desktop window reports a hint such as software rendering. Running on battery alone keeps previews smooth. The global `--efficiency` flag wins over `CAPTUREFAB_EFFICIENCY`, which wins over the desktop setting. It applies to the process that reads it (the desktop window, `serve` or a direct worker); a running session keeps its own.
+
+```sh
+capturefab doctor
+capturefab --efficiency efficient serve --name line1
+```
+
+Run without a command, a headless build (exit 5) or a Linux login without `DISPLAY` or `WAYLAND_DISPLAY` explains how to start a `serve` session instead of opening a window.
+
 ## Debugging and limits
 
 `features`, `get`, `set`, `execute`, `xml`, `memory read`, `memory write` and `doctor` expose camera state and transport diagnostics. Raw register writes are advanced operations; settings apply sequentially and a later failure does not undo earlier successful settings. Camera feature access, bounds and availability are evaluated live.
