@@ -956,6 +956,17 @@ fn project_selected(state: &mut SessionSnapshot) {
     }
 }
 fn merge_session_metadata(snapshot: &mut SessionSnapshot, current: &SessionSnapshot) {
+    // A busy worker's entry was copied from the stored snapshot before this
+    // one was built; the command that kept it busy may have stored a newer
+    // one since, such as the job it just scheduled.
+    for camera in snapshot.cameras.iter_mut().filter(|camera| camera.stale) {
+        if let Some(newer) = current.cameras.iter().find(|c| c.info.id == camera.info.id) {
+            *camera = CameraSnapshot {
+                stale: true,
+                ..newer.clone()
+            };
+        }
+    }
     // Polling does worker I/O outside the state lock. Preserve session edits
     // that completed while that poll was in flight.
     snapshot.active_camera = current.active_camera.clone();
@@ -2639,7 +2650,7 @@ impl SessionHandle {
             command => {
                 let w = self.target(target)?;
                 let schedule = matches!(command, SessionCommand::Schedule { .. });
-                let (result, (batch, gaps)) = {
+                let (result, (batch, gaps), fresh) = {
                     let mut worker = w.lock().unwrap_or_else(|e| e.into_inner());
                     let mut result = worker.call(command);
                     if schedule
@@ -2648,16 +2659,31 @@ impl SessionHandle {
                     {
                         fields.insert("worker_pid".into(), json!(worker.child.id()));
                     }
-                    (result, worker.take_saved())
+                    (result, worker.take_saved(), worker.camera())
                 };
                 self.inner.dataset.record_saved(batch, gaps);
-                self.store_snapshot();
+                self.store_snapshot_with(fresh);
                 result
             }
         }
     }
     fn store_snapshot(&self) {
-        let (snapshot, revision) = self.assemble();
+        self.store_snapshot_with(None);
+    }
+    /// Store a snapshot, with `fresh` for its camera's entry if that worker
+    /// is busy again, as when the poller asks for its status right after a
+    /// command: the entry that command left is newer than the stored one.
+    fn store_snapshot_with(&self, fresh: Option<CameraSnapshot>) {
+        let (mut snapshot, revision) = self.assemble();
+        if let Some(fresh) = fresh
+            && let Some(entry) = snapshot
+                .cameras
+                .iter_mut()
+                .find(|camera| camera.stale && camera.info.id == fresh.info.id)
+        {
+            *entry = fresh;
+            project_selected(&mut snapshot);
+        }
         self.inner.analytics.observe(&snapshot);
         if snapshot.cameras.iter().any(|camera| camera.streaming) {
             self.hurry(SLOW);
@@ -3037,6 +3063,37 @@ mod tests {
         assert_eq!(in_flight.active_camera.as_deref(), Some("sim:1"));
         assert_eq!(in_flight.connected.as_ref().unwrap().id, "sim:1");
         assert_eq!(in_flight.devices[0].id, "sim:2");
+    }
+    #[test]
+    fn a_poll_that_found_a_worker_busy_keeps_what_its_command_stored_since() {
+        // The poll copied sim:0's entry while a schedule held its worker;
+        // the schedule's own snapshot, with the new job, was stored first.
+        let mut in_flight = SessionSnapshot {
+            active_camera: Some("sim:0".into()),
+            cameras: vec![CameraSnapshot {
+                stale: true,
+                ..cached_camera("sim:0", 10)
+            }],
+            ..Default::default()
+        };
+        let job: crate::scheduling::CaptureJob = serde_json::from_value(json!({
+            "id": 7, "status": "pending", "output": "t", "count": 3, "captured": 0,
+            "first_at_ms": 0, "interval_ms": 400, "next_at_ms": 0,
+            "last_file": null, "error": null
+        }))
+        .unwrap();
+        let current = SessionSnapshot {
+            active_camera: Some("sim:0".into()),
+            cameras: vec![CameraSnapshot {
+                jobs: vec![job],
+                ..cached_camera("sim:0", 12)
+            }],
+            ..Default::default()
+        };
+        merge_session_metadata(&mut in_flight, &current);
+        assert_eq!(in_flight.jobs.len(), 1, "the job stays");
+        assert_eq!(in_flight.cameras[0].frames, 12);
+        assert!(in_flight.cameras[0].stale, "still shown as busy");
     }
     #[test]
     fn lines_logged_while_a_poll_builds_its_snapshot_are_stored_with_it() {
