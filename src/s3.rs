@@ -1,13 +1,15 @@
 //! A small S3-compatible client for uploading finished captures: AWS Signature
-//! Version 4 over a pure-Rust HTTPS stack that trusts the OS certificate
-//! store. Payloads are signed with their SHA-256, so the service rejects bytes
-//! that changed in transit, and writes are conditional (`If-None-Match: *`),
-//! so an existing object is never replaced. Services that ignore conditional
-//! writes (found with `probe_conditional_writes`) use a HEAD check first.
+//! Version 4 (see `aws`) over a pure-Rust HTTPS stack that trusts the OS
+//! certificate store. Payloads are signed with their SHA-256, so the service
+//! rejects bytes that changed in transit, and writes are conditional
+//! (`If-None-Match: *`), so an existing object is never replaced. Services
+//! that ignore conditional writes (found with `probe_conditional_writes`) use
+//! a HEAD check first.
 //!
 //! Credentials come from the OS credential store, an AWS shared-credentials
 //! profile, or the environment; secrets are never written to Capturefab files
 //! or sent over the wire.
+use crate::aws::{Request, UriMode, hex, uri_encode};
 use crate::destination::{Bucket, Credentials, NoOverwrite};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use sha2::{Digest, Sha256};
@@ -31,11 +33,7 @@ pub use crate::transfer::{Permanent, retryable};
 // ---------------------------------------------------------------------------
 // Credentials.
 
-pub struct Keys {
-    pub id: String,
-    secret: String,
-    token: Option<String>,
-}
+pub use crate::aws::Keys;
 
 /// Store a secret access key in the OS credential store.
 pub fn store_secret(access_key_id: &str, secret: &str) -> Result<()> {
@@ -71,49 +69,6 @@ pub(crate) fn read_secret(access_key_id: &str) -> Result<Option<String>> {
     crate::transfer::read_secret(KEYCHAIN_SERVICE, access_key_id)
 }
 
-/// The `[profile]` section of an AWS shared credentials file.
-fn profile_keys(text: &str, profile: &str) -> Option<Keys> {
-    let mut section = String::new();
-    let (mut id, mut secret, mut token) = (None, None, None);
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with('[') && line.ends_with(']') {
-            section = line[1..line.len() - 1].trim().to_string();
-            continue;
-        }
-        if section != profile || line.starts_with(['#', ';']) {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim().to_string();
-        match key.trim() {
-            "aws_access_key_id" => id = Some(value),
-            "aws_secret_access_key" => secret = Some(value),
-            "aws_session_token" => token = Some(value),
-            _ => {}
-        }
-    }
-    Some(Keys {
-        id: id?,
-        secret: secret?,
-        token,
-    })
-}
-
-fn credentials_file() -> Option<std::path::PathBuf> {
-    if let Some(path) = std::env::var_os("AWS_SHARED_CREDENTIALS_FILE") {
-        return Some(path.into());
-    }
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
-    Some(
-        std::path::PathBuf::from(home)
-            .join(".aws")
-            .join("credentials"),
-    )
-}
-
 pub fn validate_secret(secret: &str) -> Result<()> {
     ensure!(
         !secret.is_empty() && secret.len() <= 4096,
@@ -122,28 +77,27 @@ pub fn validate_secret(secret: &str) -> Result<()> {
     Ok(())
 }
 
-impl Keys {
-    fn validate(&self) -> Result<()> {
-        Credentials::Keychain {
-            access_key_id: self.id.clone(),
-        }
-        .validate()?;
-        validate_secret(&self.secret)?;
-        if let Some(token) = &self.token {
-            ensure!(
-                !token.is_empty()
-                    && token.len() <= 16384
-                    && token.bytes().all(|b| b.is_ascii_graphic()),
-                "AWS session token must contain 1..16384 printable ASCII characters without whitespace"
-            );
-        }
-        Ok(())
+fn validate_keys(keys: &Keys) -> Result<()> {
+    Credentials::Keychain {
+        access_key_id: keys.id().into(),
     }
+    .validate()?;
+    validate_secret(keys.secret())?;
+    if let Some(token) = keys.token() {
+        crate::aws::validate_session_token(token)?;
+    }
+    Ok(())
 }
 
 pub fn keys(credentials: &Credentials) -> Result<Keys> {
+    keys_in(credentials, &crate::aws::process_vars)
+}
+
+/// `keys`, reading AWS variables through `vars`.
+fn keys_in(credentials: &Credentials, vars: crate::aws::Vars<'_>) -> Result<Keys> {
     credentials.validate()?;
-    let keys: Result<Keys> = match credentials {
+    let permanent = |error: anyhow::Error| Permanent(error.to_string());
+    let keys = match credentials {
         Credentials::Keychain { access_key_id } => {
             let secret = keyring::Entry::new(KEYCHAIN_SERVICE, access_key_id)
                 .and_then(|entry| entry.get_password())
@@ -152,162 +106,18 @@ pub fn keys(credentials: &Credentials) -> Result<Keys> {
                         "no secret key for {access_key_id} in the OS credential store ({e}); enter it again in the destination settings or `capturefab destination add-s3 --secret-stdin`"
                     ))
                 })?;
-            Ok(Keys {
-                id: access_key_id.clone(),
-                secret,
-                token: None,
-            })
+            Keys::new(access_key_id.clone(), secret, None)
         }
+        // Exactly the named profile, or exactly the environment: never the
+        // AWS_PROFILE or default-profile fallbacks of `aws::bedrock_chain`,
+        // which could sign uploads with another account's keys.
         Credentials::Profile { name } => {
-            let path = credentials_file()
-                .ok_or_else(|| Permanent("cannot locate the AWS credentials file".into()))?;
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| Permanent(format!("cannot read {}: {e}", path.display())))?;
-            Ok(profile_keys(&text, name).ok_or_else(|| {
-                Permanent(format!(
-                    "profile [{name}] in {} has no aws_access_key_id and aws_secret_access_key",
-                    path.display()
-                ))
-            })?)
+            crate::aws::keys_from_profile_in(name, vars).map_err(permanent)?
         }
-        Credentials::Environment => {
-            let get = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-            match (get("AWS_ACCESS_KEY_ID"), get("AWS_SECRET_ACCESS_KEY")) {
-                (Some(id), Some(secret)) => Ok(Keys {
-                    id,
-                    secret,
-                    token: get("AWS_SESSION_TOKEN"),
-                }),
-                _ => Err(Permanent(
-                    "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are not set in the uploading process"
-                        .into(),
-                )
-                .into()),
-            }
-        }
+        Credentials::Environment => crate::aws::keys_from_env_in(vars).map_err(permanent)?,
     };
-    let keys = keys?;
-    keys.validate()
-        .map_err(|error| Permanent(error.to_string()))?;
+    validate_keys(&keys).map_err(permanent)?;
     Ok(keys)
-}
-
-// ---------------------------------------------------------------------------
-// Signature Version 4.
-
-fn hex(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
-}
-
-fn hmac(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut block = [0u8; 64];
-    if key.len() > 64 {
-        block[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        block[..key.len()].copy_from_slice(key);
-    }
-    let pad = |byte: u8| block.map(|b| b ^ byte);
-    let inner = Sha256::new()
-        .chain_update(pad(0x36))
-        .chain_update(message)
-        .finalize();
-    Sha256::new()
-        .chain_update(pad(0x5c))
-        .chain_update(inner)
-        .finalize()
-        .into()
-}
-
-/// Percent-encode for SigV4: everything except unreserved characters, and
-/// `/` too unless it separates path segments.
-fn encode(text: &str, slash: bool) -> String {
-    let mut out = String::with_capacity(text.len());
-    for b in text.bytes() {
-        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) || (b == b'/' && !slash) {
-            out.push(b as char);
-        } else {
-            let _ = write!(out, "%{b:02X}");
-        }
-    }
-    out
-}
-
-/// A request to sign: method, host, path (already encoded), query pairs and
-/// the headers to include besides host and the x-amz ones.
-struct Request<'a> {
-    method: &'a str,
-    host: &'a str,
-    path: &'a str,
-    query: &'a [(&'a str, &'a str)],
-    headers: &'a [(&'a str, String)],
-    payload_sha256: &'a str,
-}
-
-/// The Authorization header and the headers that must accompany it.
-fn sign(
-    keys: &Keys,
-    region: &str,
-    amz_date: &str,
-    request: &Request,
-) -> (String, Vec<(String, String)>) {
-    let mut headers: Vec<(String, String)> = request
-        .headers
-        .iter()
-        .map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_string()))
-        .collect();
-    headers.push(("host".into(), request.host.into()));
-    headers.push(("x-amz-content-sha256".into(), request.payload_sha256.into()));
-    headers.push(("x-amz-date".into(), amz_date.into()));
-    if let Some(token) = &keys.token {
-        headers.push(("x-amz-security-token".into(), token.clone()));
-    }
-    headers.sort();
-    let mut query: Vec<(String, String)> = request
-        .query
-        .iter()
-        .map(|(k, v)| (encode(k, true), encode(v, true)))
-        .collect();
-    query.sort();
-    let canonical_query = query
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&");
-    let signed = headers
-        .iter()
-        .map(|(k, _)| k.as_str())
-        .collect::<Vec<_>>()
-        .join(";");
-    let canonical_headers: String = headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
-    let canonical = format!(
-        "{}\n{}\n{canonical_query}\n{canonical_headers}\n{signed}\n{}",
-        request.method, request.path, request.payload_sha256
-    );
-    let date = &amz_date[..8];
-    let scope = format!("{date}/{region}/s3/aws4_request");
-    let to_sign = format!(
-        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-        hex(&Sha256::digest(canonical.as_bytes()))
-    );
-    let key = [region, "s3", "aws4_request"].iter().fold(
-        hmac(format!("AWS4{}", keys.secret).as_bytes(), date.as_bytes()),
-        |key, part| hmac(&key, part.as_bytes()),
-    );
-    let signature = hex(&hmac(&key, to_sign.as_bytes()));
-    let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed}, Signature={signature}",
-        keys.id
-    );
-    let extra = headers
-        .into_iter()
-        .filter(|(k, _)| k.starts_with("x-amz-"))
-        .collect();
-    (authorization, extra)
 }
 
 // ---------------------------------------------------------------------------
@@ -378,14 +188,7 @@ impl Client {
         };
         bucket.validate()?;
         validate_secret(&secret)?;
-        Self::with_keys(
-            bucket,
-            Keys {
-                id: access_key_id.clone(),
-                secret,
-                token: None,
-            },
-        )
+        Self::with_keys(bucket, Keys::new(access_key_id.clone(), secret, None))
     }
 
     fn with_keys(bucket: &Bucket, keys: Keys) -> Result<Self> {
@@ -395,7 +198,7 @@ impl Client {
         let mut bucket = bucket.clone();
         bucket.path_style |= crate::destination::endpoint_needs_path_style(&bucket.endpoint);
         let bucket = &bucket;
-        keys.validate()?;
+        validate_keys(&keys)?;
         let service = bucket.service_url();
         let (scheme, authority) = service
             .split_once("://")
@@ -429,7 +232,7 @@ impl Client {
 
     /// The encoded request path for a key (empty for the bucket itself).
     fn path(&self, key: &str) -> String {
-        let key = encode(key, false);
+        let key = uri_encode(key, false);
         match (self.bucket.path_style, key.is_empty()) {
             (true, true) => format!("/{}", self.bucket.bucket),
             (true, false) => format!("/{}/{key}", self.bucket.bucket),
@@ -448,9 +251,11 @@ impl Client {
     ) -> Result<Response> {
         let path = self.path(key);
         let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let (authorization, signed) = sign(
+        let (authorization, signed) = crate::aws::sign(
             &self.keys,
             &self.bucket.region,
+            "s3",
+            UriMode::S3,
             &amz_date,
             &Request {
                 method,
@@ -467,7 +272,7 @@ impl Client {
             url.push_str(
                 &query
                     .iter()
-                    .map(|(k, v)| format!("{}={}", encode(k, true), encode(v, true)))
+                    .map(|(k, v)| format!("{}={}", uri_encode(k, true), uri_encode(v, true)))
                     .collect::<Vec<_>>()
                     .join("&"),
             );
@@ -924,42 +729,7 @@ pub fn hash_reader(reader: &mut impl Read) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn example() -> Keys {
-        Keys {
-            id: "AKIAIOSFODNN7EXAMPLE".into(),
-            secret: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
-            token: None,
-        }
-    }
-
-    /// The GET Object example from the AWS Signature Version 4 documentation
-    /// for Amazon S3 ("Signature Calculations for the Authorization Header").
-    #[test]
-    fn signature_matches_the_aws_documentation_example() {
-        let (authorization, extra) = sign(
-            &example(),
-            "us-east-1",
-            "20130524T000000Z",
-            &Request {
-                method: "GET",
-                host: "examplebucket.s3.amazonaws.com",
-                path: "/test.txt",
-                query: &[],
-                headers: &[("Range", "bytes=0-9".into())],
-                payload_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            },
-        );
-        assert_eq!(
-            authorization,
-            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
-        );
-        assert!(
-            extra
-                .iter()
-                .any(|(k, v)| k == "x-amz-date" && v == "20130524T000000Z")
-        );
-    }
+    use std::ffi::OsString;
 
     /// Against a live S3-compatible service: set CAPTUREFAB_S3_TEST_ENDPOINT,
     /// CAPTUREFAB_S3_TEST_BUCKET, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
@@ -1007,35 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn hmac_matches_rfc_4231() {
-        // RFC 4231 test case 2.
-        assert_eq!(
-            hex(&hmac(b"Jefe", b"what do ya want for nothing?")),
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-        );
-        // Test case 6: a key longer than the block size is hashed first.
-        assert_eq!(
-            hex(&hmac(
-                &[0xaa; 131],
-                b"Test Using Larger Than Block-Size Key - Hash Key First"
-            )),
-            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
-        );
-    }
-
-    #[test]
-    fn keys_encode_and_profiles_parse() {
-        assert_eq!(encode("run 1/a+b.png", false), "run%201/a%2Bb.png");
-        assert_eq!(encode("a/b", true), "a%2Fb");
-        let file = "[default]\naws_access_key_id = A1\naws_secret_access_key=S1\n\n# comment\n[lab]\naws_access_key_id=A2\naws_secret_access_key = S2\naws_session_token = T2\n[empty]\n";
-        let lab = profile_keys(file, "lab").unwrap();
-        assert_eq!(
-            (lab.id.as_str(), lab.secret.as_str(), lab.token.as_deref()),
-            ("A2", "S2", Some("T2"))
-        );
-        assert_eq!(profile_keys(file, "default").unwrap().id, "A1");
-        assert!(profile_keys(file, "empty").is_none());
-        assert!(profile_keys(file, "missing").is_none());
+    fn error_text_and_content_types() {
         assert_eq!(
             error_text(
                 "<?xml version=\"1.0\"?><Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"
@@ -1051,17 +793,15 @@ mod tests {
         for secret in ["has whitespace", "line\nfeed", "unicodeé"] {
             assert!(validate_secret(secret).is_ok());
         }
-        let valid = Keys {
-            id: "access-key".into(),
-            secret: "printable/secret+value=".into(),
-            token: Some("token+value=".into()),
+        let keys = |token: &str| {
+            Keys::new(
+                "access-key".into(),
+                "printable/secret+value=".into(),
+                Some(token.into()),
+            )
         };
-        assert!(valid.validate().is_ok());
-        let invalid = Keys {
-            token: Some("bad\r\nheader".into()),
-            ..valid
-        };
-        assert!(invalid.validate().is_err());
+        assert!(validate_keys(&keys("token+value=")).is_ok());
+        assert!(validate_keys(&keys("bad\r\nheader")).is_err());
         let bucket = Bucket {
             endpoint: "https://".into(),
             region: "us-east-1".into(),
@@ -1099,15 +839,8 @@ mod tests {
             keep_local: true,
             no_overwrite: NoOverwrite::IfNoneMatch,
         };
-        let client = Client::with_keys(
-            &bucket,
-            Keys {
-                id: "access".into(),
-                secret: "secret".into(),
-                token: None,
-            },
-        )
-        .unwrap();
+        let client =
+            Client::with_keys(&bucket, Keys::new("access".into(), "secret".into(), None)).unwrap();
         assert_eq!(client.origin, "https://MinIO.Example:9000");
         assert_eq!(client.host, "MinIO.Example:9000");
         assert_eq!(client.bucket.prefix, "Exact %2f /");
@@ -1115,6 +848,72 @@ mod tests {
             client.path("Exact %2f /clip.mkv"),
             "/camera-archive/Exact%20%252f%20/clip.mkv"
         );
+    }
+
+    /// S3 credentials name exactly one source: `environment` never falls
+    /// back to AWS_PROFILE or the default profile, and a profile never to
+    /// the environment, unlike Bedrock's chain.
+    #[test]
+    fn s3_credentials_never_fall_back_to_other_aws_sources() {
+        let dir = std::env::temp_dir().join(format!(
+            "capturefab-s3-sources-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let credentials = dir.join("credentials");
+        std::fs::write(
+            &credentials,
+            "[default]\naws_access_key_id=DEFAULT\naws_secret_access_key=d\n[lab]\naws_access_key_id=LAB\naws_secret_access_key=l\n",
+        )
+        .unwrap();
+        let vars = |name: &str| -> Option<OsString> {
+            match name {
+                "AWS_SHARED_CREDENTIALS_FILE" => Some(credentials.clone().into()),
+                "AWS_PROFILE" => Some("default".into()),
+                _ => None,
+            }
+        };
+        let error = keys_in(&Credentials::Environment, &vars).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are not set in the uploading process"
+        );
+        assert!(!retryable(&error));
+        let with_environment = |name: &str| -> Option<OsString> {
+            match name {
+                "AWS_ACCESS_KEY_ID" => Some("ENV".into()),
+                "AWS_SECRET_ACCESS_KEY" => Some("e".into()),
+                _ => vars(name),
+            }
+        };
+        let lab = Credentials::Profile { name: "lab".into() };
+        assert_eq!(keys_in(&lab, &with_environment).unwrap().id(), "LAB");
+        let missing = Credentials::Profile {
+            name: "missing".into(),
+        };
+        let error = keys_in(&missing, &with_environment).err().unwrap();
+        assert!(
+            error.to_string().starts_with("profile [missing] in ") && !retryable(&error),
+            "{error:#}"
+        );
+        let invalid = |name: &str| -> Option<OsString> {
+            match name {
+                "AWS_ACCESS_KEY_ID" => Some("ENV".into()),
+                "AWS_SECRET_ACCESS_KEY" => Some("e".into()),
+                "AWS_SESSION_TOKEN" => Some("bad token".into()),
+                _ => None,
+            }
+        };
+        let error = keys_in(&Credentials::Environment, &invalid).err().unwrap();
+        assert!(
+            error.to_string().starts_with("AWS session token") && !retryable(&error),
+            "{error:#}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A loopback HTTP server answering each request with the next status,
@@ -1194,15 +993,7 @@ mod tests {
     }
 
     fn client(bucket: &Bucket) -> Client {
-        Client::with_keys(
-            bucket,
-            Keys {
-                id: "access".into(),
-                secret: "secret".into(),
-                token: None,
-            },
-        )
-        .unwrap()
+        Client::with_keys(bucket, Keys::new("access".into(), "secret".into(), None)).unwrap()
     }
 
     fn upload_file() -> (std::path::PathBuf, String) {

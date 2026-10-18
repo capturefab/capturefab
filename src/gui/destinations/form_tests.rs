@@ -2,6 +2,7 @@
 use super::*;
 use crate::gui::accessibility::{Node, NodeId, Role, mapped, snapshot_widget};
 use iced::Size;
+use std::collections::BTreeMap;
 
 fn editor(source: Option<Source>) -> Editor {
     let mut editor = match source {

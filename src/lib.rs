@@ -5,6 +5,8 @@ pub mod ai;
 pub mod analytics;
 pub mod auto;
 pub mod autocapture;
+#[cfg(any(feature = "s3", feature = "ai"))]
+pub mod aws;
 pub mod camera;
 pub mod camera_profile;
 pub mod cli;
@@ -30,6 +32,7 @@ pub mod remote;
 pub mod s3;
 pub mod scanner;
 pub mod scheduling;
+pub mod secret_input;
 pub mod session;
 pub mod shared_memory;
 pub mod signals;

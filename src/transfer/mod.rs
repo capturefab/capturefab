@@ -6,7 +6,7 @@
 //! (`destination add-*`, `destination test`, the GUI's Test action), never in
 //! camera workers or the session coordinator.
 use crate::destination::{Remote, SecretSource};
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::{io::Read, path::Path};
 
@@ -18,6 +18,7 @@ pub mod sftp;
 mod sftp_test_server;
 
 pub use crate::destination::{FTP_SERVICE, SFTP_KEY_SERVICE, SFTP_SERVICE};
+pub use crate::secret_input::read_stdin_secret;
 
 /// An error that retrying will not fix: refused credentials, a missing
 /// bucket or folder, a changed host key, or an object that already exists.
@@ -182,31 +183,6 @@ pub(crate) fn secret_for(remote: &Remote) -> Result<Option<String>> {
     }
 }
 
-/// Read a secret from stdin: at most 4096 bytes plus one terminal newline
-/// (LF or CRLF), which is removed. Other bytes, including spaces, are kept.
-pub(crate) fn read_stdin_secret(reader: impl Read, what: &str) -> Result<String> {
-    let mut data = Vec::new();
-    // Allow a maximum-size secret followed by CRLF, plus one byte to detect
-    // an oversized input without reading an unbounded pipe into memory.
-    reader.take(4099).read_to_end(&mut data)?;
-    ensure!(
-        data.len() <= 4098,
-        "{what} stdin exceeds 4096 bytes plus a terminal newline"
-    );
-    if data.last() == Some(&b'\n') {
-        data.pop();
-        if data.last() == Some(&b'\r') {
-            data.pop();
-        }
-    }
-    let secret = String::from_utf8(data).with_context(|| format!("{what} stdin must be UTF-8"))?;
-    ensure!(
-        !secret.is_empty() && secret.len() <= 4096,
-        "{what} must contain 1..4096 bytes"
-    );
-    Ok(secret)
-}
-
 // ---------------------------------------------------------------------------
 // Checksummed reads.
 
@@ -308,21 +284,6 @@ pub(crate) fn token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stdin_secrets_keep_bytes_and_bound_reads() {
-        for (input, expected) in [
-            (" key \t", " key \t"),
-            (" key \t\r\n", " key \t"),
-            ("clé \n", "clé "),
-            ("key\n\n", "key\n"),
-        ] {
-            assert_eq!(read_stdin_secret(input.as_bytes(), "x").unwrap(), expected);
-        }
-        assert!(read_stdin_secret("\n".as_bytes(), "x").is_err());
-        assert!(read_stdin_secret("x".repeat(5000).as_bytes(), "x").is_err());
-        assert!(read_stdin_secret(&[0xff, 0xfe][..], "x").is_err());
-    }
 
     #[test]
     fn hashing_reader_counts_and_hashes() {

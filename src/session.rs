@@ -602,6 +602,29 @@ impl SessionCommand {
         )
     }
 }
+/// How long a client waits for the session to answer `command` unless told
+/// otherwise: a minute, or longer for commands whose own timeouts or work
+/// can exceed it (multi-frame captures, exports, signal reads and browses).
+pub fn default_request_timeout(command: &SessionCommand) -> Duration {
+    Duration::from_millis(match command {
+        SessionCommand::Capture {
+            count, timeout_ms, ..
+        } => timeout_ms
+            .saturating_mul(u64::from(*count))
+            .saturating_add(60_000),
+        SessionCommand::CaptureExample { timeout_ms } => timeout_ms.saturating_add(60_000),
+        SessionCommand::DatasetExport { .. } => 600_000,
+        SessionCommand::DatasetQuery { timeout_ms, .. } => (if *timeout_ms == 0 {
+            30_000
+        } else {
+            *timeout_ms
+        })
+        .saturating_add(10_000),
+        SessionCommand::SignalRead { timeout_ms, .. } => timeout_ms.saturating_add(10_000),
+        SessionCommand::SignalBrowse { duration_ms, .. } => duration_ms.saturating_add(15_000),
+        _ => 60_000,
+    })
+}
 pub fn validate_timeout(timeout_ms: u64) -> Result<()> {
     ensure!(
         (1..=60_000).contains(&timeout_ms),
@@ -2306,6 +2329,42 @@ mod tests {
         .unwrap();
         assert!(!failed.ok);
         assert_eq!((failed.saved.items.len(), failed.saved.lost), (1, 2));
+    }
+    #[test]
+    fn request_timeouts_cover_the_work_a_command_can_wait_for() {
+        let timeout = |json: &str| {
+            default_request_timeout(&SessionCommand::from_json_slice(json.as_bytes()).unwrap())
+        };
+        // Every frame may wait its full timeout, plus a minute to save.
+        assert_eq!(
+            timeout(
+                r#"{"op":"capture","output":"a.png","count":5,"timeout_ms":10000,"format":"png"}"#
+            ),
+            Duration::from_secs(110)
+        );
+        assert_eq!(
+            timeout(
+                r#"{"op":"capture","output":"a.png","count":1,"timeout_ms":60000,"format":"png"}"#
+            ),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            timeout(r#"{"op":"dataset_export","output":"export"}"#),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            timeout(r#"{"op":"dataset_query","sql":"SELECT 1"}"#),
+            Duration::from_secs(40)
+        );
+        assert_eq!(
+            timeout(r#"{"op":"dataset_query","sql":"SELECT 1","timeout_ms":5000}"#),
+            Duration::from_secs(15)
+        );
+        assert_eq!(timeout(r#"{"op":"status"}"#), Duration::from_secs(60));
+        assert_eq!(
+            default_request_timeout(&SessionCommand::Disconnect),
+            Duration::from_secs(60)
+        );
     }
     #[test]
     fn plant_floor_commands_keep_old_wire_shapes_and_strict_unit_ops() {

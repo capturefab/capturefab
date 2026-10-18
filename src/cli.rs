@@ -1054,8 +1054,8 @@ fn hex(s: &str) -> Result<Vec<u8>> {
 }
 
 #[cfg(feature = "s3")]
-fn read_secret(reader: impl io::Read) -> Result<String> {
-    let secret = crate::transfer::read_stdin_secret(reader, "S3 secret")?;
+fn read_secret(reader: impl io::Read) -> Result<zeroize::Zeroizing<String>> {
+    let secret = crate::secret_input::read_stdin_secret(reader, "S3 secret")?;
     crate::s3::validate_secret(&secret)?;
     Ok(secret)
 }
@@ -1167,29 +1167,10 @@ impl<'a> Client<'a> {
 }
 
 fn request_timeout(cli: &Cli, command: &SessionCommand) -> Result<Duration> {
-    let millis = if let Some(timeout) = &cli.request_timeout {
-        crate::scheduling::parse_duration(timeout)?
-    } else {
-        match command {
-            SessionCommand::Capture {
-                count, timeout_ms, ..
-            } => timeout_ms
-                .saturating_mul(u64::from(*count))
-                .saturating_add(60_000),
-            SessionCommand::CaptureExample { timeout_ms } => timeout_ms.saturating_add(60_000),
-            SessionCommand::DatasetExport { .. } => 600_000,
-            SessionCommand::DatasetQuery { timeout_ms, .. } => (if *timeout_ms == 0 {
-                30_000
-            } else {
-                *timeout_ms
-            })
-            .saturating_add(10_000),
-            SessionCommand::SignalRead { timeout_ms, .. } => timeout_ms.saturating_add(10_000),
-            SessionCommand::SignalBrowse { duration_ms, .. } => duration_ms.saturating_add(15_000),
-            _ => 60_000,
-        }
-    };
-    Ok(Duration::from_millis(millis))
+    Ok(match &cli.request_timeout {
+        Some(timeout) => Duration::from_millis(crate::scheduling::parse_duration(timeout)?),
+        None => crate::session::default_request_timeout(command),
+    })
 }
 fn addressed_camera<'a>(state: &'a Value, selector: &str) -> Option<&'a Value> {
     let cameras = state["cameras"].as_array()?;
@@ -4012,12 +3993,12 @@ mod tests {
             ("key\n\n", "key\n"),
             ("key\r", "key\r"),
         ] {
-            assert_eq!(read_secret(input.as_bytes()).unwrap(), expected);
+            assert_eq!(read_secret(input.as_bytes()).unwrap().as_str(), expected);
         }
         let maximum = "x".repeat(4096);
-        assert_eq!(read_secret(maximum.as_bytes()).unwrap(), maximum);
+        assert_eq!(*read_secret(maximum.as_bytes()).unwrap(), maximum);
         assert_eq!(
-            read_secret(format!("{maximum}\r\n").as_bytes()).unwrap(),
+            *read_secret(format!("{maximum}\r\n").as_bytes()).unwrap(),
             maximum
         );
         for input in [

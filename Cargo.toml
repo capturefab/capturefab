@@ -42,7 +42,7 @@ opcua = ["dep:async-opcua", "dep:tokio"]
 mtconnect = ["dep:ureq"]
 # Prompt measurements use HTTPS with the OS certificate store and native
 # Keychain / Credential Manager / Secret Service credentials.
-ai = ["dep:ureq", "dep:keyring", "dep:zeroize"]
+ai = ["dep:ureq", "dep:keyring", "dep:ring"]
 # Bundled DINOv2 ViT-S/14 embeddings for auto capture (Apache-2.0 weights from
 # scripts/fetch-dinov2.py): wgpu compute shaders in an isolated helper process
 # (Metal, Vulkan, DX12), with a native CPU fallback.
@@ -87,8 +87,11 @@ turbojpeg = { version = "1.5", optional = true, default-features = false, featur
 libloading = { version = "0.8", optional = true }
 ureq = { version = "3.4", optional = true, default-features = false, features = ["rustls", "platform-verifier"] }
 keyring = { version = "4.2", optional = true }
-zeroize = { version = "1", optional = true }
+zeroize = "1"
 rfd = { version = "0.17", optional = true }
+# RS256 signing of Google service-account tokens for the assistant; the same
+# ring that rustls and russh already build.
+ring = { version = "0.17.14", optional = true }
 # TLS for FTPS and MQTT over TLS: ring only (no aws-lc-rs, so no C toolchain or cmake).
 rustls = { version = "0.23.45", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 rustls-platform-verifier = { version = "0.7.1", optional = true }

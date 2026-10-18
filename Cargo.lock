@@ -1154,6 +1154,7 @@ dependencies = [
  "png",
  "raw-window-handle",
  "rfd",
+ "ring",
  "roxmltree",
  "rumqttc",
  "russh",

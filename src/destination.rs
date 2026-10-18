@@ -7,13 +7,16 @@
 //! Every file is still written locally through `storage` (budgets, retention,
 //! never overwriting). A network destination writes into a local staging
 //! folder and queues each finished file for upload (see `upload`).
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
 };
+use zeroize::Zeroizing;
+
+pub(crate) mod secrets;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Destination {
@@ -853,6 +856,42 @@ pub fn save(destination: Destination) -> Result<()> {
     })
 }
 
+/// Add a new destination, never replacing a saved one with the same name.
+/// A folder destination's directory is made first; `secret` is stored in
+/// the OS credential store under an S3 destination's access key ID while the
+/// list is written, and put back if the list cannot be. Answers whether a
+/// secret was stored. The credential store can prompt, so never call this
+/// on the GUI thread.
+pub fn create(destination: &Destination, secret: Option<Zeroizing<String>>) -> Result<bool> {
+    destination.validate()?;
+    let write = match secret {
+        None => None,
+        Some(_) if !cfg!(feature = "s3") => {
+            bail!("S3 destinations are unsupported in this build; rebuild with --features s3")
+        }
+        Some(secret) => {
+            let Target::S3(Bucket {
+                credentials: Credentials::Keychain { access_key_id },
+                ..
+            }) = &destination.target
+            else {
+                bail!("only an S3 destination with keychain credentials takes a secret key");
+            };
+            #[cfg(feature = "s3")]
+            crate::s3::validate_secret(&secret)?;
+            secrets::SecretWrite::queue(Some((access_key_id.clone(), secret)))
+        }
+    };
+    // Checked again under the lock: a destination saved meanwhile is still
+    // never replaced, only reported less plainly.
+    let name = &destination.name;
+    ensure!(
+        !list()?.iter().any(|saved| &saved.name == name),
+        "a destination named {name} already exists; choose another name"
+    );
+    Ok(secrets::save_with_secret(None, destination, None, write)?.is_some())
+}
+
 pub fn remove(name: &str) -> Result<Destination> {
     validate_name(name)?;
     locked(|file| {
@@ -1282,6 +1321,96 @@ mod tests {
             !touched.get(),
             "conflict validation happens before touching credentials"
         );
+    }
+
+    #[test]
+    fn create_makes_folders_and_never_replaces_a_saved_name() {
+        // A child with its own session directory, like the undo test above.
+        if std::env::var_os("CAPTUREFAB_DESTINATION_CREATE_TEST").is_none() {
+            let dir = std::env::temp_dir().join(format!(
+                "capturefab-destination-create-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            crate::ipc::ensure_private_dir(&dir).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "destination::tests::create_makes_folders_and_never_replaces_a_saved_name",
+                    "--nocapture",
+                ])
+                .env("CAPTUREFAB_SESSION_DIR", &dir)
+                .env("CAPTUREFAB_DESTINATION_CREATE_TEST", "1")
+                .output()
+                .unwrap();
+            let _ = fs::remove_dir_all(dir);
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = crate::ipc::session_dir().join("folders");
+        let folder = |name: &str, path: &str| Destination {
+            name: name.into(),
+            target: Target::Folder {
+                path: root.join(path),
+            },
+        };
+        let line = folder("line-1", "line-1/photos");
+        assert!(!create(&line, None).unwrap());
+        assert!(root.join("line-1/photos").is_dir());
+        assert_eq!(get("line-1").unwrap(), line);
+        // The same name is refused before anything changes.
+        let error = create(&folder("line-1", "other"), None).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "a destination named line-1 already exists; choose another name"
+        );
+        assert_eq!(get("line-1").unwrap(), line);
+        assert!(!root.join("other").exists());
+        let secret = || Some(Zeroizing::new("secret".to_string()));
+        // Builds without S3 support refuse every secret.
+        let refused = |result: Result<bool>, reason: &str| {
+            let error = result.unwrap_err().to_string();
+            let reason = if cfg!(feature = "s3") {
+                reason
+            } else {
+                "S3 destinations are unsupported in this build"
+            };
+            assert!(error.contains(reason), "{error}");
+        };
+        refused(
+            create(&folder("line-2", "line-2"), secret()),
+            "only an S3 destination with keychain credentials",
+        );
+        assert!(get("line-2").is_err() && !root.join("line-2").exists());
+        let mut by_profile = bucket();
+        by_profile.credentials = Credentials::Profile { name: "lab".into() };
+        let profile = Destination {
+            name: "by-profile".into(),
+            target: Target::S3(by_profile),
+        };
+        refused(
+            create(&profile, secret()),
+            "only an S3 destination with keychain credentials",
+        );
+        assert!(!create(&profile, None).unwrap());
+        // A bucket without a typed secret never touches the credential
+        // store; with one, a taken name is refused before it is stored.
+        let archive = Destination {
+            name: "archive".into(),
+            target: Target::S3(bucket()),
+        };
+        assert!(!create(&archive, None).unwrap());
+        refused(create(&archive, secret()), "already exists");
+        assert!(create(&folder("../bad", "bad"), None).is_err());
+        assert_eq!(list().unwrap().len(), 3);
     }
 
     #[test]

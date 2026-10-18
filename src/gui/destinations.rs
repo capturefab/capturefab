@@ -15,21 +15,20 @@ use super::sparkline::History;
 use super::style::{self, Palette};
 use super::text_input::{self, text_input};
 use super::widgets::{SheetFrame, disclosure, fade, field_error, one_line, sheet_frame};
+use crate::destination::secrets::{self, SecretChange, SecretWrite, restore_secret};
 use crate::destination::{self, Bucket, Credentials, Destination, NoOverwrite, Target};
 use crate::volumes::{self, Volume};
 use iced::widget::{column, container, row, space, text};
 use iced::{Alignment, Element, Fill, Length, Theme};
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
     fmt,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
     sync::mpsc::{Receiver, TryRecvError, channel},
-    sync::{Mutex, PoisonError},
     thread,
     time::{Duration, Instant},
 };
+use zeroize::Zeroizing;
 
 /// How long the access key ID must rest before the keychain is asked
 /// whether it holds the key's secret, so typing never waits on it.
@@ -53,8 +52,6 @@ mod form_tests;
 pub(super) mod layout_tests;
 mod naming_presets;
 pub use naming_presets::Naming;
-static SECRET_WRITES: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
-static NEXT_SECRET_WRITE: AtomicU64 = AtomicU64::new(1);
 
 /// Run `work` on a thread; poll the receiver for its result.
 fn background<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Receiver<T> {
@@ -257,22 +254,6 @@ impl DraftHistory {
         }
         self.redo.clear();
         self.last = (coalesce && !canceled).then_some((label, now));
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct SecretChange {
-    access_key_id: String,
-    before: Option<String>,
-    after: String,
-}
-
-impl fmt::Debug for SecretChange {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SecretChange")
-            .field("access_key_id", &self.access_key_id)
-            .field("previously_stored", &self.before.is_some())
-            .finish_non_exhaustive()
     }
 }
 
@@ -779,27 +760,17 @@ impl Editor {
         before: Option<Destination>,
         remember: bool,
     ) -> impl FnOnce() -> anyhow::Result<Option<SecretChange>> + Send + 'static {
-        let folder = match &destination.target {
-            Target::Folder { path } => Some(path.clone()),
-            _ => None,
-        };
         let destination = destination.clone();
-        let secret = SecretWrite::queue(self.secret_to_store());
+        let secret = SecretWrite::queue(
+            self.secret_to_store()
+                .map(|(access_key_id, secret)| (access_key_id, Zeroizing::new(secret))),
+        );
         move || {
-            if let Some(path) = folder {
-                volumes::ensure_present(&path)?;
-                std::fs::create_dir_all(&path)
-                    .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", path.display()))?;
-            }
-            destination::replace_with_selection(
+            secrets::save_with_secret(
                 before.as_ref(),
-                Some(&destination),
+                &destination,
                 Some((Some(&destination.name), remember)),
-                || store_secret(secret),
-                |change| match change {
-                    Some(change) => restore_secret(change, true),
-                    None => Ok(()),
-                },
+                secret,
             )
         }
     }
@@ -860,116 +831,6 @@ impl Editor {
             }
         }
     }
-}
-
-/// A typed secret to store under its access key ID, numbered on the UI
-/// thread in the order editors asked for stores.
-struct SecretWrite {
-    access_key_id: String,
-    secret: String,
-    ticket: u64,
-}
-
-impl SecretWrite {
-    fn queue(secret: Option<(String, String)>) -> Option<Self> {
-        secret.map(|(access_key_id, secret)| Self {
-            access_key_id,
-            secret,
-            ticket: NEXT_SECRET_WRITE.fetch_add(1, Ordering::Relaxed),
-        })
-    }
-
-    /// Store with `store`, one write at a time, unless a store asked for
-    /// later already wrote this key: an editor drops a store it no longer
-    /// wants, but its thread may still be waiting on a keychain prompt, and
-    /// must not land over the newer secret.
-    fn store_in_order<T>(
-        self,
-        written: &Mutex<BTreeMap<String, u64>>,
-        store: impl FnOnce(&str, &str) -> anyhow::Result<T>,
-    ) -> anyhow::Result<T> {
-        let mut written = written.lock().unwrap_or_else(PoisonError::into_inner);
-        if written
-            .get(&self.access_key_id)
-            .is_some_and(|&ticket| ticket > self.ticket)
-        {
-            return Err(anyhow::anyhow!(
-                "The credential write was superseded; save again"
-            ));
-        }
-        let result = store(&self.access_key_id, &self.secret)?;
-        written.insert(self.access_key_id, self.ticket);
-        Ok(result)
-    }
-}
-
-/// Store a typed secret under its access key ID in the OS credential store;
-/// whether one was. It can wait on a keychain prompt, so off the UI thread.
-fn store_secret(write: Option<SecretWrite>) -> anyhow::Result<Option<SecretChange>> {
-    // Without S3 support there is no bucket to store a secret for.
-    let Some(write) = write.filter(|_| cfg!(feature = "s3")) else {
-        return Ok(None);
-    };
-    write
-        .store_in_order(&SECRET_WRITES, |access_key_id, secret| {
-            let before = keychain_read(access_key_id)?;
-            keychain_store(access_key_id, secret)?;
-            Ok(SecretChange {
-                access_key_id: access_key_id.into(),
-                before,
-                after: secret.into(),
-            })
-        })
-        .map(Some)
-}
-
-fn restore_secret(change: &SecretChange, undo: bool) -> anyhow::Result<()> {
-    let mut written = SECRET_WRITES.lock().unwrap_or_else(PoisonError::into_inner);
-    restore_secret_using(change, undo, keychain_read, |id, secret| match secret {
-        Some(secret) => keychain_store(id, secret),
-        None => keychain_delete(id),
-    })?;
-    written.insert(
-        change.access_key_id.clone(),
-        NEXT_SECRET_WRITE.fetch_add(1, Ordering::Relaxed),
-    );
-    Ok(())
-}
-
-fn restore_secret_using(
-    change: &SecretChange,
-    undo: bool,
-    read: impl FnOnce(&str) -> anyhow::Result<Option<String>>,
-    write: impl FnOnce(&str, Option<&str>) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    let (expected, desired) = if undo {
-        (Some(change.after.as_str()), change.before.as_deref())
-    } else {
-        (change.before.as_deref(), Some(change.after.as_str()))
-    };
-    anyhow::ensure!(
-        read(&change.access_key_id)?.as_deref() == expected,
-        "the stored credential changed outside this edit; undo cannot overwrite it"
-    );
-    write(&change.access_key_id, desired)
-}
-
-#[cfg(feature = "s3")]
-use crate::s3::store_secret as keychain_store;
-#[cfg(feature = "s3")]
-use crate::s3::{delete_secret as keychain_delete, read_secret as keychain_read};
-
-#[cfg(not(feature = "s3"))]
-fn keychain_store(_access_key_id: &str, _secret: &str) -> anyhow::Result<()> {
-    Ok(())
-}
-#[cfg(not(feature = "s3"))]
-fn keychain_read(_access_key_id: &str) -> anyhow::Result<Option<String>> {
-    Ok(None)
-}
-#[cfg(not(feature = "s3"))]
-fn keychain_delete(_access_key_id: &str) -> anyhow::Result<()> {
-    Ok(())
 }
 
 /// Check a destination: write a probe file to a folder, or reach a bucket.
@@ -3579,6 +3440,7 @@ fn folder_encoding_error() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn ms(value: u64) -> Duration {
         Duration::from_millis(value)
@@ -3664,11 +3526,11 @@ mod tests {
         picker.record_change(
             None,
             Some(bucket(|_| {}).destination().unwrap()),
-            Some(SecretChange {
-                access_key_id: "AKIA".into(),
-                before: Some("private-first".into()),
-                after: "private-second".into(),
-            }),
+            Some(SecretChange::new(
+                "AKIA",
+                Some("private-first"),
+                "private-second",
+            )),
             before_selection,
             &output,
             Instant::now(),
@@ -3881,11 +3743,7 @@ mod tests {
         app.capture_to.record_change(
             None,
             Some(bucket(|_| {}).destination().unwrap()),
-            Some(SecretChange {
-                access_key_id: "test-key".into(),
-                before: None,
-                after: "test-secret".into(),
-            }),
+            Some(SecretChange::new("test-key", None, "test-secret")),
             before.clone(),
             &app.output,
             Instant::now(),
@@ -3930,70 +3788,6 @@ mod tests {
         );
         let _ = app.update(AppMessage::Redo);
         assert_eq!(app.output, "newer.png");
-    }
-
-    #[test]
-    fn a_superseded_secret_store_never_lands_over_a_newer_one() {
-        let queue =
-            |id: &str, secret: &str| SecretWrite::queue(Some((id.into(), secret.into()))).unwrap();
-        let older = queue("AKIA", "old");
-        let newer = queue("AKIA", "new");
-        let other = queue("AKIB", "b");
-        let written = Mutex::new(BTreeMap::new());
-        let stored = std::cell::RefCell::new(Vec::new());
-        let store = |id: &str, secret: &str| {
-            stored.borrow_mut().push(format!("{id}={secret}"));
-            Ok(())
-        };
-        // The newer store's thread runs first; the older one then finds it
-        // superseded, while an unrelated key still stores.
-        newer.store_in_order(&written, store).unwrap();
-        assert!(older.store_in_order(&written, store).is_err());
-        other.store_in_order(&written, store).unwrap();
-        assert_eq!(*stored.borrow(), ["AKIA=new", "AKIB=b"]);
-        // In order, both store and the newer one is last.
-        let (first, second) = (queue("AKIC", "1"), queue("AKIC", "2"));
-        first.store_in_order(&written, store).unwrap();
-        second.store_in_order(&written, store).unwrap();
-        assert_eq!(stored.borrow()[2..], ["AKIC=1", "AKIC=2"]);
-    }
-
-    #[test]
-    fn credential_undo_redo_restore_old_values_without_overwriting_external_changes() {
-        let change = SecretChange {
-            access_key_id: "AKIA".into(),
-            before: Some("old".into()),
-            after: "new".into(),
-        };
-        let current = std::cell::RefCell::new(Some("new".to_string()));
-        let read = |_: &str| Ok(current.borrow().clone());
-        let write = |_: &str, value: Option<&str>| {
-            *current.borrow_mut() = value.map(str::to_owned);
-            Ok(())
-        };
-        restore_secret_using(&change, true, read, write).unwrap();
-        assert_eq!(current.borrow().as_deref(), Some("old"));
-        restore_secret_using(&change, false, read, write).unwrap();
-        assert_eq!(current.borrow().as_deref(), Some("new"));
-        *current.borrow_mut() = Some("external".into());
-        assert!(restore_secret_using(&change, true, read, write).is_err());
-        assert_eq!(current.borrow().as_deref(), Some("external"));
-        assert!(
-            restore_secret_using(&change, true, |_| Err(anyhow::anyhow!("locked")), write).is_err()
-        );
-        assert_eq!(current.borrow().as_deref(), Some("external"));
-        let new_key = SecretChange {
-            before: None,
-            ..change
-        };
-        *current.borrow_mut() = Some("new".into());
-        restore_secret_using(&new_key, true, read, write).unwrap();
-        assert!(
-            current.borrow().is_none(),
-            "undoing a new key removes only that key"
-        );
-        restore_secret_using(&new_key, false, read, write).unwrap();
-        assert_eq!(current.borrow().as_deref(), Some("new"));
     }
 
     /// A bucket that validates, changed by `change`.

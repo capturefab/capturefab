@@ -508,6 +508,91 @@ pub fn ffmpeg_info() -> Result<Value> {
         json!({"embedded":!EMBEDDED.is_empty(),"embedded_bytes":EMBEDDED.len(),"version":version,"protocols":protocols,"encoders":encoders,"license_notice":LICENSE}),
     )
 }
+/// How long a failed encoder listing is remembered before FFmpeg runs again.
+const ENCODER_RETRY: Duration = Duration::from_secs(60);
+/// What `encoder_names` learned from FFmpeg so far in this process.
+enum EncoderListing {
+    Unknown,
+    Listed(Arc<Vec<String>>),
+    Failed { at: Instant, error: String },
+}
+static ENCODER_NAMES: Mutex<EncoderListing> = Mutex::new(EncoderListing::Unknown);
+
+/// Names of the encoders in this FFmpeg build, such as `libx264` and
+/// `h264_videotoolbox`. FFmpeg runs once per process, with only `-encoders`;
+/// a failure is remembered for a minute, so callers that refresh often do
+/// not relaunch (or re-extract) a missing or broken FFmpeg each time.
+pub fn encoder_names() -> Result<Arc<Vec<String>>> {
+    listed_encoders(&ENCODER_NAMES, Instant::now(), || {
+        let exe = executable()?;
+        let (ok, listing) = bounded_output(
+            &exe,
+            &["-hide_banner".into(), "-encoders".into()],
+            PROBE_TIMEOUT,
+        )?;
+        ensure!(ok, "FFmpeg encoder query failed");
+        let names = parse_encoder_names(&listing);
+        ensure!(!names.is_empty(), "FFmpeg listed no encoders");
+        Ok(names)
+    })
+}
+
+fn listed_encoders(
+    cache: &Mutex<EncoderListing>,
+    now: Instant,
+    list: impl FnOnce() -> Result<Vec<String>>,
+) -> Result<Arc<Vec<String>>> {
+    // Held while FFmpeg runs, so concurrent callers share one run.
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    match &*cache {
+        EncoderListing::Listed(names) => return Ok(names.clone()),
+        EncoderListing::Failed { at, error }
+            if now.saturating_duration_since(*at) < ENCODER_RETRY =>
+        {
+            bail!("{error}")
+        }
+        _ => {}
+    }
+    match list() {
+        Ok(names) => {
+            let names = Arc::new(names);
+            *cache = EncoderListing::Listed(names.clone());
+            Ok(names)
+        }
+        Err(error) => {
+            *cache = EncoderListing::Failed {
+                at: now,
+                error: format!("{error:#}"),
+            };
+            Err(error)
+        }
+    }
+}
+
+/// Encoder names from `ffmpeg -encoders` output: the second column of each
+/// row after the `------` line that ends the flag legend. Rows start with
+/// six or more capital-letter-or-dot flags, which skips stderr noise.
+fn parse_encoder_names(listing: &str) -> Vec<String> {
+    let separator = |line: &str| {
+        let line = line.trim();
+        !line.is_empty() && line.bytes().all(|b| b == b'-')
+    };
+    listing
+        .lines()
+        .skip_while(|line| !separator(line))
+        .skip(1)
+        .filter_map(|line| {
+            let mut columns = line.split_whitespace();
+            let (flags, name) = (columns.next()?, columns.next()?);
+            (flags.len() >= 6
+                && flags.bytes().all(|b| b == b'.' || b.is_ascii_uppercase())
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+            .then(|| name.to_owned())
+        })
+        .collect()
+}
 pub fn native_devices() -> Result<Value> {
     native_devices_with_timeout(Duration::from_secs(8))
 }
@@ -3113,6 +3198,92 @@ impl Drop for Forwarder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Trimmed `ffmpeg -hide_banner -encoders` output of FFmpeg 9.0.2 on
+    /// macOS, with a stderr line appended as `bounded_output` does.
+    const ENCODER_LISTING: &str = "Encoders:
+ V..... = Video
+ A..... = Audio
+ S..... = Subtitle
+ .F.... = Frame-level multithreading
+ ..S... = Slice-level multithreading
+ ...X.. = Codec is experimental
+ ....B. = Supports draw_horiz_band
+ .....D = Supports direct rendering method 1
+ ------
+ V....D a64multi             Multicolor charset for Commodore 64 (codec a64_multi)
+ V..... libsvtav1            SVT-AV1(Scalable Video Technology for AV1) encoder (codec av1)
+ V....D libx264              libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (codec h264)
+ V....D libx264rgb           libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 RGB (codec h264)
+ V....D h264_videotoolbox    VideoToolbox H.264 Encoder (codec h264)
+ V....D libx265              libx265 H.265 / HEVC (codec hevc)
+ V....D hevc_videotoolbox    VideoToolbox H.265 Encoder (codec hevc)
+ VFS..D mjpeg                MJPEG (Motion JPEG)
+ V..X.D avui                 Avid Meridien Uncompressed
+ A....D aac                  AAC (Advanced Audio Coding)
+ A..... aac_at               aac (AudioToolbox) (codec aac)
+ S..... dvbsub               DVB subtitles (codec dvb_subtitle)
+[warning] Some stderr line from FFmpeg
+";
+
+    #[test]
+    fn encoder_names_come_from_the_table_after_the_legend() {
+        assert_eq!(
+            parse_encoder_names(ENCODER_LISTING),
+            [
+                "a64multi",
+                "libsvtav1",
+                "libx264",
+                "libx264rgb",
+                "h264_videotoolbox",
+                "libx265",
+                "hevc_videotoolbox",
+                "mjpeg",
+                "avui",
+                "aac",
+                "aac_at",
+                "dvbsub"
+            ]
+        );
+        // Without the legend's end there is no table to read.
+        assert!(parse_encoder_names(" V....D libx264 libx264 H.264").is_empty());
+        assert!(parse_encoder_names("").is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
+    fn ffmpeg_encoder_names_list_the_build_once() {
+        let names = encoder_names().unwrap();
+        assert!(names.iter().any(|name| name == "png"), "{names:?}");
+        assert!(Arc::ptr_eq(&names, &encoder_names().unwrap()));
+    }
+
+    #[test]
+    fn encoder_listing_is_kept_and_failures_retried_after_a_minute() {
+        let cache = Mutex::new(EncoderListing::Unknown);
+        let start = Instant::now();
+        let runs = std::cell::Cell::new(0);
+        let failing = || {
+            runs.set(runs.get() + 1);
+            Err(anyhow!("FFmpeg encoder query failed"))
+        };
+        let listing = || {
+            runs.set(runs.get() + 1);
+            Ok(vec!["libx264".to_string()])
+        };
+        let error = listed_encoders(&cache, start, failing).unwrap_err();
+        assert_eq!(error.to_string(), "FFmpeg encoder query failed");
+        // Within a minute the failure is answered without running FFmpeg.
+        let error = listed_encoders(&cache, start + Duration::from_secs(59), listing).unwrap_err();
+        assert_eq!(error.to_string(), "FFmpeg encoder query failed");
+        assert_eq!(runs.get(), 1);
+        let names = listed_encoders(&cache, start + ENCODER_RETRY, listing).unwrap();
+        assert_eq!(*names, ["libx264"]);
+        // A listing is kept for the rest of the process.
+        let again = listed_encoders(&cache, start + Duration::from_secs(3600), failing).unwrap();
+        assert!(Arc::ptr_eq(&names, &again));
+        assert_eq!(runs.get(), 2);
+    }
     use crate::genicam::NodeMap;
     #[test]
     fn ppm_preserves_whitespace_pixels_and_multiple_frames() {
