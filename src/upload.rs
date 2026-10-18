@@ -1046,17 +1046,17 @@ fn run() {
         Ok(((), Change::put(put)))
     });
     let mut clients: HashMap<String, (Box<dyn Uploader>, Instant)> = HashMap::new();
-    let mut held_at: Option<Instant> = None;
+    let mut hold_at = Instant::now();
     loop {
         clients.retain(|_, (_, used)| used.elapsed() < CLIENT_IDLE);
-        if held_at.is_none_or(|at| at.elapsed() >= HOLD_RETRY) {
+        if Instant::now() >= hold_at {
             let _ = with_queue(hold_unheld);
-            held_at = Some(Instant::now());
+            hold_at = Instant::now() + HOLD_RETRY;
         }
         let item = match with_queue(next_due) {
             Ok(Some(item)) => item,
             Ok(None) | Err(_) => {
-                idle();
+                idle(hold_at);
                 continue;
             }
         };
@@ -1072,18 +1072,15 @@ fn run() {
     }
 }
 
-/// Wait while nothing is due: until the next upload is, this process
-/// queues or retries one, or the queue files change. Another process's
-/// change is noticed with a look at the files every `POLL`, without
-/// reading or locking them.
-fn idle() {
+/// Wait while nothing is due: until the next upload is, `hold_at` passes
+/// with files queued unheld, this process queues or retries one, or the
+/// queue files change. Another process's change is noticed with a look at
+/// the files every `POLL`, without reading or locking them.
+fn idle(hold_at: Instant) {
     let cached = UPLOADS.lock().unwrap_or_else(PoisonError::into_inner);
-    let Some((due, dir, seen)) = cached.as_ref().map(|u| {
-        // Files queued unheld are tried again soon, whatever is due.
-        let hold = u.queue.items.iter().any(|i| i.unheld);
-        let hold = hold.then(|| now() + HOLD_RETRY.as_secs());
-        let due = u.next_due_at().into_iter().chain(hold).min();
-        (due, u.dir.clone(), u.seen)
+    let Some((due, unheld, dir, seen)) = cached.as_ref().map(|u| {
+        let unheld = u.queue.items.iter().any(|i| i.unheld);
+        (u.next_due_at(), unheld, u.dir.clone(), u.seen)
     }) else {
         drop(cached);
         thread::sleep(POLL);
@@ -1093,11 +1090,18 @@ fn idle() {
     let stamp = |name| Stamp::read(&dir.join(name)).ok().flatten();
     loop {
         let now = now();
-        let wait = match due {
+        let mut wait = match due {
             Some(due) if due <= now => return,
             Some(due) => POLL.min(Duration::from_secs(due - now)),
             None => POLL,
         };
+        if unheld {
+            let left = hold_at.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            wait = wait.min(left);
+        }
         let guard = WAKE.0.lock().unwrap_or_else(PoisonError::into_inner);
         let woken = !WAKE
             .1
@@ -1763,6 +1767,23 @@ mod tests {
         let archive = &status().unwrap()["destinations"]["archive"];
         assert!(archive["next_attempt"].as_u64().unwrap() <= now());
         assert!(read(|uploads| Ok(uploads.queue.totals.backoff.is_empty())).unwrap());
+    }
+
+    #[test]
+    fn the_uploader_holds_unheld_captures_once_the_ledger_allows() {
+        if !isolated("the_uploader_holds_unheld_captures_once_the_ledger_allows") {
+            return;
+        }
+        HOLD_FAILS.store(true, Ordering::Relaxed);
+        enqueue("line", &ftp(), &staged("shot.png"), "shot.png").unwrap();
+        back_off_first();
+        start_uploading();
+        // Its first try is refused; the next comes while it waits.
+        thread::sleep(Duration::from_secs(1));
+        let unheld = || status().unwrap()["items"][0]["unheld"] == true;
+        assert!(unheld());
+        HOLD_FAILS.store(false, Ordering::Relaxed);
+        assert!(eventually(HOLD_RETRY + Duration::from_secs(5), || !unheld()));
     }
 
     #[test]
