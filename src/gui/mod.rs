@@ -699,6 +699,8 @@ enum Message {
     FocusRegionEnd,
     /// The overview scrolled this far down.
     OverviewScrolled(f32),
+    /// Show the control that changes the histogram's exposure.
+    AdjustExposure,
     FocusMetric(scopes::Metric),
     ResetFocusPeak,
     ToggleActivity,
@@ -2506,6 +2508,23 @@ impl Workbench {
         }
     }
 
+    /// Open the Features tab on the exposure control, lit as when the
+    /// camera takes a value, and focus it when it is a field. Quick controls
+    /// show only while no search narrows the features.
+    fn adjust_exposure(&mut self) -> Task<Message> {
+        let Some(name) = self.exposure_control() else {
+            return Task::none();
+        };
+        self.search.clear();
+        let tab = self.handle_message(Message::ShowTab(Tab::Features));
+        self.flash_feature(name);
+        match name {
+            // A choice, which takes no focus by name.
+            "ExposureAuto" => tab,
+            _ => operation::focus(format!("feature:{name}")),
+        }
+    }
+
     fn zoom_by(&mut self, factor: f32) {
         let from = if self.fit {
             self.shown.as_ref().map_or(1.0, |shown| {
@@ -3166,6 +3185,7 @@ impl Workbench {
             }
             Message::FocusRegionStart => self.break_history_group(),
             Message::FocusRegionEnd => self.remeasure_focus(),
+            Message::AdjustExposure => return self.adjust_exposure(),
             Message::OverviewScrolled(offset) => {
                 self.grid_scroll = offset;
                 // Tiles scrolled into view show their newest frame at once.

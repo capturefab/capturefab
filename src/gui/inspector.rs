@@ -1170,6 +1170,12 @@ impl Workbench {
         self.inspect.accepted.hit(feature.clone(), self.now);
     }
 
+    /// Light up feature `name`'s control as when the camera takes a value,
+    /// to show where something sent the user.
+    pub(super) fn flash_feature(&mut self, name: &str) {
+        self.inspect.accepted.hit(name.to_owned(), self.now);
+    }
+
     /// Take a screenshot scene word for the settings panel: `late` is false
     /// while the scene is set up and true once its cameras stream. Returns
     /// whether the word was taken; see `apply_scene`. Words:
