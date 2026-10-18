@@ -659,10 +659,18 @@ fn analytics_collects_without_scraping_and_charts_current_capture_session() {
     let metrics = fixture.http("GET", "/metrics", None, b"");
     assert_eq!(metrics.status, 200);
     let metrics = std::str::from_utf8(&metrics.body).unwrap();
+    // Nobody watched the stream: no frame was lost or skipped for a preview.
+    assert_eq!(report["totals"]["lost"], 0, "{report}");
+    assert_eq!(report["totals"]["preview_skipped"], 0, "{report}");
     for (name, field) in [
         ("capturefab_session_frames_total", "frames"),
         ("capturefab_session_dropped_frames_total", "dropped"),
         ("capturefab_session_received_bytes_total", "bytes"),
+        ("capturefab_session_lost_frames_total", "lost"),
+        (
+            "capturefab_session_preview_skipped_frames_total",
+            "preview_skipped",
+        ),
     ] {
         assert_eq!(
             metric(metrics, name),
@@ -670,10 +678,16 @@ fn analytics_collects_without_scraping_and_charts_current_capture_session() {
             "{name}"
         );
     }
-    assert!(
-        metrics.contains("capturefab_camera_frames_total{camera_id=\"sim:0\""),
-        "{metrics}"
-    );
+    for name in [
+        "capturefab_camera_frames_total",
+        "capturefab_camera_lost_frames_total",
+        "capturefab_camera_preview_skipped_frames_total",
+    ] {
+        assert!(
+            metrics.contains(&format!("{name}{{camera_id=\"sim:0\"")),
+            "{metrics}"
+        );
+    }
     let health = fixture.http("GET", "/health", None, b"").json();
     assert_eq!(health["ready"], true);
     assert_eq!(health["cameras"]["connected"], 1);

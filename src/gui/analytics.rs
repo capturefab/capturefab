@@ -64,6 +64,13 @@ impl Workbench {
         }
         self.analytics.tab = tab;
         self.analytics.scrolled = false;
+        // Only the visible tab refreshes, so the one shown now may be stale.
+        match tab {
+            Tab::Acquisition => self.analytics.refreshed = None,
+            Tab::Measurements => self.video_analytics.expire(),
+        }
+        self.tick_analytics();
+        self.tick_video_analytics();
         operation::snap_to(SHEET_BODY, operation::RelativeOffset::START)
     }
 
@@ -142,7 +149,10 @@ impl Workbench {
                 Err(TryRecvError::Empty) => {}
             }
         }
-        if !self.analytics.open || self.analytics.pending.is_some() {
+        if !self.analytics.open
+            || self.analytics.tab != Tab::Acquisition
+            || self.analytics.pending.is_some()
+        {
             return;
         }
         let query_due = self
@@ -230,11 +240,11 @@ impl Workbench {
         // widgets retain their native identities when a refresh fails.
         let mut body = column![introduction,].spacing(14);
         if let Some(report) = &self.analytics.report {
-            let attempted = report.totals.frames.saturating_add(report.totals.dropped);
+            let attempted = report.totals.frames.saturating_add(report.totals.lost);
             let loss = if attempted == 0 {
                 0.0
             } else {
-                report.totals.dropped as f64 / attempted as f64 * 100.0
+                report.totals.lost as f64 / attempted as f64 * 100.0
             };
             let elapsed = report.collected_at_ms.saturating_sub(report.started_at_ms) / 1000;
             let mut summary = column![accessibility::group(
@@ -249,7 +259,7 @@ impl Workbench {
                         .font(style::MEDIUM),
                         text(format!(
                             "{} missed frames ({loss:.2}%) · session {:02}:{:02}:{:02}",
-                            grouped(report.totals.dropped),
+                            grouped(report.totals.lost),
                             elapsed / 3600,
                             elapsed / 60 % 60,
                             elapsed % 60
@@ -345,7 +355,7 @@ impl Workbench {
                         camera.id,
                         camera.fps,
                         camera.bytes_per_second / 1_048_576.0,
-                        camera.drop_percent,
+                        camera.lost_percent,
                         if camera.stale {
                             " · waiting for worker"
                         } else if camera.streaming {
@@ -368,7 +378,7 @@ impl Workbench {
                 accessibility::Role::Status,
             ));
         }
-        body = body.push(text("Missed frames include acquisition failures and preview frames replaced before the workbench read them. Payload is acquired image data before encoding.").size(style::SMALL).color(p.secondary));
+        body = body.push(text("Missed frames were lost on the camera link or in the camera's worker. Preview frames the workbench skipped are not counted; captures and recordings still received them. Payload is acquired image data before encoding.").size(style::SMALL).color(p.secondary));
         body.into()
     }
 }
@@ -540,6 +550,8 @@ mod tests {
                 frames: 989,
                 dropped: 11,
                 bytes: 1_048_576,
+                lost: 11,
+                preview_skipped: 0,
             },
             cameras: vec![crate::analytics::CameraAnalytics {
                 id: "sim:0".into(),
@@ -552,6 +564,9 @@ mod tests {
                 drop_percent: 1.1,
                 streaming: true,
                 stale: false,
+                lost: 11,
+                preview_skipped: 0,
+                lost_percent: 1.1,
             }],
             points: vec![],
         }
@@ -757,6 +772,29 @@ mod tests {
         assert!(bench.analytics.chart.is_none());
         assert!(bench.analytics.chart_profile.is_none());
         assert!(bench.analytics.pending.is_none());
+    }
+
+    #[test]
+    fn acquisition_data_refreshes_only_while_its_tab_shows() {
+        let mut bench = Workbench::new(SessionHandle::new(), "visible-tab".into(), true, None);
+        bench.width = 900.0;
+        bench.analytics.tab = Tab::Measurements;
+        drop(bench.show_analytics(true));
+        assert!(
+            bench.analytics.pending.is_none(),
+            "hidden behind measurements"
+        );
+        drop(bench.analytics_tab(Tab::Acquisition));
+        let reply = bench.analytics.pending.take().expect("loads when shown");
+        bench.analytics.accept(
+            reply.recv_timeout(Duration::from_secs(10)).unwrap(),
+            bench.analytics_chart_profile(),
+        );
+        assert!(bench.analytics.report.is_some());
+        drop(bench.analytics_tab(Tab::Measurements));
+        bench.analytics.refreshed = None;
+        bench.tick_analytics();
+        assert!(bench.analytics.pending.is_none(), "due, but not shown");
     }
 
     #[test]

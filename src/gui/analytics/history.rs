@@ -245,8 +245,8 @@ impl State {
                         column![
                             text(format!("{} · +{} from retained start", timestamp(point.timestamp_ms), duration(point.timestamp_ms.saturating_sub(first))))
                                 .size(style::SMALL).font(style::MEDIUM).width(Fill).wrapping(text::Wrapping::WordOrGlyph),
-                            caption(format!("Frame rate {} frames per second · throughput {} MiB per second · missed frames {} percent", number(point.fps), number(point.bytes_per_second / 1_048_576.0), number(point.drop_percent)), p),
-                            caption(format!("Bucket totals: {} acquired frames · {} missed frames · {} payload bytes", grouped(point.frames), grouped(point.dropped), grouped(point.bytes)), p),
+                            caption(format!("Frame rate {} frames per second · throughput {} MiB per second · missed frames {} percent", number(point.fps), number(point.bytes_per_second / 1_048_576.0), number(point.lost_percent)), p),
+                            caption(format!("Bucket totals: {} acquired frames · {} missed frames · {} payload bytes", grouped(point.frames), grouped(point.lost), grouped(point.bytes)), p),
                         ].spacing(4).width(Fill).into(),
                         format!("History point {}", timestamp(point.timestamp_ms)),
                         id,
@@ -286,7 +286,7 @@ impl State {
         let mut content = column![
             heading("Axes and aggregation", p),
             caption(time_axis, p),
-            caption(format!("Vertical scales, rounded: frame rate zero to {} frames per second; throughput zero to {} MiB per second; missed frames zero to {} percent.", number(axis_max(report, |p| p.fps)), number(axis_max(report, |p| p.bytes_per_second / 1_048_576.0)), number(axis_max(report, |p| p.drop_percent))), p),
+            caption(format!("Vertical scales, rounded: frame rate zero to {} frames per second; throughput zero to {} MiB per second; missed frames zero to {} percent.", number(axis_max(report, |p| p.fps)), number(axis_max(report, |p| p.bytes_per_second / 1_048_576.0)), number(axis_max(report, |p| p.lost_percent))), p),
             caption("Each point combines retained samples in one time bucket. Its timestamp is the last sample in that bucket. Frame/byte rates are bucket averages; missed percentage uses usable rate deltas; counts are observed bucket totals. Counts may include an initial counter baseline, so missed percentage can differ from a ratio of the displayed counts. A bucket can cover several sampling intervals. Lines connect measurements; they do not supply values for missing samples.".into(), p),
         ].spacing(6).width(Fill);
         if report.points.len() <= 1 {
@@ -414,7 +414,7 @@ fn overview(report: &AnalyticsSnapshot) -> Vec<String> {
         (
             "Missed frames",
             "percent",
-            (|p: &AnalyticsPoint| p.drop_percent) as fn(&AnalyticsPoint) -> f64,
+            (|p: &AnalyticsPoint| p.lost_percent) as fn(&AnalyticsPoint) -> f64,
         ),
     ] {
         let last = report.points.last().unwrap();

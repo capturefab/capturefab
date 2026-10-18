@@ -27,6 +27,8 @@ fn fixture() -> AnalyticsSnapshot {
             frames: 200,
             dropped: 4,
             bytes: 1_048_576,
+            lost: 4,
+            preview_skipped: 0,
         },
         cameras: (0..5)
             .map(|index| CameraAnalytics {
@@ -44,6 +46,9 @@ fn fixture() -> AnalyticsSnapshot {
                 drop_percent: 0.5,
                 streaming: index == 0,
                 stale: false,
+                lost: 1,
+                preview_skipped: 0,
+                lost_percent: 0.5,
             })
             .collect(),
         points: [1_000, 86_401_000]
@@ -56,6 +61,8 @@ fn fixture() -> AnalyticsSnapshot {
                 fps: 25.0,
                 bytes_per_second: 1e19,
                 drop_percent: 2.0,
+                lost: 2,
+                lost_percent: 2.0,
             })
             .collect(),
     }

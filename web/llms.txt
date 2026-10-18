@@ -100,6 +100,7 @@ Use `--actor NAME --actor-kind agent` for an automation agent.
 Actor metadata is display attribution, not authentication.
 
 In `status --json`, `lost` counts frames lost on the camera link or in the worker; use it for acquisition health. `preview_skipped` counts preview frames a viewer missed because a newer one was ready. `dropped` keeps its v1 meaning: worker receive errors plus `preview_skipped`.
+Analytics (`/api/analytics`, the charts and `/metrics`) count missed frames as `lost`; totals and cameras add `lost` and `preview_skipped`, Prometheus adds `capturefab_{session,camera}_lost_frames_total` and `capturefab_{session,camera}_preview_skipped_frames_total`, and `samples` counts one-second samples of all cameras together, so 24 hours fit for any camera count.
 
 `status --json` includes global `result.activity` and `result.activity_revision`, even for a busy target camera.
 Activity retains the latest 200 completed entries plus active commands and schedules.

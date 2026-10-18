@@ -32,6 +32,8 @@ fn active_report() -> AnalyticsSnapshot {
             frames: u64::MAX,
             dropped: 129,
             bytes: u64::MAX,
+            lost: 129,
+            preview_skipped: 0,
         },
         cameras: (0..5)
             .map(|index| CameraAnalytics {
@@ -45,6 +47,9 @@ fn active_report() -> AnalyticsSnapshot {
                 drop_percent: index as f64,
                 streaming: index % 2 == 0,
                 stale: false,
+                lost: index,
+                preview_skipped: 0,
+                lost_percent: index as f64,
             })
             .collect(),
         points: (0..8)
@@ -56,6 +61,8 @@ fn active_report() -> AnalyticsSnapshot {
                 fps: 10.0 + index as f64 * 7.0,
                 bytes_per_second: 1.0e14 + index as f64 * 1.0e13,
                 drop_percent: index as f64 * 0.5,
+                lost: index,
+                lost_percent: index as f64 * 0.5,
             })
             .collect(),
     }

@@ -44,11 +44,6 @@ fn session(cameras: Vec<CameraSnapshot>) -> SessionSnapshot {
 }
 fn observe(analytics: &Analytics, cameras: Vec<CameraSnapshot>, now: u64, sample: bool) {
     let mut store = analytics.store.lock().unwrap();
-    assert!(
-        store.db.is_some(),
-        "DuckDB initialization: {:?}",
-        store.error
-    );
     store.observe_counters(&session(cameras), now);
     if sample {
         store.sample(now).unwrap();
@@ -56,6 +51,16 @@ fn observe(analytics: &Analytics, cameras: Vec<CameraSnapshot>, now: u64, sample
 }
 fn report(analytics: &Analytics, now: u64) -> AnalyticsSnapshot {
     analytics.store.lock().unwrap().report(now).unwrap()
+}
+/// Insert rows directly, counting them as samples do.
+fn insert(store: &mut Store, sql: &str, params: impl duckdb::Params) {
+    let rows = store.connection().unwrap().execute(sql, params).unwrap();
+    store.rows += rows as u64;
+}
+fn count(store: &Store) -> u64 {
+    let db = store.db.as_ref().unwrap();
+    db.query_row("SELECT count(*) FROM samples", [], |r| r.get(0))
+        .unwrap()
 }
 
 #[test]
@@ -100,7 +105,8 @@ fn short_captures_reconnects_resets_and_stale_status_keep_true_totals() {
         AnalyticsTotals {
             frames: 18,
             dropped: 4,
-            bytes: 1800
+            bytes: 1800,
+            ..Default::default()
         }
     );
     assert_eq!(report.cameras[0].frames, 18);
@@ -130,12 +136,11 @@ fn idle_reads_expire_history_but_keep_constant_size_session_totals() {
 fn hard_row_limit_and_plot_downsampling_bound_long_and_busy_sessions() {
     let analytics = Analytics::new();
     let now = now_ms();
-    {
-        let store = analytics.store.lock().unwrap();
-        let db = store.db.as_ref().unwrap();
-        db.execute("INSERT INTO samples SELECT range, ? + range, 0, 1, 0, 100, 1.0, 100.0, 1, 0 FROM range(?)",
-            params![now, MAX_SAMPLES as i64 + 5]).unwrap();
-    }
+    insert(
+        &mut analytics.store.lock().unwrap(),
+        "INSERT INTO samples SELECT range, ? + range, 0, 1, 0, 100, 1.0, 100.0, 1, 0, 0, 0 FROM range(?)",
+        params![now, MAX_SAMPLES as i64 + 5],
+    );
     let summary = report(&analytics, now + MAX_SAMPLES as u64 + 5);
     assert_eq!(summary.samples, MAX_SAMPLES);
     assert!(summary.truncated);
@@ -152,10 +157,19 @@ fn hard_row_limit_and_plot_downsampling_bound_long_and_busy_sessions() {
     assert_eq!(oldest, 5);
     // Sparse 24-hour data exercises bucket alignment as well as count limits.
     {
-        let store = analytics.store.lock().unwrap();
-        let db = store.db.as_ref().unwrap();
-        db.execute_batch("DELETE FROM samples").unwrap();
-        db.execute("INSERT INTO samples SELECT range, ? + range * 60000, 0, 1, 0, 100, 1.0, 100.0, 1, 0 FROM range(1440)", params![now + 999]).unwrap();
+        let mut store = analytics.store.lock().unwrap();
+        store
+            .db
+            .as_ref()
+            .unwrap()
+            .execute_batch("DELETE FROM samples")
+            .unwrap();
+        store.rows = 0;
+        insert(
+            &mut store,
+            "INSERT INTO samples SELECT range, ? + range * 60000, 0, 1, 0, 100, 1.0, 100.0, 1, 0, 0, 0 FROM range(1440)",
+            params![now + 999],
+        );
     }
     assert!(
         report(&analytics, now + RETENTION_SECONDS * 1000)
@@ -267,18 +281,14 @@ fn database_reuses_memory_through_millions_of_rows_and_expired_history() {
             } else {
                 0
             };
-        store.db.as_ref().unwrap().execute(
-            "INSERT INTO samples SELECT CAST(? + range AS UBIGINT), ?, 0, 1, 0, 100, 1.0, 100.0, 1, 0 FROM range(?)",
-            params![batch * batch_size as u64, now, batch_size]
-        ).unwrap();
+        insert(
+            &mut store,
+            "INSERT INTO samples SELECT CAST(? + range AS UBIGINT), ?, 0, 1, 0, 100, 1.0, 100.0, 1, 0, 0, 0 FROM range(?)",
+            params![batch * batch_size as u64, now, batch_size],
+        );
         store.prune(now).unwrap();
-        let count: u64 = store
-            .db
-            .as_ref()
-            .unwrap()
-            .query_row("SELECT count(*) FROM samples", [], |r| r.get(0))
-            .unwrap();
-        assert!(count <= MAX_SAMPLES as u64);
+        assert!(count(&store) <= MAX_SAMPLES as u64);
+        assert_eq!(count(&store), store.rows);
     }
     let summary = store
         .report(initial + RETENTION_SECONDS * 1000 + 80_000)
@@ -373,4 +383,148 @@ fn database_initialization_failure_is_visible_in_health_and_queries() {
     assert!(analytics.snapshot().is_err());
     assert!(analytics.svg().is_err());
     assert!(analytics.metrics(&SessionSnapshot::default()).is_err());
+}
+
+#[test]
+fn eight_cameras_keep_a_full_day_of_history() {
+    // One row per sample whatever the camera count, so a day of one-second
+    // samples fits the row limit. With a row per camera as well, eight
+    // cameras kept under eight hours.
+    const { assert!(RETENTION_SECONDS / SAMPLE_INTERVAL_SECONDS <= MAX_SAMPLES as u64) };
+    let analytics = Analytics::new();
+    let start = now_ms();
+    let mut cameras: Vec<_> = (0..8)
+        .map(|index| camera(&format!("cam{index}"), index + 1, 0, 0, 0))
+        .collect();
+    let samples = RETENTION_SECONDS / 60;
+    for minute in 0..samples {
+        for camera in &mut cameras {
+            camera.frames += 1800;
+            camera.received_bytes += 180_000;
+        }
+        observe(&analytics, cameras.clone(), start + minute * 60_000, true);
+    }
+    let end = start + (samples - 1) * 60_000;
+    let summary = report(&analytics, end);
+    assert!(!summary.truncated);
+    assert_eq!(summary.samples as u64, samples, "one row per sample");
+    assert!(summary.points.len() as u64 <= MAX_POINTS + 1);
+    assert_eq!(summary.points.first().unwrap().timestamp_ms, start);
+    assert_eq!(summary.points.last().unwrap().timestamp_ms, end);
+    assert_eq!(summary.totals.frames, samples * 8 * 1800);
+}
+
+#[test]
+fn sessions_without_cameras_never_open_the_database_and_stay_ready() {
+    let analytics = Analytics::new();
+    let now = now_ms();
+    for second in 0..5 {
+        observe(&analytics, vec![], now + second * 1000, true);
+    }
+    analytics.observe(&SessionSnapshot::default());
+    assert!(analytics.store.lock().unwrap().db.is_none());
+    let health = analytics.health();
+    assert!(health.ready && health.error.is_none());
+    let empty = analytics.snapshot().unwrap();
+    assert_eq!((empty.samples, empty.points.len()), (0, 0));
+    assert!(
+        analytics
+            .svg()
+            .unwrap()
+            .contains("Ready for your first frame")
+    );
+    assert!(
+        analytics.store.lock().unwrap().db.is_none(),
+        "reports open nothing"
+    );
+    observe(&analytics, vec![camera("a", 1, 0, 0, 0)], now + 5000, true);
+    assert!(analytics.store.lock().unwrap().db.is_some());
+}
+
+#[test]
+fn missed_frames_count_losses_and_preview_skips_apart() {
+    let analytics = Analytics::new();
+    let now = now_ms();
+    let counted = |frames, lost, skipped| CameraSnapshot {
+        lost,
+        preview_skipped: skipped,
+        dropped: lost + skipped,
+        ..camera("a", 1, frames, 0, frames * 100)
+    };
+    observe(&analytics, vec![counted(0, 0, 0)], now, true);
+    observe(&analytics, vec![counted(95, 5, 400)], now + 1000, true);
+    let summary = report(&analytics, now + 1000);
+    assert_eq!(
+        summary.totals,
+        AnalyticsTotals {
+            frames: 95,
+            dropped: 405,
+            bytes: 9500,
+            lost: 5,
+            preview_skipped: 400,
+        }
+    );
+    assert_eq!(summary.cameras[0].lost_percent, 5.0);
+    let point = summary.points.last().unwrap();
+    assert_eq!((point.lost, point.lost_percent), (5, 5.0));
+    let metrics = analytics
+        .metrics(&session(vec![counted(95, 5, 400)]))
+        .unwrap();
+    for line in [
+        "capturefab_session_lost_frames_total 5\n",
+        "capturefab_session_preview_skipped_frames_total 400\n",
+        "capturefab_session_dropped_frames_total 405\n",
+        "capturefab_camera_lost_frames_total{camera_id=\"a\",name=\"Capturefab Test camera\"} 5\n",
+        "capturefab_camera_preview_skipped_frames_total{camera_id=\"a\",name=\"Capturefab Test camera\"} 400\n",
+    ] {
+        assert!(metrics.contains(line), "{line} in {metrics}");
+    }
+}
+
+#[test]
+fn time_without_cameras_charts_as_idle() {
+    let analytics = Analytics::new();
+    let now = now_ms();
+    let mut busy = camera("a", 1, 0, 0, 0);
+    for second in 0..3 {
+        busy.frames += 30;
+        observe(&analytics, vec![busy.clone()], now + second * 1000, true);
+    }
+    // Disconnected for ten minutes: nothing is stored.
+    for second in 3..603 {
+        observe(&analytics, vec![], now + second * 1000, true);
+    }
+    let mut back = camera("a", 2, 0, 0, 0);
+    for second in 603..606 {
+        back.frames += 30;
+        observe(&analytics, vec![back.clone()], now + second * 1000, true);
+    }
+    let summary = report(&analytics, now + 605_000);
+    assert_eq!(summary.samples, 6, "only seconds with a camera are stored");
+    let idle: Vec<_> = summary
+        .points
+        .iter()
+        .filter(|point| point.frames == 0 && point.fps == 0.0)
+        .map(|point| point.timestamp_ms - now)
+        .collect();
+    assert_eq!(idle, [3000, 602_000], "the gap drops to idle and back");
+}
+
+#[test]
+fn expired_samples_are_deleted_once_a_minute() {
+    let analytics = Analytics::new();
+    let now = now_ms();
+    let day = RETENTION_SECONDS * 1000;
+    observe(&analytics, vec![camera("a", 1, 1, 0, 1)], now, true);
+    let mut store = analytics.store.lock().unwrap();
+    store.prune(now + day).unwrap();
+    assert_eq!(store.pruned_at, Some(now + day));
+    assert_eq!(count(&store), 1, "not expired yet");
+    // Expired now, but the last deletion was under a minute ago.
+    store.prune(now + day + 30_000).unwrap();
+    assert_eq!((count(&store), store.rows), (1, 1));
+    let summary = store.report(now + day + 30_000).unwrap();
+    assert!(summary.points.is_empty(), "reports skip it");
+    store.prune(now + day + 60_000).unwrap();
+    assert_eq!((count(&store), store.rows), (0, 0));
 }

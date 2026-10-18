@@ -120,6 +120,10 @@ pub(super) struct State {
 }
 
 impl State {
+    /// Load the history again at the next refresh.
+    pub(super) fn expire(&mut self) {
+        self.refreshed = None;
+    }
     pub(super) fn new(handle: SessionHandle, mut preferences: Preferences) -> Self {
         preferences.measurements.truncate(MAX_MEASUREMENTS);
         let credential_provider = preferences.model.provider;
@@ -545,7 +549,10 @@ impl Workbench {
                 Err(TryRecvError::Empty) => {}
             }
         }
-        if !self.analytics.open || state.pending.is_some() {
+        if !self.analytics.open
+            || self.analytics.tab != analytics::Tab::Measurements
+            || state.pending.is_some()
+        {
             return;
         }
         let query_due = !state
@@ -1161,6 +1168,22 @@ mod tests {
         bench.video_analytics_input(Input::Keys(false));
         assert!(!bench.video_analytics.keys_section_open());
         assert!(!bench.prefs().video_analytics.keys_open);
+    }
+
+    #[test]
+    fn measurement_history_loads_only_while_its_tab_shows() {
+        let mut bench = Workbench::new(SessionHandle::new(), "visible-tab".into(), true, None);
+        bench.width = 900.0;
+        drop(bench.show_analytics(true));
+        bench.tick_video_analytics();
+        assert!(
+            bench.video_analytics.pending.is_none(),
+            "hidden behind acquisition"
+        );
+        assert!(bench.video_analytics.refreshed.is_none());
+        drop(bench.analytics_tab(analytics::Tab::Measurements));
+        assert!(bench.video_analytics.pending.is_some(), "loads when shown");
+        assert_eq!(bench.video_analytics.refreshed, Some(bench.now));
     }
 
     #[test]
