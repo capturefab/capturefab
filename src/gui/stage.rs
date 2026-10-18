@@ -564,6 +564,14 @@ impl Workbench {
             .or_else(|| reported.filter(open).map(badge(true)))
     }
 
+    /// The worker's report while camera `id`'s network stream is being
+    /// reopened, which its badge and the title bar's pill show.
+    pub(super) fn reconnecting(&self, id: &str) -> Option<&str> {
+        self.badge_error(id)
+            .filter(|error| error.reported && error.text.starts_with(RECONNECTING))
+            .map(|error| error.text)
+    }
+
     /// The badges over the top left of camera `id`'s picture, laid out in
     /// `room` as `BadgePlan` says: "Last frame" when `stopped`, how long
     /// frames have stopped, and its error. Clipped to the room, so nothing
@@ -577,13 +585,10 @@ impl Workbench {
         padding: f32,
     ) -> Element<'_, Message> {
         let stalled = self.stalled(id);
-        let error = self.badge_error(id);
         // A stream being reopened says why frames stopped, calmly, in the
         // stall badge's place.
-        let reconnecting = error
-            .filter(|error| error.reported && error.text.starts_with(RECONNECTING))
-            .map(|error| error.text);
-        let error = error.filter(|_| reconnecting.is_none());
+        let reconnecting = self.reconnecting(id);
+        let error = self.badge_error(id).filter(|_| reconnecting.is_none());
         let plan = BadgePlan::new(
             room,
             hover,
@@ -780,7 +785,7 @@ fn stall_badge<'a>(silent: Duration, whole: bool) -> Element<'a, Message> {
 fn reconnect_badge<'a>(report: &str, whole: bool) -> Element<'a, Message> {
     const NAME: &str = "Reconnecting…";
     let mark = icon(Icon::Refresh, 12.0, style::STAGE.secondary);
-    let about = format!("{report}. Frames resume on their own once the stream is back.");
+    let about = reconnect_about(report);
     let badge = if whole {
         container(
             row![
@@ -804,6 +809,11 @@ fn reconnect_badge<'a>(report: &str, whole: bool) -> Element<'a, Message> {
         ),
         about,
     )
+}
+
+/// What a stream being reopened means, after the worker's `report`.
+pub(super) fn reconnect_about(report: &str) -> String {
+    format!("{report}. Frames resume on their own once the stream is back.")
 }
 
 /// `from` to `to` at `t`, evenly in ratio, so each step of the way zooms by
