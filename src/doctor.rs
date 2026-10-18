@@ -320,7 +320,7 @@ fn graphics_check(graphics: &Value) -> Check {
     }
 }
 
-/// Frame buffers stay in memory either way; what differs is where sessions
+/// Frame rings stay in memory either way; what differs is where sessions
 /// are found. The fix moves the whole session directory, so it says what
 /// stays behind; logind creates the runtime directory only for a logged-in
 /// or lingering user and removes it at logout otherwise.
@@ -343,7 +343,8 @@ fn runtime_dir_check(runtime_dir: &Path, session: &Place) -> Check {
 
 /// Informational rather than a warning: memory suits a session's short-lived
 /// files, and only the user knows whether the rest must outlive a reboot.
-/// Camera frame buffers are anonymous shared memory wherever this is.
+/// Camera frame rings are anonymous shared memory wherever this is; the
+/// nvJPEG and VA-API helpers' staging buffers are files in it (`accel`).
 fn session_check(session: &Place) -> Check {
     if !session.ram_backed {
         return Check::ok(
@@ -359,7 +360,7 @@ fn session_check(session: &Place) -> Check {
         ),
     );
     check.fix = Some(
-        "To keep them, set CAPTUREFAB_SESSION_DIR to a folder on disk such as ~/.local/state/capturefab; camera frame buffers stay in memory."
+        "To keep them, set CAPTUREFAB_SESSION_DIR to a folder on disk such as ~/.local/state/capturefab; camera frame rings stay in memory, but JPEG captures encoded by nvJPEG or VA-API then pass their pixels through a mapped file on that disk."
             .into(),
     );
     check
@@ -926,7 +927,8 @@ mod tests {
         assert!(check.message.contains("cleared at reboot"));
         let fix = check.fix.unwrap();
         assert!(fix.contains("CAPTUREFAB_SESSION_DIR"), "{fix}");
-        assert!(fix.contains("frame buffers stay in memory"), "{fix}");
+        assert!(fix.contains("frame rings stay in memory"), "{fix}");
+        assert!(fix.contains("nvJPEG or VA-API"), "{fix}");
         let disk = place("/home/pi/.cache/capturefab/sessions", "ext4", 6 << 30);
         assert_eq!(session_check(&disk).level, Level::Ok);
         assert_eq!(session_check(&disk).fix, None);
