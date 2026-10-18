@@ -13,8 +13,8 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("__worker") {
         let result = std::env::args_os()
             .nth(2)
-            .ok_or_else(|| anyhow::anyhow!("missing shared ring path"))
-            .and_then(|p| capturefab::session::run_worker(std::path::Path::new(&p)));
+            .ok_or_else(|| anyhow::anyhow!("missing shared ring"))
+            .and_then(|ring| capturefab::session::run_worker(&ring));
         if let Err(e) = result {
             eprintln!("capturefab worker: {e:#}");
             std::process::exit(1)

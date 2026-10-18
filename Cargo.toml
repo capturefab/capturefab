@@ -131,7 +131,9 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32
 accesskit_unix = { version = "0.17.2", optional = true }
 x11-dl = { version = "2.21", optional = true }
 
-# Host facts for doctor and efficiency mode (sysctl, statfs, access).
+# Host facts for doctor and efficiency mode (sysctl, statfs, access), and
+# anonymous shared memory for frame rings (memfd_create, shm_open) with
+# descriptor inheritance by camera workers.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

@@ -31,7 +31,7 @@ python3 scripts/test-site.py                                  # validate static 
 python3 scripts/test-media.py --binary target/debug/capturefab [--srt]  # needs MediaMTX on :18554/:18890
 ```
 
-Use the simulator (`--camera sim:0`, `sim:1`, ...) to exercise acquisition without hardware. Set `CAPTUREFAB_SESSION_DIR` to an isolated temp dir when running the binary manually or in tests; it holds session descriptors, worker shared-memory rings and the storage ledger.
+Use the simulator (`--camera sim:0`, `sim:1`, ...) to exercise acquisition without hardware. Set `CAPTUREFAB_SESSION_DIR` to an isolated temp dir when running the binary manually or in tests; it holds session descriptors and the storage ledger, and worker frame rings only on Windows or where shared memory is unavailable.
 
 DINOv2 (auto capture): `python3 scripts/fetch-dinov2.py` downloads the pinned, checksummed `facebook/dinov2-small` weights to `target/models/dinov2-small/`; release builds embed them (or `CAPTUREFAB_DINOV2_WEIGHTS`), dev/test builds read that file in place, and unit tests use the tiny fixtures from `scripts/dinov2-fixtures.py`. GPU inference is wgpu compute (`src/autocapture/dinov2/dinov2.wgsl`) in the isolated `__embed` helper; the CPU path is the reference.
 
@@ -39,9 +39,9 @@ FFmpeg: `build.rs` embeds `CAPTUREFAB_FFMPEG_BINARY` when set at build time, and
 
 ## Architecture
 
-**Process model.** `main.rs` dispatches the hidden `__worker <ring-path>` argv to `session::run_worker`; everything else goes through `cli::run`. Each connected camera runs in its own child process (re-exec of the same binary, overridable via `CAPTUREFAB_EXECUTABLE`):
+**Process model.** `main.rs` dispatches the hidden `__worker fd:N` (or `__worker <ring-path>` for a file ring) argv to `session::run_worker`; everything else goes through `cli::run`. Each connected camera runs in its own child process (re-exec of the same binary, overridable via `CAPTUREFAB_EXECUTABLE`):
 - `session::SessionHandle` / `Coordinator` (parent) owns one `Process` per camera, sends `SessionCommand` as newline-delimited JSON over the child's stdin and reads `{ok,result,error,snapshot}` lines from stdout.
-- Frames bypass the pipe: the worker writes into a `shared_memory::SharedRing` (mmap'd three-slot, newest-frame-wins ring); the parent `take_latest()`s from it.
+- Frames bypass the pipe: the worker writes into a `shared_memory::SharedRing` (mmap'd three-slot, newest-frame-wins ring, in a memfd or unlinked POSIX shm object passed as an inherited descriptor); the parent `take_latest()`s from it. The worker copies every frame only while the parent polls, otherwise one keep-alive per second; one-off readers use `SessionHandle::fresh_frame_for`, and captures are always published (see the `shared_memory` module docs).
 - Inside the worker, `engine::WorkerHandle` runs a single worker thread that exclusively owns the `camera::Camera` (and its transport), forwarder and scheduled capture jobs (`scheduling.rs`).
 
 **Sessions / IPC.** `gui --name X` and `serve --name X` start an `ipc::Server` (loopback TCP, token-authenticated, descriptor file in the private session dir). `--session X` clients use `ipc::call` to send the same `SessionCommand`s. Without `--session`, the CLI creates a local `SessionHandle` in-process, so direct commands and session commands share one code path. The GUI (`gui/`, behind the `gui` feature) is just another `SessionHandle` consumer and shows IPC commands in its activity log; it keeps settings and recent cameras in `gui.prefs.json` in the session dir (`gui/prefs.rs`, never credential-bearing addresses) and uses embedded Phosphor icon fonts (`assets/fonts`).

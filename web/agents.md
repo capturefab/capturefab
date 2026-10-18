@@ -20,7 +20,9 @@ Capture paths are a file, a directory or a template, and do not accept network U
 
 `--efficiency auto|smooth|efficient` (global) or `CAPTUREFAB_EFFICIENCY` sets efficiency mode for the process that reads it, such as the desktop window or `serve`. A running session keeps its own. The flag wins over the variable. An unknown variable value means `auto`; an unknown flag value is `usage` (exit 2). Auto is efficient with at most 2 CPU cores or 2 GiB of memory, or in the OS low-power or battery-saver mode; battery power alone does not switch it. `doctor --json` reports the result in `efficiency`. Captures and recordings keep every frame in every mode. Without a subcommand, a headless build exits 5 (`unsupported`) and names the `serve` command to use instead.
 
-An explicit `CAPTUREFAB_MAX_CAMERAS` must be an integer from 1 to 64. `CAPTUREFAB_FRAME_BYTES` must be 4096–268435456 bytes and a multiple of 64. Malformed overrides fail before worker startup. They do not select the default values.
+An explicit `CAPTUREFAB_MAX_CAMERAS` must be an integer from 1 to 64. `CAPTUREFAB_FRAME_BYTES` must be 4096–268435456 bytes and a multiple of 64. Malformed overrides fail before worker startup. They do not select the default values. Frames larger than the ring payload preview downscaled; files keep full resolution, but `capture -o -` refuses them (exit 1), so capture such frames to a file.
+
+Judge acquisition health by `lost` in `status --json` (top level and `cameras[]`): frames lost on the camera link or in the worker. `preview_skipped` counts preview frames a viewer missed because a newer one was ready; captures and recordings still receive them. `dropped` keeps its v1 meaning, worker receive errors plus `preview_skipped`.
 
 ## Use an existing visible session
 

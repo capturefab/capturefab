@@ -874,6 +874,9 @@ struct Workbench {
     /// Nanoseconds between new-frame announcements, read by the frame watcher.
     frame_gap: Arc<AtomicU64>,
     frame_meta: Option<(u64, u32, u32, u32, u64)>,
+    /// When the frame shown is a downscaled preview of one larger than the
+    /// camera's ring, that frame's width, height and pixel format.
+    frame_source: Option<(u32, u32, u32)>,
     frame_id: Option<u64>,
     display_error: Option<String>,
     previews: HashMap<String, CameraPreview>,
@@ -1085,6 +1088,7 @@ impl Workbench {
             refresh: refresh::Refresh::default(),
             frame_gap: Arc::default(),
             frame_meta: None,
+            frame_source: None,
             frame_id: None,
             display_error: None,
             previews: HashMap::new(),
@@ -1999,6 +2003,7 @@ impl Workbench {
         self.measure(&frame);
         let kind = self.camera_kind();
         let id = self.snapshot.active_camera.clone().unwrap_or_default();
+        let source = self.handle.preview_of(&id);
         let state = self.camera_views.entry(id).or_default();
         let shown = camera_view::present(
             &self.gpu,
@@ -2012,6 +2017,7 @@ impl Workbench {
         match shown {
             Ok(()) => {
                 self.frame_meta = Some(meta);
+                self.frame_source = source;
                 self.display_error = None;
             }
             Err(err) => self.display_error = Some(err.to_string()),

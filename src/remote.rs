@@ -641,13 +641,20 @@ impl Service {
             Ok(camera) => camera,
             Err(message) => return error(400, message),
         };
-        let frame = match camera {
-            Some(camera) => self.handle.latest_frame_for(&camera),
-            None => self.handle.latest_frame(),
-        };
-        let Some(frame) = frame else {
+        let camera = camera.or_else(|| self.handle.active_camera());
+        let frame = camera
+            .as_deref()
+            .and_then(|camera| self.handle.latest_frame_for(camera));
+        let (Some(camera), Some(frame)) = (camera, frame) else {
             return Response::new(204, "image/png", Vec::new());
         };
+        // A frame larger than the camera's ring arrives downscaled; the
+        // headers give the size the camera delivered.
+        let (frame_width, frame_height, _) = self.handle.preview_of(&camera).unwrap_or((
+            frame.width,
+            frame.height,
+            frame.pixel_format,
+        ));
         let (width, height, rgba) = match crate::frame::preview_rgba(&frame, 1280, 720) {
             Ok(image) => image,
             Err(err) => return error(422, format!("preview unavailable: {err:#}")),
@@ -670,8 +677,8 @@ impl Service {
         response.headers.extend([
             ("X-Frame-Id", frame.id.to_string()),
             ("X-Frame-Timestamp-Ns", frame.timestamp_ns.to_string()),
-            ("X-Frame-Width", frame.width.to_string()),
-            ("X-Frame-Height", frame.height.to_string()),
+            ("X-Frame-Width", frame_width.to_string()),
+            ("X-Frame-Height", frame_height.to_string()),
         ]);
         response
     }
@@ -974,6 +981,43 @@ mod tests {
             .unwrap();
             assert!(!same_origin(&request));
         }
+    }
+
+    #[test]
+    fn previews_report_the_size_the_camera_delivered() {
+        let root = WebRoot::new();
+        let (handle, mut writer) = SessionHandle::fed(4096);
+        let service = Service {
+            handle: handle.clone(),
+            web_root: root.0.clone(),
+            quitting: Arc::new(AtomicBool::new(false)),
+            activity_waits: Arc::new(AtomicUsize::new(0)),
+        };
+        assert_eq!(service.preview("").status, 204);
+        // Larger than the ring, so the ring holds a downscaled preview.
+        let large = crate::types::Frame {
+            id: 1,
+            width: 80,
+            height: 60,
+            pixel_format: crate::types::MONO8,
+            timestamp_ns: 0,
+            data: vec![7; 4800],
+        };
+        writer.write(&large, true).unwrap();
+        for query in ["", "camera=cam"] {
+            let response = service.preview(query);
+            assert_eq!(response.status, 200);
+            let header = |name| {
+                response
+                    .headers
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.as_str())
+            };
+            assert_eq!(header("X-Frame-Width"), Some("80"));
+            assert_eq!(header("X-Frame-Height"), Some("60"));
+        }
+        handle.shutdown();
     }
 
     #[test]

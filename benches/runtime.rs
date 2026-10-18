@@ -341,14 +341,13 @@ fn main() {
     let dir = temp("ring");
     for (name, format) in [("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
         let f = frame(1920, 1200, format);
-        let path = dir.join(format!("{name}.shm"));
-        let mut writer = SharedRing::create(&path, 16 << 20).unwrap();
-        let mut reader = SharedRing::open(&path).unwrap();
+        let mut writer = SharedRing::create(&dir, 16 << 20).unwrap();
+        let mut reader = writer.reader().unwrap();
         b.run(
             &format!("ring/write+take/{name}/1920x1200"),
             f.data.len(),
             || {
-                writer.write(&f).unwrap();
+                writer.write(&f, false).unwrap();
                 reader.take_latest().unwrap().unwrap()
             },
         );
@@ -358,14 +357,13 @@ fn main() {
     // new = ring copy into the reused cache, one direct RGBA decode.
     for (name, format) in [("Mono8", MONO8), ("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
         let f = frame(1920, 1200, format);
-        let path = dir.join(format!("display-{name}.shm"));
-        let mut writer = SharedRing::create(&path, 16 << 20).unwrap();
-        let mut reader = SharedRing::open(&path).unwrap();
+        let mut writer = SharedRing::create(&dir, 16 << 20).unwrap();
+        let mut reader = writer.reader().unwrap();
         b.run(
             &format!("display-old/{name}/1920x1200"),
             f.data.len(),
             || {
-                writer.write(&f).unwrap();
+                writer.write(&f, false).unwrap();
                 let cached = reader.take_latest().unwrap().unwrap();
                 let rgb = frame::rgb(&cached.clone()).unwrap();
                 rgb.as_chunks::<3>()
@@ -380,7 +378,7 @@ fn main() {
             &format!("display-new/{name}/1920x1200"),
             f.data.len(),
             || {
-                writer.write(&f).unwrap();
+                writer.write(&f, false).unwrap();
                 reader.take_latest_into(&mut cached).unwrap();
                 frame::convert(&cached, |[r, g, b]| [r, g, b, 255]).unwrap()
             },

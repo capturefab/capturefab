@@ -214,6 +214,7 @@ impl Workbench {
             self.frame_id = None;
             self.shown = None;
             self.frame_meta = None;
+            self.frame_source = None;
             self.display_error = None;
             self.exposure = None;
             self.focus.reset();

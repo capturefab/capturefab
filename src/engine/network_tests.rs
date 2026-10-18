@@ -139,6 +139,7 @@ impl Harness {
             quitting: Arc::new(AtomicBool::new(false)),
             thread: Arc::new(Mutex::new(None)),
             ring: None,
+            ring_note: Arc::default(),
             history: Arc::default(),
             saved: Arc::default(),
             recording: Arc::default(),

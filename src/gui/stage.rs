@@ -950,12 +950,18 @@ impl Workbench {
             }
         }
         if let Some((_, width, height, format, _)) = self.frame_meta {
+            // Describe what the camera delivers, even when the picture is a
+            // downscaled preview of it.
+            let (width, height, format) = self.frame_source.unwrap_or((width, height, format));
             details.push(if kind == CameraKind::LineScan {
                 format!("{width} px × {height} lines/block")
             } else {
                 format!("{width} × {height}")
             });
             details.push(pixel_name(format));
+            if self.frame_source.is_some() {
+                details.push("downscaled preview".into());
+            }
         }
         details.push(format!(
             "{} {}",

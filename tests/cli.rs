@@ -28,10 +28,15 @@ fn cmd(dir: &PathBuf, args: &[&str]) -> std::process::Output {
 }
 
 fn serve_at(dir: &PathBuf, cwd: &PathBuf, name: &str) -> Child {
+    serve_with(dir, cwd, name, &[])
+}
+
+fn serve_with(dir: &PathBuf, cwd: &PathBuf, name: &str, env: &[(&str, &str)]) -> Child {
     let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
         .env_remove("CAPTUREFAB_SESSION")
         .env_remove("CAPTUREFAB_CAMERA")
         .env("CAPTUREFAB_SESSION_DIR", dir)
+        .envs(env.iter().copied())
         .current_dir(cwd)
         .args(["--json", "serve", "--name", name])
         .stdout(Stdio::piped())
@@ -1686,6 +1691,79 @@ fn stale_session_descriptor_is_replaced_but_live_one_is_kept() {
     let (mut third, refused) = serve();
     assert!(refused.contains("already exists"), "{refused}");
     third.wait().unwrap();
+}
+
+fn ring_files(dir: &PathBuf) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "shm"))
+        .collect()
+}
+
+#[test]
+fn viewerless_streams_report_no_losses_and_keep_frames_off_disk() {
+    let root = temp_root("ring-viewerless");
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let _fixture = Fixture {
+        child: serve_at(&dir, &root, "rings"),
+        dir: root.clone(),
+    };
+    json(&dir, &["--json", "connect", "sim:0"]);
+    json(&dir, &["--json", "start"]);
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let status = json(&dir, &["--json", "status"]);
+    let camera = &status["cameras"][0];
+    let frames = camera["frames"].as_u64().unwrap();
+    let dropped = camera["dropped"].as_u64().unwrap();
+    assert!(frames > 30, "{camera}");
+    // Frames nobody previewed were neither lost nor skipped.
+    assert_eq!(
+        (camera["lost"].as_u64(), camera["preview_skipped"].as_u64()),
+        (Some(0), Some(0))
+    );
+    assert!(dropped * 10 < frames, "{dropped} dropped of {frames}");
+    assert_eq!(status["lost"], 0);
+    let backing = json(&dir, &["--json", "doctor"])["ring_backing"].clone();
+    if cfg!(target_os = "linux") {
+        assert_eq!(backing, "memfd");
+        let pid = camera["worker_pid"].as_u64().unwrap();
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+        assert!(maps.contains("/memfd:capturefab-ring"), "{maps}");
+    } else if cfg!(target_os = "macos") {
+        assert_eq!(backing, "posix-shm");
+    }
+    if cfg!(unix) {
+        assert!(ring_files(&dir).is_empty(), "frame rings stay in memory");
+    }
+    json(&dir, &["--json", "stop"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_new_session_sweeps_ring_files_a_killed_one_left() {
+    let root = temp_root("ring-sweep");
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let files = [("CAPTUREFAB_RING_FILE_TEST", "1")];
+    let mut killed = serve_with(&dir, &root, "killed", &files);
+    json(&dir, &["--json", "--session", "killed", "connect", "sim:0"]);
+    let stale = ring_files(&dir);
+    assert_eq!(stale.len(), 1);
+    killed.kill().unwrap();
+    killed.wait().unwrap();
+    assert!(stale[0].exists(), "a killed session cannot remove its ring");
+    let _fixture = Fixture {
+        child: serve_with(&dir, &root, "next", &files),
+        dir: root.clone(),
+    };
+    json(&dir, &["--json", "--session", "next", "connect", "sim:1"]);
+    let live = ring_files(&dir);
+    assert!(!stale[0].exists(), "{live:?}");
+    assert_eq!(live.len(), 1);
+    json(&dir, &["--json", "--session", "next", "disconnect"]);
+    assert!(ring_files(&dir).is_empty());
 }
 
 // ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@ mod activity;
 mod log;
 use crate::{
     genicam::FeatureInfo,
-    shared_memory::{DEFAULT_CAPACITY, SharedRing},
+    shared_memory::{DEFAULT_CAPACITY, RingCounters, SharedRing},
     types::{CameraInfo, Frame},
 };
 pub use activity::{
@@ -648,6 +648,14 @@ fn append_log(logs: &mut Vec<LogEntry>, entry: LogEntry) {
         logs.push(entry);
     }
 }
+/// Frames a worker lost on the way, never frames skipped for a preview.
+fn frames_lost(worker: &SessionSnapshot) -> u64 {
+    let transport = worker
+        .transport
+        .as_ref()
+        .map_or(0, |t| t.incomplete_frames + t.lost_frames);
+    worker.dropped.saturating_add(transport)
+}
 fn camera_log(entry: &LogEntry, camera: &str) -> LogEntry {
     LogEntry {
         message: activity::redact(&format!("[{camera}] {}", entry.message)),
@@ -700,10 +708,15 @@ pub struct CameraSnapshot {
     pub transport: Option<crate::types::TransportStats>,
     #[serde(default)]
     pub history: CameraHistoryStatus,
-    /// Frames the shared ring replaced before this process read them, which
-    /// `dropped` includes. Kept for this process's own views; not serialized.
-    #[serde(skip)]
-    pub ring_dropped: u64,
+    /// Frames lost on the way: the worker's receive errors plus the
+    /// transport's incomplete and missing frames.
+    #[serde(default)]
+    pub lost: u64,
+    /// Preview frames the shared ring replaced while a viewer was reading,
+    /// because a newer one came first; `dropped` includes them. Captures and
+    /// recordings still receive those frames.
+    #[serde(default)]
+    pub preview_skipped: u64,
     /// The worker was busy, so this entry repeats its last report. Kept for
     /// this process's own views; not serialized.
     #[serde(skip)]
@@ -726,6 +739,11 @@ pub struct SessionSnapshot {
     #[serde(default)]
     pub received_bytes: u64,
     pub dropped: u64,
+    /// The selected camera's `lost` and `preview_skipped`.
+    #[serde(default)]
+    pub lost: u64,
+    #[serde(default)]
+    pub preview_skipped: u64,
     pub fps: f64,
     pub last_error: Option<String>,
     pub logs: Vec<LogEntry>,
@@ -782,6 +800,8 @@ fn project_selected(state: &mut SessionSnapshot) {
         state.frames = camera.frames;
         state.received_bytes = camera.received_bytes;
         state.dropped = camera.dropped;
+        state.lost = camera.lost;
+        state.preview_skipped = camera.preview_skipped;
         state.fps = camera.fps;
         state.forwarding = camera.forwarding.clone();
         state.forwarding_since_ms = camera.forwarding_since_ms;
@@ -798,6 +818,8 @@ fn project_selected(state: &mut SessionSnapshot) {
         state.frames = 0;
         state.received_bytes = 0;
         state.dropped = 0;
+        state.lost = 0;
+        state.preview_skipped = 0;
         state.fps = 0.0;
         state.forwarding = None;
         state.forwarding_since_ms = None;
@@ -853,6 +875,20 @@ fn addressed_status(
     Ok(camera_state)
 }
 type Reply = Receiver<Result<Value>>;
+/// A camera's frames: the newest-frame cache behind its own lock, and the
+/// ring's counters beside it, which sequence polls read without that lock.
+struct Feed {
+    counters: RingCounters,
+    frames: Mutex<FrameFeed>,
+}
+impl Feed {
+    fn new(ring: SharedRing) -> Self {
+        Self {
+            counters: ring.counters(),
+            frames: Mutex::new(FrameFeed { ring, latest: None }),
+        }
+    }
+}
 /// Newest-frame cache fed by a worker's shared ring. It has its own lock so
 /// previews never wait behind a slow command on the worker's stdio pipe.
 /// Lock order: a `Process` lock may be held while taking a feed lock, never
@@ -862,14 +898,16 @@ struct FrameFeed {
     latest: Option<Arc<Frame>>,
 }
 impl FrameFeed {
-    fn poll(&mut self) -> Option<Arc<Frame>> {
+    /// The newest frame. With `watch` this counts as the ring's reader
+    /// polling, which keeps the worker publishing every frame.
+    fn poll(&mut self, watch: bool) -> Option<Arc<Frame>> {
         // Overwrite the cached frame in place when no consumer still holds it,
         // so steady-state streaming reuses one pixel allocation.
         let updated = match self.latest.as_mut().and_then(Arc::get_mut) {
-            Some(frame) => self.ring.take_latest_into(frame),
+            Some(frame) => self.ring.take_into(frame, watch),
             None => {
                 let mut frame = Frame::default();
-                let updated = self.ring.take_latest_into(&mut frame);
+                let updated = self.ring.take_into(&mut frame, watch);
                 if matches!(updated, Ok(true)) {
                     self.latest = Some(Arc::new(frame));
                 }
@@ -916,7 +954,7 @@ struct Process {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
-    feed: Arc<Mutex<FrameFeed>>,
+    feed: Arc<Feed>,
     snapshot: SessionSnapshot,
     /// Saved files reported by the worker, not yet given to the dataset.
     saved: Vec<crate::dataset::SavedFile>,
@@ -950,33 +988,31 @@ impl Process {
         let capacity = frame_capacity(scanner)?;
         let dir = crate::ipc::session_dir();
         crate::ipc::ensure_private_dir(&dir)?;
-        let mut random = [0u8; 16];
-        getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("random ring name: {e}"))?;
-        let name = random
-            .iter()
-            .map(|v| format!("{v:02x}"))
-            .collect::<String>();
-        let path = dir.join(format!("worker-{name}.shm"));
-        let ring = SharedRing::create(&path, capacity)?;
+        // Ring files are left behind only when a process dies; clear them
+        // before this coordinator's first camera.
+        static SWEEP: std::sync::Once = std::sync::Once::new();
+        SWEEP.call_once(|| crate::shared_memory::sweep(&dir));
+        let mut ring = SharedRing::create(&dir, capacity)?;
         let executable = std::env::var_os("CAPTUREFAB_EXECUTABLE")
             .map(std::path::PathBuf::from)
             .unwrap_or(std::env::current_exe()?);
-        let mut child = std::process::Command::new(executable)
+        let mut command = std::process::Command::new(executable);
+        command
             .env("CAPTUREFAB_HWACCEL", crate::media::hwaccel())
             .arg("__worker")
-            .arg(&path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .context("launch camera capture process")?;
+            .stderr(Stdio::inherit());
+        ring.pass_to(&mut command);
+        let mut child = command.spawn().context("launch camera capture process")?;
+        ring.passed();
         let input = child.stdin.take().context("worker stdin")?;
         let output = BufReader::new(child.stdout.take().context("worker stdout")?);
         Ok(Self {
             child,
             input,
             output,
-            feed: Arc::new(Mutex::new(FrameFeed { ring, latest: None })),
+            feed: Arc::new(Feed::new(ring)),
             snapshot: SessionSnapshot::default(),
             saved: Vec::new(),
             saved_camera: None,
@@ -1087,7 +1123,7 @@ struct Coordinator {
     started: Instant,
     state: RwLock<SessionSnapshot>,
     workers: RwLock<BTreeMap<String, Arc<Mutex<Process>>>>,
-    feeds: RwLock<BTreeMap<String, Arc<Mutex<FrameFeed>>>>,
+    feeds: RwLock<BTreeMap<String, Arc<Feed>>>,
     quitting: AtomicBool,
     /// Set when `shutdown` has finished; later callers wait for it.
     shut_down: (Mutex<bool>, Condvar),
@@ -1289,14 +1325,14 @@ impl SessionHandle {
                     for entry in &s.logs {
                         append_log(&mut state.logs, camera_log(entry, &info.id));
                     }
-                    let ring_dropped = u64::from(locked(&p.feed).ring.dropped());
+                    let preview_skipped = u64::from(p.feed.counters.preview_skipped());
                     let camera = CameraSnapshot {
                         info: info.clone(),
                         features: s.features.clone(),
                         streaming: s.streaming,
                         frames: s.frames,
                         received_bytes: s.received_bytes,
-                        dropped: s.dropped + ring_dropped,
+                        dropped: s.dropped + preview_skipped,
                         fps: s.fps,
                         last_error: s.last_error.clone(),
                         worker_pid: p.child.id(),
@@ -1307,7 +1343,8 @@ impl SessionHandle {
                         capture_session: s.capture_session.clone(),
                         transport: s.transport.clone(),
                         history: s.history.clone(),
-                        ring_dropped,
+                        lost: frames_lost(s),
+                        preview_skipped,
                         stale: false,
                         error_logged: s
                             .logs
@@ -1372,28 +1409,96 @@ impl SessionHandle {
         }
         anyhow::bail!("camera '{id}' not connected in this session")
     }
+    /// The selected camera's id.
+    pub fn active_camera(&self) -> Option<String> {
+        self.inner
+            .state
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .active_camera
+            .clone()
+    }
     pub fn latest_frame(&self) -> Option<Arc<Frame>> {
-        let id = self.inner.state.read().ok()?.active_camera.clone()?;
-        self.latest_frame_for(&id)
+        self.latest_frame_for(&self.active_camera()?)
     }
     /// Newest frame from a camera's shared ring. Never waits for the worker's
-    /// command pipe, so previews keep updating while commands run.
+    /// command pipe, so previews keep updating while commands run. Polling
+    /// keeps the worker publishing; after a pause of over two seconds the
+    /// first poll may return a keep-alive frame up to a second old (see
+    /// `shared_memory`).
     pub fn latest_frame_for(&self, id: &str) -> Option<Arc<Frame>> {
         let feed = self.feed(id)?;
-        locked(&feed).poll()
+        locked(&feed.frames).poll(true)
     }
-    /// Changes whenever any camera publishes a frame. Reads each shared ring's
-    /// sequence counter without copying pixels, so it is cheap to poll.
+    /// When the frame a camera's feed last returned is a downscaled preview
+    /// of a frame larger than its ring, the width, height and pixel format
+    /// of the frame the camera delivered.
+    pub fn preview_of(&self, id: &str) -> Option<(u32, u32, u32)> {
+        let feed = self.feed(id)?;
+        locked(&feed.frames).ring.preview_of()
+    }
+    /// The newest frame a camera has acquired, for occasional readers that
+    /// need current pixels. An unwatched ring holds only keep-alive frames,
+    /// so this asks for a frame, without keeping the ring watched, and waits
+    /// up to `wait` for one offered since it was called.
+    pub fn fresh_frame_for(&self, id: &str, wait: Duration) -> Option<Arc<Frame>> {
+        let feed = self.feed(id)?;
+        let deadline = Instant::now() + wait;
+        let since = feed.counters.sequence();
+        loop {
+            let (frame, fresh) = {
+                let mut frames = locked(&feed.frames);
+                let frame = frames.poll(false);
+                (frame, frames.ring.fresh() || frames.ring.taken_since(since))
+            };
+            if fresh || Instant::now() >= deadline {
+                return frame;
+            }
+            feed.counters.ask();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    /// The frame a capture just published from the selected camera, for
+    /// binary stdout. A downscaled preview of a frame larger than the ring
+    /// is refused rather than written in its place.
+    pub fn captured_frame(&self) -> Result<Arc<Frame>> {
+        let id = self.active_camera().context("capture returned no frame")?;
+        let feed = self.feed(&id).context("capture returned no frame")?;
+        let mut frames = locked(&feed.frames);
+        let frame = frames.poll(false).context("capture returned no frame")?;
+        ensure!(
+            !frames.ring.preview_only(),
+            "the frame is larger than the {} shared frame buffer; save it to a file, or raise CAPTUREFAB_FRAME_BYTES",
+            crate::analytics::human_bytes(frames.ring.capacity() as u64)
+        );
+        Ok(frame)
+    }
+    /// Changes whenever any camera offers a frame, or publishes one it held
+    /// back. Reads each shared ring's sequence counter without its lock or
+    /// pixels, so it is cheap to poll.
     pub fn frame_sequence(&self) -> u64 {
         self.inner
             .feeds
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .values()
-            .map(|feed| u64::from(locked(feed).ring.sequence()))
+            .map(|feed| u64::from(feed.counters.sequence()))
             .fold(0, u64::wrapping_add)
     }
-    fn feed(&self, id: &str) -> Option<Arc<Mutex<FrameFeed>>> {
+    /// `frame_sequence` for only these cameras, so a view can wait on the
+    /// cameras it shows.
+    pub fn frame_sequence_of(&self, ids: &[&str]) -> u64 {
+        let feeds = self
+            .inner
+            .feeds
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        ids.iter()
+            .filter_map(|id| feeds.get(*id))
+            .map(|feed| u64::from(feed.counters.sequence()))
+            .fold(0, u64::wrapping_add)
+    }
+    fn feed(&self, id: &str) -> Option<Arc<Feed>> {
         let feeds = self
             .inner
             .feeds
@@ -2025,8 +2130,9 @@ impl SessionHandle {
                 if let Some(camera) = final_snapshot.cameras.iter_mut().find(|c| c.info.id == id) {
                     camera.frames = p.snapshot.frames;
                     camera.received_bytes = p.snapshot.received_bytes;
-                    camera.ring_dropped = u64::from(locked(&p.feed).ring.dropped());
-                    camera.dropped = p.snapshot.dropped.saturating_add(camera.ring_dropped);
+                    camera.preview_skipped = u64::from(p.feed.counters.preview_skipped());
+                    camera.dropped = p.snapshot.dropped.saturating_add(camera.preview_skipped);
+                    camera.lost = frames_lost(&p.snapshot);
                     camera.streaming = false;
                     camera.fps = 0.0;
                     camera.stale = false;
@@ -2172,7 +2278,7 @@ impl SessionHandle {
             .unwrap_or_else(|e| e.into_inner())
             .values()
         {
-            locked(feed).ring.cancel();
+            feed.counters.cancel();
         }
         let workers = std::mem::take(
             &mut *self
@@ -2197,8 +2303,9 @@ impl SessionHandle {
 }
 
 /// Hidden mode: stdio controls, separate publisher, mmap frame transfer.
-pub fn run_worker(path: &std::path::Path) -> Result<()> {
-    let ring = Arc::new(Mutex::new(SharedRing::open(path)?));
+/// `ring` is what `SharedRing::pass_to` gave the worker.
+pub fn run_worker(ring: &std::ffi::OsStr) -> Result<()> {
+    let ring = Arc::new(Mutex::new(SharedRing::open(ring)?));
     let handle = crate::engine::WorkerHandle::with_ring(ring);
     let result = (|| -> Result<()> {
         let input = std::io::stdin();
@@ -2257,8 +2364,27 @@ pub fn run_worker(path: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(test)]
+impl SessionHandle {
+    /// A session whose selected camera, "cam", is fed by a ring without a
+    /// worker, and that ring's writer, for tests of frame consumers.
+    pub(crate) fn fed(capacity: usize) -> (Self, SharedRing) {
+        let writer = SharedRing::create(&std::env::temp_dir(), capacity).unwrap();
+        let handle = Self::new();
+        handle
+            .inner
+            .feeds
+            .write()
+            .unwrap()
+            .insert("cam".into(), Arc::new(Feed::new(writer.reader().unwrap())));
+        handle.inner.state.write().unwrap().active_camera = Some("cam".into());
+        (handle, writer)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared_memory::Published;
     #[test]
     fn parent_replies_carry_saved_files_even_when_failed() {
         let old: ParentReply = serde_json::from_str(r#"{"ok":true,"snapshot":null}"#).unwrap();
@@ -2323,7 +2449,8 @@ mod tests {
             capture_session: None,
             transport: None,
             history: CameraHistoryStatus::default(),
-            ring_dropped: 0,
+            lost: 0,
+            preview_skipped: 0,
             stale: true,
             error_logged: None,
             forwarding_since_ms: None,
@@ -2879,46 +3006,134 @@ mod tests {
         );
     }
 
-    #[test]
-    fn frame_feed_reuses_unshared_frames_and_never_mutates_shared_ones() {
-        let path = std::env::temp_dir().join(format!(
-            "capturefab-feed-test-{}-{}.bin",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut writer = SharedRing::create(&path, 4096).unwrap();
-        let mut feed = FrameFeed {
-            ring: SharedRing::open(&path).unwrap(),
-            latest: None,
-        };
-        let frame = |id: u64| Frame {
+    fn ring_frame(id: u64) -> Frame {
+        Frame {
             id,
             width: 4,
             height: 4,
             pixel_format: crate::types::MONO8,
             timestamp_ns: 0,
             data: vec![id as u8; 16],
+        }
+    }
+    #[test]
+    fn frame_feed_reuses_unshared_frames_and_never_mutates_shared_ones() {
+        let mut writer = SharedRing::create(&std::env::temp_dir(), 4096).unwrap();
+        let mut feed = FrameFeed {
+            ring: writer.reader().unwrap(),
+            latest: None,
         };
-        assert!(feed.poll().is_none());
-        writer.write(&frame(1)).unwrap();
-        let held = feed.poll().unwrap();
+        let frame = ring_frame;
+        assert!(feed.poll(true).is_none());
+        writer.write(&frame(1), false).unwrap();
+        let held = feed.poll(true).unwrap();
         // A consumer still holds frame 1, so frame 2 must get its own buffer.
-        writer.write(&frame(2)).unwrap();
-        let second = feed.poll().unwrap();
+        writer.write(&frame(2), false).unwrap();
+        let second = feed.poll(true).unwrap();
         assert_eq!((held.id, held.data.as_slice()), (1, &[1; 16][..]));
         assert_eq!((second.id, second.data.as_slice()), (2, &[2; 16][..]));
         assert_ne!(held.data.as_ptr(), second.data.as_ptr());
         let buffer = second.data.as_ptr();
         drop((held, second));
         // Once released, the cached allocation is overwritten in place.
-        writer.write(&frame(3)).unwrap();
-        let third = feed.poll().unwrap();
+        writer.write(&frame(3), false).unwrap();
+        let third = feed.poll(true).unwrap();
         assert_eq!((third.id, third.data.as_ptr()), (3, buffer));
         drop(third);
         // Without a newer frame the cached one is returned unchanged.
-        assert_eq!(feed.poll().unwrap().id, 3);
+        assert_eq!(feed.poll(true).unwrap().id, 3);
+    }
+    #[test]
+    fn sequences_never_wait_for_a_frame_copy() {
+        let (handle, mut writer) = SessionHandle::fed(4096);
+        writer.write(&ring_frame(1), false).unwrap();
+        writer.write(&ring_frame(2), false).unwrap();
+        let feed = handle.feed("cam").unwrap();
+        // A frame copy holds this lock; sequence polls must not need it.
+        let copying = locked(&feed.frames);
+        assert_eq!(handle.frame_sequence(), 2);
+        assert_eq!(handle.frame_sequence_of(&["cam", "absent"]), 2);
+        assert_eq!(handle.frame_sequence_of(&["absent"]), 0);
+        drop(copying);
+        handle.shutdown();
+    }
+    #[test]
+    fn fresh_frames_wait_for_an_idle_ring_to_publish() {
+        let (handle, mut writer) = SessionHandle::fed(4096);
+        // Nobody watched: frame 1 was the keep-alive, 2 and 3 were skipped.
+        for id in 1..=3 {
+            writer.write(&ring_frame(id), false).unwrap();
+        }
+        let acquisition = std::thread::spawn(move || {
+            for id in 4..=40 {
+                std::thread::sleep(Duration::from_millis(5));
+                writer.write(&ring_frame(id), false).unwrap();
+            }
+            writer
+        });
+        let fresh = handle
+            .fresh_frame_for("cam", Duration::from_secs(5))
+            .unwrap();
+        assert!(fresh.id >= 4, "got keep-alive frame {}", fresh.id);
+        // The sample asked for one frame; it did not watch the ring, so the
+        // frames after it were neither copied nor counted as skipped.
+        let mut writer = acquisition.join().unwrap();
+        assert_eq!(writer.preview_skipped(), 0);
+        assert_eq!(
+            writer.write(&ring_frame(41), false).unwrap(),
+            Published::Skipped
+        );
+        handle.shutdown();
+    }
+    #[test]
+    fn fresh_frames_from_a_quiet_ring_are_its_held_frame() {
+        let (handle, mut writer) = SessionHandle::fed(4096);
+        // Frames 2 and 3 were skipped, then no frame came: a triggered
+        // camera between triggers. The worker held frame 3.
+        for id in 1..=3 {
+            if writer.write(&ring_frame(id), false).unwrap() == Published::Skipped {
+                writer.hold(ring_frame(id));
+            }
+        }
+        // The worker's loop flushes while it waits for frames.
+        let worker = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(5);
+            while writer.flush().unwrap() == Published::Skipped && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            writer
+        });
+        let fresh = handle
+            .fresh_frame_for("cam", Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(fresh.id, 3);
+        let writer = worker.join().unwrap();
+        assert_eq!(writer.preview_skipped(), 0);
+        handle.shutdown();
+    }
+    #[test]
+    fn stdout_captures_refuse_downscaled_previews() {
+        let (handle, mut writer) = SessionHandle::fed(4096);
+        writer.write(&ring_frame(1), true).unwrap();
+        assert_eq!(handle.captured_frame().unwrap().id, 1);
+        let large = Frame {
+            id: 2,
+            width: 80,
+            height: 80,
+            data: vec![9; 6400],
+            ..ring_frame(2)
+        };
+        writer.write(&large, true).unwrap();
+        let error = handle.captured_frame().unwrap_err().to_string();
+        assert!(
+            error.contains("larger than the 4.0 KiB shared frame buffer"),
+            "{error}"
+        );
+        // Views can still say what the camera delivers.
+        assert_eq!(
+            handle.preview_of("cam"),
+            Some((80, 80, crate::types::MONO8))
+        );
+        handle.shutdown();
     }
 }
