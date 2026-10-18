@@ -21,7 +21,7 @@ use std::{
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, OnceLock,
         mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
     },
     thread::JoinHandle,
@@ -52,6 +52,10 @@ const WRITE_RETRY: Duration = Duration::from_secs(5);
 /// How long a note stays in the status.
 const NOTE_LIFETIME: Duration = Duration::from_secs(60);
 const BUSY_NOTE: &str = "Skipped a suggestion while the previous capture was still being saved";
+/// The share of one core that embedding sampled frames on the CPU may use on
+/// average, normally and in efficiency mode. A GPU embeds at the camera's pace.
+const CPU_SHARE: f64 = 0.5;
+const EFFICIENT_CPU_SHARE: f64 = 0.2;
 const MODEL: &str = "Session exemplar kNN + background novelty";
 type Descriptor = Vec<f32>;
 
@@ -75,7 +79,7 @@ pub struct SessionStatus {
     /// Where embeddings run, for example "GPU: Apple M4 Max (Metal)" or "CPU".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accelerator: Option<String>,
-    /// Frames embedded per second over the last few seconds.
+    /// Frames embedded per second over the last few samples.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub samples_per_second: Option<f64>,
     /// Why the latest suggestion was skipped or a capture was dropped.
@@ -368,31 +372,36 @@ struct Throughput {
 impl Throughput {
     fn record(&mut self, now: Instant) {
         self.finished.push_back(now);
-        while self
-            .finished
-            .front()
-            .is_some_and(|t| now.saturating_duration_since(*t) > Duration::from_secs(3))
-        {
+        // Three seconds of samples, but the latest two for up to a minute,
+        // so sampling paced to the CPU still has a rate.
+        while self.finished.front().is_some_and(|t| {
+            let age = now.saturating_duration_since(*t);
+            age > Duration::from_secs(60)
+                || (age > Duration::from_secs(3) && self.finished.len() > 2)
+        }) {
             self.finished.pop_front();
         }
     }
     fn rate(&self) -> Option<f64> {
         let (first, last) = (self.finished.front()?, self.finished.back()?);
         let span = last.saturating_duration_since(*first).as_secs_f64();
-        (self.finished.len() >= 2
-            && span > 0.0
-            && Instant::now().saturating_duration_since(*last) < Duration::from_secs(1))
-        .then(|| (self.finished.len() - 1) as f64 / span)
+        let samples = self.finished.len().saturating_sub(1) as f64;
+        // Sampling has stopped once it misses twice its usual spacing.
+        let quiet = Duration::from_secs_f64((2.0 * span / samples.max(1.0)).max(1.0));
+        (samples >= 1.0 && span > 0.0 && last.elapsed() < quiet).then(|| samples / span)
     }
 }
 
 /// One encoder thread per DINOv2 session. At most one sampled frame is in
 /// flight, so the worker holds one extra frame copy and sampling slows to the
-/// encoder's speed instead of queueing.
+/// encoder's speed instead of queueing. On the CPU, sampling also rests after
+/// each frame, so embedding never takes over the computer.
 struct Embedder {
     jobs: Option<mpsc::SyncSender<Job>>,
-    done: mpsc::Receiver<Embedded>,
+    done: mpsc::Receiver<(Embedded, Duration)>,
     busy: bool,
+    /// When the CPU has rested long enough after the last sample.
+    rested: Option<Instant>,
     thread: Option<std::thread::JoinHandle<()>>,
     throughput: Arc<Mutex<Throughput>>,
 }
@@ -419,9 +428,17 @@ impl Embedder {
                 for job in inbox {
                     match job {
                         Job::Sample(frame, at) => {
+                            let (started, before) = (Instant::now(), process_cpu());
                             let feature = backend.describe(&encoder, &frame);
+                            let took = started.elapsed();
+                            let used = before
+                                .zip(process_cpu())
+                                .map(|(before, after)| after.saturating_sub(before));
+                            let cpu = backend.cpu_time(took, used);
+                            let rest = rest_after(cpu, took, cpu_share());
                             publish(&backend, feature.is_ok());
-                            if outbox.send((frame, at, Instant::now(), feature)).is_err() {
+                            let embedded = (frame, at, Instant::now(), feature);
+                            if outbox.send((embedded, rest)).is_err() {
                                 break;
                             }
                         }
@@ -438,6 +455,7 @@ impl Embedder {
             jobs: Some(jobs),
             done,
             busy: false,
+            rested: None,
             thread: Some(thread),
             throughput,
         })
@@ -455,6 +473,11 @@ impl Embedder {
         self.busy = true;
         Ok(())
     }
+    /// Whether a new sample must wait for the one in flight, or for the CPU
+    /// to rest after the last one.
+    fn waiting(&self, now: Instant) -> bool {
+        self.busy || self.rested.is_some_and(|rested| now < rested)
+    }
     fn describe(&self, frame: &Frame) -> Result<Descriptor> {
         let (reply, result) = mpsc::channel();
         self.send(Job::Manual(frame.clone(), reply))?;
@@ -462,10 +485,7 @@ impl Embedder {
     }
     fn finished(&mut self) -> Result<Option<Embedded>> {
         match self.done.try_recv() {
-            Ok(result) => {
-                self.busy = false;
-                Ok(Some(result))
-            }
+            Ok(result) => Ok(Some(self.landed(result))),
             Err(mpsc::TryRecvError::Empty) => Ok(None),
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.busy = false;
@@ -473,11 +493,16 @@ impl Embedder {
             }
         }
     }
+    fn landed(&mut self, (embedded, rest): (Embedded, Duration)) -> Embedded {
+        self.busy = false;
+        self.rested = Some(embedded.2 + rest);
+        embedded
+    }
     #[cfg(all(test, feature = "dinov2"))]
     fn wait(&mut self) -> Option<Embedded> {
         let result = self.busy.then(|| self.done.recv().ok()).flatten();
         self.busy = false;
-        result
+        result.map(|result| self.landed(result))
     }
 }
 
@@ -490,6 +515,52 @@ impl Drop for Embedder {
             let _ = thread.join();
         }
     }
+}
+
+/// The share of one core CPU embeddings may use now.
+fn cpu_share() -> f64 {
+    if crate::efficiency::efficient() {
+        EFFICIENT_CPU_SHARE
+    } else {
+        CPU_SHARE
+    }
+}
+
+/// How long sampling rests after an embedding that took `took` and used
+/// `cpu` of processor time, so that embedding averages `share` of one core.
+fn rest_after(cpu: Duration, took: Duration, share: f64) -> Duration {
+    cpu.div_f64(share).saturating_sub(took)
+}
+
+/// Threads a CPU forward pass may keep busy: matrixmultiply's pool takes
+/// MATMUL_NUM_THREADS, or one thread per physical core, at most four.
+/// Counting logical cores can only overstate the cost.
+fn cpu_threads() -> u32 {
+    static THREADS: OnceLock<u32> = OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("MATMUL_NUM_THREADS")
+            .ok()
+            .and_then(|threads| threads.trim().parse().ok())
+            .unwrap_or(crate::efficiency::host().cpu_cores as u32)
+            .clamp(1, 4)
+    })
+}
+
+/// Processor time this process has used.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn process_cpu() -> Option<Duration> {
+    let mut used = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime only writes the timespec it is given.
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut used) };
+    (status == 0).then(|| Duration::new(used.tv_sec as u64, used.tv_nsec as u32))
+}
+#[cfg(not(unix))]
+fn process_cpu() -> Option<Duration> {
+    None
 }
 
 /// Where the encoder thread computes embeddings. The GPU helper starts in the
@@ -558,6 +629,21 @@ impl Backend {
             return model.embed_rgb(&rgb);
         }
         encoder.describe(frame)
+    }
+
+    /// Processor time of an embedding that just took `took`, while the
+    /// worker `used` this much: none on the GPU. On the CPU that counts every
+    /// thread of the forward pass, and other worker threads can only
+    /// overstate it; without a measurement every thread is assumed busy.
+    fn cpu_time(&self, took: Duration, used: Option<Duration>) -> Duration {
+        match self {
+            #[cfg(feature = "dinov2")]
+            Self::Gpu(_) => Duration::ZERO,
+            _ => {
+                let most = took.saturating_mul(cpu_threads());
+                used.map_or(most, |used| used.min(most))
+            }
+        }
     }
 
     fn accelerator(&self) -> Option<String> {
@@ -980,10 +1066,11 @@ impl CaptureSession {
             model: self.encoder.label(),
             encoder: self.encoder.name().into(),
             accelerator: throughput.as_ref().and_then(|t| t.accelerator.clone()),
-            samples_per_second: throughput
-                .as_ref()
-                .and_then(|t| t.rate())
-                .map(|rate| (rate * 10.0).round() / 10.0),
+            samples_per_second: throughput.as_ref().and_then(|t| t.rate()).map(|rate| {
+                // Paced CPU sampling below one per second keeps two decimals.
+                let scale = if rate < 1.0 { 100.0 } else { 10.0 };
+                (rate * scale).round() / scale
+            }),
             note: shared
                 .note
                 .as_ref()
@@ -1012,7 +1099,7 @@ impl CaptureSession {
         if self
             .last_sample
             .is_some_and(|last| now + interval / 4 < last + interval)
-            || self.embedder.as_ref().is_some_and(|e| e.busy)
+            || self.embedder.as_ref().is_some_and(|e| e.waiting(now))
         {
             return Ok(captured);
         }

@@ -990,15 +990,20 @@ impl Workbench {
 mod accessibility_tests;
 
 /// The model, then where and how fast it is embedding frames, for example
-/// "DINOv2 ViT-S/14 ... · GPU: Apple M4 Max (Metal) · 30 frames/s".
+/// "DINOv2 ViT-S/14 ... · GPU: Apple M4 Max (Metal) · 30 frames/s", or
+/// "... · CPU · 1 frame every 8 s" when sampling rests for the CPU.
 fn model_caption(status: &crate::autocapture::SessionStatus) -> String {
     let mut caption = status.model.clone();
     if let Some(accelerator) = &status.accelerator {
         caption.push_str(" · ");
         caption.push_str(accelerator);
     }
-    if let Some(rate) = status.samples_per_second {
-        caption.push_str(&format!(" · {rate:.0} frames/s"));
+    match status.samples_per_second {
+        Some(rate) if rate > 0.0 && rate < 1.0 => {
+            caption.push_str(&format!(" · 1 frame every {:.0} s", 1.0 / rate));
+        }
+        Some(rate) => caption.push_str(&format!(" · {rate:.0} frames/s")),
+        None => {}
     }
     caption
 }
@@ -1007,6 +1012,31 @@ fn model_caption(status: &crate::autocapture::SessionStatus) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_model_caption_says_how_often_a_paced_cpu_samples() {
+        let mut status = crate::autocapture::SessionStatus {
+            path: "/captures/line-1.duckdb".into(),
+            camera: "sim:0".into(),
+            enabled: true,
+            sensitivity: 0.5,
+            cooldown_ms: 2000,
+            manual_count: 1,
+            kept_count: 0,
+            discarded_count: 0,
+            pending_count: 0,
+            blocked_storage: false,
+            state: "watching".into(),
+            model: "DINOv2".into(),
+            encoder: "dinov2".into(),
+            accelerator: Some("CPU".into()),
+            samples_per_second: Some(0.13),
+            note: None,
+        };
+        assert_eq!(model_caption(&status), "DINOv2 · CPU · 1 frame every 8 s");
+        status.samples_per_second = Some(29.6);
+        assert_eq!(model_caption(&status), "DINOv2 · CPU · 30 frames/s");
+    }
 
     #[test]
     fn preview_validates_pixels_before_creating_image() {

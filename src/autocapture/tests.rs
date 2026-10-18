@@ -990,6 +990,61 @@ fn close_finishes_even_when_duckdb_cannot_checkpoint() {
     assert_eq!(resumed.status().unwrap().manual_count, 1);
 }
 
+#[test]
+fn cpu_embeddings_rest_to_stay_within_their_share_of_a_core() {
+    let took = Duration::from_millis(100);
+    // Four busy threads for 100 ms is 400 ms of processor time: at half a
+    // core the cycle lasts 800 ms, at a fifth 2 s.
+    let cpu = took * 4;
+    assert_eq!(rest_after(cpu, took, CPU_SHARE), Duration::from_millis(700));
+    assert_eq!(
+        rest_after(cpu, took, EFFICIENT_CPU_SHARE),
+        Duration::from_millis(1900)
+    );
+    assert_eq!(rest_after(Duration::ZERO, took, CPU_SHARE), Duration::ZERO);
+    // The worker's measured processor time counts, up to every thread of
+    // the forward pass; without a measurement all of them are assumed busy.
+    let most = took * cpu_threads();
+    assert_eq!(Backend::Cpu.cpu_time(took, Some(took)), took);
+    assert_eq!(Backend::Cpu.cpu_time(took, Some(most * 2)), most);
+    assert_eq!(Backend::Cpu.cpu_time(took, None), most);
+    assert!((1..=4).contains(&cpu_threads()));
+}
+
+#[cfg(unix)]
+#[test]
+fn process_cpu_time_counts_work_on_any_thread() {
+    let before = process_cpu().unwrap();
+    std::thread::spawn(|| {
+        let started = Instant::now();
+        let mut state = 1_u64;
+        while started.elapsed() < Duration::from_millis(100) {
+            state = std::hint::black_box(state.wrapping_mul(6364136223846793005).wrapping_add(1));
+        }
+    })
+    .join()
+    .unwrap();
+    assert!(process_cpu().unwrap() >= before + Duration::from_millis(20));
+}
+
+#[test]
+fn slow_sampling_still_reports_its_rate_until_it_stops() {
+    let mut throughput = Throughput::default();
+    let now = Instant::now();
+    throughput.record(now - Duration::from_secs(20));
+    throughput.record(now - Duration::from_secs(10));
+    throughput.record(now);
+    assert_eq!(throughput.finished.len(), 2, "the latest two are kept");
+    assert_eq!(throughput.rate(), Some(0.1));
+    throughput.finished = [now - Duration::from_secs(40), now - Duration::from_secs(30)].into();
+    assert_eq!(throughput.rate(), None, "no sample for three spacings");
+    let mut fast = Throughput::default();
+    for frame in 0..=30 {
+        fast.record(now - Duration::from_millis(1000 - frame * 1000 / 30));
+    }
+    assert!(fast.rate().is_some_and(|rate| (rate - 30.0).abs() < 0.5));
+}
+
 /// Under `cfg(test)` the bundled model is the tiny committed fixture.
 #[cfg(feature = "dinov2")]
 mod dinov2_sessions {
@@ -1007,6 +1062,10 @@ mod dinov2_sessions {
             .unwrap();
         session.flush();
         id
+    }
+    /// The grid alone decides when to sample; resting has its own test.
+    fn rested(session: &mut CaptureSession) {
+        session.embedder.as_mut().unwrap().rested = None;
     }
 
     #[test]
@@ -1062,6 +1121,7 @@ mod dinov2_sessions {
         session.recent.clear();
         session.last_sample = None;
         let now = Instant::now();
+        rested(&mut session);
         session.observe_at(&color([220, 40, 40]), now).unwrap();
         session.configure(false, 0.5, 250).unwrap();
         session.configure(true, 0.5, 250).unwrap();
@@ -1069,6 +1129,7 @@ mod dinov2_sessions {
         assert_eq!(session.status().unwrap().pending_count, 1);
         // The same frame sampled after re-arming is captured.
         session.last_sample = None;
+        rested(&mut session);
         let later = Instant::now();
         session.observe_at(&color([220, 40, 40]), later).unwrap();
         assert!(settle(&mut session, later + Duration::from_millis(100)).is_some());
@@ -1103,6 +1164,7 @@ mod dinov2_sessions {
         let t = Instant::now();
         session.observe_at(&color([0, 0, 0]), t).unwrap();
         session.embedder.as_mut().unwrap().wait();
+        rested(&mut session);
         assert!(
             !session.embedder.as_ref().unwrap().busy
                 && session.last_sample.is_some_and(|last| last == t),
@@ -1123,6 +1185,7 @@ mod dinov2_sessions {
             "the next 30 fps slot"
         );
         session.embedder.as_mut().unwrap().wait();
+        rested(&mut session);
         // ...and the grid, not the early arrival, sets the following slot.
         session
             .observe_at(&color([0, 0, 0]), t + Duration::from_millis(48))
@@ -1132,6 +1195,33 @@ mod dinov2_sessions {
             .observe_at(&color([0, 0, 0]), t + Duration::from_millis(60))
             .unwrap();
         assert!(session.embedder.as_ref().unwrap().busy);
+    }
+
+    #[test]
+    fn cpu_sampling_rests_after_each_embedding() {
+        let file = SessionFile::new();
+        let mut session = create(&file, Some(EncoderChoice::Dinov2));
+        session.manual(&color([220, 40, 40])).unwrap();
+        ready(&mut session);
+        let t = Instant::now();
+        session.observe_at(&color([0, 0, 0]), t).unwrap();
+        let (_, _, finished, _) = session.embedder.as_mut().unwrap().wait().unwrap();
+        let rested = session.embedder.as_ref().unwrap().rested.unwrap();
+        assert!(rested >= finished, "unit tests embed on the CPU");
+        // As after a 200 ms embedding: no sample until the CPU has rested.
+        let until = finished + Duration::from_secs(1);
+        session.embedder.as_mut().unwrap().rested = Some(until);
+        session
+            .observe_at(&color([0, 0, 0]), until - Duration::from_millis(10))
+            .unwrap();
+        assert!(!session.embedder.as_ref().unwrap().busy, "still resting");
+        session.observe_at(&color([0, 0, 0]), until).unwrap();
+        assert!(session.embedder.as_ref().unwrap().busy);
+        assert_eq!(
+            session.last_sample,
+            Some(until),
+            "a rested sampler restarts its grid"
+        );
     }
 
     #[test]

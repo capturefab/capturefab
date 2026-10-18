@@ -255,7 +255,8 @@ Frames count against the storage budget; a full budget is exit 6.
 A refused suggestion is retried after a minute, or at once after `discard` or `auto`; free space or raise the budget.
 `status.capture_session.note` says why a suggestion was skipped.
 `new --encoder auto` (the default) uses the DINOv2 ViT-S/14 model bundled in the executable; nothing is downloaded.
-Embeddings run on the GPU in an isolated helper process when possible (up to 30 frames per second), otherwise on the CPU.
+Embeddings run on the GPU in an isolated helper process when possible (up to 30 frames per second), otherwise on the CPU, paced to at most half of one core (a fifth in efficiency mode).
+`auto` picks DINOv2 even without a GPU; `--encoder native` samples 4 times a second on CPU-only small computers.
 `status --json` reports `capture_session.accelerator` and `samples_per_second`; `doctor --json` reports `auto_capture.dinov2.gpu`.
 `--encoder native` uses a color/edge descriptor; `CAPTUREFAB_DINOV2_GPU=0` keeps DINOv2 on the CPU.
 A session keeps its encoder and model fingerprint: `resume` refuses a session learned with a different bundled model (exit 1).

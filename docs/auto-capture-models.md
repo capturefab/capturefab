@@ -147,6 +147,27 @@ frame (roughly 7-10 samples per second). Sampling uses a fixed grid of up to
 30 per second that tolerates frames arriving a quarter interval early, so
 camera jitter does not halve the rate. Slower GPUs have not been measured.
 
+**CPU pacing.** Keeping one frame in flight on the CPU held a core busy all
+the time: about 90% of one core for a CPU-only session on the simulator, and
+everything a Raspberry Pi has. Sampling now rests after each CPU embedding, so
+that the worker's processor time during embeddings averages at most half of
+one core, or a fifth in efficiency mode. The worker's processor time counts
+every thread of the forward pass, and anything else the worker does meanwhile
+can only lengthen the rest. GPU embeddings are not paced. In the same session
+the worker used 38% of one core at 1.1 samples per second, and 21% in
+efficiency mode, on an M4 Max shared with other heavy work. A slower computer
+samples less often: if an embedding costs one second of processor time, half
+a core allows one sample every two seconds and efficiency mode one every five.
+
+**Why `auto` keeps DINOv2 without a GPU.** A session's encoder never changes,
+but whether a GPU helps is only known at run time: the helper can fail to
+start, fault later or miss its deadline, and efficiency mode can change while
+a session runs. Probing the GPU when a session is created would also stall
+the camera worker for seconds, up to 20 with a hung driver. So `auto` keeps
+DINOv2 and pacing bounds its CPU use, while status reports the achieved
+`samples_per_second`. On a CPU-only small computer where frequent sampling
+matters more than semantics, choose `--encoder native`.
+
 **Preprocessing and pooling.** Frames are converted to RGB, squashed to
 224 x 224 with an antialiased triangle filter (the reference processor resizes
 and center-crops; squashing keeps events at the frame edges), ImageNet-
@@ -173,10 +194,10 @@ cameras.
 
 **Limits.** The CLS token describes the whole image, so targets covering a
 small part of the frame move the embedding little and can be missed. Without a
-usable GPU, sampling falls well below 30 per second. A session stores the
-encoder, embedding dimensions and a SHA-256 fingerprint of the weights and
-configuration; a build that bundles a different model refuses to resume it
-rather than mixing embedding spaces.
+usable GPU, sampling falls well below 30 per second (see CPU pacing above). A
+session stores the encoder, embedding dimensions and a SHA-256 fingerprint of
+the weights and configuration; a build that bundles a different model refuses
+to resume it rather than mixing embedding spaces.
 
 ## Native descriptor fallback and its limits
 
