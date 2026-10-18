@@ -581,8 +581,6 @@ enum Message {
     /// Whether the main window is out of sight, where the platform says;
     /// see `pacing::out_of_sight`.
     Hidden(Option<bool>),
-    /// The size of the main window's monitor, where the platform says.
-    Monitor(Option<Size>),
     /// The window opened, moved or changed scale, perhaps onto another display.
     Displaced,
     /// The refresh interval the window's screen reports, if any.
@@ -850,8 +848,6 @@ struct Workbench {
     shown: Option<Shown>,
     gpu: GpuFrames,
     refresh: refresh::Refresh,
-    /// The size of the main window's monitor when last asked.
-    monitor: Option<Size>,
     /// What the frame watcher follows.
     cadence: Arc<pacing::Cadence>,
     draws: Arc<pacing::Draws>,
@@ -860,6 +856,8 @@ struct Workbench {
     undrawn: Option<Instant>,
     /// The main window is out of sight, as far as the platform tells.
     hidden: bool,
+    /// When frame work last took the newest frames; see `tick_frames`.
+    frames_taken: Option<Instant>,
     frame_meta: Option<(u64, u32, u32, u32, u64)>,
     /// When the frame shown is a downscaled preview of one larger than the
     /// camera's ring, that frame's width, height and pixel format.
@@ -1076,11 +1074,11 @@ impl Workbench {
             shown: None,
             gpu: GpuFrames::new(),
             refresh: refresh::Refresh::default(),
-            monitor: None,
             cadence: Arc::default(),
             draws: Arc::default(),
             undrawn: None,
             hidden: false,
+            frames_taken: None,
             frame_meta: None,
             frame_source: None,
             frame_id: None,
@@ -1851,7 +1849,8 @@ impl Workbench {
         self.sync_client_activity();
         self.sample_throughput();
         self.observe_liveness();
-        self.update_frames();
+        self.tick_frames();
+        self.refresh.settle(self.now);
         self.tick_performance();
         let destination_before = local_history::LocalState::capture(self);
         self.capture_to.tick(&mut self.output);
@@ -1875,9 +1874,8 @@ impl Workbench {
         Task::batch([
             pages,
             self.screenshot_tick(),
-            // A window in the background can be covered, hidden or restored
-            // without the keyboard moving, and may still draw meanwhile.
-            if self.key_window.is_none() && self.screenshot.is_none() {
+            // An unseen window may still draw.
+            if self.sight_unknown() {
                 pacing::out_of_sight(self.main_window)
             } else {
                 Task::none()
@@ -1932,6 +1930,7 @@ impl Workbench {
             return;
         }
         self.cadence.taken();
+        self.frames_taken = Some(self.now);
         self.camera_views.retain(|id, _| {
             self.snapshot
                 .cameras
@@ -2704,10 +2703,7 @@ impl Workbench {
                     .map(move |message| Message::InWindow(id, Box::new(message)));
             }
             Message::WindowScale(id, scale) => {
-                let before = self.window_scales.insert(id, scale);
-                if id == self.main_window && before.is_some_and(|before| before != scale) {
-                    self.refresh.recalibrate();
-                }
+                self.window_scales.insert(id, scale);
             }
             Message::WindowFocused(id) => {
                 if let Some(error) = &self.close_error
@@ -2715,14 +2711,21 @@ impl Workbench {
                 {
                     return window::gain_focus(error.window);
                 }
-                if id == self.main_window && std::mem::take(&mut self.hidden) {
+                let sight = if id == self.main_window && std::mem::take(&mut self.hidden) {
                     self.update_frames();
-                }
+                    Task::none()
+                } else if self.hidden {
+                    // Another window brought the app forward, and the main
+                    // window perhaps with it.
+                    pacing::out_of_sight(self.main_window)
+                } else {
+                    Task::none()
+                };
                 self.focused_window = id;
                 self.key_window = Some(id);
                 self.menu_editor = self.window_editor_focus.get(&id).copied().unwrap_or(false);
                 self.popup_open = false;
-                return self.accessibility.focused(id, true).discard();
+                return Task::batch([self.accessibility.focused(id, true).discard(), sight]);
             }
             Message::WindowUnfocused(id) => {
                 if self.key_window == Some(id) {
@@ -2878,22 +2881,12 @@ impl Workbench {
             Message::Tick => return self.tick(),
             Message::Frame(at) => self.refresh.redraw(at),
             Message::Displaced => {
-                // Measured again only on another display or scale; see
-                // `Monitor` and `WindowScale`.
+                self.refresh.moved(self.now);
                 let id = self.main_window;
                 return Task::batch([
                     screen_refresh(id),
-                    window::monitor_size(id).map(Message::Monitor),
                     window::scale_factor(id).map(move |scale| Message::WindowScale(id, scale)),
                 ]);
-            }
-            Message::Monitor(size) => {
-                if size.is_some()
-                    && std::mem::replace(&mut self.monitor, size)
-                        .is_some_and(|before| Some(before) != size)
-                {
-                    self.refresh.recalibrate();
-                }
             }
             Message::ScreenRefresh(period) => self.refresh.report(period),
             Message::FrameArrived | Message::Redrawn if !self.shot_staged() => self.update_frames(),

@@ -22,6 +22,9 @@ const ENOUGH: usize = 12;
 /// Redraws after which measuring stops even without an estimate, e.g. on a
 /// display slower than `SLOWEST`, so an idle window does not keep redrawing.
 const GIVE_UP: u32 = 90;
+/// How long the window stays put after moving before it is measured again:
+/// a drag moves it many times.
+const SETTLE: Duration = Duration::from_millis(500);
 
 pub(super) struct Refresh {
     last: Option<Instant>,
@@ -33,6 +36,8 @@ pub(super) struct Refresh {
     reported: Option<Duration>,
     /// Redraws time the drawing, not the display: never measure.
     unpaced: bool,
+    /// When the window last moved, until it is measured again.
+    moved: Option<Instant>,
 }
 
 impl Default for Refresh {
@@ -44,6 +49,7 @@ impl Default for Refresh {
             measured: DEFAULT,
             reported: None,
             unpaced: false,
+            moved: None,
         }
     }
 }
@@ -105,6 +111,24 @@ impl Refresh {
         self.intervals.clear();
         self.redraws = 0;
         self.last = None;
+    }
+
+    /// The window moved, perhaps onto another display of the same size and
+    /// scale, which only measuring tells apart where none is reported.
+    pub(super) fn moved(&mut self, at: Instant) {
+        self.moved = Some(at);
+    }
+
+    /// Measure again once the window has stayed put `SETTLE` since it last
+    /// moved.
+    pub(super) fn settle(&mut self, now: Instant) {
+        if self
+            .moved
+            .is_some_and(|at| now.saturating_duration_since(at) >= SETTLE)
+        {
+            self.moved = None;
+            self.recalibrate();
+        }
     }
 
     /// The display's refresh interval.
@@ -207,6 +231,31 @@ mod tests {
         assert_eq!(refresh.period(), DEFAULT);
         refresh.recalibrate();
         assert!(refresh.calibrated(), "moving the window changes nothing");
+    }
+
+    #[test]
+    fn a_moved_window_is_measured_again_once_it_stays_put() {
+        let mut refresh = Refresh::default();
+        let start = Instant::now();
+        feed(&mut refresh, start, [6_944; 12]);
+        // A drag moves the window many times; it is measured after the last.
+        for step in 0..10 {
+            refresh.moved(start + Duration::from_millis(step * 100));
+            refresh.settle(start + Duration::from_millis(step * 100 + 50));
+            assert!(refresh.calibrated(), "still moving");
+        }
+        refresh.settle(start + Duration::from_millis(900 + 499));
+        assert!(refresh.calibrated());
+        refresh.settle(start + Duration::from_millis(900) + SETTLE);
+        assert!(
+            !refresh.calibrated(),
+            "settled on what may be another display"
+        );
+        // Now on a 60 Hz display of the same size and scale.
+        feed(&mut refresh, start + Duration::from_secs(2), [16_667; 12]);
+        assert_eq!(refresh.period(), Duration::from_micros(16_667));
+        refresh.settle(start + Duration::from_secs(5));
+        assert!(refresh.calibrated(), "measured once per move");
     }
 
     #[test]

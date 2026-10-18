@@ -8,6 +8,7 @@ use iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
     widget::{Operation, Tree, tree},
 };
+use iced::futures::channel::mpsc::Sender;
 use iced::{Event, Rectangle, Vector, mouse};
 use std::{sync::atomic::AtomicBool, thread::Thread};
 
@@ -112,34 +113,37 @@ pub(super) fn watch_frames(
 ) -> impl iced::futures::Stream<Item = Message> + use<> {
     let handle = watch.handle.clone();
     let cadence = watch.cadence.clone();
-    iced::stream::channel(0, async move |mut output| {
-        std::thread::spawn(move || {
-            *cadence.watcher.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(std::thread::current());
-            let mut seen = cadence.sequence(&handle);
-            let mut changed = Instant::now();
-            while !output.is_closed() {
-                let (gap, fine, interval) = cadence.timing();
-                std::thread::sleep(poll_after(changed.elapsed(), interval, gap, fine));
-                let sequence = cadence.sequence(&handle);
-                if sequence == seen {
-                    continue;
-                }
-                cadence.announced.store(true, Ordering::Release);
-                if output.try_send(Message::FrameArrived).is_err() {
-                    cadence.announced.store(false, Ordering::Release);
-                    continue;
-                }
-                seen = sequence;
-                changed = Instant::now();
-                while cadence.announced.load(Ordering::Acquire) && !output.is_closed() {
-                    std::thread::park_timeout(PARKED);
-                }
-                std::thread::sleep(gap.saturating_sub(changed.elapsed()));
-            }
-        });
+    iced::stream::channel(0, async move |output| {
+        std::thread::spawn(move || announce(&cadence, output, || cadence.sequence(&handle)));
         std::future::pending::<()>().await;
     })
+}
+
+/// The frame watcher's thread: announce each change of `sequence` on
+/// `output`, as `watch_frames` describes, until `output` closes.
+fn announce(cadence: &Cadence, mut output: Sender<Message>, sequence: impl Fn() -> u64) {
+    *cadence.watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current());
+    let mut seen = sequence();
+    let mut changed = Instant::now();
+    while !output.is_closed() {
+        let (gap, fine, interval) = cadence.timing();
+        std::thread::sleep(poll_after(changed.elapsed(), interval, gap, fine));
+        let sequence = sequence();
+        if sequence == seen {
+            continue;
+        }
+        cadence.announced.store(true, Ordering::Release);
+        if output.try_send(Message::FrameArrived).is_err() {
+            cadence.announced.store(false, Ordering::Release);
+            continue;
+        }
+        seen = sequence;
+        changed = Instant::now();
+        while cadence.announced.load(Ordering::Acquire) && !output.is_closed() {
+            std::thread::park_timeout(PARKED);
+        }
+        std::thread::sleep(gap.saturating_sub(changed.elapsed()));
+    }
 }
 
 /// How long the watcher sleeps before looking again, `since` the last new
@@ -191,7 +195,8 @@ pub(super) struct Draws(Mutex<DrawLog>);
 
 #[derive(Default)]
 struct DrawLog {
-    /// When the main window last drew.
+    /// When the main window last drew, after any update made during the
+    /// draw.
     at: Option<Instant>,
     /// How many times it drew.
     count: u64,
@@ -207,12 +212,12 @@ impl Draws {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The window drew at `at`, showing `frames` (camera ID, frame ID).
+    /// The window draws at `at`, showing `frames` (camera ID, frame ID):
+    /// told before each draw, and again after any update made during it.
     /// Whether that ends a pause, which the workbench must hear about.
     pub(super) fn drew(&self, at: Instant, frames: &[(String, u64)]) -> bool {
         let mut log = self.log();
         log.at = Some(at);
-        log.count += 1;
         for (camera, frame) in frames {
             match log.presented.get_mut(camera) {
                 Some((last, _)) if last == frame => {}
@@ -226,6 +231,11 @@ impl Draws {
             }
         }
         std::mem::take(&mut log.paused)
+    }
+
+    /// A draw finished.
+    pub(super) fn drawn(&self) {
+        self.log().count += 1;
     }
 
     /// When the main window last drew, and how many times it has.
@@ -315,6 +325,7 @@ impl Widget<Message, Theme, iced::Renderer> for Observer<'_> {
         self.content
             .as_widget()
             .draw(tree, renderer, theme, style, layout, cursor, viewport);
+        self.draws.drawn();
     }
     fn operate(
         &mut self,
@@ -341,9 +352,11 @@ impl Widget<Message, Theme, iced::Renderer> for Observer<'_> {
         self.content.as_widget_mut().update(
             tree, event, layout, cursor, renderer, clipboard, shell, viewport,
         );
-        // iced sends this to the window's widgets just before it draws them.
-        if let Event::Window(window::Event::RedrawRequested(at)) = event
-            && self.draws.drew(*at, &self.frames)
+        // iced sends this to the window's widgets just before it draws them,
+        // and again after updating for any message they publish, all with
+        // the first pass's instant. Each pass's own time covers that update.
+        if let Event::Window(window::Event::RedrawRequested(_)) = event
+            && self.draws.drew(Instant::now(), &self.frames)
         {
             shell.publish(Message::Redrawn);
         }
@@ -385,6 +398,26 @@ impl Workbench {
                 || self
                     .undrawn
                     .is_some_and(|since| self.now.saturating_duration_since(since) >= UNDRAWN))
+    }
+
+    /// Take frames on the tick only when frame work has not lately: to catch
+    /// one the frame watcher missed, such as one offered before it started,
+    /// without adding to the pace it keeps. A pause is noted either way.
+    pub(super) fn tick_frames(&mut self) {
+        let lately = self
+            .frames_taken
+            .is_some_and(|at| self.now.saturating_duration_since(at) < self.frame_interval());
+        if self.frames_paused() || !lately {
+            self.update_frames();
+        }
+    }
+
+    /// Whether to ask if the main window is out of sight. In the background
+    /// it can be covered, hidden or restored without the keyboard moving,
+    /// and once out of sight it can come back with another window keeping
+    /// the keyboard, as when the app comes forward with Settings in front.
+    pub(super) fn sight_unknown(&self) -> bool {
+        self.screenshot.is_none() && (self.key_window.is_none() || self.hidden)
     }
 
     /// Note that this update changes the view, which iced draws next,
@@ -528,28 +561,202 @@ mod tests {
         assert_eq!(cadence.timing().1, ms(4));
     }
 
+    /// The next message on `arrivals` within `wait`.
+    fn arrival(
+        arrivals: &mut iced::futures::channel::mpsc::Receiver<Message>,
+        wait: Duration,
+    ) -> Option<Message> {
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Ok(message) = arrivals.try_recv() {
+                return Some(message);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(ms(1));
+        }
+    }
+
     #[test]
     fn the_watcher_announces_nothing_more_until_the_frame_is_taken() {
-        let cadence = Cadence::default();
-        cadence.announced.store(true, Ordering::Release);
-        let waiting = Arc::new(cadence);
-        let parked = waiting.clone();
-        let watcher = std::thread::spawn(move || {
-            *parked.watcher.lock().unwrap() = Some(std::thread::current());
-            let started = Instant::now();
-            while parked.announced.load(Ordering::Acquire) {
-                std::thread::park_timeout(PARKED);
-            }
-            started.elapsed()
-        });
-        std::thread::sleep(ms(30));
-        assert!(!watcher.is_finished(), "parked while the frame waits");
-        while waiting.watcher.lock().unwrap().is_none() {
-            std::thread::yield_now();
+        let cadence = Arc::new(Cadence::default());
+        cadence.follow(ms(2), None, false, Vec::new());
+        let sequence = Arc::new(AtomicU64::new(0));
+        let (output, mut arrivals) = iced::futures::channel::mpsc::channel(0);
+        let watcher = {
+            let (cadence, sequence) = (cadence.clone(), sequence.clone());
+            std::thread::spawn(move || {
+                announce(&cadence, output, || sequence.load(Ordering::Relaxed))
+            })
+        };
+        assert!(arrival(&mut arrivals, ms(20)).is_none(), "no frame yet");
+        sequence.store(1, Ordering::Relaxed);
+        let first = arrival(&mut arrivals, Duration::from_secs(1));
+        assert!(matches!(first, Some(Message::FrameArrived)));
+        // More frames while the workbench has not taken the first: however
+        // many gaps pass, nothing more queues behind it.
+        for frame in 2..=4 {
+            sequence.store(frame, Ordering::Relaxed);
+            assert!(arrival(&mut arrivals, ms(20)).is_none());
         }
-        waiting.taken();
-        let waited = watcher.join().unwrap();
-        assert!(waited < PARKED, "woken at once, after {waited:?}");
+        let started = Instant::now();
+        cadence.taken();
+        let next = arrival(&mut arrivals, Duration::from_secs(1));
+        assert!(
+            matches!(next, Some(Message::FrameArrived)),
+            "woken once taken"
+        );
+        assert!(started.elapsed() < PARKED, "at once, not on a timeout");
+        // Dropping the subscription ends the thread.
+        drop(arrivals);
+        watcher.join().unwrap();
+    }
+
+    #[test]
+    fn efficiency_mode_floors_the_frame_interval_in_each_view() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        let camera = liveness::streaming_camera(100, 0, 30.0);
+        let us = Duration::from_micros;
+        // Refresh period, efficient, overview, and the frame interval.
+        for (period, efficient, overview, interval) in [
+            (16_667, false, false, 16_667),
+            (16_667, false, true, 33_333),
+            (16_667, true, false, 66_667),
+            (16_667, true, true, 200_000),
+            (8_333, false, false, 8_333),
+            (8_333, false, true, 33_333),
+            (8_333, true, false, 66_667),
+            (8_333, true, true, 200_000),
+        ] {
+            let _mode = performance::process::force(efficient);
+            bench.refresh.report(Some(us(period)));
+            bench.snapshot.cameras = vec![camera.clone(); if overview { 2 } else { 1 }];
+            assert_eq!(bench.frame_interval(), us(interval));
+            // A quarter refresh early, so a late poll still meets its vsync.
+            assert_eq!(bench.frame_gap(), us(interval) - us(period) / 4);
+        }
+    }
+
+    #[test]
+    fn ticks_take_only_frames_the_watcher_missed() {
+        let _efficient = performance::process::force(true);
+        let (handle, mut writer) = SessionHandle::fed(4096);
+        let mut bench = Workbench::new(handle.clone(), "test".into(), true, None);
+        bench.snapshot.active_camera = Some("cam".into());
+        let frame = |id| crate::types::Frame {
+            id,
+            width: 4,
+            height: 4,
+            pixel_format: crate::types::MONO8,
+            timestamp_ns: 0,
+            data: vec![0; 16],
+        };
+        // A frame offered before the watcher started is the tick's to take.
+        writer.write(&frame(1), true).unwrap();
+        bench.tick_frames();
+        assert_eq!(bench.frame_id, Some(1));
+        // Efficient takes at most 15 frames a second, ticks included.
+        writer.write(&frame(2), true).unwrap();
+        bench.now += ms(40);
+        bench.tick_frames();
+        assert_eq!(bench.frame_id, Some(1), "taken lately");
+        bench.now += ms(30);
+        bench.tick_frames();
+        assert_eq!(bench.frame_id, Some(2));
+        handle.shutdown();
+    }
+
+    #[test]
+    fn frames_out_of_sight_wait_unannounced_until_the_window_is_back() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        let (main, settings) = (bench.main_window, window::Id::unique());
+        bench.settings_window = Some(settings);
+        let announced = |bench: &Workbench| bench.cadence.announced.load(Ordering::Acquire);
+        bench.cadence.announced.store(true, Ordering::Release);
+        let _ = bench.handle_message(Message::Hidden(Some(true)));
+        let _ = bench.handle_message(Message::FrameArrived);
+        bench.tick_frames();
+        assert!(announced(&bench), "the watcher waits");
+        let _ = bench.handle_message(Message::Hidden(Some(false)));
+        assert!(!announced(&bench), "taken once back in sight");
+        // Settings comes forward in front of the hidden main window, which
+        // never gets the keyboard: ask until the platform says it shows.
+        let shown = bench
+            .handle_message(Message::WindowFocused(settings))
+            .units();
+        assert!(!bench.sight_unknown());
+        bench.cadence.announced.store(true, Ordering::Release);
+        let _ = bench.handle_message(Message::Hidden(Some(true)));
+        let hidden = bench
+            .handle_message(Message::WindowFocused(settings))
+            .units();
+        assert!(hidden > shown, "asked as Settings comes forward");
+        assert!(bench.sight_unknown(), "and on each tick");
+        let _ = bench.handle_message(Message::Hidden(Some(false)));
+        assert!(!announced(&bench));
+        assert!(!bench.sight_unknown());
+        // The main window taking the keyboard shows it.
+        bench.cadence.announced.store(true, Ordering::Release);
+        let _ = bench.handle_message(Message::Hidden(Some(true)));
+        let _ = bench.handle_message(Message::WindowFocused(main));
+        assert!(!bench.hidden && !announced(&bench));
+    }
+
+    #[test]
+    fn an_update_made_during_a_draw_is_drawn_by_it() {
+        use iced::advanced::{clipboard, renderer::Headless};
+        let renderer = iced::futures::executor::block_on(iced::Renderer::new(
+            iced::Font::default(),
+            iced::Pixels(16.0),
+            Some("tiny-skia"),
+        ))
+        .expect("software renderer");
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        // iced builds a redraw's event once and passes it to the observed
+        // view again after updating for any message the view published.
+        let redraw = Event::Window(window::Event::RedrawRequested(Instant::now()));
+        let size = Size::new(8.0, 8.0);
+        let pass = |bench: &Workbench| {
+            let mut view = observe(
+                iced::widget::Space::new().into(),
+                bench.draws.clone(),
+                Vec::new(),
+            );
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, size),
+            );
+            let mut published = Vec::new();
+            view.as_widget_mut().update(
+                &mut tree,
+                &redraw,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut published),
+                &Rectangle::with_size(size),
+            );
+            published
+        };
+        // Frame work paused while the window drew nothing.
+        bench.note_undrawn();
+        bench.now += UNDRAWN;
+        bench.update_frames();
+        assert!(bench.frames_paused());
+        // The draw that resumes it publishes Redrawn, which updates the view
+        // before the same redraw passes again.
+        assert!(matches!(pass(&bench)[..], [Message::Redrawn]));
+        let _ = bench.update(Message::Redrawn);
+        assert!(!bench.frames_paused(), "resumed");
+        assert!(pass(&bench).is_empty());
+        // That update was drawn: the next tick does not pause again.
+        bench.now += UNDRAWN + ms(50);
+        bench.note_undrawn();
+        assert!(!bench.frames_paused());
     }
 
     #[test]
@@ -575,6 +782,10 @@ mod tests {
         assert!(!draws.drew(start + ms(33), &shown(2)));
         assert_eq!(draws.take_presented()["sim:0"], 2);
         assert_eq!(draws.take_presented()["sim:0"], 0, "taken");
+        // Only finished draws count as draws.
+        for _ in 0..3 {
+            draws.drawn();
+        }
         assert_eq!(draws.last(), (Some(start + ms(33)), 3));
         draws.pause();
         assert!(draws.drew(start + ms(500), &shown(9)), "a draw resumes");

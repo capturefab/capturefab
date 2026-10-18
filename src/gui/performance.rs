@@ -21,6 +21,10 @@ const CAUGHT_UP: f64 = 0.9;
 const SLOWEST_JUDGED: f64 = 5.0;
 /// Drawn frames are counted over windows this long.
 const WINDOW: Duration = Duration::from_secs(1);
+/// How long every preview must keep up, while judged, before Automatic
+/// hears that the overload is over. It doubles each time that happens in a
+/// run, so a computer that keeps falling behind settles on Efficient.
+const RELEASE: Duration = Duration::from_secs(120);
 
 /// The process-wide efficiency state. Unit tests run beside others that read
 /// it, so under test each thread keeps its own, resolved the same way from a
@@ -57,6 +61,8 @@ pub(super) mod process {
     #[derive(Clone, Default)]
     struct State {
         preference: Mode,
+        /// What the environment variable would set.
+        overriding: Option<Mode>,
         hints: Vec<&'static str>,
         forced: Option<bool>,
         software: bool,
@@ -69,17 +75,23 @@ pub(super) mod process {
             .unwrap_or_else(|| current().efficient)
     }
     pub(in super::super) fn current() -> Resolved {
-        STATE.with_borrow(|state| match state.preference {
-            Mode::Auto => Resolved {
-                setting: Mode::Auto,
-                efficient: !state.hints.is_empty(),
-                reasons: state.hints.iter().map(|hint| hint.to_string()).collect(),
-            },
-            mode => Resolved {
-                setting: mode,
-                efficient: mode == Mode::Efficient,
-                reasons: vec!["set in the desktop settings".into()],
-            },
+        STATE.with_borrow(|state| {
+            let (setting, source) = match state.overriding {
+                Some(mode) => (mode, format!("set by {}={mode}", crate::efficiency::ENV)),
+                None => (state.preference, "set in the desktop settings".into()),
+            };
+            match setting {
+                Mode::Auto => Resolved {
+                    setting,
+                    efficient: !state.hints.is_empty(),
+                    reasons: state.hints.iter().map(|hint| hint.to_string()).collect(),
+                },
+                mode => Resolved {
+                    setting,
+                    efficient: mode == Mode::Efficient,
+                    reasons: vec![source],
+                },
+            }
         })
     }
     pub(in super::super) fn set(mode: Mode) {
@@ -99,8 +111,13 @@ pub(super) mod process {
     pub(in super::super) fn reset(mode: Mode) {
         STATE.with_borrow_mut(|state| {
             state.preference = mode;
+            state.overriding = None;
             state.hints.clear();
         });
+    }
+    /// Set the environment variable, as far as this thread can tell.
+    pub(in super::super) fn override_with(mode: Mode) {
+        STATE.with_borrow_mut(|state| state.overriding = Some(mode));
     }
     pub(in super::super) fn software() -> bool {
         STATE.with_borrow(|state| state.software)
@@ -156,6 +173,22 @@ fn about(mode: Mode) -> &'static str {
 /// The line under the Performance setting: what Automatic chose and why, or
 /// what overrides the choice. `None` when the choice simply stands.
 fn note(chosen: Mode, resolved: &Resolved) -> Option<String> {
+    if let Some(overridden) = overridden(chosen, resolved, "this setting") {
+        return Some(overridden);
+    }
+    match chosen {
+        Mode::Auto if resolved.efficient => Some(format!(
+            "Automatic chose Efficient: {}.",
+            resolved.reasons.join(", ")
+        )),
+        Mode::Auto => Some("Automatic chose Smooth for this computer.".into()),
+        _ => None,
+    }
+}
+
+/// What overrides the `chosen` setting, called `setting`, if the command
+/// line or the environment does.
+fn overridden(chosen: Mode, resolved: &Resolved, setting: &str) -> Option<String> {
     let mode = if resolved.efficient {
         "Efficient"
     } else {
@@ -163,18 +196,13 @@ fn note(chosen: Mode, resolved: &Resolved) -> Option<String> {
     };
     match resolved.reasons.first() {
         Some(source) if source.starts_with("set by ") => {
-            Some(format!("{mode} is {source}, which overrides this setting."))
+            Some(format!("{mode} is {source}, which overrides {setting}."))
         }
         _ if resolved.setting != chosen => Some(format!(
-            "The command line or {} overrides this setting; {mode} is in use.",
+            "The command line or {} overrides {setting}; {mode} is in use.",
             crate::efficiency::ENV
         )),
-        _ if chosen != Mode::Auto => None,
-        _ if resolved.efficient => Some(format!(
-            "Automatic chose Efficient: {}.",
-            resolved.reasons.join(", ")
-        )),
-        _ => Some("Automatic chose Smooth for this computer.".into()),
+        _ => None,
     }
 }
 
@@ -211,6 +239,14 @@ impl Keeping {
     }
 }
 
+/// Automatic heard that previews fell behind.
+struct Overload {
+    /// The cameras whose previews did.
+    cameras: Vec<String>,
+    /// How long every preview has kept up since, while judged.
+    calm: Duration,
+}
+
 /// The desktop's performance state, beside the workbench's.
 #[derive(Default)]
 pub(super) struct PerformanceState {
@@ -219,9 +255,10 @@ pub(super) struct PerformanceState {
     /// What the setting resolved to at the last tick, for Settings.
     pub(super) resolved: Option<Resolved>,
     renderer_judged: bool,
-    /// Automatic has heard that a preview fell behind.
-    overloaded: bool,
-    /// The notice saying so has shown, once a run.
+    overload: Option<Overload>,
+    /// How many times Automatic heard an overload was over.
+    released: u32,
+    /// The notice saying a preview fell behind has shown, once a run.
     noticed: bool,
     /// Each shown camera's preview, by camera ID.
     cameras: HashMap<String, Keeping>,
@@ -239,7 +276,8 @@ impl Workbench {
         }
         if state.applied.is_some() {
             process::clear_hint(OVERLOAD);
-            state.overloaded = false;
+            state.overload = None;
+            state.released = 0;
             process::set(self.performance);
         }
         state.applied = Some(self.performance);
@@ -250,8 +288,8 @@ impl Workbench {
     /// count what each preview drew and tell Automatic when it fell behind.
     pub(super) fn tick_performance(&mut self) {
         self.judge_renderer();
-        self.count_presented();
-        self.hint_overload();
+        let judged = self.count_presented();
+        self.weigh_overload(judged);
         self.performance_state.resolved = Some(process::current());
     }
 
@@ -272,8 +310,9 @@ impl Workbench {
 
     /// Add the frames each shown camera's view drew, and every `WINDOW`
     /// judge whether its preview keeps up: only while the main window draws
-    /// and has the keyboard, since a background window may draw less.
-    fn count_presented(&mut self) {
+    /// and has the keyboard, since a background window may draw less, and
+    /// knows the display's rate. Returns how long a window just judged.
+    fn count_presented(&mut self) -> Option<Duration> {
         let now = self.now;
         let cameras_shown = self.cameras_shown();
         let shown: Vec<(String, f64)> = self
@@ -293,12 +332,13 @@ impl Workbench {
         let since = *state.since.get_or_insert(now);
         let elapsed = now.saturating_duration_since(since);
         if elapsed < WINDOW {
-            return;
+            return None;
         }
         state.since = Some(now);
         let judging = self.screenshot.is_none()
             && !self.frames_paused()
-            && self.key_window == Some(self.main_window);
+            && self.key_window == Some(self.main_window)
+            && self.refresh.calibrated();
         let cap = 1.0 / self.frame_interval().as_secs_f64();
         for (id, fps) in shown {
             let keeping = self.performance_state.cameras.entry(id).or_default();
@@ -310,20 +350,50 @@ impl Workbench {
                 keeping.turning = None;
             }
         }
+        judging.then_some(elapsed)
     }
 
-    /// Tell Automatic once that a preview fell behind; say so the first
-    /// time that makes the preview efficient.
-    fn hint_overload(&mut self) {
+    /// Tell Automatic when a preview falls behind, saying so the first time
+    /// that makes the preview efficient. The overload is over once the
+    /// cameras behind are no longer shown streaming, or every preview has
+    /// kept up for the release time over the windows `judged`.
+    fn weigh_overload(&mut self, judged: Option<Duration>) {
         let state = &mut self.performance_state;
+        let behind: Vec<String> = state
+            .cameras
+            .iter()
+            .filter(|(_, keeping)| keeping.behind)
+            .map(|(camera, _)| camera.clone())
+            .collect();
+        if let Some(overload) = &mut state.overload {
+            if !behind.is_empty() {
+                overload.calm = Duration::ZERO;
+            } else if let Some(window) = judged {
+                overload.calm += window;
+            }
+            let shown = overload
+                .cameras
+                .iter()
+                .any(|camera| state.cameras.contains_key(camera));
+            let hold = RELEASE.saturating_mul(1 << state.released.min(8));
+            if !shown || overload.calm >= hold {
+                state.overload = None;
+                state.released += 1;
+                process::clear_hint(OVERLOAD);
+            }
+            return;
+        }
         let auto = state
             .resolved
             .as_ref()
             .is_some_and(|resolved| resolved.setting == Mode::Auto);
-        if state.overloaded || !auto || !state.cameras.values().any(|keeping| keeping.behind) {
+        if !auto || behind.is_empty() {
             return;
         }
-        state.overloaded = true;
+        state.overload = Some(Overload {
+            cameras: behind,
+            calm: Duration::ZERO,
+        });
         let before = efficient();
         process::hint(OVERLOAD);
         if !before && efficient() && !std::mem::replace(&mut state.noticed, true) {
@@ -352,20 +422,30 @@ impl Workbench {
     /// What the preview figure means, and what to do about it.
     pub(super) fn preview_about(&self) -> String {
         let mut about = "This computer is drawing fewer frames than the camera sends. Captures and recordings still get every frame.".to_owned();
-        about.push_str(if efficient() {
-            " Efficient preview is on."
+        if efficient() {
+            about.push_str(" Efficient preview is on.");
+        } else if let Some(overridden) = self.performance_overridden() {
+            about.push(' ');
+            about.push_str(&overridden);
         } else {
-            " Use Efficient preview to lower the load."
-        });
+            about.push_str(" Use Efficient preview to lower the load.");
+        }
         about
     }
 
+    /// What overrides Settings › Performance, if anything does.
+    fn performance_overridden(&self) -> Option<String> {
+        let resolved = self.performance_state.resolved.as_ref()?;
+        overridden(self.performance, resolved, "Settings › Performance")
+    }
+
     /// The neutral chip with the preview figure, whose press turns on
-    /// Efficient preview unless it is on; `shown` fades it with the controls.
+    /// Efficient preview unless it is on or the command line or environment
+    /// decides; `shown` fades it with the controls.
     pub(super) fn preview_chip(&self, id: &str, shown: f32) -> Option<Element<'_, Message>> {
         let figure = self.preview_figure(id)?;
         let stage = style::stage_palette(self.key_window == Some(self.main_window));
-        let switch = !efficient();
+        let switch = !efficient() && self.performance_overridden().is_none();
         let label = text(figure.clone())
             .size(style::SMALL)
             .color(fade(stage.secondary, shown))
@@ -544,6 +624,7 @@ mod tests {
         bench.snapshot.cameras = vec![liveness::streaming_camera(100, 0, fps)];
         bench.snapshot.active_camera = Some("sim:0".into());
         bench.key_window = Some(bench.main_window);
+        bench.refresh.report(Some(Duration::from_micros(16_667)));
     }
 
     /// Draw `fps` new frames of `sim:0` a second for `seconds`, ticking
@@ -595,6 +676,111 @@ mod tests {
     }
 
     #[test]
+    fn automatic_hears_the_overload_is_over_once_previews_keep_up_long_enough() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        streaming(&mut bench, 30.0);
+        bench.shown = Some(Shown::Gpu {
+            key: MAIN_VIEW.into(),
+            size: Size::new(8.0, 8.0),
+        });
+        draw(&mut bench, 8, 5);
+        assert!(efficient());
+        // Efficient previews keep up; only time judged counts towards two
+        // minutes of it.
+        draw(&mut bench, 15, 50);
+        bench.key_window = None;
+        draw(&mut bench, 15, 120);
+        bench.key_window = Some(bench.main_window);
+        draw(&mut bench, 15, 50);
+        assert!(efficient());
+        // Past them this computer keeps up with the camera in Smooth too.
+        draw(&mut bench, 28, 30);
+        assert!(!efficient(), "kept up long enough");
+        assert_eq!(
+            note(
+                Mode::Auto,
+                bench.performance_state.resolved.as_ref().unwrap()
+            )
+            .unwrap(),
+            "Automatic chose Smooth for this computer."
+        );
+        // Falling behind again switches back quietly, for twice as long.
+        bench.notice = None;
+        draw(&mut bench, 8, 5);
+        assert!(efficient());
+        assert!(bench.notice.is_none(), "said once a run");
+        draw(&mut bench, 15, 130);
+        assert!(efficient(), "four minutes now");
+        draw(&mut bench, 28, 120);
+        assert!(!efficient());
+        // The camera that fell behind stopping ends the overload at once.
+        draw(&mut bench, 8, 5);
+        assert!(efficient());
+        bench.snapshot.cameras[0].streaming = false;
+        bench.now += ms(250);
+        bench.tick_performance();
+        assert!(!efficient());
+    }
+
+    #[test]
+    fn the_chip_switches_nothing_the_command_line_or_environment_decides() {
+        use iced::advanced::{Layout, layout, renderer::Headless, widget::Tree};
+        let renderer = iced::futures::executor::block_on(iced::Renderer::new(
+            iced::Font::default(),
+            iced::Pixels(16.0),
+            Some("tiny-skia"),
+        ))
+        .expect("software renderer");
+        // The chip's accessible name, and whether it can be pressed.
+        let chip = |bench: &Workbench| {
+            let mut chip = bench.preview_chip("sim:0", 1.0).unwrap();
+            let mut tree = Tree::new(chip.as_widget());
+            let node = chip.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(400.0, 100.0)),
+            );
+            let (native, _, _) = accessibility::snapshot_widget(
+                chip.as_widget_mut(),
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+            );
+            let (_, button) = native
+                .nodes
+                .iter()
+                .find(|(_, node)| node.role() == accessibility::Role::Button)
+                .unwrap();
+            (button.label().unwrap().to_owned(), !button.is_disabled())
+        };
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        choose(&mut bench, Mode::Smooth);
+        streaming(&mut bench, 30.0);
+        bench.shown = Some(Shown::Gpu {
+            key: MAIN_VIEW.into(),
+            size: Size::new(8.0, 8.0),
+        });
+        draw(&mut bench, 8, 5);
+        assert_eq!(
+            chip(&bench),
+            ("Preview 8 of 30 fps. Use Efficient preview".into(), true)
+        );
+        process::override_with(Mode::Smooth);
+        bench.tick_performance();
+        assert_eq!(chip(&bench), ("Preview 8 of 30 fps".into(), false));
+        assert!(bench.preview_about().ends_with(
+            "Smooth is set by CAPTUREFAB_EFFICIENCY=smooth, which overrides Settings › Performance."
+        ));
+        // An automatic override of a chosen Smooth decides as well.
+        process::override_with(Mode::Auto);
+        bench.tick_performance();
+        assert!(!chip(&bench).1);
+        assert!(bench.preview_about().ends_with(
+            "The command line or CAPTUREFAB_EFFICIENCY overrides Settings › Performance; Smooth is in use."
+        ));
+    }
+
+    #[test]
     fn previews_are_judged_only_while_the_window_draws_with_the_keyboard() {
         let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
         streaming(&mut bench, 30.0);
@@ -605,6 +791,12 @@ mod tests {
         bench.key_window = None;
         draw(&mut bench, 4, 6);
         assert_eq!(bench.preview_figure("sim:0"), None, "in the background");
+        // Nor while the display's refresh rate, the cap, is being measured.
+        bench.key_window = Some(bench.main_window);
+        bench.refresh.report(None);
+        bench.refresh.recalibrate();
+        draw(&mut bench, 4, 6);
+        assert_eq!(bench.preview_figure("sim:0"), None, "measuring the display");
         // A slow camera says too little to judge.
         streaming(&mut bench, 4.0);
         draw(&mut bench, 1, 6);
@@ -624,10 +816,14 @@ mod tests {
         process::render_in_software(true);
         for _ in 0..RENDERER_DRAWS - 1 {
             bench.draws.drew(bench.now, &[]);
+            bench.draws.drawn();
         }
+        // iced repeats a draw's first pass after an update made during it.
+        bench.draws.drew(bench.now, &[]);
         bench.tick_performance();
         assert!(!efficient(), "judged only after a few draws");
         bench.draws.drew(bench.now, &[]);
+        bench.draws.drawn();
         bench.tick_performance();
         process::render_in_software(false);
         assert!(efficient());
