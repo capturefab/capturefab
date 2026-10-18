@@ -31,7 +31,7 @@ python3 scripts/test-site.py                                  # validate static 
 python3 scripts/test-media.py --binary target/debug/capturefab [--srt]  # needs MediaMTX on :18554/:18890
 ```
 
-Use the simulator (`--camera sim:0`, `sim:1`, ...) to exercise acquisition without hardware. Set `CAPTUREFAB_SESSION_DIR` to an isolated temp dir when running the binary manually or in tests; it holds session descriptors and the storage ledger, and worker frame rings only on Windows or where shared memory is unavailable.
+Use the simulator (`--camera sim:0`, `sim:1`, ...) to exercise acquisition without hardware. Set `CAPTUREFAB_SESSION_DIR` to an isolated temp dir when running the binary manually or in tests; it holds session descriptors and the storage ledger, while worker frame rings live in anonymous shared memory, with files there only as a fallback and on Windows.
 
 DINOv2 (auto capture): `python3 scripts/fetch-dinov2.py` downloads the pinned, checksummed `facebook/dinov2-small` weights to `target/models/dinov2-small/`; release builds embed them (or `CAPTUREFAB_DINOV2_WEIGHTS`), dev/test builds read that file in place, and unit tests use the tiny fixtures from `scripts/dinov2-fixtures.py`. GPU inference is wgpu compute (`src/autocapture/dinov2/dinov2.wgsl`) in the isolated `__embed` helper; the CPU path is the reference.
 
