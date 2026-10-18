@@ -1003,7 +1003,7 @@ fn worker_command(executable: std::path::PathBuf) -> std::process::Command {
 impl Process {
     fn spawn(scanner: bool) -> Result<Self> {
         let capacity = frame_capacity(scanner)?;
-        let dir = crate::ipc::session_dir();
+        let dir = crate::ipc::runtime_dir();
         crate::ipc::ensure_private_dir(&dir)?;
         // Ring files are left behind only when a process dies; clear them
         // before this coordinator's first camera.

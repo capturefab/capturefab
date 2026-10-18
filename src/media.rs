@@ -432,7 +432,7 @@ pub(crate) fn executable() -> Result<Arc<Executable>> {
         return Ok(private);
     }
     if !extracted.uncached {
-        let shared = cache_dir()
+        let shared = crate::ipc::cache_dir()
             .context("no user cache directory")
             .and_then(|root| cached_copy(&root, EMBEDDED, EMBEDDED_SHA256))
             .and_then(|copy| {
@@ -471,28 +471,6 @@ fn runs(exe: &Executable) -> bool {
         // writing, is for the real launch to report.
         Err(error) => error.kind() != std::io::ErrorKind::PermissionDenied,
     }
-}
-/// The per-user cache: ~/Library/Caches on macOS, %LOCALAPPDATA% on Windows,
-/// and $XDG_CACHE_HOME or ~/.cache elsewhere.
-fn cache_dir() -> Option<PathBuf> {
-    // Tests never touch the user's cache.
-    if cfg!(test) {
-        return Some(std::env::temp_dir().join("capturefab-test-cache"));
-    }
-    let home = || std::env::var_os("HOME").filter(|home| !home.is_empty());
-    if cfg!(target_os = "macos") {
-        return home().map(|home| PathBuf::from(home).join("Library/Caches/capturefab"));
-    }
-    if cfg!(windows) {
-        return std::env::var_os("LOCALAPPDATA")
-            .filter(|dir| !dir.is_empty())
-            .map(|dir| PathBuf::from(dir).join("capturefab").join("cache"));
-    }
-    std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|dir| dir.is_absolute())
-        .or_else(|| home().map(|home| PathBuf::from(home).join(".cache")))
-        .map(|dir| dir.join("capturefab"))
 }
 /// The shared copy of `bytes` under `root`, named by its digest. It is
 /// written once, under a lock, to a new file that is renamed into place;
@@ -672,7 +650,7 @@ fn private_dir(dir: &std::path::Path) -> Result<()> {
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         ensure!(
-            meta.uid() == effective_uid(),
+            meta.uid() == crate::ipc::effective_uid(),
             "{} belongs to another user",
             dir.display()
         );
@@ -693,19 +671,11 @@ fn trusted(path: &std::path::Path, length: usize) -> Result<()> {
     {
         use std::os::unix::fs::MetadataExt;
         ensure!(
-            meta.uid() == effective_uid() && meta.mode() & 0o022 == 0,
+            meta.uid() == crate::ipc::effective_uid() && meta.mode() & 0o022 == 0,
             "extracted FFmpeg is writable by another user"
         );
     }
     Ok(())
-}
-#[cfg(unix)]
-fn effective_uid() -> u32 {
-    unsafe extern "C" {
-        fn geteuid() -> u32;
-    }
-    // SAFETY: geteuid has no preconditions and always succeeds.
-    unsafe { geteuid() }
 }
 fn lock_file(path: &std::path::Path) -> Result<fs::File> {
     let mut options = OpenOptions::new();
@@ -742,7 +712,7 @@ impl Active {
     const SLOTS: usize = 32;
     /// Claim a slot of `kind`, and count the active ones, this one included.
     fn claim(kind: &str) -> (Self, usize) {
-        let Some(dir) = cache_dir()
+        let Some(dir) = crate::ipc::cache_dir()
             .map(|root| root.join("active"))
             .filter(|dir| private_dir(dir).is_ok())
         else {

@@ -146,7 +146,7 @@ struct Shared {
 }
 impl Shared {
     fn create(prefix: &str, capacity: usize) -> Result<Self> {
-        let dir = crate::ipc::session_dir();
+        let dir = crate::ipc::runtime_dir();
         crate::ipc::ensure_private_dir(&dir)?;
         let mut random = [0u8; 8];
         getrandom::fill(&mut random).map_err(|e| anyhow!("random buffer name: {e}"))?;

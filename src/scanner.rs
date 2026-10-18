@@ -149,7 +149,7 @@ fn macos_executable() -> Result<std::path::PathBuf> {
     use std::{fs, io::Write, os::unix::fs::OpenOptionsExt};
     let mut nonce = [0u8; 16];
     getrandom::fill(&mut nonce).map_err(|e| anyhow::anyhow!("scanner helper entropy: {e}"))?;
-    let dir = crate::ipc::session_dir().join(format!(
+    let dir = crate::ipc::runtime_dir().join(format!(
         "scanner-{}",
         nonce.iter().map(|n| format!("{n:02x}")).collect::<String>()
     ));

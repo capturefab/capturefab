@@ -5,7 +5,7 @@
 //! or a macOS POSIX shared memory object unlinked as soon as it exists. The
 //! worker inherits its descriptor, so no file holds frames and nothing
 //! outlives the two processes. Windows, and hosts where that fails, use a file
-//! in the session directory that its creator keeps locked and removes;
+//! in the runtime directory that its creator keeps locked and removes;
 //! `sweep` removes files whose creator died.
 //!
 //! Publishing follows the reader. A watching take counts as a poll. While the
@@ -754,7 +754,7 @@ pub fn sweep(dir: &Path) {
 }
 
 /// Where a ring created now would live: `memfd` (Linux), `posix-shm` (macOS),
-/// or `file` in the session directory.
+/// or `file` in the runtime directory.
 pub fn backing() -> &'static str {
     #[cfg(unix)]
     if std::env::var_os("CAPTUREFAB_RING_FILE_TEST").is_none() && memory(4096).is_ok() {

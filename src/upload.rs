@@ -202,7 +202,14 @@ fn now() -> u64 {
 }
 
 fn dir() -> Result<PathBuf> {
-    let dir = crate::ipc::session_dir();
+    static ADOPTED: std::sync::Once = std::sync::Once::new();
+    ADOPTED.call_once(|| {
+        crate::ipc::adopt_state(
+            &[COMPLETED_FILE, JOURNAL_FILE, QUEUE_FILE],
+            Some("uploads.lock"),
+        )
+    });
+    let dir = crate::ipc::state_dir();
     crate::ipc::ensure_private_dir(&dir)?;
     Ok(dir)
 }
@@ -1550,7 +1557,7 @@ mod tests {
 
     /// The queue file and journal as they stand.
     fn versions() -> (Option<Stamp>, Option<Stamp>) {
-        let dir = crate::ipc::session_dir();
+        let dir = crate::ipc::state_dir();
         (
             Stamp::read(&dir.join(QUEUE_FILE)).unwrap(),
             Stamp::read(&dir.join(JOURNAL_FILE)).unwrap(),
@@ -1570,7 +1577,7 @@ mod tests {
     }
 
     fn staged(name: &str) -> PathBuf {
-        let dir = crate::ipc::session_dir().join("staged");
+        let dir = crate::ipc::state_dir().join("staged");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
         crate::storage::save_bytes(
@@ -1703,7 +1710,7 @@ mod tests {
             return;
         }
         let take = || UPLOADS.lock().unwrap().take();
-        let journal = crate::ipc::session_dir().join(JOURNAL_FILE);
+        let journal = crate::ipc::state_dir().join(JOURNAL_FILE);
         put(items(0..2));
         // Another process's view, read before the changes below.
         let stale = take();
@@ -1967,7 +1974,7 @@ mod tests {
         assert!(item.get("unheld").is_none(), "{item}");
         // Only a busy ledger queues a file unheld; one it never recorded is
         // refused.
-        let stray = crate::ipc::session_dir().join("stray.png");
+        let stray = crate::ipc::state_dir().join("stray.png");
         fs::write(&stray, b"0123456789").unwrap();
         let error = enqueue("line", &ftp(), &stray, "stray.png", None).unwrap_err();
         assert!(error.to_string().contains("not a finished"), "{error:#}");
@@ -2052,7 +2059,7 @@ mod tests {
             return;
         }
         put(items(0..3));
-        let dir = crate::ipc::session_dir();
+        let dir = crate::ipc::state_dir();
         assert!(dir.join(JOURNAL_FILE).exists());
         fold();
         assert!(!dir.join(JOURNAL_FILE).exists());
@@ -2108,7 +2115,7 @@ mod tests {
             ["1004.png", "1005.png"]
         );
         // Status reads the log but never rewrites it.
-        let path = crate::ipc::session_dir().join(COMPLETED_FILE);
+        let path = crate::ipc::state_dir().join(COMPLETED_FILE);
         let before = (fs::read(&path).unwrap(), versions());
         let status = status().unwrap();
         assert_eq!(status["completed_seq"], 1005);

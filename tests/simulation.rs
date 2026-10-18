@@ -6,6 +6,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+/// Spawned binaries keep their cache, such as dataset staging, out of the
+/// user's.
+fn test_cache() -> PathBuf {
+    std::env::temp_dir().join("capturefab-test-cache")
+}
+
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
@@ -20,7 +26,9 @@ impl Fixture {
     }
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_capturefab"));
-        command.env("CAPTUREFAB_SESSION_DIR", &self.0);
+        command
+            .env("CAPTUREFAB_SESSION_DIR", &self.0)
+            .env("CAPTUREFAB_CACHE_DIR", test_cache());
         command
     }
 }

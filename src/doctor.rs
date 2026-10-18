@@ -1,4 +1,4 @@
-//! Host checks for `doctor`: where session state and temporary files live,
+//! Host checks for `doctor`: where sessions, state and temporary files live,
 //! kernel limits that cap camera throughput, the storage budget against the
 //! capture disk and the graphics adapter the desktop window would get, each
 //! turned into a check with a copyable fix.
@@ -118,10 +118,15 @@ struct Facts {
     efficiency: Resolved,
     /// The GPU probe's answer, when it ran.
     graphics: Option<Value>,
-    session: Place,
-    /// `/run/user/<uid>` when the session directory fell back to disk
-    /// because XDG_RUNTIME_DIR is unset.
-    unused_runtime_dir: Option<PathBuf>,
+    /// Where sessions are found, with their short-lived files.
+    runtime: Place,
+    /// Settings, saved destinations, the upload queue and the storage ledger.
+    state: Place,
+    /// CAPTUREFAB_SESSION_DIR chose both.
+    session_dir_set: bool,
+    /// `/run/user/<uid>` when the runtime directory fell back to disk
+    /// without it.
+    missed_runtime_dir: Option<PathBuf>,
     limits: Limits,
     usb: Vec<UsbCamera>,
     budget: u64,
@@ -134,15 +139,18 @@ struct Facts {
 }
 impl Facts {
     fn gather() -> Self {
-        let session = crate::ipc::session_dir();
-        let (budget, used) = ledger(&session);
+        let state = crate::ipc::state_dir();
+        let (budget, used) = ledger(&state);
         Self {
             efficiency: efficiency::current(),
             graphics: None,
             budget,
             used,
-            session: Place::of(session),
-            unused_runtime_dir: unused_runtime_dir(),
+            runtime: Place::of(crate::ipc::runtime_dir()),
+            state: Place::of(state),
+            session_dir_set: std::env::var_os("CAPTUREFAB_SESSION_DIR")
+                .is_some_and(|dir| !dir.is_empty()),
+            missed_runtime_dir: crate::ipc::missed_runtime_dir(),
             limits: limits(),
             usb: usb_cameras(),
             working_directory: Place::of(std::env::current_dir().unwrap_or_else(|_| ".".into())),
@@ -175,7 +183,10 @@ impl HostReport {
         report["host"] = json!(efficiency::host());
         report["efficiency"] = json!(facts.efficiency);
         report["paths"] = json!({
-            "session": facts.session,
+            "session": facts.runtime,
+            "runtime": facts.runtime,
+            "state": facts.state,
+            "cache": crate::ipc::cache_dir().map(Place::of),
             "temp": Place::of(std::env::temp_dir()),
             "working_directory": facts.working_directory,
         });
@@ -253,11 +264,11 @@ fn checks(facts: &Facts) -> Vec<Check> {
     checks.extend(facts.graphics.as_ref().map(graphics_check));
     checks.extend(
         facts
-            .unused_runtime_dir
+            .missed_runtime_dir
             .as_deref()
-            .map(|dir| runtime_dir_check(dir, &facts.session)),
+            .map(|dir| runtime_dir_check(dir, &facts.runtime, &facts.state)),
     );
-    checks.push(session_check(&facts.session));
+    checks.push(session_check(&facts.state, facts.session_dir_set));
     checks.extend(facts.limits.rmem_max.map(receive_buffer_check));
     checks.extend(usb_check(&facts.usb));
     checks.extend(
@@ -320,49 +331,57 @@ fn graphics_check(graphics: &Value) -> Check {
     }
 }
 
-/// Frame rings stay in memory either way; what differs is where sessions
-/// are found. The fix moves the whole session directory, so it says what
-/// stays behind; logind creates the runtime directory only for a logged-in
-/// or lingering user and removes it at logout otherwise.
-fn runtime_dir_check(runtime_dir: &Path, session: &Place) -> Check {
-    let dir = runtime_dir.display();
-    let session = session.path.display();
-    let user = runtime_dir
+/// Without XDG_RUNTIME_DIR, Capturefab uses the login's runtime directory
+/// when it exists, so a service and an SSH shell find the same sessions.
+/// logind creates it only for a logged-in or lingering user, so a service
+/// started at boot without lingering finds it missing and falls back to
+/// disk. Frame rings are anonymous memory either way, but the nvJPEG and
+/// VA-API helpers' staging buffers are files there (`accel`).
+fn runtime_dir_check(login: &Path, runtime: &Place, state: &Place) -> Check {
+    let dir = login.display();
+    let runtime = runtime.path.display();
+    let state = state.path.display();
+    let uid = login
         .file_name()
         .map_or_else(|| "$USER".into(), |uid| uid.to_string_lossy());
     Check::warn(
         "runtime_dir",
         format!(
-            "XDG_RUNTIME_DIR is unset, so session state is on disk in {session}, while logins that set it look for sessions in {dir}/capturefab."
+            "XDG_RUNTIME_DIR is unset and {dir} is missing or not private to this user, so sessions are on disk in {runtime}, while logins look for them in {dir}/capturefab."
         ),
         format!(
-            "In a shell, export XDG_RUNTIME_DIR={dir}; a service needs `sudo loginctl enable-linger {user}` before Environment=XDG_RUNTIME_DIR={dir}, so {dir} exists at boot and survives logout. Either way the session directory moves into memory: saved destinations, the upload queue and the storage budget in {session} stay behind, and new ones are cleared at reboot."
+            "Run `sudo loginctl enable-linger {uid}` so {dir} exists from boot and survives logout, and give a service Wants= and After=user@{uid}.service; Capturefab then uses {dir} without XDG_RUNTIME_DIR. Settings, destinations, the upload queue and the storage ledger stay in {state} either way."
         ),
     )
 }
 
-/// Informational rather than a warning: memory suits a session's short-lived
-/// files, and only the user knows whether the rest must outlive a reboot.
-/// Camera frame rings are anonymous shared memory wherever this is; the
-/// nvJPEG and VA-API helpers' staging buffers are files in it (`accel`).
-fn session_check(session: &Place) -> Check {
-    if !session.ram_backed {
+/// Informational rather than a warning: by default state is on disk, so
+/// memory means the user chose it, and only they know whether it must
+/// outlive a reboot.
+fn session_check(state: &Place, session_dir_set: bool) -> Check {
+    if !state.ram_backed {
         return Check::ok(
             "session_storage",
-            format!("Session state is in {}.", session.described()),
+            format!(
+                "Settings, saved destinations, the upload queue and the storage ledger are in {}.",
+                state.described()
+            ),
         );
     }
     let mut check = Check::ok(
         "session_storage",
         format!(
-            "Session state is in memory in {}: settings, saved destinations, the upload queue and the storage ledger are cleared at reboot.",
-            session.described()
+            "Settings, saved destinations, the upload queue and the storage ledger are in memory in {} and are cleared at reboot.",
+            state.described()
         ),
     );
-    check.fix = Some(
-        "To keep them, set CAPTUREFAB_SESSION_DIR to a folder on disk such as ~/.local/state/capturefab; camera frame rings stay in memory, but JPEG captures encoded by nvJPEG or VA-API then pass their pixels through a mapped file on that disk."
-            .into(),
-    );
+    check.fix = Some(if session_dir_set {
+        "To keep them, unset CAPTUREFAB_SESSION_DIR. A folder on disk keeps them too, but JPEG captures encoded by nvJPEG or VA-API then pass their pixels through a mapped file there.".into()
+    } else if cfg!(target_os = "linux") {
+        "To keep them, point XDG_STATE_HOME at a folder on disk.".into()
+    } else {
+        "To keep them, set CAPTUREFAB_SESSION_DIR to a folder on disk.".into()
+    });
     check
 }
 
@@ -485,11 +504,13 @@ fn suggested_budget(used: u64, free: u64) -> String {
 /// ledger's lock-free reads, so `doctor` never waits behind capture
 /// bookkeeping; its usage summary includes the journal's tail. Usage is None
 /// while unknown, such as after an older version saved, which omits the
-/// check. Without a session directory nothing is stored yet, and `doctor`
-/// does not create one to find that out.
-fn ledger(session: &Path) -> (u64, Option<u64>) {
+/// check. Without a state directory nothing is stored yet, and `doctor`
+/// does not create one to find that out, unless the ledger of a version
+/// before the split may be waiting to move into it.
+fn ledger(state: &Path) -> (u64, Option<u64>) {
     let default = StoragePolicy::default().max_bytes;
-    if !session.is_dir() {
+    let moving = crate::ipc::legacy_dir().is_some_and(|old| old.is_dir());
+    if !state.is_dir() && !moving {
         return (default, Some(0));
     }
     let budget = crate::storage::configured_policy().map_or(default, |policy| policy.max_bytes);
@@ -579,23 +600,6 @@ fn limits() -> Limits {
 #[cfg(not(target_os = "linux"))]
 fn limits() -> Limits {
     Limits::default()
-}
-
-#[cfg(target_os = "linux")]
-fn unused_runtime_dir() -> Option<PathBuf> {
-    // The same fallbacks as ipc::session_dir.
-    if std::env::var_os("CAPTUREFAB_SESSION_DIR").is_some()
-        || std::env::var_os("XDG_RUNTIME_DIR").is_some()
-    {
-        return None;
-    }
-    // SAFETY: getuid cannot fail.
-    let dir = PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }));
-    dir.is_dir().then_some(dir)
-}
-#[cfg(not(target_os = "linux"))]
-fn unused_runtime_dir() -> Option<PathBuf> {
-    None
 }
 
 /// USB3 Vision devices from sysfs, by their control interface, and whether
@@ -917,53 +921,61 @@ mod tests {
     }
 
     #[test]
-    fn session_state_on_tmpfs_informs_and_a_missing_runtime_dir_warns() {
-        // The default on a Linux login: worth knowing, but whether the state
-        // must outlive a reboot is the user's call, so it is not a warning.
-        let runtime = place("/run/user/1000/capturefab", "tmpfs", 400 << 20);
-        let check = session_check(&runtime);
+    fn state_on_disk_is_the_default_and_memory_explains_how_to_keep_it() {
+        let disk = place("/home/pi/.local/state/capturefab", "ext4", 6 << 30);
+        let check = session_check(&disk, false);
         assert_eq!(check.level, Level::Ok);
-        assert!(check.message.contains("(tmpfs)"), "{}", check.message);
-        assert!(check.message.contains("cleared at reboot"));
-        let fix = check.fix.unwrap();
-        assert!(fix.contains("CAPTUREFAB_SESSION_DIR"), "{fix}");
-        assert!(fix.contains("frame rings stay in memory"), "{fix}");
+        assert_eq!(
+            check.message,
+            "Settings, saved destinations, the upload queue and the storage ledger are in /home/pi/.local/state/capturefab (ext4)."
+        );
+        assert_eq!(check.fix, None);
+        // Memory is only ever chosen, so it informs rather than warns, with
+        // the setting that put it there.
+        let memory = place("/tmp/capturefab", "tmpfs", 400 << 20);
+        let chosen = session_check(&memory, true);
+        assert_eq!(chosen.level, Level::Ok);
+        assert!(chosen.message.contains("(tmpfs)"), "{}", chosen.message);
+        assert!(chosen.message.contains("cleared at reboot"));
+        let fix = chosen.fix.unwrap();
+        assert!(fix.starts_with("To keep them, unset CAPTUREFAB_SESSION_DIR."));
         assert!(fix.contains("nvJPEG or VA-API"), "{fix}");
-        let disk = place("/home/pi/.cache/capturefab/sessions", "ext4", 6 << 30);
-        assert_eq!(session_check(&disk).level, Level::Ok);
-        assert_eq!(session_check(&disk).fix, None);
-        let fallback = runtime_dir_check(Path::new("/run/user/1000"), &disk);
-        assert_eq!(fallback.level, Level::Warn);
+        let fix = session_check(&memory, false).fix.unwrap();
         assert!(
-            fallback
-                .message
-                .contains("/home/pi/.cache/capturefab/sessions")
-        );
-        // Frame rings are anonymous memory, so only where sessions are
-        // found differs.
-        assert!(
-            fallback.message.contains("/run/user/1000/capturefab"),
-            "{}",
-            fallback.message
-        );
-        assert!(!fallback.message.contains("frame"), "{}", fallback.message);
-        // A service cannot rely on the runtime directory without lingering,
-        // and moving the session directory leaves its saved state behind.
-        let fix = fallback.fix.unwrap();
-        assert!(
-            fix.starts_with("In a shell, export XDG_RUNTIME_DIR=/run/user/1000;"),
+            fix.contains(if cfg!(target_os = "linux") {
+                "XDG_STATE_HOME"
+            } else {
+                "CAPTUREFAB_SESSION_DIR"
+            }),
             "{fix}"
         );
+    }
+
+    #[test]
+    fn a_runtime_directory_on_disk_warns_with_lingering() {
+        let runtime = place("/home/pi/.cache/capturefab/sessions", "ext4", 6 << 30);
+        let state = place("/home/pi/.local/state/capturefab", "ext4", 6 << 30);
+        let fallback = runtime_dir_check(Path::new("/run/user/1000"), &runtime, &state);
+        assert_eq!(fallback.level, Level::Warn);
+        assert_eq!(
+            fallback.message,
+            "XDG_RUNTIME_DIR is unset and /run/user/1000 is missing or not private to this user, so sessions are on disk in /home/pi/.cache/capturefab/sessions, while logins look for them in /run/user/1000/capturefab."
+        );
+        // Lingering makes the login directory exist for a service at boot;
+        // state no longer moves with it.
+        let fix = fallback.fix.unwrap();
         assert!(
-            fix.contains(
-                "`sudo loginctl enable-linger 1000` before Environment=XDG_RUNTIME_DIR=/run/user/1000"
+            fix.starts_with(
+                "Run `sudo loginctl enable-linger 1000` so /run/user/1000 exists from boot"
             ),
             "{fix}"
         );
+        assert!(fix.contains("After=user@1000.service"), "{fix}");
         assert!(
-            fix.contains("the upload queue and the storage budget in /home/pi/.cache/capturefab/sessions stay behind"),
+            fix.contains("stay in /home/pi/.local/state/capturefab either way"),
             "{fix}"
         );
+        assert!(!fix.contains("export XDG_RUNTIME_DIR"), "{fix}");
     }
 
     #[test]

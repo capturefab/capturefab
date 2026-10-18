@@ -114,7 +114,14 @@ pub(crate) fn random_name() -> Result<String> {
 }
 impl Staging {
     fn create() -> Result<Self> {
-        let root = crate::ipc::session_dir().join("dataset-staging");
+        // Exports and spill can outgrow the Linux runtime directory, a RAM
+        // disk capped at a share of memory, so there they go to the cache.
+        let cache = cfg!(target_os = "linux")
+            .then(crate::ipc::cache_dir)
+            .flatten();
+        let root = cache
+            .unwrap_or_else(crate::ipc::runtime_dir)
+            .join("dataset-staging");
         crate::ipc::ensure_private_dir(&root)?;
         remove_stale(&root);
         let dir = root.join(random_name()?);

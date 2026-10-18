@@ -344,10 +344,16 @@ fn lock_wait(file: &File) -> Result<()> {
 }
 impl Manager {
     /// The one place the storage bookkeeping directory is chosen; every
-    /// ledger, policy and summary path is resolved from it.
+    /// ledger, policy and summary path is resolved from it. Leases of
+    /// writers an older version left running are not moved, so their
+    /// reservations are reclaimed as interrupted.
     fn global() -> Self {
+        static ADOPTED: std::sync::Once = std::sync::Once::new();
+        ADOPTED.call_once(|| {
+            crate::ipc::adopt_state(&[POLICY, SUMMARY, JOURNAL, SNAPSHOT], Some("storage.lock"))
+        });
         Self {
-            directory: crate::ipc::session_dir(),
+            directory: crate::ipc::state_dir(),
         }
     }
     fn lock(&self) -> Result<Locked> {

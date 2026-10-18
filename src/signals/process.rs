@@ -101,9 +101,9 @@ pub fn read_line(reader: &mut impl BufRead) -> Result<Option<Line>> {
     ))
 }
 
-/// Where OPC UA keeps certificates: a private directory in the session dir.
+/// Where OPC UA keeps certificates: a private directory in the runtime dir.
 pub fn pki_dir() -> Option<PathBuf> {
-    let base = crate::ipc::session_dir();
+    let base = crate::ipc::runtime_dir();
     let signals = base.join("signals");
     let pki = signals.join("opcua-pki");
     for dir in [&base, &signals, &pki] {

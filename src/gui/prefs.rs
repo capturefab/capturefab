@@ -626,11 +626,14 @@ impl Prefs {
 }
 
 fn path() -> PathBuf {
-    crate::ipc::session_dir().join(FILE)
+    crate::ipc::state_dir().join(FILE)
 }
 
+/// Rename settings saved under the old name, which a session called `gui`
+/// needs for its descriptor, then move them into the state directory.
 pub fn migrate() {
-    migrate_in(&crate::ipc::session_dir());
+    migrate_in(&crate::ipc::runtime_dir());
+    crate::ipc::adopt_state(&[FILE], None);
 }
 
 fn migrate_in(dir: &Path) {
