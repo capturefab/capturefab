@@ -1130,7 +1130,10 @@ impl<T: Send + 'static> Polled<T> {
 
     /// The value, if it changed since `seen`.
     fn newer(&self, seen: &mut u64) -> Option<&T> {
-        (*seen != self.changes).then(|| *seen = self.changes)?;
+        if *seen == self.changes {
+            return None;
+        }
+        *seen = self.changes;
         self.value.as_ref()
     }
 }
