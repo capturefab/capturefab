@@ -265,6 +265,7 @@ fn active_automatic_sessions_prioritize_review_without_moving_editors_on_suggest
         encoder: "native".into(),
         accelerator: None,
         samples_per_second: None,
+        note: None,
     });
     let active = snapshot(&app, Tab::Capture, &mut tree, &renderer);
     assert_eq!(output_control(&active).0, output_id);

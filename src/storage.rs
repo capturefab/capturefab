@@ -382,6 +382,16 @@ impl Manager {
         result.reconcile(false)?;
         Ok(result)
     }
+    /// One journal commit records the deletion, or that the file changed.
+    fn remove(&self, path: &Path) -> Result<bool> {
+        let mut locked = self.lock()?;
+        let Ok(index) = locked.find(path) else {
+            return Ok(false);
+        };
+        let removed = locked.delete(index);
+        locked.persist()?;
+        removed
+    }
     fn writer(&self, path: &Path, policy: &StoragePolicy, reserve: u64) -> Result<StorageWriter> {
         policy.validate()?;
         ensure!(reserve > 0, "capture storage reservation must be positive");
@@ -1730,6 +1740,11 @@ pub fn remove_uploaded(path: &Path) -> Result<bool> {
     locked.persist()?;
     removed
 }
+/// Delete a finished capture only if it is still exactly the file Capturefab
+/// wrote. False when the ledger does not track it or it changed; it is kept.
+pub fn remove(path: &Path) -> Result<bool> {
+    Manager::global().remove(path)
+}
 pub fn quota_status() -> Result<Value> {
     Manager::global().lock()?.status()
 }
@@ -2070,6 +2085,39 @@ mod tests {
         assert_eq!(request.constrained_by(&global).max_age_seconds, Some(20));
         request.on_full = "delete-oldest".into();
         assert_eq!(request.constrained_by(&global).on_full, "delete-oldest");
+    }
+    #[test]
+    fn removing_a_capture_deletes_it_only_if_unchanged_with_one_commit() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        let policy = policy(100, 10, "stop");
+        for name in ["kept", "gone", "edited"] {
+            completed(&manager, &temp.path(name), &policy, name.as_bytes());
+        }
+        fs::write(temp.path("untracked"), b"a user file").unwrap();
+        let journal = manager.directory.join(JOURNAL);
+        let records = || fs::read_to_string(&journal).unwrap().lines().count();
+        let before = records();
+        assert!(manager.remove(&temp.path("gone")).unwrap());
+        assert!(!temp.path("gone").exists());
+        assert_eq!(records(), before + 1);
+        fs::write(temp.path("edited"), b"changed").unwrap();
+        assert!(!manager.remove(&temp.path("edited")).unwrap());
+        assert_eq!(fs::read(temp.path("edited")).unwrap(), b"changed");
+        assert_eq!(records(), before + 2, "the change is recorded");
+        assert!(!manager.remove(&temp.path("untracked")).unwrap());
+        assert!(!manager.remove(&temp.path("missing")).unwrap());
+        assert_eq!(fs::read(temp.path("untracked")).unwrap(), b"a user file");
+        assert_eq!(records(), before + 2);
+        forget(&manager);
+        let locked = manager.lock().unwrap();
+        let entries: Vec<_> = locked
+            .ledger
+            .entries
+            .iter()
+            .map(|entry| (entry.path.file_name().unwrap().to_owned(), entry.changed))
+            .collect();
+        assert_eq!(entries, [("kept".into(), false), ("edited".into(), true)]);
     }
     #[test]
     fn oldest_retention_only_removes_unchanged_owned_files() {

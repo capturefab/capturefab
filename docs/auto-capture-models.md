@@ -196,13 +196,16 @@ visually similar frames, and react to illumination or viewpoint changes. A model
 score expresses a relative decision signal, not a calibrated probability. Human
 review remains the source of truth.
 
-The portable session artifact is one DuckDB database containing the saved image
-bytes, source/camera identity, frame metadata, descriptors, capture origin,
-pending/kept/discarded decisions, encoder, model/settings version, and review
-history. Resuming that file restores the examples and pending review queue. The
-live camera connection must be established again; a database cannot restore
-access to hardware that is unavailable, and a DINOv2 session needs a build that
-bundles the same model.
+A session is a DuckDB database plus a `.frames` folder beside it. The database
+holds source/camera identity, frame metadata, descriptors, capture origin,
+pending/kept/discarded decisions, encoder, model/settings version, review
+history, and each frame's file name and SHA-256. The folder holds the saved
+image bytes as raw files, written through the storage budget. Copy the database
+and its folder together to move a session; sessions from earlier versions keep
+their image bytes inside the database. Resuming restores the examples and
+pending review queue. The live camera connection must be established again; a
+database cannot restore access to hardware that is unavailable, and a DINOv2
+session needs a build that bundles the same model.
 
 ## How to compare a future encoder
 
