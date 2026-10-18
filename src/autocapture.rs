@@ -1159,6 +1159,12 @@ impl CaptureSession {
     /// Decide on a background embedding that has finished, on the frame it
     /// was computed from. Called for every frame and from the worker's idle
     /// loop, so slow or triggered cameras need no later frame to capture.
+    /// Whether an embedding is on its way, for `poll` to collect: until it
+    /// lands, a camera worker without frames still checks often.
+    pub fn embedding(&self) -> bool {
+        self.enabled && self.embedder.as_ref().is_some_and(|embedder| embedder.busy)
+    }
+
     pub fn poll(&mut self) -> Result<Option<u64>> {
         if !self.enabled {
             return Ok(None);

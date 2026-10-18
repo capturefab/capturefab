@@ -87,6 +87,18 @@ fn exact_manual_sensor_frame_survives_close_and_resume() {
 }
 
 #[test]
+fn an_open_session_with_no_embedding_on_its_way_lets_the_worker_sleep() {
+    let f = Fixture::new();
+    f.open(true);
+    assert!(f.worker.capture_session.lock().unwrap().is_some());
+    assert!(
+        !f.worker.embedding(),
+        "a native session embeds nothing later"
+    );
+    assert_eq!(idle_wait(&f.worker, &[]), IDLE);
+}
+
+#[test]
 fn close_and_disconnect_succeed_after_the_database_fails() {
     let f = Fixture::new();
     let blocked = |f: &Fixture| {

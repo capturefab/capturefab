@@ -270,13 +270,14 @@ impl WorkerHandle {
                 .is_some()
         })
     }
-    /// Whether an auto capture session is open; it may have embeddings to
-    /// finish while no frames arrive.
-    fn capturing(&self) -> bool {
+    /// Whether an open auto capture session waits for an embedding, which
+    /// only `poll_capture` collects while no frames arrive.
+    fn embedding(&self) -> bool {
         self.capture_session
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .is_some()
+            .as_ref()
+            .is_some_and(crate::autocapture::CaptureSession::embedding)
     }
     /// Log a frame the ring could not take as it was, once while that keeps
     /// happening rather than for every frame.
@@ -1892,7 +1893,7 @@ const TICK: Duration = Duration::from_millis(100);
 /// How long the camera thread may wait for a command while it receives no
 /// frames: until the next job is due or a requested frame times out.
 fn idle_wait(h: &WorkerHandle, jobs: &[Scheduled]) -> Duration {
-    if h.holding() || h.capturing() {
+    if h.holding() || h.embedding() {
         return TICK;
     }
     let now = Instant::now();
