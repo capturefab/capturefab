@@ -99,6 +99,27 @@ pub fn session_dir() -> PathBuf {
     if let Some(p) = std::env::var_os("CAPTUREFAB_SESSION_DIR") {
         return p.into();
     }
+    default_session_dir()
+}
+/// Unit tests never touch the user's sessions, storage ledger or upload
+/// queue: without CAPTUREFAB_SESSION_DIR each test process gets its own
+/// private directory, which its tests share as they would the real one.
+#[cfg(test)]
+fn default_session_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        std::env::temp_dir().join(format!(
+            "capturefab-test-sessions-{}-{nanos}",
+            std::process::id()
+        ))
+    })
+    .clone()
+}
+#[cfg(not(test))]
+fn default_session_dir() -> PathBuf {
     if let Some(p) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(p).join("capturefab");
     }
@@ -719,6 +740,20 @@ mod tests {
             pid: std::process::id(),
             address,
             token: "a".repeat(64),
+        }
+    }
+    #[test]
+    fn tests_never_default_to_the_users_session_directory() {
+        let dir = default_session_dir();
+        assert!(dir.starts_with(std::env::temp_dir()), "{}", dir.display());
+        assert_eq!(dir, default_session_dir(), "one directory per process");
+        if std::env::var_os("CAPTUREFAB_SESSION_DIR").is_none() {
+            assert_eq!(session_dir(), dir);
+            assert_eq!(
+                crate::destination::staging_root(),
+                dir.join("staging"),
+                "staged uploads stay in it too"
+            );
         }
     }
     #[test]

@@ -615,6 +615,10 @@ pub fn staging_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("CAPTUREFAB_SESSION_DIR") {
         return PathBuf::from(dir).join("staging");
     }
+    // Unit tests stage in their own session directory, never the user's.
+    if cfg!(test) {
+        return crate::ipc::session_dir().join("staging");
+    }
     let home = || std::env::var_os("HOME").map(PathBuf::from);
     let base = if cfg!(target_os = "macos") {
         home().map(|h| h.join("Library/Application Support/Capturefab"))
@@ -1443,12 +1447,12 @@ mod tests {
             target: Target::S3(bucket()),
         };
         if cfg!(feature = "s3") {
+            // Under the staging root, wherever the environment puts it.
             let resolved = resolve_with(&staged, "frames").unwrap();
-            assert!(resolved.output.ends_with(&format!(
-                "uploads{}archive{}frames",
-                std::path::MAIN_SEPARATOR,
-                std::path::MAIN_SEPARATOR
-            )));
+            assert_eq!(
+                PathBuf::from(&resolved.output),
+                staging_root().join("archive").join("frames")
+            );
             assert!(
                 matches!(&resolved.upload, Some(Remote::S3(b)) if b.bucket == "camera-archive")
             );
