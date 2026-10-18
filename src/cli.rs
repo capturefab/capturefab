@@ -79,7 +79,7 @@ pub struct Cli {
         default_value = "auto"
     )]
     pub hwaccel: String,
-    /// Efficiency mode for this process; auto saves work on small computers (default: CAPTUREFAB_EFFICIENCY, the desktop setting, then auto)
+    /// Efficiency mode for this process (default: CAPTUREFAB_EFFICIENCY, then auto, which is efficient on small or low-power computers)
     #[arg(
         long,
         global = true,
@@ -2000,9 +2000,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 ready["remote_url"] = json!(format!("http://{}/", server.local_addr()));
             }
             output(&cli, ready)?;
-            if !cli.json {
-                crate::doctor::print_warnings();
-            }
             let stopped = Arc::new(AtomicBool::new(false));
             let flag = stopped.clone();
             let h = handle.clone();
@@ -2011,6 +2008,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 h.shutdown();
             })
             .context("install signal handler")?;
+            // After the handler, so Ctrl-C during the checks still cleans up.
+            if !cli.json {
+                crate::doctor::print_warnings();
+            }
             while !stopped.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -2940,10 +2941,9 @@ fn schema() -> Value {
     contract["efficiency"] = json!({
         "cli":"--efficiency auto|smooth|efficient (global)",
         "environment":crate::efficiency::ENV,
-        "precedence":"--efficiency, then CAPTUREFAB_EFFICIENCY, then the desktop setting, then auto; an unknown CAPTUREFAB_EFFICIENCY value means auto",
-        "auto":"efficient with at most 2 CPU cores, at most 2 GiB of memory, the OS low-power or battery-saver mode, or a desktop runtime hint such as software rendering; running on battery alone stays smooth",
-        "effect":"Efficient mode reduces preview and polling work; captures and recordings keep every frame",
-        "scope":"The process that parses it: the desktop window, serve or a direct worker. A running session keeps its own setting.",
+        "precedence":"--efficiency, then CAPTUREFAB_EFFICIENCY, then auto; an unknown CAPTUREFAB_EFFICIENCY value means auto",
+        "auto":"efficient with at most 2 CPU cores, at most 2 GiB of memory, or the OS low-power or battery-saver mode; running on battery alone stays smooth",
+        "scope":"The process that parses it, such as the desktop window or serve; a running session keeps its own setting. Captures and recordings keep every frame in every mode.",
         "status":"doctor --json efficiency {setting,efficient,reasons}"
     });
     contract["doctor"] = json!({

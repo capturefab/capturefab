@@ -18,7 +18,7 @@ Durations and timestamp fractions must resolve to whole milliseconds. `1.001s` i
 
 Capture paths are a file, a directory or a template, and do not accept network URLs; see [name outputs and tag captures](#name-outputs-and-tag-captures). Recording reservations must stay within the requested budget. Capturefab does not reduce `--max-file-size` automatically. `record`/`forward --duration 30s` works with temporary workers and persistent sessions. It keeps the CLI active and stops the encoder at the deadline or Ctrl-C. Without a duration, session forwarding returns immediately and runs until `stop-forward`; direct forwarding stays in the foreground.
 
-`--efficiency auto|smooth|efficient` (global) or `CAPTUREFAB_EFFICIENCY` sets efficiency mode for the process that reads it: the desktop window, `serve` or a direct worker. A running session keeps its own. The flag wins over the variable, which wins over the desktop setting. An unknown variable value means `auto`; an unknown flag value is `usage` (exit 2). Auto is efficient with at most 2 CPU cores or 2 GiB of memory, or in the OS low-power or battery-saver mode; battery power alone does not switch it. Efficient mode reduces preview and polling work, never captured or recorded frames. Without a subcommand, a headless build exits 5 (`unsupported`) and names the `serve` command to use instead.
+`--efficiency auto|smooth|efficient` (global) or `CAPTUREFAB_EFFICIENCY` sets efficiency mode for the process that reads it, such as the desktop window or `serve`. A running session keeps its own. The flag wins over the variable. An unknown variable value means `auto`; an unknown flag value is `usage` (exit 2). Auto is efficient with at most 2 CPU cores or 2 GiB of memory, or in the OS low-power or battery-saver mode; battery power alone does not switch it. `doctor --json` reports the result in `efficiency`. Captures and recordings keep every frame in every mode. Without a subcommand, a headless build exits 5 (`unsupported`) and names the `serve` command to use instead.
 
 An explicit `CAPTUREFAB_MAX_CAMERAS` must be an integer from 1 to 64. `CAPTUREFAB_FRAME_BYTES` must be 4096–268435456 bytes and a multiple of 64. Malformed overrides fail before worker startup. They do not select the default values.
 
@@ -213,7 +213,7 @@ Media inputs and forwarding use bundled FFmpeg in release builds. Inspect `captu
 
 ## Scan documents
 
-`capturefab scanners --json` lists platform document scanners; `discover` includes them with `transport: "scanner"`. Use the returned full `scanner:sane:DEVICE` (Linux), `scanner:wia:ID` (Windows), or `scanner:ica:UUID` (macOS) ID. Linux requires SANE `scanimage` and an appropriate backend; Windows requires a WIA driver and Windows PowerShell; macOS uses a bundled ImageCaptureCore helper and compatible driver. `doctor` reports the compiled `scanner` feature and runtime availability. Physical scanner compatibility has not been verified.
+`capturefab scanners --json` lists platform document scanners; `discover` includes them with `transport: "scanner"`. Use the returned full `scanner:sane:DEVICE` (Linux), `scanner:wia:ID` (Windows), or `scanner:ica:UUID` (macOS) ID. Linux requires SANE `scanimage` and an appropriate backend; Windows requires a WIA driver and Windows PowerShell; macOS uses a bundled ImageCaptureCore helper and compatible driver. `doctor --json` reports the compiled `scanner` feature and runtime availability. Physical scanner compatibility has not been verified.
 
 ```sh
 capturefab scanners --json

@@ -6,7 +6,7 @@
 
 use crate::analytics::human_bytes;
 use crate::efficiency::{self, Mode, Resolved};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     io::{self, Write},
@@ -112,6 +112,15 @@ struct UsbCamera {
     accessible: bool,
 }
 
+/// What the storage ledger holds.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Usage {
+    /// Bytes counted against the budget, reservations included.
+    allocated: u64,
+    /// The folder of the newest capture.
+    latest: Option<PathBuf>,
+}
+
 /// What the checks look at, gathered once.
 struct Facts {
     efficiency: Resolved,
@@ -124,20 +133,32 @@ struct Facts {
     limits: Limits,
     usb: Vec<UsbCamera>,
     budget: u64,
+    /// None when the ledger cannot be read.
+    usage: Option<Usage>,
     working_directory: Place,
+    /// Where the newest capture landed, else where relative paths land.
+    captures: Place,
 }
 impl Facts {
     fn gather() -> Self {
         let session = crate::ipc::session_dir();
+        let usage = ledger_usage(&session);
+        let working_directory = Place::of(std::env::current_dir().unwrap_or_else(|_| ".".into()));
+        let captures = match usage.as_ref().and_then(|usage| usage.latest.clone()) {
+            Some(folder) => Place::of(folder),
+            None => working_directory.clone(),
+        };
         Self {
             efficiency: efficiency::current(),
             graphics: None,
             budget: storage_budget(&session),
+            usage,
             session: Place::of(session),
             unused_runtime_dir: unused_runtime_dir(),
             limits: limits(),
             usb: usb_cameras(),
-            working_directory: Place::of(std::env::current_dir().unwrap_or_else(|_| ".".into())),
+            working_directory,
+            captures,
         }
     }
 }
@@ -235,7 +256,7 @@ pub fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
     }
     writeln!(
         out,
-        "More: {GUIDE}. doctor --json adds compiled features, JPEG encoders and interfaces."
+        "More: {GUIDE}. doctor --json adds compiled features, scanners, signal protocols, JPEG encoders and network interfaces."
     )
 }
 
@@ -251,7 +272,12 @@ fn checks(facts: &Facts) -> Vec<Check> {
     checks.push(session_check(&facts.session));
     checks.extend(facts.limits.rmem_max.map(receive_buffer_check));
     checks.extend(usb_check(&facts.usb));
-    checks.extend(budget_check(facts.budget, &facts.working_directory));
+    checks.extend(
+        facts
+            .usage
+            .as_ref()
+            .and_then(|usage| budget_check(facts.budget, usage.allocated, &facts.captures)),
+    );
     checks
 }
 
@@ -269,7 +295,7 @@ fn efficiency_check(resolved: &Resolved) -> Check {
     let mut check = Check::ok("efficiency", format!("{mode} mode: {why}."));
     if resolved.efficient && resolved.setting == Mode::Auto {
         check.fix = Some(
-            "For full-rate previews anyway, use --efficiency smooth or CAPTUREFAB_EFFICIENCY=smooth."
+            "To stay smooth anyway, use --efficiency smooth or CAPTUREFAB_EFFICIENCY=smooth."
                 .into(),
         );
     }
@@ -285,13 +311,15 @@ fn graphics_check(graphics: &Value) -> Check {
                 "No GPU adapter ({}), so the desktop window would draw in software.",
                 graphics["reason"].as_str().unwrap_or("unknown reason")
             ),
-            "Install the GPU's Vulkan, Metal, Direct3D 12 or OpenGL driver; --efficiency efficient keeps software previews light.".into(),
+            "Install the GPU's Vulkan, Metal, Direct3D 12 or OpenGL driver.".into(),
         )
     } else if graphics["software"] == true {
         Check::warn(
             "graphics",
-            format!("The desktop window would draw on the CPU ({adapter}): no hardware GPU driver is in use."),
-            "Install the GPU's Vulkan or OpenGL driver, or use --efficiency efficient to keep previews light.".into(),
+            format!(
+                "The desktop window would draw on the CPU ({adapter}): no hardware GPU driver is in use."
+            ),
+            "Install the GPU's Vulkan or OpenGL driver.".into(),
         )
     } else {
         Check::ok(
@@ -305,36 +333,47 @@ fn graphics_check(graphics: &Value) -> Check {
     }
 }
 
+/// The fix moves the whole session directory, so it says what stays behind;
+/// logind creates the runtime directory only for a logged-in or lingering
+/// user and removes it at logout otherwise.
 fn runtime_dir_check(runtime_dir: &Path, session: &Place) -> Check {
     let dir = runtime_dir.display();
+    let session = session.path.display();
+    let user = runtime_dir
+        .file_name()
+        .map_or_else(|| "$USER".into(), |uid| uid.to_string_lossy());
     Check::warn(
         "runtime_dir",
         format!(
-            "XDG_RUNTIME_DIR is unset, so camera frame buffers in {} are written to disk instead of memory.",
-            session.path.display()
+            "XDG_RUNTIME_DIR is unset, so camera frame buffers in {session} are written to disk instead of memory."
         ),
         format!(
-            "export XDG_RUNTIME_DIR={dir} before starting Capturefab; in a systemd service, add Environment=XDG_RUNTIME_DIR={dir}"
+            "In a shell, export XDG_RUNTIME_DIR={dir}; a service needs `sudo loginctl enable-linger {user}` before Environment=XDG_RUNTIME_DIR={dir}, so {dir} exists at boot and survives logout. Either way the session directory moves into memory: saved destinations, the upload queue and the storage budget in {session} stay behind, and new ones are cleared at reboot."
         ),
     )
 }
 
+/// Informational rather than a warning: keeping this state on disk puts the
+/// frame buffers there too.
 fn session_check(session: &Place) -> Check {
-    if session.ram_backed {
-        Check::warn(
-            "session_storage",
-            format!(
-                "Settings, saved destinations, the upload queue and the storage ledger in {} do not survive a reboot.",
-                session.described()
-            ),
-            "To keep them, set CAPTUREFAB_SESSION_DIR to a folder on disk such as ~/.local/state/capturefab; camera frame buffers then live on disk too.".into(),
-        )
-    } else {
-        Check::ok(
+    if !session.ram_backed {
+        return Check::ok(
             "session_storage",
             format!("Session state is in {}.", session.described()),
-        )
+        );
     }
+    let mut check = Check::ok(
+        "session_storage",
+        format!(
+            "Session state is in memory in {}: settings, saved destinations, the upload queue and the storage ledger are cleared at reboot.",
+            session.described()
+        ),
+    );
+    check.fix = Some(
+        "To keep them, set CAPTUREFAB_SESSION_DIR to a folder on disk such as ~/.local/state/capturefab; camera frame buffers then live on disk too, which wears SD cards."
+            .into(),
+    );
+    check
 }
 
 fn receive_buffer_check(rmem_max: u64) -> Check {
@@ -380,11 +419,13 @@ fn usb_check(cameras: &[UsbCamera]) -> Option<Check> {
     let mut vendors: Vec<&str> = denied.iter().map(|c| c.vendor.as_str()).collect();
     vendors.sort_unstable();
     vendors.dedup();
+    // One file per vendor, so a later fix for another camera cannot replace
+    // the rule an earlier one wrote.
     let rules: Vec<String> = vendors
         .iter()
         .map(|vendor| {
             format!(
-                "'SUBSYSTEM==\"usb\", ATTR{{idVendor}}==\"{vendor}\", MODE=\"0660\", GROUP=\"plugdev\", TAG+=\"uaccess\"'"
+                "echo 'SUBSYSTEM==\"usb\", ATTR{{idVendor}}==\"{vendor}\", MODE=\"0660\", GROUP=\"plugdev\", TAG+=\"uaccess\"' | sudo tee /etc/udev/rules.d/60-capturefab-{vendor}.rules >/dev/null"
             )
         })
         .collect();
@@ -395,46 +436,55 @@ fn usb_check(cameras: &[UsbCamera]) -> Option<Check> {
             names.join(", ")
         ),
         format!(
-            "printf '%s\\n' {} | sudo tee /etc/udev/rules.d/60-capturefab.rules && sudo udevadm control --reload && sudo udevadm trigger; services also need their user in the plugdev group",
-            rules.join(" ")
+            "{} && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb; services also need their user in the plugdev group",
+            rules.join(" && ")
         ),
     ))
 }
 
-fn budget_check(budget: u64, place: &Place) -> Option<Check> {
+/// Whether the part of the budget not yet used fits on the disk captures
+/// land on; what is already stored is on that disk too.
+fn budget_check(budget: u64, used: u64, place: &Place) -> Option<Check> {
     let free = place.free_bytes?;
     let path = place.path.display();
-    Some(if budget > free {
+    let room = budget.saturating_sub(used);
+    Some(if room > free {
         Check::warn(
             "storage_budget",
             format!(
-                "The storage budget of {} is more than the {} free on {path}, so the disk can fill before the budget stops captures.",
+                "The storage budget leaves room for {} more ({} of {} used), but only {} is free on {path}, so the disk can fill first.",
+                human_bytes(room),
+                human_bytes(used),
                 human_bytes(budget),
                 human_bytes(free)
             ),
             format!(
                 "capturefab storage configure --max-space {}",
-                suggested_budget(free)
+                suggested_budget(used, free)
             ),
         )
     } else {
         Check::ok(
             "storage_budget",
             format!(
-                "Storage budget {}; {} free on {path}.",
+                "Storage budget {}, {} used; {} free on {path}.",
                 human_bytes(budget),
+                human_bytes(used),
                 human_bytes(free)
             ),
         )
     })
 }
-/// Three quarters of the free space, in whole units `storage configure` accepts.
-fn suggested_budget(free: u64) -> String {
-    let budget = free / 4 * 3;
-    if budget >= 1 << 30 {
-        format!("{}GiB", budget >> 30)
+/// What is stored plus three quarters of the free space, in whole units
+/// `storage configure` accepts. Never below what is stored: retention would
+/// delete the oldest captures to get under it, or stop every capture.
+fn suggested_budget(used: u64, free: u64) -> String {
+    let budget = used.saturating_add(free / 4 * 3);
+    let gib = budget >> 30;
+    if gib > 0 && gib << 30 >= used {
+        format!("{gib}GiB")
     } else {
-        format!("{}MiB", (budget >> 20).max(1))
+        format!("{}MiB", (budget >> 20).max(used.div_ceil(1 << 20)).max(1))
     }
 }
 
@@ -446,6 +496,43 @@ fn storage_budget(session: &Path) -> u64 {
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|policy| policy["policy"]["max_bytes"].as_u64())
         .unwrap_or_else(|| crate::storage::StoragePolicy::default().max_bytes)
+}
+
+/// The fields of storage.json `doctor` needs.
+#[derive(Deserialize)]
+struct LedgerFile {
+    entries: Vec<LedgerEntry>,
+}
+#[derive(Deserialize)]
+struct LedgerEntry {
+    base: PathBuf,
+    created: u64,
+    bytes: u64,
+    reserved: u64,
+}
+
+/// The ledger's usage, also read without the lock: it is replaced by a
+/// rename, so a read sees one whole version. No ledger means nothing is
+/// stored yet; an unreadable one means the usage is unknown.
+fn ledger_usage(session: &Path) -> Option<Usage> {
+    let path = session.join("storage.json");
+    let bytes = match std::fs::metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(Usage::default()),
+        // The ledger's own size limit.
+        Ok(meta) if meta.len() <= 64 << 20 => std::fs::read(&path).ok()?,
+        _ => return None,
+    };
+    let ledger: LedgerFile = serde_json::from_slice(&bytes).ok()?;
+    Some(Usage {
+        allocated: ledger.entries.iter().fold(0, |sum: u64, entry| {
+            sum.saturating_add(entry.bytes.max(entry.reserved))
+        }),
+        latest: ledger
+            .entries
+            .into_iter()
+            .max_by_key(|entry| entry.created)
+            .map(|entry| entry.base),
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -755,38 +842,117 @@ mod tests {
     fn budget_larger_than_free_space_warns_with_a_smaller_budget() {
         let budget = crate::storage::StoragePolicy::default().max_bytes;
         let card = place("/home/pi", "ext4", 6 << 30);
-        let check = budget_check(budget, &card).unwrap();
+        let check = budget_check(budget, 0, &card).unwrap();
         assert_eq!(check.level, Level::Warn);
-        assert!(check.message.contains("10.00 GiB"), "{}", check.message);
-        assert!(check.message.contains("6.00 GiB free on /home/pi"));
+        assert_eq!(
+            check.message,
+            "The storage budget leaves room for 10.00 GiB more (0.0 KiB of 10.00 GiB used), but only 6.00 GiB is free on /home/pi, so the disk can fill first."
+        );
         assert_eq!(
             check.fix.as_deref(),
             Some("capturefab storage configure --max-space 4GiB")
         );
         assert_eq!(
-            budget_check(budget, &place("/data", "xfs", 100 << 30))
+            budget_check(budget, 0, &place("/data", "xfs", 100 << 30))
                 .unwrap()
                 .level,
             Level::Ok
         );
-        assert_eq!(suggested_budget(100 << 20), "75MiB");
-        assert_eq!(suggested_budget(0), "1MiB");
+        assert_eq!(suggested_budget(0, 100 << 20), "75MiB");
+        assert_eq!(suggested_budget(0, 0), "1MiB");
         let unknown = Place {
             free_bytes: None,
             ..card
         };
-        assert_eq!(budget_check(budget, &unknown), None);
+        assert_eq!(budget_check(budget, 0, &unknown), None);
     }
 
     #[test]
-    fn session_state_on_tmpfs_and_a_missing_runtime_dir_warn() {
+    fn budget_check_counts_what_is_already_stored() {
+        // A 10 GiB budget with 9.5 GiB stored has 0.5 GiB left: 5 GiB free
+        // is plenty, so nothing warns.
+        let budget = 10 << 30;
+        let stored = 19 << 29;
+        let card = place("/home/pi/captures", "ext4", 5 << 30);
+        let check = budget_check(budget, stored, &card).unwrap();
+        assert_eq!(check.level, Level::Ok);
+        assert_eq!(
+            check.message,
+            "Storage budget 10.00 GiB, 9.50 GiB used; 5.00 GiB free on /home/pi/captures."
+        );
+        // With 2 GiB stored, 8 GiB would not fit, and the suggestion keeps
+        // what is stored plus three quarters of the free space.
+        let check = budget_check(budget, 2 << 30, &card).unwrap();
+        assert_eq!(check.level, Level::Warn);
+        assert!(check.message.contains("(2.00 GiB of 10.00 GiB used)"));
+        assert_eq!(
+            check.fix.as_deref(),
+            Some("capturefab storage configure --max-space 5GiB")
+        );
+        // A suggestion never drops below what is stored, even where whole
+        // GiB would round under it.
+        for (used, free) in [
+            (stored, 200 << 20),
+            (stored + 100, 0),
+            ((1 << 30) - 1, 0),
+            (3 << 30, 100 << 30),
+        ] {
+            let suggested = crate::storage::parse_bytes(&suggested_budget(used, free)).unwrap();
+            assert!(suggested >= used, "{used} {free}: {suggested}");
+            assert!(
+                suggested <= used + free / 4 * 3 + (1 << 20),
+                "{used} {free}"
+            );
+        }
+        assert_eq!(suggested_budget(stored, 200 << 20), "9878MiB");
+    }
+
+    #[test]
+    fn ledger_usage_reads_bytes_and_the_newest_capture_folder() {
+        let dir = std::env::temp_dir().join(format!(
+            "capturefab-doctor-ledger-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert_eq!(ledger_usage(&dir), Some(Usage::default()), "no ledger yet");
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = |base: &str, created: u64, bytes: u64, reserved: u64| json!({"id":"a","path":format!("{base}/a.png"),"base":base,"identity":{"created_ns":null},"created":created,"bytes":bytes,"reserved":reserved,"lease":null,"sha256":null,"modified_ns":null});
+        let ledger = json!({"version":1,"entries":[
+            entry("/data/old", 10, 300, 0),
+            entry("/data/new", 20, 0, 1000),
+            entry("/data/middle", 15, 50, 40),
+        ]});
+        std::fs::write(dir.join("storage.json"), ledger.to_string()).unwrap();
+        assert_eq!(
+            ledger_usage(&dir),
+            Some(Usage {
+                allocated: 1350,
+                latest: Some("/data/new".into()),
+            })
+        );
+        std::fs::write(dir.join("storage.json"), "{").unwrap();
+        assert_eq!(ledger_usage(&dir), None, "unreadable means unknown");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_state_on_tmpfs_informs_and_a_missing_runtime_dir_warns() {
+        // The default on a Linux login: worth knowing, but moving it puts
+        // frame buffers on disk, so it is not a warning.
         let runtime = place("/run/user/1000/capturefab", "tmpfs", 400 << 20);
         let check = session_check(&runtime);
-        assert_eq!(check.level, Level::Warn);
+        assert_eq!(check.level, Level::Ok);
         assert!(check.message.contains("(tmpfs)"), "{}", check.message);
-        assert!(check.fix.unwrap().contains("CAPTUREFAB_SESSION_DIR"));
+        assert!(check.message.contains("cleared at reboot"));
+        let fix = check.fix.unwrap();
+        assert!(fix.contains("CAPTUREFAB_SESSION_DIR"), "{fix}");
+        assert!(fix.contains("frame buffers then live on disk"), "{fix}");
         let disk = place("/home/pi/.cache/capturefab/sessions", "ext4", 6 << 30);
         assert_eq!(session_check(&disk).level, Level::Ok);
+        assert_eq!(session_check(&disk).fix, None);
         let fallback = runtime_dir_check(Path::new("/run/user/1000"), &disk);
         assert_eq!(fallback.level, Level::Warn);
         assert!(
@@ -794,11 +960,22 @@ mod tests {
                 .message
                 .contains("/home/pi/.cache/capturefab/sessions")
         );
+        // A service cannot rely on the runtime directory without lingering,
+        // and moving the session directory leaves its saved state behind.
+        let fix = fallback.fix.unwrap();
         assert!(
-            fallback
-                .fix
-                .unwrap()
-                .contains("Environment=XDG_RUNTIME_DIR=/run/user/1000")
+            fix.starts_with("In a shell, export XDG_RUNTIME_DIR=/run/user/1000;"),
+            "{fix}"
+        );
+        assert!(
+            fix.contains(
+                "`sudo loginctl enable-linger 1000` before Environment=XDG_RUNTIME_DIR=/run/user/1000"
+            ),
+            "{fix}"
+        );
+        assert!(
+            fix.contains("the upload queue and the storage budget in /home/pi/.cache/capturefab/sessions stay behind"),
+            "{fix}"
         );
     }
 
@@ -819,7 +996,7 @@ mod tests {
             accessible: false,
             ..camera
         };
-        let check = usb_check(&[denied.clone(), denied]).unwrap();
+        let check = usb_check(&[denied.clone(), denied.clone()]).unwrap();
         assert_eq!(check.level, Level::Warn);
         assert!(
             check
@@ -830,6 +1007,28 @@ mod tests {
         assert_eq!(fix.matches("idVendor").count(), 1, "{fix}");
         assert!(fix.contains(r#"ATTR{idVendor}=="2676""#), "{fix}");
         assert!(fix.contains("udevadm trigger"), "{fix}");
+        // Each vendor gets its own file, so fixing a camera plugged in later
+        // keeps the rule that already gives this one access.
+        let other = UsbCamera {
+            name: "BFS-U3-16S2M".into(),
+            node: "/dev/bus/usb/002/004".into(),
+            vendor: "1e10".into(),
+            accessible: false,
+        };
+        let fix = usb_check(std::slice::from_ref(&other))
+            .unwrap()
+            .fix
+            .unwrap();
+        assert!(
+            fix.contains("sudo tee /etc/udev/rules.d/60-capturefab-1e10.rules"),
+            "{fix}"
+        );
+        assert!(!fix.contains("2676"), "{fix}");
+        assert!(!fix.contains("tee /etc/udev/rules.d/60-capturefab.rules"));
+        let both = usb_check(&[denied, other]).unwrap().fix.unwrap();
+        for file in ["60-capturefab-2676.rules", "60-capturefab-1e10.rules"] {
+            assert_eq!(both.matches(file).count(), 1, "{both}");
+        }
     }
 
     #[test]
@@ -906,6 +1105,8 @@ mod tests {
             lines[4].contains("#host-checks-and-efficiency-mode"),
             "{text}"
         );
+        // What plain doctor no longer prints, so the docs' pointers still work.
+        assert!(lines[4].contains("scanners, signal protocols"), "{text}");
         assert_eq!(lines.len(), 5);
     }
 }
