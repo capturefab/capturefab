@@ -6,7 +6,7 @@ The HTTP listener is opt-in. Ordinary `capturefab serve --name bench` keeps its 
 
 ## Get the server and browser client
 
-Release executables, desktop and headless, have the browser client built in, so a downloaded archive needs nothing else: `capturefab serve --listen ...` serves it. `capturefab doctor --json` reports `features.embedded_web: true` for such an executable. To run Capturefab as a service on a Raspberry Pi, Jetson or industrial PC, follow the [line computer guide](line-computer.md).
+Release executables from 0.2.2 on, desktop and headless, have the browser client built in, so a downloaded archive needs nothing else: `capturefab serve --listen ...` serves it. `capturefab doctor --json` reports `features.embedded_web: true` for such an executable; with an older one, build the client as below and pass `--web-dir`. To run Capturefab as a service on a Raspberry Pi, Jetson or industrial PC, follow the [line computer guide](line-computer.md).
 
 From source, install the browser build tools once, using the same Rust toolchain as the client build:
 

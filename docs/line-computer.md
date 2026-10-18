@@ -14,7 +14,7 @@ dpkg --print-architecture
 
 `arm64` takes the `linux-aarch64` archive and `amd64` the `linux-x86_64` one. `armhf` is a 32-bit system, for which there is no build: Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS, so reinstall with that. Do not go by `uname -m`, which prints `aarch64` on 32-bit Raspberry Pi OS too. Releases need glibc 2.28 or newer: Debian 10, Ubuntu 18.10, Jetson Linux R34 and later.
 
-Take the **headless** archive. It is the CLI without the desktop window, so it is smaller and loads no display libraries, and it includes the browser client for `serve --listen` and uploads to S3, FTP and SFTP. Download it and `SHA256SUMS` from [GitHub Releases](https://github.com/capturefab/capturefab/releases), then check and install it:
+Take the **headless** archive. It is the CLI without the desktop window, so it is smaller and loads no display libraries. From 0.2.2 on it includes the browser client for `serve --listen` and uploads to S3, FTP and SFTP; an older archive needs a [separately built client](remote-control.md#get-the-server-and-browser-client) passed with `--web-dir`. Download it and `SHA256SUMS` from [GitHub Releases](https://github.com/capturefab/capturefab/releases), then check and install it:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
