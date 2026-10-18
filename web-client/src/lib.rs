@@ -836,15 +836,15 @@ fn render_analytics(app: &App) {
     let snapshot = &app.analytics;
     let totals = &snapshot["totals"];
     let frames = number(totals, "frames");
-    let dropped = number(totals, "dropped");
+    let lost = number(totals, "lost");
     set_text("analytics-frames", &grouped_number(frames));
     set_text(
         "analytics-dropped",
-        &format!("{:.2}%", drop_percent(frames, dropped)),
+        &format!("{:.2}%", drop_percent(frames, lost)),
     );
     set_text(
         "analytics-drop-detail",
-        &format!("{} missed frames", grouped_number(dropped)),
+        &format!("{} missed frames", grouped_number(lost)),
     );
     set_text("analytics-bytes", &data_size(number(totals, "bytes")));
     set_text(
@@ -861,7 +861,7 @@ fn render_analytics(app: &App) {
     set_text("analytics-status", "Live · refreshes every 5 s");
     element("analytics-status").set_class_name("analytics-status live");
 
-    let has_activity = frames > 0 || dropped > 0;
+    let has_activity = frames > 0 || lost > 0;
     visible(
         "analytics-empty",
         !has_activity || app.analytics_url.is_none(),
@@ -882,7 +882,7 @@ fn render_analytics(app: &App) {
     set_text(
         "analytics-chart-caption",
         &format!(
-            "Totals cover all cameras since this server started. Timeline history stays in memory for at most {hours} hours and clears on restart. Missed frames include transport losses and overwritten preview frames.{}",
+            "Totals cover all cameras since this server started. Timeline history stays in memory for at most {hours} hours and clears on restart. Missed frames were lost on the camera link or in the camera's worker; preview frames a viewer skipped are not counted.{}",
             if flag(snapshot, "truncated") {
                 " The oldest samples have been removed to keep history bounded."
             } else {
@@ -892,7 +892,7 @@ fn render_analytics(app: &App) {
     );
     let _ = element("analytics-chart").set_attribute("alt", &format!(
         "Capture timeline for all cameras: frame rate, acquired data rate, missed frame rate and acquired data volume by camera. This session has {} acquired frames, {} missed frames and {} of camera data.",
-        grouped_number(frames), grouped_number(dropped), data_size(number(totals, "bytes")),
+        grouped_number(frames), grouped_number(lost), data_size(number(totals, "bytes")),
     ));
 
     let cameras = list(snapshot, "cameras");
@@ -915,17 +915,17 @@ fn render_analytics(app: &App) {
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
         let frames = number(camera, "frames");
-        let dropped = number(camera, "dropped");
+        let lost = number(camera, "lost");
         rows.push_str(&format!(
             "<tr><th scope=\"row\" title=\"{}\">{}<span class=\"muted\">{state}</span></th><td>{}</td><td>{}</td><td>{}</td><td>{:.2}%</td></tr>",
             escape(id), escape(if name.is_empty() { id } else { name }), grouped_number(frames),
             if streaming && !stale { format!("{fps:.1} fps") } else { "—".into() },
             if streaming && !stale { format!("{}/s", data_size(rate.max(0.0) as u64)) } else { "—".into() },
-            drop_percent(frames, dropped),
+            drop_percent(frames, lost),
         ));
     }
     element("analytics-cameras").set_inner_html(&format!(
-        "<table><caption class=\"sr-only\">Session totals and current acquisition rates by camera. Missed frame percentages include transport losses and overwritten preview frames.</caption><thead><tr><th scope=\"col\">Camera</th><th scope=\"col\">Frames</th><th scope=\"col\">Now</th><th scope=\"col\">Data rate</th><th scope=\"col\">Missed</th></tr></thead><tbody>{rows}</tbody></table>"
+        "<table><caption class=\"sr-only\">Session totals and current acquisition rates by camera. Missed frame percentages count frames lost on the camera link or in the camera's worker.</caption><thead><tr><th scope=\"col\">Camera</th><th scope=\"col\">Frames</th><th scope=\"col\">Now</th><th scope=\"col\">Data rate</th><th scope=\"col\">Missed</th></tr></thead><tbody>{rows}</tbody></table>"
     ));
     visible("analytics-cameras", !cameras.is_empty());
 }
@@ -1025,7 +1025,7 @@ fn refresh_analytics() {
     spawn_local(async move {
         let snapshot = request("/api/analytics", None).await;
         let chart = if snapshot.as_ref().is_ok_and(|snapshot| {
-            number(&snapshot["totals"], "frames") > 0 || number(&snapshot["totals"], "dropped") > 0
+            number(&snapshot["totals"], "frames") > 0 || number(&snapshot["totals"], "lost") > 0
         }) {
             Some(analytics_chart_url().await)
         } else {

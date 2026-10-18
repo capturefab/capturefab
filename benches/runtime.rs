@@ -6,6 +6,7 @@
 use capturefab::jpeg;
 use capturefab::{
     frame,
+    session::{SessionCommand, SessionHandle},
     shared_memory::SharedRing,
     storage::{self, StoragePolicy},
     types::{Frame, MONO8, RGB8},
@@ -451,6 +452,39 @@ fn main() {
         if let Some(per_save) = written.checked_div(saves) {
             println!("{large:<40} ledger {per_save:>7} bytes per save");
         }
+    }
+    // Session snapshots, as views take them, with eight idle simulated
+    // cameras on real workers and a full session log.
+    if b.selected("session/snapshot") {
+        unsafe { std::env::set_var("CAPTUREFAB_EXECUTABLE", env!("CARGO_BIN_EXE_capturefab")) };
+        let h = SessionHandle::new();
+        for camera in 0..8 {
+            h.request(SessionCommand::Connect {
+                camera: format!("sim:{camera}"),
+                timeout_ms: 5000,
+            })
+            .unwrap();
+        }
+        for _ in 0..200 {
+            let missing = SessionCommand::Get {
+                feature: "NoSuchFeature".into(),
+            };
+            let _ = h.request_to("sim:0", missing);
+        }
+        let snapshot = h.snapshot();
+        println!(
+            "session/snapshot: {} cameras, {} features, {} log lines, {} activity entries",
+            snapshot.cameras.len(),
+            snapshot
+                .cameras
+                .iter()
+                .map(|c| c.features.len())
+                .sum::<usize>(),
+            snapshot.logs.len(),
+            snapshot.activity.len()
+        );
+        b.run("session/snapshot/8-sim-cameras", 0, || h.snapshot());
+        h.shutdown();
     }
     for path in [dir, session, output] {
         let _ = std::fs::remove_dir_all(path);

@@ -61,7 +61,7 @@ fn optional_timestamp<'de, D: Deserializer<'de>>(
     Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LogEntry {
     pub time: String,
     pub level: String,

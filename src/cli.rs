@@ -2191,11 +2191,11 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 let epoch = std::time::Instant::now();
                 let h = client.local.as_ref().unwrap();
                 while until.is_none_or(|d| epoch.elapsed() < d) {
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(check_in(until.map(|d| d.saturating_sub(epoch.elapsed()))));
                     if h.is_shutting_down() {
                         return Ok(());
                     }
-                    let state = h.snapshot();
+                    let state = h.stored();
                     if state.forwarding.is_none() {
                         anyhow::bail!(
                             "{}",
@@ -2225,7 +2225,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 }
                 let epoch = std::time::Instant::now();
                 while epoch.elapsed() < until && !stopped.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(check_in(Some(until.saturating_sub(epoch.elapsed()))));
                     let state = client.call(SessionCommand::Status)?;
                     if state["forwarding"].is_null() {
                         anyhow::bail!(
@@ -2296,29 +2296,33 @@ pub fn run(mut cli: Cli) -> Result<()> {
                         "Capture job {id} scheduled. Keep this process running; Ctrl-C cancels."
                     );
                 }
+                let h = client.local.as_ref().unwrap();
                 loop {
-                    if client.local.as_ref().unwrap().is_shutting_down() {
+                    if h.is_shutting_down() {
                         return Ok(());
                     }
-                    let jobs = client.call(SessionCommand::Jobs)?;
-                    let job = jobs["jobs"]
-                        .as_array()
-                        .and_then(|j| j.iter().find(|j| j["id"] == id))
+                    // The status poller keeps the stored jobs current.
+                    let state = h.stored();
+                    let job = state
+                        .jobs
+                        .iter()
+                        .find(|job| job.id == id)
                         .context("capture job disappeared")?;
-                    match job["status"].as_str() {
-                        Some("complete") => {
+                    match job.status.as_str() {
+                        "complete" => {
                             let mut result = json!({"job":job});
                             wait_for_uploads(&cli, saved.as_deref(), &mut result)?;
                             return output(&cli, result);
                         }
-                        Some("failed") => anyhow::bail!(
+                        "failed" => anyhow::bail!(
                             "{}",
-                            job["error"].as_str().unwrap_or("scheduled capture failed")
+                            job.error.as_deref().unwrap_or("scheduled capture failed")
                         ),
-                        Some("cancelled") => anyhow::bail!("capture job cancelled"),
+                        "cancelled" => anyhow::bail!("capture job cancelled"),
                         _ => {}
                     }
-                    std::thread::sleep(Duration::from_millis(100));
+                    let next = job.next_at_ms.saturating_sub(crate::scheduling::now_ms());
+                    std::thread::sleep(check_in(Some(Duration::from_millis(next))));
                 }
             }
             let result = client.call(prepared.clone().unwrap())?;
@@ -2894,7 +2898,7 @@ fn schema() -> Value {
         "browser":"Rust WASM client built with web-client/build.sh; same-origin HTTP API",
         "routes":{"GET /api/session":"SessionSnapshot", "GET /api/activity?after=REV&timeout_ms=20000":"{revision,activity}; waits for shared actions and job progress", "POST /api/command":"{version:1,camera?:ID,actor?:{id,name,kind},command:SessionCommand}", "GET /api/preview?camera=ID":"bounded PNG preview", "GET /api/destinations":"saved destination names and locations", "GET /api/storage":"global quota status", "GET, HEAD /health":"plain JSON readiness, uptime, camera counts and analytics health (200 ready, 503 unavailable)", "GET, HEAD /metrics":"Prometheus text exposition", "GET, HEAD /api/analytics":"AnalyticsSnapshot for the current session", "GET, HEAD /api/analytics.svg":"Plotters SVG acquisition dashboard", "GET, HEAD /api/signals?history=0|1":"{sources,persisting,dropped,sink_error}; history=1 adds recent points per tag"},
         "result":"JSON APIs use the versioned ok/result/error envelope; /health returns plain JSON",
-        "analytics":"In-memory DuckDB collects independently of clients; at most 24 hours of time-series history and a fixed sample limit. Session counters survive camera disconnects and reset with the server process.",
+        "analytics":"In-memory DuckDB collects independently of clients, starting with the first connected camera: one sample per second of all cameras together, so 24 hours of time-series history for any camera count within a fixed sample limit; samples counts those samples, and seconds with no camera store nothing. Missed-frame charts and percentages count lost frames: totals and cameras add lost and preview_skipped, cameras and points add lost and lost_percent, and dropped/drop_percent keep the status meaning. /metrics adds capturefab_{session,camera}_lost_frames_total and capturefab_{session,camera}_preview_skipped_frames_total. Session counters survive camera disconnects and reset with the server process.",
         "outputs":"Capture paths and destinations belong to the server. Stdout captures are rejected.",
         "lifetime":"Browser disconnection leaves cameras and jobs running in the serve session. Jobs stop when the server exits.",
         "network":"No remote listener unless --listen is given. Bind a Tailscale address, or loopback behind Tailscale Serve."
@@ -3006,7 +3010,7 @@ fn schema() -> Value {
         "environment":crate::efficiency::ENV,
         "precedence":"--efficiency, then CAPTUREFAB_EFFICIENCY, then auto; an unknown CAPTUREFAB_EFFICIENCY value means auto",
         "auto":"efficient with at most 2 CPU cores, at most 2 GiB of memory, or the OS low-power or battery-saver mode; running on battery alone stays smooth",
-        "scope":"The process that parses it, such as the desktop window, serve or a direct command, and the camera workers it starts, which are told efficient whenever that process resolved efficient; a running session keeps its own setting. In workers, efficient decodes each live stream with one thread and picks a faster libx264 preset. Captures and recordings keep every frame in every mode.",
+        "scope":"The process that parses it, such as the desktop window, serve or a direct command, and the camera workers it starts, which are told efficient whenever that process resolved efficient; a running session keeps its own setting, and its workers follow when it changes, for decoders they start afterwards. In workers, efficient decodes each live stream with one thread and picks a faster libx264 preset; the session polls its workers for status every 500 ms instead of 250 ms while a camera streams or a view watches, and every 2 s instead of 1 s otherwise. Captures and recordings keep every frame in every mode.",
         "status":"doctor --json efficiency {setting,efficient,reasons}"
     });
     contract["doctor"] = json!({
@@ -3848,6 +3852,13 @@ fn display_available() -> bool {
             .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
 }
 
+/// How long a wait loop sleeps before it checks again: a second, or until
+/// its next deadline when that is sooner, but not under 100 ms.
+fn check_in(deadline: Option<Duration>) -> Duration {
+    const MOST: Duration = Duration::from_secs(1);
+    deadline.map_or(MOST, |left| left.clamp(Duration::from_millis(100), MOST))
+}
+
 pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
     if error
         .chain()
@@ -3896,6 +3907,17 @@ pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wait_loops_check_in_once_a_second_or_at_their_deadline() {
+        let second = Duration::from_secs(1);
+        assert_eq!(check_in(None), second);
+        assert_eq!(check_in(Some(Duration::from_secs(3600))), second);
+        assert_eq!(
+            check_in(Some(Duration::from_millis(400))),
+            Duration::from_millis(400)
+        );
+        assert_eq!(check_in(Some(Duration::ZERO)), Duration::from_millis(100));
+    }
     #[test]
     fn exact_camera_identity_takes_priority_over_another_cameras_serial() {
         let state = json!({"cameras":[{"info":{"id":"sim:first","serial":"sim:second"}}, {"info":{"id":"sim:second","serial":"SECOND"}}]});
