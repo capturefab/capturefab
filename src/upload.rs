@@ -156,8 +156,9 @@ struct Totals {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
     /// Destinations whose last upload failed in a way worth retrying, by
-    /// name: none of their uploads starts before the backoff ends, so an
-    /// unreachable server is tried once per wait rather than once per file.
+    /// name: none of their uploads tried before starts again until the
+    /// backoff ends, so an unreachable server is tried once per wait (and
+    /// once per new file) rather than once per file per wait.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     backoff: BTreeMap<String, Backoff>,
 }
@@ -176,10 +177,14 @@ fn backoff(failures: u32) -> u64 {
 }
 
 impl Queue {
-    /// When `item` may start, in Unix seconds: after its own retry time and
-    /// its destination's backoff.
+    /// When `item` may start, in Unix seconds: after its own retry time and,
+    /// once it has been tried, its destination's backoff. A new or retried
+    /// upload goes ahead, so a direct capture or a manual retry tries its
+    /// files, and the first to get through ends the backoff for the rest.
     fn due_at(&self, item: &Item) -> u64 {
-        let backoff = self.totals.backoff.get(&item.destination);
+        let backoff = (item.attempts > 0)
+            .then(|| self.totals.backoff.get(&item.destination))
+            .flatten();
         item.next_attempt.max(backoff.map_or(0, |b| b.until))
     }
 }
@@ -1541,6 +1546,22 @@ mod tests {
         with_queue(|_| Ok(((), Change::put(items)))).unwrap();
     }
 
+    /// Items an uploader has tried before, as in a backlog.
+    fn tried(items: Vec<Item>) -> Vec<Item> {
+        items
+            .into_iter()
+            .map(|item| Item {
+                attempts: 1,
+                ..item
+            })
+            .collect()
+    }
+
+    /// Record an attempt's outcome, as the uploader does.
+    fn finish(item: &Item, result: Result<()>) {
+        with_queue(|uploads| Ok(((), update_after(uploads, item, &result)))).unwrap();
+    }
+
     fn pending() -> Value {
         status().unwrap()["pending"].clone()
     }
@@ -1659,12 +1680,9 @@ mod tests {
         if !isolated("a_failing_destination_waits_as_a_whole") {
             return;
         }
-        let mut queued = items(0..3);
+        let mut queued = tried(items(0..3));
         queued[2].destination = "other".into();
         put(queued.clone());
-        let finish = |item: &Item, result: Result<()>| {
-            with_queue(|uploads| Ok(((), update_after(uploads, item, &result)))).unwrap();
-        };
         let backoff = || read(|uploads| Ok(uploads.queue.totals.backoff.get("archive").cloned()));
         let first = with_queue(next_due).unwrap().unwrap();
         assert_eq!(first.id, queued[0].id);
@@ -1681,10 +1699,32 @@ mod tests {
             read(|uploads| Ok(uploads.next_due_at())).unwrap(),
             Some(backoff_until)
         );
-        // A success clears the destination's backoff.
-        finish(&queued[1], Ok(()));
+        // A new upload goes ahead and finds the destination back, which
+        // clears its backoff.
+        let new = items(3..4).remove(0);
+        put(vec![new.clone()]);
+        assert_eq!(with_queue(next_due).unwrap().unwrap().id, new.id);
+        finish(&new, Ok(()));
         assert!(backoff().unwrap().is_none());
-        assert_eq!(pending(), 1);
+        assert_eq!(with_queue(next_due).unwrap().unwrap().id, queued[1].id);
+    }
+
+    #[test]
+    fn a_retried_upload_starts_while_its_destination_backs_off() {
+        if !isolated("a_retried_upload_starts_while_its_destination_backs_off") {
+            return;
+        }
+        let queued = tried(items(0..2));
+        put(queued.clone());
+        finish(
+            &queued[0],
+            Err(Permanent("credentials refused".into()).into()),
+        );
+        finish(&queued[1], Err(anyhow!("connection refused")));
+        assert!(with_queue(next_due).unwrap().is_none());
+        // Once the credentials are fixed, a plain retry tries it at once.
+        assert_eq!(retry(None, false).unwrap(), 1);
+        assert_eq!(with_queue(next_due).unwrap().unwrap().id, queued[0].id);
     }
 
     #[test]
@@ -1724,7 +1764,7 @@ mod tests {
         if !isolated("status_counts_every_upload_of_each_destination") {
             return;
         }
-        let mut queued = items(0..502);
+        let mut queued = tried(items(0..502));
         for (item, state) in queued[500..]
             .iter_mut()
             .zip([State::Pending, State::Failed])
@@ -1736,8 +1776,7 @@ mod tests {
         put(queued.clone());
         // The archive's first upload fails, and all 500 wait for its backoff.
         let first = with_queue(next_due).unwrap().unwrap();
-        let error = Err(anyhow!("connection refused"));
-        with_queue(|uploads| Ok(((), update_after(uploads, &first, &error)))).unwrap();
+        finish(&first, Err(anyhow!("connection refused")));
         let queue = status().unwrap();
         assert_eq!(queue["items"].as_array().unwrap().len(), 200);
         let archive = &queue["destinations"]["archive"];
@@ -1784,6 +1823,59 @@ mod tests {
         assert!(unheld());
         HOLD_FAILS.store(false, Ordering::Relaxed);
         assert!(eventually(HOLD_RETRY + Duration::from_secs(5), || !unheld()));
+    }
+
+    /// An FTP server nobody listens on, so connecting fails at once in a
+    /// way worth retrying.
+    #[cfg(feature = "ftp")]
+    fn closed_ftp() -> Remote {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let Remote::Ftp(server) = ftp() else {
+            unreachable!()
+        };
+        Remote::Ftp(FtpServer {
+            port,
+            password: SecretSource::NoSecret,
+            ..server
+        })
+    }
+
+    #[cfg(feature = "ftp")]
+    #[test]
+    fn a_wait_tries_every_new_upload_after_one_fails() {
+        if !isolated("a_wait_tries_every_new_upload_after_one_fails") {
+            return;
+        }
+        let remote = closed_ftp();
+        let queue = |files: std::ops::Range<usize>| {
+            for n in files {
+                let name = format!("{n}.png");
+                enqueue("line", &remote, &staged(&name), &name).unwrap();
+            }
+        };
+        let attempts = |status: &Value| -> Vec<u64> {
+            let items = status["items"].as_array().unwrap();
+            items
+                .iter()
+                .map(|i| i["attempts"].as_u64().unwrap())
+                .collect()
+        };
+        queue(0..3);
+        // The first refusal backs the destination off, yet a direct capture
+        // still tries each of its files.
+        let status = drain(Duration::from_secs(30)).unwrap();
+        assert_eq!(attempts(&status), [1, 1, 1]);
+        assert!(
+            status["destinations"]["line"]["next_attempt"]
+                .as_u64()
+                .unwrap()
+                > now()
+        );
+        // So does the next one, while the destination backs off.
+        queue(3..4);
+        let status = drain(Duration::from_secs(30)).unwrap();
+        assert_eq!(attempts(&status), [1, 1, 1, 1]);
     }
 
     #[test]
