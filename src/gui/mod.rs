@@ -124,8 +124,8 @@ const OVERVIEW_INTERVAL: Duration = Duration::from_micros(33_333);
 /// scores: a histogram reads as well at 5 Hz, and focusing by hand wants more.
 const EXPOSURE_EVERY: Duration = Duration::from_millis(200);
 const FOCUS_EVERY: Duration = Duration::from_millis(66);
-/// Most pixels a side of a shrunk overview tile keeps, and of any shrunk
-/// view in efficiency mode.
+/// Most pixels a side of a shrunk overview tile keeps, and of any view short
+/// of 1:1 in efficiency mode, on the GPU too.
 const TILE_SIDE: u32 = 1920;
 const EFFICIENT_SIDE: u32 = 1280;
 
@@ -1984,6 +1984,11 @@ impl Workbench {
         });
         let grid = self.grid.get();
         let (count, scale) = (snapshot.cameras.len(), self.main_scale());
+        let (most, shrink_for_gpu) = if crate::efficiency::efficient() {
+            (EFFICIENT_SIDE, preview::Shrink::Larger)
+        } else {
+            (TILE_SIDE, preview::Shrink::UnderHalf)
+        };
         for (index, camera) in snapshot.cameras.iter().enumerate() {
             let id = &camera.info.id;
             if grid.is_some_and(|grid| !grid.shows(index, count, self.grid_scroll)) {
@@ -2003,13 +2008,8 @@ impl Workbench {
             };
             let tile = grid.map_or(Size::new(640.0, 480.0), |grid| grid.tile);
             let native = Size::new(frame.width as f32, frame.height as f32);
-            let most = if crate::efficiency::efficient() {
-                EFFICIENT_SIDE
-            } else {
-                TILE_SIDE
-            };
             let limits = preview::Limits {
-                shrink_for_gpu: true,
+                shrink_for_gpu,
                 ..preview::Limits::shown(&frame, preview::fit_scale(tile, native) * scale, most)
             };
             let preview = self.previews.entry(id.clone()).or_default();
@@ -2126,12 +2126,15 @@ impl Workbench {
         } else {
             self.zoom
         };
-        let most = if crate::efficiency::efficient() {
-            EFFICIENT_SIDE
+        let (most, shrink_for_gpu) = if crate::efficiency::efficient() {
+            (EFFICIENT_SIDE, preview::Shrink::Larger)
         } else {
-            u32::MAX
+            (u32::MAX, preview::Shrink::Never)
         };
-        preview::Limits::shown(frame, zoom * self.main_scale(), most)
+        preview::Limits {
+            shrink_for_gpu,
+            ..preview::Limits::shown(frame, zoom * self.main_scale(), most)
+        }
     }
 
     /// Update the open scopes from `frame`; `paced` while frames stream, so

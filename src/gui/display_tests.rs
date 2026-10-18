@@ -1,11 +1,12 @@
 //! How the workbench sizes the frames it shows, and paces its scopes.
 use super::*;
-use crate::{shared_memory::SharedRing, types::Frame};
+use crate::{session::CameraSnapshot, shared_memory::SharedRing, types::Frame};
 
 /// A workbench showing the selected camera of a ring this test writes to,
-/// converting on the CPU.
+/// converting on the CPU, out of efficiency mode whatever the host.
 fn bench() -> (Workbench, SharedRing) {
-    let (handle, writer) = SessionHandle::fed(4 << 20);
+    crate::efficiency::pin(false);
+    let (handle, writer) = SessionHandle::fed(8 << 20);
     let mut bench = Workbench::new(handle, "test".into(), true, None);
     bench.gpu = GpuFrames::cpu_only();
     bench.snapshot.active_camera = Some("cam".into());
@@ -26,6 +27,21 @@ fn frame(id: u64) -> Frame {
         timestamp_ns: id,
         data: (0..3_000_000).map(|i| (i % 251) as u8).collect(),
     }
+}
+
+/// Sizes of the frames waiting for the GPU under `key`.
+fn uploaded(gpu: &GpuFrames, key: &str) -> Option<(u32, u32)> {
+    gpu.pending(key).map(|frame| (frame.width, frame.height))
+}
+
+/// Streaming cameras by `ids`, for the overview.
+fn cameras<const N: usize>(ids: [&str; N]) -> Vec<CameraSnapshot> {
+    ids.map(|id| {
+        let mut camera = liveness::streaming_camera(0, 0, 0.0);
+        camera.info.id = id.into();
+        camera
+    })
+    .into()
 }
 
 #[test]
@@ -62,6 +78,58 @@ fn the_main_view_converts_what_the_stage_shows_and_every_pixel_at_one_to_one() {
     bench.stage.set(Size::new(1600.0, 1200.0));
     bench.update_frames();
     assert_eq!(converted(&bench), Some((2000, 1500)));
+    bench.handle.shutdown();
+}
+
+#[test]
+fn efficiency_mode_keeps_1280_pixels_a_side_on_the_gpu_too_short_of_one_to_one() {
+    let (mut bench, mut writer) = bench();
+    let gpu = GpuFrames::limited(8192);
+    bench.gpu = gpu.clone();
+    // A 5 MP mosaic fitted on a display at twice the scale: 0.59 of it shows.
+    bench.window_scales.insert(bench.main_window, 2.0);
+    let mosaic = Frame {
+        id: 1,
+        width: 2448,
+        height: 2048,
+        pixel_format: 0x0108_0009,
+        timestamp_ns: 1,
+        data: vec![90; 2448 * 2048],
+    };
+    writer.write(&mosaic, false).unwrap();
+    bench.update_frames();
+    assert_eq!(uploaded(&gpu, MAIN_VIEW), Some((2448, 2048)));
+    crate::efficiency::pin(true);
+    bench.update_frames();
+    assert_eq!(uploaded(&gpu, MAIN_VIEW), Some((1224, 1024)));
+    assert_eq!(
+        bench.shown.as_ref().unwrap().size(),
+        Size::new(2448.0, 2048.0),
+        "placed at its full size"
+    );
+    let _ = bench.update(Message::Actual);
+    assert_eq!(
+        uploaded(&gpu, MAIN_VIEW),
+        Some((2448, 2048)),
+        "1:1 stays exact"
+    );
+    // An overview tile at more than half size, likewise.
+    bench.snapshot.cameras = cameras(["cam"]);
+    bench.grid.set(Some(grid::Grid {
+        columns: 1,
+        tile: Size::new(800.0, 600.0),
+        viewport: 600.0,
+    }));
+    bench.update_previews();
+    assert_eq!(uploaded(&gpu, "cam"), Some((1224, 1024)));
+    crate::efficiency::pin(false);
+    bench.update_previews();
+    assert_eq!(uploaded(&gpu, "cam"), Some((2448, 2048)));
+    // Without a GPU it converts as much.
+    crate::efficiency::pin(true);
+    bench.gpu = GpuFrames::cpu_only();
+    let _ = bench.update(Message::Fit);
+    assert_eq!(converted(&bench), Some((1224, 1024)));
     bench.handle.shutdown();
 }
 

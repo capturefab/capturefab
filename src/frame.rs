@@ -702,7 +702,8 @@ pub(crate) fn shrink_to(frame: &Frame, (max_width, max_height): (u32, u32)) -> O
 /// `frame` made `factor` times smaller each way for display, as RGB8 or
 /// Mono8. Each pixel is the rounded mean of the block it covers, or of four
 /// of its rows spread across a taller block, so detail finer than a pixel
-/// averages out instead of aliasing. A Bayer mosaic is read in whole quads
+/// averages out instead of aliasing; in efficiency mode, the pixel amid the
+/// block, at a fraction of the cost. A Bayer mosaic is read in whole quads
 /// (red, the mean of both greens, blue) rather than demosaiced, so its
 /// colors never mix samples from far apart, and `factor` must be even. None
 /// for other formats, a factor below 2, or a frame without a whole block.
@@ -718,6 +719,7 @@ pub(crate) fn shrink(frame: &Frame, factor: u32) -> Option<Frame> {
     let bayer = is_bayer(frame.pixel_format);
     // Pixels of the source per unit: a quad for a mosaic, else one pixel.
     let unit = if bayer { 2 } else { 1 };
+    let sparse = crate::efficiency::efficient();
     let pixels = checked_pixels(frame).ok()?;
     if factor < 2 || !(factor as usize).is_multiple_of(unit) || frame.data.len() < pixels * bytes {
         return None;
@@ -740,6 +742,15 @@ pub(crate) fn shrink(frame: &Frame, factor: u32) -> Option<Frame> {
     let used = columns * unit * bytes;
     let samples = if bytes == 2 { used / 2 } else { used };
     let [red, green, other, blue] = quad_order(pattern);
+    let quad_color = |quad: [u8; 4]| {
+        let greens = u16::from(quad[green]) + u16::from(quad[other]);
+        [quad[red], ((greens + 1) >> 1) as u8, quad[blue]]
+    };
+    let order = if frame.pixel_format == RGB8 {
+        [0, 1, 2]
+    } else {
+        [2, 1, 0]
+    };
     let mean = |sum: u64, count: u64| ((sum + count / 2) / count) as u8;
     // Totals of every `N`th sum from each of the first `N`.
     fn totals<const N: usize>(sums: &[u32]) -> [u64; N] {
@@ -762,9 +773,34 @@ pub(crate) fn shrink(frame: &Frame, factor: u32) -> Option<Frame> {
                 [0, 1].map(|dy| frame.data[(2 * y + dy) * line..][..used].as_chunks::<2>().0);
             for ((pixel, top), bottom) in out.as_chunks_mut::<3>().0.iter_mut().zip(top).zip(bottom)
             {
-                let quad = [top[0], top[1], bottom[0], bottom[1]];
-                let greens = u16::from(quad[green]) + u16::from(quad[other]);
-                *pixel = [quad[red], ((greens + 1) >> 1) as u8, quad[blue]];
+                *pixel = quad_color([top[0], top[1], bottom[0], bottom[1]]);
+            }
+            return;
+        }
+        let first = y * blocks;
+        let present = (first + blocks).min(rows) - first;
+        if sparse {
+            // The unit amid each block straight to its pixel.
+            let [top, bottom] = [0, unit - 1]
+                .map(|dy| &frame.data[((first + present / 2) * unit + dy) * line..][..used]);
+            let middle =
+                |x: usize| (x * blocks + blocks.min(columns - x * blocks) / 2) * unit * bytes;
+            for (x, pixel) in out.chunks_exact_mut(channels).enumerate() {
+                let i = middle(x);
+                match (bayer, bytes) {
+                    (true, _) => pixel.copy_from_slice(&quad_color([
+                        top[i],
+                        top[i + 1],
+                        bottom[i],
+                        bottom[i + 1],
+                    ])),
+                    (false, 1) => pixel[0] = top[i],
+                    (false, 2) => {
+                        pixel[0] =
+                            (u16::from_le_bytes([top[i], top[i + 1]]) >> shift).min(255) as u8
+                    }
+                    _ => pixel.copy_from_slice(&order.map(|c| top[i + c])),
+                }
             }
             return;
         }
@@ -772,8 +808,6 @@ pub(crate) fn shrink(frame: &Frame, factor: u32) -> Option<Frame> {
         sums.resize(unit * samples, 0);
         // At most four rows of a block, spread across it: every column still
         // counts, and the work stays bounded however far a frame shrinks.
-        let first = y * blocks;
-        let present = (first + blocks).min(rows) - first;
         let picked = present.min(MAX_ROWS);
         for source in (0..picked).map(|i| first + (2 * i + 1) * present / (2 * picked)) {
             for (sums, line) in sums.chunks_exact_mut(samples).zip(lines(source)) {
@@ -809,11 +843,6 @@ pub(crate) fn shrink(frame: &Frame, factor: u32) -> Option<Frame> {
                 ];
             }
         } else if channels == 3 {
-            let order = if frame.pixel_format == RGB8 {
-                [0, 1, 2]
-            } else {
-                [2, 1, 0]
-            };
             for (pixel, block) in out
                 .as_chunks_mut::<3>()
                 .0
@@ -1075,6 +1104,7 @@ mod tests {
     }
     #[test]
     fn preview_matches_conversion_and_preserves_bayer_phase() {
+        crate::efficiency::pin(false);
         let sized = |pixel_format, width, height, data| Frame {
             width,
             height,
@@ -1169,6 +1199,7 @@ mod tests {
     }
     #[test]
     fn shrinking_averages_blocks_and_reads_mosaics_in_whole_quads() {
+        crate::efficiency::pin(false);
         let formats = [
             (MONO8, 1),
             (0x0108_00b1, 1),
@@ -1272,6 +1303,51 @@ mod tests {
             );
         }
         assert!(shrink(&f(0x0120_00bf, vec![0; 8]), 2).is_none());
+    }
+    #[test]
+    fn efficiency_mode_shrinks_to_the_pixel_amid_each_block() {
+        crate::efficiency::pin(true);
+        // The middle of the block from `start` of `size` units, up to `end`.
+        let middle = |start: usize, size: usize, end: usize| start + size.min(end - start) / 2;
+        let formats = [(MONO8, 1), (RGB8, 3), (0x0218_0015, 3), (0x0110_0005, 2)];
+        for (format, bytes) in formats {
+            let frame = Frame {
+                width: 33,
+                height: 17,
+                ..f(format, random(format as u64, 33 * 17 * bytes))
+            };
+            let full = rgb(&frame).unwrap();
+            for factor in [2, 3, 5, 40] {
+                let small = shrink(&frame, factor).unwrap();
+                let factor = factor as usize;
+                let expected: Vec<u8> = (0..17)
+                    .step_by(factor)
+                    .flat_map(|y| (0..33).step_by(factor).map(move |x| (x, y)))
+                    .flat_map(|(x, y)| {
+                        let i = middle(y, factor, 17) * 33 + middle(x, factor, 33);
+                        full[i * 3..i * 3 + 3].to_vec()
+                    })
+                    .collect();
+                assert_eq!(rgb(&small).unwrap(), expected, "{format:x} by {factor}");
+            }
+        }
+        // A grey mosaic, each quad its row and column: whole quads are kept.
+        let (width, height) = (34, 22);
+        let data = (0..width * height)
+            .map(|i| (i / width / 2 * 20 + i % width / 2) as u8)
+            .collect();
+        let frame = Frame {
+            width,
+            height,
+            ..f(0x0108_0009, data)
+        };
+        let small = shrink(&frame, 6).unwrap();
+        assert_eq!((small.width, small.height), (6, 4));
+        for (i, pixel) in small.data.as_chunks::<3>().0.iter().enumerate() {
+            let (x, y) = (i % 6 * 3, i / 6 * 3);
+            let value = (middle(y, 3, 11) * 20 + middle(x, 3, 17)) as u8;
+            assert_eq!(*pixel, [value; 3], "at {x},{y}");
+        }
     }
     #[test]
     fn covering_bounds_never_enlarge_a_view() {

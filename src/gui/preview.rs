@@ -94,12 +94,23 @@ pub struct Limits {
     /// large for a GPU texture is then converted whole on the CPU rather
     /// than shrunk to fit one.
     pub exact: bool,
-    /// Shrink frames the GPU could decode whole too, when shown at under half
-    /// their size, as overview tiles of large sensors are: a small texture
-    /// filters cleanly where the shader would point-sample a large one, and
-    /// uploads a fraction of the bytes. The main view keeps whole frames on
-    /// the GPU, so zooming in needs no new upload.
-    pub shrink_for_gpu: bool,
+    pub shrink_for_gpu: Shrink,
+}
+
+/// Which frames the GPU could decode whole are shrunk to `Limits::size` for
+/// it on the CPU first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shrink {
+    /// None: the main view keeps whole frames on the GPU, so zooming in
+    /// needs no new upload.
+    Never,
+    /// Those shown at under half their size, as overview tiles of large
+    /// sensors are: a small texture filters cleanly where the shader would
+    /// point-sample a large one, and uploads a fraction of the bytes.
+    UnderHalf,
+    /// Any larger, in efficiency mode, so no view uploads or decodes more
+    /// pixels than it would convert without a GPU.
+    Larger,
 }
 
 impl Limits {
@@ -110,7 +121,7 @@ impl Limits {
         Self {
             size: shown_bounds(frame, scale, most),
             exact: scale >= 1.0,
-            shrink_for_gpu: false,
+            shrink_for_gpu: Shrink::Never,
         }
     }
 }
@@ -147,11 +158,18 @@ pub fn present(
         Some(side) if !whole && !limits.exact => (limits.size.0.min(side), limits.size.1.min(side)),
         _ => limits.size,
     };
-    // The GPU filters a whole frame cleanly down to half its size; below
-    // that it would point-sample it.
-    let small_view = limits.size.0.saturating_mul(2) < frame.width
-        && limits.size.1.saturating_mul(2) < frame.height;
-    let small = (!whole || (limits.shrink_for_gpu && small_view))
+    let shrink = !whole
+        || match limits.shrink_for_gpu {
+            Shrink::Never => false,
+            // The GPU filters a whole frame cleanly down to half its size;
+            // below that it would point-sample it.
+            Shrink::UnderHalf => {
+                limits.size.0.saturating_mul(2) < frame.width
+                    && limits.size.1.saturating_mul(2) < frame.height
+            }
+            Shrink::Larger => true,
+        };
+    let small = shrink
         .then(|| crate::frame::shrink_to(&frame, bounds))
         .flatten();
     let decoded = match small {
@@ -233,7 +251,7 @@ mod tests {
         let half = Limits {
             size: (1224, 1024),
             exact: false,
-            shrink_for_gpu: false,
+            shrink_for_gpu: Shrink::Never,
         };
         // The main view hands the GPU a frame it takes whole as it is.
         let gpu = GpuFrames::limited(8192);
@@ -246,7 +264,7 @@ mod tests {
         let tile = |size| Limits {
             size,
             exact: false,
-            shrink_for_gpu: true,
+            shrink_for_gpu: Shrink::UnderHalf,
         };
         present(&gpu, &mut shown, "tile", bayer.clone(), tile((1224, 1024))).unwrap();
         assert!(Arc::ptr_eq(&gpu.pending("tile").unwrap(), &bayer));
@@ -289,7 +307,7 @@ mod tests {
         let every = Limits {
             size: (2448, 2048),
             exact: true,
-            shrink_for_gpu: false,
+            shrink_for_gpu: Shrink::Never,
         };
         present(&downlevel, &mut shown, "main", bayer.clone(), every).unwrap();
         assert_eq!(
@@ -305,6 +323,29 @@ mod tests {
             Some((1224, 1024))
         );
         assert_eq!(placed(&shown), Some(native));
+    }
+
+    #[test]
+    fn efficiency_mode_shrinks_for_the_gpu_too_short_of_one_to_one() {
+        let bayer = frame(0x0108_0009, 5472, 3648);
+        let gpu = GpuFrames::limited(8192);
+        let mut shown = None;
+        let capped = |scale| Limits {
+            shrink_for_gpu: Shrink::Larger,
+            ..Limits::shown(&bayer, scale, 1280)
+        };
+        // Fitted, and as a tile at more than half size.
+        for scale in [0.29, 0.6] {
+            present(&gpu, &mut shown, "main", bayer.clone(), capped(scale)).unwrap();
+            let small = gpu.pending("main").unwrap();
+            assert_eq!((small.width, small.height), (912, 608), "at {scale}");
+            assert_eq!(
+                shown.as_ref().map(Shown::size),
+                Some(Size::new(5472.0, 3648.0))
+            );
+        }
+        present(&gpu, &mut shown, "main", bayer.clone(), capped(1.0)).unwrap();
+        assert!(Arc::ptr_eq(&gpu.pending("main").unwrap(), &bayer));
     }
 
     #[test]
