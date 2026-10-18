@@ -17,11 +17,18 @@ impl Drop for Fixture {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
+/// Spawned binaries keep their cache, such as dataset staging, out of the
+/// user's.
+fn test_cache() -> PathBuf {
+    std::env::temp_dir().join("capturefab-test-cache")
+}
+
 fn cmd(dir: &PathBuf, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_capturefab"))
         .env_remove("CAPTUREFAB_SESSION")
         .env_remove("CAPTUREFAB_CAMERA")
         .env("CAPTUREFAB_SESSION_DIR", dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .args(args)
         .output()
         .unwrap()
@@ -36,6 +43,7 @@ fn serve_with(dir: &PathBuf, cwd: &PathBuf, name: &str, env: &[(&str, &str)]) ->
         .env_remove("CAPTUREFAB_SESSION")
         .env_remove("CAPTUREFAB_CAMERA")
         .env("CAPTUREFAB_SESSION_DIR", dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .envs(env.iter().copied())
         .current_dir(cwd)
         .args(["--json", "serve", "--name", name])
@@ -80,6 +88,7 @@ fn automatic_session_targeting_workflow_paths_and_partial_failure() {
         .env_remove("CAPTUREFAB_SESSION")
         .env_remove("CAPTUREFAB_CAMERA")
         .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .current_dir(&caller)
         .args([
             "--json",
@@ -250,6 +259,7 @@ fn ambiguous_sessions_require_target_and_direct_bypasses_them() {
     );
     let env_direct = Command::new(env!("CARGO_BIN_EXE_capturefab"))
         .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .env("CAPTUREFAB_SESSION", "first")
         .env("CAPTUREFAB_CAMERA", "sim:environment")
         .args(["--json", "--direct", "get", "Width"])
@@ -272,6 +282,7 @@ fn ambiguous_sessions_require_target_and_direct_bypasses_them() {
     );
     let env_stdout = Command::new(env!("CARGO_BIN_EXE_capturefab"))
         .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .env("CAPTUREFAB_SESSION", "first")
         .env_remove("CAPTUREFAB_CAMERA")
         .args([
@@ -335,6 +346,7 @@ fn session_recording_duration_stops_original_camera_after_selection_changes() {
         .env_remove("CAPTUREFAB_SESSION")
         .env_remove("CAPTUREFAB_CAMERA")
         .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .args([
             "--json",
             "--camera",
@@ -422,6 +434,7 @@ fn network_scan_preserves_active_non_gige_streams_and_retains_report() {
     ));
     let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
         .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .args([
             "--json",
             "--camera",
@@ -555,6 +568,7 @@ fn invalid_inputs_fail_before_creating_camera_resources() {
     ] {
         let result = Command::new(env!("CARGO_BIN_EXE_capturefab"))
             .env("CAPTUREFAB_SESSION_DIR", &dir)
+            .env("CAPTUREFAB_CACHE_DIR", test_cache())
             .env(name, value)
             .args(["--json", "--camera", "sim:0", "get", "Width"])
             .output()
@@ -585,6 +599,7 @@ fn rpc_rejects_ignored_fields_before_accessing_a_session() {
     ] {
         let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
             .env("CAPTUREFAB_SESSION_DIR", &dir)
+            .env("CAPTUREFAB_CACHE_DIR", test_cache())
             .args(["--json", "--session", "missing", "rpc"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -689,6 +704,7 @@ fn undo_redo_camera_session_contract() {
     ));
     let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
         .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .args(["--json", "serve", "--name", "history-ci"])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -716,6 +732,7 @@ fn undo_redo_camera_session_contract() {
     let rpc = |id: &str, request: Value| {
         let mut process = Command::new(env!("CARGO_BIN_EXE_capturefab"))
             .env("CAPTUREFAB_SESSION_DIR", &dir)
+            .env("CAPTUREFAB_CACHE_DIR", test_cache())
             .args(["--json", "--session", "history-ci", "--camera", id, "rpc"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -917,6 +934,7 @@ fn parallel_camera_workers_and_public_cli() {
     ));
     let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
         .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .args(["--json", "serve", "--name", "ci"])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -1224,6 +1242,7 @@ fn auto_mode_session_contract() {
     ));
     let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
         .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .args([
             "--json", "--camera", "sim:0", "serve", "--name", "auto-ci", "--auto",
         ])
@@ -1367,6 +1386,7 @@ fn camera_types_propagate_through_workers_and_preserve_native_capture() {
     ));
     let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
         .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .args(["--json", "serve", "--name", "types-ci"])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -1576,6 +1596,7 @@ fn discovery_reports_native_backend_failure_without_hiding_other_cameras() {
     ));
     let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
         .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .env("CAPTUREFAB_FFMPEG", dir.join("missing-ffmpeg"))
         .args(["--json", "serve", "--name", "discovery"])
         .stdout(Stdio::piped())
@@ -1596,6 +1617,7 @@ fn discovery_reports_native_backend_failure_without_hiding_other_cameras() {
     };
     let output = Command::new(env!("CARGO_BIN_EXE_capturefab"))
         .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .env("CAPTUREFAB_FFMPEG", dir.join("missing-ffmpeg"))
         .args([
             "--json",
@@ -1666,6 +1688,7 @@ fn stale_session_descriptor_is_replaced_but_live_one_is_kept() {
     let serve = || {
         let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
             .env("CAPTUREFAB_SESSION_DIR", &dir)
+            .env("CAPTUREFAB_CACHE_DIR", test_cache())
             .args(["--json", "serve", "--name", "stale"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1792,7 +1815,8 @@ fn cmd_env(dir: &PathBuf, env: &[(&str, &str)], args: &[&str]) -> std::process::
         .env_remove("CAPTUREFAB_CAMERA")
         .env_remove("CAPTUREFAB_FTP_PASSWORD")
         .env_remove("CAPTUREFAB_SFTP_PASSWORD")
-        .env("CAPTUREFAB_SESSION_DIR", dir);
+        .env("CAPTUREFAB_SESSION_DIR", dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache());
     for (name, value) in env {
         command.env(name, value);
     }
@@ -2243,10 +2267,18 @@ fn doctor_reports_destination_features() {
         doctor["efficiency"]["setting"].as_str(),
         Some("auto" | "smooth" | "efficient")
     ));
-    assert_eq!(
-        doctor["paths"]["session"]["path"],
-        Value::from(dir.to_string_lossy().into_owned())
-    );
+    // CAPTUREFAB_SESSION_DIR is both the runtime and the state directory;
+    // session_directory stays for older scripts.
+    let path = Value::from(dir.to_string_lossy().into_owned());
+    for key in ["session_directory", "runtime_directory", "state_directory"] {
+        assert_eq!(doctor[key], path, "{key}");
+    }
+    for key in ["session", "runtime", "state"] {
+        assert_eq!(doctor["paths"][key]["path"], path, "{key}");
+    }
+    let cache = Value::from(test_cache().to_string_lossy().into_owned());
+    assert_eq!(doctor["cache_directory"], cache);
+    assert_eq!(doctor["paths"]["cache"]["path"], cache);
     let checks = doctor["checks"].as_array().unwrap();
     assert!(checks.iter().all(|check| {
         check["id"].is_string()
@@ -2400,6 +2432,208 @@ fn doctor_measures_the_storage_budget_on_the_capture_folder_disk() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The binary after the split, with XDG_RUNTIME_DIR at `run` and the state
+/// directory in `state`; `root/login` stands in for /run/user/<uid>, so the
+/// user's own is never looked at. Returns the JSON result and stderr.
+#[cfg(target_os = "linux")]
+fn upgraded(
+    root: &std::path::Path,
+    run: &std::path::Path,
+    state: &std::path::Path,
+    env: &[(&str, &str)],
+    args: &[&str],
+) -> (Value, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+        .env_remove("CAPTUREFAB_SESSION")
+        .env_remove("CAPTUREFAB_CAMERA")
+        .env_remove("CAPTUREFAB_SESSION_DIR")
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
+        .env("CAPTUREFAB_LOGIN_RUNTIME_DIR_TEST", root.join("login"))
+        .env("XDG_RUNTIME_DIR", run)
+        .env("XDG_STATE_HOME", state)
+        .envs(env.iter().copied())
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result = serde_json::from_slice::<Value>(&out.stdout).unwrap()["result"].clone();
+    (result, String::from_utf8(out.stderr).unwrap())
+}
+
+/// Linux keeps settings, destinations, the upload queue and the storage
+/// ledger out of the runtime directory, a RAM disk that logout clears. What
+/// an older version kept there moves to the state directory once.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_state_moves_out_of_the_runtime_directory_once() {
+    use std::os::unix::fs::DirBuilderExt;
+    let root = temp_root("state-dir");
+    let (home, run, state) = (root.join("home"), root.join("run"), root.join("state"));
+    let (archive, staging) = (root.join("archive"), root.join("staging"));
+    let old = run.join("capturefab");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&old)
+        .unwrap();
+    let shared = [
+        ("HOME", home.to_str().unwrap()),
+        ("CAPTUREFAB_STAGING_DIR", staging.to_str().unwrap()),
+        ("CAPTUREFAB_FTP_PASSWORD", "secret"),
+    ];
+    // An older version kept everything in its session directory.
+    let before = |args: &[&str]| json_env(&old, &shared, args);
+    before(&[
+        "--json",
+        "destination",
+        "add-folder",
+        "archive",
+        archive.to_str().unwrap(),
+    ]);
+    before(&["--json", "storage", "configure", "--max-space", "2GiB"]);
+    let shot = root.join("shots/a.png");
+    before(&[
+        "--json",
+        "--camera",
+        "sim:0",
+        "capture",
+        "-o",
+        shot.to_str().unwrap(),
+    ]);
+    if cfg!(feature = "ftp") {
+        before(&[
+            "--json",
+            "destination",
+            "add-ftp",
+            "down",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "1",
+            "--user",
+            "cam",
+            "--plain",
+            "--password-env",
+            "--no-check",
+        ]);
+        before(&[
+            "--json",
+            "--camera",
+            "sim:0",
+            "capture",
+            "-o",
+            "b.png",
+            "--destination",
+            "down",
+        ]);
+    }
+    let after = |args: &[&str]| upgraded(&root, &run, &state, &shared, args);
+    let (listed, moved) = after(&["--json", "destination", "list"]);
+    assert_eq!(listed["destinations"][0]["name"], "archive", "{listed}");
+    assert!(moved.contains("moved destinations.json from"), "{moved}");
+    let new = state.join("capturefab");
+    assert!(new.join("destinations.json").is_file());
+    assert!(!old.join("destinations.json").exists());
+    let (storage, moved) = after(&["--json", "storage"]);
+    assert!(moved.contains("storage.json"), "{moved}");
+    assert_eq!(storage["policy"]["max_bytes"], 2_u64 << 30, "{storage}");
+    assert_eq!(storage["files"], if cfg!(feature = "ftp") { 2 } else { 1 });
+    assert_eq!(
+        storage["ledger"],
+        Value::from(new.join("storage.json").to_str().unwrap())
+    );
+    assert!(!old.join("storage.json").exists() && !old.join("storage-policy.json").exists());
+    if cfg!(feature = "ftp") {
+        let (uploads, moved) = after(&["--json", "uploads"]);
+        // The queue may be only a journal so far.
+        assert!(moved.contains("moved uploads"), "{moved}");
+        assert_eq!(uploads["pending"], 1, "{uploads}");
+        assert!(!old.join("uploads.json").exists() && !old.join("uploads.journal").exists());
+    }
+    // Once moved, nothing moves again, and doctor names both directories.
+    let (doctor, quiet) = after(&["--json", "doctor"]);
+    assert!(!quiet.contains("moved"), "{quiet}");
+    let runtime = Value::from(old.to_str().unwrap());
+    assert_eq!(doctor["runtime_directory"], runtime);
+    assert_eq!(doctor["session_directory"], runtime);
+    assert_eq!(
+        doctor["state_directory"],
+        Value::from(new.to_str().unwrap())
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A service without XDG_RUNTIME_DIR kept its state on disk while logins
+/// kept theirs in the runtime directory. After an upgrade, whichever process
+/// runs first moves the one copy there is, and a copy that cannot move is
+/// named rather than dropped.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_state_moves_from_whichever_folder_an_older_version_used() {
+    use std::os::unix::fs::DirBuilderExt;
+    let root = temp_root("state-sources");
+    let (home, run, state) = (root.join("home"), root.join("run"), root.join("state"));
+    let service = home.join(".cache/capturefab/sessions");
+    let shell = run.join("capturefab");
+    for dir in [&service, &shell] {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .unwrap();
+    }
+    let shared = [("HOME", home.to_str().unwrap())];
+    let configure = |dir: &PathBuf, args: &[&str]| {
+        let mut command = vec!["--json", "storage", "configure"];
+        command.extend(args);
+        json_env(dir, &shared, &command)
+    };
+    configure(
+        &service,
+        &["--max-space", "3GiB", "--on-full", "delete-oldest"],
+    );
+    let after = |args: &[&str]| upgraded(&root, &run, &state, &shared, args);
+    // An SSH shell's runtime directory holds nothing; the service's budget
+    // still moves rather than falling back to the default.
+    let (storage, moved) = after(&["--json", "storage"]);
+    assert!(
+        moved.contains(&format!("from {}", service.display())),
+        "{moved}"
+    );
+    assert_eq!(storage["policy"]["max_bytes"], 3_u64 << 30, "{storage}");
+    assert_eq!(storage["policy"]["on_full"], "delete-oldest");
+    assert!(!service.join("storage-policy.json").exists());
+    // A copy an older shell made meanwhile never replaces it, and is named
+    // on stderr and by doctor.
+    configure(&shell, &["--max-space", "1GiB"]);
+    let (storage, left) = after(&["--json", "storage"]);
+    assert_eq!(storage["policy"]["max_bytes"], 3_u64 << 30, "{storage}");
+    assert!(
+        left.contains(&format!(
+            "not using the storage ledger and budget an older version left in {}",
+            shell.display()
+        )),
+        "{left}"
+    );
+    let (doctor, _) = after(&["--json", "doctor"]);
+    let check = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "old_state")
+        .cloned()
+        .unwrap_or_else(|| panic!("{doctor}"));
+    assert_eq!(check["level"], "warn");
+    let message = check["message"].as_str().unwrap();
+    assert!(message.contains(shell.to_str().unwrap()), "{message}");
+    assert!(shell.join("storage-policy.json").is_file(), "never deleted");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn serve_greets_people_and_keeps_its_json_ready_line() {
     let dir = temp_root("serve-banner");
@@ -2407,6 +2641,7 @@ fn serve_greets_people_and_keeps_its_json_ready_line() {
         .env_remove("CAPTUREFAB_SESSION")
         .env_remove("CAPTUREFAB_CAMERA")
         .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .args(["serve", "--name", "banner"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -2794,6 +3029,7 @@ fn dataset_recordings_are_cataloged_on_duration_and_ctrl_c() {
         .env_remove("CAPTUREFAB_SESSION")
         .env_remove("CAPTUREFAB_CAMERA")
         .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .args([
             "--json",
             "--camera",

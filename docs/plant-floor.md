@@ -189,7 +189,8 @@ An export that does not fit the storage budget fails before it writes a file.
 ## 7. Copy files to a server
 
 Captures and recordings can go to a saved destination. Files are first written
-locally, then a persistent queue uploads them and never replaces a remote file.
+locally, then a queue that survives reboots uploads them and never replaces a
+remote file.
 
 ```sh
 # FTPS (explicit TLS); the password is kept in the OS credential store

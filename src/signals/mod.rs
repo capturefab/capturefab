@@ -116,7 +116,7 @@ pub struct SignalSpec {
     #[serde(default)]
     pub tags: Vec<String>,
     pub timeout_ms: u64,
-    /// OPC UA's certificate store: `<session dir>/signals/opcua-pki`.
+    /// OPC UA's certificate store: `<runtime dir>/signals/opcua-pki`.
     #[serde(default)]
     pub pki_dir: Option<PathBuf>,
 }

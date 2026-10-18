@@ -12,6 +12,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+/// Spawned binaries keep their cache, such as dataset staging, out of the
+/// user's.
+fn test_cache() -> PathBuf {
+    std::env::temp_dir().join("capturefab-test-cache")
+}
+
 const DEVICE: &str = "scanner:sane:airscan:e0:Office Scanner|unit";
 const FAKE_SCANIMAGE: &str = r#"#!/bin/sh
 set -eu
@@ -75,6 +81,7 @@ impl Fixture {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
             .env("CAPTUREFAB_SESSION_DIR", &dir)
+            .env("CAPTUREFAB_CACHE_DIR", test_cache())
             .env("CAPTUREFAB_SCANIMAGE", &executable)
             .env("CAPTUREFAB_SCANNER_FIXTURE_DIR", &dir)
             .args(["--json", "serve", "--name", "scanner-ci"])
@@ -101,6 +108,7 @@ impl Fixture {
     fn command(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_capturefab"))
             .env("CAPTUREFAB_SESSION_DIR", &self.dir)
+            .env("CAPTUREFAB_CACHE_DIR", test_cache())
             .env("CAPTUREFAB_SCANIMAGE", &self.executable)
             .env("CAPTUREFAB_SCANNER_FIXTURE_DIR", &self.dir)
             .args(args)

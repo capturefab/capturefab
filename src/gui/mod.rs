@@ -80,8 +80,8 @@ use liveness::{CameraState, Liveness};
 use motion::{Kind, Motion};
 use notice::{Batch, Level, Notice, Saved, command_notice};
 use pick_list::pick_list;
-pub(crate) use prefs::migrate as migrate_prefs;
 use prefs::{CaptureTags, Prefs, Recent, UiScale};
+pub(crate) use prefs::{STATE as PREFS_STATE, migrate as migrate_prefs};
 use preview::Shown;
 use scene::{Scene, ScreenshotRequest};
 use std::{

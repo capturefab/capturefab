@@ -20,7 +20,7 @@ p.add_argument("--output")
 a = p.parse_args()
 root = pathlib.Path(a.output or tempfile.mkdtemp(prefix="capturefab-media-test-"))
 root.mkdir(parents=True, exist_ok=True)
-env = dict(os.environ, CAPTUREFAB_SESSION_DIR=str(root / "sessions"))
+env = dict(os.environ, CAPTUREFAB_SESSION_DIR=str(root / "sessions"), CAPTUREFAB_CACHE_DIR=str(root / "cache"))
 binary = str(pathlib.Path(a.binary).resolve())
 publish = "srt://127.0.0.1:18890?streamid=publish:capturefab-srt&pkt_size=1316" if a.srt else "rtsp://127.0.0.1:18554/capturefab-rtsp"
 receive = "srt://127.0.0.1:18890?streamid=read:capturefab-srt" if a.srt else publish

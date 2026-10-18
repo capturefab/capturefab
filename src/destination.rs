@@ -617,7 +617,7 @@ pub fn staging_root() -> PathBuf {
     }
     // Unit tests stage in their own session directory, never the user's.
     if cfg!(test) {
-        return crate::ipc::session_dir().join("staging");
+        return crate::ipc::state_dir().join("staging");
     }
     let home = || std::env::var_os("HOME").map(PathBuf::from);
     let base = if cfg!(target_os = "macos") {
@@ -641,9 +641,22 @@ struct File {
     preferred: Option<String>,
 }
 
+pub(crate) static STATE: crate::ipc::StateSet = crate::ipc::StateSet {
+    what: "saved destinations",
+    names: &["destinations.json"],
+    lock: Some("destinations.lock"),
+};
+
+/// The directory holding the saved list and its lock.
+fn dir() -> PathBuf {
+    static ADOPTED: std::sync::Once = std::sync::Once::new();
+    ADOPTED.call_once(|| crate::ipc::adopt_state(&STATE));
+    crate::ipc::state_dir()
+}
+
 /// The file holding the saved list.
 pub(crate) fn path() -> PathBuf {
-    crate::ipc::session_dir().join("destinations.json")
+    dir().join("destinations.json")
 }
 
 /// All saved destinations.
@@ -714,7 +727,7 @@ pub fn get(name: &str) -> Result<Destination> {
 }
 
 fn write(file: &File) -> Result<()> {
-    let dir = crate::ipc::session_dir();
+    let dir = dir();
     crate::ipc::ensure_private_dir(&dir)?;
     // Write a sibling and rename it into place, so readers never see a
     // partial list.
@@ -743,7 +756,7 @@ fn locked_with_rollback<T>(
     rollback: impl FnOnce(&T) -> Result<()>,
 ) -> Result<T> {
     use fs2::FileExt;
-    let dir = crate::ipc::session_dir();
+    let dir = dir();
     crate::ipc::ensure_private_dir(&dir)?;
     let lock = fs::OpenOptions::new()
         .create(true)
@@ -1244,7 +1257,7 @@ mod tests {
         assert_eq!(preferred().as_deref(), Some("before"));
         let secret = std::cell::Cell::new("old");
         let temp =
-            crate::ipc::session_dir().join(format!("destinations.json.{}.tmp", std::process::id()));
+            crate::ipc::state_dir().join(format!("destinations.json.{}.tmp", std::process::id()));
         let result = replace_with(
             Some(&before),
             Some(&after),

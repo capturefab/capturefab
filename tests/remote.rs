@@ -30,6 +30,12 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.root);
     }
 }
+/// Spawned binaries keep their cache, such as dataset staging, out of the
+/// user's.
+fn test_cache() -> PathBuf {
+    std::env::temp_dir().join("capturefab-test-cache")
+}
+
 fn root(name: &str) -> PathBuf {
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
     std::env::temp_dir().join(format!(
@@ -54,6 +60,7 @@ impl Fixture {
         let child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
             .current_dir(&root)
             .env("CAPTUREFAB_SESSION_DIR", root.join("sessions"))
+            .env("CAPTUREFAB_CACHE_DIR", test_cache())
             .env_remove("CAPTUREFAB_SESSION")
             .env("CAPTUREFAB_FRAME_BYTES", "1048576")
             .args([
@@ -171,6 +178,7 @@ impl Fixture {
         let output = Command::new(env!("CARGO_BIN_EXE_capturefab"))
             .current_dir(&self.root)
             .env("CAPTUREFAB_SESSION_DIR", self.root.join("sessions"))
+            .env("CAPTUREFAB_CACHE_DIR", test_cache())
             .env_remove("CAPTUREFAB_SESSION")
             .args(["--json", "--session", "remote-ci"])
             .args(args)
@@ -779,6 +787,7 @@ fn remote_requires_web_assets_before_creating_session_resources() {
         let output = Command::new(env!("CARGO_BIN_EXE_capturefab"))
             .current_dir(&root)
             .env("CAPTUREFAB_SESSION_DIR", root.join("sessions"))
+            .env("CAPTUREFAB_CACHE_DIR", test_cache())
             .env_remove("CAPTUREFAB_SESSION")
             .args([
                 "--json",
