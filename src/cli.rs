@@ -635,7 +635,7 @@ pub enum WorkflowCommand {
 }
 #[derive(Debug, Subcommand)]
 pub enum CaptureSessionCommand {
-    /// Create a new camera-bound DuckDB session; existing files are never overwritten
+    /// Create a camera-bound DuckDB session and its .frames folder; existing files are never overwritten
     New { path: PathBuf },
     /// Resume examples, feedback and pending reviews from an existing DuckDB session
     Resume { path: PathBuf },
@@ -2755,11 +2755,11 @@ fn schema() -> Value {
     contract["capture_session"] = json!({
         "cli":"--session NAME [--camera ID] capture-session new PATH.duckdb | resume PATH.duckdb | close | teach | auto [--pause] [--sensitivity 0.5] [--cooldown-ms 2000] | review [--id ID] | keep ID | discard ID",
         "scope":"Camera-bound persistent controls; connect the camera in a GUI/serve session first. Temporary --direct workers are rejected.",
-        "storage":"One .duckdb file stores raw saved frames, descriptors, capture decisions, settings and background prototypes. New refuses existing paths; resume requires an existing compatible session for this camera. Close checkpoints the database. Discard removes raw pixels while retaining negative descriptors and the decision.",
+        "storage":"A session is NAME.duckdb plus a NAME.frames folder beside it. The database stores descriptors, capture decisions, settings, background prototypes and each frame's file name and SHA-256; each saved frame is a raw file in the folder, written through the storage budget (Storage full is exit 6). New refuses existing paths and an existing .frames folder; resume requires an existing compatible session for this camera. Close checkpoints the database; copy the database and its .frames folder together. Keep only relabels; discard deletes the frame file if it is unchanged and retains negative descriptors and the decision. Sessions from earlier versions keep their frames inside the database and still review.",
         "paths":"CLI and RPC database paths resolve in the calling terminal; workflow database paths resolve beside the workflow file.",
         "learning":"Manual training captures and kept suggestions are positive examples; discarded suggestions are negative examples. Pending suggestions do not train the model. The built-in model is a native visual-descriptor nearest-example baseline with background novelty; no pretrained neural weights are downloaded.",
         "controls":"Auto capture is independent of auto exposure. auto enables acquisition; --pause pauses suggestions and keeps examples. Sensitivity and cooldown default to 0.5 and 2000ms on each auto command. Resume restores saved settings; hardware must be reconnected.",
-        "status":"status.capture_session and cameras[].capture_session; null when no capture database is open",
+        "status":"status.capture_session and cameras[].capture_session; null when no capture database is open. note, when present, says why a suggestion was skipped (the previous frame was still being saved, or storage refused it) or why a pending capture left the queue (its frame file was deleted)",
         "review":"Returns {capture:null|{id,score,reason,width,height,rgba},capture_session:...}; rgba is a base64-encoded 480x360-or-smaller RGBA preview. Review IDs address pending captures; stale or repeated decisions fail.",
         "limits":{"sensitivity":[0.0,1.0],"cooldown_ms":[250,3600000],"pending":200,"stored_pixel_bytes":2147483648_u64},
         "research":"docs/auto-capture-models.md"

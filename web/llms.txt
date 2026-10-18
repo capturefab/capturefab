@@ -219,6 +219,14 @@ RPC operations are `dataset_open`, `dataset_close`, `dataset_status`, `dataset_n
 Signal RPC operations are `signals`, `signal_read`, `signal_browse`, `signal_start` and `signal_stop`.
 Workflow files can use these operations too.
 
+## Review automatic captures
+
+A capture session is `NAME.duckdb` plus a `NAME.frames` folder of raw frames beside it.
+Close it, then copy the database and its `.frames` folder together.
+`capture-session keep ID` only relabels; `discard ID` deletes the frame file if it is unchanged.
+Frames count against the storage budget; a full budget is exit 6.
+`status.capture_session.note` says why a suggestion was skipped.
+
 ## Apply workflow files
 
 ```sh

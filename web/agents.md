@@ -180,6 +180,19 @@ Tables: `captures` (one row per saved image: `wall_ms`, `camera_id`, identity, f
 
 Limits: the dataset file plus WAL defaults to 8 GiB (`--max-bytes`, minimum 16 MiB; a new dataset already takes about 1 MiB); inserts stop below 512 MiB free disk (`Storage full: dataset ...`, exit 6); notes are 1..4096 bytes. Exit codes: 2 wrong extension, unknown table, multi-statement or non-SELECT query, `--limit 0`, `--new` with `--existing`; 3 locked; 4 timeout; 5 format unsupported in this build; 6 storage full. RPC: `dataset_open {path,mode:auto|create|open,max_bytes?}`, `dataset_close`, `dataset_status`, `dataset_note {text,context?,camera?}`, `dataset_query {sql,limit,timeout_ms}`, `dataset_export {output,formats?,tables?,since_ms?,until_ms?,storage?}`; RPC paths must be absolute. `result.dataset` in `schema --json` lists tables, formats, limits and exit codes. The GUI's Dataset section catalogs into `~/Capturefab/capturefab.duckdb` automatically unless the user turns that off.
 
+## Teach automatic capture and review suggestions
+
+```sh
+capturefab --session gui --camera sim:0 capture-session new /data/inspection.duckdb --json
+capturefab --session gui --camera sim:0 capture-session teach --json
+capturefab --session gui --camera sim:0 capture-session auto --sensitivity 0.5 --json
+capturefab --session gui --camera sim:0 capture-session review --json
+capturefab --session gui --camera sim:0 capture-session discard 3 --json
+capturefab --session gui --camera sim:0 capture-session close --json
+```
+
+A capture session is `NAME.duckdb` plus a `NAME.frames` folder beside it. The database holds descriptors, decisions and settings; each saved frame is a raw file in the folder, written through the storage budget. Close the session, then copy the database and its `.frames` folder together. `keep ID` only relabels; `discard ID` deletes the frame file if it is unchanged since Capturefab saved it. `status.capture_session.state` is `paused`, `learning`, `watching`, `review_queue_full` (200 pending) or `storage_full` (2 GiB of session frames, or the storage budget refused a frame); `teach` on a full budget fails with exit 6. Suggestions are saved off the camera thread; `note`, when present, says why a suggestion was skipped or a pending capture left the queue. Sessions from earlier versions keep their frames inside the database and still review.
+
 ## Let Capturefab tune exposure and frame rate
 
 ```sh
