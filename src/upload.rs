@@ -203,12 +203,7 @@ fn now() -> u64 {
 
 fn dir() -> Result<PathBuf> {
     static ADOPTED: std::sync::Once = std::sync::Once::new();
-    ADOPTED.call_once(|| {
-        crate::ipc::adopt_state(
-            &[COMPLETED_FILE, JOURNAL_FILE, QUEUE_FILE],
-            Some("uploads.lock"),
-        )
-    });
+    ADOPTED.call_once(|| crate::ipc::adopt_state(&STATE));
     let dir = crate::ipc::state_dir();
     crate::ipc::ensure_private_dir(&dir)?;
     Ok(dir)
@@ -299,6 +294,11 @@ impl Stamp {
 const QUEUE_FILE: &str = "uploads.json";
 const COMPLETED_FILE: &str = "uploads-completed.json";
 const JOURNAL_FILE: &str = "uploads.journal";
+pub(crate) static STATE: crate::ipc::StateSet = crate::ipc::StateSet {
+    what: "the upload queue",
+    names: &[COMPLETED_FILE, JOURNAL_FILE, QUEUE_FILE],
+    lock: Some("uploads.lock"),
+};
 /// The journal is folded into the queue and completed log once it outgrows
 /// them, or this, so a change costs a short append however long the queue,
 /// and readers replay little.

@@ -20,6 +20,11 @@ use std::{
 
 const RECENT_LIMIT: usize = 6;
 const FILE: &str = "gui.prefs.json";
+pub(crate) static STATE: crate::ipc::StateSet = crate::ipc::StateSet {
+    what: "GUI settings",
+    names: &[FILE],
+    lock: None,
+};
 
 const MIN_WINDOW: Size = Size::new(900.0, 620.0);
 
@@ -633,7 +638,7 @@ fn path() -> PathBuf {
 /// needs for its descriptor, then move them into the state directory.
 pub fn migrate() {
     migrate_in(&crate::ipc::runtime_dir());
-    crate::ipc::adopt_state(&[FILE], None);
+    crate::ipc::adopt_state(&STATE);
 }
 
 fn migrate_in(dir: &Path) {

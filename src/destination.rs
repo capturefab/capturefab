@@ -641,11 +641,16 @@ struct File {
     preferred: Option<String>,
 }
 
+pub(crate) static STATE: crate::ipc::StateSet = crate::ipc::StateSet {
+    what: "saved destinations",
+    names: &["destinations.json"],
+    lock: Some("destinations.lock"),
+};
+
 /// The directory holding the saved list and its lock.
 fn dir() -> PathBuf {
     static ADOPTED: std::sync::Once = std::sync::Once::new();
-    ADOPTED
-        .call_once(|| crate::ipc::adopt_state(&["destinations.json"], Some("destinations.lock")));
+    ADOPTED.call_once(|| crate::ipc::adopt_state(&STATE));
     crate::ipc::state_dir()
 }
 

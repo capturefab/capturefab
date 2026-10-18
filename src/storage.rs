@@ -39,6 +39,11 @@ const SNAPSHOT: &str = "storage.json";
 const JOURNAL: &str = "storage.journal";
 const POLICY: &str = "storage-policy.json";
 const SUMMARY: &str = "storage-summary.json";
+pub(crate) static STATE: crate::ipc::StateSet = crate::ipc::StateSet {
+    what: "the storage ledger and budget",
+    names: &[POLICY, SUMMARY, JOURNAL, SNAPSHOT],
+    lock: Some("storage.lock"),
+};
 /// Tests compact far sooner, so that they exercise it.
 const COMPACT_BYTES: u64 = if cfg!(test) { 64 * 1024 } else { 1024 * 1024 };
 /// Entries without a live reservation only change when something else touches
@@ -349,9 +354,7 @@ impl Manager {
     /// reservations are reclaimed as interrupted.
     fn global() -> Self {
         static ADOPTED: std::sync::Once = std::sync::Once::new();
-        ADOPTED.call_once(|| {
-            crate::ipc::adopt_state(&[POLICY, SUMMARY, JOURNAL, SNAPSHOT], Some("storage.lock"))
-        });
+        ADOPTED.call_once(|| crate::ipc::adopt_state(&STATE));
         Self {
             directory: crate::ipc::state_dir(),
         }

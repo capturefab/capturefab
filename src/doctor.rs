@@ -6,6 +6,7 @@
 
 use crate::analytics::human_bytes;
 use crate::efficiency::{self, Mode, Resolved};
+use crate::ipc::{Adoption, LoginDir, StateSet};
 use crate::storage::{FREE_SPACE_FLOOR, StoragePolicy};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -103,6 +104,50 @@ pub struct Limits {
     pub usbfs_memory_mb: Option<u64>,
 }
 
+/// A set of state files an older version left where Capturefab no longer
+/// reads it.
+#[derive(Debug, Clone, PartialEq)]
+struct LeftBehind {
+    what: &'static str,
+    /// The set's files found there.
+    files: Vec<&'static str>,
+    dirs: Vec<PathBuf>,
+    /// The state directory has a copy of its own.
+    replaced: bool,
+}
+impl LeftBehind {
+    fn of(set: &StateSet, state: &Path) -> Option<Self> {
+        let Adoption::LeftBehind(dirs) = crate::ipc::adoption(set) else {
+            return None;
+        };
+        let found: Vec<&str> = dirs
+            .iter()
+            .flat_map(|dir| crate::ipc::held(dir, set.names))
+            .collect();
+        let files = set
+            .names
+            .iter()
+            .copied()
+            .filter(|name| found.contains(name))
+            .collect();
+        Some(Self {
+            what: set.what,
+            files,
+            dirs,
+            replaced: !crate::ipc::held(state, set.names).is_empty(),
+        })
+    }
+}
+/// Every set of state files, to find what older versions left elsewhere.
+static STATE_SETS: &[&StateSet] = &[
+    &crate::storage::STATE,
+    &crate::destination::STATE,
+    #[cfg(feature = "uploads")]
+    &crate::upload::STATE,
+    #[cfg(feature = "gui")]
+    &crate::gui::PREFS_STATE,
+];
+
 /// Only Linux reads these from sysfs.
 #[cfg_attr(not(all(target_os = "linux", feature = "usb")), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq)]
@@ -125,8 +170,10 @@ struct Facts {
     /// CAPTUREFAB_SESSION_DIR chose both.
     session_dir_set: bool,
     /// `/run/user/<uid>` when the runtime directory fell back to disk
-    /// without it.
-    missed_runtime_dir: Option<PathBuf>,
+    /// without it, and why.
+    missed_runtime_dir: Option<(PathBuf, LoginDir)>,
+    /// State an older version kept elsewhere that did not move.
+    left_behind: Vec<LeftBehind>,
     limits: Limits,
     usb: Vec<UsbCamera>,
     budget: u64,
@@ -140,7 +187,12 @@ struct Facts {
 impl Facts {
     fn gather() -> Self {
         let state = crate::ipc::state_dir();
+        // Reading the ledger first moves one still waiting to.
         let (budget, used) = ledger(&state);
+        let left_behind = STATE_SETS
+            .iter()
+            .filter_map(|set| LeftBehind::of(set, &state))
+            .collect();
         Self {
             efficiency: efficiency::current(),
             graphics: None,
@@ -151,6 +203,7 @@ impl Facts {
             session_dir_set: std::env::var_os("CAPTUREFAB_SESSION_DIR")
                 .is_some_and(|dir| !dir.is_empty()),
             missed_runtime_dir: crate::ipc::missed_runtime_dir(),
+            left_behind,
             limits: limits(),
             usb: usb_cameras(),
             working_directory: Place::of(std::env::current_dir().unwrap_or_else(|_| ".".into())),
@@ -265,10 +318,16 @@ fn checks(facts: &Facts) -> Vec<Check> {
     checks.extend(
         facts
             .missed_runtime_dir
-            .as_deref()
-            .map(|dir| runtime_dir_check(dir, &facts.runtime, &facts.state)),
+            .as_ref()
+            .map(|(dir, login)| runtime_dir_check(dir, *login, &facts.runtime, &facts.state)),
     );
     checks.push(session_check(&facts.state, facts.session_dir_set));
+    checks.extend(
+        facts
+            .left_behind
+            .iter()
+            .map(|left| old_state_check(left, &facts.state)),
+    );
     checks.extend(facts.limits.rmem_max.map(receive_buffer_check));
     checks.extend(usb_check(&facts.usb));
     checks.extend(
@@ -332,26 +391,81 @@ fn graphics_check(graphics: &Value) -> Check {
 }
 
 /// Without XDG_RUNTIME_DIR, Capturefab uses the login's runtime directory
-/// when it exists, so a service and an SSH shell find the same sessions.
-/// logind creates it only for a logged-in or lingering user, so a service
-/// started at boot without lingering finds it missing and falls back to
-/// disk. Frame rings are anonymous memory either way, but the nvJPEG and
-/// VA-API helpers' staging buffers are files there (`accel`).
-fn runtime_dir_check(login: &Path, runtime: &Place, state: &Place) -> Check {
+/// for a lingering user, so a service and an SSH shell find the same
+/// sessions. Otherwise logind removes it at logout, taking a service's
+/// session with it, so Capturefab falls back to disk. Frame rings are
+/// anonymous memory either way, but the nvJPEG and VA-API helpers' staging
+/// buffers are files there (`accel`).
+fn runtime_dir_check(login: &Path, why: LoginDir, runtime: &Place, state: &Place) -> Check {
     let dir = login.display();
     let runtime = runtime.path.display();
     let state = state.path.display();
     let uid = login
         .file_name()
         .map_or_else(|| "$USER".into(), |uid| uid.to_string_lossy());
+    let (why, fix) = match why {
+        LoginDir::NotPrivate => (
+            format!("{dir} is not private to this user"),
+            format!(
+                "Make {dir} this user's with mode 0700, as logind creates it: `sudo chown {uid} {dir} && sudo chmod 700 {dir}`."
+            ),
+        ),
+        LoginDir::Missing => (
+            format!("{dir} does not exist yet"),
+            format!(
+                "Give a service Wants= and After=user@{uid}.service, so it starts once logind has made {dir}."
+            ),
+        ),
+        LoginDir::NotLingering | LoginDir::Usable => (
+            format!("this user does not linger (logind keeps {dir} only while they are logged in)"),
+            format!(
+                "Run `sudo loginctl enable-linger {uid}` so {dir} exists from boot and survives logout, and give a service Wants= and After=user@{uid}.service; Capturefab then uses {dir} without XDG_RUNTIME_DIR."
+            ),
+        ),
+    };
     Check::warn(
         "runtime_dir",
         format!(
-            "XDG_RUNTIME_DIR is unset and {dir} is missing or not private to this user, so sessions are on disk in {runtime}, while logins look for them in {dir}/capturefab."
+            "XDG_RUNTIME_DIR is unset and {why}, so sessions are on disk in {runtime}, while logins look for them in {dir}/capturefab."
         ),
         format!(
-            "Run `sudo loginctl enable-linger {uid}` so {dir} exists from boot and survives logout, and give a service Wants= and After=user@{uid}.service; Capturefab then uses {dir} without XDG_RUNTIME_DIR. Settings, destinations, the upload queue and the storage ledger stay in {state} either way."
+            "{fix} Settings, destinations, the upload queue and the storage ledger stay in {state} either way."
         ),
+    )
+}
+
+/// State an older version kept in another directory stays there when the
+/// state directory has its own, or more than one directory holds a copy:
+/// only the user knows which ledger, budget or queue is current.
+fn old_state_check(left: &LeftBehind, state: &Place) -> Check {
+    let state = state.path.display();
+    let dirs: Vec<String> = left
+        .dirs
+        .iter()
+        .map(|dir| dir.display().to_string())
+        .collect();
+    let dirs = dirs.join(" and ");
+    let files = left.files.join(", ");
+    let why = if left.replaced {
+        format!("{state} has its own")
+    } else {
+        "more than one folder holds a copy".into()
+    };
+    let fix = match left.dirs.as_slice() {
+        [_] if left.replaced => format!(
+            "To keep the old copy instead, stop Capturefab and move {files} from {dirs} into {state}, replacing the ones there; otherwise delete them from {dirs}."
+        ),
+        _ => format!(
+            "Stop Capturefab and choose the copy to keep: move its files ({files}) into {state}, replacing any there, then delete the old copies from {dirs}."
+        ),
+    };
+    Check::warn(
+        "old_state",
+        format!(
+            "Capturefab no longer reads {} an older version left in {dirs}, as {why}.",
+            left.what
+        ),
+        fix,
     )
 }
 
@@ -506,10 +620,13 @@ fn suggested_budget(used: u64, free: u64) -> String {
 /// while unknown, such as after an older version saved, which omits the
 /// check. Without a state directory nothing is stored yet, and `doctor`
 /// does not create one to find that out, unless the ledger of a version
-/// before the split may be waiting to move into it.
+/// before the split is waiting to move into it.
 fn ledger(state: &Path) -> (u64, Option<u64>) {
     let default = StoragePolicy::default().max_bytes;
-    let moving = crate::ipc::legacy_dir().is_some_and(|old| old.is_dir());
+    let moving = matches!(
+        crate::ipc::adoption(&crate::storage::STATE),
+        Adoption::Pending(_)
+    );
     if !state.is_dir() && !moving {
         return (default, Some(0));
     }
@@ -955,11 +1072,12 @@ mod tests {
     fn a_runtime_directory_on_disk_warns_with_lingering() {
         let runtime = place("/home/pi/.cache/capturefab/sessions", "ext4", 6 << 30);
         let state = place("/home/pi/.local/state/capturefab", "ext4", 6 << 30);
-        let fallback = runtime_dir_check(Path::new("/run/user/1000"), &runtime, &state);
+        let login = Path::new("/run/user/1000");
+        let fallback = runtime_dir_check(login, LoginDir::NotLingering, &runtime, &state);
         assert_eq!(fallback.level, Level::Warn);
         assert_eq!(
             fallback.message,
-            "XDG_RUNTIME_DIR is unset and /run/user/1000 is missing or not private to this user, so sessions are on disk in /home/pi/.cache/capturefab/sessions, while logins look for them in /run/user/1000/capturefab."
+            "XDG_RUNTIME_DIR is unset and this user does not linger (logind keeps /run/user/1000 only while they are logged in), so sessions are on disk in /home/pi/.cache/capturefab/sessions, while logins look for them in /run/user/1000/capturefab."
         );
         // Lingering makes the login directory exist for a service at boot;
         // state no longer moves with it.
@@ -976,6 +1094,70 @@ mod tests {
             "{fix}"
         );
         assert!(!fix.contains("export XDG_RUNTIME_DIR"), "{fix}");
+        // A lingering service that started before logind made the directory
+        // needs only to wait for it.
+        let early = runtime_dir_check(login, LoginDir::Missing, &runtime, &state);
+        assert!(
+            early
+                .message
+                .contains("and /run/user/1000 does not exist yet, so"),
+            "{}",
+            early.message
+        );
+        let fix = early.fix.unwrap();
+        assert!(fix.starts_with("Give a service Wants= and After=user@1000.service"));
+        assert!(!fix.contains("enable-linger"), "{fix}");
+        let foreign = runtime_dir_check(login, LoginDir::NotPrivate, &runtime, &state);
+        assert!(foreign.message.contains("is not private to this user"));
+        assert!(
+            foreign
+                .fix
+                .unwrap()
+                .contains("sudo chown 1000 /run/user/1000 && sudo chmod 700 /run/user/1000")
+        );
+    }
+
+    #[test]
+    fn state_an_older_version_left_behind_warns_with_how_to_keep_it() {
+        let state = place("/home/pi/.local/state/capturefab", "ext4", 6 << 30);
+        let service = PathBuf::from("/home/pi/.cache/capturefab/sessions");
+        let mut left = LeftBehind {
+            what: "the storage ledger and budget",
+            files: vec!["storage-policy.json", "storage.json"],
+            dirs: vec![service.clone()],
+            replaced: true,
+        };
+        let check = old_state_check(&left, &state);
+        assert_eq!(check.id, "old_state");
+        assert_eq!(check.level, Level::Warn);
+        assert_eq!(
+            check.message,
+            "Capturefab no longer reads the storage ledger and budget an older version left in /home/pi/.cache/capturefab/sessions, as /home/pi/.local/state/capturefab has its own."
+        );
+        assert_eq!(
+            check.fix.as_deref(),
+            Some(
+                "To keep the old copy instead, stop Capturefab and move storage-policy.json, storage.json from /home/pi/.cache/capturefab/sessions into /home/pi/.local/state/capturefab, replacing the ones there; otherwise delete them from /home/pi/.cache/capturefab/sessions."
+            )
+        );
+        // With a copy in each folder only the user knows which is current.
+        left.dirs.insert(0, "/run/user/1000/capturefab".into());
+        left.replaced = false;
+        let check = old_state_check(&left, &state);
+        assert!(
+            check.message.ends_with(
+                "left in /run/user/1000/capturefab and /home/pi/.cache/capturefab/sessions, as more than one folder holds a copy."
+            ),
+            "{}",
+            check.message
+        );
+        let fix = check.fix.unwrap();
+        assert!(
+            fix.starts_with("Stop Capturefab and choose the copy to keep"),
+            "{fix}"
+        );
+        // Nothing an older version left means no check at all, as in tests.
+        assert_eq!(LeftBehind::of(&crate::storage::STATE, &state.path), None);
     }
 
     #[test]

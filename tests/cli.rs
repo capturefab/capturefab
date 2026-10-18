@@ -2432,6 +2432,38 @@ fn doctor_measures_the_storage_budget_on_the_capture_folder_disk() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The binary after the split, with XDG_RUNTIME_DIR at `run` and the state
+/// directory in `state`; `root/login` stands in for /run/user/<uid>, so the
+/// user's own is never looked at. Returns the JSON result and stderr.
+#[cfg(target_os = "linux")]
+fn upgraded(
+    root: &std::path::Path,
+    run: &std::path::Path,
+    state: &std::path::Path,
+    env: &[(&str, &str)],
+    args: &[&str],
+) -> (Value, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+        .env_remove("CAPTUREFAB_SESSION")
+        .env_remove("CAPTUREFAB_CAMERA")
+        .env_remove("CAPTUREFAB_SESSION_DIR")
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
+        .env("CAPTUREFAB_LOGIN_RUNTIME_DIR_TEST", root.join("login"))
+        .env("XDG_RUNTIME_DIR", run)
+        .env("XDG_STATE_HOME", state)
+        .envs(env.iter().copied())
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result = serde_json::from_slice::<Value>(&out.stdout).unwrap()["result"].clone();
+    (result, String::from_utf8(out.stderr).unwrap())
+}
+
 /// Linux keeps settings, destinations, the upload queue and the storage
 /// ledger out of the runtime directory, a RAM disk that logout clears. What
 /// an older version kept there moves to the state directory once.
@@ -2499,26 +2531,7 @@ fn linux_state_moves_out_of_the_runtime_directory_once() {
             "down",
         ]);
     }
-    let after = |args: &[&str]| {
-        let out = Command::new(env!("CARGO_BIN_EXE_capturefab"))
-            .env_remove("CAPTUREFAB_SESSION")
-            .env_remove("CAPTUREFAB_CAMERA")
-            .env_remove("CAPTUREFAB_SESSION_DIR")
-            .env("CAPTUREFAB_CACHE_DIR", test_cache())
-            .env("XDG_RUNTIME_DIR", &run)
-            .env("XDG_STATE_HOME", &state)
-            .envs(shared)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let result = serde_json::from_slice::<Value>(&out.stdout).unwrap()["result"].clone();
-        (result, String::from_utf8(out.stderr).unwrap())
-    };
+    let after = |args: &[&str]| upgraded(&root, &run, &state, &shared, args);
     let (listed, moved) = after(&["--json", "destination", "list"]);
     assert_eq!(listed["destinations"][0]["name"], "archive", "{listed}");
     assert!(moved.contains("moved destinations.json from"), "{moved}");
@@ -2551,6 +2564,73 @@ fn linux_state_moves_out_of_the_runtime_directory_once() {
         doctor["state_directory"],
         Value::from(new.to_str().unwrap())
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A service without XDG_RUNTIME_DIR kept its state on disk while logins
+/// kept theirs in the runtime directory. After an upgrade, whichever process
+/// runs first moves the one copy there is, and a copy that cannot move is
+/// named rather than dropped.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_state_moves_from_whichever_folder_an_older_version_used() {
+    use std::os::unix::fs::DirBuilderExt;
+    let root = temp_root("state-sources");
+    let (home, run, state) = (root.join("home"), root.join("run"), root.join("state"));
+    let service = home.join(".cache/capturefab/sessions");
+    let shell = run.join("capturefab");
+    for dir in [&service, &shell] {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .unwrap();
+    }
+    let shared = [("HOME", home.to_str().unwrap())];
+    let configure = |dir: &PathBuf, args: &[&str]| {
+        let mut command = vec!["--json", "storage", "configure"];
+        command.extend(args);
+        json_env(dir, &shared, &command)
+    };
+    configure(
+        &service,
+        &["--max-space", "3GiB", "--on-full", "delete-oldest"],
+    );
+    let after = |args: &[&str]| upgraded(&root, &run, &state, &shared, args);
+    // An SSH shell's runtime directory holds nothing; the service's budget
+    // still moves rather than falling back to the default.
+    let (storage, moved) = after(&["--json", "storage"]);
+    assert!(
+        moved.contains(&format!("from {}", service.display())),
+        "{moved}"
+    );
+    assert_eq!(storage["policy"]["max_bytes"], 3_u64 << 30, "{storage}");
+    assert_eq!(storage["policy"]["on_full"], "delete-oldest");
+    assert!(!service.join("storage-policy.json").exists());
+    // A copy an older shell made meanwhile never replaces it, and is named
+    // on stderr and by doctor.
+    configure(&shell, &["--max-space", "1GiB"]);
+    let (storage, left) = after(&["--json", "storage"]);
+    assert_eq!(storage["policy"]["max_bytes"], 3_u64 << 30, "{storage}");
+    assert!(
+        left.contains(&format!(
+            "not using the storage ledger and budget an older version left in {}",
+            shell.display()
+        )),
+        "{left}"
+    );
+    let (doctor, _) = after(&["--json", "doctor"]);
+    let check = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "old_state")
+        .cloned()
+        .unwrap_or_else(|| panic!("{doctor}"));
+    assert_eq!(check["level"], "warn");
+    let message = check["message"].as_str().unwrap();
+    assert!(message.contains(shell.to_str().unwrap()), "{message}");
+    assert!(shell.join("storage-policy.json").is_file(), "never deleted");
     let _ = std::fs::remove_dir_all(&root);
 }
 
