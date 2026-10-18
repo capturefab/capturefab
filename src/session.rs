@@ -1275,14 +1275,23 @@ impl Process {
         // before this coordinator's first camera.
         static SWEEP: std::sync::Once = std::sync::Once::new();
         SWEEP.call_once(|| crate::shared_memory::sweep(&dir));
-        let mut ring = SharedRing::create(&dir, capacity)?;
+        let ring = SharedRing::create(&dir, capacity)?;
         let executable = std::env::var_os("CAPTUREFAB_EXECUTABLE")
             .map(std::path::PathBuf::from)
             .unwrap_or(std::env::current_exe()?);
         let efficiency = crate::efficiency::for_workers();
         let mut command = worker_command(executable, efficiency);
         ring.pass_to(&mut command);
-        let mut child = command.spawn().context("launch camera capture process")?;
+        let child = command.spawn().context("launch camera capture process")?;
+        Self::attach(child, ring, revision, efficiency)
+    }
+    /// Take over a worker started with `ring` and `efficiency`.
+    fn attach(
+        mut child: Child,
+        mut ring: SharedRing,
+        revision: Arc<AtomicU64>,
+        efficiency: crate::efficiency::Mode,
+    ) -> Result<Self> {
         ring.passed();
         let input = child.stdin.take().context("worker stdin")?;
         let output = BufReader::new(child.stdout.take().context("worker stdout")?);
@@ -1660,9 +1669,14 @@ impl SessionHandle {
     }
     /// Wake the status poller if it waits at `pace`.
     fn hurry(&self, pace: u8) {
-        if self.inner.pace.load(Ordering::Relaxed) == pace
-            && let Some(poller) = self.inner.poller.get()
-        {
+        if self.inner.pace.load(Ordering::Relaxed) == pace {
+            self.wake();
+        }
+    }
+    /// Wake the status poller whatever its pace. A wake that comes before it
+    /// parks is kept, so one that just saw no workers still polls a new one.
+    fn wake(&self) {
+        if let Some(poller) = self.inner.poller.get() {
             poller.unpark();
         }
     }
@@ -1726,6 +1740,21 @@ impl SessionHandle {
             self.inner.dataset.record_saved(batch, gaps);
         }
     }
+    /// Give a connected worker's frames and status to the session.
+    fn add_worker(&self, id: String, p: Process) {
+        self.inner
+            .feeds
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.clone(), p.feed.clone());
+        self.inner
+            .workers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, Arc::new(Mutex::new(p)));
+        // The poller may have just seen no workers, at whatever pace.
+        self.wake();
+    }
     fn workers(&self) -> Vec<(String, Arc<Mutex<Process>>)> {
         self.inner
             .workers
@@ -1738,6 +1767,12 @@ impl SessionHandle {
     /// The snapshot the status poller last stored, for loops that check on
     /// work now and then. Unlike `snapshot`, reading it is not watching.
     pub fn stored(&self) -> SessionSnapshot {
+        if self.inner.poller.get().is_none() {
+            // No poller started, so poll here or the loop would never see
+            // its work finish.
+            self.refresh_workers();
+            self.store_snapshot();
+        }
         self.inner
             .state
             .read()
@@ -2477,19 +2512,9 @@ impl SessionHandle {
                     .context("worker connected without identity")?;
                 let id = info.id.clone();
                 let pid = p.child.id();
-                self.inner
-                    .feeds
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(id.clone(), p.feed.clone());
-                self.inner
-                    .workers
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(id.clone(), Arc::new(Mutex::new(p)));
+                self.add_worker(id.clone(), p);
                 self.edit_state().active_camera = Some(id);
                 self.store_snapshot();
-                self.hurry(PARKED);
                 Ok(json!({"connected":result["connected"],"worker_pid":pid}))
             }
             SessionCommand::Select { camera } => {
@@ -2704,9 +2729,7 @@ impl SessionHandle {
         self.inner
             .activity
             .cancel_jobs(None, None, "session stopped before schedule completed");
-        if let Some(poller) = self.inner.poller.get() {
-            poller.unpark();
-        }
+        self.wake();
         // Signals first, so their final samples reach the dataset before it closes.
         let signals = &self.inner.signals;
         signals.stop_all(Duration::from_secs(3));
@@ -3945,6 +3968,92 @@ mod tests {
         assert!(handle.watching());
         assert_eq!(handle.next_poll(), None, "no worker: wait to be woken");
         assert_eq!(handle.inner.pace.load(Ordering::Relaxed), PARKED);
+        handle.shutdown();
+    }
+    const TEST_WORKER: &str = "CAPTUREFAB_TEST_WORKER";
+    /// This test binary as a camera worker, for `test_worker`.
+    #[test]
+    fn serve_as_test_worker() {
+        if std::env::var_os(TEST_WORKER).is_none() {
+            return;
+        }
+        println!("test worker ready");
+        // `SharedRing::pass_to` adds the ring last.
+        run_worker(&std::env::args_os().last().unwrap()).unwrap();
+        println!("test worker efficient {}", crate::efficiency::efficient());
+    }
+    /// A camera worker run by this test binary, started with `efficiency`.
+    #[cfg(unix)]
+    fn test_worker(efficiency: crate::efficiency::Mode) -> Process {
+        let ring = SharedRing::create(&std::env::temp_dir(), 4096).unwrap();
+        let mut command = worker_command(std::env::current_exe().unwrap(), efficiency);
+        command
+            .args([
+                "--exact",
+                "session::tests::serve_as_test_worker",
+                "--nocapture",
+            ])
+            .env(TEST_WORKER, "1");
+        ring.pass_to(&mut command);
+        let child = command.spawn().unwrap();
+        let mut worker = Process::attach(child, ring, Arc::default(), efficiency).unwrap();
+        // Past what the test harness prints first.
+        let mut line = String::new();
+        while !line.ends_with("test worker ready\n") {
+            line.clear();
+            let read = worker.output.read_line(&mut line).unwrap();
+            assert_ne!(read, 0, "test worker did not start");
+        }
+        worker
+    }
+    #[test]
+    #[cfg(unix)]
+    fn a_new_worker_wakes_the_poller_whatever_pace_it_last_set() {
+        let handle = SessionHandle::new();
+        let reaches = |pace| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while handle.inner.pace.load(Ordering::Relaxed) != pace {
+                if Instant::now() > deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            true
+        };
+        assert!(reaches(PARKED), "no worker: the poller parks");
+        // As if it had just seen no workers, but not yet said so.
+        handle.inner.pace.store(QUICK, Ordering::Relaxed);
+        let worker = test_worker(crate::efficiency::for_workers());
+        handle.add_worker("cam".into(), worker);
+        assert!(reaches(SLOW), "the poller polls the new worker");
+        handle.shutdown();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn running_workers_follow_the_coordinator_efficiency() {
+        use crate::efficiency::Mode;
+        use std::io::Read;
+        // Started the other way, so only a refresh can bring it in line.
+        let efficient = crate::efficiency::efficient();
+        let started = if efficient {
+            Mode::Smooth
+        } else {
+            Mode::Efficient
+        };
+        let handle = SessionHandle::new();
+        handle.add_worker("cam".into(), test_worker(started));
+        handle.refresh_workers();
+        let worker = handle.inner.workers.write().unwrap().remove("cam").unwrap();
+        let mut worker = worker.lock().unwrap();
+        assert_eq!(worker.efficiency, crate::efficiency::for_workers());
+        worker.input.write_all(b"{\"shutdown\":true}\n").unwrap();
+        let mut rest = String::new();
+        worker.output.read_to_string(&mut rest).unwrap();
+        assert!(
+            rest.contains(&format!("test worker efficient {efficient}\n")),
+            "{rest}"
+        );
+        drop(worker);
         handle.shutdown();
     }
     #[test]
