@@ -263,6 +263,7 @@ fn tiles_scrolled_out_of_view_let_go_of_their_frames() {
             id.clone(),
             CameraPreview {
                 frame_id: Some(1),
+                limits: Some(preview::Limits::shown(&Frame::default(), 1.0, TILE_SIDE)),
                 shown: Some(Shown::Gpu {
                     key: id,
                     size: Size::new(640.0, 480.0),
@@ -283,9 +284,44 @@ fn tiles_scrolled_out_of_view_let_go_of_their_frames() {
         let scrolled_out = i >= 4;
         assert_eq!(gpu.is_retired(id), scrolled_out, "{id}");
         assert_eq!(gpu.pending(id).is_none(), scrolled_out, "{id}");
-        assert_eq!(bench.previews[id].frame_id.is_none(), scrolled_out, "{id}");
+        assert_eq!(bench.previews[id].limits.is_none(), scrolled_out, "{id}");
+        assert_eq!(bench.previews[id].frame_id, Some(1), "{id}");
     }
     // Scrolling back shows them again with their newest frames.
     let _ = bench.update(Message::OverviewScrolled(300.0));
     assert_eq!(bench.grid_scroll, 300.0);
+}
+
+#[test]
+fn a_tile_scrolled_back_shows_its_frame_again_without_counting_it_as_new() {
+    let (mut bench, mut writer) = bench();
+    let gpu = GpuFrames::limited(8192);
+    bench.gpu = gpu.clone();
+    // Three tiles in a column, one in view; the fed camera last.
+    bench.snapshot.cameras = cameras(["a", "b", "cam"]);
+    bench.grid.set(Some(grid::Grid {
+        columns: 1,
+        tile: Size::new(400.0, 300.0),
+        viewport: 300.0,
+    }));
+    bench.observe_liveness();
+    let started = bench.now;
+    writer.write(&frame(1), false).unwrap();
+    bench.grid_scroll = 1000.0;
+    bench.update_previews();
+    assert!(gpu.pending("cam").is_some());
+    bench.grid_scroll = 0.0;
+    bench.update_previews();
+    assert!(gpu.is_retired("cam"));
+    // The camera stalls meanwhile: its frame shows again but is no news.
+    bench.now += Duration::from_secs(10);
+    bench.grid_scroll = 1000.0;
+    bench.update_previews();
+    assert!(!gpu.is_retired("cam") && gpu.pending("cam").is_some());
+    assert_eq!(bench.liveness["cam"].frame_at, started);
+    // A new frame is.
+    writer.write(&frame(2), false).unwrap();
+    bench.update_previews();
+    assert_eq!(bench.liveness["cam"].frame_at, bench.now);
+    bench.handle.shutdown();
 }

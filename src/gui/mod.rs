@@ -1994,10 +1994,10 @@ impl Workbench {
             if grid.is_some_and(|grid| !grid.shows(index, count, self.grid_scroll)) {
                 // Scrolled out: nothing pulled from the ring or converted, and
                 // no frame held for a GPU view that is not drawn. Shown again
-                // when it scrolls back in.
+                // when it scrolls back in, without counting as a new frame.
                 if let Some(preview) = self.previews.get_mut(id)
                     && matches!(preview.shown, Some(Shown::Gpu { .. }))
-                    && preview.frame_id.take().is_some()
+                    && preview.limits.take().is_some()
                 {
                     gpu.retire(id);
                 }
