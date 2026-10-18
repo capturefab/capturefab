@@ -1741,6 +1741,33 @@ fn viewerless_streams_report_no_losses_and_keep_frames_off_disk() {
 }
 
 #[test]
+fn a_direct_timelapse_waits_for_its_job_and_reports_it() {
+    let root = temp_root("direct-timelapse");
+    let dir = root.join("sessions");
+    let frames = root.join("frames");
+    std::fs::create_dir_all(&root).unwrap();
+    let result = json(
+        &dir,
+        &[
+            "--json",
+            "--camera",
+            "sim:0",
+            "capture",
+            "-o",
+            frames.to_str().unwrap(),
+            "-n",
+            "3",
+            "--interval",
+            "400ms",
+        ],
+    );
+    assert_eq!(result["job"]["status"], "complete", "{result}");
+    assert_eq!(result["job"]["captured"], 3, "{result}");
+    assert_eq!(std::fs::read_dir(&frames).unwrap().count(), 3);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 #[cfg(unix)]
 fn a_new_session_sweeps_ring_files_a_killed_one_left() {
     let root = temp_root("ring-sweep");

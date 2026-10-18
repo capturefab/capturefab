@@ -1730,6 +1730,15 @@ impl SessionHandle {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
+    /// The snapshot the status poller last stored, for loops that check on
+    /// work now and then. Unlike `snapshot`, reading it is not watching.
+    pub fn stored(&self) -> SessionSnapshot {
+        self.inner
+            .state
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
     /// The session as views show it. Asking counts as watching, so camera
     /// workers are polled often while views keep asking.
     pub fn snapshot(&self) -> SessionSnapshot {
