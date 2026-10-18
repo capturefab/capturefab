@@ -637,7 +637,8 @@ struct File {
     preferred: Option<String>,
 }
 
-fn path() -> PathBuf {
+/// The file holding the saved list.
+pub(crate) fn path() -> PathBuf {
     crate::ipc::session_dir().join("destinations.json")
 }
 

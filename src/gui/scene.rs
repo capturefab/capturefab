@@ -190,7 +190,7 @@ impl Workbench {
     ///   `destinations-remove`, `bucket-editor-advanced`, `settings-credentials`,
     ///   `settings-credential-error`, `analytics-measurements`,
     ///   `analytics-measurements-populated`, `analytics-invalid`,
-    ///   `close-error`;
+    ///   `close-error`, `uploads-offline`;
     ///   `sheet-bottom` and `inspector-bottom` expose their lower content
     /// - failures: `write-error` (setting the selected camera's exposure
     ///   time was refused) and `connect-failed` (connecting to a typed

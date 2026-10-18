@@ -26,9 +26,9 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     sync::mpsc::{Receiver, TryRecvError, channel},
-    sync::{Mutex, PoisonError},
+    sync::{Arc, Mutex, PoisonError},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// How long the access key ID must rest before the keychain is asked
@@ -1077,6 +1077,221 @@ pub enum Message {
     Scrolled(bool),
 }
 
+/// A value read on a background thread now and then. `changes` counts
+/// readings that found something new, so each picker copies only those.
+struct Polled<T> {
+    value: Option<T>,
+    changes: u64,
+    task: Option<Receiver<Option<T>>>,
+    at: Option<Instant>,
+}
+
+impl<T> Default for Polled<T> {
+    fn default() -> Self {
+        Self {
+            value: None,
+            changes: 0,
+            task: None,
+            at: None,
+        }
+    }
+}
+
+impl<T: Send + 'static> Polled<T> {
+    /// Collect a finished reading, and start the next once `every` has
+    /// passed; `read` returns `None` when nothing changed.
+    fn poll(&mut self, every: Duration, read: impl FnOnce() -> Option<T> + Send + 'static) {
+        self.collect();
+        if self.task.is_none() && self.at.is_none_or(|t| t.elapsed() >= every) {
+            self.start(read);
+        }
+    }
+
+    /// Read now, replacing any reading under way.
+    fn start(&mut self, read: impl FnOnce() -> Option<T> + Send + 'static) {
+        self.at = Some(Instant::now());
+        self.task = Some(background(read));
+    }
+
+    fn collect(&mut self) {
+        let Some(task) = &self.task else { return };
+        match task.try_recv() {
+            Ok(found) => {
+                self.task = None;
+                if let Some(found) = found {
+                    self.value = Some(found);
+                    self.changes += 1;
+                }
+            }
+            Err(TryRecvError::Disconnected) => self.task = None,
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    /// The value, if it changed since `seen`.
+    fn newer(&self, seen: &mut u64) -> Option<&T> {
+        (*seen != self.changes).then(|| *seen = self.changes)?;
+        self.value.as_ref()
+    }
+}
+
+/// The saved list's file as it stands: modification time and length.
+type ListVersion = Option<(Option<SystemTime>, u64)>;
+
+fn list_version() -> ListVersion {
+    let meta = std::fs::metadata(destination::path()).ok()?;
+    Some((meta.modified().ok(), meta.len()))
+}
+
+/// What both pickers read in the background and share, so they never poll
+/// twice: the saved list when its file changes, the drives, and upload
+/// status while there is a network destination or anything queued.
+#[derive(Default)]
+struct Watch {
+    saved: Polled<(ListVersion, Vec<Destination>)>,
+    volumes: Polled<Vec<Volume>>,
+    /// The status and how long reading it took.
+    uploads: Polled<(Arc<Value>, Duration)>,
+    /// A screenshot scene holds the upload status it set.
+    pinned: bool,
+}
+
+impl Watch {
+    fn poll(&mut self) {
+        let known = self.saved.value.as_ref().map(|(version, _)| *version);
+        self.saved.poll(Duration::from_secs(3), move || {
+            let version = list_version();
+            (known != Some(version)).then(|| (version, destination::list().unwrap_or_default()))
+        });
+        self.volumes
+            .poll(Duration::from_secs(5), || Some(volumes::list()));
+        #[cfg(feature = "uploads")]
+        if !self.pinned && self.uploads_matter() {
+            // A long queue takes longer to read; look less often then, so
+            // status never keeps a core busy.
+            let cost = self
+                .uploads
+                .value
+                .as_ref()
+                .map_or(Duration::ZERO, |(_, cost)| *cost);
+            self.uploads
+                .poll(Duration::from_secs(2).max(cost * 20), read_uploads);
+        }
+    }
+
+    /// Whether a network destination is saved or uploads are queued; both
+    /// count until first read.
+    #[cfg(feature = "uploads")]
+    fn uploads_matter(&self) -> bool {
+        let remote = self
+            .saved
+            .value
+            .as_ref()
+            .is_none_or(|(_, saved)| saved.iter().any(|d| d.target.is_remote()));
+        let queued = self.uploads.value.as_ref().is_none_or(|(status, _)| {
+            ["pending", "uploading", "failed"]
+                .iter()
+                .any(|key| status[key].as_u64().unwrap_or(0) > 0)
+        });
+        remote || queued
+    }
+
+    /// The saved list changed here; read it again for the other picker.
+    fn saved_changed(&mut self) {
+        self.saved.value = None;
+        self.saved.at = None;
+    }
+
+    /// Retry failed and waiting uploads now, then read what that leaves.
+    #[cfg(feature = "uploads")]
+    fn retry(&mut self) {
+        self.uploads.start(|| {
+            let _ = crate::upload::retry(None, true);
+            read_uploads()
+        });
+    }
+}
+
+#[cfg(feature = "uploads")]
+fn read_uploads() -> Option<(Arc<Value>, Duration)> {
+    let started = Instant::now();
+    let status = crate::upload::status().ok()?;
+    Some((Arc::new(status), started.elapsed()))
+}
+
+/// How a destination's upload line reads.
+#[derive(Debug, PartialEq)]
+enum Mood {
+    Calm,
+    /// Waiting for the destination to come back.
+    Waiting,
+    Failed,
+}
+
+/// What a destination's upload line says, from the queue's status.
+#[derive(Debug, PartialEq)]
+struct UploadLine<'a> {
+    summary: String,
+    mood: Mood,
+    /// The retry button's label, when it has one.
+    action: Option<&'static str>,
+    /// The newest error, when it matters.
+    error: Option<&'a str>,
+    /// Files waiting or uploading.
+    waiting: u64,
+}
+
+impl<'a> UploadLine<'a> {
+    /// `now` is in Unix seconds, like the status's `next_attempt`.
+    fn of(status: &'a Value, destination: &str, now: u64) -> Self {
+        let backlog = &status["destinations"][destination];
+        let count = |key: &str| backlog[key].as_u64().unwrap_or(0);
+        let waiting = count("pending") + count("uploading");
+        let (failed, size) = (count("failed"), bytes(count("waiting_bytes")));
+        let files = plural(waiting, "file", "files");
+        // Nothing starts before the next attempt, so a later one means the
+        // destination could not be reached and is waiting to retry.
+        let retry_in = backlog["next_attempt"]
+            .as_u64()
+            .filter(|&next| count("uploading") == 0 && next > now)
+            .map(|next| super::format::span(Duration::from_secs(next - now)));
+        let error = backlog["last_error"].as_str();
+        let (summary, mood, action, error) = match (waiting, failed, retry_in) {
+            (0, 0, _) => (
+                format!("All uploaded · {} sent in total", status["uploaded"]),
+                Mood::Calm,
+                None,
+                None,
+            ),
+            (_, 0, None) => (
+                format!("Uploading {files} ({size})"),
+                Mood::Calm,
+                None,
+                None,
+            ),
+            (_, 0, Some(retry_in)) => (
+                format!("Offline · {files} ({size}) waiting · retrying in {retry_in}"),
+                Mood::Waiting,
+                Some("Retry now"),
+                error,
+            ),
+            (waiting, failed, _) => (
+                format!("{} waiting · {} failed", grouped(waiting), grouped(failed)),
+                Mood::Failed,
+                Some("Retry"),
+                error,
+            ),
+        };
+        Self {
+            summary,
+            mood,
+            action,
+            error,
+            waiting,
+        }
+    }
+}
+
 /// Free space and presence of the selected folder, refreshed in the background.
 struct FolderStatus {
     path: PathBuf,
@@ -1091,16 +1306,14 @@ pub struct Picker {
     /// None saves to the output path on this computer.
     pub selected: Option<String>,
     volumes: Vec<Volume>,
-    volumes_task: Option<Receiver<Vec<Volume>>>,
-    volumes_at: Option<Instant>,
     folder: Option<FolderStatus>,
     folder_task: Option<Receiver<FolderStatus>>,
     folder_at: Option<Instant>,
-    uploads: Option<Value>,
-    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
-    uploads_task: Option<Receiver<Option<Value>>>,
-    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
-    uploads_at: Option<Instant>,
+    uploads: Option<Arc<Value>>,
+    /// Shared with the other picker.
+    watch: Arc<Mutex<Watch>>,
+    /// The watch's changes already copied: saved list, drives, uploads.
+    seen: [u64; 3],
     /// Bytes waiting to upload, while any are.
     backlog: History,
     editor: Option<Editor>,
@@ -1152,14 +1365,12 @@ impl Picker {
                 None
             },
             volumes: Vec::new(),
-            volumes_task: None,
-            volumes_at: None,
             folder: None,
             folder_task: None,
             folder_at: None,
             uploads: None,
-            uploads_task: None,
-            uploads_at: None,
+            watch: Arc::default(),
+            seen: [0; 3],
             // Status is read every two seconds or so; take every reading.
             backlog: History::every(Duration::from_secs(1), Duration::from_secs(120)),
             editor: None,
@@ -1179,6 +1390,12 @@ impl Picker {
             saving_context: None,
             replay: None,
         }
+    }
+
+    /// Share `other`'s background reads, so the two never poll twice.
+    pub fn sharing(mut self, other: &Picker) -> Self {
+        self.watch = other.watch.clone();
+        self
     }
 
     /// Reload the saved list now and then, and collect background results;
@@ -1201,34 +1418,25 @@ impl Picker {
         } else if self.editor.as_ref().is_none_or(|e| e.saving.is_none()) {
             self.saving_context = None;
         }
-        if self
-            .loaded
-            .is_none_or(|t| t.elapsed() > Duration::from_secs(3))
-        {
-            self.saved = destination::list().unwrap_or_default();
-            self.loaded = Some(Instant::now());
-            if self
-                .selected
-                .as_ref()
-                .is_some_and(|name| !self.saved.iter().any(|d| &d.name == name))
-            {
-                self.selected = None;
-            }
+        let watch = self.watch.clone();
+        let mut watch = watch.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.loaded.is_none() {
+            // Changed here: read it now, so the change shows at once.
+            self.adopt(destination::list().unwrap_or_default());
+            watch.saved_changed();
         }
-        if let Some(task) = &self.volumes_task
-            && let Ok(found) = task.try_recv()
-        {
-            self.volumes = found;
-            self.volumes_task = None;
+        watch.poll();
+        if let Some((_, saved)) = watch.saved.newer(&mut self.seen[0]) {
+            self.adopt(saved.clone());
         }
-        if self.volumes_task.is_none()
-            && self
-                .volumes_at
-                .is_none_or(|t| t.elapsed() > Duration::from_secs(5))
-        {
-            self.volumes_at = Some(Instant::now());
-            self.volumes_task = Some(background(volumes::list));
+        if let Some(volumes) = watch.volumes.newer(&mut self.seen[1]) {
+            self.volumes = volumes.clone();
         }
+        if let Some((status, _)) = watch.uploads.newer(&mut self.seen[2]) {
+            self.sample_uploads(status);
+            self.uploads = Some(status.clone());
+        }
+        drop(watch);
         if let Some(task) = &self.folder_task
             && let Ok(status) = task.try_recv()
         {
@@ -1257,24 +1465,6 @@ impl Picker {
             Some(_) => {}
             None => self.folder = None,
         }
-        if let Some(task) = &self.uploads_task
-            && let Ok(status) = task.try_recv()
-        {
-            if let Some(status) = &status {
-                self.sample_uploads(status);
-            }
-            self.uploads = status;
-            self.uploads_task = None;
-        }
-        #[cfg(feature = "uploads")]
-        if self.uploads_task.is_none()
-            && self
-                .uploads_at
-                .is_none_or(|t| t.elapsed() > Duration::from_secs(2))
-        {
-            self.uploads_at = Some(Instant::now());
-            self.uploads_task = Some(background(|| crate::upload::status().ok()));
-        }
         if let Some(editor) = &mut self.editor {
             editor.poll_test();
         }
@@ -1283,6 +1473,20 @@ impl Picker {
             editor.poll_key(Instant::now(), |id| {
                 background(move || crate::s3::has_secret(&id))
             });
+        }
+    }
+
+    /// Take a freshly read saved list; a chosen destination that is gone
+    /// goes back to this computer.
+    fn adopt(&mut self, saved: Vec<Destination>) {
+        self.saved = saved;
+        self.loaded = Some(Instant::now());
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|name| !self.saved.iter().any(|d| &d.name == name))
+        {
+            self.selected = None;
         }
     }
 
@@ -1775,10 +1979,10 @@ impl Picker {
             Message::Scrolled(scrolled) => self.scrolled = scrolled,
             Message::Retry => {
                 #[cfg(feature = "uploads")]
-                {
-                    let _ = crate::upload::retry(None, false);
-                    self.uploads_at = None;
-                }
+                self.watch
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .retry();
             }
             Message::Edit(name) => {
                 self.removing = None;
@@ -2405,9 +2609,7 @@ impl Picker {
                             .color(p.ink(p.warn)),
                     );
                 }
-                lines
-                    .push(self.upload_status(Some(&destination.name), p))
-                    .into()
+                lines.push(self.upload_status(&destination.name, p)).into()
             }
             Target::Ftp(_) | Target::Sftp(_) => {
                 let remote = destination.target.remote().expect("network destination");
@@ -2433,9 +2635,7 @@ impl Picker {
                             .color(p.ink(p.warn)),
                     );
                 }
-                lines
-                    .push(self.upload_status(Some(&destination.name), p))
-                    .into()
+                lines.push(self.upload_status(&destination.name, p)).into()
             }
         }
     }
@@ -2457,52 +2657,46 @@ impl Picker {
         }
     }
 
-    /// Waiting and failed uploads, with a retry button.
-    fn upload_status<'a>(
-        &'a self,
-        destination: Option<&str>,
-        p: &'static Palette,
-    ) -> Element<'a, Message> {
+    /// A destination's waiting and failed uploads, with a retry button.
+    fn upload_status<'a>(&'a self, destination: &str, p: &'static Palette) -> Element<'a, Message> {
         let Some(status) = &self.uploads else {
             return column![].into();
         };
-        let items = status["items"].as_array().cloned().unwrap_or_default();
-        let mine = |state: &str| {
-            items
-                .iter()
-                .filter(|i| {
-                    i["state"] == state
-                        && destination.is_none_or(|d| i["destination"].as_str() == Some(d))
-                })
-                .count()
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let line = UploadLine::of(status, destination, now);
+        let ink = match line.mood {
+            Mood::Calm => p.secondary,
+            Mood::Waiting => p.ink(p.warn),
+            Mood::Failed => p.ink(p.danger),
         };
-        let (waiting, failed) = (mine("pending") + mine("uploading"), mine("failed"));
-        let summary = match (waiting, failed) {
-            (0, 0) => format!("All uploaded · {} sent in total", status["uploaded"]),
-            (w, 0) => format!("Uploading {}", plural(w as u64, "file", "files")),
-            (w, f) => format!(
-                "{} waiting · {} failed",
-                grouped(w as u64),
-                grouped(f as u64)
-            ),
-        };
-        let mut head = row![text(summary).size(style::CAPTION).color(if failed > 0 {
-            p.ink(p.danger)
-        } else {
-            p.secondary
-        })]
+        // The summary wraps; the action keeps its line.
+        let mut head = row![
+            text(line.summary)
+                .size(style::CAPTION)
+                .color(ink)
+                .width(Fill)
+        ]
         .spacing(8)
         .align_y(Alignment::Center);
-        if cfg!(feature = "uploads") && failed > 0 {
+        if cfg!(feature = "uploads")
+            && let Some(action) = line.action
+        {
             head = head.push(
-                button(text("Retry").size(style::CAPTION))
-                    .padding([2, 6])
-                    .style(style::link)
-                    .on_press(Message::Retry),
+                button(
+                    text(action)
+                        .size(style::CAPTION)
+                        .wrapping(text::Wrapping::None),
+                )
+                .padding([2, 6])
+                .style(style::link)
+                .on_press(Message::Retry),
             );
         }
         let mut lines = column![head].spacing(4);
-        if waiting > 0
+        if line.waiting > 0
             && let Some(left) = self.backlog.last()
         {
             lines = lines.push(
@@ -2529,20 +2723,15 @@ impl Picker {
                 .align_y(Alignment::Center),
             );
         }
-        if failed > 0
-            && let Some(error) = items
-                .iter()
-                .rev()
-                .find(|i| i["state"] == "failed")
-                .and_then(|i| i["error"].as_str())
-        {
-            lines = lines.push(
-                text(error.to_owned())
-                    .size(style::CAPTION)
-                    .color(p.ink(p.danger)),
-            );
+        if let Some(error) = line.error {
+            let ink = if line.mood == Mood::Failed {
+                ink
+            } else {
+                p.secondary
+            };
+            lines = lines.push(text(error.to_owned()).size(style::CAPTION).color(ink));
         }
-        if !status["uploader_running"].as_bool().unwrap_or(true) && waiting > 0 {
+        if !status["uploader_running"].as_bool().unwrap_or(true) && line.waiting > 0 {
             lines = lines.push(
                 text("No uploader is running; keep this window open to upload.")
                     .size(style::CAPTION)
@@ -3118,14 +3307,16 @@ impl Picker {
     /// saves them in the session folder, so give the screenshot its own),
     /// `folder-editor`, `bucket-editor` (filled in, its secret stored and
     /// checked) and `testing` (after an editor word: its check never ends).
-    /// `capture-custom` shows the capture panel's template field instead.
-    pub(super) fn scene(&mut self, word: &str) -> bool {
+    /// `capture-custom` shows the capture panel's template field instead,
+    /// and `uploads-offline` the capture panel saving to a bucket that has
+    /// been out of reach for a while.
+    pub(super) fn scene(&mut self, word: &str, output: &mut String) -> bool {
         match word {
             "capture-custom" => {
                 self.custom_naming = true;
                 return true;
             }
-            "destinations-list" | "destinations-remove" => {
+            "destinations-list" | "destinations-remove" | "uploads-offline" => {
                 for (name, target) in [
                     (
                         "archive",
@@ -3155,6 +3346,11 @@ impl Picker {
                     });
                 }
                 self.saved = destination::list().unwrap_or_default();
+                if word == "uploads-offline" {
+                    self.select(Some("line-1".into()), output);
+                    self.scene_offline();
+                    return true;
+                }
                 self.notice = Some(("Saved line-1".into(), false));
                 if word == "destinations-remove" {
                     self.removing = Some("archive".into());
@@ -3188,6 +3384,36 @@ impl Picker {
         }
         self.manager_open = true;
         true
+    }
+}
+
+impl Picker {
+    /// Hold an offline backlog for line-1 that has grown for a minute.
+    fn scene_offline(&mut self) {
+        let next = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + 180;
+        let error = "connect to line-1-captures.ACCOUNT_ID.r2.cloudflarestorage.com: network is unreachable";
+        self.uploads = Some(Arc::new(serde_json::json!({
+            "pending": 1234, "uploading": 0, "failed": 0, "waiting_bytes": 2_104_000_000u64,
+            "uploaded": 8812, "failures": 0, "last_error": error, "uploader_running": true,
+            "destinations": {"line-1": {
+                "pending": 1234, "uploading": 0, "failed": 0, "waiting_bytes": 2_104_000_000u64,
+                "next_attempt": next, "last_error": error,
+            }},
+        })));
+        self.watch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pinned = true;
+        let now = Instant::now();
+        for second in (0..=60).rev().step_by(2) {
+            let at = now.checked_sub(Duration::from_secs(second)).unwrap_or(now);
+            let bytes = 2_104_000_000.0 - second as f64 * 1_700_000.0;
+            self.backlog.offer(at, bytes, 0);
+        }
     }
 }
 
@@ -4152,7 +4378,7 @@ mod tests {
         picker.update(Message::Cancel, &mut output);
         assert!(picker.editor.is_none());
         assert!(!picker.scrolled && picker.take_to_top());
-        picker.scene("folder-editor");
+        picker.scene("folder-editor", &mut output);
         assert_eq!(picker.take_focus(), Some(NAME_FIELD));
         assert!(picker.manager_open);
     }
@@ -4436,5 +4662,117 @@ mod tests {
             Some(SERVER_EDIT_HINT)
         );
         assert!(!editor.s3);
+    }
+
+    #[test]
+    fn upload_lines_count_the_whole_destination_and_say_when_it_retries() {
+        let now = 1_000_000;
+        let status = |backlog: Value| serde_json::json!({"uploaded": 7, "destinations": {"line-1": backlog}});
+        let offline = status(serde_json::json!({
+            "pending": 1234, "uploading": 0, "failed": 0, "waiting_bytes": 2_100_000_000u64,
+            "next_attempt": now + 180, "last_error": "network is unreachable"
+        }));
+        let line = UploadLine::of(&offline, "line-1", now);
+        assert_eq!(
+            line.summary,
+            "Offline · 1,234 files (2.1 GB) waiting · retrying in 3 min"
+        );
+        assert_eq!(
+            (line.mood, line.action, line.error),
+            (
+                Mood::Waiting,
+                Some("Retry now"),
+                Some("network is unreachable")
+            )
+        );
+        // One under way is uploading, whenever the others are due.
+        let due = status(serde_json::json!({
+            "pending": 2, "uploading": 1, "failed": 0, "waiting_bytes": 3000,
+            "next_attempt": now + 60, "last_error": null
+        }));
+        let line = UploadLine::of(&due, "line-1", now);
+        assert_eq!(line.summary, "Uploading 3 files (3.0 KB)");
+        assert_eq!(
+            (line.mood, line.action, line.waiting),
+            (Mood::Calm, None, 3)
+        );
+        let failed = status(serde_json::json!({
+            "pending": 1, "uploading": 0, "failed": 2, "waiting_bytes": 10,
+            "next_attempt": now + 60, "last_error": "credentials refused"
+        }));
+        let line = UploadLine::of(&failed, "line-1", now);
+        assert_eq!(line.summary, "1 waiting · 2 failed");
+        assert_eq!(
+            (line.mood, line.action, line.error),
+            (Mood::Failed, Some("Retry"), Some("credentials refused"))
+        );
+        let other = UploadLine::of(&offline, "archive", now);
+        assert_eq!(other.summary, "All uploaded · 7 sent in total");
+        assert_eq!((other.action, other.error), (None, None));
+    }
+
+    #[test]
+    fn both_pickers_take_one_reading_and_a_scene_holds_its_own() {
+        let mut capture = Picker::new(false, false);
+        let mut record = Picker::new(false, true).sharing(&capture);
+        assert!(Arc::ptr_eq(&capture.watch, &record.watch));
+        capture.scene_offline();
+        let mut output = String::new();
+        for _ in 0..2 {
+            capture.tick(&mut output);
+            record.tick(&mut output);
+        }
+        let held = capture.uploads.clone().expect("the scene's status");
+        assert_eq!(
+            UploadLine::of(&held, "line-1", 0).mood,
+            Mood::Waiting,
+            "ticks keep the scene's status"
+        );
+        assert!(capture.backlog.last().is_some());
+        let mut watch = capture.watch.lock().unwrap();
+        watch.uploads.value = Some((Arc::new(serde_json::json!({"pending": 1})), Duration::ZERO));
+        watch.uploads.changes += 1;
+        drop(watch);
+        capture.tick(&mut output);
+        record.tick(&mut output);
+        let (Some(a), Some(b)) = (&capture.uploads, &record.uploads) else {
+            panic!("both pickers have the reading");
+        };
+        assert!(Arc::ptr_eq(a, b));
+    }
+
+    #[cfg(feature = "uploads")]
+    #[test]
+    fn upload_status_is_read_only_while_it_can_show_something() {
+        let mut watch = Watch::default();
+        assert!(watch.uploads_matter(), "until first read");
+        let folder = Destination {
+            name: "archive".into(),
+            target: Target::Folder {
+                path: "/Volumes/Archive".into(),
+            },
+        };
+        let empty = serde_json::json!({"pending": 0, "uploading": 0, "failed": 0});
+        watch.saved.value = Some((None, vec![folder.clone()]));
+        watch.uploads.value = Some((Arc::new(empty), Duration::ZERO));
+        assert!(!watch.uploads_matter());
+        watch.uploads.value = Some((Arc::new(serde_json::json!({"failed": 1})), Duration::ZERO));
+        assert!(watch.uploads_matter(), "failed uploads still show");
+        watch.uploads.value = None;
+        let bucket = Destination {
+            name: "line-1".into(),
+            target: Target::S3(Bucket {
+                endpoint: "https://storage.example".into(),
+                region: "auto".into(),
+                bucket: "line-1".into(),
+                prefix: String::new(),
+                path_style: true,
+                credentials: Credentials::Environment,
+                keep_local: false,
+                no_overwrite: NoOverwrite::IfNoneMatch,
+            }),
+        };
+        watch.saved.value = Some((None, vec![folder, bucket]));
+        assert!(watch.uploads_matter());
     }
 }

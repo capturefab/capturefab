@@ -988,6 +988,7 @@ impl Workbench {
         let client_activity = client_activity::State::from_snapshot(&handle.snapshot());
         let video_analytics =
             video_analytics::State::new(handle.clone(), prefs.video_analytics.clone());
+        let capture_to = Picker::new(true, false);
         let mut bench = Self {
             main_window,
             focused_window: main_window,
@@ -1017,8 +1018,8 @@ impl Workbench {
             tab: prefs.tab,
             edits: HashMap::new(),
             edit_sources: HashMap::new(),
-            capture_to: Picker::new(true, false),
-            record_to: Picker::new(false, true),
+            record_to: Picker::new(false, true).sharing(&capture_to),
+            capture_to,
             count: prefs.count,
             format: pick(&FORMATS, &prefs.format, &defaults.format),
             timeout_ms: prefs.timeout_ms,
