@@ -3126,11 +3126,11 @@ impl Workbench {
             options = options.push(
                 settings
                     .push(
-                        text("Auto chooses an available encoder. Check this computer's encoders with:")
+                        text("Auto chooses an available encoder. List FFmpeg's encoders with:")
                             .size(style::SMALL)
                             .color(p.secondary),
                     )
-                    .push(self.copyable("capturefab doctor".into(), p)),
+                    .push(self.copyable("capturefab ffmpeg --json".into(), p)),
             );
         }
         let modes = segmented(
