@@ -509,7 +509,7 @@ impl Workbench {
             camera.info = info.clone();
             if scanner {
                 camera.streaming = false;
-                camera.features = self.snapshot.features.clone();
+                camera.features = self.snapshot.features.clone().into();
             }
         }
         self.snapshot.connected = Some(info);

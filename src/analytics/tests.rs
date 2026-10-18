@@ -15,7 +15,7 @@ fn camera(id: &str, pid: u32, frames: u64, dropped: u64, bytes: u64) -> CameraSn
             transport: Transport::Simulator,
             profile: Default::default(),
         },
-        features: vec![],
+        features: vec![].into(),
         streaming: true,
         frames,
         dropped,

@@ -358,7 +358,7 @@ impl Workbench {
 pub(super) fn streaming_camera(frames: u64, dropped: u64, fps: f64) -> CameraSnapshot {
     CameraSnapshot {
         info: crate::transport::simulator::info(),
-        features: Vec::new(),
+        features: Vec::new().into(),
         streaming: true,
         frames,
         received_bytes: 0,
@@ -463,7 +463,7 @@ mod tests {
         let mut bench = bench();
         let start = bench.now;
         let camera = |frames: u64, fps: f64| CameraSnapshot {
-            features: features.clone(),
+            features: features.clone().into(),
             ..streaming_camera(frames, 0, fps)
         };
         report(&mut bench, start, ms(0), camera(0, 0.0));
@@ -583,7 +583,7 @@ mod tests {
         assert_eq!(bench.stalled(id), Some(ms(3000)));
 
         let mut triggered = streaming_camera(200, 0, 0.0);
-        triggered.features = vec![feature("TriggerMode", json!("On"))];
+        triggered.features = vec![feature("TriggerMode", json!("On"))].into();
         report(&mut bench, start, ms(20_000), triggered);
         assert_eq!(bench.stalled(id), None, "waits for triggers");
     }
