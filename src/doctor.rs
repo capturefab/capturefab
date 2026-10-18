@@ -19,6 +19,11 @@ const GUIDE: &str = concat!(
     env!("CARGO_PKG_REPOSITORY"),
     "#host-checks-and-efficiency-mode"
 );
+/// Running Capturefab as a Linux service, with these fixes in context.
+const LINE_COMPUTER: &str = concat!(
+    env!("CARGO_PKG_REPOSITORY"),
+    "/blob/main/docs/line-computer.md"
+);
 /// Room for two frames of a 16 MiB GigE camera; the value the GigE transport
 /// already suggests when its receive buffer comes up short.
 const GIGE_RECEIVE_BUFFER: u64 = 32 << 20;
@@ -245,7 +250,11 @@ pub fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
     writeln!(
         out,
         "More: {GUIDE}. doctor --json adds compiled features, scanners, signal protocols, JPEG encoders and network interfaces."
-    )
+    )?;
+    if report["os"] == "linux" {
+        writeln!(out, "Running it as a service: {LINE_COMPUTER}")?;
+    }
+    Ok(())
 }
 
 fn checks(facts: &Facts) -> Vec<Check> {
@@ -426,7 +435,7 @@ fn usb_check(cameras: &[UsbCamera]) -> Option<Check> {
             names.join(", ")
         ),
         format!(
-            "{} && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb; services also need their user in the plugdev group",
+            "{} && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb; services also need their user in the plugdev group ({LINE_COMPUTER})",
             rules.join(" && ")
         ),
     ))
@@ -994,6 +1003,7 @@ mod tests {
         assert_eq!(fix.matches("idVendor").count(), 1, "{fix}");
         assert!(fix.contains(r#"ATTR{idVendor}=="2676""#), "{fix}");
         assert!(fix.contains("udevadm trigger"), "{fix}");
+        assert!(fix.ends_with("plugdev group (https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md)"), "{fix}");
         // Each vendor gets its own file, so fixing a camera plugged in later
         // keeps the rule that already gives this one access.
         let other = UsbCamera {
@@ -1094,6 +1104,13 @@ mod tests {
         );
         // What plain doctor no longer prints, so the docs' pointers still work.
         assert!(lines[4].contains("scanners, signal protocols"), "{text}");
-        assert_eq!(lines.len(), 5);
+        // Linux hosts also get the service guide that walks through these fixes.
+        assert!(lines[5].ends_with("/docs/line-computer.md"), "{text}");
+        assert_eq!(lines.len(), 6);
+        let mut out = Vec::new();
+        let mut mac = report.clone();
+        mac["os"] = json!("macos");
+        print_checklist(&mut out, &mac).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap().lines().count(), 5);
     }
 }

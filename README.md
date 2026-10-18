@@ -45,7 +45,7 @@ Commands work from bash, zsh, fish, PowerShell, tmux, Ghostty, Warp, Claude Code
 
 ## Plant-floor data for analysis
 
-A typical shift: open the desktop app (or `serve` on a headless line computer), connect the cameras, add the line's PLC or sensor sources, fill in the **Capture tags** (Line, Station, Part, Lot, Note), and capture or record. Each saved image and recording gets a row in the dataset, with its time, camera, path, SHA-256, destination and tags. Samples from every source go into the same file. The `captures_with_signals` view joins each capture with the latest value of every tag at that moment. At the end, `dataset export` writes an analysis bundle to a new folder.
+A typical shift: open the desktop app (or `serve` on a headless [line computer](docs/line-computer.md)), connect the cameras, add the line's PLC or sensor sources, fill in the **Capture tags** (Line, Station, Part, Lot, Note), and capture or record. Each saved image and recording gets a row in the dataset, with its time, camera, path, SHA-256, destination and tags. Samples from every source go into the same file. The `captures_with_signals` view joins each capture with the latest value of every tag at that moment. At the end, `dataset export` writes an analysis bundle to a new folder.
 
 ```sh
 capturefab serve --name line1 --dataset plant.duckdb
@@ -148,7 +148,7 @@ Relative capture and recording paths resolve beside the workflow file; stdin wor
 
 ## Remote browser control
 
-Release executables have the WebAssembly browser client built in. Run a headless server with `capturefab serve --name remote --listen 100.101.102.103:8787` and open the server URL from another laptop on the same tailnet to discover cameras, edit settings, preview frames and set up captures or schedules. Anyone who can reach the listener can control captures; tailnet policy and the host firewall provide the access boundary. Capture files and jobs stay on the server; the local CLI can control the same session. Each tab costs the server one JPEG encode per new frame, shared with every other tab, and nothing while the frame is unchanged or the tab is hidden. Source builds build the client with `./web-client/build.sh` and either the `embedded-web` feature or `--web-dir web-client/dist`. See [remote setup and Tailscale HTTPS](docs/remote-control.md).
+Release executables have the WebAssembly browser client built in. Run a headless server with `capturefab serve --name remote --listen 100.101.102.103:8787` and open the server URL from another laptop on the same tailnet to discover cameras, edit settings, preview frames and set up captures or schedules. Anyone who can reach the listener can control captures; tailnet policy and the host firewall provide the access boundary. Capture files and jobs stay on the server; the local CLI can control the same session. Each tab costs the server one JPEG encode per new frame, shared with every other tab, and nothing while the frame is unchanged or the tab is hidden. Source builds build the client with `./web-client/build.sh` and either the `embedded-web` feature or `--web-dir web-client/dist`. See [remote setup and Tailscale HTTPS](docs/remote-control.md), and the [line computer guide](docs/line-computer.md) to run it as a service on a Raspberry Pi, Jetson or industrial PC: the headless archive, camera permissions, a systemd unit, the storage budget and efficiency mode.
 
 ## Session analytics
 

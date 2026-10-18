@@ -233,14 +233,20 @@ class ReleaseTests(unittest.TestCase):
             def notices(target, variant, web=False):
                 licensed.append(web)
                 return 'crate licenses'
-            items = []
+            items, readmes = [], []
             with mock.patch.object(release, 'notices', side_effect=notices), mock.patch.object(release, 'web_dist', return_value=dist):
                 for name, payload in [('embedded', ffmpeg + wasm), ('plain', ffmpeg)]:
                     binary = temp / name
                     binary.write_bytes(self.elf(['GLIBC_2.17']) + payload)
                     items.append(release.package(args, binary, 'headless'))
+                    with tarfile.open(temp / 'out' / items[-1]['name']) as archive:
+                        readmes.append(archive.extractfile('capturefab-1.2.3-linux-aarch64-headless/README.txt').read().decode())
             self.assertEqual([item.get('browser_client') for item in items], [True, None])
             self.assertEqual(licensed, [True, False])
+            self.assertIn('serve --name line1 --listen', readmes[0])
+            self.assertNotIn('--listen', readmes[1])
+            for readme in readmes:
+                self.assertIn('https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md', readme)
 
     def test_set_version_raises_cargo_toml_and_lock_only_forward(self):
         with tempfile.TemporaryDirectory() as temp:

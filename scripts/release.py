@@ -20,6 +20,7 @@ import uuid
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
+LINE_COMPUTER = re.search(r'^repository\s*=\s*"([^"]+)"', (ROOT / 'Cargo.toml').read_text(), re.M)[1] + '/blob/main/docs/line-computer.md'
 SEMVER = re.compile(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?')
 # No 32-bit ARM: Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS.
 TARGETS = [(os_, arch, variant) for os_, arches in [('linux', ['x86_64', 'aarch64']), ('macos', ['x86_64', 'aarch64']), ('windows', ['x86_64', 'aarch64'])] for arch in arches for variant in ['desktop', 'headless']]
@@ -490,7 +491,12 @@ def package(args, binary, variant):
         shutil.copytree(Path(args.ffmpeg_bundle) / 'licenses', stage / 'media-licenses')
         shutil.copy2(Path(args.ffmpeg_bundle) / 'build-manifest.txt', stage / 'media-build-manifest.txt')
         (stage / 'THIRD-PARTY-LICENSES.txt').write_text(notices(args.target, variant, browser), encoding='utf-8')
-        (stage / 'README.txt').write_text(f'Capturefab {args.version}\n{args.os}/{args.arch}; {variant}\nRun capturefab --help for CLI usage. Desktop builds open the GUI with no arguments.\nFFmpeg is embedded; no separately installed media executable or camera SDK is required.\nPlatform signature: {signed}. Verify the download against the release SHA256SUMS.\nLicenses: LICENSE (Capturefab), THIRD-PARTY-LICENSES.txt (Rust crates and bundled fonts), media-licenses/ (FFmpeg payload).\nCorresponding source: the release source and media-sources archives.\n')
+        readme = f'Capturefab {args.version}\n{args.os}/{args.arch}; {variant}\nRun capturefab --help for CLI usage. Desktop builds open the GUI with no arguments. capturefab doctor checks this computer.\nFFmpeg is embedded; no separately installed media executable or camera SDK is required.\nPlatform signature: {signed}. Verify the download against the release SHA256SUMS.\nLicenses: LICENSE (Capturefab), THIRD-PARTY-LICENSES.txt (Rust crates and bundled fonts), media-licenses/ (FFmpeg payload).\nCorresponding source: the release source and media-sources archives.\n'
+        if browser:
+            readme += 'Remote browser: capturefab serve --name line1 --listen TAILNET-IP:8787 serves the browser interface. Anyone who can reach that address can control the cameras; bind it to a Tailscale or loopback address.\n'
+        if args.os == 'linux':
+            readme += f'Run it as a service on a Raspberry Pi, Jetson or industrial PC: {LINE_COMPUTER}\n'
+        (stage / 'README.txt').write_text(readme)
         if args.os == 'macos' and variant == 'desktop':
             app = stage / 'Capturefab.app' / 'Contents'
             (app / 'MacOS').mkdir(parents=True)
