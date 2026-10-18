@@ -223,8 +223,12 @@ fn dragging_the_focus_region_scores_only_focus_and_once_more_on_release() {
     let _ = bench.update(Message::FocusRegion(region(0.5)));
     assert!(!scored(&bench) && bench.focus.latest().is_some());
     // Held still, the region is scored on the first tick a frame's time on.
+    // The window drew that move, and the tick's own update is drawn next,
+    // so frame work is not paused.
     let tick = just + FOCUS_EVERY;
+    bench.draws.drew(bench.now, &[]);
     bench.now = tick;
+    bench.note_undrawn();
     bench.update_frames();
     assert_eq!(bench.measured.1.at, Some(tick));
     assert!(scored(&bench));
