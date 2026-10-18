@@ -25,7 +25,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -136,8 +136,8 @@ struct Queue {
     totals: Totals,
 }
 
-/// The queue's running totals; a journal change that alters them carries
-/// them whole.
+/// The queue's running totals and destination backoffs; a journal change
+/// that alters them carries them whole.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct Totals {
     #[serde(default)]
@@ -149,6 +149,33 @@ struct Totals {
     failures: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
+    /// Destinations whose last upload failed in a way worth retrying, by
+    /// name: none of their uploads starts before the backoff ends, so an
+    /// unreachable server is tried once per wait rather than once per file.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    backoff: BTreeMap<String, Backoff>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Backoff {
+    /// Failures in a row.
+    failures: u32,
+    /// Unix seconds.
+    until: u64,
+}
+
+/// Seconds to wait after `failures` failed attempts in a row.
+fn backoff(failures: u32) -> u64 {
+    (5u64 << failures.min(8)).min(MAX_BACKOFF)
+}
+
+impl Queue {
+    /// When `item` may start, in Unix seconds: after its own retry time and
+    /// its destination's backoff.
+    fn due_at(&self, item: &Item) -> u64 {
+        let backoff = self.totals.backoff.get(&item.destination);
+        item.next_attempt.max(backoff.map_or(0, |b| b.until))
+    }
 }
 
 fn now() -> u64 {
@@ -359,7 +386,7 @@ impl Uploads {
             .items
             .iter()
             .filter(|i| i.state == State::Pending)
-            .map(|i| i.next_attempt)
+            .map(|i| self.queue.due_at(i))
             .min()
     }
 
@@ -957,7 +984,7 @@ fn next_due(uploads: &Uploads) -> Result<(Option<Item>, Change)> {
         .queue
         .items
         .iter()
-        .filter(|i| i.state == State::Pending && i.next_attempt <= now)
+        .filter(|i| i.state == State::Pending && uploads.queue.due_at(i) <= now)
         .min_by_key(|i| (i.next_attempt, i.queued));
     Ok(match due {
         Some(item) => {
@@ -987,6 +1014,7 @@ fn update_after(uploads: &Uploads, item: &Item, result: &Result<()>) -> Change {
         Ok(()) => {
             totals.uploaded += 1;
             totals.uploaded_bytes += item.bytes;
+            totals.backoff.remove(&item.destination);
             if !queue.items.iter().any(|i| i.state == State::Failed) {
                 totals.last_error = None;
             }
@@ -1014,8 +1042,18 @@ fn update_after(uploads: &Uploads, item: &Item, result: &Result<()>) -> Change {
             let mut entry = entry.clone();
             entry.attempts = entry.attempts.saturating_add(1);
             if crate::transfer::retryable(error) {
+                let now = now();
                 entry.state = State::Pending;
-                entry.next_attempt = now() + (5u64 << entry.attempts.min(8)).min(MAX_BACKOFF);
+                entry.next_attempt = now + backoff(entry.attempts);
+                let failures = totals
+                    .backoff
+                    .get(&item.destination)
+                    .map_or(0, |b| b.failures)
+                    .saturating_add(1);
+                let until = now + backoff(failures);
+                totals
+                    .backoff
+                    .insert(item.destination.clone(), Backoff { failures, until });
             } else {
                 entry.state = State::Failed;
                 totals.failures += 1;
@@ -1094,8 +1132,9 @@ pub fn drain(timeout: Duration) -> Result<Value> {
     loop {
         let busy = read(|uploads| {
             let now = now();
-            Ok(uploads.queue.items.iter().any(|i| {
-                i.state == State::Uploading || (i.state == State::Pending && i.next_attempt <= now)
+            let queue = &uploads.queue;
+            Ok(queue.items.iter().any(|i| {
+                i.state == State::Uploading || (i.state == State::Pending && queue.due_at(i) <= now)
             }))
         })?;
         if !busy || std::time::Instant::now() >= deadline {
@@ -1471,6 +1510,39 @@ mod tests {
         thread::sleep(Duration::from_secs(1));
         assert_eq!(attempts(), Some(1));
         assert!(eventually(Duration::from_secs(8), || attempts() == Some(2)));
+    }
+
+    #[test]
+    fn a_failing_destination_waits_as_a_whole() {
+        if !isolated("a_failing_destination_waits_as_a_whole") {
+            return;
+        }
+        let mut queued = items(0..3);
+        queued[2].destination = "other".into();
+        put(queued.clone());
+        let finish = |item: &Item, result: Result<()>| {
+            with_queue(|uploads| Ok(((), update_after(uploads, item, &result)))).unwrap();
+        };
+        let backoff = || read(|uploads| Ok(uploads.queue.totals.backoff.get("archive").cloned()));
+        let first = with_queue(next_due).unwrap().unwrap();
+        assert_eq!(first.id, queued[0].id);
+        finish(&first, Err(anyhow!("connection refused")));
+        let backoff_until = backoff().unwrap().unwrap().until;
+        assert!(backoff_until >= now() + 9);
+        // The archive's other upload waits with it; another destination goes
+        // ahead.
+        let next = with_queue(next_due).unwrap().unwrap();
+        assert_eq!(next.destination, "other");
+        finish(&next, Ok(()));
+        assert!(with_queue(next_due).unwrap().is_none());
+        assert_eq!(
+            read(|uploads| Ok(uploads.next_due_at())).unwrap(),
+            Some(backoff_until)
+        );
+        // A success clears the destination's backoff.
+        finish(&queued[1], Ok(()));
+        assert!(backoff().unwrap().is_none());
+        assert_eq!(pending(), 1);
     }
 
     #[test]
