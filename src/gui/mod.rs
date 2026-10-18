@@ -1869,7 +1869,17 @@ impl Workbench {
 
     fn tick(&mut self) -> Task<Message> {
         if self.shot_staged() {
-            return self.screenshot_tick();
+            let task = self.screenshot_tick();
+            // The shot is saved: take the frames held back meanwhile now,
+            // which frees the frame watcher, rather than a tick later.
+            if self
+                .screenshot
+                .as_ref()
+                .is_some_and(|request| !request.staged)
+            {
+                self.tick_frames();
+            }
+            return task;
         }
         self.poll();
         self.age_notice();

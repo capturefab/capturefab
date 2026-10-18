@@ -31,6 +31,11 @@ pub(super) const UNDRAWN: Duration = Duration::from_millis(250);
 pub(super) struct Cadence {
     /// Nanoseconds between announcements; see `Workbench::frame_gap`.
     gap: AtomicU64,
+    /// Nanoseconds of the frame interval, which efficiency mode keeps
+    /// between announcements.
+    cap: AtomicU64,
+    /// Efficiency mode is on.
+    efficient: AtomicBool,
     /// Nanoseconds of the finest wait between checks.
     fine: AtomicU64,
     /// Nanoseconds between frames of the fastest camera shown; zero while
@@ -46,10 +51,12 @@ pub(super) struct Cadence {
 
 impl Cadence {
     /// Follow the workbench: announce frames of `shown` cameras at most
-    /// every `gap`, expecting one every `interval`.
+    /// every `gap` on average, expecting one every `interval`; in efficiency
+    /// mode never within `cap`, the frame interval. See `next_allowed`.
     pub(super) fn follow(
         &self,
         gap: Duration,
+        cap: Duration,
         interval: Option<Duration>,
         efficient: bool,
         shown: Vec<&str>,
@@ -61,6 +68,8 @@ impl Cadence {
         };
         let nanos = |duration: Duration| duration.as_nanos() as u64;
         self.gap.store(nanos(gap), Ordering::Relaxed);
+        self.cap.store(nanos(cap), Ordering::Relaxed);
+        self.efficient.store(efficient, Ordering::Relaxed);
         self.fine
             .store(nanos((gap / 8).clamp(finest, coarsest)), Ordering::Relaxed);
         self.interval
@@ -79,10 +88,16 @@ impl Cadence {
         }
     }
 
-    /// The gap, finest wait and expected interval, as last followed.
-    fn timing(&self) -> (Duration, Duration, Duration) {
+    /// The timing last followed.
+    fn timing(&self) -> Timing {
         let read = |value: &AtomicU64| Duration::from_nanos(value.load(Ordering::Relaxed));
-        (read(&self.gap), read(&self.fine), read(&self.interval))
+        Timing {
+            gap: read(&self.gap),
+            cap: read(&self.cap),
+            efficient: self.efficient.load(Ordering::Relaxed),
+            fine: read(&self.fine),
+            interval: read(&self.interval),
+        }
     }
 
     /// The shown cameras' frame sequences together; it changes with each
@@ -92,6 +107,16 @@ impl Cadence {
         let ids: Vec<&str> = shown.iter().map(String::as_str).collect();
         handle.frame_sequence_of(&ids)
     }
+}
+
+/// What `Cadence::follow` last set, as the watcher reads it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Timing {
+    gap: Duration,
+    cap: Duration,
+    efficient: bool,
+    fine: Duration,
+    interval: Duration,
 }
 
 /// The session whose shared frame rings the frame watcher polls, and how. A
@@ -106,8 +131,8 @@ impl std::hash::Hash for FrameWatch {
 }
 
 /// Sends `FrameArrived` when a shown camera publishes a frame: at most once
-/// per gap, and not again until the workbench has taken the last one, so
-/// announcements never queue up behind a slow update.
+/// per gap on average, and not again until the workbench has taken the last
+/// one, so announcements never queue up behind a slow update.
 pub(super) fn watch_frames(
     watch: &FrameWatch,
 ) -> impl iced::futures::Stream<Item = Message> + use<> {
@@ -125,9 +150,12 @@ fn announce(cadence: &Cadence, mut output: Sender<Message>, sequence: impl Fn() 
     *cadence.watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current());
     let mut seen = sequence();
     let mut changed = Instant::now();
+    // When the next announcement may go; see `next_allowed`.
+    let mut allowed = changed;
     while !output.is_closed() {
-        let (gap, fine, interval) = cadence.timing();
-        std::thread::sleep(poll_after(changed.elapsed(), interval, gap, fine));
+        let timing = cadence.timing();
+        let look = poll_after(changed.elapsed(), timing.interval, timing.gap, timing.fine);
+        std::thread::sleep(allowed.saturating_duration_since(Instant::now()).max(look));
         let sequence = sequence();
         if sequence == seen {
             continue;
@@ -139,10 +167,27 @@ fn announce(cadence: &Cadence, mut output: Sender<Message>, sequence: impl Fn() 
         }
         seen = sequence;
         changed = Instant::now();
+        allowed = next_allowed(allowed, changed, &timing);
         while cadence.announced.load(Ordering::Acquire) && !output.is_closed() {
             std::thread::park_timeout(PARKED);
         }
-        std::thread::sleep(gap.saturating_sub(changed.elapsed()));
+    }
+}
+
+/// When the announcement after one made `at` may go, the last having been
+/// allowed from `allowed`. While frames come as fast as announcements may
+/// go, the next is a gap after the last one allowed: a watcher that wakes
+/// late to each would otherwise lengthen every gap by that much and fall
+/// behind a camera as fast as the frame interval, skipping its frames.
+/// After a lull it is a gap after `at`. Efficiency mode keeps them a whole
+/// frame interval apart, so its frame rate caps hold in every second.
+fn next_allowed(allowed: Instant, at: Instant, timing: &Timing) -> Instant {
+    if timing.efficient {
+        at + timing.cap
+    } else if at.saturating_duration_since(allowed) < timing.gap / 2 {
+        allowed + timing.gap
+    } else {
+        at + timing.gap
     }
 }
 
@@ -497,6 +542,7 @@ impl Workbench {
     pub(super) fn follow_frames(&self) {
         self.cadence.follow(
             self.frame_gap(),
+            self.frame_interval(),
             self.shown_interval(),
             performance::efficient(),
             self.cameras_shown(),
@@ -515,7 +561,7 @@ mod tests {
 
     fn watch() -> FrameWatch {
         let cadence = Arc::new(Cadence::default());
-        cadence.follow(ms(16), None, false, vec!["sim:0"]);
+        cadence.follow(ms(16), ms(16), None, false, vec!["sim:0"]);
         FrameWatch {
             handle: SessionHandle::new(),
             cadence,
@@ -557,14 +603,68 @@ mod tests {
     #[test]
     fn efficiency_mode_looks_less_often() {
         let cadence = Cadence::default();
-        cadence.follow(ms(16), None, false, Vec::new());
-        assert_eq!(cadence.timing().1, ms(2));
-        cadence.follow(Duration::from_micros(4_167), None, false, Vec::new());
-        assert_eq!(cadence.timing().1, ms(1));
-        cadence.follow(ms(66), Some(ms(33)), true, Vec::new());
-        assert_eq!(cadence.timing(), (ms(66), ms(8), ms(33)));
-        cadence.follow(ms(16), None, true, Vec::new());
-        assert_eq!(cadence.timing().1, ms(4));
+        cadence.follow(ms(16), ms(16), None, false, Vec::new());
+        assert_eq!(cadence.timing().fine, ms(2));
+        let us = Duration::from_micros;
+        cadence.follow(us(4_167), us(5_208), None, false, Vec::new());
+        assert_eq!(cadence.timing().fine, ms(1));
+        cadence.follow(ms(64), ms(66), Some(ms(33)), true, Vec::new());
+        assert_eq!(
+            cadence.timing(),
+            Timing {
+                gap: ms(64),
+                cap: ms(66),
+                efficient: true,
+                fine: ms(8),
+                interval: ms(33)
+            }
+        );
+        cadence.follow(ms(16), ms(16), None, true, Vec::new());
+        assert_eq!(cadence.timing().fine, ms(4));
+    }
+
+    #[test]
+    fn late_wakeups_do_not_lengthen_the_gap_but_a_lull_restarts_it() {
+        // A 30 fps overview on a 60 Hz display: a quarter refresh early.
+        let us = Duration::from_micros;
+        let timing = Timing {
+            gap: us(29_167),
+            cap: us(33_333),
+            efficient: false,
+            fine: ms(2),
+            interval: us(33_333),
+        };
+        let start = Instant::now();
+        // Every look comes 5 ms late, yet each announcement is allowed a gap
+        // after the last one allowed, so they keep up with the camera.
+        let mut allowed = start;
+        for n in 1..=10 {
+            let at = allowed + ms(5);
+            allowed = next_allowed(allowed, at, &timing);
+            assert_eq!(allowed, start + timing.gap * n);
+        }
+        // Up to half a gap late still keeps the cadence.
+        assert_eq!(
+            next_allowed(allowed, allowed + ms(14), &timing),
+            allowed + timing.gap
+        );
+        // After a lull a frame goes at once, and the next a gap later.
+        let at = allowed + ms(500);
+        assert_eq!(next_allowed(allowed, at, &timing), at + timing.gap);
+        assert_eq!(
+            next_allowed(allowed, allowed + ms(15), &timing),
+            allowed + ms(15) + timing.gap
+        );
+        // Efficiency mode keeps a whole frame interval between them, late
+        // or not: 15 frames a second at most, in any second.
+        let efficient = Timing {
+            efficient: true,
+            ..timing
+        };
+        assert_eq!(
+            next_allowed(allowed, allowed + ms(5), &efficient),
+            allowed + ms(5) + timing.cap
+        );
     }
 
     /// The next message on `arrivals` within `wait`.
@@ -587,7 +687,7 @@ mod tests {
     #[test]
     fn the_watcher_announces_nothing_more_until_the_frame_is_taken() {
         let cadence = Arc::new(Cadence::default());
-        cadence.follow(ms(2), None, false, Vec::new());
+        cadence.follow(ms(2), ms(2), None, false, Vec::new());
         let sequence = Arc::new(AtomicU64::new(0));
         let (output, mut arrivals) = iced::futures::channel::mpsc::channel(0);
         let watcher = {
@@ -670,6 +770,45 @@ mod tests {
         bench.now += ms(30);
         bench.tick_frames();
         assert_eq!(bench.frame_id, Some(2));
+        handle.shutdown();
+    }
+
+    #[test]
+    fn frames_held_back_for_a_shot_are_taken_on_the_tick_that_saves_it() {
+        let (handle, mut writer) = SessionHandle::fed(4096);
+        let mut bench = Workbench::new(handle.clone(), "test".into(), true, None);
+        bench.snapshot.active_camera = Some("cam".into());
+        let (saved, save) = std::sync::mpsc::channel();
+        bench.screenshot = Some(ScreenshotRequest {
+            path: "shot.png".into(),
+            cameras: 1,
+            started: Instant::now(),
+            streams_started: None,
+            staged: true,
+            requested: true,
+            save: Some(save),
+            outcome: Default::default(),
+            sequence: scene::ScreenshotSequence::parse(Some("2"), Some("8")).unwrap(),
+        });
+        let frame = crate::types::Frame {
+            id: 1,
+            width: 4,
+            height: 4,
+            pixel_format: crate::types::MONO8,
+            timestamp_ns: 0,
+            data: vec![0; 16],
+        };
+        writer.write(&frame, true).unwrap();
+        // Announced while the scene holds still for the shot: the watcher
+        // waits for the frame to be taken.
+        bench.cadence.announced.store(true, Ordering::Release);
+        let _ = bench.update(Message::FrameArrived);
+        assert_eq!(bench.frame_id, None, "held back");
+        saved.send(Ok(())).unwrap();
+        let _ = bench.update(Message::Tick);
+        assert!(!bench.shot_staged(), "released for the next shot");
+        assert_eq!(bench.frame_id, Some(1), "taken on that tick");
+        assert!(!bench.cadence.announced.load(Ordering::Acquire));
         handle.shutdown();
     }
 
@@ -782,9 +921,9 @@ mod tests {
     #[test]
     fn the_watcher_follows_the_cameras_shown() {
         let cadence = Cadence::default();
-        cadence.follow(ms(16), None, false, vec!["sim:0", "sim:1"]);
+        cadence.follow(ms(16), ms(16), None, false, vec!["sim:0", "sim:1"]);
         assert_eq!(*cadence.shown.lock().unwrap(), ["sim:0", "sim:1"]);
-        cadence.follow(ms(16), None, false, vec!["sim:1"]);
+        cadence.follow(ms(16), ms(16), None, false, vec!["sim:1"]);
         assert_eq!(*cadence.shown.lock().unwrap(), ["sim:1"]);
         let handle = SessionHandle::new();
         assert_eq!(cadence.sequence(&handle), 0, "no feed, no frames");

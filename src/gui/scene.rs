@@ -38,7 +38,7 @@ impl ScreenshotSequence {
         )
     }
 
-    fn parse(frames: Option<&str>, fps: Option<&str>) -> Result<Self> {
+    pub(super) fn parse(frames: Option<&str>, fps: Option<&str>) -> Result<Self> {
         let frames = frames.unwrap_or("1").parse::<u32>().map_err(|_| {
             anyhow::anyhow!("CAPTUREFAB_SCREENSHOT_FRAMES must be an integer from 1 to 240")
         })?;
