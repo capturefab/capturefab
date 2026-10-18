@@ -10,10 +10,12 @@
   let release = null;
   let assets = [];
   let processorChosen = false;
+  // A browser on a 32-bit ARM system, for which there is no build.
+  let thirtyTwoBitArm = false;
   const osNames = { macos: 'macOS', windows: 'Windows', linux: 'Linux' };
-  const archNames = { x86_64: 'x64', aarch64: 'ARM64', armv7: 'ARMv7' };
+  const archNames = { x86_64: 'x64', aarch64: 'ARM64' };
   const osAliases = { darwin: 'macos', mac: 'macos', win: 'windows', win32: 'windows' };
-  const archAliases = { x64: 'x86_64', amd64: 'x86_64', arm64: 'aarch64', arm32: 'armv7', armv7l: 'armv7' };
+  const archAliases = { x64: 'x86_64', amd64: 'x86_64', arm64: 'aarch64' };
   const safeUrl = (value) => {
     if (typeof value !== 'string' || !value || /[\u0000-\u001f]/.test(value)) return null;
     try {
@@ -94,9 +96,10 @@
     const hints = {
       macos: 'Apple silicon (M1 and later) uses ARM64. Intel Macs use x64. Read Apple menu → About This Mac to identify the processor.',
       windows: 'Intel and AMD PCs usually use x64. Windows on ARM uses ARM64. Read Settings → System → About → System type.',
-      linux: 'Run uname -m. x86_64 means x64; aarch64 means ARM64; armv7l means ARMv7. Select the processor architecture of the installed OS.'
+      linux: 'Run dpkg --print-architecture: amd64 means x64 and arm64 means ARM64. armhf is 32-bit ARM, which has no build; Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS. Without dpkg, run uname -m, but it prints aarch64 on 32-bit Raspberry Pi OS too.'
     };
-    text('platform-hint', hints[os.value] || 'Select the computer that runs Capturefab. If the browser cannot identify the processor architecture, select it.');
+    const armhf = 'This browser runs on 32-bit ARM, which has no Capturefab build. Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS, which uses ARM64. dpkg --print-architecture prints arm64 there and armhf on a 32-bit system; uname -m prints aarch64 on both.';
+    text('platform-hint', (thirtyTwoBitArm && os.value === 'linux' && !arch.value ? armhf : hints[os.value]) || 'Select the computer that runs Capturefab. If the browser cannot identify the processor architecture, select it.');
   };
   const hasDownloadPanel = Boolean(os && arch && variant);
   if (hasDownloadPanel) {
@@ -115,11 +118,13 @@
       try {
         const hints = await navigator.userAgentData.getHighEntropyValues(['architecture', 'bitness']);
         if (!processorChosen) {
-          if (hints.architecture === 'arm') arch.value = hints.bitness === '64' ? 'aarch64' : hints.bitness === '32' ? 'armv7' : '';
+          if (hints.architecture === 'arm' && hints.bitness === '64') arch.value = 'aarch64';
           else if (hints.architecture === 'x86' && hints.bitness === '64') arch.value = 'x86_64';
+          thirtyTwoBitArm = hints.architecture === 'arm' && hints.bitness === '32';
         }
       } catch (_) { /* Explicit selectors remain available. */ }
     } else if (/\baarch64\b|\barm64\b/i.test(ua) && os.value === 'linux') arch.value = 'aarch64';
+    else if (/\barmv[67]l?\b|\barmhf\b/i.test(ua) && os.value === 'linux') thirtyTwoBitArm = true;
     updateHint(); renderSelection();
   };
   if (hasDownloadPanel) fetch('releases.json', { cache: 'no-cache' })

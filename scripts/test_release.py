@@ -587,6 +587,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(assets[('linux', 'x86_64', 'headless')]['url'], f'https://example.invalid/v1.2.3/{asset.name}')
             self.assertEqual(assets[('linux', 'x86_64', 'desktop')]['reason'], 'cargo exited with status 101')
             self.assertEqual(assets[('macos', 'aarch64', 'desktop')]['reason'], 'Not built for this release')
+            self.assertNotIn(('linux', 'armv7', 'desktop'), assets)
             self.assertEqual((entry['checksums_url'], entry['source_url']), ('https://example.invalid/v1.2.3/SHA256SUMS', 'https://example.invalid/v1.2.3/capturefab-1.2.3-source.tar.gz'))
             self.assertNotIn('checksums_signature_url', entry)
             sums = {name: digest for digest, name in (line.split('  ') for line in (output / 'SHA256SUMS').read_text().splitlines())}

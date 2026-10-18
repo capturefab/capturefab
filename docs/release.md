@@ -29,9 +29,7 @@ All actions are pinned to full commit SHAs. Checkouts do not persist credentials
 
 Each target builds a desktop (`--features wgpu`) and a headless (`--no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,s3,ftp,sftp,parquet,modbus,mqtt,opcua,mtconnect,dinov2`) variant. When `web-client/dist` exists (`./web-client/build.sh`), both also get `embedded-web`, which builds the browser client into the executable for `serve --listen`; the asset then records `browser_client: true`, and THIRD-PARTY-LICENSES.txt and the SBOM list the client's crates. `scripts/release.py build` embeds the target's FFmpeg, checks that the executable contains exactly that FFmpeg, runs `--version`, `ffmpeg` (SRT input and output must be present) and a two-frame simulator capture, then packages. The `wgpu` feature is kept for these build commands; the GUI always renders through wgpu. Desktop Linux builds need no X11, Wayland, Vulkan or OpenGL development packages: the GUI loads those libraries from the system at run time. A target without a successful build is listed as unavailable, with the packaging error when there is one.
 
-Not built by the workflow, so the manifest lists it as unavailable:
-
-- **Linux ARMv7.** GitHub has no ARMv7 runner. A cross build would be unexecuted; build natively on the device, or cross-compile and package with `--skip-smoke`, which labels the result `cross-compiled`.
+There is no 32-bit ARM target: Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS and the ARM64 build. Releases before 0.2.2 listed Linux ARMv7 as unavailable.
 
 macOS desktop ZIPs store the executable once inside `Capturefab.app`. The small
 `capturefab` shell launcher beside the app forwards CLI arguments to that same

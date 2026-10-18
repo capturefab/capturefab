@@ -312,6 +312,18 @@ def check_manifest(root, errors):
     return versions
 
 
+def check_processors(root, errors):
+    """The download selector offers only processors scripts/release.py builds."""
+    spec = importlib.util.spec_from_file_location("release", Path(__file__).with_name("release.py"))
+    release = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(release)
+    built = {arch for _, arch, _ in release.TARGETS}
+    select = re.search(r'<select id="arch-select"[^>]*>(.*?)</select>', (root / "index.html").read_text(encoding="utf-8"), re.S)
+    offered = set(re.findall(r'<option value="([^"]+)"', select[1])) if select else set()
+    if not offered or offered - built:
+        errors.append(f"index.html: the processor selector offers builds release.py does not make: {sorted(offered - built) or 'none offered'}")
+
+
 def check_feed(root, versions, errors):
     feed = ET.parse(root / "feed.xml").getroot()
     if feed.tag != f"{ATOM}feed":
@@ -406,6 +418,7 @@ def validate(root=ROOT):
         if path.name == "style.css" and ("prefers-color-scheme" not in css or "focus-visible" not in css):
             errors.append("style.css: missing color-scheme/focus styles")
     versions = check_manifest(root, errors)
+    check_processors(root, errors)
     check_feed(root, versions, errors)
     check_generated(root, errors)
     check_search_index(root, errors)

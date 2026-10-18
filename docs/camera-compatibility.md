@@ -139,8 +139,11 @@ libcamera's pipeline API, the NVIDIA Argus API, or CSI sensor/PHY drivers.
 
 Check native discovery, then capture from a node it reports. If the platform only
 exports a network stream, use its RTSP or other supported URL. Choose the Linux
-release matching the **installed operating system architecture**: `aarch64` for
-64-bit ARM or `armv7` for a supported 32-bit ARM system.
+release matching the **installed operating system architecture**: run
+`dpkg --print-architecture`, and `arm64` takes the ARM64 (`aarch64`) release.
+There is no 32-bit ARM release; an `armhf` system, such as 32-bit Raspberry Pi
+OS, needs the 64-bit OS instead, which Raspberry Pi 3 and later run. `uname -m`
+cannot tell them apart there: it prints `aarch64` on 32-bit Raspberry Pi OS too.
 
 ## Panasonic LUMIX GX85 through HDMI
 
