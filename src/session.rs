@@ -669,10 +669,11 @@ impl SessionLog {
             || chrono::Utc::now().timestamp_millis(),
             LogTimestamp::unix_ms,
         );
+        // One event reported by two producers is kept once.
         if self
             .lines
             .range((time, 0, 0)..=(time, u64::MAX, u64::MAX))
-            .any(|(_, line)| line.same_event(&entry))
+            .any(|((_, from, _), line)| *from != source && line.same_event(&entry))
         {
             return;
         }
@@ -1685,6 +1686,10 @@ impl SessionHandle {
     /// they last drew to skip unchanged work. Asking counts as watching.
     pub fn revision(&self) -> u64 {
         self.watch();
+        // Signal values change all the time.
+        if self.inner.signals.has_sources() {
+            self.inner.revision.fetch_add(1, Ordering::Relaxed);
+        }
         self.inner
             .revision
             .load(Ordering::Relaxed)
@@ -2627,12 +2632,11 @@ impl SessionHandle {
             snapshot.logs = log.lines();
         }
         drop(log);
-        // Signal values change all the time; busy workers change nothing
-        // themselves but show as stale.
-        let stale_changed = snapshot.cameras.len() != state.cameras.len()
+        // Busy workers change nothing themselves but show as stale.
+        if snapshot.cameras.len() != state.cameras.len()
             || (snapshot.cameras.iter().zip(&state.cameras))
-                .any(|(now, then)| now.info.id != then.info.id || now.stale != then.stale);
-        if !snapshot.signals.is_empty() || stale_changed {
+                .any(|(now, then)| now.info.id != then.info.id || now.stale != then.stale)
+        {
             self.inner.revision.fetch_add(1, Ordering::Relaxed);
         }
         *state = snapshot;
@@ -3025,7 +3029,8 @@ mod tests {
         let mut log = SessionLog::default();
         log.note(later.clone());
         log.note(tagged.clone());
-        log.note(tagged.clone());
+        // The same event reported by a worker as well is kept once.
+        log.add(WORKERS, 0, tagged.clone());
         let lines = log.lines();
         assert_eq!(
             lines.len(),
@@ -3034,6 +3039,12 @@ mod tests {
         );
         assert_eq!(lines[0].timestamp, tagged.timestamp);
         assert_eq!(lines[1].timestamp, later.timestamp);
+        log.note(tagged.clone());
+        assert_eq!(
+            log.lines().len(),
+            3,
+            "a source repeating itself logged twice"
+        );
     }
     #[test]
     fn addressed_status_preserves_camera_fields_and_includes_actual_session_selection() {

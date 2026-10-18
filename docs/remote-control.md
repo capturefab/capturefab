@@ -114,6 +114,8 @@ Local agents can observe the same immediate changes without enabling HTTP: `capt
 
 ## Analytics and monitoring
 
+Session snapshots hold the newest 200 `logs` lines from every camera (tagged
+`[camera-id]`), the session and signal sources, oldest first.
 Raw `logs` in session snapshots retain `time`, `level` and `message` and may add
 `timestamp:{unix_ms,utc_offset_seconds}`. Signed Unix milliseconds identify the
 absolute event, while the offset describes the producer clock's seconds east of
