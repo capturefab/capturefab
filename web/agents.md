@@ -273,7 +273,7 @@ capturefab storage --json
 capturefab storage configure --max-space 2GiB --max-files 1000 --on-full stop
 ```
 
-Schedules belong to the running session and do not survive its exit. The shared private session directory has a persisted storage ceiling, initially 10 GiB and 10,000 Capturefab files. Per-capture limits can lower that ceiling. Recording reservations count against the same budget and a local recording has a separate maximum file size, initially 512 MiB. A storage-full failure uses exit code 6; inspect the status before requesting more space.
+Schedules belong to the running session and do not survive its exit. The shared private session directory has a persisted storage ceiling, initially 10 GiB and 10,000 Capturefab files. Per-capture limits can lower that ceiling. Recording reservations count against the same budget and a local recording has a separate maximum file size, initially 512 MiB. Every save must also leave 512 MiB free on its disk (`free_space_floor` in `schema`), counting what active recordings may still write; `storage --json` reports `free_bytes` for the default capture folder's disk. A storage-full failure uses exit code 6; inspect the status before requesting more space.
 
 Explicit `--delete-oldest` retention only removes completed Capturefab files whose identity and SHA-256 still match. Existing user files, altered captures, active recordings, and unverified interrupted files are protected. Do not raise the global ceiling or enable deletion without the user's authorization. Use the same `CAPTUREFAB_SESSION_DIR` for processes that should share this budget.
 

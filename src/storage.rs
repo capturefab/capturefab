@@ -48,6 +48,12 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 /// backlog, such as a new age limit or a machine that was off, cannot hold
 /// the lock for long. A full budget removes as many as it needs.
 const EXPIRED_BATCH: usize = 32;
+/// Free space a save must leave on the disk it writes to, as datasets do.
+/// A fixed amount rather than a share of the disk: the free space reported
+/// to unprivileged processes already excludes what ext4 reserves for the
+/// system (5%), and a percentage would refuse saves on a large, mostly full
+/// disk that still has gigabytes free.
+pub const FREE_SPACE_FLOOR: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -381,7 +387,7 @@ impl Manager {
                 });
             }
         }
-        locked.make_room(&policy, reserve)?;
+        locked.make_room(&policy, reserve, &base)?;
         let id = nonce()?;
         let lease_name = format!("storage-{id}.lease");
         let lease_path = locked.directory.join(&lease_name);
@@ -530,6 +536,50 @@ fn hash_file(path: &Path) -> Result<String> {
         hash.update(&bytes[..read]);
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+/// Free space for unprivileged writes on the disk holding `path`, or None
+/// when the file system does not report its size, as some network ones do not.
+fn available(path: &Path) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(free) = tests::AVAILABLE.get() {
+        return Some(free(path));
+    }
+    let stats = fs2::statvfs(path).ok()?;
+    (stats.total_space() > 0).then(|| stats.available_space())
+}
+/// Where captures are saved by default: `Capturefab` in the user's home folder.
+pub fn capture_root() -> PathBuf {
+    let home = if cfg!(windows) {
+        std::env::var_os("USERPROFILE")
+    } else {
+        std::env::var_os("HOME")
+    };
+    home.filter(|home| !home.is_empty()).map_or_else(
+        || PathBuf::from("Capturefab"),
+        |home| PathBuf::from(home).join("Capturefab"),
+    )
+}
+/// Free space for saves on the disk holding `path`, or its nearest existing
+/// parent, when the file system reports it.
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    let path = std::path::absolute(path).ok()?;
+    path.ancestors()
+        .find(|dir| dir.exists())
+        .and_then(available)
+}
+/// Whether `entry` lives on the disk `disk` describes. Without device numbers
+/// every entry counts, which can only refuse a save sooner.
+fn on_disk(entry: &Entry, disk: Option<&Metadata>) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        disk.is_none_or(|disk| disk.dev() == entry.identity.device)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (entry, disk);
+        true
+    }
 }
 /// The persisted policy. It is only ever replaced whole, by rename, so it can
 /// be read without the storage lock.
@@ -1056,6 +1106,7 @@ impl Locked {
             "files": self.ledger.entries.len(),
             "active_reservations": self.ledger.entries.iter().filter(|entry| entry.lease.is_some()).count(),
             "externally_changed_files": self.ledger.entries.iter().filter(|entry| entry.changed).count(),
+            "free_bytes": free_bytes(&capture_root()),
         }))
     }
     fn expired(&self, entry: &Entry, policy: &StoragePolicy) -> bool {
@@ -1112,8 +1163,12 @@ impl Locked {
         self.remove(index);
         Ok(true)
     }
-    fn make_room(&mut self, policy: &StoragePolicy, reserve: u64) -> Result<()> {
+    fn make_room(&mut self, policy: &StoragePolicy, reserve: u64, base: &Path) -> Result<()> {
+        // Expired files beyond one batch, and space on the disk beyond one
+        // round of removals, wait for later saves: freeing disk space can
+        // fail to show, for example while a snapshot holds the blocks.
         let mut expiry_due = true;
+        let mut disk_due = true;
         loop {
             let allocated = self.allocated()?;
             let expired = expiry_due
@@ -1126,7 +1181,8 @@ impl Locked {
                 .checked_add(reserve)
                 .is_none_or(|sum| sum > policy.max_bytes)
                 || self.ledger.entries.len() >= policy.max_files as usize;
-            if !full && !expired {
+            let (short, free) = self.shortfall(base, reserve);
+            if !full && !expired && short == 0 {
                 return Ok(());
             }
             if !self.checked {
@@ -1135,7 +1191,7 @@ impl Locked {
                 self.reconcile(true)?;
                 continue;
             }
-            if policy.on_full == "stop" {
+            if policy.on_full == "stop" && (full || expired) {
                 bail!(
                     "Storage full: {allocated} allocated bytes and {} retained files (limits: {} bytes, {} files{}); enable explicit --delete-oldest retention, remove old captures yourself, or use storage configure --max-space/--max-files to increase the budget",
                     self.ledger.entries.len(),
@@ -1144,7 +1200,15 @@ impl Locked {
                     if expired { "; maximum age reached" } else { "" }
                 );
             }
-            let Some(victims) = self.victims(policy, reserve)? else {
+            let low = || {
+                anyhow!(
+                    "Storage full: {} needs at least 512 MiB free on its disk after this {reserve}-byte save, and {free} bytes are free; free some space, lower --max-file-size, or choose another output folder",
+                    base.display()
+                )
+            };
+            ensure!(short == 0 || (policy.on_full != "stop" && disk_due), low());
+            let Some(victims) = self.victims(policy, reserve, base, short)? else {
+                ensure!(full, low());
                 if !self.ledger.entries.iter().any(Self::removable) {
                     bail!(
                         "Storage full: no unchanged, completed Capturefab files can be removed safely; active recordings and externally changed files are protected. Stop recordings, remove files yourself, or increase the storage limits"
@@ -1156,13 +1220,41 @@ impl Locked {
             };
             self.delete_all(&victims)?;
             expiry_due = false;
+            disk_due &= short == 0;
         }
     }
-    /// The files to remove so that `reserve` more bytes and one more file fit:
-    /// the oldest removable ones, and up to EXPIRED_BATCH expired ones. None
-    /// when even removing all of them would not be enough, so that nothing is
-    /// deleted for a save that fails anyway.
-    fn victims(&self, policy: &StoragePolicy, reserve: u64) -> Result<Option<Vec<String>>> {
+    /// Bytes to free on `base`'s disk so that `reserve` more, and the rest of
+    /// every live reservation there, still leave FREE_SPACE_FLOOR; and the
+    /// free space. Nothing when the file system does not report its size.
+    fn shortfall(&self, base: &Path, reserve: u64) -> (u64, u64) {
+        let Some(free) = available(base) else {
+            return (0, 0);
+        };
+        let disk = fs::metadata(base).ok();
+        let promised: u64 = self
+            .ledger
+            .entries
+            .iter()
+            .filter(|entry| entry.lease.is_some() && on_disk(entry, disk.as_ref()))
+            .map(|entry| entry.reserved.saturating_sub(entry.bytes))
+            .sum();
+        let needed = FREE_SPACE_FLOOR
+            .saturating_add(reserve)
+            .saturating_add(promised);
+        (needed.saturating_sub(free), free)
+    }
+    /// The files to remove so that `reserve` more bytes and one more file fit
+    /// and `short` bytes are freed on `base`'s disk: the oldest removable ones,
+    /// and up to EXPIRED_BATCH expired ones. None when even removing all of
+    /// them would not be enough, so that nothing is deleted for a save that
+    /// fails anyway.
+    fn victims(
+        &self,
+        policy: &StoragePolicy,
+        reserve: u64,
+        base: &Path,
+        mut short: u64,
+    ) -> Result<Option<Vec<String>>> {
         let mut candidates: Vec<&Entry> = self
             .ledger
             .entries
@@ -1176,19 +1268,25 @@ impl Locked {
                 .is_none_or(|sum| sum > policy.max_bytes)
                 || files >= policy.max_files as usize
         };
+        let disk = fs::metadata(base).ok();
         let (mut allocated, mut files) = (self.allocated()?, self.ledger.entries.len());
         let mut victims = Vec::new();
         for entry in candidates {
+            let here = on_disk(entry, disk.as_ref());
             if !full(allocated, files)
+                && !(short > 0 && here)
                 && !(victims.len() < EXPIRED_BATCH && self.expired(entry, policy))
             {
-                break;
+                continue;
             }
             victims.push(entry.id.clone());
             allocated = allocated.saturating_sub(entry.bytes.max(entry.reserved));
             files -= 1;
+            if here {
+                short = short.saturating_sub(entry.bytes);
+            }
         }
-        Ok((!full(allocated, files)).then_some(victims))
+        Ok((!full(allocated, files) && short == 0).then_some(victims))
     }
     /// Remove verified files, then commit once for all of them.
     fn delete_all(&mut self, ids: &[String]) -> Result<()> {
@@ -1576,6 +1674,12 @@ pub fn parse_bytes(value: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Free space a test reports for a save's directory.
+    type Space = fn(&Path) -> u64;
+    thread_local! {
+        pub(super) static AVAILABLE: std::cell::Cell<Option<Space>> =
+            const { std::cell::Cell::new(None) };
+    }
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
@@ -2434,8 +2538,9 @@ mod tests {
         let manager = temp.manager();
         populate(&manager, &temp, 2_000);
         let mut locked = manager.lock().unwrap();
+        let base = fs::canonicalize(&temp.0).unwrap();
         locked
-            .make_room(&policy(1 << 30, 2_000, "delete-oldest"), 1)
+            .make_room(&policy(1 << 30, 2_000, "delete-oldest"), 1, &base)
             .unwrap();
         assert_eq!(locked.ledger.entries.len(), 1_999);
         assert_eq!(locked.commits, 1);
@@ -2447,7 +2552,7 @@ mod tests {
         let mut policy = policy(1 << 30, 100_000, "delete-oldest");
         policy.max_age_seconds = Some(10);
         locked.commits = 0;
-        locked.make_room(&policy, 1).unwrap();
+        locked.make_room(&policy, 1, &base).unwrap();
         assert_eq!(locked.ledger.entries.len(), 1_999 - EXPIRED_BATCH);
         assert_eq!(locked.commits, 1);
         assert!(!temp.path("filler-0").exists());
@@ -2477,5 +2582,56 @@ mod tests {
             finished - released
         );
         assert_eq!(manager.lock().unwrap().ledger.entries[0].sha256, Some(hash));
+    }
+    /// A disk with room for the floor and 100 bytes more, holding the files
+    /// saved in `base`.
+    fn small_disk(base: &Path) -> u64 {
+        let used: u64 = fs::read_dir(base)
+            .unwrap()
+            .flatten()
+            .filter_map(|file| file.metadata().ok())
+            .filter(Metadata::is_file)
+            .map(|meta| meta.len())
+            .sum();
+        (FREE_SPACE_FLOOR + 100).saturating_sub(used)
+    }
+    #[test]
+    fn saves_leave_the_free_space_floor_on_their_disk() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        AVAILABLE.set(Some(small_disk));
+        let stop = policy(1 << 30, 100, "stop");
+        completed(&manager, &temp.path("first"), &stop, &[1; 60]);
+        let error = manager
+            .writer(&temp.path("second"), &stop, 60)
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("needs at least 512 MiB free on its disk"),
+            "{error:#}"
+        );
+        assert_eq!(crate::cli::error_code(&error), ("storage_full", 6));
+        assert!(!temp.path("second").exists());
+        // Delete-oldest frees the oldest files on that disk instead.
+        let oldest = policy(1 << 30, 100, "delete-oldest");
+        completed(&manager, &temp.path("second"), &oldest, &[2; 60]);
+        assert!(!temp.path("first").exists());
+        // What live reservations may still write is already spoken for.
+        let live = manager.writer(&temp.path("live"), &stop, 30).unwrap();
+        assert!(manager.writer(&temp.path("third"), &stop, 20).is_err());
+        drop(live);
+        // Nothing is removed when owned files cannot free enough, and files
+        // Capturefab does not own never are.
+        fs::write(temp.path("user"), [3; 100]).unwrap();
+        let error = manager
+            .writer(&temp.path("fourth"), &oldest, 10)
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("needs at least 512 MiB free"),
+            "{error:#}"
+        );
+        assert!(temp.path("second").exists() && temp.path("user").exists());
+        AVAILABLE.set(None);
     }
 }

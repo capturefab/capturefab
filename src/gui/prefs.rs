@@ -584,15 +584,7 @@ impl Default for Prefs {
 }
 /// Where the GUI saves by default: `Capturefab` in the user's home folder.
 pub fn capture_root() -> PathBuf {
-    let home = if cfg!(windows) {
-        std::env::var_os("USERPROFILE")
-    } else {
-        std::env::var_os("HOME")
-    };
-    home.filter(|home| !home.is_empty()).map_or_else(
-        || PathBuf::from("Capturefab"),
-        |home| PathBuf::from(home).join("Capturefab"),
-    )
+    crate::storage::capture_root()
 }
 /// A dated folder of uniquely named stills under `capture_root`.
 pub fn default_capture_output() -> String {

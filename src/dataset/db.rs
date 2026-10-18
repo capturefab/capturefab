@@ -4,6 +4,7 @@ use super::{DatasetStatus, SCHEMA_VERSION, SavedCamera, SavedFile, SavedItem};
 use crate::{
     context::Context,
     signals::{Sample, SignalInfo, TagInfo, Value as SignalValue},
+    storage::FREE_SPACE_FLOOR,
 };
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use duckdb::{AccessMode, Config, Connection, OptionalExt, params};
@@ -18,8 +19,6 @@ use std::{
 
 /// Default cap on the dataset file plus its write-ahead log.
 pub const DEFAULT_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-/// Inserts stop while the disk holding the dataset has less free space.
-pub const FREE_SPACE_FLOOR: u64 = 512 * 1024 * 1024;
 /// Rows accepted by one `append_samples` call.
 pub const MAX_SAMPLES_PER_CALL: usize = 10_000;
 
