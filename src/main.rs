@@ -1,4 +1,6 @@
 use capturefab::cli::{self, Cli};
+// Diagnostics that a hung-up terminal cannot turn into a panic.
+use capturefab::eprintln;
 use clap::Parser;
 use serde_json::json;
 

@@ -505,6 +505,7 @@ impl Manager {
             hash: Sha256::new(),
             reread: true,
             failed: false,
+            cut: false,
             finalized: false,
         })
     }
@@ -1473,6 +1474,9 @@ pub struct StorageWriter {
     /// Read the file back to confirm the streamed hash when finishing.
     reread: bool,
     failed: bool,
+    /// Writing stopped early, at the reservation or on a write error, with
+    /// every byte before it intact; see `finish_cut`.
+    cut: bool,
     finalized: bool,
 }
 impl Write for StorageWriter {
@@ -1488,8 +1492,9 @@ impl Write for StorageWriter {
             .is_none_or(|size| size > self.reserve)
         {
             self.failed = true;
+            self.cut = true;
             return Err(io::Error::other(format!(
-                "Storage full: {} reached its {} byte recording reservation; increase the reservation or record shorter segments",
+                "Storage full: {} reached its maximum file size of {} bytes; raise the maximum file size (--max-file-size) or record shorter segments",
                 self.path.display(),
                 self.reserve
             )));
@@ -1506,7 +1511,9 @@ impl Write for StorageWriter {
                 Ok(count)
             }
             Err(error) => {
+                // A failed write wrote nothing, so the bytes before it stand.
                 self.failed = true;
+                self.cut = true;
                 Err(io::Error::new(
                     error.kind(),
                     format!(
@@ -1566,6 +1573,20 @@ impl StorageWriter {
             )),
             result => result,
         }
+    }
+    /// Finish a recording whose writing was cut short, at its reservation
+    /// or by a write error. Its container plays up to its last complete
+    /// part, so the bytes written are kept and recorded like a finished
+    /// file's, where `finish` removes them. Otherwise the same as `finish`.
+    pub fn finish_cut(mut self) -> Result<()> {
+        if self.cut {
+            self.failed = false;
+        }
+        self.finish()
+    }
+    /// Whether writing stopped early, at the reservation or on a write error.
+    pub fn cut(&self) -> bool {
+        self.cut
     }
     pub fn path(&self) -> &Path {
         &self.path
@@ -2243,6 +2264,24 @@ mod tests {
         assert!(!path.exists());
         completed(&manager, &temp.path("complete"), &policy, b"1234");
         assert_eq!(manager.lock().unwrap().allocated().unwrap(), 4);
+    }
+    #[test]
+    fn a_recording_cut_at_its_reservation_keeps_what_it_wrote() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        let path = temp.path("cut.mkv");
+        let mut writer = manager.writer(&path, &policy(16, 2, "stop"), 4).unwrap();
+        writer.write_all(b"abc").unwrap();
+        assert!(!writer.cut());
+        let error = writer.write_all(b"de").unwrap_err().to_string();
+        assert!(error.contains("Storage full") && error.contains("maximum file size"));
+        assert!(writer.cut());
+        writer.finish_cut().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"abc");
+        let locked = manager.lock().unwrap();
+        let entry = &locked.ledger.entries[locked.find(&path).unwrap()];
+        assert_eq!((entry.bytes, entry.reserved), (3, 0));
+        assert!(entry.sha256.is_some() && !entry.changed && entry.lease.is_none());
     }
     #[test]
     fn io_failure_removes_partial_without_overwriting() {

@@ -183,7 +183,7 @@ pub fn keys(credentials: &Credentials) -> Result<Keys> {
                     token: get("AWS_SESSION_TOKEN"),
                 }),
                 _ => Err(Permanent(
-                    "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are not set in the uploading process"
+                    "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are not set in this process; the process that uploads, such as a serve service, needs them"
                         .into(),
                 )
                 .into()),

@@ -565,8 +565,10 @@ impl Service {
         }
     }
 
+    /// Health and metrics monitor the session without anyone viewing it, so
+    /// a probe every few seconds leaves idle workers on the slow poll.
     fn health(&self) -> Response {
-        let snapshot = self.handle.snapshot();
+        let snapshot = self.handle.snapshot_unwatched();
         let analytics = self.handle.analytics().health();
         let ready =
             !self.quitting.load(Ordering::Acquire) && self.handle.is_running() && analytics.ready;
@@ -587,7 +589,11 @@ impl Service {
     }
 
     fn metrics(&self) -> Response {
-        match self.handle.analytics().metrics(&self.handle.snapshot()) {
+        match self
+            .handle
+            .analytics()
+            .metrics(&self.handle.snapshot_unwatched())
+        {
             Ok(metrics) => Response::new(
                 200,
                 "text/plain; version=0.0.4; charset=utf-8",
@@ -1725,6 +1731,10 @@ mod tests {
         let ready: Value = serde_json::from_slice(&ready.body).unwrap();
         assert_eq!(ready["ready"], true);
         assert_eq!(ready["cameras"]["connected"], 0);
+        // Monitoring probes are nobody viewing: idle workers stay on the
+        // slow poll.
+        service.metrics();
+        assert!(!handle.watching());
 
         service.quitting.store(true, Ordering::Release);
         let stopping = service.health();

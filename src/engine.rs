@@ -1731,7 +1731,14 @@ fn tick_jobs(
             );
         }
     }
-    if *started && !forwarding && !jobs.iter().any(|j| j.info.active() && j.deadline.is_some()) {
+    // A shot with the saver holds the stream too: a job due again once it is
+    // saved would otherwise restart the camera, and warm it up, every shot.
+    if *started
+        && !forwarding
+        && !jobs
+            .iter()
+            .any(|j| j.info.active() && (j.deadline.is_some() || j.saving))
+    {
         if let Some(c) = camera.as_mut() {
             let _ = c.stop();
         }
@@ -1846,6 +1853,16 @@ fn saved(h: &WorkerHandle, jobs: &mut [Scheduled], saver: &saver::Saver) -> bool
                 }
                 return changed;
             }
+        }
+    }
+}
+/// Wait for the shots with the saver and apply them, as before a disconnect:
+/// their files then ride its reply to the coordinator, which catalogs them.
+fn settle_saves(h: &WorkerHandle, saver: &mut saver::Saver, jobs: &mut [Scheduled]) {
+    let finished = std::mem::replace(saver, saver::Saver::new(h.clone())).join();
+    for done in finished.try_iter() {
+        if let Some(job) = jobs.iter_mut().find(|job| job.info.id == done.job) {
+            finish(h, job, done.result);
         }
     }
 }
@@ -1985,6 +2002,9 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
             rx.recv_timeout(idle_wait(&h, &jobs)).ok()
         };
         if let Some(e) = envelope.flatten() {
+            if matches!(e.command, SessionCommand::Disconnect) {
+                settle_saves(&h, &mut saver, &mut jobs);
+            }
             let result = process(
                 &h,
                 &mut camera,
@@ -2647,6 +2667,121 @@ mod tests {
             assert_eq!(job.info.next_at_ms, 60_000);
         }
         drop(saver);
+        h.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn a_disconnect_waits_for_the_shot_the_saver_is_writing() {
+        fn slow(_: &WorkerHandle, _: &saver::Shot, save: &saver::Save) -> Result<String> {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(save.path.to_string_lossy().into_owned())
+        }
+        let h = WorkerHandle::new();
+        let mut saver = saver::Saver::with(h.clone(), slow);
+        let dir = temp_dir("disconnect-saves");
+        let mut jobs = vec![armed(1, &dir)];
+        let shot = shoot(&h, &small_frame(1), &mut jobs, true, saver.has_room()).unwrap();
+        saver.offer(shot);
+        assert!(jobs[0].saving);
+        settle_saves(&h, &mut saver, &mut jobs);
+        assert!(!jobs[0].saving);
+        assert_eq!(jobs[0].info.captured, 1);
+        assert!(
+            jobs[0]
+                .info
+                .last_file
+                .as_ref()
+                .unwrap()
+                .ends_with("-000001.raw")
+        );
+        // The saver takes shots again afterwards.
+        assert!(saver.has_room());
+        drop(saver);
+        h.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// A simulator that counts how often its stream starts and stops.
+    struct Counted {
+        simulator: crate::transport::simulator::Simulator,
+        starts: Arc<AtomicU64>,
+        stops: Arc<AtomicU64>,
+    }
+    impl crate::types::RegisterIo for Counted {
+        fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
+            self.simulator.read_memory(address, length)
+        }
+        fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
+            self.simulator.write_memory(address, data)
+        }
+    }
+    impl crate::types::Backend for Counted {
+        fn xml(&mut self) -> Result<String> {
+            self.simulator.xml()
+        }
+        fn start(&mut self, payload: usize) -> Result<()> {
+            self.starts.fetch_add(1, Ordering::Relaxed);
+            self.simulator.start(payload)
+        }
+        fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
+            self.simulator.next_frame(timeout)
+        }
+        fn stop(&mut self) -> Result<()> {
+            self.stops.fetch_add(1, Ordering::Relaxed);
+            self.simulator.stop()
+        }
+    }
+    #[test]
+    fn a_shot_being_saved_keeps_the_scheduled_stream_running() {
+        let h = WorkerHandle::new();
+        let (starts, stops) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let mut camera = Some(
+            Camera::from_backend(
+                crate::transport::simulator::info(),
+                Box::new(Counted {
+                    simulator: Default::default(),
+                    starts: starts.clone(),
+                    stops: stops.clone(),
+                }),
+            )
+            .unwrap(),
+        );
+        let count = || {
+            (
+                starts.load(Ordering::Relaxed),
+                stops.load(Ordering::Relaxed),
+            )
+        };
+        let dir = temp_dir("saving-stream");
+        // Due every 10 ms, which is sooner than a save.
+        let mut job = armed(1, &dir);
+        job.deadline = None;
+        job.info.interval_ms = 10;
+        let mut jobs = vec![job];
+        let mut started = false;
+        tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, true);
+        assert!(started && jobs[0].deadline.is_some() && jobs[0].warm.is_some());
+        let frame = camera
+            .as_mut()
+            .unwrap()
+            .next_frame(Duration::from_secs(1))
+            .unwrap();
+        assert!(shoot(&h, &frame, &mut jobs, true, true).is_some());
+        assert!(jobs[0].saving && jobs[0].info.next_at_ms <= crate::scheduling::now_ms());
+        // Due again while its shot is saved: the stream keeps running.
+        tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, true);
+        assert!(started && camera.as_ref().unwrap().is_streaming());
+        assert_eq!(count(), (1, 0));
+        // Saved: the next shot needs no start and no warm-up.
+        finish(&h, &mut jobs[0], Ok("shot.raw".into()));
+        tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, true);
+        assert!(jobs[0].deadline.is_some() && jobs[0].warm.is_none());
+        assert_eq!(count(), (1, 0));
+        // Nothing due or being saved: the schedule stops the stream it started.
+        jobs[0].deadline = None;
+        jobs[0].info.next_at_ms = u64::MAX;
+        tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, true);
+        assert!(!started && !camera.as_ref().unwrap().is_streaming());
+        assert_eq!(count(), (1, 1));
         h.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -171,7 +171,10 @@ pub(crate) fn secret_for(remote: &Remote) -> Result<Option<String>> {
         SecretSource::NoSecret => Ok(None),
         SecretSource::Environment => match std::env::var(variable) {
             Ok(secret) if !secret.is_empty() => Ok(Some(secret)),
-            _ => Err(Permanent(format!("{variable} is not set in the uploading process")).into()),
+            _ => Err(Permanent(format!(
+                "{variable} is not set in this process; the process that uploads, such as a serve service, needs it"
+            ))
+            .into()),
         },
         SecretSource::Keychain => {
             let (service, account) = remote.secret_ref().expect("keychain secret reference");

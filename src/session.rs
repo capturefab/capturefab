@@ -1265,6 +1265,12 @@ pub(crate) fn spawn_helper(
 
 /// A camera worker inherits this process's decoding and efficiency settings,
 /// including a `--efficiency` flag or desktop choice it cannot see itself.
+///
+/// It leads a process group of its own, which its FFmpeg and helper
+/// processes join. A terminal sends Ctrl-C, and the shell sends the SIGHUP of
+/// a closed terminal, to the whole foreground group: in this one, they would
+/// end a recording before this process could finish it, catalog it and queue
+/// its upload. The worker still exits when told to or when its stdin closes.
 fn worker_command(
     executable: std::path::PathBuf,
     efficiency: crate::efficiency::Mode,
@@ -1277,6 +1283,18 @@ fn worker_command(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    // The console's Ctrl-C reaches every process attached to it, except
+    // those in a new process group, and the processes they start.
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        std::os::windows::process::CommandExt::creation_flags(
+            &mut command,
+            CREATE_NEW_PROCESS_GROUP,
+        );
+    }
     command
 }
 
@@ -2778,6 +2796,16 @@ impl SessionHandle {
                 .unwrap_or_else(PoisonError::into_inner);
             return;
         }
+        /// Releases those waiting callers when shutdown ends, even by a panic.
+        struct Finished<'a>(&'a (Mutex<bool>, Condvar));
+        impl Drop for Finished<'_> {
+            fn drop(&mut self) {
+                let (done, finished) = self.0;
+                *locked(done) = true;
+                finished.notify_all();
+            }
+        }
+        let _finished = Finished(&self.inner.shut_down);
         self.inner.activity.stop();
         self.inner
             .activity
@@ -2816,9 +2844,6 @@ impl SessionHandle {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        let (done, finished) = &self.inner.shut_down;
-        *locked(done) = true;
-        finished.notify_all();
     }
     pub fn is_shutting_down(&self) -> bool {
         self.inner.quitting.load(Ordering::Relaxed)
@@ -2851,6 +2876,15 @@ impl WorkerRequest {
 /// Hidden mode: stdio controls, separate publisher, mmap frame transfer.
 /// `ring` is what `SharedRing::pass_to` gave the worker.
 pub fn run_worker(ring: &std::ffi::OsStr) -> Result<()> {
+    // Its own process group is in the background of a terminal, where a
+    // write to it stops the worker when `stty tostop` is set, unless SIGTTOU
+    // is ignored. FFmpeg and the helpers inherit that.
+    #[cfg(unix)]
+    // SAFETY: setting a standard signal's disposition to ignore has no
+    // preconditions.
+    unsafe {
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+    }
     let ring = Arc::new(Mutex::new(SharedRing::open(ring)?));
     let handle = crate::engine::WorkerHandle::with_ring(ring);
     let result = (|| -> Result<()> {

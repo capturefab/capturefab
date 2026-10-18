@@ -32,6 +32,7 @@ mod pacing;
 mod performance;
 mod pick_list;
 mod prefs;
+pub(crate) use prefs::saved_performance;
 mod preview;
 mod refresh;
 mod reveal;
@@ -143,14 +144,14 @@ pub fn run(handle: SessionHandle, session_label: String, simulated: bool) -> Res
 /// once, in case the window cannot quit.
 fn quit_on_signal(requested: Arc<AtomicBool>) {
     let again = AtomicBool::new(false);
-    let installed = ctrlc::set_handler(move || {
+    let installed = crate::cli::on_quit_signal(move || {
         if again.swap(true, Ordering::AcqRel) {
             std::process::exit(130);
         }
         requested.store(true, Ordering::Release);
     });
     if let Err(error) = installed {
-        eprintln!("capturefab: a quit signal will end the window at once: {error}");
+        eprintln!("capturefab: a quit signal will end the window at once: {error:#}");
     }
 }
 

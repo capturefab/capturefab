@@ -1323,8 +1323,8 @@ pub struct Picker {
     watch: Arc<Mutex<Watch>>,
     /// The watch's changes already copied: saved list, drives, uploads.
     seen: [u64; 3],
-    /// Bytes waiting to upload, while any are.
-    backlog: History,
+    /// Bytes waiting to upload to each destination, while any are.
+    backlog: BTreeMap<String, History>,
     editor: Option<Editor>,
     removing: Option<String>,
     /// The one row whose removal trigger regains focus after cancellation.
@@ -1380,8 +1380,7 @@ impl Picker {
             uploads: None,
             watch: Arc::default(),
             seen: [0; 3],
-            // Status is read every two seconds or so; take every reading.
-            backlog: History::every(Duration::from_secs(1), Duration::from_secs(120)),
+            backlog: BTreeMap::new(),
             editor: None,
             removing: None,
             removal_focus: None,
@@ -2649,20 +2648,28 @@ impl Picker {
         }
     }
 
-    /// Add the bytes waiting to upload to their history, flagging readings
-    /// where uploads failed; an empty queue clears it. The queue counts a
-    /// file only once it is fully sent, so this shows whether uploads keep
-    /// up rather than a transfer speed.
+    /// Add the bytes waiting to upload to each destination to its history,
+    /// flagging readings where more of its uploads failed; a destination
+    /// with nothing waiting loses its history. The queue counts a file only
+    /// once it is fully sent, so this shows whether uploads keep up rather
+    /// than a transfer speed.
     fn sample_uploads(&mut self, status: &Value) {
-        let count = |key: &str| status[key].as_u64().unwrap_or(0);
-        if count("pending") + count("uploading") == 0 {
-            self.backlog.clear();
-        } else {
-            self.backlog.offer(
-                Instant::now(),
-                count("waiting_bytes") as f64,
-                count("failures"),
-            );
+        let now = Instant::now();
+        let empty = serde_json::Map::new();
+        let destinations = status["destinations"].as_object().unwrap_or(&empty);
+        let waiting = |backlog: &Value| {
+            let count = |key: &str| backlog[key].as_u64().unwrap_or(0);
+            count("pending") + count("uploading") > 0
+        };
+        self.backlog
+            .retain(|name, _| destinations.get(name).is_some_and(waiting));
+        for (name, backlog) in destinations.iter().filter(|(_, backlog)| waiting(backlog)) {
+            let count = |key: &str| backlog[key].as_u64().unwrap_or(0);
+            self.backlog
+                .entry(name.clone())
+                // Status is read every two seconds or so; take every reading.
+                .or_insert_with(|| History::every(Duration::from_secs(1), Duration::from_secs(120)))
+                .offer(now, count("waiting_bytes") as f64, count("failed"));
         }
     }
 
@@ -2706,19 +2713,20 @@ impl Picker {
         }
         let mut lines = column![head].spacing(4);
         if line.waiting > 0
-            && let Some(left) = self.backlog.last()
+            && let Some(history) = self.backlog.get(destination)
+            && let Some(left) = history.last()
         {
             lines = lines.push(
                 row![
                     super::spark(
-                        Some(&self.backlog),
+                        Some(history),
                         p.accent,
                         p.danger,
                         (140.0, 18.0),
                         |history| {
                             super::format::trend(
                                 history,
-                                "Waiting to upload, all buckets",
+                                "Waiting to upload",
                                 |left| bytes(left as u64),
                                 "failed uploads",
                             )
@@ -3418,10 +3426,14 @@ impl Picker {
             .unwrap_or_else(PoisonError::into_inner)
             .pinned = true;
         let now = Instant::now();
+        let history = self
+            .backlog
+            .entry("line-1".into())
+            .or_insert_with(|| History::every(Duration::from_secs(1), Duration::from_secs(120)));
         for second in (0..=60).rev().step_by(2) {
             let at = now.checked_sub(Duration::from_secs(second)).unwrap_or(now);
             let bytes = 2_104_000_000.0 - second as f64 * 1_700_000.0;
-            self.backlog.offer(at, bytes, 0);
+            history.offer(at, bytes, 0);
         }
     }
 }
@@ -4720,6 +4732,27 @@ mod tests {
         assert_eq!((other.action, other.error), (None, None));
     }
 
+    #[test]
+    fn each_destination_keeps_its_own_upload_backlog() {
+        let mut picker = Picker::new(false, false);
+        let status = |nas: u64| {
+            serde_json::json!({
+                "pending": 1235, "uploading": nas.min(1), "waiting_bytes": 2_100_000_000u64 + nas,
+                "destinations": {
+                    "line-1": {"pending": 1234, "uploading": 0, "failed": 0, "waiting_bytes": 2_100_000_000u64},
+                    "nas": {"pending": 0, "uploading": nas.min(1), "failed": 0, "waiting_bytes": nas},
+                },
+            })
+        };
+        picker.sample_uploads(&status(50_000_000));
+        assert_eq!(picker.backlog["line-1"].last(), Some(2_100_000_000.0));
+        assert_eq!(picker.backlog["nas"].last(), Some(50_000_000.0));
+        // A destination with nothing left to send drops its history.
+        picker.sample_uploads(&status(0));
+        assert!(!picker.backlog.contains_key("nas"));
+        assert!(picker.backlog.contains_key("line-1"));
+    }
+
     #[cfg(feature = "uploads")]
     #[test]
     fn upload_status_is_read_less_often_for_a_long_queue_but_stays_fresh() {
@@ -4747,7 +4780,7 @@ mod tests {
             Mood::Waiting,
             "ticks keep the scene's status"
         );
-        assert!(capture.backlog.last().is_some());
+        assert!(capture.backlog["line-1"].last().is_some());
         let mut watch = capture.watch.lock().unwrap();
         watch.uploads.value = Some((Arc::new(serde_json::json!({"pending": 1})), Duration::ZERO));
         watch.uploads.changes += 1;

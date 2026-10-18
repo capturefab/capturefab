@@ -1,3 +1,16 @@
+/// Diagnostics on stderr that never panic. std's `eprintln!` panics when
+/// writing fails, as it does with EIO once the terminal hangs up, which is
+/// SIGHUP's usual cause: shutdown would then stop halfway. This one drops the
+/// line instead. Defined before the modules, it stands in for std's in all of
+/// them; `main.rs` imports it.
+#[macro_export]
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
+    }};
+}
+
 #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
 pub mod accel;
 #[cfg(feature = "ai")]

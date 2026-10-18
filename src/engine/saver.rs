@@ -102,6 +102,18 @@ impl Saver {
     }
 }
 
+impl Saver {
+    /// Finish the shots already handed over, and hand back what became of
+    /// them.
+    pub(super) fn join(mut self) -> Receiver<Saved> {
+        self.shots.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        std::mem::replace(&mut self.saved, mpsc::channel().1)
+    }
+}
+
 impl Drop for Saver {
     /// Finish the shots already handed over.
     fn drop(&mut self) {

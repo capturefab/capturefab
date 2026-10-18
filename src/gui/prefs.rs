@@ -663,6 +663,15 @@ pub fn load() -> Prefs {
     load_from(&path())
 }
 
+/// Settings › Performance as last saved, unless Automatic or never saved,
+/// for `doctor`: only the desktop window applies it.
+pub(crate) fn saved_performance() -> Option<crate::efficiency::Mode> {
+    let path = path();
+    path.is_file()
+        .then(|| load_from(&path).performance)
+        .filter(|mode| *mode != crate::efficiency::Mode::Auto)
+}
+
 /// One application's preference destination. All instances share a serialized
 /// writer, so independent snapshots for the same path cannot race a rename.
 #[derive(Clone)]

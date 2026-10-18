@@ -271,7 +271,18 @@ impl State {
             super::format::grouped(effective.max_files.into())
         );
         if let Some(free) = usage.free {
-            text = format!("{text} · {} free on this disk", rounded(free));
+            // Once the disk is what limits saves, say what is left for them
+            // and why that is less than its free space.
+            let room = free.saturating_sub(FREE_SPACE_FLOOR);
+            text = if usage.bytes.saturating_add(room) < effective.max_bytes {
+                format!(
+                    "{text} · {} left for captures on this disk (saves keep {} free)",
+                    rounded(room),
+                    bytes(FREE_SPACE_FLOOR)
+                )
+            } else {
+                format!("{text} · {} free on this disk", rounded(free))
+            };
         }
         Some(Meter {
             label: format!("Storage {:.0}% full: {text}", fraction * 100.0),
@@ -505,9 +516,17 @@ mod tests {
         let disk = meter(1 << 30, 10, Some(FREE_SPACE_FLOOR + (100 << 20)));
         assert_eq!(disk.tone, Tone::Warning);
         assert!(
-            disk.text.ends_with(" · 612.0 MiB free on this disk"),
+            disk.text
+                .ends_with(" · 100.0 MiB left for captures on this disk (saves keep 512 MiB free)"),
             "{}",
             disk.text
+        );
+        // With room for the whole budget, the disk's free space is enough.
+        let roomy = meter(1 << 30, 10, Some(20 << 30));
+        assert!(
+            roomy.text.ends_with(" · 20.0 GiB free on this disk"),
+            "{}",
+            roomy.text
         );
         assert!(state.meter(&requested, None).is_none());
         assert!(

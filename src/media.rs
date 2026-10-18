@@ -4046,9 +4046,12 @@ impl Forwarder {
         self.final_stats.written = process.queue.written.load(Ordering::Relaxed);
         if let Some(output) = recording {
             // Video the encoder wrote stays even when it failed or had to be
-            // stopped, since every recording container plays up to its last
-            // complete part; a full disk or size limit fails the file itself.
-            let kept = output.error.is_none() && output.storage.bytes_written() > HEADER_BYTES;
+            // stopped, or when the file reached its maximum size or a write
+            // to it failed, since every recording container plays up to its
+            // last complete part. The cause still ends the recording.
+            let cut = output.storage.cut();
+            let kept =
+                (output.error.is_none() || cut) && output.storage.bytes_written() > HEADER_BYTES;
             if error.is_none() {
                 error = output.error;
             }
@@ -4059,7 +4062,7 @@ impl Forwarder {
             let path = output.storage.path().to_path_buf();
             let (bytes, sha256) = (output.storage.bytes_written(), output.storage.sha256());
             let result = if valid {
-                output.storage.finish().and_then(|()| {
+                output.storage.finish_cut().and_then(|()| {
                     // The file is complete and in the ledger even if queueing fails.
                     let mut recorded = crate::dataset::RecordedFile {
                         path: path.display().to_string(),
@@ -5780,8 +5783,77 @@ esac"#
         assert_eq!(forward.stats().encoder, encoder);
         assert!(
             !path.exists(),
-            "over-limit partial recordings must be removed"
+            "a recording cut before it holds any video must be removed"
         );
+    }
+    #[test]
+    #[ignore = "requires FFmpeg"]
+    fn ffmpeg_a_recording_that_reaches_its_maximum_size_keeps_the_video_before() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("capturefab-capped-recording-{nonce}.mkv"));
+        let limit = 256 << 10;
+        let mut forward = Forwarder::new(ForwardConfig {
+            output: path.to_string_lossy().into(),
+            codec: "h264".into(),
+            encoder: "libx264".into(),
+            fps: 30.0,
+            bitrate: "8M".into(),
+            storage: Default::default(),
+            max_file_bytes: limit,
+            destination: None,
+        })
+        .unwrap();
+        // Noise compresses poorly, so the limit comes within seconds.
+        let mut seed = 1u32;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        for id in 1.. {
+            if forward.stats().error.is_some() || Instant::now() >= deadline {
+                break;
+            }
+            let data = (0..160 * 120 * 3)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (seed >> 24) as u8
+                })
+                .collect();
+            let frame = Frame {
+                id,
+                width: 160,
+                height: 120,
+                pixel_format: RGB8,
+                timestamp_ns: id * 33_333_333,
+                data,
+            };
+            let _ = forward.push(frame);
+            thread::sleep(Duration::from_millis(33));
+        }
+        let error = forward.stop().unwrap_err().to_string();
+        assert!(error.contains("maximum file size"), "{error}");
+        let recorded = forward
+            .stats()
+            .recording
+            .expect("the recording up to its limit is kept");
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        assert!(bytes > HEADER_BYTES && bytes <= limit, "{bytes}");
+        assert_eq!(recorded.bytes, bytes);
+        let exe = executable().unwrap();
+        let args = [
+            "-v",
+            "error",
+            "-i",
+            &path.to_string_lossy(),
+            "-f",
+            "framemd5",
+            "-",
+        ]
+        .map(String::from);
+        let (_, log) = bounded_output(&exe, &args, Duration::from_secs(30)).unwrap();
+        let frames = log.lines().filter(|line| line.starts_with("0,")).count();
+        assert!(frames > 0, "{log}");
+        std::fs::remove_file(&path).unwrap();
     }
     #[test]
     fn forwarding_configuration_fails_closed() {

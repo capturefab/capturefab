@@ -74,11 +74,6 @@ impl History {
         }
     }
 
-    pub fn clear(&mut self) {
-        self.samples.clear();
-        self.counter = None;
-    }
-
     /// Enough samples, far enough apart, for a line that shows a trend.
     pub fn ready(&self) -> bool {
         self.samples.len() >= MIN_SAMPLES && self.elapsed() >= MIN_SPAN

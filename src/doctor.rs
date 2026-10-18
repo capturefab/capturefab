@@ -166,6 +166,8 @@ struct UsbCamera {
 /// What the checks look at, gathered once.
 struct Facts {
     efficiency: Resolved,
+    /// Settings › Performance, unless Automatic.
+    desktop: Option<Mode>,
     /// The GPU probe's answer, when it ran.
     graphics: Option<Value>,
     /// Where sessions are found, with their short-lived files.
@@ -177,6 +179,9 @@ struct Facts {
     /// `/run/user/<uid>` when the runtime directory fell back to disk
     /// without it, and why.
     missed_runtime_dir: Option<(PathBuf, LoginDir)>,
+    /// From a login that has XDG_RUNTIME_DIR: where a service without it
+    /// keeps sessions instead.
+    service_runtime_dir: Option<ServiceDir>,
     /// State an older version kept elsewhere that did not move.
     left_behind: Vec<LeftBehind>,
     limits: Limits,
@@ -189,6 +194,15 @@ struct Facts {
     /// The default capture folder's disk, where `storage --json` measures.
     captures: Place,
 }
+/// Where a service started without XDG_RUNTIME_DIR keeps sessions, out of
+/// this login's sight, the login runtime directory it passes over and why,
+/// and the sessions running there.
+struct ServiceDir {
+    dir: PathBuf,
+    login: PathBuf,
+    why: LoginDir,
+    running: Vec<String>,
+}
 impl Facts {
     fn gather() -> Self {
         let state = crate::ipc::state_dir();
@@ -200,6 +214,10 @@ impl Facts {
             .collect();
         Self {
             efficiency: efficiency::current(),
+            #[cfg(feature = "gui")]
+            desktop: crate::gui::saved_performance(),
+            #[cfg(not(feature = "gui"))]
+            desktop: None,
             graphics: None,
             budget,
             used,
@@ -208,6 +226,17 @@ impl Facts {
             session_dir_set: std::env::var_os("CAPTUREFAB_SESSION_DIR")
                 .is_some_and(|dir| !dir.is_empty()),
             missed_runtime_dir: crate::ipc::missed_runtime_dir(),
+            service_runtime_dir: crate::ipc::service_runtime_dir().map(|(dir, login, why)| {
+                let running = crate::ipc::sessions_elsewhere()
+                    .map(|(_, names)| names)
+                    .unwrap_or_default();
+                ServiceDir {
+                    dir,
+                    login,
+                    why,
+                    running,
+                }
+            }),
             left_behind,
             limits: limits(),
             usb: usb_cameras(),
@@ -322,7 +351,7 @@ pub fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
 }
 
 fn checks(facts: &Facts) -> Vec<Check> {
-    let mut checks = vec![efficiency_check(&facts.efficiency)];
+    let mut checks = vec![efficiency_check(&facts.efficiency, facts.desktop)];
     checks.extend(facts.graphics.as_ref().map(graphics_check));
     checks.extend(
         facts
@@ -330,6 +359,15 @@ fn checks(facts: &Facts) -> Vec<Check> {
             .as_ref()
             .map(|(dir, login)| runtime_dir_check(dir, *login, &facts.runtime, &facts.state)),
     );
+    checks.extend(facts.service_runtime_dir.as_ref().map(|service| {
+        service_runtime_dir_check(
+            &service.dir,
+            &service.login,
+            service.why,
+            &service.running,
+            &facts.runtime,
+        )
+    }));
     checks.push(session_check(&facts.state, facts.session_dir_set));
     checks.extend(
         facts
@@ -347,7 +385,9 @@ fn checks(facts: &Facts) -> Vec<Check> {
     checks
 }
 
-fn efficiency_check(resolved: &Resolved) -> Check {
+/// `desktop` is Settings › Performance, which only the desktop window
+/// applies: it is named when the window would run otherwise than this.
+fn efficiency_check(resolved: &Resolved, desktop: Option<Mode>) -> Check {
     let mode = if resolved.efficient {
         "Efficient"
     } else {
@@ -358,7 +398,18 @@ fn efficiency_check(resolved: &Resolved) -> Check {
     } else {
         resolved.reasons.join(", ")
     };
-    let mut check = Check::ok("efficiency", format!("{mode} mode: {why}."));
+    let mut message = format!("{mode} mode: {why}.");
+    let window = match desktop {
+        Some(Mode::Efficient) if !resolved.efficient => Some("Efficient"),
+        Some(Mode::Smooth) if resolved.efficient => Some("Smooth"),
+        _ => None,
+    };
+    if let Some(window) = window {
+        message.push_str(&format!(
+            " The desktop window runs {window}, as set in its Settings › Performance, which applies there only."
+        ));
+    }
+    let mut check = Check::ok("efficiency", message);
     if resolved.efficient && resolved.setting == Mode::Auto {
         check.fix = Some(
             "To stay smooth anyway, use --efficiency smooth or CAPTUREFAB_EFFICIENCY=smooth."
@@ -409,10 +460,64 @@ fn runtime_dir_check(login: &Path, why: LoginDir, runtime: &Place, state: &Place
     let dir = login.display();
     let runtime = runtime.path.display();
     let state = state.path.display();
+    let (why, fix) = login_dir_problem(login, why);
+    Check::warn(
+        "runtime_dir",
+        format!(
+            "XDG_RUNTIME_DIR is unset and {why}, so sessions are on disk in {runtime}, while logins look for them in {dir}/capturefab."
+        ),
+        format!(
+            "{fix} Settings, destinations, the upload queue and the storage ledger stay in {state} either way. A service unit that does this: {LINE_COMPUTER}"
+        ),
+    )
+}
+
+/// The same problem seen from a login, such as SSH, that has
+/// XDG_RUNTIME_DIR: a service started without it keeps its sessions in
+/// `service` instead, out of this login's sight. A warning once such a
+/// session runs, otherwise a note, as most logins never start a service.
+fn service_runtime_dir_check(
+    service: &Path,
+    login: &Path,
+    why: LoginDir,
+    running: &[String],
+    runtime: &Place,
+) -> Check {
+    let (why, fix) = login_dir_problem(login, why);
+    let (service, runtime) = (service.display(), runtime.path.display());
+    let fix = format!(
+        "{fix} To see what such a service sees, run `env -u XDG_RUNTIME_DIR capturefab doctor`. A service unit that does this: {LINE_COMPUTER}"
+    );
+    if running.is_empty() {
+        let mut check = Check::ok(
+            "runtime_dir",
+            format!(
+                "Sessions are in {runtime}. A service started without XDG_RUNTIME_DIR would keep its own in {service}, where logins do not look, as {why}."
+            ),
+        );
+        check.fix = Some(fix);
+        check
+    } else {
+        Check::warn(
+            "runtime_dir",
+            format!(
+                "{} {} from {service}, where this login does not look: a service started without XDG_RUNTIME_DIR keeps sessions there, as {why}.",
+                running.join(", "),
+                if running.len() == 1 { "runs" } else { "run" }
+            ),
+            fix,
+        )
+    }
+}
+
+/// Why the login runtime directory cannot hold a service's sessions, and
+/// the fix.
+fn login_dir_problem(login: &Path, why: LoginDir) -> (String, String) {
+    let dir = login.display();
     let uid = login
         .file_name()
         .map_or_else(|| "$USER".into(), |uid| uid.to_string_lossy());
-    let (why, fix) = match why {
+    match why {
         LoginDir::NotPrivate => (
             format!("{dir} is not private to this user"),
             format!(
@@ -431,16 +536,7 @@ fn runtime_dir_check(login: &Path, why: LoginDir, runtime: &Place, state: &Place
                 "Run `sudo loginctl enable-linger {uid}` so {dir} exists from boot and survives logout, and give a service Wants= and After=user@{uid}.service; Capturefab then uses {dir} without XDG_RUNTIME_DIR."
             ),
         ),
-    };
-    Check::warn(
-        "runtime_dir",
-        format!(
-            "XDG_RUNTIME_DIR is unset and {why}, so sessions are on disk in {runtime}, while logins look for them in {dir}/capturefab."
-        ),
-        format!(
-            "{fix} Settings, destinations, the upload queue and the storage ledger stay in {state} either way. A service unit that does this: {LINE_COMPUTER}"
-        ),
-    )
+    }
 }
 
 /// State an older version kept in another directory stays there when the
@@ -1129,6 +1225,44 @@ mod tests {
     }
 
     #[test]
+    fn an_ssh_login_learns_where_a_service_keeps_its_sessions() {
+        let runtime = place("/run/user/1000/capturefab", "tmpfs", 400 << 20);
+        let service = Path::new("/home/pi/.cache/capturefab/sessions");
+        let login = Path::new("/run/user/1000");
+        let note = service_runtime_dir_check(service, login, LoginDir::NotLingering, &[], &runtime);
+        assert_eq!(note.level, Level::Ok);
+        assert_eq!(
+            note.message,
+            "Sessions are in /run/user/1000/capturefab. A service started without XDG_RUNTIME_DIR would keep its own in /home/pi/.cache/capturefab/sessions, where logins do not look, as this user does not linger (logind keeps /run/user/1000 only while they are logged in)."
+        );
+        let fix = note.fix.unwrap();
+        assert!(
+            fix.starts_with("Run `sudo loginctl enable-linger 1000`"),
+            "{fix}"
+        );
+        assert!(
+            fix.contains("`env -u XDG_RUNTIME_DIR capturefab doctor`"),
+            "{fix}"
+        );
+        // Once such a service runs, the login is told where.
+        let running = service_runtime_dir_check(
+            service,
+            login,
+            LoginDir::NotLingering,
+            &["line1".into()],
+            &runtime,
+        );
+        assert_eq!(running.level, Level::Warn);
+        assert!(
+            running
+                .message
+                .starts_with("line1 runs from /home/pi/.cache/capturefab/sessions, where this login does not look"),
+            "{}",
+            running.message
+        );
+    }
+
+    #[test]
     fn state_an_older_version_left_behind_warns_with_how_to_keep_it() {
         let state = place("/home/pi/.local/state/capturefab", "ext4", 6 << 30);
         let service = PathBuf::from("/home/pi/.cache/capturefab/sessions");
@@ -1247,19 +1381,30 @@ mod tests {
             efficient: true,
             reasons: vec!["2 CPU cores".into()],
         };
-        let check = efficiency_check(&auto);
+        let check = efficiency_check(&auto, None);
         assert_eq!(
             (check.level, check.message.as_str()),
             (Level::Ok, "Efficient mode: 2 CPU cores.")
         );
         assert!(check.fix.unwrap().contains("--efficiency smooth"));
-        let smooth = efficiency_check(&Resolved {
+        let auto_smooth = Resolved {
             setting: Mode::Auto,
             efficient: false,
             reasons: Vec::new(),
-        });
+        };
+        let smooth = efficiency_check(&auto_smooth, None);
         assert_eq!(smooth.message, "Smooth mode: auto found no constraint.");
         assert_eq!(smooth.fix, None);
+        // Only the desktop window applies its own setting, so doctor says
+        // when that window runs otherwise.
+        assert_eq!(
+            efficiency_check(&auto_smooth, Some(Mode::Efficient)).message,
+            "Smooth mode: auto found no constraint. The desktop window runs Efficient, as set in its Settings › Performance, which applies there only."
+        );
+        assert_eq!(
+            efficiency_check(&auto, Some(Mode::Efficient)).message,
+            "Efficient mode: 2 CPU cores."
+        );
         let software = json!({"available":true,"adapter":"llvmpipe (LLVM 17.0.6, 256 bits)","backend":"vulkan","device_type":"cpu","software":true});
         assert_eq!(graphics_check(&software).level, Level::Warn);
         let missing = json!({"available":false,"reason":"no adapter"});

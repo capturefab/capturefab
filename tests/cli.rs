@@ -39,7 +39,12 @@ fn serve_at(dir: &PathBuf, cwd: &PathBuf, name: &str) -> Child {
 }
 
 fn serve_with(dir: &PathBuf, cwd: &PathBuf, name: &str, env: &[(&str, &str)]) -> Child {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+    serve_ready(serve_command(dir, cwd, name, env).spawn().unwrap())
+}
+
+fn serve_command(dir: &PathBuf, cwd: &PathBuf, name: &str, env: &[(&str, &str)]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_capturefab"));
+    command
         .env_remove("CAPTUREFAB_SESSION")
         .env_remove("CAPTUREFAB_CAMERA")
         .env("CAPTUREFAB_SESSION_DIR", dir)
@@ -48,9 +53,12 @@ fn serve_with(dir: &PathBuf, cwd: &PathBuf, name: &str, env: &[(&str, &str)]) ->
         .current_dir(cwd)
         .args(["--json", "serve", "--name", name])
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::inherit());
+    command
+}
+
+/// Wait for a spawned serve to say it is ready.
+fn serve_ready(mut child: Child) -> Child {
     let mut ready = String::new();
     BufReader::new(child.stdout.take().unwrap())
         .read_line(&mut ready)
@@ -1869,6 +1877,10 @@ fn serve_shuts_down_cleanly_on_sigterm_and_sighup() {
         let status = json(&dir, &["--json", "--session", name, "status"]);
         let worker = status["cameras"][0]["worker_pid"].as_i64().unwrap() as i32;
         assert!(process_lives(worker));
+        // In a process group of its own, which a terminal's Ctrl-C or
+        // hangup does not reach.
+        // SAFETY: getpgid only reads the process group of a child of serve.
+        assert_eq!(unsafe { libc::getpgid(worker) }, worker);
         if cfg!(feature = "ftp") {
             // A capture whose upload stays queued: nothing listens on port 1.
             json_env(
@@ -1920,6 +1932,141 @@ fn serve_shuts_down_cleanly_on_sigterm_and_sighup() {
                 serde_json::from_slice(&std::fs::read(dir.join("uploads.json")).unwrap()).unwrap();
             assert_eq!(queue["items"].as_array().unwrap().len(), 1, "{queue}");
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// `nohup` starts serve with SIGHUP ignored, so it must outlive the
+/// terminal it was started from; SIGTERM still stops it.
+#[test]
+#[cfg(unix)]
+fn serve_under_nohup_ignores_sighup() {
+    use std::os::unix::process::CommandExt;
+    let root = temp_root("nohup");
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut command = serve_command(&dir, &root, "nohup", &[]);
+    // SAFETY: signal is async-signal-safe, as pre_exec requires.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let mut serve = serve_ready(command.spawn().unwrap());
+    // SAFETY: kill only sends a signal to the child this test spawned.
+    assert_eq!(unsafe { libc::kill(serve.id() as i32, libc::SIGHUP) }, 0);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(serve.try_wait().unwrap().is_none(), "serve outlives SIGHUP");
+    assert!(dir.join("nohup.json").is_file());
+    let exit = signal_and_wait(&mut serve, libc::SIGTERM);
+    assert!(exit.success(), "{exit:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A terminal sends Ctrl-C, and the shell the SIGHUP of a closed terminal,
+/// to serve's whole process group. Its camera workers are not in it, so serve
+/// still finishes a recording to a bucket: kept in the storage ledger and
+/// queued for upload.
+#[test]
+#[cfg(unix)]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn serve_finishes_a_recording_when_its_terminal_signals_the_process_group() {
+    use std::os::unix::process::CommandExt;
+    if !cfg!(feature = "ftp") {
+        return;
+    }
+    for (signal, name) in [(libc::SIGINT, "int"), (libc::SIGHUP, "hup")] {
+        let root = temp_root(&format!("group-{name}"));
+        let (dir, staging) = (root.join("sessions"), root.join("staging"));
+        std::fs::create_dir_all(&root).unwrap();
+        let env = [
+            ("CAPTUREFAB_STAGING_DIR", staging.to_str().unwrap()),
+            ("CAPTUREFAB_FTP_PASSWORD", "secret"),
+        ];
+        let mut command = serve_command(&dir, &root, name, &env);
+        command.process_group(0);
+        let mut serve = serve_ready(command.spawn().unwrap());
+        json(&dir, &["--json", "--session", name, "connect", "sim:rec"]);
+        json(
+            &dir,
+            &["--json", "--session", name, "set", "Width=64", "Height=64"],
+        );
+        // Nothing listens on port 1, so the upload stays queued.
+        json_env(
+            &dir,
+            &env,
+            &[
+                "--json",
+                "destination",
+                "add-ftp",
+                "down",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "1",
+                "--user",
+                "cam",
+                "--plain",
+                "--password-env",
+                "--no-check",
+            ],
+        );
+        json_env(
+            &dir,
+            &env,
+            &[
+                "--json",
+                "--session",
+                name,
+                "record",
+                "-o",
+                "clip.mp4",
+                "--destination",
+                "down",
+                "--encoder",
+                "libx264",
+                "--fps",
+                "10",
+                "--max-file-size",
+                "8MiB",
+            ],
+        );
+        let start = std::time::Instant::now();
+        loop {
+            let status = json(&dir, &["--json", "--session", name, "status"]);
+            if status["forwarding"].is_string() && start.elapsed().as_secs() >= 1 {
+                break;
+            }
+            assert!(start.elapsed().as_secs() < 10, "recording failed to start");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // SAFETY: serve leads the group this test made for it.
+        assert_eq!(unsafe { libc::killpg(serve.id() as i32, signal) }, 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let exit = loop {
+            if let Some(status) = serve.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{name}: still running"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(exit.success(), "{name}: {exit:?}");
+        let storage = json(&dir, &["--json", "storage"]);
+        assert_eq!(storage["files"], 1, "{name}: {storage}");
+        assert_eq!(storage["externally_changed_files"], 0, "{name}: {storage}");
+        assert_eq!(storage["active_reservations"], 0, "{name}: {storage}");
+        let queue: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("uploads.json")).unwrap()).unwrap();
+        let items = queue["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{name}: {queue}");
+        assert!(
+            items[0]["path"].as_str().unwrap().ends_with("clip.mp4"),
+            "{name}: {queue}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

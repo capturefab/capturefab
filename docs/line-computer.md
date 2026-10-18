@@ -73,7 +73,7 @@ A session is found by name in the runtime folder, so the service and your SSH lo
 sudo loginctl enable-linger pi
 ```
 
-Without lingering, a service that sets no `XDG_RUNTIME_DIR` keeps its sessions on disk in `~/.cache/capturefab/sessions`, where an SSH login does not look, and `capturefab doctor` warns about `runtime_dir` with the fix. After an upgrade from an older version, its `old_state` check names any settings, destinations, upload queue or storage ledger that could not move into the state folder, and how to keep them.
+Without lingering, a service that sets no `XDG_RUNTIME_DIR` keeps its sessions on disk in `~/.cache/capturefab/sessions`, where an SSH login does not look. `capturefab doctor` in your SSH login notes this under `runtime_dir` with the fix, and warns once such a session runs; `capturefab sessions` and `--session` name a session they find there. `env -u XDG_RUNTIME_DIR capturefab doctor` shows what the service sees, and the service prints its own warning to `journalctl -u capturefab-line1` when it starts. After an upgrade from an older version, its `old_state` check names any settings, destinations, upload queue or storage ledger that could not move into the state folder, and how to keep them.
 
 ## 4. Run serve as a service
 
@@ -112,7 +112,7 @@ journalctl -u capturefab-line1 -f
 
 `Wants=` and `After=user@1000.service` start the service once logind has made `/run/user/1000`. If no login needs to reach the session with `--session`, the service can keep a runtime folder of its own instead: replace the `XDG_RUNTIME_DIR` line with `RuntimeDirectory=capturefab`, `RuntimeDirectoryMode=0700` and `Environment=XDG_RUNTIME_DIR=/run/capturefab`, and leave out `user@1000.service`. The browser and its API still reach it through `--listen`, and state stays in `~/.local/state/capturefab`.
 
-`serve` stops on SIGTERM, SIGHUP and Ctrl-C alike. Keep `KillMode=mixed`: by default systemd signals every process of the service at once, so a camera worker would end before `serve` could finish its recording. With `mixed`, systemd kills whatever is still running once `serve` exits, and everything after `TimeoutStopSec`. `Restart=on-failure` also retries when the Tailscale address is not up yet at boot. To connect a camera and start streaming when the service starts, put the camera before the command: `capturefab --camera ID serve --name line1 --stream ...`. Camera connections and schedules belong to the running process and do not survive a restart; reapply a [workflow file](../README.md#repeatable-workflows) to set them up again.
+`serve` stops on SIGTERM, SIGHUP and Ctrl-C alike, and finishes its recordings first. Its camera workers run in process groups of their own, so the Ctrl-C of a terminal, or the hangup when it closes, reaches only `serve`. Started with `nohup`, `serve` ignores SIGHUP and keeps running after you log out. Keep `KillMode=mixed`: by default systemd signals every process of the service at once, so a camera worker would end before `serve` could finish its recording. With `mixed`, systemd kills whatever is still running once `serve` exits, and everything after `TimeoutStopSec`. `Restart=on-failure` also retries when the Tailscale address is not up yet at boot. To connect a camera and start streaming when the service starts, put the camera before the command: `capturefab --camera ID serve --name line1 --stream ...`. Camera connections and schedules belong to the running process and do not survive a restart; reapply a [workflow file](../README.md#repeatable-workflows) to set them up again.
 
 Over SSH, as the same account, every CLI command can use the running session:
 
@@ -149,6 +149,8 @@ sudoedit /etc/capturefab/line1.env
 ```
 
 Put one `NAME=value` per line in it, such as `CAPTUREFAB_SFTP_PASSWORD=...`, or `AWS_ACCESS_KEY_ID=...` and `AWS_SECRET_ACCESS_KEY=...`, then add `EnvironmentFile=/etc/capturefab/line1.env` to the unit's `[Service]` section and restart the service. systemd reads the file before it switches to `User=`.
+
+Only the service has these keys then, not your SSH shell, where `destination add-s3`, `add-sftp` and `add-ftp` check the destination before saving it. Save it with `--no-check`, and once the service runs, see that uploads go through with `capturefab uploads --json`; `destination test` also runs in your shell, without the keys.
 
 ## 7. Efficiency mode
 

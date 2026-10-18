@@ -298,6 +298,17 @@ enum Phase {
     Reconnecting,
 }
 
+/// The overview pill's count: cameras waiting or reconnecting of those
+/// streaming, or streaming of all. Reconnects are counted attempts too, so
+/// that count names its unit.
+fn overview_figure(phase: Phase, waiting: usize, streaming: usize, total: usize) -> String {
+    match phase {
+        Phase::Waiting(_) => format!("{waiting} of {streaming}"),
+        Phase::Reconnecting => format!("{waiting} of {streaming} cameras"),
+        _ => format!("{streaming} of {total}"),
+    }
+}
+
 impl Phase {
     fn label(self) -> &'static str {
         match self {
@@ -1035,12 +1046,8 @@ impl Workbench {
         let fit = self.overview_fit(phase.label(), record_label, (auto_on, auto_total));
         let pill = status_pill(
             phase.label(),
-            (reveal > 0.001 && fit.figure).then(|| match phase {
-                Phase::Waiting(_) | Phase::Reconnecting => {
-                    format!("{} of {streaming}", waiting.len())
-                }
-                _ => format!("{streaming} of {total}"),
-            }),
+            (reveal > 0.001 && fit.figure)
+                .then(|| overview_figure(phase, waiting.len(), streaming, total)),
             None,
             None,
             style::mix(p.accent_text, on, tint),
@@ -1236,7 +1243,15 @@ impl Workbench {
             auto_label: auto_width(true) - auto_width(false),
             record_label: if recording { 0.0 } else { worded(record) },
             capture_label: worded("Capture all"),
-            figure: live_width(false, Some(&format!("{total} of {total}")), None),
+            figure: live_width(
+                false,
+                Some(&if word == Phase::Reconnecting.label() {
+                    format!("{total} of {total} cameras")
+                } else {
+                    format!("{total} of {total}")
+                }),
+                None,
+            ),
         }
     }
 
@@ -1484,6 +1499,16 @@ mod tests {
         assert_eq!(bench.reconnecting("sim:0"), Some(report));
         assert_eq!(bench.single_phase(), Some(Phase::Reconnecting));
         assert_eq!(Phase::Reconnecting.label(), "Reconnecting…");
+        // "1 of 3" alone would read as the first of three attempts.
+        assert_eq!(
+            overview_figure(Phase::Reconnecting, 1, 3, 4),
+            "1 of 3 cameras"
+        );
+        assert_eq!(
+            overview_figure(Phase::Waiting(Duration::ZERO), 1, 3, 4),
+            "1 of 3"
+        );
+        assert_eq!(overview_figure(Phase::Streaming, 0, 3, 4), "3 of 4");
         // Its tint is the camera's dot elsewhere, which also says no frames
         // come.
         assert_eq!(Phase::Reconnecting.state(), CameraState::Stalled);

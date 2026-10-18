@@ -300,6 +300,33 @@ pub(crate) fn missed_runtime_dir() -> Option<(PathBuf, LoginDir)> {
     let logind = Path::new("/run/systemd/seats").is_dir() || Path::new("/run/user").is_dir();
     missed(login_runtime_dir(), logind)
 }
+/// In a login with XDG_RUNTIME_DIR, where a service started without it
+/// keeps its sessions instead, with the login runtime directory it passes
+/// over and why. An SSH login on a line computer would otherwise see no sign
+/// of a service whose sessions it cannot find.
+pub(crate) fn service_runtime_dir() -> Option<(PathBuf, PathBuf, LoginDir)> {
+    if cfg!(test)
+        || var("CAPTUREFAB_SESSION_DIR").is_some()
+        || xdg(&var, "XDG_RUNTIME_DIR").is_none()
+    {
+        return None;
+    }
+    let logind = Path::new("/run/systemd/seats").is_dir() || Path::new("/run/user").is_dir();
+    let (login, why) = missed(login_runtime_dir(), logind)?;
+    Some((disk_session_dir(&var), login, why))
+}
+/// The responsive sessions in `service_runtime_dir`, which this login's
+/// commands do not find, and that folder.
+pub(crate) fn sessions_elsewhere() -> Option<(PathBuf, Vec<String>)> {
+    let (dir, ..) = service_runtime_dir()?;
+    let names: Vec<String> = descriptors_in(&dir)
+        .ok()?
+        .into_iter()
+        .filter(descriptor_active)
+        .map(|descriptor| descriptor.name)
+        .collect();
+    (!names.is_empty()).then_some((dir, names))
+}
 /// A host without logind, such as a container, has no logins to miss.
 fn missed(login: Option<(PathBuf, LoginDir)>, logind: bool) -> Option<(PathBuf, LoginDir)> {
     login.filter(|(_, login)| logind && *login != LoginDir::Usable)
@@ -609,7 +636,21 @@ fn check_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 pub fn read_descriptor(name: &str) -> Result<Descriptor> {
-    read_descriptor_in(&runtime_dir(), name)
+    let dir = runtime_dir();
+    read_descriptor_in(&dir, name).map_err(|error| {
+        let absent = |dir: &Path| {
+            descriptor_path_in(dir, name).is_ok_and(|path| fs::symlink_metadata(path).is_err())
+        };
+        match service_runtime_dir() {
+            Some((service, ..)) if service != dir && absent(&dir) && !absent(&service) => {
+                anyhow::anyhow!(
+                    "{error:#}; a session named {name} is in {}, where a service started without XDG_RUNTIME_DIR keeps it and this login does not look: `capturefab doctor` shows the fix under runtime_dir",
+                    service.display()
+                )
+            }
+            _ => error,
+        }
+    })
 }
 fn read_descriptor_in(dir: &Path, name: &str) -> Result<Descriptor> {
     let path = descriptor_path_in(dir, name)?;

@@ -79,7 +79,7 @@ pub struct Cli {
         default_value = "auto"
     )]
     pub hwaccel: String,
-    /// Efficiency mode for this process and the camera workers it starts (default: CAPTUREFAB_EFFICIENCY, the desktop setting, then auto, which is efficient on small or low-power computers)
+    /// Efficiency mode for this process and the camera workers it starts (default: CAPTUREFAB_EFFICIENCY, then in the desktop window its Settings › Performance, then auto, which is efficient on small or low-power computers)
     #[arg(
         long,
         global = true,
@@ -957,7 +957,7 @@ pub enum Command {
         #[command(flatten)]
         storage: StorageArgs,
     },
-    /// Report interfaces, platform and compiled capabilities
+    /// Check this computer (efficiency mode, GPU, session and state folders, GigE and USB limits, storage budget) and print a fix under each warning; --json adds interfaces and compiled capabilities
     Doctor,
     /// Emit the versioned CLI and session automation contract as JSON
     Schema,
@@ -1878,8 +1878,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 let server = options.start(Duration::from_millis(cli.timeout_ms))?;
                 let stopped = Arc::new(AtomicBool::new(false));
                 let flag = stopped.clone();
-                ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed))
-                    .context("install signal handler")?;
+                on_quit_signal(move || flag.store(true, Ordering::Relaxed))?;
                 let mut ready = server.endpoints();
                 ready["ready"] = json!(true);
                 ready["preset"] = json!(options.preset);
@@ -1924,7 +1923,17 @@ pub fn run(mut cli: Cli) -> Result<()> {
         Some(Command::Compatibility { model }) => {
             return output(&cli, crate::compatibility::guide(model.as_deref()));
         }
-        Some(Command::Sessions) => return output(&cli, ipc::list()?),
+        Some(Command::Sessions) => {
+            let sessions = ipc::list()?;
+            if let Some((dir, names)) = ipc::sessions_elsewhere() {
+                eprintln!(
+                    "capturefab: these sessions run from {}, where a service started without XDG_RUNTIME_DIR keeps them and this login does not look: {}. `capturefab doctor` shows the fix under runtime_dir.",
+                    dir.display(),
+                    names.join(", ")
+                );
+            }
+            return output(&cli, sessions);
+        }
         Some(Command::Native) => return output(&cli, crate::media::native_devices()?),
         Some(Command::Scanners) => {
             ensure!(
@@ -2008,20 +2017,20 @@ pub fn run(mut cli: Cli) -> Result<()> {
             // A persistent session uploads what its cameras queue.
             #[cfg(feature = "uploads")]
             crate::upload::start();
+            // Ctrl-C, SIGTERM from `systemctl stop` or SIGHUP from a closed
+            // terminal; in place before serve says it is ready, so a signal
+            // sent once it is always finds the handler.
+            let (stop, stopped) = std::sync::mpsc::channel();
+            let h = handle.clone();
+            on_quit_signal(move || {
+                let _ = stop.send(());
+                h.shutdown();
+            })?;
             let mut ready = json!({"session":name,"pid":std::process::id(),"ready":true});
             if let Some(server) = &remote_server {
                 ready["remote_url"] = json!(format!("http://{}/", server.local_addr()));
             }
             output(&cli, ready)?;
-            // Ctrl-C, SIGTERM from `systemctl stop` or SIGHUP from a closed
-            // terminal.
-            let (stop, stopped) = std::sync::mpsc::channel();
-            let h = handle.clone();
-            ctrlc::set_handler(move || {
-                let _ = stop.send(());
-                h.shutdown();
-            })
-            .context("install signal handler")?;
             // After the handler, so Ctrl-C during the checks still cleans up.
             if !cli.json {
                 crate::doctor::print_warnings();
@@ -2100,7 +2109,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     // Ctrl-C stops direct acquisition and releases the camera rather than leaving control held.
     if let Some(h) = &client.local {
         let h = h.clone();
-        ctrlc::set_handler(move || h.shutdown()).context("install signal handler")?;
+        on_quit_signal(move || h.shutdown())?;
     }
     let result = match cli.command.as_ref().unwrap() {
         Command::Discover => client.call(SessionCommand::Discover {
@@ -2212,8 +2221,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             if let Some(until) = until {
                 let stopped = Arc::new(AtomicBool::new(false));
                 let flag = stopped.clone();
-                ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed))
-                    .context("install signal handler")?;
+                on_quit_signal(move || flag.store(true, Ordering::Relaxed))?;
                 if !cli.json {
                     eprintln!(
                         "Recording/forwarding for {}. Ctrl-C stops this encoder.",
@@ -2952,7 +2960,7 @@ fn schema() -> Value {
         "lifetime":"Runs in foreground until Ctrl-C or --duration; protocol listeners and decoder/encoder children are stopped on exit."
     });
     contract["scanners"] = json!({"enumeration":"scanners --json or discover --json; transport is scanner","backends":{"linux":"SANE scanimage (installed separately)","windows":"Windows Image Acquisition (WIA)","macos":"ImageCaptureCore (bundled native helper)"},"feature":"scanner; enabled by default","settings":{"ScanResolution":{"default":150,"range":[75,600],"unit":"dpi"},"ScanMode":{"default":"Color","choices":["Color","Gray","Lineart"]},"ScanSource":{"default":"Default","choices":["Default","Flatbed","Feeder"]}},"acquisition":"capture requests one page; count requests successive pages, including feeder pages; connecting/start never scans; forwarding and auto exposure are unsupported","timeout":"Use --timeout-ms 60000 for physical scans; GUI scanner timeout defaults to 60000. Each page has its own deadline and timeout cancels the helper.","outputs":"Existing capture image formats, destinations and storage quotas; no PDF/OCR conversion","limits":{"frame_bytes":134217728,"shared_ring_default_bytes_per_slot":134217728},"compatibility":"Driver-dependent settings; unsupported resolutions, modes and source names fail without silent fallback. SANE source names vary between drivers."});
-    contract["storage"] = json!({"default":crate::storage::StoragePolicy::default(),"scope":"All Capturefab-owned capture and recording files across output directories, recorded in this user's state directory. Reservations count toward quota. Existing/unowned/modified files are never deleted.","recording_file_cap_default":crate::media::default_recording_cap(),"on_full":["stop","delete-oldest"],"status":"capturefab storage --json","error":"storage_full; exit 6","free_space_floor":crate::storage::FREE_SPACE_FLOOR,"free_bytes":"storage --json reports free space on the disk of the default capture folder (~/Capturefab), or null. Every save must leave free_space_floor bytes free on its own disk, counting what active recordings may still write; delete-oldest removes the oldest owned files on that disk to keep it, except on Windows, and not again on a disk where that freed no space until a save there fits."});
+    contract["storage"] = json!({"default":crate::storage::StoragePolicy::default(),"scope":"All Capturefab-owned capture and recording files across output directories, recorded in this user's state directory. Reservations count toward quota. Existing/unowned/modified files are never deleted.","recording_file_cap_default":crate::media::default_recording_cap(),"recording_cut":"A recording that reaches its maximum file size (storage_full) or fails to write stops, and keeps the video written until then, recorded in the ledger and queued for upload like a finished file","on_full":["stop","delete-oldest"],"status":"capturefab storage --json","error":"storage_full; exit 6","free_space_floor":crate::storage::FREE_SPACE_FLOOR,"free_bytes":"storage --json reports free space on the disk of the default capture folder (~/Capturefab), or null. Every save must leave free_space_floor bytes free on its own disk, counting what active recordings may still write; delete-oldest removes the oldest owned files on that disk to keep it, except on Windows, and not again on a disk where that freed no space until a save there fits."});
     #[cfg(feature = "uploads")]
     {
         contract["uploads"] = json!({
@@ -3005,7 +3013,7 @@ fn schema() -> Value {
     contract["efficiency"] = json!({
         "cli":"--efficiency auto|smooth|efficient (global)",
         "environment":crate::efficiency::ENV,
-        "precedence":"--efficiency, then CAPTUREFAB_EFFICIENCY, then the desktop setting (Settings > Performance), then auto; an unknown CAPTUREFAB_EFFICIENCY value means auto",
+        "precedence":"--efficiency, then CAPTUREFAB_EFFICIENCY, then, in the desktop window only, its setting (Settings > Performance), then auto; serve and direct commands do not read the desktop setting; an unknown CAPTUREFAB_EFFICIENCY value means auto",
         "auto":"efficient with at most 2 CPU cores, at most 2 GiB of memory, the OS low-power or battery-saver mode, or a desktop runtime hint (software rendering, or a preview that keeps falling behind); running on battery alone stays smooth",
         "scope":"The process that parses it, such as the desktop window, serve or a direct command, and the camera workers it starts, which are told efficient whenever that process resolved efficient; a running session keeps its own setting, and its workers follow when it changes, for decoders they start afterwards and from the next embedding. In workers, efficient decodes each live stream with one thread, picks a faster libx264 preset and limits automatic capture's CPU embedding to a fifth of one core instead of half; the session polls its workers for status every 500 ms instead of 250 ms while a camera streams or a view watches, and every 2 s instead of 1 s otherwise. In the desktop window it draws at most 15 camera frames a second in a camera's view and 5 per overview tile, keeps a scaled-down picture to 1280 pixels on its long side, checks for new frames less often and skips animations. Scaled-down previews, desktop and remote, keep one pixel of each block instead of averaging. Captures and recordings keep every frame in every mode.",
         "status":"doctor --json efficiency {setting,efficient,reasons}"
@@ -3321,8 +3329,7 @@ fn log_command(cli: &Cli) -> Result<()> {
     let handle = SessionHandle::new();
     let stopped = Arc::new(AtomicBool::new(false));
     let flag = stopped.clone();
-    ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed))
-        .context("install signal handler")?;
+    on_quit_signal(move || flag.store(true, Ordering::Relaxed))?;
     let result = crate::signals::log::run(&handle, &options, &stopped);
     handle.shutdown();
     output(cli, result?)
@@ -3847,6 +3854,33 @@ fn display_available() -> bool {
         || ["DISPLAY", "WAYLAND_DISPLAY", "WAYLAND_SOCKET"]
             .iter()
             .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+/// Run `handler` on Ctrl-C, SIGTERM (`systemctl stop`) or SIGHUP (a closed
+/// terminal). A SIGHUP this process started out ignoring, as under `nohup`,
+/// stays ignored: whoever started it asked it to outlive its terminal.
+pub(crate) fn on_quit_signal(handler: impl FnMut() + Send + 'static) -> Result<()> {
+    #[cfg(unix)]
+    let hangup_ignored = hangup_ignored();
+    ctrlc::set_handler(handler).context("install signal handler")?;
+    #[cfg(unix)]
+    if hangup_ignored {
+        // SAFETY: setting a standard signal's disposition to ignore has no
+        // preconditions.
+        unsafe {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        }
+    }
+    Ok(())
+}
+#[cfg(unix)]
+fn hangup_ignored() -> bool {
+    // SAFETY: a null new action only reads the current one into `old`.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut old) == 0
+            && old.sa_sigaction == libc::SIG_IGN
+    }
 }
 
 /// How long a wait loop sleeps before it checks again: a second, or until
