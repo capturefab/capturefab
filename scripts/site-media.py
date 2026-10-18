@@ -61,6 +61,7 @@ def record(binary, scene, temp, frames, fps):
     for key in ("CAPTUREFAB_SESSION", "CAPTUREFAB_EXECUTABLE", "CAPTUREFAB_CAMERA"):
         env.pop(key, None)
     env.update(CAPTUREFAB_SESSION_DIR=str(temp / "sessions"),
+               CAPTUREFAB_CACHE_DIR=str(temp / "cache"),
                CAPTUREFAB_SCREENSHOT_SCENE=scene["scene"],
                CAPTUREFAB_SCREENSHOT_SIZE="1100x700",
                CAPTUREFAB_SCREENSHOT_FRAMES=str(frames),

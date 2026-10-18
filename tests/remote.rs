@@ -1010,6 +1010,7 @@ fn serve_finds_the_browser_client_beside_its_executable_from_any_directory() {
     assets(&bin);
     let embedded = Command::new(&executable)
         .env("CAPTUREFAB_SESSION_DIR", root.join("sessions"))
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .args(["--json", "doctor"])
         .output()
         .unwrap();

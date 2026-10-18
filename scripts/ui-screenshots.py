@@ -228,6 +228,7 @@ def main():
         with tempfile.TemporaryDirectory(prefix="capturefab-ui-review-") as temporary:
             env = {key: value for key, value in os.environ.items() if not key.startswith("CAPTUREFAB_") and key not in {"OPENAI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY"}}
             env.update(CAPTUREFAB_SESSION_DIR=str(Path(temporary) / "sessions"),
+                       CAPTUREFAB_CACHE_DIR=str(Path(temporary) / "cache"),
                        CAPTUREFAB_SCREENSHOT_SCENE=f"{appearance},{scene.words}",
                        CAPTUREFAB_SCREENSHOT_SIZE=f"{size[0]}x{size[1]}",
                        CAPTUREFAB_UI_SCALE=scale)

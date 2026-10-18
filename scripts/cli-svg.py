@@ -25,6 +25,7 @@ def transcript(binary):
     with tempfile.TemporaryDirectory(prefix='capturefab-cli-svg-') as temp:
         env = {k: v for k, v in os.environ.items() if not k.startswith('CAPTUREFAB_')}
         env['CAPTUREFAB_SESSION_DIR'] = str(Path(temp) / 'sessions')
+        env['CAPTUREFAB_CACHE_DIR'] = str(Path(temp) / 'cache')
         lines = []
         for args in COMMANDS:
             result = subprocess.run([str(binary), *args], cwd=temp, env=env, capture_output=True, text=True, timeout=120)
