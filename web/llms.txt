@@ -142,6 +142,7 @@ A remote file is never replaced; FTP rename can replace on some servers, so use 
 Persistent sessions return local capture results before upload completion; inspect the upload queue.
 `uploads --json` has `destinations:{NAME:{pending,uploading,failed,waiting_bytes,next_attempt,last_error}}` over every queued upload; `next_attempt` is in Unix seconds.
 A failing destination backs off as a whole for uploads it already tried, while new ones still go ahead; `uploads retry --now` retries waiting uploads at once, and `uploads retry` retries failed ones at once.
+An item queued while the storage ledger was busy has `unheld:true` until the uploader holds it back from retention.
 
 Captures and recordings share a storage budget across processes with the same `CAPTUREFAB_SESSION_DIR`.
 Defaults are 10 GiB and 10,000 files; each recording defaults to a 512 MiB file limit.

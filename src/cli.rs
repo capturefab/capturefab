@@ -2877,7 +2877,7 @@ fn schema() -> Value {
             "status":"{pending,uploading,failed,waiting_bytes,uploaded,uploaded_bytes,failures,last_error,destinations:{NAME:{pending,uploading,failed,waiting_bytes,next_attempt,last_error}},items:[newest 200],uploader_running,completed_seq,recent_completed:[newest 20]}",
             "destinations":"Counts every queued upload per destination. next_attempt is when its next waiting upload may start, in Unix seconds: at or before now while one is due, later while the destination backs off after a failure, which holds back only uploads it already tried, null when none waits.",
             "retry":"{retried}: failed uploads made due again; --now also starts uploads waiting to retry and ends their destinations' backoff",
-            "unheld":"An item queued while the storage ledger was busy carries unheld:true until the uploader holds it back from retention"
+            "unheld":"An item queued while the storage ledger was busy carries unheld:true until the uploader holds it back from retention, or finds the ledger no longer has the file"
         });
     }
     contract["scheduling"] = json!({"cli":"capture --at RFC3339 | --delay 30s; --interval 10s -n 100","lifetime":"Schedules run while the GUI, serve session or direct CLI process remains running; jobs are not persisted across exit.","interval":"First time plus captured count times interval; zero interval captures consecutive frames. All frames must fall within 10 years. A past first timestamp starts immediately. Durations must resolve to whole milliseconds. Each job has a per-frame transport timeout.","states":["pending","running","complete","cancelled","failed"]});
