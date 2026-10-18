@@ -24,6 +24,9 @@ const KEYCHAIN_SERVICE: &str = "capturefab-s3";
 /// Files above this size use multipart upload, in parts of `PART_BYTES`.
 const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
 const PART_BYTES: u64 = 16 * 1024 * 1024;
+/// Files up to this size are read once and checked in memory before they are
+/// sent; larger single uploads are hashed first, then read again as the body.
+const BUFFERED_PUT: u64 = 16 * 1024 * 1024;
 const MAX_RESPONSE: u64 = 1024 * 1024;
 
 pub use crate::transfer::{Permanent, retryable};
@@ -725,16 +728,13 @@ impl Client {
             return self.upload_parts(path, key, sha256, size);
         }
         let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let actual = hash_reader(&mut file)?;
-        ensure!(
-            actual == sha256,
-            Permanent(format!(
-                "{} changed after it was queued; not uploaded",
-                path.display()
-            ))
-        );
-        file.seek(SeekFrom::Start(0))?;
-        let mut body = (&mut file).take(size);
+        let mut body: Box<dyn Read> = if size <= BUFFERED_PUT {
+            Box::new(std::io::Cursor::new(read_queued(file, size, sha256, path)?))
+        } else {
+            ensure!(hash_reader(&mut file)? == sha256, changed(path));
+            file.seek(SeekFrom::Start(0))?;
+            Box::new(file.take(size))
+        };
         let mut headers = vec![
             ("content-length", size.to_string()),
             ("content-type", content_type(path).to_string()),
@@ -751,15 +751,10 @@ impl Client {
         }
     }
 
+    /// Upload in parts, hashing the file as they are read: completion waits
+    /// for the whole hash, and a changed file aborts the upload instead.
     fn upload_parts(&self, path: &Path, key: &str, sha256: &str, size: u64) -> Result<()> {
         let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        ensure!(
-            hash_reader(&mut file)? == sha256,
-            Permanent(format!(
-                "{} changed after it was queued; not uploaded",
-                path.display()
-            ))
-        );
         if self.condition().is_none() {
             self.ensure_free(key)?;
         }
@@ -786,7 +781,6 @@ impl Client {
         let result = (|| -> Result<()> {
             let mut parts = Vec::new();
             let mut buffer = Vec::with_capacity(PART_BYTES as usize);
-            file.seek(SeekFrom::Start(0))?;
             let mut whole = Sha256::new();
             for number in 1.. {
                 buffer.clear();
@@ -905,6 +899,24 @@ impl crate::transfer::Uploader for Client {
             }
         ))
     }
+}
+
+/// A queued file read whole, unless it is no longer exactly the queued bytes.
+fn read_queued(reader: impl Read, size: u64, sha256: &str, path: &Path) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(size as usize);
+    reader.take(size + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 == size && hex(&Sha256::digest(&bytes)) == sha256,
+        changed(path)
+    );
+    Ok(bytes)
+}
+
+fn changed(path: &Path) -> Permanent {
+    Permanent(format!(
+        "{} changed after it was queued; not uploaded",
+        path.display()
+    ))
 }
 
 /// Hex SHA-256 of a reader's remaining bytes.
@@ -1162,6 +1174,19 @@ mod tests {
                     }
                     let mut body = vec![0; length];
                     std::io::Read::read_exact(&mut reader, &mut body).unwrap();
+                    // A bodiless POST may come chunked: skip to its last chunk.
+                    if headers.iter().any(|h| h == "transfer-encoding") {
+                        loop {
+                            let mut size = String::new();
+                            reader.read_line(&mut size).unwrap();
+                            let size = usize::from_str_radix(size.trim(), 16).unwrap();
+                            let mut chunk = vec![0; size + 2];
+                            std::io::Read::read_exact(&mut reader, &mut chunk).unwrap();
+                            if size == 0 {
+                                break;
+                            }
+                        }
+                    }
                     let line: Vec<&str> = request.split_whitespace().collect();
                     log.lock().unwrap().push(format!(
                         "{} {} [{}]",
@@ -1173,7 +1198,7 @@ mod tests {
                     let length = if line[0] == "HEAD" { 0 } else { reply.len() };
                     write!(
                         out,
-                        "HTTP/1.1 {status} Scripted\r\ncontent-length: {length}\r\n\r\n{}",
+                        "HTTP/1.1 {status} Scripted\r\netag: \"scripted\"\r\ncontent-length: {length}\r\n\r\n{}",
                         &reply[..length]
                     )
                     .unwrap();
@@ -1315,6 +1340,63 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert!(seen[1].starts_with("PUT /camera-archive/line-1/a.png"));
         assert!(!seen[1].contains("if-none-match"), "{seen:?}");
+    }
+
+    /// Counts the bytes read through it.
+    struct Counted<R>(R, std::rc::Rc<std::cell::Cell<u64>>);
+    impl<R: Read> Read for Counted<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.0.read(buffer)?;
+            self.1.set(self.1.get() + read as u64);
+            Ok(read)
+        }
+    }
+
+    #[test]
+    fn a_small_upload_reads_its_file_once() {
+        let path = Path::new("/staged/a.png");
+        let sha = hex(&Sha256::digest(b"frame"));
+        let read = std::rc::Rc::new(std::cell::Cell::new(0));
+        let reader = Counted(&b"frame"[..], read.clone());
+        assert_eq!(read_queued(reader, 5, &sha, path).unwrap(), b"frame");
+        assert_eq!(read.get(), 5);
+        for (bytes, size) in [(&b"frame!"[..], 5), (b"fram", 5), (b"frane", 5)] {
+            let error = read_queued(bytes, size, &sha, path).unwrap_err();
+            assert!(!retryable(&error) && error.to_string().contains("changed"));
+        }
+        // A changed file is refused before anything is sent.
+        let (bucket, seen) = scripted(&[200]);
+        let (path, _) = upload_file();
+        let error = client(&bucket)
+            .upload(&path, "line-1/a.png", &"0".repeat(64), 5)
+            .unwrap_err();
+        assert!(!retryable(&error), "{error:#}");
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn multipart_upload_completes_only_with_the_queued_bytes() {
+        let started = "<InitiateMultipartUploadResult><UploadId>u1</UploadId></InitiateMultipartUploadResult>";
+        let (path, sha) = upload_file();
+        // The whole-file hash is checked as the parts go up; a mismatch
+        // aborts the upload instead of completing it.
+        let (bucket, seen) = scripted_with(&[(200, started), (200, ""), (204, "")]);
+        let error = client(&bucket)
+            .upload_parts(&path, "line-1/a.bin", &"0".repeat(64), 5)
+            .unwrap_err();
+        assert!(!retryable(&error) && error.to_string().contains("changed during upload"));
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert!(seen[0].starts_with("POST /camera-archive/line-1/a.bin?uploads"));
+        assert!(seen[1].starts_with("PUT /camera-archive/line-1/a.bin?partNumber=1&uploadId=u1"));
+        assert!(seen[2].starts_with("DELETE /camera-archive/line-1/a.bin?uploadId=u1"));
+        let (bucket, seen) = scripted_with(&[(200, started), (200, ""), (200, "<Done/>")]);
+        client(&bucket)
+            .upload_parts(&path, "line-1/a.bin", &sha, 5)
+            .unwrap();
+        assert!(
+            seen.lock().unwrap()[2].starts_with("POST /camera-archive/line-1/a.bin?uploadId=u1")
+        );
     }
 
     #[test]
