@@ -19,7 +19,7 @@ use std::{
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        mpsc::RecvTimeoutError,
+        mpsc::{self, Receiver, RecvTimeoutError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -35,6 +35,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 // Out of descriptors and similar accept failures repeat at once; pause instead of spinning.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+// How long Drop waits for its wakeup connect, and then for accept to see it.
+const WAKE_TIMEOUT: Duration = Duration::from_secs(1);
 // One cached preview per camera and format; a viewer of a camera beyond
 // this re-encodes as before.
 const PREVIEW_SLOTS: usize = 16;
@@ -111,6 +113,8 @@ pub fn validate_web_root(root: &Path) -> Result<PathBuf> {
 pub struct Server {
     address: SocketAddr,
     quitting: Arc<AtomicBool>,
+    /// Signalled once the accept loop has stopped.
+    stopped: Receiver<()>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -137,6 +141,7 @@ impl Server {
             previews: Previews::default(),
         });
         let active = Arc::new(AtomicUsize::new(0));
+        let (done, stopped) = mpsc::channel();
         // Accept blocks instead of polling; Drop wakes it with a loopback connect.
         // Client handlers use blocking I/O with deadlines so partial reads and
         // backpressure cannot truncate requests or responses.
@@ -198,6 +203,7 @@ impl Server {
                         }
                     }
                 }
+                let _ = done.send(());
                 for client in clients {
                     let _ = client.join();
                 }
@@ -206,6 +212,7 @@ impl Server {
         Ok(Self {
             address,
             quitting,
+            stopped,
             thread: Some(server_thread),
         })
     }
@@ -219,11 +226,14 @@ impl Drop for Server {
     fn drop(&mut self) {
         self.quitting.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
-            // Unblock accept(). If even a loopback connect fails, detach rather
-            // than risk joining a thread that can never wake.
-            if TcpStream::connect_timeout(&wake_address(self.address), Duration::from_secs(1))
+            // Unblock accept(). Another socket on the loopback port can take
+            // that connect instead (BSD lets 127.0.0.1 bind beside 0.0.0.0),
+            // so unless accept is seen to stop, detach rather than risk
+            // joining a thread that can never wake.
+            let woke = TcpStream::connect_timeout(&wake_address(self.address), WAKE_TIMEOUT)
                 .is_ok()
-            {
+                && self.stopped.recv_timeout(WAKE_TIMEOUT).is_ok();
+            if woke {
                 let _ = thread.join();
             }
         }
@@ -1566,6 +1576,39 @@ mod tests {
             wake_address("100.64.0.1:8787".parse().unwrap()),
             "100.64.0.1:8787".parse().unwrap()
         );
+        handle.shutdown();
+    }
+
+    #[test]
+    fn dropping_the_server_returns_when_another_socket_takes_its_wakeup() {
+        let root = TempWebRoot::new();
+        let handle = SessionHandle::new();
+        let server = Server::start(
+            handle.clone(),
+            "0.0.0.0:0".parse().unwrap(),
+            WebRoot::Folder(root.0.clone()),
+        )
+        .unwrap();
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, server.local_addr().port()));
+        // BSD lets this bind beside 0.0.0.0 and take its loopback connects;
+        // Linux refuses it, so there the wakeup cannot go astray.
+        let Ok(shadow) = TcpListener::bind(loopback) else {
+            drop(server);
+            handle.shutdown();
+            return;
+        };
+        let (dropped, done) = mpsc::channel();
+        thread::spawn(move || {
+            drop(server);
+            let _ = dropped.send(());
+        });
+        assert!(
+            done.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "drop waited for a wakeup another socket accepted"
+        );
+        // A connect of its own lets the detached thread finish.
+        drop(shadow);
+        let _ = TcpStream::connect_timeout(&loopback, Duration::from_millis(200));
         handle.shutdown();
     }
 
