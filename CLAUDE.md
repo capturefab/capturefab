@@ -19,8 +19,8 @@ FFmpeg stays a separate executable. Never enable nonfree FFmpeg components: the 
 ## Commands
 
 ```sh
-cargo build                                                   # desktop (default features: gui, usb, scanner, jpeg, nvjpeg, vaapi, videotoolbox, s3, ftp, sftp, parquet, modbus, mqtt, opcua, mtconnect)
-cargo build --release --no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,parquet,modbus,mqtt,opcua,mtconnect  # headless
+cargo build                                                   # desktop (default features: gui, usb, scanner, jpeg, nvjpeg, vaapi, videotoolbox, s3, ftp, sftp, parquet, modbus, mqtt, opcua, mtconnect, dinov2)
+cargo build --release --no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,parquet,modbus,mqtt,opcua,mtconnect,dinov2  # headless
 cargo test
 cargo test --test cli                                         # end-to-end binary tests (tests/cli.rs)
 cargo test --lib storage::                                    # unit tests in one module
@@ -32,6 +32,8 @@ python3 scripts/test-media.py --binary target/debug/capturefab [--srt]  # needs 
 ```
 
 Use the simulator (`--camera sim:0`, `sim:1`, ...) to exercise acquisition without hardware. Set `CAPTUREFAB_SESSION_DIR` to an isolated temp dir when running the binary manually or in tests; it holds session descriptors, worker shared-memory rings and the storage ledger.
+
+DINOv2 (auto capture): `python3 scripts/fetch-dinov2.py` downloads the pinned, checksummed `facebook/dinov2-small` weights to `target/models/dinov2-small/`; release builds embed them (or `CAPTUREFAB_DINOV2_WEIGHTS`), dev/test builds read that file in place, and unit tests use the tiny fixtures from `scripts/dinov2-fixtures.py`. GPU inference is wgpu compute (`src/autocapture/dinov2/dinov2.wgsl`) in the isolated `__embed` helper; the CPU path is the reference.
 
 FFmpeg: `build.rs` embeds `CAPTUREFAB_FFMPEG_BINARY` when set at build time, and `target/ffmpeg/<target>/bin/ffmpeg` only in release-profile builds; dev/test builds instead run that file in place when it exists, which keeps their binaries and links small. At runtime `CAPTUREFAB_FFMPEG=/abs/path/ffmpeg` overrides. Media tests requiring FFmpeg are `#[ignore]`d; run them with `-- --ignored` once FFmpeg is available. `scripts/build-ffmpeg.sh` builds the pinned, checksummed GPL FFmpeg; `scripts/release.py` packages releases.
 

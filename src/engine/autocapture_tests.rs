@@ -37,6 +37,8 @@ impl Fixture {
                     .to_string_lossy()
                     .into_owned(),
                 create,
+                // Pinned to the native descriptor, whose calibration these tests assume.
+                encoder: create.then_some(crate::autocapture::EncoderChoice::Native),
             })
             .unwrap()
     }
@@ -159,6 +161,12 @@ fn invalid_auto_capture_inputs_are_rejected_before_mutation() {
         SessionCommand::CaptureSessionOpen {
             path: ":memory:".into(),
             create: true,
+            encoder: None,
+        },
+        SessionCommand::CaptureSessionOpen {
+            path: "resume.duckdb".into(),
+            create: false,
+            encoder: Some(crate::autocapture::EncoderChoice::Dinov2),
         },
         SessionCommand::ReviewCapture { id: 0, keep: true },
     ] {

@@ -636,7 +636,12 @@ pub enum WorkflowCommand {
 #[derive(Debug, Subcommand)]
 pub enum CaptureSessionCommand {
     /// Create a new camera-bound DuckDB session; existing files are never overwritten
-    New { path: PathBuf },
+    New {
+        path: PathBuf,
+        /// Image encoder: auto uses the bundled DINOv2 model, on the GPU when possible
+        #[arg(long, value_enum, default_value_t = crate::autocapture::EncoderChoice::Auto)]
+        encoder: crate::autocapture::EncoderChoice,
+    },
     /// Resume examples, feedback and pending reviews from an existing DuckDB session
     Resume { path: PathBuf },
     /// Close and checkpoint the active capture database
@@ -1359,13 +1364,17 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
     crate::session::validate_timeout(cli.timeout_ms)?;
     let command = match &cli.command {
         Some(Command::CaptureSession { command }) => Some(match command {
-            CaptureSessionCommand::New { path } | CaptureSessionCommand::Resume { path } => {
+            CaptureSessionCommand::New { path, .. } | CaptureSessionCommand::Resume { path } => {
                 SessionCommand::CaptureSessionOpen {
                     path: path
                         .to_str()
                         .context("capture session path must be valid UTF-8")?
                         .into(),
                     create: matches!(command, CaptureSessionCommand::New { .. }),
+                    encoder: match command {
+                        CaptureSessionCommand::New { encoder, .. } => Some(*encoder),
+                        _ => None,
+                    },
                 }
             }
             CaptureSessionCommand::Close => SessionCommand::CaptureSessionClose,
@@ -2654,7 +2663,7 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
 }
 fn doctor() -> Value {
     let interfaces=if_addrs::get_if_addrs().map(|items|items.into_iter().filter_map(|i|match i.addr{if_addrs::IfAddr::V4(a)=>Some(json!({"name":i.name,"ip":a.ip,"netmask":a.netmask,"broadcast":a.broadcast})),_=>None}).collect::<Vec<_>>()).unwrap_or_default();
-    json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"scanner":cfg!(feature="scanner"),"wgpu":cfg!(feature="gui"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox"),"s3":cfg!(feature="s3"),"ftp":cfg!(feature="ftp"),"sftp":cfg!(feature="sftp"),"parquet":cfg!(feature="parquet"),"modbus":cfg!(feature="modbus"),"mqtt":cfg!(feature="mqtt"),"opcua":cfg!(feature="opcua"),"mtconnect":cfg!(feature="mtconnect")},"signals":crate::signals::compiled_protocols(),"scanners":crate::scanner::doctor(),"jpeg":jpeg_backends(),"session_directory":ipc::session_dir(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox. Document scanning uses installed platform scanner drivers (SANE scanimage on Linux).","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}})
+    json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"scanner":cfg!(feature="scanner"),"wgpu":cfg!(feature="gui"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox"),"s3":cfg!(feature="s3"),"ftp":cfg!(feature="ftp"),"sftp":cfg!(feature="sftp"),"parquet":cfg!(feature="parquet"),"modbus":cfg!(feature="modbus"),"mqtt":cfg!(feature="mqtt"),"opcua":cfg!(feature="opcua"),"mtconnect":cfg!(feature="mtconnect"),"dinov2":cfg!(feature="dinov2")},"auto_capture":crate::autocapture::doctor(),"signals":crate::signals::compiled_protocols(),"scanners":crate::scanner::doctor(),"jpeg":jpeg_backends(),"session_directory":ipc::session_dir(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox. Document scanning uses installed platform scanner drivers (SANE scanimage on Linux).","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}})
 }
 /// JPEG encoders available to this build and host, best first.
 fn jpeg_backends() -> Value {
@@ -2753,13 +2762,20 @@ fn schema() -> Value {
         "status":"forwarding_since_ms per camera and at the top level while forwarding"
     });
     contract["capture_session"] = json!({
-        "cli":"--session NAME [--camera ID] capture-session new PATH.duckdb | resume PATH.duckdb | close | teach | auto [--pause] [--sensitivity 0.5] [--cooldown-ms 2000] | review [--id ID] | keep ID | discard ID",
+        "cli":"--session NAME [--camera ID] capture-session new PATH.duckdb [--encoder auto|dinov2|native] | resume PATH.duckdb | close | teach | auto [--pause] [--sensitivity 0.5] [--cooldown-ms 2000] | review [--id ID] | keep ID | discard ID",
+        "encoders":{
+            "auto":"default for new sessions: dinov2 when the build bundles it (release builds do), otherwise native",
+            "dinov2":"L2-normalized CLS embedding of Meta's DINOv2 ViT-S/14 (facebook/dinov2-small, Apache-2.0), bundled in the executable; nothing is downloaded. Frames are squashed to 224x224 and ImageNet-normalized, then embedded on the GPU (wgpu: Metal, Vulkan or DX12) in an isolated helper process, or on the CPU when no hardware GPU is usable, the helper fails or it misses its 2 s deadline. Sampling follows the camera at up to 30 frames per second; status reports accelerator and samples_per_second. CAPTUREFAB_DINOV2_GPU=0 forces the CPU",
+            "native":"84-value spatial color/edge descriptor sampled at up to 4 frames per second",
+            "persistence":"The encoder, descriptor dimensions and a SHA-256 fingerprint of the model weights and configuration are stored in the session. Resume fails if the running build bundles a different model; the encoder of an existing session never changes",
+            "doctor":"doctor reports auto_capture.default_encoder and auto_capture.dinov2 {bundled,model,fingerprint,license,gpu:{available,adapter|reason}}"
+        },
         "scope":"Camera-bound persistent controls; connect the camera in a GUI/serve session first. Temporary --direct workers are rejected.",
         "storage":"One .duckdb file stores raw saved frames, descriptors, capture decisions, settings and background prototypes. New refuses existing paths; resume requires an existing compatible session for this camera. Close checkpoints the database. Discard removes raw pixels while retaining negative descriptors and the decision.",
         "paths":"CLI and RPC database paths resolve in the calling terminal; workflow database paths resolve beside the workflow file.",
-        "learning":"Manual training captures and kept suggestions are positive examples; discarded suggestions are negative examples. Pending suggestions do not train the model. The built-in model is a native visual-descriptor nearest-example baseline with background novelty; no pretrained neural weights are downloaded.",
+        "learning":"Manual training captures and kept suggestions are positive examples; discarded suggestions are negative examples. Pending suggestions do not train the model. Scoring is a session-local nearest-example model with background novelty over the session's encoder; the encoder itself is never trained, and Capturefab downloads no weights.",
         "controls":"Auto capture is independent of auto exposure. auto enables acquisition; --pause pauses suggestions and keeps examples. Sensitivity and cooldown default to 0.5 and 2000ms on each auto command. Resume restores saved settings; hardware must be reconnected.",
-        "status":"status.capture_session and cameras[].capture_session; null when no capture database is open",
+        "status":"status.capture_session and cameras[].capture_session ({...,encoder:\"dinov2\"|\"native\",model,accelerator?,samples_per_second?}); null when no capture database is open",
         "review":"Returns {capture:null|{id,score,reason,width,height,rgba},capture_session:...}; rgba is a base64-encoded 480x360-or-smaller RGBA preview. Review IDs address pending captures; stale or repeated decisions fail.",
         "limits":{"sensitivity":[0.0,1.0],"cooldown_ms":[250,3600000],"pending":200,"stored_pixel_bytes":2147483648_u64},
         "research":"docs/auto-capture-models.md"
@@ -2888,7 +2904,8 @@ fn schema() -> Value {
         json!({"op":"replay_camera_change","token":"TOKEN_FROM_CAMERA_CHANGE","undo":true}),
     ]);
     commands.extend([
-        json!({"op":"capture_session_open","path":"session.duckdb","create":true}),
+        json!({"op":"capture_session_open","path":"session.duckdb","create":true,"encoder":"auto"}),
+        json!({"op":"capture_session_open","path":"session.duckdb","create":true,"encoder":"native"}),
         json!({"op":"capture_session_open","path":"session.duckdb","create":false}),
         json!({"op":"capture_session_close"}),
         json!({"op":"capture_example","timeout_ms":2000}),
@@ -3910,7 +3927,15 @@ mod tests {
         for (args, expected) in [
             (
                 vec!["new", "session.duckdb"],
-                json!({"op":"capture_session_open","path":"session.duckdb","create":true}),
+                json!({"op":"capture_session_open","path":"session.duckdb","create":true,"encoder":"auto"}),
+            ),
+            (
+                vec!["new", "session.duckdb", "--encoder", "dinov2"],
+                json!({"op":"capture_session_open","path":"session.duckdb","create":true,"encoder":"dinov2"}),
+            ),
+            (
+                vec!["new", "session.duckdb", "--encoder", "native"],
+                json!({"op":"capture_session_open","path":"session.duckdb","create":true,"encoder":"native"}),
             ),
             (
                 vec!["resume", "session.duckdb"],
@@ -3985,8 +4010,20 @@ mod tests {
         let mut command = prepare(&cli).unwrap().unwrap();
         caller_output(&mut command).unwrap();
         assert!(
-            matches!(command, SessionCommand::CaptureSessionOpen { path, create: false } if std::path::Path::new(&path).is_absolute() && path.ends_with("relative.duckdb"))
+            matches!(command, SessionCommand::CaptureSessionOpen { path, create: false, encoder: None } if std::path::Path::new(&path).is_absolute() && path.ends_with("relative.duckdb"))
         );
+        for args in [
+            vec!["new", "s.duckdb", "--encoder", "dinov3"],
+            vec!["new", "s.duckdb", "--model", "weights"],
+            vec!["resume", "s.duckdb", "--encoder", "native"],
+        ] {
+            let cli = Cli::try_parse_from(
+                ["capturefab", "--session", "bench", "capture-session"]
+                    .into_iter()
+                    .chain(args.iter().copied()),
+            );
+            assert!(cli.is_err() || prepare(&cli.unwrap()).is_err(), "{args:?}");
+        }
     }
     #[test]
     fn capture_session_rejects_invalid_settings_ids_and_paths() {

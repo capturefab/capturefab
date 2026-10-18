@@ -19,6 +19,9 @@ fn app() -> Workbench {
         blocked_storage: false,
         state: "watching".into(),
         model: "Session exemplar kNN + background novelty".into(),
+        encoder: "native".into(),
+        accelerator: None,
+        samples_per_second: None,
     });
     app.sync_capture_session();
     app.auto_capture.open = true;

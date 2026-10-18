@@ -171,7 +171,10 @@ impl Workbench {
             pending_count: 8,
             blocked_storage: false,
             state: "watching".into(),
-            model: "Session exemplar kNN + background novelty".into(),
+            model: "Session exemplar kNN + background novelty (DINOv2 ViT-S/14 embedding, model c487d70950a8)".into(),
+            encoder: "dinov2".into(),
+            accelerator: Some("GPU: Apple M4 Max (Metal)".into()),
+            samples_per_second: Some(30.0),
         };
         if let Some(selected) = self
             .snapshot
@@ -297,7 +300,11 @@ impl Workbench {
                     self.send_to(
                         &camera,
                         Job::CaptureSessionOpen,
-                        SessionCommand::CaptureSessionOpen { path, create },
+                        SessionCommand::CaptureSessionOpen {
+                            path,
+                            create,
+                            encoder: None,
+                        },
                     );
                 }
             }
@@ -715,7 +722,9 @@ impl Workbench {
                     .align_y(Alignment::Center),
                 )
                 .push(tip(
-                    text(&status.model).size(style::CAPTION).color(p.secondary),
+                    text(model_caption(status))
+                        .size(style::CAPTION)
+                        .color(p.secondary),
                     "The model learns from examples and keep/discard feedback in this database.",
                 ));
             }
@@ -973,6 +982,20 @@ impl Workbench {
 #[path = "autocapture/accessibility_tests.rs"]
 mod accessibility_tests;
 
+/// The model, then where and how fast it is embedding frames, for example
+/// "DINOv2 ViT-S/14 ... · GPU: Apple M4 Max (Metal) · 30 frames/s".
+fn model_caption(status: &crate::autocapture::SessionStatus) -> String {
+    let mut caption = status.model.clone();
+    if let Some(accelerator) = &status.accelerator {
+        caption.push_str(" · ");
+        caption.push_str(accelerator);
+    }
+    if let Some(rate) = status.samples_per_second {
+        caption.push_str(&format!(" · {rate:.0} frames/s"));
+    }
+    caption
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,6 +1079,9 @@ mod tests {
             blocked_storage: false,
             state: "Learning".into(),
             model: "kNN".into(),
+            encoder: "native".into(),
+            accelerator: None,
+            samples_per_second: None,
         });
         app.sync_capture_session();
         app.auto_capture.open = true;

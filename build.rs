@@ -59,6 +59,40 @@ fn build_macos_scanner(out: &std::path::Path, target: &str) {
     assert!(status.success(), "cannot build macOS scanner helper");
 }
 
+/// Release builds embed the DINOv2 weights from scripts/fetch-dinov2.py (or
+/// `CAPTUREFAB_DINOV2_WEIGHTS`); development builds read that file in place,
+/// keeping their binaries small, as with FFmpeg.
+fn bundle_dinov2() {
+    println!("cargo:rustc-check-cfg=cfg(dinov2_embedded)");
+    println!("cargo:rerun-if-env-changed=CAPTUREFAB_DINOV2_WEIGHTS");
+    let default =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory"))
+            .join("target/models/dinov2-small/model.safetensors");
+    let release = env::var("PROFILE").is_ok_and(|p| p == "release");
+    if release && env::var_os("CAPTUREFAB_DINOV2_WEIGHTS").is_none() {
+        println!("cargo:rerun-if-changed={}", default.display());
+    }
+    let source = env::var_os("CAPTUREFAB_DINOV2_WEIGHTS")
+        .map(PathBuf::from)
+        .or_else(|| (release && default.is_file()).then(|| default.clone()));
+    if let Some(path) = source {
+        assert!(path.is_file(), "missing DINOv2 weights {}", path.display());
+        println!("cargo:rerun-if-changed={}", path.display());
+        println!("cargo:rustc-env=CAPTUREFAB_DINOV2_EMBED={}", path.display());
+        println!("cargo:rustc-cfg=dinov2_embedded");
+    } else {
+        if release {
+            println!(
+                "cargo:warning=DINOv2 weights are not bundled; run scripts/fetch-dinov2.py before building releases"
+            );
+        }
+        println!(
+            "cargo:rustc-env=CAPTUREFAB_DINOV2_PATH={}",
+            default.display()
+        );
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=CAPTUREFAB_FFMPEG_BINARY");
     println!("cargo:rerun-if-env-changed=CAPTUREFAB_FFMPEG_LICENSE");
@@ -74,6 +108,9 @@ fn main() {
         println!("cargo:rustc-link-arg-bin=capturefab={}", resource.display());
     }
     build_macos_scanner(&out, &target);
+    if env::var_os("CARGO_FEATURE_DINOV2").is_some() {
+        bundle_dinov2();
+    }
     if target.contains("apple-darwin") {
         let plist =
             PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory"))

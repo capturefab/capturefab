@@ -108,14 +108,83 @@ or define normality, but it adds a different input workflow and should not repla
 learning from the actual captures and review decisions.
 [WinCLIP paper](https://openaccess.thecvf.com/content/CVPR2023/html/Jeong_WinCLIP_Zero-Few-Shot_Anomaly_Classification_and_Segmentation_CVPR_2023_paper.html).
 
-## Implemented baseline and its limits
+## Implemented: bundled DINOv2 ViT-S/14 on the GPU
 
-The initial automatic capture implementation uses native image descriptors and a
-session-local nearest-example model. It learns nonparametrically by saving manual
-capture examples and review labels; it does not train a neural network, run
-PatchCore or EfficientAD, download DINO weights, or require a cloud service.
+New sessions use a frozen DINOv2 ViT-S/14 encoder (`--encoder auto`, the
+default, or `--encoder dinov2`); `--encoder native` keeps the descriptor below.
+This follows the shortlist above in choosing a frozen DINO encoder with a
+session-local nearest-example head. DINOv2 was chosen over DINOv3 because its
+standard weights are Apache-2.0 and ungated, so they can ship inside every
+build and users never download or license anything separately. A DINOv3
+variant was prototyped first: DINOv3's license requires redistributing the
+weights under its own terms and use restrictions, so it could only have been a
+separate user download.
 
-This baseline makes feedback immediate and keeps the feature usable offline.
+**Weights.** `scripts/fetch-dinov2.py` downloads `facebook/dinov2-small` at a
+pinned revision, verifies its SHA-256, converts it to float16 (44 MB,
+deterministic, also pinned) and fetches the Apache-2.0 license. Release builds
+embed the file in the executable; the license goes into
+`THIRD-PARTY-LICENSES.txt` and the model into the CycloneDX SBOM. float16
+storage changes embeddings by at most cosine 0.999998 against float32.
+
+**Runtime.** `src/autocapture/dinov2.rs` implements the transformers
+`Dinov2Model` forward pass natively: patch embedding, learned position
+embeddings resampled from the 37 x 37 pretraining grid to 16 x 16 with torch's
+bicubic interpolation, LayerScale and exact-erf GELU, all in float32. The same
+network runs on the GPU through wgpu compute shaders (`dinov2.wgsl`: a tiled,
+software-pipelined matrix product with fused bias/GELU/residual epilogues,
+LayerNorm, batched attention products and a row softmax), on Metal, Vulkan or
+DX12 with no vendor SDK. Every dispatch is recorded once; a frame is one
+600 KB upload, one submission and a 1.5 KB readback. GPU work runs in the
+`capturefab __embed` helper process, following the JPEG accelerators: requests
+have a 2 s deadline, and a helper that faults or misses it is abandoned and the
+session continues on the CPU. Frames use the CPU until the helper is ready.
+
+**Speed.** On an Apple M4 Max the GPU path measured about 100 embeddings per
+second (10 ms) in isolation, and a live session followed a 30 fps simulated
+camera at 30.0 samples per second. The CPU path measured about 100 ms per
+frame (roughly 7-10 samples per second). Sampling uses a fixed grid of up to
+30 per second that tolerates frames arriving a quarter interval early, so
+camera jitter does not halve the rate. Slower GPUs have not been measured.
+
+**Preprocessing and pooling.** Frames are converted to RGB, squashed to
+224 x 224 with an antialiased triangle filter (the reference processor resizes
+and center-crops; squashing keeps events at the frame edges), ImageNet-
+normalized, and represented by the L2-normalized final CLS token. Distances
+are half the chord between unit vectors: 0 is identical, 0.5 orthogonal.
+
+**Verification.** Committed tiny random-weight fixtures (a non-square patch
+grid against a larger position table, and the native grid) reproduce
+transformers outputs within 2e-5 on the CPU and 1e-4 on the GPU
+(`scripts/dinov2-fixtures.py` regenerates them). An ignored test checks the
+bundled weights against transformers within 1e-4 on both backends and asserts
+at least 30 GPU embeddings per second.
+
+**Calibration.** On ViT-S/14 CLS embeddings of composed scenes (a target pasted
+into a static background), distances were about 0.01-0.05 for exposure
+changes and strong per-pixel noise, 0.14-0.20 for the same target moved, 0.32
+for the target at 0.6x scale, 0.55-0.61 between the target scene and the empty
+background, and about 0.7 between unrelated images. A target at 0.35x scale
+moved the embedding 0.15 from the empty background, against 0.06 for the
+DINOv3 prototype. The session uses a similarity kernel width of 0.30,
+duplicate and background-prototype radii of 0.08 and a novelty scale of 0.40.
+These are first estimates from synthetic compositions, not results on user
+cameras.
+
+**Limits.** The CLS token describes the whole image, so targets covering a
+small part of the frame move the embedding little and can be missed. Without a
+usable GPU, sampling falls well below 30 per second. A session stores the
+encoder, embedding dimensions and a SHA-256 fingerprint of the weights and
+configuration; a build that bundles a different model refuses to resume it
+rather than mixing embedding spaces.
+
+## Native descriptor fallback and its limits
+
+The native encoder uses image descriptors and a session-local nearest-example
+model. It learns nonparametrically by saving manual capture examples and review
+labels; it does not train a neural network or require a cloud service.
+
+This keeps the feature usable offline without model files.
 It analyzes a preview of at most 64 × 64 pixels at up to four samples per second,
 with bounded banks of 256 positive and 256 negative examples and 64 background
 prototypes. Events shorter than the sampling interval and tiny image defects
@@ -129,10 +198,11 @@ review remains the source of truth.
 
 The portable session artifact is one DuckDB database containing the saved image
 bytes, source/camera identity, frame metadata, descriptors, capture origin,
-pending/kept/discarded decisions, model/settings version, and review history.
-Resuming that file restores the examples and pending review queue. The live
-camera connection must be established again; a database cannot restore access to
-hardware that is unavailable.
+pending/kept/discarded decisions, encoder, model/settings version, and review
+history. Resuming that file restores the examples and pending review queue. The
+live camera connection must be established again; a database cannot restore
+access to hardware that is unavailable, and a DINOv2 session needs a build that
+bundles the same model.
 
 ## How to compare a future encoder
 

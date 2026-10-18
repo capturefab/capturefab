@@ -84,6 +84,9 @@ pub enum SessionCommand {
     CaptureSessionOpen {
         path: String,
         create: bool,
+        /// New sessions only: the image encoder (default auto).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encoder: Option<crate::autocapture::EncoderChoice>,
     },
     CaptureSessionClose,
     /// Capture preference learning is independent of automatic exposure.
@@ -381,12 +384,20 @@ impl SessionCommand {
     /// their owners when the command executes.
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::CaptureSessionOpen { path, .. } => {
+            Self::CaptureSessionOpen {
+                path,
+                create,
+                encoder,
+            } => {
                 ensure!(
                     !path.trim().is_empty()
                         && !path.chars().any(char::is_control)
                         && path != ":memory:",
                     "capture session requires a database file path"
+                );
+                ensure!(
+                    *create || encoder.is_none(),
+                    "the encoder is chosen when a capture session is created; resume uses the session's own"
                 );
                 ensure!(
                     std::path::Path::new(path)

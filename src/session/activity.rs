@@ -522,7 +522,7 @@ fn describe(command: &SessionCommand) -> (&'static str, String) {
             }
             .into(),
         ),
-        CaptureSessionOpen { path, create } => (
+        CaptureSessionOpen { path, create, .. } => (
             "capture_session_open",
             format!(
                 "{} capture session {path}",

@@ -29,6 +29,15 @@ fn main() {
         }
         return;
     }
+    #[cfg(feature = "dinov2")]
+    if std::env::args().nth(1).as_deref() == Some(capturefab::autocapture::dinov2::helper::ARGUMENT)
+    {
+        if let Err(e) = capturefab::autocapture::dinov2::helper::run_helper() {
+            eprintln!("capturefab DINOv2 GPU helper: {e:#}");
+            std::process::exit(1)
+        }
+        return;
+    }
     #[cfg(feature = "vaapi")]
     if std::env::args().nth(1).as_deref() == Some("__vajpeg") {
         if let Err(e) = capturefab::vajpeg::run_helper() {

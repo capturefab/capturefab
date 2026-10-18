@@ -14,7 +14,10 @@ impl SessionFile {
         )))
     }
     fn create(&self) -> CaptureSession {
-        CaptureSession::open(&self.0, "test-camera", true).unwrap()
+        CaptureSession::open(&self.0, "test-camera", true, NATIVE).unwrap()
+    }
+    fn resume(&self) -> Result<CaptureSession> {
+        CaptureSession::open(&self.0, "test-camera", false, None)
     }
 }
 impl Drop for SessionFile {
@@ -23,6 +26,8 @@ impl Drop for SessionFile {
         let _ = std::fs::remove_file(format!("{}.wal", self.0.display()));
     }
 }
+/// Pinned so these tests keep the native descriptor's calibration.
+const NATIVE: Option<EncoderChoice> = Some(EncoderChoice::Native);
 fn solid(value: u8) -> Frame {
     Frame {
         id: 42,
@@ -83,7 +88,7 @@ fn session_is_a_single_resumable_duckdb_with_exact_sensor_frames() {
         !Path::new(&format!("{}.wal", file.0.display())).exists(),
         "clean session consists of one file"
     );
-    let mut resumed = CaptureSession::open(&file.0, "test-camera", false).unwrap();
+    let mut resumed = file.resume().unwrap();
     assert!(resumed.status().unwrap().enabled);
     assert_eq!(resumed.status().unwrap().cooldown_ms, 250);
     assert_eq!(
@@ -100,7 +105,7 @@ fn session_is_a_single_resumable_duckdb_with_exact_sensor_frames() {
     assert_eq!(resumed.status().unwrap().kept_count, 1);
     assert_eq!(resumed.positive.len(), 2);
     drop(resumed);
-    let resumed = CaptureSession::open(&file.0, "test-camera", false).unwrap();
+    let resumed = file.resume().unwrap();
     assert_eq!(resumed.status().unwrap().manual_count, 1);
     assert_eq!(resumed.status().unwrap().kept_count, 1);
     assert_eq!(resumed.positive.len(), 2);
@@ -152,7 +157,7 @@ fn manual_preference_novelty_and_rejection_drive_scoring() {
         "a stale review cannot change a final decision"
     );
     drop(session);
-    let resumed = CaptureSession::open(&file.0, "test-camera", false).unwrap();
+    let resumed = file.resume().unwrap();
     assert_eq!(resumed.negative.len(), 1);
     assert_eq!(resumed.background.len(), 1);
     assert_eq!(resumed.status().unwrap().discarded_count, 1);
@@ -247,7 +252,7 @@ fn out_of_order_reviews_use_the_same_bounded_example_bank_after_resume() {
         );
         session.checkpoint().unwrap();
     }
-    let resumed = CaptureSession::open(&file.0, "test-camera", false).unwrap();
+    let resumed = file.resume().unwrap();
     assert_eq!(resumed.positive.len(), 256);
     assert!(
         resumed
@@ -307,7 +312,7 @@ fn full_review_queue_and_pixel_budget_apply_backpressure() {
 #[test]
 fn malformed_session_settings_identity_versions_and_descriptors_are_rejected() {
     let file = SessionFile::new();
-    assert!(CaptureSession::open(&file.0, "test-camera", false).is_err());
+    assert!(file.resume().is_err());
     {
         let mut session = file.create();
         assert!(session.configure(true, f64::NAN, 250).is_err());
@@ -324,26 +329,26 @@ fn malformed_session_settings_identity_versions_and_descriptors_are_rejected() {
         session.manual(&solid(1)).unwrap();
         assert_eq!(session.status().unwrap().manual_count, 1);
     }
-    assert!(CaptureSession::open(&file.0, "other-camera", false).is_err());
-    assert!(CaptureSession::open(&file.0, "test-camera", true).is_err());
+    assert!(CaptureSession::open(&file.0, "other-camera", false, None).is_err());
+    assert!(CaptureSession::open(&file.0, "test-camera", true, NATIVE).is_err());
     {
         let db = Connection::open(&file.0).unwrap();
         db.execute("UPDATE capture_session SET schema_version = 99", [])
             .unwrap();
     }
-    assert!(CaptureSession::open(&file.0, "test-camera", false).is_err());
+    assert!(file.resume().is_err());
     {
         let db = Connection::open(&file.0).unwrap();
-        db.execute("UPDATE capture_session SET schema_version = 1", [])
+        db.execute("UPDATE capture_session SET schema_version = 2", [])
             .unwrap();
         db.execute("UPDATE captures SET descriptor = ?", params![vec![0_u8; 3]])
             .unwrap();
     }
-    assert!(CaptureSession::open(&file.0, "test-camera", false).is_err());
-    assert!(decode(&vec![0; FEATURES * 4 - 1]).is_err());
+    assert!(file.resume().is_err());
+    assert!(Encoder::Native.decode(&vec![0; FEATURES * 4 - 1]).is_err());
     let mut nonfinite = vec![0_u8; FEATURES * 4];
     nonfinite[..4].copy_from_slice(&f32::NAN.to_le_bytes());
-    assert!(decode(&nonfinite).is_err());
+    assert!(Encoder::Native.decode(&nonfinite).is_err());
 }
 
 #[test]
@@ -379,7 +384,7 @@ fn descriptor_handles_supported_raw_formats_and_is_bounded() {
                 .iter()
                 .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
         );
-        assert_eq!(decode(&encode(&feature)).unwrap(), feature);
+        assert_eq!(Encoder::Native.decode(&encode(&feature)).unwrap(), feature);
     }
     assert!(
         descriptor(&Frame {
@@ -391,4 +396,247 @@ fn descriptor_handles_supported_raw_formats_and_is_bounded() {
         })
         .is_err()
     );
+}
+
+#[test]
+fn version_1_sessions_upgrade_in_place_as_native() {
+    let file = SessionFile::new();
+    let feature = descriptor(&solid(120)).unwrap();
+    {
+        // The schema Capturefab wrote before encoder choice existed.
+        let db = Connection::open(&file.0).unwrap();
+        db.execute_batch(
+            "CREATE TABLE capture_session (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                schema_version UINTEGER NOT NULL, descriptor_version UINTEGER NOT NULL,
+                camera VARCHAR NOT NULL, created_ms UBIGINT NOT NULL,
+                enabled BOOLEAN NOT NULL, sensitivity DOUBLE NOT NULL, cooldown_ms UBIGINT NOT NULL
+            );
+            CREATE TABLE captures (
+                id UBIGINT PRIMARY KEY, created_ms UBIGINT NOT NULL,
+                source VARCHAR NOT NULL CHECK (source IN ('manual', 'automatic')),
+                label VARCHAR NOT NULL CHECK (label IN ('manual', 'pending', 'kept', 'discarded')),
+                frame_id UBIGINT NOT NULL, width UINTEGER NOT NULL, height UINTEGER NOT NULL,
+                pixel_format UINTEGER NOT NULL, timestamp_ns UBIGINT NOT NULL,
+                data BLOB, data_bytes UBIGINT NOT NULL, descriptor BLOB NOT NULL, score DOUBLE NOT NULL,
+                reason VARCHAR NOT NULL, reviewed_ms UBIGINT
+            );
+            CREATE TABLE background (id UINTEGER PRIMARY KEY, descriptor BLOB NOT NULL);
+            INSERT INTO capture_session VALUES (1, 1, 1, 'test-camera', 0, true, 0.25, 500);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO captures VALUES (1, 0, 'manual', 'manual', 1, 32, 32, ?, 0, ?, 1024, ?, 1.0, 'test', NULL)",
+            params![MONO8, solid(120).data, encode(&feature)],
+        )
+        .unwrap();
+    }
+    let session = file.resume().unwrap();
+    let status = session.status().unwrap();
+    assert_eq!(status.encoder, "native");
+    assert_eq!((status.manual_count, status.cooldown_ms), (1, 500));
+    assert_eq!(session.positive, vec![feature]);
+    drop(session);
+    let version: u32 = Connection::open(&file.0)
+        .unwrap()
+        .query_row("SELECT schema_version FROM capture_session", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+}
+
+#[test]
+fn the_encoder_is_chosen_only_when_a_session_is_created() {
+    let file = SessionFile::new();
+    file.create();
+    let error = CaptureSession::open(&file.0, "test-camera", false, NATIVE)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("fixed when a capture session is created"),
+        "{error}"
+    );
+    let resumed = file.resume().unwrap();
+    assert_eq!(resumed.status().unwrap().encoder, "native");
+    assert!(resumed.status().unwrap().accelerator.is_none());
+}
+
+#[cfg(not(feature = "dinov2"))]
+#[test]
+fn builds_without_dinov2_use_the_native_descriptor() {
+    let file = SessionFile::new();
+    let error = CaptureSession::open(&file.0, "test-camera", true, Some(EncoderChoice::Dinov2))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("not supported"), "{error}");
+    assert!(!file.0.exists(), "a failed encoder leaves no session file");
+    let session = CaptureSession::open(&file.0, "test-camera", true, None).unwrap();
+    assert_eq!(session.status().unwrap().encoder, "native");
+}
+
+/// Under `cfg(test)` the bundled model is the tiny committed fixture.
+#[cfg(feature = "dinov2")]
+mod dinov2_sessions {
+    use super::*;
+
+    fn create(file: &SessionFile, choice: Option<EncoderChoice>) -> CaptureSession {
+        CaptureSession::open(&file.0, "test-camera", true, choice).unwrap()
+    }
+    /// Wait for the background embedding, then decide on it as if it had
+    /// finished at `finished`.
+    fn settle(session: &mut CaptureSession, finished: Instant) -> Option<u64> {
+        let (frame, at, _, feature) = session.embedder.as_mut().unwrap().wait().unwrap();
+        session
+            .decide_late(&frame, feature.unwrap(), at, finished)
+            .unwrap()
+    }
+
+    #[test]
+    fn auto_uses_the_bundled_model_and_reports_where_it_runs() {
+        let file = SessionFile::new();
+        let mut session = create(&file, None);
+        session.manual(&color([220, 40, 40])).unwrap();
+        let status = session.status().unwrap();
+        assert_eq!(status.encoder, "dinov2");
+        assert!(status.model.contains("DINOv2"), "{}", status.model);
+        assert_eq!(
+            status.accelerator.as_deref(),
+            Some("CPU"),
+            "unit tests never start the GPU helper"
+        );
+    }
+
+    #[test]
+    fn embeds_off_thread_and_captures_after_the_result_arrives() {
+        let file = SessionFile::new();
+        let mut session = create(&file, Some(EncoderChoice::Dinov2));
+        session.manual(&color([220, 40, 40])).unwrap();
+        ready(&mut session);
+        let t = Instant::now() + Duration::from_secs(31);
+        assert_eq!(
+            session.observe_at(&color([220, 40, 40]), t).unwrap(),
+            None,
+            "the frame is only submitted on this call"
+        );
+        assert!(
+            session.embedder.as_ref().unwrap().busy,
+            "one frame is in flight; sampling waits for it"
+        );
+        let id = settle(&mut session, t + Duration::from_millis(40))
+            .expect("the exact manual target is suggested once embedded");
+        let review = session.review_capture(id).unwrap().unwrap();
+        assert_eq!(
+            review.frame.data,
+            color([220, 40, 40]).data,
+            "the sampled frame is stored"
+        );
+        // A result that arrives after the scene moved on is dropped.
+        session.last_capture = None;
+        session.recent.clear();
+        session.last_sample = None;
+        session
+            .observe_at(&color([220, 40, 40]), t + Duration::from_secs(40))
+            .unwrap();
+        assert_eq!(settle(&mut session, t + Duration::from_secs(43)), None);
+        assert_eq!(session.status().unwrap().pending_count, 1);
+        // Pausing discards the frame in flight, even when re-armed at once.
+        session.last_capture = None;
+        session.recent.clear();
+        session.last_sample = None;
+        let now = Instant::now();
+        session.observe_at(&color([220, 40, 40]), now).unwrap();
+        session.configure(false, 0.5, 250).unwrap();
+        session.configure(true, 0.5, 250).unwrap();
+        assert_eq!(settle(&mut session, now + Duration::from_millis(100)), None);
+        assert_eq!(session.status().unwrap().pending_count, 1);
+        // The same frame sampled after re-arming is captured.
+        session.last_sample = None;
+        let later = Instant::now();
+        session.observe_at(&color([220, 40, 40]), later).unwrap();
+        assert!(settle(&mut session, later + Duration::from_millis(100)).is_some());
+    }
+
+    #[test]
+    fn a_single_triggered_frame_is_captured_without_a_later_frame() {
+        let file = SessionFile::new();
+        let mut session = create(&file, Some(EncoderChoice::Dinov2));
+        session.manual(&color([220, 40, 40])).unwrap();
+        ready(&mut session);
+        session.recent.clear();
+        assert_eq!(session.observe(&color([220, 40, 40])).unwrap(), None);
+        // No further frames arrive; the worker loop polls, even seconds later.
+        let started = Instant::now();
+        let id = loop {
+            if let Some(id) = session.poll().unwrap() {
+                break id;
+            }
+            assert!(started.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(session.review_capture(id).unwrap().is_some());
+    }
+
+    #[test]
+    fn samples_follow_the_camera_at_up_to_30_frames_per_second() {
+        let file = SessionFile::new();
+        let mut session = create(&file, Some(EncoderChoice::Dinov2));
+        session.manual(&color([220, 40, 40])).unwrap();
+        ready(&mut session);
+        let t = Instant::now();
+        session.observe_at(&color([0, 0, 0]), t).unwrap();
+        session.embedder.as_mut().unwrap().wait();
+        assert!(
+            !session.embedder.as_ref().unwrap().busy
+                && session.last_sample.is_some_and(|last| last == t),
+        );
+        session
+            .observe_at(&color([0, 0, 0]), t + Duration::from_millis(20))
+            .unwrap();
+        assert!(
+            !session.embedder.as_ref().unwrap().busy,
+            "a 60 fps frame is skipped"
+        );
+        // A 30 fps camera's frame arriving a few milliseconds early still counts.
+        session
+            .observe_at(&color([0, 0, 0]), t + Duration::from_millis(30))
+            .unwrap();
+        assert!(
+            session.embedder.as_ref().unwrap().busy,
+            "the next 30 fps slot"
+        );
+        session.embedder.as_mut().unwrap().wait();
+        // ...and the grid, not the early arrival, sets the following slot.
+        session
+            .observe_at(&color([0, 0, 0]), t + Duration::from_millis(48))
+            .unwrap();
+        assert!(!session.embedder.as_ref().unwrap().busy);
+        session
+            .observe_at(&color([0, 0, 0]), t + Duration::from_millis(60))
+            .unwrap();
+        assert!(session.embedder.as_ref().unwrap().busy);
+    }
+
+    #[test]
+    fn resume_requires_the_model_the_session_learned_with() {
+        let file = SessionFile::new();
+        {
+            let mut session = create(&file, None);
+            session.manual(&color([220, 40, 40])).unwrap();
+        }
+        let resumed = file.resume().unwrap();
+        assert_eq!(resumed.status().unwrap().encoder, "dinov2");
+        assert_eq!(resumed.positive.len(), 1);
+        drop(resumed);
+        // A session from a build that bundled another model is refused
+        // rather than mixing embedding spaces.
+        Connection::open(&file.0)
+            .unwrap()
+            .execute("UPDATE capture_session SET model_fingerprint = 'abc'", [])
+            .unwrap();
+        let error = file.resume().err().unwrap().to_string();
+        assert!(error.contains("learned with DINOv2 model abc"), "{error}");
+    }
 }

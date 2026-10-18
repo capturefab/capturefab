@@ -57,6 +57,24 @@ capturefab --camera 192.168.1.10 serve --name bench --stream
 capturefab --session bench status --json
 ```
 
+## Learn automatic captures
+
+```sh
+capturefab --session gui --camera sim:0 capture-session new /data/line.duckdb --json
+capturefab --session gui --camera sim:0 capture-session teach --json
+capturefab --session gui --camera sim:0 capture-session auto --sensitivity 0.5 --cooldown-ms 2000 --json
+capturefab --session gui --camera sim:0 capture-session review --json
+capturefab --session gui --camera sim:0 capture-session keep 2 --json
+capturefab --session gui --camera sim:0 capture-session discard 3 --json
+capturefab --session gui --camera sim:0 capture-session close --json
+```
+
+A capture session is one camera-bound `.duckdb` file of sensor frames, descriptors and keep/discard decisions; it needs a GUI or `serve` session with the camera already connected. `teach` saves a positive example, auto capture queues similar frames as pending suggestions, and only `keep` (positive) and `discard` (negative) decisions train it. `status --json` shows `capture_session` with `state`, counts, `encoder` and `model`.
+
+`capture-session new PATH [--encoder auto|dinov2|native]` picks how frames are compared. `auto` (default) and `dinov2` use the DINOv2 ViT-S/14 model bundled in the executable; nothing is downloaded. Embeddings run on the GPU (Metal, Vulkan or DX12) in an isolated helper process when one is usable, and on the CPU otherwise or after the helper faults or misses its deadline; sampling follows the camera at up to 30 frames per second on a GPU and slower on the CPU. `status --json` reports `capture_session.accelerator` (`GPU: ...`, `CPU` or `CPU (starting GPU)`) and `samples_per_second`; `doctor --json` reports `auto_capture.default_encoder` and `auto_capture.dinov2` (`bundled`, `model`, `fingerprint`, `license`, `gpu`). `CAPTUREFAB_DINOV2_GPU=0` forces the CPU. `native` uses a color/edge descriptor at up to 4 Hz. `--encoder dinov2` in a build without the model is exit 5.
+
+Each session stores its encoder and a SHA-256 fingerprint of the model. `resume PATH` refuses a session learned with a different bundled model (exit 1) so incompatible embeddings are never mixed; the encoder of an existing session never changes, so create a new session to switch. Sessions from earlier versions upgrade in place as `native`. RPC operations are `capture_session_open` (`path`, `create`, optional `encoder`), `capture_session_close`, `capture_example`, `auto_capture`, `capture_review` and `review_capture`.
+
 ## Apply repeatable JSON workflows
 
 Use workflow files for ordered multi-camera setup and acquisition without shell escaping. [The workflow guide](https://github.com/capturefab/capturefab/blob/main/docs/cli-workflows.md) includes [validated examples](https://github.com/capturefab/capturefab/tree/main/examples/workflows) for timelapse, scanner feeders and bounded recording.

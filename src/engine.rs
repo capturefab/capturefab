@@ -226,6 +226,17 @@ impl WorkerHandle {
         Ok(Some(id))
     }
     fn observe_capture(&self, frame: &Frame) {
+        self.drive_capture(|session| session.observe(frame));
+    }
+    /// Finish background embeddings while no frames arrive (slow, triggered
+    /// or stopped cameras).
+    fn poll_capture(&self) {
+        self.drive_capture(crate::autocapture::CaptureSession::poll);
+    }
+    fn drive_capture(
+        &self,
+        step: impl FnOnce(&mut crate::autocapture::CaptureSession) -> Result<Option<u64>>,
+    ) {
         let mut guard = self
             .capture_session
             .lock()
@@ -233,7 +244,7 @@ impl WorkerHandle {
         let Some(session) = guard.as_mut() else {
             return;
         };
-        match session.observe(frame) {
+        match step(session) {
             Ok(Some(_)) => {
                 if let Err(error) = self.publish_capture(session) {
                     self.log("error", format!("Auto capture status: {error:#}"));
@@ -496,7 +507,11 @@ fn process_plain(
     command: SessionCommand,
 ) -> Result<Value> {
     match command {
-        SessionCommand::CaptureSessionOpen { path, create } => {
+        SessionCommand::CaptureSessionOpen {
+            path,
+            create,
+            encoder,
+        } => {
             let c = camera_mut(camera)?;
             ensure!(
                 !c.is_scanner(),
@@ -511,6 +526,7 @@ fn process_plain(
                 std::path::Path::new(&path),
                 &c.info.id,
                 create,
+                encoder,
             )?;
             if session.status()?.enabled {
                 c.start()?;
@@ -1644,6 +1660,7 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
         {
             publish_auto(&h, controller);
         }
+        h.poll_capture();
         let scheduled_scan = jobs.iter().any(|j| j.info.active() && j.deadline.is_some());
         if let Some(c) = camera
             .as_mut()

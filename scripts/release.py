@@ -22,7 +22,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 SEMVER = re.compile(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?')
 TARGETS = [(os_, arch, variant) for os_, arches in [('linux', ['x86_64', 'aarch64', 'armv7']), ('macos', ['x86_64', 'aarch64']), ('windows', ['x86_64', 'aarch64'])] for arch in arches for variant in ['desktop', 'headless']]
-FEATURES = {'desktop': ['--features', 'wgpu'], 'headless': ['--no-default-features', '--features', 'usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,parquet,modbus,mqtt,opcua,mtconnect']}
+FEATURES = {'desktop': ['--features', 'wgpu'], 'headless': ['--no-default-features', '--features', 'usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,parquet,modbus,mqtt,opcua,mtconnect,dinov2']}
 # The oldest systems release executables must start on: glibc 2.28 (RHEL,
 # Rocky and Alma 8, Debian 10, Ubuntu 18.10 and newer) and the macOS
 # deployment targets. Windows executables must not need the Visual C++
@@ -262,6 +262,23 @@ MEDIA = [('FFMPEG', 'ffmpeg', 'GPL-3.0-or-later', 'https://ffmpeg.org/'), ('X264
          ('NV_HEADERS', 'nv-codec-headers', 'MIT', 'https://github.com/FFmpeg/nv-codec-headers'), ('VULKAN_HEADERS', 'Vulkan-Headers', 'Apache-2.0 OR MIT', 'https://github.com/KhronosGroup/Vulkan-Headers'),
          ('LIBVPL', 'libvpl', 'MIT', 'https://github.com/intel/libvpl'), ('AMF', 'AMF', 'MIT', 'https://github.com/GPUOpen-LibrariesAndSDKs/AMF')]
 
+DINOV2_SCRIPT = ROOT / 'scripts' / 'fetch-dinov2.py'
+DINOV2_DIR = ROOT / 'target' / 'models' / 'dinov2-small'
+
+def dinov2_pins():
+    """REPOSITORY, REVISION and SHA-256 pins of the bundled DINOv2 weights."""
+    return dict(re.findall(r'^([A-Z0-9_]+) = "([^"]*)"$', DINOV2_SCRIPT.read_text(), re.M))
+
+def dinov2_weights():
+    """The DINOv2 weights every release embeds, fetched by scripts/fetch-dinov2.py
+    when absent and verified against its pinned output SHA-256."""
+    pins, model = dinov2_pins(), DINOV2_DIR / 'model.safetensors'
+    if not model.is_file() or digest(model) != pins['OUTPUT_SHA256']:
+        run([sys.executable, str(DINOV2_SCRIPT)], cwd=ROOT)
+    if not model.is_file() or digest(model) != pins['OUTPUT_SHA256']:
+        raise RuntimeError(f'{model} does not match the pinned DINOv2 weights')
+    return model
+
 def cyclonedx(metadata, lock, recipe, ver, repository, serial):
     """A CycloneDX 1.6 SBOM for every platform of a release: the Rust crates
     linked with all features, with Cargo.lock checksums, and the media
@@ -289,11 +306,16 @@ def cyclonedx(metadata, lock, recipe, ver, repository, serial):
         if pinned.get(f'{prefix}_SHA256'):
             item['hashes'] = [dict(alg='SHA-256', content=pinned[f'{prefix}_SHA256'])]
         media.append(item)
+    pins = dinov2_pins()
+    models = [dict(type='machine-learning-model', **{'bom-ref': 'model:dinov2-small'}, name=pins['REPOSITORY'], version=pins['REVISION'], scope='required',
+                   licenses=[dict(license=dict(id='Apache-2.0'))], hashes=[dict(alg='SHA-256', content=pins['OUTPUT_SHA256'])],
+                   description='DINOv2 ViT-S/14 weights converted to float16 by scripts/fetch-dinov2.py and embedded in each executable for automatic capture.',
+                   externalReferences=[dict(type='distribution', url=f"https://huggingface.co/{pins['REPOSITORY']}")])]
     root = dict(type='application', **{'bom-ref': 'capturefab'}, name='capturefab', version=ver, licenses=[dict(license=dict(id='MIT'))], purl=f'pkg:github/{repository}@v{ver}')
     return {'bomFormat': 'CycloneDX', 'specVersion': '1.6', 'serialNumber': f'urn:uuid:{serial}', 'version': 1,
             'metadata': dict(timestamp=dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'), tools=dict(components=[dict(type='application', name='capturefab scripts/release.py')]), component=root),
-            'components': crates + media,
-            'dependencies': [dict(ref='capturefab', dependsOn=[c['bom-ref'] for c in crates] + ['media:ffmpeg']), dict(ref='media:ffmpeg', dependsOn=[m['bom-ref'] for m in media if m['bom-ref'] != 'media:ffmpeg'])]}
+            'components': crates + media + models,
+            'dependencies': [dict(ref='capturefab', dependsOn=[c['bom-ref'] for c in crates] + ['media:ffmpeg', 'model:dinov2-small']), dict(ref='media:ffmpeg', dependsOn=[m['bom-ref'] for m in media if m['bom-ref'] != 'media:ffmpeg'])]}
 
 def sbom(output, ver, repository):
     metadata = run(['cargo', 'metadata', '--format-version', '1', '--locked', '--all-features'], cwd=ROOT, capture_output=True, text=True).stdout
@@ -321,6 +343,9 @@ def license_notices(metadata):
 def notices(target, variant):
     metadata = run(['cargo', 'metadata', '--format-version', '1', '--locked', '--filter-platform', target, *FEATURES[variant]], cwd=ROOT, capture_output=True, text=True).stdout
     text = license_notices(json.loads(metadata))
+    pins = dinov2_pins()
+    dinov2_weights()
+    text += f"\n===== DINOv2 ViT-S/14 model weights ({pins['REPOSITORY']}@{pins['REVISION']}, Apache-2.0), embedded for automatic capture =====\n\n{(DINOV2_DIR / 'LICENSE').read_text(encoding='utf-8').strip()}\n"
     if variant == 'desktop':
         text += f"\n===== Phosphor Icons 2.1.2 font (MIT), assets/fonts =====\n\n{(ROOT / 'assets/fonts/Phosphor-LICENSE.txt').read_text(encoding='utf-8').strip()}\n"
     return text
@@ -567,7 +592,7 @@ def build(args):
                 binary = Path(args.binary).resolve()
             else:
                 command = ['cargo', 'build', '--locked', '--release', '--target', args.target, *FEATURES[variant]]
-                env = dict(os.environ, CAPTUREFAB_FFMPEG_BINARY=str((Path(args.ffmpeg_bundle) / 'bin' / ('ffmpeg.exe' if args.os == 'windows' else 'ffmpeg')).resolve()), CAPTUREFAB_FFMPEG_LICENSE=str((Path(args.ffmpeg_bundle) / 'licenses/NOTICE.txt').resolve()))
+                env = dict(os.environ, CAPTUREFAB_DINOV2_WEIGHTS=str(dinov2_weights()), CAPTUREFAB_FFMPEG_BINARY=str((Path(args.ffmpeg_bundle) / 'bin' / ('ffmpeg.exe' if args.os == 'windows' else 'ffmpeg')).resolve()), CAPTUREFAB_FFMPEG_LICENSE=str((Path(args.ffmpeg_bundle) / 'licenses/NOTICE.txt').resolve()))
                 run(command, cwd=ROOT, env=env)
                 binary = (ROOT / os.environ.get('CARGO_TARGET_DIR', 'target') / args.target / 'release' / ('capturefab.exe' if args.os == 'windows' else 'capturefab')).resolve()
             assets.append(package(args, binary, variant))
