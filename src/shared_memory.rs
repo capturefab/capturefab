@@ -8,21 +8,28 @@
 //! in the session directory that its creator keeps locked and removes;
 //! `sweep` removes files whose creator died.
 //!
-//! Publishing follows the reader. Every take counts as a poll. While the
+//! Publishing follows the reader. A watching take counts as a poll. While the
 //! reader has polled within `READER_IDLE` the writer copies every frame;
 //! otherwise it copies one keep-alive frame per `KEEP_ALIVE`, so a camera
-//! nobody watches costs no copies. The sequence counts every frame offered,
-//! published or not, so watchers still see acquisition move. Consumers rely on:
+//! nobody watches costs no copies. The sequence advances with every frame
+//! offered, published or not, so watchers still see acquisition move. The
+//! writer holds the newest frame it skipped and publishes it, under a new
+//! sequence, once the reader polls or asks, or a keep-alive is due, so a
+//! stream that goes quiet (stopped, or a triggered camera between triggers)
+//! still ends on its newest frame.
+//! Consumers rely on:
 //! - Continuous readers (GUI previews, the browser's 250 ms preview poll) keep
 //!   the ring watched and get current frames.
 //! - An occasional poller may get a keep-alive frame up to `KEEP_ALIVE` old.
-//!   Take one plainly only where that is acceptable; otherwise poll until
-//!   `fresh` (`SessionHandle::fresh_frame_for`), which happens within one
-//!   frame because the poll itself re-arms the writer.
+//!   Take one plainly only where that is acceptable; otherwise `ask` and take
+//!   without watching until a frame offered since arrives
+//!   (`SessionHandle::fresh_frame_for`). An ask publishes the next frame, or
+//!   the held one, without making the ring count as watched.
 //! - Frames a command captured are forced in, so a capture's own frame is the
 //!   newest one published (`capture -o -`).
 //! - A frame larger than a slot is replaced by a downscaled RGB8 preview
 //!   marked `preview_only`, which must never stand in for the captured frame.
+//!   `preview_of` gives the size and format of the frame it stands in for.
 use crate::types::{Frame, RGB8};
 use anyhow::{Context, Result, ensure};
 use memmap2::MmapRaw;
@@ -45,6 +52,7 @@ const SEQUENCE: usize = 16;
 const SKIPPED: usize = 20;
 const CANCEL: usize = 24;
 const POLLS: usize = 28;
+const WANT: usize = 32;
 const FREE: u32 = 0;
 const WRITING: u32 = 1;
 const READY: u32 = 2;
@@ -57,14 +65,14 @@ const READER_IDLE: Duration = Duration::from_secs(2);
 /// An unwatched ring still gets a frame this often.
 const KEEP_ALIVE: Duration = Duration::from_secs(1);
 
-/// What `write` did with a frame.
+/// What `write` or `flush` did with a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Published {
     /// Copied into a slot.
     Frame,
     /// Larger than a slot: a downscaled preview took its place.
     Preview,
-    /// Not copied: nobody is watching and no keep-alive is due.
+    /// Not copied: nobody is watching or asking and no keep-alive is due.
     Skipped,
 }
 
@@ -164,12 +172,18 @@ impl RingCounters {
     pub fn cancel(&self) {
         self.0.atomic(CANCEL).store(1, Ordering::Release);
     }
+    /// Ask the writer for its newest frame once, without watching: it
+    /// publishes the next frame it is offered, or the one it holds.
+    pub fn ask(&self) {
+        self.0.atomic(WANT).store(1, Ordering::Release);
+    }
 }
 
 #[derive(Clone, Copy)]
 struct Taken {
     sequence: u32,
-    preview: bool,
+    /// For a preview, the width, height and pixel format it stands in for.
+    source: Option<(u32, u32, u32)>,
 }
 
 pub struct SharedRing {
@@ -182,6 +196,10 @@ pub struct SharedRing {
     polls: u32,
     polled_at: Option<Instant>,
     published_at: Option<Instant>,
+    /// Writer: whether the last frame offered went uncopied, and that frame
+    /// once `hold` has it.
+    skipped: bool,
+    held: Option<Frame>,
     /// Reader: the frame last taken.
     taken: Option<Taken>,
 }
@@ -281,6 +299,8 @@ impl SharedRing {
             polls: 0,
             polled_at: None,
             published_at: None,
+            skipped: false,
+            held: None,
             taken: None,
         }
     }
@@ -433,27 +453,74 @@ impl SharedRing {
         self.polled_at
             .is_some_and(|at| now.duration_since(at) < READER_IDLE)
     }
-    /// Offer `frame` to the reader. It is copied while the reader polls, as
-    /// a keep-alive once per `KEEP_ALIVE` otherwise, and always with `force`,
-    /// for frames a command captured.
+    /// Whether to copy a frame now: the reader polls or asked for one, or a
+    /// keep-alive is due.
+    fn wanted(&mut self, now: Instant) -> bool {
+        self.watched(now)
+            || self.atomic(WANT).load(Ordering::Acquire) != 0
+            || self
+                .published_at
+                .is_none_or(|at| now.duration_since(at) >= KEEP_ALIVE)
+    }
+    /// Offer `frame` to the reader. It is copied while the reader polls or
+    /// has asked, as a keep-alive once per `KEEP_ALIVE` otherwise, and always
+    /// with `force`, for frames a command captured. A frame it skips can be
+    /// given to `hold`.
     pub fn write(&mut self, frame: &Frame, force: bool) -> Result<Published> {
+        // This frame supersedes any held one.
+        self.held = None;
         let now = Instant::now();
-        let watched = self.watched(now);
         let sequence = self.sequence().wrapping_add(1);
-        let due = self
-            .published_at
-            .is_none_or(|at| now.duration_since(at) >= KEEP_ALIVE);
-        if !(force || watched || due) {
+        let published = if force || self.wanted(now) {
+            self.copy(frame, sequence, now)
+        } else {
             self.atomic(SEQUENCE).store(sequence, Ordering::Release);
+            Ok(Published::Skipped)
+        };
+        self.skipped = matches!(published, Ok(Published::Skipped));
+        published
+    }
+    /// Keep the frame `write` just skipped, so a reader that polls or asks
+    /// later, or a keep-alive, still gets it after the stream goes quiet.
+    /// A frame that was copied is not kept.
+    pub fn hold(&mut self, frame: Frame) {
+        if self.skipped {
+            self.held = Some(frame);
+        }
+    }
+    /// The size of the frame `hold` kept, while it has one.
+    pub fn held_bytes(&self) -> Option<usize> {
+        self.held.as_ref().map(|frame| frame.data.len())
+    }
+    /// Publish the held frame if the reader polls or asked, or a keep-alive
+    /// is due. Call it while no frames arrive, such as between triggers.
+    pub fn flush(&mut self) -> Result<Published> {
+        let now = Instant::now();
+        if self.held.is_none() || !self.wanted(now) {
             return Ok(Published::Skipped);
         }
+        let frame = self.held.take().expect("a held frame");
+        // A new sequence, so watchers see it and readers know it is newer.
+        let published = self.copy(&frame, self.sequence().wrapping_add(1), now)?;
+        if published == Published::Skipped {
+            self.held = Some(frame);
+        } else {
+            self.skipped = false;
+        }
+        Ok(published)
+    }
+    fn copy(&mut self, frame: &Frame, sequence: u32, now: Instant) -> Result<Published> {
         let small = (frame.data.len() > self.capacity)
             .then(|| preview(frame, self.capacity))
             .transpose()?;
+        let watched = self.watched(now);
         let Some(slot) = self.claim(watched) else {
             self.atomic(SEQUENCE).store(sequence, Ordering::Release);
             return Ok(Published::Skipped);
         };
+        // This frame answers any ask made so far.
+        self.atomic(WANT).store(0, Ordering::Release);
+        let source = frame;
         let (frame, flags) = small.as_ref().map_or((frame, 0), |small| (small, PREVIEW));
         let b = self.base(slot);
         self.put(b + 4, &sequence.to_le_bytes());
@@ -464,6 +531,9 @@ impl SharedRing {
         self.put(b + 28, &(frame.data.len() as u32).to_le_bytes());
         self.put(b + 32, &frame.timestamp_ns.to_le_bytes());
         self.put(b + 40, &flags.to_le_bytes());
+        self.put(b + 44, &source.width.to_le_bytes());
+        self.put(b + 48, &source.height.to_le_bytes());
+        self.put(b + 52, &source.pixel_format.to_le_bytes());
         self.put(b + META, &frame.data);
         self.atomic(b).store(READY, Ordering::Release);
         self.atomic(SEQUENCE).store(sequence, Ordering::Release);
@@ -505,7 +575,14 @@ impl SharedRing {
     /// Returns false, leaving `frame` untouched, when no new frame is ready.
     /// Every call counts as a poll, which keeps the writer publishing.
     pub fn take_latest_into(&mut self, frame: &mut Frame) -> Result<bool> {
-        self.atomic(POLLS).fetch_add(1, Ordering::Relaxed);
+        self.take_into(frame, true)
+    }
+    /// `take_latest_into`, counting as a poll only with `watch`. One-off
+    /// readers take without watching and `ask` for a frame instead.
+    pub fn take_into(&mut self, frame: &mut Frame, watch: bool) -> Result<bool> {
+        if watch {
+            self.atomic(POLLS).fetch_add(1, Ordering::Relaxed);
+        }
         let mut newest: Option<(usize, u32)> = None;
         // Claim before inspecting non-atomic metadata. A writer may reclaim READY slots.
         for i in 0..SLOTS {
@@ -542,9 +619,10 @@ impl SharedRing {
             frame
                 .data
                 .extend_from_slice(self.map.bytes(b + META, length));
+            let preview = self.word(b + 40) & PREVIEW != 0;
             self.taken = Some(Taken {
                 sequence,
-                preview: self.word(b + 40) & PREVIEW != 0,
+                source: preview.then(|| (self.word(b + 44), self.word(b + 48), self.word(b + 52))),
             });
             Ok(())
         })();
@@ -555,7 +633,12 @@ impl SharedRing {
     /// The frame last taken is a downscaled stand-in for a frame larger than
     /// a slot, fit for display only.
     pub fn preview_only(&self) -> bool {
-        self.taken.is_some_and(|taken| taken.preview)
+        self.preview_of().is_some()
+    }
+    /// For a preview, the width, height and pixel format of the frame it
+    /// stands in for, which is what the camera delivers.
+    pub fn preview_of(&self) -> Option<(u32, u32, u32)> {
+        self.taken?.source
     }
     /// The frame last taken is the newest the writer was offered, rather
     /// than a keep-alive with newer frames skipped since.
@@ -565,6 +648,12 @@ impl SharedRing {
             Some(taken) => newest.wrapping_sub(taken.sequence) as i32 <= 0,
             None => newest == 0,
         }
+    }
+    /// The frame last taken was offered or published after the writer's
+    /// sequence read `sequence`.
+    pub fn taken_since(&self, sequence: u32) -> bool {
+        self.taken
+            .is_some_and(|taken| taken.sequence.wrapping_sub(sequence) as i32 > 0)
     }
 }
 
@@ -831,6 +920,65 @@ mod tests {
         assert_eq!(writer.preview_skipped(), 0);
     }
     #[test]
+    fn quiet_streams_still_end_on_their_newest_frame() {
+        let mut writer = SharedRing::create(&std::env::temp_dir(), 4096).unwrap();
+        let mut reader = writer.reader().unwrap();
+        assert_eq!(writer.write(&frame(1), false).unwrap(), Published::Frame);
+        // A copied frame is not held again.
+        writer.hold(frame(1));
+        assert_eq!(writer.write(&frame(2), false).unwrap(), Published::Skipped);
+        writer.hold(frame(2));
+        // Then no frame arrives: a stop, or a trigger that does not come.
+        assert_eq!(writer.flush().unwrap(), Published::Skipped);
+        // A viewer turns up to the keep-alive; its poll has frame 2 published
+        // although no newer frame is ever written.
+        assert_eq!(reader.take_latest().unwrap().unwrap().id, 1);
+        assert!(!reader.fresh());
+        assert_eq!(writer.flush().unwrap(), Published::Frame);
+        assert_eq!(reader.take_latest().unwrap().unwrap().id, 2);
+        assert!(reader.fresh());
+        assert_eq!(writer.flush().unwrap(), Published::Skipped);
+        // With nobody reading, the held frame is the next keep-alive.
+        writer.watched(Instant::now());
+        writer.polled_at = Some(Instant::now() - READER_IDLE);
+        assert_eq!(writer.write(&frame(3), false).unwrap(), Published::Skipped);
+        writer.hold(frame(3));
+        assert_eq!(writer.flush().unwrap(), Published::Skipped);
+        writer.published_at = Some(Instant::now() - KEEP_ALIVE);
+        assert_eq!(writer.flush().unwrap(), Published::Frame);
+        let mut taken = Frame::default();
+        assert!(reader.take_into(&mut taken, false).unwrap());
+        assert!(taken.id == 3 && reader.fresh());
+        assert_eq!(writer.preview_skipped(), 0);
+    }
+    #[test]
+    fn one_off_readers_ask_without_watching() {
+        let mut writer = SharedRing::create(&std::env::temp_dir(), 4096).unwrap();
+        let mut reader = writer.reader().unwrap();
+        writer.write(&frame(1), false).unwrap();
+        assert_eq!(writer.write(&frame(2), false).unwrap(), Published::Skipped);
+        let mut taken = Frame::default();
+        assert!(reader.take_into(&mut taken, false).unwrap());
+        assert!(taken.id == 1 && !reader.fresh());
+        let asked = reader.sequence();
+        reader.counters().ask();
+        assert_eq!(writer.write(&frame(3), false).unwrap(), Published::Frame);
+        // The ask was answered once, and the takes left the ring unwatched.
+        assert_eq!(writer.write(&frame(4), false).unwrap(), Published::Skipped);
+        assert!(reader.take_into(&mut taken, false).unwrap());
+        assert_eq!(taken.id, 3);
+        assert!(reader.taken_since(asked) && !reader.fresh());
+        // An ask between frames publishes the held one.
+        writer.hold(frame(4));
+        let asked = reader.sequence();
+        reader.counters().ask();
+        assert_eq!(writer.flush().unwrap(), Published::Frame);
+        assert!(reader.take_into(&mut taken, false).unwrap());
+        assert!(taken.id == 4 && reader.taken_since(asked) && reader.fresh());
+        // Unwatched, nothing a newer frame replaced was a loss.
+        assert_eq!(writer.preview_skipped(), 0);
+    }
+    #[test]
     fn captures_are_published_even_unwatched() {
         let mut writer = SharedRing::create(&std::env::temp_dir(), 4096).unwrap();
         let mut reader = writer.reader().unwrap();
@@ -855,6 +1003,7 @@ mod tests {
         assert_eq!(writer.write(&large, true).unwrap(), Published::Preview);
         let preview = reader.take_latest().unwrap().unwrap();
         assert!(reader.preview_only());
+        assert_eq!(reader.preview_of(), Some((80, 80, crate::types::MONO8)));
         assert_eq!((preview.id, preview.timestamp_ns), (7, 70));
         assert_eq!(preview.pixel_format, RGB8);
         assert!(preview.width < 80 && preview.height < 80);
@@ -866,6 +1015,7 @@ mod tests {
         writer.write(&frame(8), true).unwrap();
         reader.take_latest().unwrap().unwrap();
         assert!(!reader.preview_only());
+        assert_eq!(reader.preview_of(), None);
     }
     #[test]
     #[cfg(unix)]
