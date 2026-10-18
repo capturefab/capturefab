@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File, Metadata, OpenOptions},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -781,16 +781,8 @@ impl Locked {
             .iter()
             .rposition(|&byte| byte == b'\n')
             .map_or(0, |end| end + 1);
-        for line in tail[..complete].split_inclusive(|&byte| byte == b'\n') {
-            let record: Record = serde_json::from_slice(line).context("invalid storage journal record; preserve storage.json and storage.journal and inspect them before resetting ownership")?;
-            if record.seq <= self.ledger.sequence {
-                continue;
-            }
-            ensure!(
-                record.seq == self.ledger.sequence + 1,
-                "storage journal is missing records; preserve storage.json and storage.journal and inspect them before resetting ownership"
-            );
-            self.apply(record)?;
+        if complete > 0 {
+            self.apply(&tail[..complete])?;
         }
         let end = offset + complete as u64;
         if complete < tail.len() {
@@ -800,35 +792,57 @@ impl Locked {
         self.position.offset = end;
         Ok(())
     }
-    fn apply(&mut self, record: Record) -> Result<()> {
-        match (record.put, record.remove) {
-            (Some(entry), None) => {
-                check_entry(&entry)?;
-                let mut index = None;
-                for (i, existing) in self.ledger.entries.iter().enumerate() {
-                    if existing.id == entry.id {
-                        index = Some(i);
-                    } else {
-                        ensure!(
-                            existing.path != entry.path,
-                            "invalid storage ledger capture path"
-                        );
+    /// Apply journal lines in one pass, finding entries by id, and check the
+    /// result once, so that loading takes time in proportion to the ledger
+    /// and journal rather than to their product.
+    fn apply(&mut self, lines: &[u8]) -> Result<()> {
+        let mut index: HashMap<String, usize> = self
+            .ledger
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| (entry.id.clone(), i))
+            .collect();
+        // A removed entry leaves a gap until the end, so indexes stay valid.
+        let mut slots: Vec<Option<Entry>> = std::mem::take(&mut self.ledger.entries)
+            .into_iter()
+            .map(Some)
+            .collect();
+        for line in lines.split_inclusive(|&byte| byte == b'\n') {
+            let record: Record = serde_json::from_slice(line).context("invalid storage journal record; preserve storage.json and storage.journal and inspect them before resetting ownership")?;
+            if record.seq <= self.ledger.sequence {
+                continue;
+            }
+            ensure!(
+                record.seq == self.ledger.sequence + 1,
+                "storage journal is missing records; preserve storage.json and storage.journal and inspect them before resetting ownership"
+            );
+            match (record.put, record.remove) {
+                (Some(entry), None) => {
+                    check_entry(&entry)?;
+                    match index.get(&entry.id) {
+                        Some(&i) => slots[i] = Some(entry),
+                        None => {
+                            index.insert(entry.id.clone(), slots.len());
+                            slots.push(Some(entry));
+                        }
                     }
                 }
-                match index {
-                    Some(index) => self.ledger.entries[index] = entry,
-                    None => self.ledger.entries.push(entry),
+                (None, Some(id)) => {
+                    if let Some(i) = index.remove(&id) {
+                        slots[i] = None;
+                    }
                 }
+                _ => bail!("invalid storage journal record"),
             }
-            (None, Some(id)) => self.ledger.entries.retain(|entry| entry.id != id),
-            _ => bail!("invalid storage journal record"),
+            ensure!(
+                index.len() <= 100_000,
+                "unsupported or oversized storage ledger"
+            );
+            self.ledger.sequence = record.seq;
         }
-        ensure!(
-            self.ledger.entries.len() <= 100_000,
-            "unsupported or oversized storage ledger"
-        );
-        self.ledger.sequence = record.seq;
-        Ok(())
+        self.ledger.entries = slots.into_iter().flatten().collect();
+        self.validate()
     }
     fn validate(&self) -> Result<()> {
         let mut ids = HashSet::new();
@@ -2442,6 +2456,38 @@ mod tests {
         assert!(journal <= COMPACT_BYTES.max(snapshot) + largest);
     }
     #[test]
+    fn loading_a_full_journal_takes_time_in_proportion_to_it() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        let count = 5_000;
+        populate(&manager, &temp, count);
+        let cold = || {
+            (0..3)
+                .map(|_| {
+                    forget(&manager);
+                    let started = Instant::now();
+                    drop(manager.lock().unwrap());
+                    started.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let snapshot = cold();
+        // One record per entry: about as much as the journal holds before
+        // it is compacted.
+        let mut locked = manager.lock().unwrap();
+        for index in 0..count {
+            locked.entry_mut(index).pending_upload = true;
+        }
+        locked.append().unwrap();
+        drop(locked);
+        let journal = cold();
+        assert!(
+            journal < snapshot * 5 + Duration::from_millis(500),
+            "{journal:?} to load {count} entries and {count} records, {snapshot:?} for the entries alone"
+        );
+    }
+    #[test]
     fn a_torn_append_is_cut_off_and_an_interrupted_reservation_reclaimed() {
         let temp = Temp::new();
         let manager = temp.manager();
@@ -2515,8 +2561,12 @@ mod tests {
         let (head, last) = original.trim_end().rsplit_once('\n').unwrap();
         let mut record: Value = serde_json::from_str(last).unwrap();
         record["put"]["base"] = json!(temp.path("elsewhere"));
+        // A second entry for a path that is already tracked.
+        let mut twin: Value = serde_json::from_str(last).unwrap();
+        twin["put"]["id"] = json!(nonce().unwrap());
         for altered in [
             format!("{head}\n{record}\n"),
+            format!("{head}\n{twin}\n"),
             format!("{head}\nnot a record\n{last}\n"),
         ] {
             fs::write(&journal, altered).unwrap();
