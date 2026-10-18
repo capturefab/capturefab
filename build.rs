@@ -115,6 +115,17 @@ fn main() {
         Vec::new()
     };
     fs::write(out.join("capturefab-ffmpeg.bin"), &bytes).expect("write bundled FFmpeg");
+    // Names the extracted copy, so processes running one build share a file.
+    let digest = if bytes.is_empty() {
+        String::new()
+    } else {
+        use sha2::Digest;
+        sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    println!("cargo:rustc-env=CAPTUREFAB_FFMPEG_SHA256={digest}");
     let license = if let Some(path) = env::var_os("CAPTUREFAB_FFMPEG_LICENSE") {
         let path = PathBuf::from(path);
         println!("cargo:rerun-if-changed={}", path.display());

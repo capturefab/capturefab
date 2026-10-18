@@ -1038,6 +1038,73 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FFmpeg with libx264; restarts the camera under a live media reader"]
+    fn media_reader_reconnects_after_the_camera_restarts() {
+        let frames = Arc::new(LatestFrame::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (source_frames, source_shutdown) = (frames.clone(), shutdown.clone());
+        let producer = thread::spawn(move || {
+            let mut id = 0;
+            while !source_shutdown.load(Ordering::Acquire) {
+                id += 1;
+                source_frames.publish(crate::types::Frame {
+                    id,
+                    width: 64,
+                    height: 48,
+                    pixel_format: crate::types::RGB8,
+                    timestamp_ns: id * 50_000_000,
+                    data: vec![(id % 255) as u8; 64 * 48 * 3],
+                });
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let start = |port| {
+            RtspServer::start(
+                Ipv4Addr::LOCALHOST,
+                port,
+                64,
+                48,
+                20.0,
+                "100k",
+                frames.clone(),
+                shutdown.clone(),
+            )
+            .unwrap()
+        };
+        let server = start(0);
+        let port = server.local_addr().port();
+        let url = format!("rtsp://127.0.0.1:{port}/live");
+        let mut camera = crate::media::open_url(&url, Duration::from_secs(10)).unwrap();
+        camera.start(64 * 48 * 3).unwrap();
+        camera.next_frame(Duration::from_secs(2)).unwrap();
+        drop(server);
+        // While the camera is down every poll waits out its budget, and the
+        // loss is reported once.
+        let outage = Instant::now();
+        let (mut polls, mut lost) = (0, 0);
+        while outage.elapsed() < Duration::from_secs(3) {
+            if let Err(error) = camera.next_frame(Duration::from_millis(100)) {
+                assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+                polls += 1;
+                if crate::media::stream_end(&error) == Some(crate::media::StreamEnd::Lost) {
+                    lost += 1;
+                }
+            }
+        }
+        assert_eq!(lost, 1);
+        assert!(polls <= 40, "{polls} polls in 3 s");
+        let server = start(port);
+        let resumed = Instant::now();
+        while camera.next_frame(Duration::from_millis(100)).is_err() {
+            assert!(resumed.elapsed() < Duration::from_secs(20));
+        }
+        camera.stop().unwrap();
+        drop(server);
+        shutdown.store(true, Ordering::Release);
+        producer.join().unwrap();
+    }
+
+    #[test]
     #[ignore = "requires FFmpeg with libx264; exercises real TCP and UDP RTSP playback"]
     fn ffmpeg_decodes_camera_over_tcp_and_udp() {
         let executable = crate::media::executable().unwrap();

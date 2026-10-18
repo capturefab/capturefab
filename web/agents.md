@@ -207,7 +207,9 @@ Native camera locators are `avfoundation:0` on macOS, `v4l2:/dev/video0` on Linu
 
 Native locators accept `?size=WIDTHxHEIGHT&fps=RATE`. Inspect `features` for advertised `VideoMode` choices and set a supported mode, `Width`, `Height`, or `AcquisitionFrameRate` before acquisition; stop a live session before changing them. V4L2 format listings do not establish frame-rate bounds. GigE transport status includes packet size, receive buffer, bounded resend and loss counters.
 
-Media inputs and forwarding use bundled FFmpeg in release builds. Inspect `capturefab ffmpeg --json` to see the actual build's protocols and encoders. SRT support depends on the bundled FFmpeg configuration. `--hwaccel` configures decoding in new direct, GUI or `serve` workers; an existing session retains its setting.
+Media inputs and forwarding use bundled FFmpeg in release builds. Inspect `capturefab ffmpeg --json` to see the actual build's protocols and encoders. SRT support depends on the bundled FFmpeg configuration. `--hwaccel` configures decoding in new direct, GUI or `serve` workers; an existing session retains its setting. `--hwaccel auto` decodes in software on ARM Linux and on hosts where no FFmpeg hardware decoder initializes.
+
+Network stream sources (RTSP, SRT, RTMP, HTTP, UDP, TCP, RTP) reconnect when their stream ends, backing off from 1 s to 30 s. Meanwhile acquisition keeps running, `last_error` reads `Stream lost; reconnecting to ...` and frame waits time out (exit 4); three refusals in a row (rejected credentials or a missing stream path) stop acquisition. A video file source plays at its own frame rate and stops with the `Video file finished` log entry; `--set PlaybackSpeed=Fastest` decodes every frame as fast as possible.
 
 ## Scan documents
 
@@ -238,7 +240,7 @@ capturefab --session gui forward --output rtsp://localhost:8554/camera
 capturefab --session gui stop-forward
 ```
 
-Forwarding probes usable hardware encoders and falls back to software. Destinations include RTSP, SRT, RTMP, UDP, HTTP, and bounded local video files. A destination server or recorder must already exist. Local HLS output is not implemented; an existing server such as MediaMTX can provide HLS from a published stream.
+Forwarding probes usable hardware encoders at the frame size, remembers the results until reboot, and falls back to software. An auto-selected encoder that exits in its first seconds is replaced once by the next candidate in a new file. The bundled FFmpeg has no software HEVC or AV1 encoder: without a working hardware encoder those codecs fail before recording with `unsupported` (exit 5), and the message names the codecs that work. Recordings keep wall-clock time: each new frame is sent once and FFmpeg repeats or drops frames to keep `--fps` constant. `stop-forward` returns `{forwarding:null,stats:{accepted,written,dropped,late,stalled,encoder,error,recording?}}` (`record --duration` adds it as `stopped`); `late` counts frames lost while the encoder was busy and `stalled` means no new camera frame for 2 s. A resolution change stops the recording and keeps the file. Destinations include RTSP, SRT, RTMP, UDP, HTTP, and bounded local video files. A destination server or recorder must already exist. Local HLS output is not implemented; an existing server such as MediaMTX can provide HLS from a published stream.
 
 ## Save to saved destinations
 
