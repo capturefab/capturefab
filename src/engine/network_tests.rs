@@ -301,6 +301,7 @@ fn pending_and_running_capture_jobs_prevent_network_writes() {
             camera: "camera".into(),
             on_exists: Default::default(),
             next: None,
+            saving: false,
             info: crate::scheduling::CaptureJob {
                 id: 1,
                 status: status.into(),
@@ -308,6 +309,8 @@ fn pending_and_running_capture_jobs_prevent_network_writes() {
                 destination: None,
                 count: 1,
                 captured: 0,
+                skipped: 0,
+                retries: 0,
                 first_at_ms: 0,
                 interval_ms: 1000,
                 next_at_ms: 1000,

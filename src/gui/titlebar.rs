@@ -130,6 +130,8 @@ impl Workbench {
                 output: "captures".into(),
                 count: 120,
                 captured: 18,
+                skipped: 0,
+                retries: 0,
                 first_at_ms: now.saturating_sub(18 * 60_000),
                 interval_ms: 60_000,
                 next_at_ms: now + 42_000,

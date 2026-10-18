@@ -2860,6 +2860,15 @@ fn schema() -> Value {
     contract["writes"] = json!(
         "Camera operations are ordered per camera across GUI, browser and IPC participants; different cameras run independently. Concurrent scheduled jobs on the same camera share acquisition. Multiple set assignments apply sequentially; failures may leave earlier assignments applied."
     );
+    contract["jobs"] = json!({
+        "in":"schedule result.job; jobs result.jobs; status jobs and cameras[].jobs",
+        "fields":["id","status","output","count","captured","skipped","retries","first_at_ms","interval_ms","next_at_ms","last_file","error","destination?","context?"],
+        "statuses":["pending","running","complete","failed","cancelled"],
+        "saving":"Scheduled frames are encoded and saved on their own thread, which holds at most two frames, so acquisition, previews, recording and forwarding continue meanwhile.",
+        "skipped":"Shots not taken because two earlier frames were still being saved. The job takes them at later intervals.",
+        "retries":"Shots that failed for a reason that may pass, a busy storage ledger or a disk timeout, and are taken again at the next interval. error holds the message until a later shot saves.",
+        "failures":"Storage full and other save errors fail the job."
+    });
     contract["logs"] = json!({
         "snapshot":"status.logs; GET /api/session result.logs",
         "legacy_fields":["time","level","message"],
@@ -4219,6 +4228,33 @@ mod tests {
             .all(|op| commands.iter().any(|c| c["op"] == *op))
         );
         assert_eq!(contract["auto"]["settled"], json!(["stable", "limited"]));
+    }
+    #[test]
+    fn schema_lists_every_capture_job_field() {
+        let job = crate::scheduling::CaptureJob {
+            id: 1,
+            status: "pending".into(),
+            output: "frames".into(),
+            count: 3,
+            captured: 1,
+            skipped: 1,
+            retries: 1,
+            first_at_ms: 1,
+            interval_ms: 10,
+            next_at_ms: 31,
+            last_file: None,
+            error: None,
+            destination: Some("archive".into()),
+            context: crate::context::Context::from([("line".into(), "L1".into())]),
+        };
+        let job = serde_json::to_value(job).unwrap();
+        let fields = schema()["jobs"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field.as_str().unwrap().trim_end_matches('?').to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(fields, job.as_object().unwrap().keys().cloned().collect());
     }
     #[test]
     fn multiplayer_identity_and_observer_contract_validate_before_execution() {
