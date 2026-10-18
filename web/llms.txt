@@ -50,6 +50,12 @@ Data goes to stdout; diagnostics go to stderr.
 Read the process exit code before you use the result.
 Binary image stdout, raw XML, completions, help and version output use their command-specific formats.
 
+Plain `doctor` checks the host and prints a fix for each warning.
+`doctor --json` adds `host`, `efficiency`, `paths`, `limits`, `graphics` and `checks` (`{id,level,message,fix}`).
+`--efficiency auto|smooth|efficient` or `CAPTUREFAB_EFFICIENCY` sets efficiency mode; `doctor` reports the mode in force and why.
+Auto is efficient with at most 2 CPU cores or 2 GiB of memory, or in the OS low-power mode.
+A headless build without a subcommand exits 5 and suggests `serve`.
+
 Exit codes are 1 `operation_failed`, 2 `usage`, 3 `unavailable`, 4 `timeout`, 5 `unsupported` and 6 `storage_full`.
 Capturefab rejects malformed supplied fields before connection and before capture/forward `--set` or `--auto` changes.
 RPC and workflow commands reject unknown fields.

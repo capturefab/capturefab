@@ -21,6 +21,14 @@ fn main() {
         }
         return;
     }
+    #[cfg(feature = "gui")]
+    if std::env::args().nth(1).as_deref() == Some("__gpu-probe") {
+        if let Err(e) = capturefab::doctor::run_gpu_probe() {
+            eprintln!("capturefab GPU probe: {e:#}");
+            std::process::exit(1)
+        }
+        return;
+    }
     #[cfg(feature = "nvjpeg")]
     if std::env::args().nth(1).as_deref() == Some("__nvjpeg") {
         if let Err(e) = capturefab::nvjpeg::run_helper() {

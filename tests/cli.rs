@@ -2153,6 +2153,54 @@ fn legacy_s3_upload_queue_lists_unchanged() {
 fn doctor_reports_destination_features() {
     let dir = temp_root("doctor-destinations");
     let doctor = json(&dir, &["--json", "doctor"]);
+    assert!(doctor["host"]["cpu_cores"].as_u64().unwrap() >= 1);
+    assert!(doctor["efficiency"]["efficient"].is_boolean());
+    assert!(matches!(
+        doctor["efficiency"]["setting"].as_str(),
+        Some("auto" | "smooth" | "efficient")
+    ));
+    assert_eq!(
+        doctor["paths"]["session"]["path"],
+        Value::from(dir.to_string_lossy().into_owned())
+    );
+    let checks = doctor["checks"].as_array().unwrap();
+    assert!(checks.iter().all(|check| {
+        check["id"].is_string()
+            && matches!(check["level"].as_str(), Some("ok" | "warn"))
+            && check["message"].is_string()
+    }));
+    assert!(checks.iter().any(|check| check["id"] == "efficiency"));
+    assert!(
+        doctor["graphics"]["available"].is_boolean(),
+        "{}",
+        doctor["graphics"]
+    );
+    // Timed after the first launch, which can include the OS scanning a
+    // freshly linked binary, and without the GPU probe, whose own deadline
+    // bounds a stalled driver.
+    let missing = dir.join("no-gpu-probe");
+    let started = std::time::Instant::now();
+    let out = cmd_env(
+        &dir,
+        &[("CAPTUREFAB_EXECUTABLE", missing.to_str().unwrap())],
+        &["--json", "doctor"],
+    );
+    let elapsed = started.elapsed();
+    assert!(out.status.success());
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "doctor took {elapsed:?}"
+    );
+    let graphics = &serde_json::from_slice::<Value>(&out.stdout).unwrap()["result"]["graphics"];
+    assert_eq!(graphics["available"], false, "{graphics}");
+    if cfg!(feature = "gui") {
+        assert!(
+            graphics["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("GPU probe")),
+            "{graphics}"
+        );
+    }
     for (feature, compiled) in [
         ("s3", cfg!(feature = "s3")),
         ("ftp", cfg!(feature = "ftp")),
@@ -2180,6 +2228,120 @@ fn storage_status_reports_free_space_and_the_schema_its_floor() {
     assert_eq!(status["files"], 0);
     let schema = json(&dir, &["--json", "schema"]);
     assert_eq!(schema["storage"]["free_space_floor"], 512 * 1024 * 1024);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn doctor_prints_a_checklist_and_follows_the_efficiency_setting() {
+    let dir = temp_root("doctor-checklist");
+    let out = cmd(&dir, &["doctor"]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.lines().any(|line| line.starts_with("ok    ")),
+        "{text}"
+    );
+    assert!(text.contains("#host-checks-and-efficiency-mode"), "{text}");
+    let efficient = cmd_env(
+        &dir,
+        &[("CAPTUREFAB_EFFICIENCY", "efficient")],
+        &["--json", "doctor"],
+    );
+    let efficient: Value = serde_json::from_slice(&efficient.stdout).unwrap();
+    assert_eq!(efficient["result"]["efficiency"]["efficient"], true);
+    let flag = cmd_env(
+        &dir,
+        &[("CAPTUREFAB_EFFICIENCY", "efficient")],
+        &["--efficiency", "smooth", "--json", "doctor"],
+    );
+    let flag: Value = serde_json::from_slice(&flag.stdout).unwrap();
+    assert_eq!(
+        flag["result"]["efficiency"],
+        serde_json::json!({"setting":"smooth","efficient":false,"reasons":["set by --efficiency smooth"]})
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn doctor_measures_the_storage_budget_where_captures_land() {
+    let root = temp_root("doctor-budget");
+    let dir = root.join("sessions");
+    let shots = root.join("shots");
+    std::fs::create_dir_all(&shots).unwrap();
+    let shot = shots.join("a.png");
+    json(
+        &dir,
+        &[
+            "--json",
+            "--camera",
+            "sim:0",
+            "capture",
+            "-o",
+            shot.to_str().unwrap(),
+        ],
+    );
+    let doctor = json(&dir, &["--json", "doctor"]);
+    let budget = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "storage_budget")
+        .unwrap();
+    let message = budget["message"].as_str().unwrap();
+    // doctor reads the ledger storage.rs writes: the capture's folder is
+    // where free space is measured, and its bytes count as used.
+    let folder = std::fs::canonicalize(&shots).unwrap();
+    assert!(
+        message.contains(&format!("free on {}", folder.display())),
+        "{message}"
+    );
+    assert!(
+        !message.contains(", 0.0 KiB used") && !message.contains("(0.0 KiB of"),
+        "{message}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn serve_greets_people_and_keeps_its_json_ready_line() {
+    let dir = temp_root("serve-banner");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+        .env_remove("CAPTUREFAB_SESSION")
+        .env_remove("CAPTUREFAB_CAMERA")
+        .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .args(["serve", "--name", "banner"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let ready = lines.next().unwrap().unwrap();
+    let stop = lines.next().unwrap().unwrap();
+    let _fixture = Fixture { child, dir };
+    assert!(
+        ready.starts_with("Session banner is ready (pid "),
+        "{ready}"
+    );
+    assert!(
+        ready.ends_with("Try: capturefab --session banner discover"),
+        "{ready}"
+    );
+    assert_eq!(stop, "Ctrl-C stops the session.");
+}
+
+#[cfg(not(feature = "gui"))]
+#[test]
+fn headless_build_without_a_command_explains_serve() {
+    let dir = temp_root("headless-window");
+    let out = cmd(&dir, &[]);
+    assert_eq!(out.status.code(), Some(5));
+    let message = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        message.contains("capturefab serve --name bench"),
+        "{message}"
+    );
+    // It fails before creating a session, which would create the directory.
+    assert!(!dir.exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -3,7 +3,7 @@ use crate::{
     session::{ActivityOrigin, ActorKind, SessionActor, SessionCommand, SessionHandle},
 };
 use anyhow::{Context, Result, ensure};
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, builder::TypedValueParser};
 use serde_json::{Value, json};
 use std::{
     io::{self, Write},
@@ -79,6 +79,15 @@ pub struct Cli {
         default_value = "auto"
     )]
     pub hwaccel: String,
+    /// Efficiency mode for this process (default: CAPTUREFAB_EFFICIENCY, then auto, which is efficient on small or low-power computers)
+    #[arg(
+        long,
+        global = true,
+        value_parser = clap::builder::PossibleValuesParser::new(["auto", "smooth", "efficient"])
+            .map(|mode| mode.parse::<crate::efficiency::Mode>().unwrap_or_default()),
+        help_heading = "Runtime"
+    )]
+    pub efficiency: Option<crate::efficiency::Mode>,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -1753,6 +1762,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     }
     prepare_outputs(&cli, &mut prepared)?;
     input(crate::media::configure_hwaccel(&cli.hwaccel))?;
+    crate::efficiency::configure(cli.efficiency);
     match &cli.command {
         None | Some(Command::Gui { .. }) => {
             ensure!(
@@ -1760,6 +1770,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 "use an explicit command with --session, such as status"
             );
             ensure!(!cli.json, "choose a CLI command when using --json");
+            // Before a session, IPC server and uploader start for nothing.
+            if let Some(error) = window_unavailable(cfg!(feature = "gui"), display_available()) {
+                return Err(error);
+            }
             let (name, screenshot, demo_cameras, dataset) = match &cli.command {
                 Some(Command::Gui {
                     name,
@@ -1800,9 +1814,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             #[cfg(not(feature = "gui"))]
             {
                 let _ = (handle, screenshot, demo_cameras);
-                anyhow::bail!(
-                    "GUI support is disabled; build with default features or use a CLI subcommand"
-                )
+                unreachable!("window_unavailable stops headless builds first")
             }
         }
         Some(Command::Completions { shell }) => {
@@ -2005,6 +2017,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 h.shutdown();
             })
             .context("install signal handler")?;
+            // After the handler, so Ctrl-C during the checks still cleans up.
+            if !cli.json {
+                crate::doctor::print_warnings();
+            }
             while !stopped.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -2391,7 +2407,19 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
         return write_json(&envelope);
     }
     let mut out = io::stdout().lock();
-    if matches!(&cli.command, Some(Command::Undo | Command::Redo)) {
+    if matches!(&cli.command, Some(Command::Doctor)) {
+        crate::doctor::print_checklist(&mut out, &value)?;
+    } else if let Some(Command::Serve { name, .. }) = &cli.command {
+        writeln!(
+            out,
+            "Session {name} is ready (pid {}). Try: capturefab --session {name} discover",
+            value["pid"]
+        )?;
+        if let Some(url) = value["remote_url"].as_str() {
+            writeln!(out, "Browser: {url}")?;
+        }
+        writeln!(out, "Ctrl-C stops the session.")?;
+    } else if matches!(&cli.command, Some(Command::Undo | Command::Redo)) {
         let (verb, key) = if matches!(&cli.command, Some(Command::Undo)) {
             ("Undid", "undone")
         } else {
@@ -2662,6 +2690,13 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
     Ok(())
 }
 fn doctor() -> Value {
+    let host = crate::doctor::HostReport::start();
+    let mut report = build_report();
+    host.finish(&mut report);
+    report
+}
+/// What this build supports and where it runs; `doctor` adds the host checks.
+fn build_report() -> Value {
     let interfaces=if_addrs::get_if_addrs().map(|items|items.into_iter().filter_map(|i|match i.addr{if_addrs::IfAddr::V4(a)=>Some(json!({"name":i.name,"ip":a.ip,"netmask":a.netmask,"broadcast":a.broadcast})),_=>None}).collect::<Vec<_>>()).unwrap_or_default();
     json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"scanner":cfg!(feature="scanner"),"wgpu":cfg!(feature="gui"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox"),"s3":cfg!(feature="s3"),"ftp":cfg!(feature="ftp"),"sftp":cfg!(feature="sftp"),"parquet":cfg!(feature="parquet"),"modbus":cfg!(feature="modbus"),"mqtt":cfg!(feature="mqtt"),"opcua":cfg!(feature="opcua"),"mtconnect":cfg!(feature="mtconnect"),"dinov2":cfg!(feature="dinov2")},"auto_capture":crate::autocapture::doctor(),"signals":crate::signals::compiled_protocols(),"scanners":crate::scanner::doctor(),"jpeg":jpeg_backends(),"session_directory":ipc::session_dir(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox. Document scanning uses installed platform scanner drivers (SANE scanimage on Linux).","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}})
 }
@@ -2723,6 +2758,7 @@ fn schema() -> Value {
         "CAPTUREFAB_SESSION",
         "CAPTUREFAB_SESSION_DIR",
         "CAPTUREFAB_HWACCEL",
+        "CAPTUREFAB_EFFICIENCY",
         "CAPTUREFAB_ACTOR",
         "CAPTUREFAB_ACTOR_KIND"
     ]);
@@ -2919,6 +2955,23 @@ fn schema() -> Value {
     commands.extend(crate::signals::rpc_examples());
     contract["dataset"] = crate::dataset::schema_contract();
     contract["signals"] = crate::signals::schema_contract();
+    contract["efficiency"] = json!({
+        "cli":"--efficiency auto|smooth|efficient (global)",
+        "environment":crate::efficiency::ENV,
+        "precedence":"--efficiency, then CAPTUREFAB_EFFICIENCY, then auto; an unknown CAPTUREFAB_EFFICIENCY value means auto",
+        "auto":"efficient with at most 2 CPU cores, at most 2 GiB of memory, or the OS low-power or battery-saver mode; running on battery alone stays smooth",
+        "scope":"The process that parses it, such as the desktop window or serve; a running session keeps its own setting. Captures and recordings keep every frame in every mode.",
+        "status":"doctor --json efficiency {setting,efficient,reasons}"
+    });
+    contract["doctor"] = json!({
+        "host":"{cpu_cores,memory_total,memory_available,on_battery,low_power}; on_battery is reported but never switches efficiency by itself",
+        "efficiency":"{setting:auto|smooth|efficient,efficient,reasons}",
+        "paths":"{session,temp,working_directory}, each {path,exists,fs_type,ram_backed,total_bytes,free_bytes}; without exists the facts describe the nearest existing parent",
+        "limits":"{rmem_max,usbfs_memory_mb}; null outside Linux",
+        "graphics":"{available,adapter,backend,device_type,driver,max_texture_dimension_2d,software} from a helper process with a 3 s deadline in desktop builds, or {available:false,reason}",
+        "checks":"[{id,level:ok|warn,message,fix}]; ids include efficiency, graphics, runtime_dir, session_storage, receive_buffer, usb_access and storage_budget; checks that do not apply are omitted",
+        "human":"Plain doctor prints the host summary and one line per check with its fix"
+    });
     contract
 }
 
@@ -3726,6 +3779,27 @@ fn uploads_command(command: Option<&UploadsCommand>) -> Result<Value> {
     }
 }
 
+/// Why this process cannot open the desktop window, with what to run instead.
+fn window_unavailable(compiled: bool, display: bool) -> Option<anyhow::Error> {
+    let reason = if !compiled {
+        "The desktop window is disabled in this headless build"
+    } else if !display {
+        "No display is available (DISPLAY and WAYLAND_DISPLAY are unset), so the desktop window cannot open"
+    } else {
+        return None;
+    };
+    Some(anyhow::anyhow!(
+        "{reason}. Start a session with `capturefab serve --name bench`, then run `capturefab --session bench discover`."
+    ))
+}
+/// An SSH login on a Linux board has no display to open a window on.
+fn display_available() -> bool {
+    !cfg!(target_os = "linux")
+        || ["DISPLAY", "WAYLAND_DISPLAY", "WAYLAND_SOCKET"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
 pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
     if error
         .chain()
@@ -4215,6 +4289,61 @@ mod tests {
                 "cannot reach the server: connecting on ftp://h:21: Connection refused (os error 61); fix the settings or save with --no-check"
             )),
             ("unavailable", 3)
+        );
+    }
+    #[test]
+    fn missing_window_explains_how_to_start_a_session() {
+        assert!(window_unavailable(true, true).is_none());
+        let headless = window_unavailable(false, true).unwrap();
+        assert_eq!(error_code(&headless), ("unsupported", 5));
+        let no_display = window_unavailable(true, false).unwrap();
+        assert_eq!(error_code(&no_display), ("operation_failed", 1));
+        for error in [headless, no_display] {
+            let message = error.to_string();
+            assert!(
+                message.contains("capturefab serve --name bench"),
+                "{message}"
+            );
+            assert!(
+                message.contains("capturefab --session bench discover"),
+                "{message}"
+            );
+        }
+    }
+    #[test]
+    fn efficiency_flag_parses_known_modes_only() {
+        let parse = |args: &[&str]| Cli::try_parse_from(["capturefab"].iter().chain(args));
+        assert_eq!(parse(&["doctor"]).unwrap().efficiency, None);
+        assert_eq!(
+            parse(&["doctor", "--efficiency", "efficient"])
+                .unwrap()
+                .efficiency,
+            Some(crate::efficiency::Mode::Efficient)
+        );
+        assert_eq!(
+            parse(&["--efficiency", "smooth", "serve"])
+                .unwrap()
+                .efficiency,
+            Some(crate::efficiency::Mode::Smooth)
+        );
+        assert!(parse(&["--efficiency", "turbo", "doctor"]).is_err());
+        let contract = schema();
+        let flag = contract["cli"]["arguments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|argument| argument["long"] == "efficiency")
+            .unwrap();
+        assert_eq!(flag["choices"], json!(["auto", "smooth", "efficient"]));
+        assert!(
+            contract["selection"]["environment"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("CAPTUREFAB_EFFICIENCY"))
+        );
+        assert_eq!(
+            contract["efficiency"]["environment"],
+            "CAPTUREFAB_EFFICIENCY"
         );
     }
     #[test]
