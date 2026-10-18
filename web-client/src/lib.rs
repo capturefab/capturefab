@@ -728,9 +728,9 @@ fn render(app: &mut App) {
         set_text(
             "frame-stats",
             &format!(
-                "{} frames · {} dropped",
+                "{} frames · {} lost",
                 number(camera, "frames"),
-                number(camera, "dropped")
+                number(camera, "lost")
             ),
         );
         if let Some(error) = camera.get("last_error").and_then(Value::as_str) {
@@ -760,7 +760,7 @@ fn render(app: &mut App) {
             "preview-empty-description",
             "Choose a camera in the camera list, or discover one to get started.",
         );
-        set_text("frame-stats", "0 frames · 0 dropped");
+        set_text("frame-stats", "0 frames · 0 lost");
         clear_preview(app);
     }
     render_jobs(app);
