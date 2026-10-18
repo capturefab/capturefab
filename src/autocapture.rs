@@ -943,11 +943,18 @@ impl CaptureSession {
             })?;
         if version < SCHEMA_VERSION {
             db.execute_batch(&format!("SET memory_limit = '{LEGACY_MEMORY_LIMIT}'"))?;
-            // Earlier sessions had no folder, so one by this name is another session's.
+            // Earlier sessions had no folder, so one by this name is another
+            // session's. The folder is created only once the upgrade is
+            // committed: an upgraded session that names no frame files claims
+            // a missing folder when resumed, so an interruption between the
+            // two leaves nothing that blocks it.
+            ensure!(
+                std::fs::symlink_metadata(frames).is_err(),
+                "capture session frames folder already exists: {}; it belongs to another session, so move it or rename this session",
+                frames.display()
+            );
+            upgrade(&db)?;
             claim(frames)?;
-            upgrade(&db).inspect_err(|_| {
-                let _ = std::fs::remove_dir(frames);
-            })?;
         } else {
             let (files, blobs): (u64, u64) = db.query_row(
                 "SELECT COUNT(frame_path), COUNT(*) FILTER (WHERE frame_path IS NULL AND data_bytes > 0) FROM captures",

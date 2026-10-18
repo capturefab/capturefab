@@ -501,9 +501,13 @@ fn sessions_with_pixels_in_the_database_still_review() {
             ],
         );
         std::fs::create_dir(file.frames()).unwrap();
+        let taken = file
+            .resume()
+            .err()
+            .expect("an older session never adopts another session's folder");
         assert!(
-            file.resume().is_err(),
-            "an older session never adopts another session's folder"
+            taken.to_string().contains("rename this session"),
+            "{taken:#}"
         );
         assert_eq!(schema_version(&file), 1 + schema.len() as u32);
         std::fs::remove_dir(file.frames()).unwrap();
@@ -551,6 +555,30 @@ fn sessions_with_pixels_in_the_database_still_review() {
         );
         assert_eq!(resumed.positive.len(), 3);
     }
+}
+
+#[test]
+fn an_upgrade_interrupted_before_its_folder_was_made_still_resumes() {
+    let file = SessionFile::new();
+    legacy_session(
+        &file,
+        &[SCHEMA_2],
+        &[
+            (1, "manual", "manual", solid(120)),
+            (2, "automatic", "pending", solid(140)),
+        ],
+    );
+    // The upgrade committed, then the process stopped before making the folder.
+    upgrade(&Connection::open(&file.0).unwrap()).unwrap();
+    assert!(!file.frames().exists());
+    let mut session = file.resume().unwrap();
+    assert!(file.frames().is_dir());
+    assert_eq!(
+        session.next_review().unwrap().unwrap().frame.data,
+        solid(140).data
+    );
+    session.manual(&solid(60)).unwrap();
+    assert_eq!(file.frame_files(), [file.frames().join("00000003.raw")]);
 }
 
 #[test]
