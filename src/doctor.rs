@@ -905,11 +905,13 @@ mod tests {
         assert!(!missing.exists());
         // Where storage --json reports free space: the default capture
         // folder, or its nearest existing parent.
+        // Free space moves while other processes write, so only whether the
+        // disk reports it is compared.
         let captures = capture_place();
         assert_eq!(captures.path, crate::storage::capture_root());
         assert_eq!(
-            captures.free_bytes,
-            crate::storage::free_bytes(&captures.path)
+            captures.free_bytes.is_some(),
+            crate::storage::free_bytes(&captures.path).is_some()
         );
     }
 
