@@ -359,6 +359,12 @@ pub fn connect(
         }
     };
     let secret = secret::resolve(&hub)?;
+    if !client::public_identifier(&selector.camera) {
+        return Err(crate::types::Categorized::error(
+            crate::types::ErrorKind::OperationFailed,
+            "the hub camera identifier contains a secret",
+        ));
+    }
     let plan = client::plan(&hub, secret, &selector).map_err(|failure| {
         latch(&failure);
         failure.into_error()
@@ -369,8 +375,6 @@ pub fn connect(
         latch: Some((store.clone(), hub.name.clone(), digest)),
     };
     let backend = pump::HubBackend::connect(plan.sources, timeout, meta)?;
-    // The secret works, so discovery may use it again.
-    let _ = store.clear_rejected(&hub.name, &digest);
     let info = crate::types::CameraInfo {
         id: selector.id(),
         transport: crate::types::Transport::Media,
@@ -490,6 +494,7 @@ mod tests {
                     tls_server_name: None,
                     rtsp_port: None,
                     rejected: None,
+                    revision: None,
                 },
                 |_| Ok(()),
                 |_| Ok(()),

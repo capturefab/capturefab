@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -271,6 +271,11 @@ pub struct Hub {
     pub rtsp_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rejected: Option<Rejected>,
+    /// A new, non-secret identity for every save, including re-adding the
+    /// same URL with a changed keychain or environment secret. Old workers
+    /// must not latch a refusal against that replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) revision: Option<[u8; 16]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -681,8 +686,8 @@ impl Store {
     }
     fn read(&self) -> Result<File> {
         let path = self.path();
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
+        let input = match fs::File::open(&path) {
+            Ok(input) => input,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(File {
                     version: 1,
@@ -691,6 +696,11 @@ impl Store {
             }
             Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
         };
+        let mut bytes = Vec::new();
+        input
+            .take((MAX_FILE + 1) as u64)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read {}", path.display()))?;
         ensure!(bytes.len() <= MAX_FILE, "the saved hub list is too large");
         let file: File = serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid saved hub list {}", path.display()))?;
@@ -753,14 +763,7 @@ impl Store {
         update: impl FnOnce(&mut File) -> Result<T>,
         rollback: impl FnOnce(&T) -> Result<()>,
     ) -> Result<T> {
-        use fs2::FileExt;
-        crate::ipc::ensure_private_dir(&self.dir)?;
-        let lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.dir.join("hubs.lock"))?;
-        lock.lock_exclusive()?;
+        let _lock = self.lock()?;
         let mut file = self.read()?;
         file.version = 1;
         let result = update(&mut file)?;
@@ -770,6 +773,34 @@ impl Store {
             return Err(error);
         }
         Ok(result)
+    }
+    fn lock(&self) -> Result<fs::File> {
+        use fs2::FileExt;
+        crate::ipc::ensure_private_dir(&self.dir)?;
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.dir.join("hubs.lock"))?;
+        lock.lock_exclusive()?;
+        Ok(lock)
+    }
+    /// Delete a secret only while no saved hub uses its account. Holding
+    /// the same lock as saves prevents cleanup from deleting a secret a
+    /// concurrent re-add just stored.
+    pub(crate) fn forget_unused_secret(
+        &self,
+        account: &str,
+        delete: impl FnOnce() -> Result<()>,
+    ) -> Result<bool> {
+        let _lock = self.lock()?;
+        for hub in self.read()?.hubs {
+            if hub.secret == SecretSource::Keychain && hub.account()? == account {
+                return Ok(false);
+            }
+        }
+        delete()?;
+        Ok(true)
     }
     /// Save `hub`, replacing the hub with exactly its name. `prepare` runs
     /// under the lock with the record being replaced, before the file is
@@ -785,6 +816,11 @@ impl Store {
             hub.rejected.is_none(),
             "a newly saved hub is never rejected"
         );
+        let mut hub = hub.clone();
+        let mut revision = [0; 16];
+        getrandom::fill(&mut revision)
+            .map_err(|error| anyhow::anyhow!("cannot create a saved hub revision: {error}"))?;
+        hub.revision = Some(revision);
         self.locked(
             |file| {
                 if let Some(other) = file.hubs.iter().find(|other| {
@@ -905,6 +941,7 @@ mod tests {
             tls_server_name: None,
             rtsp_port: (kind == Kind::Frigate).then_some(8554),
             rejected: None,
+            revision: None,
         }
     }
     fn temp(name: &str) -> PathBuf {
@@ -1142,13 +1179,15 @@ mod tests {
         let (previous, prepared) = store.save_with(&home, |_| Ok(7), |_| Ok(())).unwrap();
         assert!(previous.is_none());
         assert_eq!(prepared, 7);
+        let home = store.get("home").unwrap();
         let mut replacement = home.clone();
         replacement.url = "http://ha2:8123".into();
         let (previous, _) = store
             .save_with(&replacement, |_| Ok(()), |_| Ok(()))
             .unwrap();
         assert_eq!(previous.as_ref(), Some(&home));
-        assert_eq!(store.get("home").unwrap(), replacement);
+        let replacement = store.get("home").unwrap();
+        assert_eq!(replacement.url, "http://ha2:8123");
         let clash = hub("Home", Kind::HomeAssistant, "http://ha:8123");
         let error = store.save_with(&clash, |_| Ok(()), |_| Ok(())).unwrap_err();
         assert!(format!("{error}").contains("case-insensitive"));
@@ -1194,6 +1233,75 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn readding_the_same_hub_invalidates_old_refusals() {
+        let dir = temp("revision");
+        let store = Store::at(&dir);
+        let home = hub("home", Kind::HomeAssistant, "http://ha:8123");
+        store.save_with(&home, |_| Ok(()), |_| Ok(())).unwrap();
+        let first = store.get("home").unwrap();
+        store.mark_rejected("home", &first.digest(), 401).unwrap();
+        // The env variable or keychain slot can now hold a new secret,
+        // although all the public fields of the record remain identical.
+        store.save_with(&home, |_| Ok(()), |_| Ok(())).unwrap();
+        let second = store.get("home").unwrap();
+        assert_ne!(first.digest(), second.digest());
+        store.mark_rejected("home", &first.digest(), 401).unwrap();
+        assert!(store.get("home").unwrap().rejected.is_none());
+        store.mark_rejected("home", &second.digest(), 403).unwrap();
+        // An old successful request must not clear a newer refusal either.
+        store.clear_rejected("home", &first.digest()).unwrap();
+        assert_eq!(store.get("home").unwrap().rejected.unwrap().status, 403);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn oversized_saved_files_are_refused() {
+        let dir = temp("oversized");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("hubs.json"), vec![b' '; MAX_FILE + 1]).unwrap();
+        assert!(
+            Store::at(&dir)
+                .list()
+                .unwrap_err()
+                .to_string()
+                .contains("too large")
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn secret_cleanup_skips_an_account_a_new_save_is_using() {
+        let dir = temp("secret-cleanup");
+        let store = Store::at(&dir);
+        let mut home = hub("home", Kind::HomeAssistant, "http://ha:8123");
+        home.secret = SecretSource::Keychain;
+        home.secret_env = None;
+        let account = home.account().unwrap();
+        store.save_with(&home, |_| Ok(()), |_| Ok(())).unwrap();
+        store.remove("home").unwrap();
+        // Another add can finish after remove released the registry lock,
+        // but before the removing command cleans up the keychain account.
+        store.save_with(&home, |_| Ok(()), |_| Ok(())).unwrap();
+        assert!(
+            !store
+                .forget_unused_secret(&account, || panic!("the new secret must stay"))
+                .unwrap()
+        );
+        store.remove("home").unwrap();
+        let deleted = std::cell::Cell::new(false);
+        assert!(
+            store
+                .forget_unused_secret(&account, || {
+                    deleted.set(true);
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert!(deleted.get());
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_failed_write_rolls_back_what_prepare_did() {
@@ -1202,6 +1310,7 @@ mod tests {
         let store = Store::at(&dir);
         let home = hub("home", Kind::HomeAssistant, "http://ha:8123");
         store.save_with(&home, |_| Ok(()), |_| Ok(())).unwrap();
+        let home = store.get("home").unwrap();
         // A read-only directory refuses the sibling file the update is
         // written to, after `prepare` has run.
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();

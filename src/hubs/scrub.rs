@@ -6,7 +6,8 @@
 //! the first place; this only catches what a dependency might echo.
 use std::{
     borrow::Cow,
-    collections::VecDeque,
+    cmp::Reverse,
+    collections::{BinaryHeap, VecDeque},
     sync::{Mutex, PoisonError},
 };
 
@@ -38,13 +39,50 @@ impl Scrubber {
         self.0.push_back(Held::from(secret.to_owned()));
     }
     fn scrub<'a>(&self, text: &'a str) -> Cow<'a, str> {
-        let mut result = Cow::Borrowed(text);
-        for secret in &self.0 {
-            if result.contains(secret.as_str()) {
-                result = Cow::Owned(result.replace(secret.as_str(), REDACTED));
+        // Match the original text before replacing anything. Replacing a
+        // shorter secret first can otherwise expose the rest of a longer
+        // one, or hide an overlapping match from the next pass.
+        // Keep only the next match per secret. A repeated credential in an
+        // untrusted response must not allocate one range per occurrence.
+        let mut matches = BinaryHeap::new();
+        for (index, secret) in self.0.iter().enumerate() {
+            if let Some(start) = text.find(secret.as_str()) {
+                matches.push(Reverse((start, start + secret.len(), index)));
             }
         }
-        result
+        if matches.is_empty() {
+            return Cow::Borrowed(text);
+        }
+        let mut result = String::new();
+        let mut copied = 0;
+        let mut pending: Option<(usize, usize)> = None;
+        while let Some(Reverse((start, end, index))) = matches.pop() {
+            let secret = &self.0[index];
+            let from = start + secret.chars().next().expect("nonempty secret").len_utf8();
+            if let Some(offset) = text[from..].find(secret.as_str()) {
+                let next = from + offset;
+                matches.push(Reverse((next, next + secret.len(), index)));
+            }
+            match &mut pending {
+                Some((_, previous_end)) if start <= *previous_end => {
+                    *previous_end = (*previous_end).max(end);
+                }
+                Some((previous_start, previous_end)) => {
+                    result.push_str(&text[copied..*previous_start]);
+                    result.push_str(REDACTED);
+                    copied = *previous_end;
+                    pending = Some((start, end));
+                }
+                None => pending = Some((start, end)),
+            }
+        }
+        if let Some((start, end)) = pending {
+            result.push_str(&text[copied..start]);
+            result.push_str(REDACTED);
+            copied = end;
+        }
+        result.push_str(&text[copied..]);
+        Cow::Owned(result)
     }
 }
 
@@ -104,5 +142,22 @@ mod tests {
             "scrub-test-first-secret"
         );
         assert_eq!(scrubber.scrub("scrub-test-filler-0063"), "<redacted>");
+    }
+
+    #[test]
+    fn overlapping_secrets_are_completely_removed_in_either_order() {
+        for secrets in [
+            ["abcdefgh", "abcdefghijklm", "fghijklm"],
+            ["fghijklm", "abcdefghijklm", "abcdefgh"],
+        ] {
+            let mut scrubber = Scrubber::new();
+            for secret in secrets {
+                scrubber.register(secret);
+            }
+            assert_eq!(scrubber.scrub("x abcdefghijklm y"), "x <redacted> y");
+        }
+        let mut scrubber = Scrubber::new();
+        scrubber.register("éééé");
+        assert_eq!(scrubber.scrub("ééééé"), "<redacted>");
     }
 }

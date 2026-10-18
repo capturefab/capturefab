@@ -49,6 +49,7 @@ pub(crate) fn boundary(content_type: &str) -> Option<Vec<u8>> {
 pub(crate) struct Multipart<R: Read> {
     reader: BufReader<R>,
     boundary: Option<Vec<u8>>,
+    pending_delimiter: Option<Vec<u8>>,
 }
 
 enum Delimiter {
@@ -61,6 +62,7 @@ impl<R: Read> Multipart<R> {
         Self {
             reader: BufReader::with_capacity(64 * 1024, body),
             boundary: boundary(content_type),
+            pending_delimiter: None,
         }
     }
 
@@ -89,7 +91,11 @@ impl<R: Read> Multipart<R> {
     pub(crate) fn next_part(&mut self) -> Result<Option<Part>, PartError> {
         let mut skipped = 0;
         loop {
-            match read_line(&mut self.reader, MAX_LINE)? {
+            let line = match self.pending_delimiter.take() {
+                Some(line) => Line::Text(line),
+                None => read_line(&mut self.reader, MAX_LINE)?,
+            };
+            match line {
                 Line::Eof => return Ok(None),
                 Line::Long(count) => skipped += count,
                 Line::Text(line) => match self.delimiter(&line) {
@@ -140,12 +146,21 @@ impl<R: Read> Multipart<R> {
                 self.reader.read_exact(&mut bytes)?;
                 bytes
             }
-            None if self.reader.fill_buf()?.starts_with(&[0xFF, 0xD8]) => {
-                let mut bytes = Vec::new();
-                read_jpeg(&mut self.reader, &mut bytes)?;
-                bytes
+            None => {
+                // A socket read may deliver only the first SOI byte. Read
+                // both before deciding whether this is a JPEG; otherwise a
+                // complete HA image can wait forever for its next delimiter.
+                let mut prefix = Vec::with_capacity(2);
+                self.reader.by_ref().take(2).read_to_end(&mut prefix)?;
+                if prefix == [0xFF, 0xD8] {
+                    let mut bytes = Vec::new();
+                    let mut reader = io::Cursor::new(prefix).chain(&mut self.reader);
+                    read_jpeg(&mut reader, &mut bytes)?;
+                    bytes
+                } else {
+                    self.read_until_delimiter(prefix)?
+                }
             }
-            None => self.read_until_delimiter()?,
         };
         Ok(Some(Part {
             content_type,
@@ -154,33 +169,44 @@ impl<R: Read> Multipart<R> {
     }
 
     /// A part of unknown type and length: everything up to the CRLF before
-    /// the next `--` line, which is left for the next call.
-    fn read_until_delimiter(&mut self) -> Result<Vec<u8>, PartError> {
+    /// the next `--` line, which is saved for the next call. Delimiter
+    /// recognition must not depend on how network reads split its dashes.
+    fn read_until_delimiter(&mut self, prefix: Vec<u8>) -> Result<Vec<u8>, PartError> {
+        let mut reader = io::Cursor::new(prefix).chain(&mut self.reader);
         let mut bytes = Vec::new();
+        let mut line = Vec::new();
+        let mut pending_delimiter = None;
         loop {
-            let available = self.reader.fill_buf()?;
+            let available = reader.fill_buf()?;
             if available.is_empty() {
+                if line.starts_with(b"--") && (3..=MAX_LINE).contains(&trim_end(&line).len()) {
+                    pending_delimiter = Some(line);
+                } else {
+                    bytes.extend_from_slice(&line);
+                }
                 break;
             }
-            match available.iter().position(|&b| b == b'\n') {
-                Some(index) => {
-                    bytes.extend_from_slice(&available[..=index]);
-                    self.reader.consume(index + 1);
-                    let next = self.reader.fill_buf()?;
-                    if next.starts_with(b"--") || next.is_empty() {
-                        break;
-                    }
-                }
-                None => {
-                    let count = available.len();
-                    bytes.extend_from_slice(available);
-                    self.reader.consume(count);
-                }
-            }
-            if bytes.len() > MAX_PART {
+            let newline = available.iter().position(|&b| b == b'\n');
+            let count = newline.map_or(available.len(), |index| index + 1);
+            if bytes.len() + line.len() + count > MAX_PART {
                 return Err(PartError::TooLarge);
             }
+            line.extend_from_slice(&available[..count]);
+            reader.consume(count);
+            if newline.is_some() {
+                let delimiter = line.strip_suffix(b"\n").unwrap_or(&line);
+                let delimiter = delimiter.strip_suffix(b"\r").unwrap_or(delimiter);
+                if delimiter.starts_with(b"--")
+                    && (3..=MAX_LINE).contains(&trim_end(delimiter).len())
+                {
+                    pending_delimiter = Some(delimiter.to_vec());
+                    break;
+                }
+                bytes.extend_from_slice(&line);
+                line.clear();
+            }
         }
+        self.pending_delimiter = pending_delimiter;
         if bytes.ends_with(b"\r\n") {
             bytes.truncate(bytes.len() - 2);
         } else if bytes.ends_with(b"\n") {
@@ -431,6 +457,50 @@ mod tests {
             "multipart/x-mixed-replace;boundary=frame",
         );
         assert_eq!(multipart.next_part().unwrap().unwrap().bytes, jpegs[0]);
+    }
+
+    /// Deliberately split every marker across reads. Once the supplied bytes
+    /// end, an open MJPEG connection would block rather than return EOF.
+    struct Fragmented<'a> {
+        remaining: &'a [u8],
+    }
+
+    impl Read for Fragmented<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if out.is_empty() {
+                return Ok(0);
+            }
+            let Some((&byte, rest)) = self.remaining.split_first() else {
+                return Err(io::Error::other("the next frame has not arrived"));
+            };
+            out[0] = byte;
+            self.remaining = rest;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn a_split_jpeg_signature_does_not_wait_for_the_next_frame() {
+        let jpeg = jpeg_of(16, 16, 30);
+        let mut stream = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n".to_vec();
+        stream.extend(&jpeg);
+        let mut multipart = Multipart::new(
+            Fragmented { remaining: &stream },
+            "multipart/x-mixed-replace;boundary=frame",
+        );
+        assert_eq!(multipart.next_part().unwrap().unwrap().bytes, jpeg);
+    }
+
+    #[test]
+    fn split_delimiters_end_unknown_parts_and_are_retained_for_the_next_call() {
+        let stream = b"--b\r\n\r\none\r\n--b\r\n\r\ntwo\r\n--b--\r\n";
+        let mut multipart = Multipart::new(
+            Fragmented { remaining: stream },
+            "multipart/x-mixed-replace;boundary=b",
+        );
+        assert_eq!(multipart.next_part().unwrap().unwrap().bytes, b"one");
+        assert_eq!(multipart.next_part().unwrap().unwrap().bytes, b"two");
+        assert!(multipart.next_part().unwrap().is_none());
     }
 
     #[test]

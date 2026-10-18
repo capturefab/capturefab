@@ -178,7 +178,8 @@ impl Frigate {
     }
 
     /// Send `request`, signing in once more if the session was refused.
-    fn send(&self, request: &Request, cx: Option<&Cx>, route: Route) -> Result<Response, Failure> {
+    /// Keep the status available for optional routes such as `/api/profile`.
+    fn response(&self, request: &Request, cx: Option<&Cx>) -> Result<Response, Failure> {
         let mut renewed = false;
         loop {
             let token = self.token(cx, renewed)?;
@@ -186,19 +187,25 @@ impl Frigate {
                 .as_deref()
                 .map_or(Auth::None, |token| Auth::Bearer(token));
             let response = http::send(&self.endpoint, request, &auth, cx.map(|cx| &cx.cancel))?;
-            if (200..300).contains(&response.status) {
-                return Ok(response);
-            }
             if response.status == 401 && self.hub.user.is_some() && !renewed {
                 renewed = true;
                 continue;
             }
-            return Err(client::status_failure(
+            return Ok(response);
+        }
+    }
+
+    fn send(&self, request: &Request, cx: Option<&Cx>, route: Route) -> Result<Response, Failure> {
+        let response = self.response(request, cx)?;
+        if (200..300).contains(&response.status) {
+            Ok(response)
+        } else {
+            Err(client::status_failure(
                 &self.hub,
                 &response,
                 route,
                 refused(&self.hub),
-            ));
+            ))
         }
     }
 
@@ -257,7 +264,15 @@ struct Camera {
     #[serde(default)]
     friendly_name: Option<String>,
     #[serde(default)]
+    detect: Option<Detect>,
+    #[serde(default)]
     live: Option<Live>,
+}
+
+#[derive(Deserialize)]
+struct Detect {
+    #[serde(default)]
+    height: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -291,7 +306,19 @@ impl Config {
         self.go2rtc
             .as_ref()
             .and_then(|go2rtc| go2rtc.streams.as_ref())
-            .map(|streams| streams.keys().map(String::as_str).collect())
+            .map(|streams| {
+                streams
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|name| {
+                        !name.is_empty()
+                            && name.len() <= 256
+                            && !name.chars().any(char::is_control)
+                            && !name.contains("://")
+                            && client::public_identifier(name)
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -334,23 +361,35 @@ fn config(frigate: &Frigate, floor: Duration) -> Result<Config, Failure> {
 }
 
 /// Cameras the signed-in user may see, when Frigate says (0.17 and later).
-fn allowed(frigate: &Frigate, floor: Duration) -> Option<Vec<String>> {
-    let response = frigate
-        .get(
-            Route::Api("the user profile"),
+fn allowed(frigate: &Frigate, floor: Duration) -> Result<Option<Vec<String>>, Failure> {
+    let response = frigate.response(
+        &Request::get(
+            "the user profile",
             "/api/profile".into(),
             "application/json",
             client::limits(10, 10, 10, 64 << 10, floor),
-        )
-        .ok()?;
-    client::json::<Profile>(&frigate.hub, response, 64 << 10, "user profile")
-        .ok()?
-        .allowed_cameras
+        ),
+        None,
+    )?;
+    match response.status {
+        // Frigate before 0.17 does not provide the profile route.
+        404 => Ok(None),
+        200..=299 => Ok(
+            client::json::<Profile>(&frigate.hub, response, 64 << 10, "user profile")?
+                .allowed_cameras,
+        ),
+        _ => Err(client::status_failure(
+            &frigate.hub,
+            &response,
+            Route::Api("the user profile"),
+            refused(&frigate.hub),
+        )),
+    }
 }
 
 fn list(frigate: &Frigate, floor: Duration) -> Result<(Config, Vec<Listed>), Failure> {
     let config = config(frigate, floor)?;
-    let allowed = allowed(frigate, floor);
+    let allowed = allowed(frigate, floor)?;
     let restreams = config.restreams();
     let cameras = config
         .cameras
@@ -358,6 +397,7 @@ fn list(frigate: &Frigate, floor: Duration) -> Result<(Config, Vec<Listed>), Fai
         .filter(|(name, camera)| {
             camera.enabled
                 && Kind::Frigate.validate_camera(name, "").is_ok()
+                && client::public_identifier(name)
                 && allowed
                     .as_ref()
                     .is_none_or(|allowed| allowed.contains(name))
@@ -436,10 +476,16 @@ pub(crate) fn plan(
 ) -> Result<Plan, Failure> {
     let frigate = Arc::new(Frigate::new(hub, secret)?);
     let config = config(&frigate, Duration::ZERO)?;
+    let allowed = allowed(&frigate, Duration::ZERO)?;
     let camera = config
         .cameras
         .get(&selector.camera)
-        .filter(|camera| camera.enabled)
+        .filter(|camera| {
+            camera.enabled
+                && allowed
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.contains(&selector.camera))
+        })
         .ok_or_else(|| {
             Failure::permanent(
                 ErrorKind::Unavailable,
@@ -498,8 +544,13 @@ pub(crate) fn plan(
                 request: client::media(
                     "the camera stream",
                     format!(
-                        "/api/{encoded}?fps={}",
-                        selector.fps.map_or(3, |fps| fps as u32)
+                        "/api/{encoded}?fps={}&height={}",
+                        selector.fps.map_or(3, |fps| fps as u32),
+                        camera
+                            .detect
+                            .as_ref()
+                            .and_then(|detect| detect.height)
+                            .unwrap_or(0)
                     ),
                     "multipart/x-mixed-replace",
                     http::Limits {

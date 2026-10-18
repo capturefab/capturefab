@@ -112,6 +112,9 @@ struct Camera {
 }
 
 fn listed(camera: Camera) -> Option<Listed> {
+    if !client::public_identifier(&camera.id) {
+        return None;
+    }
     let id = Kind::UnifiProtect.validate_camera(&camera.id, "").ok()?;
     Some(Listed {
         name: camera

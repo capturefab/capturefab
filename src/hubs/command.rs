@@ -155,6 +155,7 @@ fn record(command: &HubCommand) -> Result<Option<Hub>> {
             _ => None,
         },
         rejected: None,
+        revision: None,
     };
     if server.accept_certificate {
         anyhow::ensure!(
@@ -180,6 +181,7 @@ pub fn prepare(command: &HubCommand) -> Result<()> {
 /// The JSON for a saved hub; never the secret.
 fn describe(hub: &Hub) -> Value {
     let mut value = serde_json::to_value(hub).expect("hub records serialize");
+    value.as_object_mut().unwrap().remove("revision");
     value["insecure"] = json!(hub.insecure());
     if hub.secret == SecretSource::Keychain
         && let Ok(account) = hub.account()
@@ -216,8 +218,9 @@ pub(crate) fn run_in(store: &Store, command: &HubCommand, timeout: Duration) -> 
             let hub = store.remove(name)?;
             let mut warnings = Vec::new();
             let forgotten = if *forget_secret && hub.secret == SecretSource::Keychain {
-                match secret::keychain_delete(&hub.account()?) {
-                    Ok(()) => true,
+                let account = hub.account()?;
+                match store.forget_unused_secret(&account, || secret::keychain_delete(&account)) {
+                    Ok(forgotten) => forgotten,
                     Err(error) => {
                         warnings.push(format!("{error:#}"));
                         false
@@ -332,7 +335,7 @@ fn add(store: &Store, command: &HubCommand, timeout: Duration) -> Result<Value> 
         && previous.secret == SecretSource::Keychain
         && let Ok(old) = previous.account()
         && old != account
-        && let Err(error) = secret::keychain_delete(&old)
+        && let Err(error) = store.forget_unused_secret(&old, || secret::keychain_delete(&old))
     {
         warnings.push(format!("{error:#}"));
     }

@@ -17,6 +17,7 @@ fn camera(streams: &[(&str, &str)]) -> Camera {
     Camera {
         enabled: true,
         friendly_name: None,
+        detect: None,
         live: Some(Live {
             streams: Ordered(
                 streams
@@ -51,6 +52,20 @@ fn restreams_are_chosen_like_frigates_own_integration() {
     assert_eq!(
         restream("side", &camera(&[("A", "elsewhere")]), &restreams),
         None
+    );
+}
+
+#[test]
+fn live_stream_order_survives_json_deserialization() {
+    // The map's order, rather than its labels' alphabetical order, selects
+    // the first stream when the camera name is not itself a restream.
+    let config: Config = serde_json::from_str(
+        r#"{"cameras":{"porch":{"live":{"streams":{"ZSub":"sub","AMain":"main"}}}},"go2rtc":{"streams":{"sub":[],"main":[]}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        restream("porch", &config.cameras["porch"], &config.restreams()),
+        Some("sub")
     );
 }
 
@@ -214,6 +229,109 @@ fn live_snapshots_and_mjpeg_without_lengths_stream() {
     assert!(
         fake.requests()
             .iter()
-            .any(|r| r.target == "/api/back_yard?fps=5")
+            .any(|r| r.target == "/api/back_yard?fps=5&height=360")
+    );
+}
+
+#[test]
+fn profiles_restrict_listing_and_explicit_rtsp_connections() {
+    let mut config = FakeFrigate::new(frames());
+    config.allowed_cameras = Some(vec!["back_yard".into()]);
+    let fake = config.start();
+    let hub = hub(Kind::Frigate, &fake.url(), false);
+    let listed = cameras(&hub, None, Duration::ZERO).unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|camera| camera.camera.as_str())
+            .collect::<Vec<_>>(),
+        ["back_yard"]
+    );
+    // /api/config exposes all cameras, and the unauthenticated RTSP server
+    // cannot enforce the HTTP user's role. Never open a disallowed stream.
+    let failure = plan(
+        &hub,
+        None,
+        &Selector::parse("hub:test/driveway?stream=rtsp").unwrap(),
+    )
+    .err()
+    .expect("the profile excludes this camera");
+    assert_eq!(failure.kind, ErrorKind::Unavailable);
+}
+
+#[test]
+fn profile_failures_propagate_but_old_servers_can_omit_the_route() {
+    for status in [401, 403, 500] {
+        let mut config = FakeFrigate::new(frames());
+        config.profile_status = status;
+        let fake = config.start();
+        let hub = hub(Kind::Frigate, &fake.url(), false);
+        let failure = cameras(&hub, None, Duration::ZERO).expect_err("profile failure");
+        if status == 500 {
+            assert!(!failure.permanent);
+        } else {
+            assert_eq!(failure.auth_status, Some(status));
+            assert!(!failure.fallback);
+        }
+        assert_eq!(
+            fake.requests()
+                .iter()
+                .filter(|request| request.path() == "/api/profile")
+                .count(),
+            1
+        );
+    }
+    let mut config = FakeFrigate::new(frames());
+    config.profile_status = 404;
+    let fake = config.start();
+    let hub = hub(Kind::Frigate, &fake.url(), false);
+    assert_eq!(cameras(&hub, None, Duration::ZERO).unwrap().len(), 2);
+    assert!(
+        plan(
+            &hub,
+            None,
+            &Selector::parse("hub:test/driveway?stream=rtsp").unwrap()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn a_second_refused_profile_stops_after_one_new_login() {
+    let mut config = FakeFrigate::new(frames());
+    config.login = Some(("viewer".into(), "CANARY-frigate-password".into()));
+    config.profile_status = 401;
+    let logins = config.logins.clone();
+    let fake = config.start();
+    let hub = hub(Kind::Frigate, &fake.url(), true);
+    let failure = cameras(
+        &hub,
+        Some(&secret(Kind::Frigate, "CANARY-frigate-password")),
+        Duration::ZERO,
+    )
+    .expect_err("the renewed session was also refused");
+    assert_eq!(failure.auth_status, Some(401));
+    assert_eq!(logins.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(
+        fake.requests()
+            .iter()
+            .filter(|request| request.path() == "/api/profile")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn url_like_restream_names_never_reach_ffmpeg() {
+    let name = "rtsp://admin:CANARY-password@10.0.0.7/video";
+    let config: Config = serde_json::from_value(serde_json::json!({
+        "cameras": {"front": {"live": {"streams": {"Main": name}}}},
+        "go2rtc": {"streams": {name: []}}
+    }))
+    .unwrap();
+    assert!(config.restreams().is_empty());
+    assert_eq!(
+        restream("front", &config.cameras["front"], &config.restreams()),
+        None
     );
 }

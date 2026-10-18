@@ -185,6 +185,61 @@ fn stalled_servers_time_out_by_phase() {
 }
 
 #[test]
+fn drip_fed_lines_cannot_extend_absolute_deadlines() {
+    use std::net::TcpListener;
+
+    for phase in ["head", "chunk", "trailer"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = parse_url(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let ep = Endpoint::new("Test hub t", url, &tls::Trust::Platform).unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut socket = BufReader::new(socket);
+            loop {
+                if read_line(&mut socket, MAX_HEADER_LINE).unwrap().is_empty() {
+                    break;
+                }
+            }
+            let socket = socket.get_mut();
+            let line = match phase {
+                "head" => [b"HTTP/1.1 200 ".as_slice(), &[b'x'; 100], b"\r\n\r\n"].concat(),
+                "chunk" => {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .unwrap();
+                    [b"1;".as_slice(), &[b'x'; 100], b"\r\na\r\n0\r\n\r\n"].concat()
+                }
+                _ => {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n")
+                        .unwrap();
+                    [b"Trailer: ".as_slice(), &[b'x'; 100], b"\r\n\r\n"].concat()
+                }
+            };
+            for byte in line {
+                if socket.write_all(&[byte]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let request = Request::get(
+            "the test resource",
+            "/".into(),
+            "*/*",
+            Limits::request(Duration::from_millis(250), 1 << 20),
+        );
+        let start = Instant::now();
+        let error = send(&ep, &request, &Auth::None, None)
+            .and_then(|response| response.body.read_all(1 << 20))
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Timeout, "{phase}: {error}");
+        assert!(start.elapsed() < Duration::from_secs(1), "{phase}");
+        server.join().unwrap();
+    }
+}
+
+#[test]
 fn a_blocked_body_read_is_cancelled_promptly() {
     // The head arrives; the body never does.
     let fake = FakeHttp::start(|_| {
@@ -490,6 +545,31 @@ fn fingerprints_are_fetched_without_sending_a_request() {
     assert_eq!(offered, pin(fake_http::LOCALHOST_SHA256));
     std::thread::sleep(Duration::from_millis(50));
     assert!(fake.requests().is_empty());
+}
+
+#[test]
+fn a_drip_fed_tls_record_cannot_extend_the_fingerprint_deadline() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = parse_url(&format!("https://{}", listener.local_addr().unwrap())).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        // Receive the ClientHello, then slowly send one incomplete TLS
+        // handshake record. rustls must wait for the complete record before
+        // it can reject its contents, so the network deadline must bound it.
+        assert!(socket.read(&mut [0; 4096]).unwrap() > 0);
+        socket.write_all(&[22, 3, 3, 0, 100]).unwrap();
+        for _ in 0..100 {
+            if socket.write_all(&[0]).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    let start = Instant::now();
+    let error = fetch_fingerprint("Test hub t", &url, Duration::from_millis(250)).unwrap_err();
+    assert_eq!(crate::cli::error_code(&error), ("timeout", 4));
+    assert!(start.elapsed() < Duration::from_secs(1));
+    server.join().unwrap();
 }
 
 #[test]

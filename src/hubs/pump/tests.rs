@@ -11,7 +11,7 @@ enum Step {
 }
 
 type Script = Arc<dyn Fn(usize, usize) -> Step + Send + Sync>;
-type OpenScript = Arc<dyn Fn(usize) -> Result<(), Failure> + Send + Sync>;
+type OpenScript = Arc<dyn Fn(usize, &Cx) -> Result<(), Failure> + Send + Sync>;
 
 struct Fake {
     stream: Stream,
@@ -33,9 +33,9 @@ impl SourceFactory for Fake {
     fn stream(&self) -> Stream {
         self.stream
     }
-    fn open(&self, _cx: &Cx) -> Result<Box<dyn FrameSession>, Failure> {
+    fn open(&self, cx: &Cx) -> Result<Box<dyn FrameSession>, Failure> {
         let open = self.opens.fetch_add(1, Ordering::SeqCst);
-        (self.open)(open)?;
+        (self.open)(open, cx)?;
         Ok(Box::new(FakeSession {
             open,
             count: 0,
@@ -59,6 +59,7 @@ impl FrameSession for FakeSession {
     fn next(&mut self, cx: &Cx) -> Result<Next, Failure> {
         if !self.continuous {
             cx.wait_until(Instant::now() + self.delay);
+            cx.begin_snapshot();
         } else {
             std::thread::sleep(self.delay);
         }
@@ -96,7 +97,7 @@ fn fake(
         Arc::new(Fake {
             stream,
             opens: opens.clone(),
-            open: Arc::new(open),
+            open: Arc::new(move |count, _| open(count)),
             step: Arc::new(step),
             delay,
         }),
@@ -294,6 +295,27 @@ fn connecting_falls_back_but_never_past_a_refused_secret() {
 }
 
 #[test]
+fn a_pump_thread_spawn_failure_is_reported_without_exposing_os_error_text() {
+    let (factory, opens) = fake(
+        Stream::Mjpeg,
+        Duration::ZERO,
+        |_| Ok(()),
+        |_, _| Step::Frame(2, 2),
+    );
+    let identity = meta();
+    let (session, cx, frame) =
+        first(factory.as_ref(), Duration::from_secs(2), &identity.id).unwrap();
+    let error = HubBackend::start_pump_with(factory, session, cx, frame, identity, |_work| {
+        Err(std::io::Error::other("CANARY operating system error"))
+    })
+    .err()
+    .expect("the missing pump must fail connection");
+    assert_eq!(format!("{error}"), "cannot start the hub camera frame pump");
+    assert_eq!(crate::cli::error_code(&error), ("operation_failed", 1));
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn a_silent_source_times_out_at_connect() {
     let (factory, _) = fake(
         Stream::Mjpeg,
@@ -338,6 +360,135 @@ fn stopping_and_dropping_do_not_wait_for_a_blocked_read() {
 }
 
 #[test]
+fn cancelling_an_open_during_stop_does_not_permanently_fail_the_pump() {
+    let (entered, opening) = std::sync::mpsc::channel();
+    let factory = Arc::new(Fake {
+        stream: Stream::Mjpeg,
+        opens: Arc::new(AtomicUsize::new(0)),
+        open: Arc::new(move |open, cx| {
+            if open == 1 {
+                entered.send(()).unwrap();
+                while !cx.cancelled() {
+                    cx.wait_until(Instant::now() + Duration::from_secs(1));
+                }
+                return Err(Failure::permanent(ErrorKind::OperationFailed, "cancelled"));
+            }
+            Ok(())
+        }),
+        step: Arc::new(|open, count| {
+            if open == 0 && count > 0 {
+                Step::Fail(Failure::transient(ErrorKind::Unavailable, "stream ended"))
+            } else {
+                Step::Frame(2, 2)
+            }
+        }),
+        delay: Duration::from_millis(2),
+    });
+    let mut backend = HubBackend::connect(vec![factory], Duration::from_secs(2), meta()).unwrap();
+    backend.start(0).unwrap();
+    opening.recv_timeout(Duration::from_secs(2)).unwrap();
+    backend.stop().unwrap();
+    backend.start(0).unwrap();
+    frames(&mut backend, 2);
+    assert!(backend.shared.lock().failure.is_none());
+}
+
+#[test]
+fn a_cancelled_session_cannot_publish_a_frame_after_stop() {
+    let (factory, _) = fake(
+        Stream::Mjpeg,
+        Duration::ZERO,
+        |_| Ok(()),
+        |_, _| Step::Frame(2, 2),
+    );
+    let mut backend =
+        HubBackend::connect(vec![factory.clone()], Duration::from_secs(2), meta()).unwrap();
+    let cancel = backend.shared.lock().current.clone().unwrap();
+    backend.stop().unwrap();
+    // Model a successful read finishing concurrently with stop, before it
+    // manages to acquire the publication lock.
+    Pump {
+        shared: backend.shared.clone(),
+        factory,
+        meta: meta(),
+        epoch: Instant::now(),
+    }
+    .publish(
+        Frame {
+            id: 0,
+            width: 2,
+            height: 2,
+            pixel_format: crate::types::RGB8,
+            timestamp_ns: 0,
+            data: vec![0; 12],
+        },
+        &Cx {
+            cancel,
+            wake: backend.shared.wake.clone(),
+            snapshot_generation: AtomicU64::new(0),
+        },
+    );
+    assert!(backend.shared.lock().latest.is_none());
+}
+
+#[test]
+fn a_new_authentication_refusal_cannot_be_cleared_by_connect_success() {
+    use crate::hubs::registry::{Hub, Kind, SecretSource};
+
+    let dir = std::env::temp_dir().join(format!(
+        "capturefab-pump-latch-{}-{}",
+        std::process::id(),
+        getrandom::u64().unwrap()
+    ));
+    let store = Store::at(&dir);
+    let hub = Hub {
+        name: "test".into(),
+        kind: Kind::HomeAssistant,
+        url: "http://127.0.0.1:8123".into(),
+        user: None,
+        secret: SecretSource::Environment,
+        secret_env: Some("CAPTUREFAB_HUB_TEST".into()),
+        certificate: None,
+        tls_server_name: None,
+        rtsp_port: None,
+        rejected: None,
+        revision: None,
+    };
+    store.save_with(&hub, |_| Ok(()), |_| Ok(())).unwrap();
+    let hub = store.get("test").unwrap();
+    store.mark_rejected("test", &hub.digest(), 401).unwrap();
+    let observed = store.clone();
+    let (factory, _) = fake(
+        Stream::Mjpeg,
+        Duration::ZERO,
+        |_| Ok(()),
+        move |_, count| {
+            if count == 0 {
+                Step::Frame(2, 2)
+            } else {
+                assert!(
+                    observed.get("test").unwrap().rejected.is_none(),
+                    "the successful first frame clears the old latch before pumping"
+                );
+                Step::Fail(Failure::rejected(403, "the token was revoked"))
+            }
+        },
+    );
+    let mut identity = meta();
+    identity.latch = Some((store.clone(), hub.name.clone(), hub.digest()));
+    let mut backend = HubBackend::connect(vec![factory], Duration::from_secs(2), identity).unwrap();
+    backend.start(0).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !backend.shared.lock().finished {
+        assert!(Instant::now() < deadline, "pump did not record the refusal");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(store.get("test").unwrap().rejected.unwrap().status, 403);
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn a_parked_stream_is_adopted_or_closed() {
     let (factory, opens) = fake(
         Stream::Mjpeg,
@@ -367,6 +518,68 @@ fn a_parked_stream_is_adopted_or_closed() {
 }
 
 #[test]
+fn a_parked_stream_is_closed_without_entering_a_blocking_next_read() {
+    struct Held {
+        reads: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl FrameSession for Held {
+        fn next(&mut self, _cx: &Cx) -> Result<Next, Failure> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(Next::Frame(Frame {
+                id: 0,
+                width: 2,
+                height: 2,
+                pixel_format: crate::types::RGB8,
+                timestamp_ns: 0,
+                data: vec![0; 12],
+            }))
+        }
+    }
+    struct HoldingFactory {
+        reads: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl SourceFactory for HoldingFactory {
+        fn stream(&self) -> Stream {
+            Stream::Mjpeg
+        }
+        fn open(&self, _cx: &Cx) -> Result<Box<dyn FrameSession>, Failure> {
+            Ok(Box::new(Held {
+                reads: self.reads.clone(),
+                drops: self.drops.clone(),
+            }))
+        }
+    }
+    let reads = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let factory = Arc::new(HoldingFactory {
+        reads: reads.clone(),
+        drops: drops.clone(),
+    });
+    let backend = HubBackend::connect(vec![factory], Duration::from_secs(2), meta()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while drops.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the parked session was not closed"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "only the connect-time frame"
+    );
+    drop(backend);
+}
+
+#[test]
 fn snapshot_captures_wait_for_an_image_taken_after_they_asked() {
     let (factory, _) = fake(
         Stream::Snapshot,
@@ -380,6 +593,81 @@ fn snapshot_captures_wait_for_an_image_taken_after_they_asked() {
     backend.request_frame().unwrap();
     let next = frames(&mut backend, 1)[0].id;
     assert!(next > first);
+}
+
+#[test]
+fn a_capture_during_a_snapshot_get_waits_for_a_new_get_without_the_poll_delay() {
+    use crate::hubs::{
+        fake_http::{FakeHttp, Reply},
+        http::{self, Auth, Endpoint, Limits, Request, Response},
+        image::tests::jpeg_of,
+        registry::parse_url,
+        sources::{Access, MediaRequest, SnapshotSource},
+        tls,
+    };
+
+    struct TestAccess(Endpoint);
+    impl Access for TestAccess {
+        fn media(&self, request: &MediaRequest, cx: &Cx) -> Result<Response, Failure> {
+            http::send(
+                &self.0,
+                &Request::get(
+                    request.route,
+                    request.target.clone(),
+                    request.accept,
+                    request.limits,
+                ),
+                &Auth::None,
+                Some(&cx.cancel),
+            )
+            .map_err(Failure::from)
+        }
+    }
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = requests.clone();
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let wait_for_capture = release.clone();
+    let (entered, in_flight) = std::sync::mpsc::channel();
+    let fake = FakeHttp::start(move |_| {
+        let request = counted.fetch_add(1, Ordering::SeqCst);
+        if request == 1 {
+            entered.send(()).unwrap();
+            wait_for_capture.wait();
+        }
+        // The connect-time, in-flight and subsequent images are distinct.
+        Reply::image("image/jpeg", jpeg_of(4, 4, [20, 100, 200][request.min(2)]))
+    });
+    let source = Arc::new(SnapshotSource {
+        access: Arc::new(TestAccess(
+            Endpoint::new(
+                "Test hub test",
+                parse_url(&fake.url()).unwrap(),
+                &tls::Trust::Platform,
+            )
+            .unwrap(),
+        )),
+        request: MediaRequest {
+            route: "the snapshot",
+            target: "/snapshot".into(),
+            accept: "image/*",
+            limits: Limits::request(Duration::from_secs(5), 1 << 20),
+        },
+        label: "camera test on hub test".into(),
+        fps: 0.01, // A regular next poll would wait 100 seconds.
+        offline_header: None,
+    });
+    let mut backend = HubBackend::connect(vec![source], Duration::from_secs(2), meta()).unwrap();
+    backend.start(0).unwrap();
+    backend.request_frame().unwrap();
+    in_flight.recv_timeout(Duration::from_secs(2)).unwrap();
+    // This request starts after the server received the second GET. Its
+    // response must be discarded even though it completes after this call.
+    backend.request_frame().unwrap();
+    release.wait();
+    let frame = backend.next_frame(Duration::from_secs(2)).unwrap();
+    assert!(frame.data.iter().all(|pixel| (195..=205).contains(pixel)));
+    assert!(requests.load(Ordering::SeqCst) >= 3);
 }
 
 #[test]

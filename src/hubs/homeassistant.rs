@@ -184,6 +184,7 @@ fn list(
             Kind::HomeAssistant
                 .validate_camera(&state.entity_id, &hub.name)
                 .is_ok()
+                && client::public_identifier(&state.entity_id)
         })
         .map(|state| Listed {
             name: state

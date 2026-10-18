@@ -137,3 +137,20 @@ fn hub_with_user(url: &str, user: &str) -> Hub {
     hub.user = Some(user.into());
     hub
 }
+
+#[test]
+fn a_server_cannot_echo_the_password_as_a_public_stream_id() {
+    let password = "CANARY-go2rtc-reflected-password";
+    let mut config = FakeGo2rtc::new(frames());
+    config.streams.push(password.into());
+    let fake = config.start();
+    let hub = hub(Kind::Go2rtc, &fake.url(), true);
+    let password = secret(Kind::Go2rtc, password);
+    let listed = cameras(&hub, Some(&password), Duration::ZERO).unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(
+        listed
+            .iter()
+            .all(|camera| !camera.camera.contains("CANARY"))
+    );
+}

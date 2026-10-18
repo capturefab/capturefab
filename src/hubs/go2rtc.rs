@@ -164,6 +164,7 @@ pub(crate) fn cameras(
                 && name.len() <= 256
                 && !name.chars().any(char::is_control)
                 && !name.contains("://")
+                && client::public_identifier(name)
         })
         .map(|name| Listed {
             name: client::display(&name, 128),
