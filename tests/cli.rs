@@ -3276,3 +3276,890 @@ fn rpc_frame_inspects_stopped_and_live_cameras_without_saving() {
     );
     assert_eq!(session(&["status"])["streaming"], true);
 }
+
+fn tools_output(
+    dir: &PathBuf,
+    cwd: &PathBuf,
+    args: &[&str],
+    input: Option<&str>,
+) -> std::process::Output {
+    use std::io::Write;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_capturefab"));
+    command
+        .env_remove("CAPTUREFAB_SESSION")
+        .env_remove("CAPTUREFAB_CAMERA")
+        .env("CAPTUREFAB_SESSION_DIR", dir)
+        .env("CAPTUREFAB_STAGING_DIR", dir.join("uploads"))
+        .current_dir(cwd)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
+    let mut child = command.spawn().unwrap();
+    if let Some(input) = input {
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    child.wait_with_output().unwrap()
+}
+
+fn tools_response(output: &std::process::Output) -> Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{error}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+fn tools_ok(dir: &PathBuf, cwd: &PathBuf, args: &[&str]) -> Value {
+    let output = tools_output(dir, cwd, args, None);
+    assert!(
+        output.status.success(),
+        "{args:?}\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response = tools_response(&output);
+    assert_eq!(response["ok"], true);
+    response["result"].clone()
+}
+
+fn tools_fixture(name: &str) -> (Fixture, PathBuf, PathBuf, PathBuf) {
+    let root = temp_root(name);
+    let dir = root.join("sessions");
+    let cwd = root.join("caller");
+    let server = root.join("server");
+    let captures = root.join("captures");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&server).unwrap();
+    let child = serve_env(
+        &dir,
+        &server,
+        "tools-ci",
+        &[(
+            "CAPTUREFAB_STAGING_DIR",
+            dir.join("uploads").to_str().unwrap(),
+        )],
+    );
+    let fixture = Fixture { child, dir: root };
+    tools_ok(
+        &dir,
+        &cwd,
+        &[
+            "--json",
+            "destination",
+            "add-folder",
+            "captures",
+            captures.to_str().unwrap(),
+        ],
+    );
+    (fixture, dir, cwd, captures)
+}
+
+fn tools_call(dir: &PathBuf, cwd: &PathBuf, name: &str, args: Value, flags: &[&str]) -> Value {
+    let args = args.to_string();
+    let mut argv = vec![
+        "--json",
+        "--session",
+        "tools-ci",
+        "--actor",
+        "tools-integration",
+        "--actor-kind",
+        "agent",
+        "tools",
+        "call",
+        name,
+        "--args",
+        &args,
+    ];
+    argv.extend_from_slice(flags);
+    tools_ok(dir, cwd, &argv)
+}
+
+fn tools_photo_args(camera: &str, name: &str) -> Value {
+    serde_json::json!({"camera":camera,"count":1,"format":"png","file_name":name,"destination":"captures","tags":null})
+}
+
+#[test]
+fn tools_list_and_overview_work_without_a_session() {
+    let root = temp_root("tools-offline");
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = root.join("sessions");
+    let listed = tools_ok(&dir, &root, &["--json", "tools", "list"]);
+    let catalog = listed.as_array().unwrap();
+    assert_eq!(catalog.len(), 24);
+    for name in [
+        "get_overview",
+        "inspect_frame",
+        "set_camera_features",
+        "capture_photos",
+        "create_s3_destination",
+    ] {
+        let tool = catalog.iter().find(|tool| tool["name"] == name).unwrap();
+        assert!(tool["risk"].is_string());
+        assert!(tool["needs_session"].is_boolean());
+        assert!(tool["needs_vision"].is_boolean());
+        assert_eq!(tool["input_schema"]["additionalProperties"], false);
+    }
+    let overview = tools_ok(&dir, &root, &["--json", "tools", "call", "get_overview"]);
+    assert_eq!(overview["session"], false);
+    assert!(overview["cameras"].as_array().unwrap().is_empty());
+    assert!(overview["storage"].is_object());
+    let from_stdin = tools_output(
+        &dir,
+        &root,
+        &[
+            "--json",
+            "tools",
+            "call",
+            "get_overview",
+            "--args-file",
+            "-",
+        ],
+        Some("{}\n"),
+    );
+    assert!(
+        from_stdin.status.success(),
+        "{}",
+        String::from_utf8_lossy(&from_stdin.stdout)
+    );
+    assert_eq!(tools_response(&from_stdin)["result"]["session"], false);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn tools_schema_and_doctor_describe_shared_registry() {
+    let root = temp_root("tools-schema");
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = root.join("sessions");
+    let schema = tools_ok(&dir, &root, &["--json", "schema"]);
+    let tools = &schema["tools"];
+    let catalog = tools["catalog"].as_array().unwrap();
+    assert_eq!(catalog.len(), 24);
+    assert_eq!(
+        tools["catalog"],
+        tools_ok(&dir, &root, &["--json", "tools", "list"])
+    );
+    for (name, risk, needs_session) in [
+        ("get_overview", "observe", false),
+        ("list_cameras", "observe", false),
+        ("list_destinations", "observe", false),
+        ("get_storage", "observe", false),
+        ("list_jobs", "observe", true),
+        ("get_camera_features", "observe", true),
+        ("inspect_frame", "observe", true),
+        ("wait_for", "observe", true),
+        ("connect_camera", "reversible", true),
+        ("start_live_view", "reversible", true),
+        ("stop_live_view", "reversible", true),
+        ("set_camera_features", "reversible", true),
+        ("set_camera_roi", "reversible", true),
+        ("set_auto_exposure", "reversible", true),
+        ("run_camera_command", "reversible", true),
+        ("undo_camera_change", "reversible", true),
+        ("capture_photos", "bounded", true),
+        ("start_recording", "bounded", true),
+        ("stop_recording", "bounded", true),
+        ("schedule_captures", "bounded", true),
+        ("cancel_job", "bounded", true),
+        ("stream_to_url", "disruptive", true),
+        ("create_folder_destination", "human_only", false),
+        ("create_s3_destination", "human_only", false),
+    ] {
+        let tool = catalog.iter().find(|tool| tool["name"] == name).unwrap();
+        assert_eq!(tool["risk"], risk, "{name}");
+        assert_eq!(tool["needs_session"], needs_session, "{name}");
+        assert_eq!(
+            tool["needs_vision"], false,
+            "metrics remain available without vision: {name}"
+        );
+        let input = &tool["input_schema"];
+        let properties = input["properties"].as_object().unwrap();
+        let required = input["required"].as_array().unwrap();
+        assert_eq!(input["additionalProperties"], false, "{name}");
+        assert_eq!(required.len(), properties.len(), "{name}");
+        for key in properties.keys() {
+            assert!(
+                required.contains(&serde_json::json!(key)),
+                "{name}.{key} must be required, with null for defaults"
+            );
+        }
+        assert!(!properties.contains_key("secret"), "{name}");
+        assert!(!properties.contains_key("password"), "{name}");
+    }
+    let photos = catalog
+        .iter()
+        .find(|tool| tool["name"] == "capture_photos")
+        .unwrap();
+    assert_eq!(
+        photos["input_schema"]["properties"]["count"]["type"],
+        serde_json::json!(["integer", "null"])
+    );
+    assert_eq!(
+        photos["input_schema"]["properties"]["destination"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    let features = catalog
+        .iter()
+        .find(|tool| tool["name"] == "set_camera_features")
+        .unwrap();
+    let settings = &features["input_schema"]["properties"]["values"]["items"];
+    assert_eq!(settings["additionalProperties"], false);
+    assert_eq!(
+        settings["required"],
+        serde_json::json!(["feature", "value", "expect"])
+    );
+    assert_eq!(
+        settings["properties"]["expect"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(tools["plan"]["version"], 1);
+    assert_eq!(tools["plan"]["max_calls"], 64);
+    assert_eq!(tools["plan"]["max_bytes"], 256 * 1024);
+    assert_eq!(
+        tools["issues"]["exit_codes"],
+        serde_json::json!({"usage":2,"unavailable":3,"timeout":4,"unsupported":5,"storage_full":6,"operation_failed":1})
+    );
+    assert_eq!(
+        tools["confirmation"]["risks"],
+        serde_json::json!(["disruptive", "human_only"])
+    );
+    assert_eq!(tools["confirmation"]["flag"], "--confirmed-by-user");
+    assert_eq!(tools["images"]["directory_mode"], "0700");
+    assert_eq!(tools["images"]["file_mode"], "0600");
+    assert_eq!(tools["images"]["max_files"], 64);
+    assert_eq!(tools["images"]["max_bytes"], 64 * 1024 * 1024);
+    assert_eq!(
+        tools["images"]["metadata"],
+        serde_json::json!(["path", "mime", "width", "height", "bytes", "sha256"])
+    );
+    let cli_tools = schema["cli"]["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|command| command["name"] == "tools")
+        .unwrap();
+    let commands = cli_tools["commands"].as_array().unwrap();
+    assert_eq!(
+        commands
+            .iter()
+            .map(|command| command["name"].as_str().unwrap())
+            .filter(|name| *name != "help")
+            .collect::<Vec<_>>(),
+        ["list", "call", "apply"]
+    );
+    let call = commands
+        .iter()
+        .find(|command| command["name"] == "call")
+        .unwrap();
+    let arguments = call["arguments"].as_array().unwrap();
+    for name in [
+        "args",
+        "args-file",
+        "dry-run",
+        "secret-stdin",
+        "confirmed-by-user",
+        "image-out",
+        "inline-image",
+    ] {
+        assert!(
+            arguments.iter().any(|argument| argument["long"] == name),
+            "tools call --{name}"
+        );
+    }
+    let apply = commands
+        .iter()
+        .find(|command| command["name"] == "apply")
+        .unwrap();
+    let arguments = apply["arguments"].as_array().unwrap();
+    assert!(
+        arguments
+            .iter()
+            .any(|argument| argument["name"] == "file" && argument["required"] == true)
+    );
+    for name in ["dry-run", "secret-stdin", "confirmed-by-user"] {
+        assert!(
+            arguments.iter().any(|argument| argument["long"] == name),
+            "tools apply --{name}"
+        );
+    }
+    let doctor = tools_ok(&dir, &root, &["--json", "doctor"]);
+    assert_eq!(doctor["features"]["ai"], cfg!(feature = "ai"));
+    assert_eq!(doctor["features"]["uploads"], cfg!(feature = "uploads"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn tools_capture_photos_numbers_existing_files_and_dry_run_saves_nothing() {
+    let (_fixture, dir, cwd, captures) = tools_fixture("tools-capture");
+    tools_call(
+        &dir,
+        &cwd,
+        "connect_camera",
+        serde_json::json!({"camera":"sim:0","size":null,"fps":null}),
+        &[],
+    );
+    let planned = tools_call(
+        &dir,
+        &cwd,
+        "capture_photos",
+        tools_photo_args("sim:0", "planned.png"),
+        &["--dry-run"],
+    );
+    assert_eq!(planned["checked"].as_array().unwrap().len(), 1);
+    assert!(
+        planned["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|op| op["command"]["op"] == "capture")
+    );
+    assert!(!captures.join("planned.png").exists());
+    let first = tools_call(
+        &dir,
+        &cwd,
+        "capture_photos",
+        tools_photo_args("sim:0", "shot.png"),
+        &[],
+    );
+    assert_eq!(first["results"].as_array().unwrap().len(), 1);
+    assert_eq!(first["results"][0]["files"].as_array().unwrap().len(), 1);
+    let original = std::fs::read(captures.join("shot.png")).unwrap();
+    tools_call(
+        &dir,
+        &cwd,
+        "capture_photos",
+        tools_photo_args("sim:0", "shot.png"),
+        &[],
+    );
+    assert_eq!(std::fs::read(captures.join("shot.png")).unwrap(), original);
+    let files = std::fs::read_dir(&captures)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(files.len(), 2, "{files:?}");
+    assert!(
+        files
+            .iter()
+            .all(|path| path.extension().and_then(|ext| ext.to_str()) == Some("png"))
+    );
+}
+
+#[test]
+fn tools_usage_errors_have_field_details_and_never_create_session_state() {
+    let root = temp_root("tools-usage");
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = root.join("sessions");
+    let mut invalid = tools_photo_args("sim:0", "photo.png");
+    invalid["count"] = serde_json::json!("ten");
+    let invalid = invalid.to_string();
+    let output = tools_output(
+        &dir,
+        &root,
+        &[
+            "--json",
+            "tools",
+            "call",
+            "capture_photos",
+            "--args",
+            &invalid,
+        ],
+        None,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let error = tools_response(&output);
+    assert_eq!(error["error"]["details"]["issues"][0]["field"], "count");
+    assert!(
+        !dir.exists(),
+        "offline argument validation created session state"
+    );
+    for args in [
+        vec!["--json", "tools", "call", "not_a_tool"],
+        vec!["--json", "tools", "call", "get_overview", "--args", "{"],
+        vec![
+            "--json",
+            "tools",
+            "call",
+            "get_overview",
+            "--args",
+            "{}",
+            "--args-file",
+            "missing.json",
+        ],
+        vec!["--json", "--camera", "sim:0", "tools", "list"],
+    ] {
+        let output = tools_output(&dir, &root, &args, None);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(!dir.exists(), "{args:?} created session state");
+    }
+    for (tool, args) in [
+        ("start_live_view", r#"{"camera":"sim:0","camera":"sim:0"}"#),
+        (
+            "set_camera_features",
+            r#"{"camera":"sim:0","values":[{"feature":"Gain","value":"0","value":"1","expect":null}],"restart_stream":false}"#,
+        ),
+    ] {
+        let output = tools_output(
+            &dir,
+            &root,
+            &["--json", "tools", "call", tool, "--args", args],
+            None,
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{tool}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            tools_response(&output)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("duplicate")
+        );
+        assert!(!dir.exists(), "duplicate args created session state");
+    }
+    let oversized = serde_json::json!({"text":"x".repeat(256*1024)}).to_string();
+    let oversized_path = root.join("oversized-args.json");
+    std::fs::write(&oversized_path, oversized).unwrap();
+    assert_eq!(
+        tools_output(
+            &dir,
+            &root,
+            &[
+                "--json",
+                "tools",
+                "call",
+                "get_overview",
+                "--args-file",
+                oversized_path.to_str().unwrap()
+            ],
+            None
+        )
+        .status
+        .code(),
+        Some(2)
+    );
+    assert!(!dir.exists());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn tools_missing_destination_and_unconfirmed_stream_have_distinct_errors() {
+    let (_fixture, dir, cwd, _) = tools_fixture("tools-refusals");
+    tools_call(
+        &dir,
+        &cwd,
+        "connect_camera",
+        serde_json::json!({"camera":"sim:0","size":null,"fps":null}),
+        &[],
+    );
+    let mut missing = tools_photo_args("sim:0", "missing.png");
+    missing["destination"] = serde_json::json!("not-saved");
+    let missing = missing.to_string();
+    let output = tools_output(
+        &dir,
+        &cwd,
+        &[
+            "--json",
+            "--session",
+            "tools-ci",
+            "tools",
+            "call",
+            "capture_photos",
+            "--args",
+            &missing,
+        ],
+        None,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        tools_response(&output)["error"]["details"]["issues"][0]["field"],
+        "destination"
+    );
+    let stream=serde_json::json!({"camera":"sim:0","url":"rtmp://uncontacted.example/live/","duration":null,"codec":null,"fps":null,"bitrate":null}).to_string();
+    let output = tools_output(
+        &dir,
+        &cwd,
+        &[
+            "--json",
+            "--session",
+            "tools-ci",
+            "tools",
+            "call",
+            "stream_to_url",
+            "--args",
+            &stream,
+        ],
+        None,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        tools_response(&output)["error"]["details"]["risk"],
+        "disruptive"
+    );
+    let status = tools_ok(
+        &dir,
+        &cwd,
+        &[
+            "--json",
+            "--session",
+            "tools-ci",
+            "--camera",
+            "sim:0",
+            "status",
+        ],
+    );
+    assert!(status["forwarding"].is_null());
+}
+
+#[test]
+fn tools_inspect_frame_delivers_private_bounded_images_and_measurements() {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let (_fixture, dir, cwd, captures) = tools_fixture("tools-inspect");
+    tools_call(
+        &dir,
+        &cwd,
+        "connect_camera",
+        serde_json::json!({"camera":"sim:0","size":null,"fps":null}),
+        &[],
+    );
+    let inspected = tools_call(
+        &dir,
+        &cwd,
+        "inspect_frame",
+        serde_json::json!({"camera":"sim:0","fresh":1,"max_dimension":256,"region":null,"include_image":true}),
+        &[],
+    );
+    assert!(inspected["exposure"]["mean"].as_f64().unwrap() > 0.0);
+    let image = &inspected["image"];
+    let path = PathBuf::from(image["path"].as_str().unwrap());
+    assert!(path.starts_with(dir.join("inspect")), "{path:?}");
+    let width = image["width"].as_u64().unwrap();
+    let height = image["height"].as_u64().unwrap();
+    assert!(width > 0 && height > 0 && width.max(height) <= 256);
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(bytes.len() as u64, image["bytes"].as_u64().unwrap());
+    assert_eq!(image["sha256"], format!("{:x}", Sha256::digest(&bytes)));
+    assert!(matches!(
+        image["mime"].as_str(),
+        Some("image/jpeg" | "image/png")
+    ));
+    assert!(image.get("base64").is_none());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(dir.join("inspect"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(captures).unwrap().count(),
+        0,
+        "inspection must not save captures"
+    );
+    let extension = if image["mime"] == "image/jpeg" {
+        "jpg"
+    } else {
+        "png"
+    };
+    let exported_path = cwd.join(format!("diagnostic.{extension}"));
+    let inspect = serde_json::json!({"camera":"sim:0","fresh":1,"max_dimension":256,"region":null,"include_image":true});
+    let exported = tools_call(
+        &dir,
+        &cwd,
+        "inspect_frame",
+        inspect.clone(),
+        &[
+            "--image-out",
+            exported_path.to_str().unwrap(),
+            "--inline-image",
+        ],
+    );
+    assert_eq!(exported["image"]["path"], exported_path.to_str().unwrap());
+    let exported_bytes = std::fs::read(&exported_path).unwrap();
+    let inline = base64::engine::general_purpose::STANDARD
+        .decode(exported["image"]["base64"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(inline, exported_bytes);
+    let inspect = inspect.to_string();
+    let refused = tools_output(
+        &dir,
+        &cwd,
+        &[
+            "--json",
+            "--session",
+            "tools-ci",
+            "tools",
+            "call",
+            "inspect_frame",
+            "--args",
+            &inspect,
+            "--image-out",
+            exported_path.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        !refused.status.success(),
+        "an explicit image export must not overwrite"
+    );
+    assert_eq!(std::fs::read(exported_path).unwrap(), exported_bytes);
+}
+
+#[test]
+fn tools_inspect_frame_without_a_session_explains_how_to_start_one() {
+    let root = temp_root("tools-no-session");
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = root.join("sessions");
+    let args=serde_json::json!({"camera":"sim:0","fresh":1,"max_dimension":256,"region":null,"include_image":true}).to_string();
+    let output = tools_output(
+        &dir,
+        &root,
+        &["--json", "tools", "call", "inspect_frame", "--args", &args],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(tools_response(&output)["error"]["message"].as_str().unwrap().contains("inspect_frame needs a running session; start one with `capturefab serve --name NAME`"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn tools_setting_exposure_changes_the_frame_and_undo_restores_it() {
+    let (_fixture, dir, cwd, _) = tools_fixture("tools-closed-loop");
+    tools_call(
+        &dir,
+        &cwd,
+        "connect_camera",
+        serde_json::json!({"camera":"sim:0","size":null,"fps":null}),
+        &[],
+    );
+    tools_call(
+        &dir,
+        &cwd,
+        "start_live_view",
+        serde_json::json!({"camera":"sim:0"}),
+        &[],
+    );
+    let inspect = serde_json::json!({"camera":"sim:0","fresh":2,"max_dimension":0,"region":null,"include_image":false});
+    let baseline = tools_call(&dir, &cwd, "inspect_frame", inspect.clone(), &[]);
+    let mean = baseline["exposure"]["mean"].as_f64().unwrap();
+    let features = tools_call(
+        &dir,
+        &cwd,
+        "get_camera_features",
+        serde_json::json!({"camera":"sim:0","search":null,"names":["ExposureTime"]}),
+        &[],
+    );
+    let exposure = &features["features"][0]["value"];
+    let changed = tools_call(
+        &dir,
+        &cwd,
+        "set_camera_features",
+        serde_json::json!({"camera":"sim:0","values":[{"feature":"ExposureTime","value":"40000","expect":exposure.to_string()}],"restart_stream":false}),
+        &[],
+    );
+    let token = changed["results"][0]["camera_change"]["token"]
+        .as_str()
+        .unwrap();
+    let brighter = tools_call(&dir, &cwd, "inspect_frame", inspect.clone(), &[]);
+    assert!(
+        brighter["exposure"]["mean"].as_f64().unwrap() > mean + 0.15,
+        "before {baseline}; after {brighter}"
+    );
+    tools_call(
+        &dir,
+        &cwd,
+        "undo_camera_change",
+        serde_json::json!({"camera":"sim:0","token":token}),
+        &[],
+    );
+    let restored = tools_call(&dir, &cwd, "inspect_frame", inspect, &[]);
+    assert!(
+        (restored["exposure"]["mean"].as_f64().unwrap() - mean).abs() < 0.1,
+        "before {baseline}; restored {restored}"
+    );
+}
+
+#[test]
+fn tools_apply_executes_a_two_step_plan_in_order() {
+    let (_fixture, dir, cwd, captures) = tools_fixture("tools-apply");
+    let plan = serde_json::json!({"version":1,"calls":[{"tool":"connect_camera","args":{"camera":"sim:apply","size":null,"fps":null}},{"tool":"capture_photos","args":tools_photo_args("sim:apply","applied.png")}]});
+    let path = cwd.join("plan.json");
+    std::fs::write(&path, plan.to_string()).unwrap();
+    let dry = tools_ok(
+        &dir,
+        &cwd,
+        &[
+            "--json",
+            "--session",
+            "tools-ci",
+            "tools",
+            "apply",
+            path.to_str().unwrap(),
+            "--dry-run",
+        ],
+    );
+    assert_eq!(dry["checked"].as_array().unwrap().len(), 2);
+    assert!(!captures.join("applied.png").exists());
+    let applied = tools_ok(
+        &dir,
+        &cwd,
+        &[
+            "--json",
+            "--session",
+            "tools-ci",
+            "--actor",
+            "tools-integration",
+            "--actor-kind",
+            "agent",
+            "tools",
+            "apply",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(applied["completed"].as_array().unwrap().len(), 2);
+    assert!(captures.join("applied.png").is_file());
+    let status = tools_ok(&dir, &cwd, &["--json", "--session", "tools-ci", "status"]);
+    assert!(
+        status["cameras"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|camera| camera["info"]["id"] == "sim:apply")
+    );
+}
+
+#[test]
+fn tools_secret_stdin_requires_exactly_one_consumer_before_touching_session_state() {
+    let root = temp_root("tools-secret-count");
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = root.join("sessions");
+    let output = tools_output(
+        &dir,
+        &root,
+        &["--json", "tools", "call", "get_overview", "--secret-stdin"],
+        Some("unused-secret\n"),
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!dir.exists());
+    let destination = |name: &str| serde_json::json!({"tool":"create_s3_destination","args":{"name":name,"bucket":"capturefab-test-bucket","region":"us-east-1","endpoint":null,"prefix":null,"path_style":false,"credentials":"keychain","profile":null,"access_key_id":"AKIA1234567890ABCDEF","keep_local":false}});
+    let plan = serde_json::json!({"version":1,"calls":[destination("one"),destination("two")]});
+    let path = root.join("two-secrets.json");
+    std::fs::write(&path, plan.to_string()).unwrap();
+    let output = tools_output(
+        &dir,
+        &root,
+        &[
+            "--json",
+            "tools",
+            "apply",
+            path.to_str().unwrap(),
+            "--secret-stdin",
+            "--dry-run",
+        ],
+        Some("never-stored-secret\n"),
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(!dir.exists());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("never-stored-secret"));
+    let output = tools_output(
+        &dir,
+        &root,
+        &[
+            "--json",
+            "tools",
+            "call",
+            "get_overview",
+            "--args-file",
+            "-",
+            "--secret-stdin",
+        ],
+        Some("{}\n"),
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!dir.exists());
+    #[cfg(feature = "s3")]
+    {
+        let plan = serde_json::json!({"version":1,"calls":[destination("one")]});
+        let path = root.join("one-secret.json");
+        std::fs::write(&path, plan.to_string()).unwrap();
+        let output = tools_output(
+            &dir,
+            &root,
+            &[
+                "--json",
+                "tools",
+                "apply",
+                path.to_str().unwrap(),
+                "--secret-stdin",
+                "--dry-run",
+                "--confirmed-by-user",
+            ],
+            Some("single-dry-run-secret\n"),
+        );
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            tools_response(&output)["result"]["checked"][0]["risk"],
+            "human_only"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("single-dry-run-secret"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("single-dry-run-secret"));
+        assert!(
+            !dir.join("destinations.json").exists(),
+            "dry-run must not create a destination or store its secret"
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}

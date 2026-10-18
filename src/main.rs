@@ -76,16 +76,45 @@ fn main() {
         }
         let (code, exit) = cli::error_code(&error);
         let workflow_failure = error.downcast_ref::<capturefab::workflow::WorkflowFailure>();
-        let message = workflow_failure
+        let check_failure = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<capturefab::tools::CheckFailure>());
+        let plan_failure = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<capturefab::tools::PlanFailure>());
+        let confirmation = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<cli::ToolsConfirmationRequired>());
+        let message = check_failure
             .map(ToString::to_string)
+            .or_else(|| plan_failure.map(ToString::to_string))
+            .or_else(|| confirmation.map(ToString::to_string))
+            .or_else(|| workflow_failure.map(ToString::to_string))
             .unwrap_or_else(|| format!("{error:#}"));
         if json_mode {
             let mut envelope =
                 json!({"version":1,"ok":false,"error":{"code":code,"message":message}});
-            if let Some(failure) = workflow_failure {
+            if let Some(failure) = check_failure {
+                envelope["error"]["details"] = failure.details();
+            } else if let Some(failure) = plan_failure {
+                envelope["error"]["details"] = failure.details();
+            } else if let Some(confirmation) = confirmation {
+                envelope["error"]["details"] = confirmation.details();
+            } else if let Some(failure) = workflow_failure {
                 envelope["error"]["details"] = failure.result();
             }
             let _ = cli::write_json(&envelope);
+        } else if let Some(failure) = check_failure {
+            for (step, issues) in &failure.issues_by_step {
+                for issue in issues {
+                    let field = issue
+                        .field
+                        .as_deref()
+                        .map(|field| format!(" ({field})"))
+                        .unwrap_or_default();
+                    eprintln!("capturefab: step {step}{field}: {}", issue.message);
+                }
+            }
         } else {
             eprintln!("capturefab: {message}");
         }

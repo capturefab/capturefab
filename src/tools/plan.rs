@@ -53,12 +53,22 @@ pub fn parse(text: &str) -> Result<PlanDocument> {
         text.len() <= MAX_PLAN_BYTES,
         "Use a plan no larger than 256 KiB."
     );
-    let strict: StrictValue = serde_json::from_str(text)
-        .context("Read a plan object with version and calls, without duplicate fields.")?;
-    let document: PlanDocument =
-        serde_json::from_value(strict.0).context("Read a plan object with version and calls.")?;
+    let document: PlanDocument = serde_json::from_value(parse_value(text)?)
+        .context("Read a plan object with version and calls.")?;
     document.validate()?;
     Ok(document)
+}
+
+/// The same bounded, duplicate-refusing JSON reader serves command-line
+/// arguments and complete plans before either can contact a session.
+pub(crate) fn parse_value(text: &str) -> Result<serde_json::Value> {
+    ensure!(
+        text.len() <= MAX_PLAN_BYTES,
+        "Use JSON no larger than 256 KiB."
+    );
+    let strict: StrictValue =
+        serde_json::from_str(text).context("Read JSON without duplicate object fields.")?;
+    Ok(strict.0)
 }
 
 struct StrictValue(serde_json::Value);

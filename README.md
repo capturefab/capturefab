@@ -2,7 +2,7 @@
 
 Capture camera images, video, sensor values and PLC tags on the plant floor, and keep them ready for analysis. Capturefab is a native desktop app and a scriptable CLI for manufacturing and process engineers who work on OT networks. It connects GigE Vision, USB3 Vision, webcams, RTSP/ONVIF cameras and document scanners; reads Modbus TCP, MQTT, OPC UA and MTConnect sources; and catalogs every saved file and sample in one DuckDB dataset. An export gives Parquet or CSV files plus a `README.md` and `manifest.json` that a notebook, a BI tool or an AI assistant such as Claude, ChatGPT or Gemini can read without more explanation.
 
-Everything runs on the local computer, with no cloud service. Files are never overwritten: captures get new names from templates such as `{camera}-{datetime}-{seq}.png`. Open `capturefab` to discover cameras, select a device, inspect its settings, and capture. The same executable runs headless and lets scripts or coding agents control an already visible GUI session.
+Camera acquisition, storage and datasets run on the local computer. Optional AI features send requests and selected camera data to the provider you choose. Files are never overwritten: captures get new names from templates such as `{camera}-{datetime}-{seq}.png`. Open `capturefab` to discover cameras, select a device, inspect its settings, and capture. The same executable runs headless and lets scripts or coding agents control an already visible GUI session.
 
 Capturefab is MIT-licensed. Its GigE Vision, USB3 Vision, GenICam, Modbus TCP, MQTT, OPC UA and MTConnect clients are Rust; each signal source runs in its own helper process. Media decoding, host-driver camera access and encoding use a bundled, source-built FFmpeg executable. Release binaries require no separately installed Aravis, FFmpeg, libusb, vendor SDK or Python. Operating-system graphics and camera drivers remain necessary.
 
@@ -100,6 +100,29 @@ capturefab --session bench stop
 ```
 
 Agents can look at a camera without saving files. RPC `{"op":"frame","fresh":1,"max_dimension":1024}` returns the camera's newest frame after the commands sent before it: exposure, auto-meter and focus measurements, and a JPEG preview of at most 1.5 MiB as base64. A stopped camera acquires one frame and stays stopped; `region` crops the full-resolution frame. `{"op":"set_many","values":[{"feature":"ExposureTime","value":"8000"},{"feature":"Gain","value":"6"}]}` writes several features as one change: a failure restores all of them, and `undo` reverts them together. `schema --json` describes `frame` in `result.frame` and `set_many` in `result.writes`, with examples of both in `result.rpc.commands`.
+
+## Camera tools for agents
+
+Claude Code, Codex and other external agents can use the same checked camera tools as Capturefab. The registry covers observation, camera controls, captures, recordings, schedules and destination creation. It is available in desktop and headless builds.
+
+```sh
+capturefab serve --name bench
+# In another terminal:
+capturefab --session bench --actor codex --actor-kind agent tools list --json
+capturefab --session bench --actor codex --actor-kind agent tools call get_overview --json
+capturefab --session bench --actor codex --actor-kind agent tools call connect_camera --args '{"camera":"sim:0","size":null,"fps":null}' --json
+capturefab --session bench --actor codex --actor-kind agent tools call start_live_view --args '{"camera":"sim:0"}' --json
+capturefab --session bench --actor codex --actor-kind agent tools call inspect_frame --args '{"camera":"sim:0","fresh":1,"max_dimension":1024,"region":null,"include_image":true}' --json
+capturefab --session bench --actor codex --actor-kind agent tools call set_camera_features --args '{"camera":"sim:0","values":[{"feature":"ExposureTime","value":"8000","expect":"10000"}],"restart_stream":false}' --dry-run --json
+```
+
+Read `result.image.path` with your image viewer. Default inspection images are private, temporary diagnostics outside the capture budget; `--image-out PATH` saves a budgeted file without overwriting. `--inline-image` returns `image.base64` in JSON. A stopped camera acquires one frame and stays stopped. With images off, `inspect_frame` still returns exposure and focus measurements.
+
+Read each tool's schema in `tools list --json` or `schema --json` under `result.tools`. Every argument key is required; use `null` for defaults. Tool calls choose their camera in `args.camera`; omit global `--camera` and `CAPTUREFAB_CAMERA`. Calls and dry runs can attach to a running session. Offline observation tools and destination creation also work without one; camera tools do not create a temporary session.
+
+Action dry runs return `{checked,commands}` without executing. Review issues, risk and output locations first. Pass `--confirmed-by-user` for Disruptive or HumanOnly actions only after the user approved that exact action. `--secret-stdin` supplies one stream password or S3 secret separately from arguments. Never put secrets in prompts, command lines or plan files.
+
+`tools apply FILE --dry-run --json` checks a strict version-1 document: `{"version":1,"calls":[{"tool":"start_live_view","args":{"camera":"sim:0"}}]}`. Plans accept 1–64 calls and at most 256 KiB. Apply rechecks the plan, executes in order and stops at the first failure; earlier effects remain. See [the external-agent recipe](web/agents.md#let-an-agent-drive-cameras) for observation, optimistic setting writes, waiting, capture, undo and typed error recovery.
 
 ## Automatic capture and review
 
