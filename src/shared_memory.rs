@@ -131,7 +131,26 @@ fn allocate(file: &File, length: u64) -> std::io::Result<()> {
         error => Err(std::io::Error::from_raw_os_error(error)),
     }
 }
-#[cfg(all(unix, not(target_os = "linux")))]
+/// All of the length or nothing: fs2 asks for contiguous blocks first, and
+/// APFS may grant only part of that on a fragmented disk.
+#[cfg(target_os = "macos")]
+fn allocate(file: &File, length: u64) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut store = libc::fstore_t {
+        fst_flags: libc::F_ALLOCATEALL,
+        fst_posmode: libc::F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: length as libc::off_t,
+        fst_bytesalloc: 0,
+    };
+    // SAFETY: a valid descriptor and an initialized fstore_t that fcntl may
+    // write its allocated byte count into.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &raw mut store) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    file.set_len(length)
+}
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn allocate(file: &File, length: u64) -> std::io::Result<()> {
     fs2::FileExt::allocate(file, length)
 }
