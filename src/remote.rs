@@ -35,9 +35,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 // Out of descriptors and similar accept failures repeat at once; pause instead of spinning.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
-// One cached preview per camera worker and format; a viewer of a camera
-// beyond this re-encodes as before.
+// One cached preview per camera and format; a viewer of a camera beyond
+// this re-encodes as before.
 const PREVIEW_SLOTS: usize = 16;
+// Clients asking this soon after an encode get that preview, even when the
+// camera has a newer frame. Under the bundled client's 250 ms poll, so tabs
+// share encodes without any one of them losing its preview rate.
+const PREVIEW_SHARE: Duration = Duration::from_millis(100);
 /// The source build's client, relative to the working directory.
 const DEFAULT_WEB_DIR: &str = "web-client/dist";
 
@@ -695,54 +699,64 @@ impl Service {
         success(self.handle.activity())
     }
 
-    /// The newest frame as a bounded display image. Every client shares one
-    /// encode per frame and format, and a client that already has the frame
-    /// gets 304 with no encode at all.
+    /// The newest frame as a bounded display image. Clients share one encode
+    /// per frame and format, or per `PREVIEW_SHARE` while a camera streams,
+    /// and a client that already has the frame gets 304 with no encode at all.
     fn preview(&self, query: &str, if_none_match: Option<&str>) -> Response {
         let (camera, format) = match preview_query(query) {
             Ok(query) => query,
             Err(message) => return error(400, message),
         };
-        let camera = camera.or_else(|| self.handle.active_camera());
-        let frame = camera
-            .as_deref()
-            .and_then(|camera| self.handle.latest_frame_from(camera));
-        let (Some(camera), Some((worker, frame))) = (camera, frame) else {
+        let Some(camera) = camera.or_else(|| self.handle.active_camera()) else {
             return Response::new(204, "image/png", Vec::new());
         };
-        // A frame larger than the camera's ring arrives downscaled; the
-        // headers give the size the camera delivered.
-        let (frame_width, frame_height, _) = self.handle.preview_of(&camera).unwrap_or((
-            frame.width,
-            frame.height,
-            frame.pixel_format,
-        ));
-        let key = PreviewKey {
-            worker,
-            frame: frame.id,
-            timestamp_ns: frame.timestamp_ns,
-            format: format.served(),
-        };
-        let etag = key.etag();
-        let mut response = if if_none_match.is_some_and(|tags| etag_matches(tags, &etag)) {
-            Response::new(304, key.format.content_type(), Vec::new())
-        } else {
-            match self
-                .previews
-                .get(key, || encode_preview(&frame, key.format))
-            {
-                Ok(body) => Response::new(200, key.format.content_type(), body),
-                Err(response) => return response,
+        let format = format.served();
+        let slot = self.previews.slot(&camera, format);
+        let mut cached = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if cached
+            .as_ref()
+            .is_none_or(|preview| preview.encoded.elapsed() >= self.previews.share)
+        {
+            let Some((worker, frame)) = self.handle.latest_frame_from(&camera) else {
+                return Response::new(204, "image/png", Vec::new());
+            };
+            let key = PreviewKey {
+                worker,
+                frame: frame.id,
+                timestamp_ns: frame.timestamp_ns,
+                format,
+            };
+            // A frame larger than the camera's ring arrives downscaled; the
+            // headers give the size the camera delivered.
+            let (width, height, _) = self.handle.preview_of(&camera).unwrap_or((
+                frame.width,
+                frame.height,
+                frame.pixel_format,
+            ));
+            if cached.as_ref().is_none_or(|preview| preview.key != key) {
+                if if_none_match.is_some_and(|tags| etag_matches(tags, &key.etag())) {
+                    return preview_response(key, (width, height), None);
+                }
+                self.previews.encodes.fetch_add(1, Ordering::Relaxed);
+                let body = match encode_preview(&frame, format) {
+                    Ok(body) => body,
+                    Err(response) => return response,
+                };
+                *cached = Some(Preview {
+                    key,
+                    size: (width, height),
+                    body,
+                    encoded: Instant::now(),
+                });
             }
-        };
-        response.headers.extend([
-            ("ETag", etag),
-            ("X-Frame-Id", frame.id.to_string()),
-            ("X-Frame-Timestamp-Ns", frame.timestamp_ns.to_string()),
-            ("X-Frame-Width", frame_width.to_string()),
-            ("X-Frame-Height", frame_height.to_string()),
-        ]);
-        response
+        }
+        let preview = cached.as_ref().expect("a preview was cached above");
+        let unchanged = if_none_match.is_some_and(|tags| etag_matches(tags, &preview.key.etag()));
+        preview_response(
+            preview.key,
+            preview.size,
+            (!unchanged).then(|| preview.body.clone()),
+        )
     }
 
     fn asset(&self, encoded_path: &str) -> Response {
@@ -910,25 +924,58 @@ impl PreviewKey {
     }
 }
 
-/// The newest preview encoded for each camera worker and format, most
-/// recently used last. Each slot has its own lock, held while encoding, so
-/// clients asking for the same new frame wait for one encode while other
-/// cameras' previews go ahead.
-#[derive(Default)]
-struct Previews {
-    slots: Mutex<VecDeque<(SlotOwner, Arc<PreviewSlot>)>>,
-    encodes: AtomicU64,
+/// A preview with its frame headers, or 304 without a body.
+fn preview_response(
+    key: PreviewKey,
+    (width, height): (u32, u32),
+    body: Option<Vec<u8>>,
+) -> Response {
+    let mut response = match body {
+        Some(body) => Response::new(200, key.format.content_type(), body),
+        None => Response::new(304, key.format.content_type(), Vec::new()),
+    };
+    response.headers.extend([
+        ("ETag", key.etag()),
+        ("X-Frame-Id", key.frame.to_string()),
+        ("X-Frame-Timestamp-Ns", key.timestamp_ns.to_string()),
+        ("X-Frame-Width", width.to_string()),
+        ("X-Frame-Height", height.to_string()),
+    ]);
+    response
 }
-/// A camera worker's pid and a format.
-type SlotOwner = (u32, PreviewFormat);
-type PreviewSlot = Mutex<Option<(PreviewKey, Vec<u8>)>>;
+
+/// The newest preview encoded for each camera and format, most recently used
+/// last. Each slot has its own lock, held while encoding, so clients asking
+/// for the same new frame wait for one encode while other cameras' previews
+/// go ahead.
+struct Previews {
+    slots: Mutex<VecDeque<((String, PreviewFormat), PreviewSlot)>>,
+    encodes: AtomicU64,
+    share: Duration,
+}
+impl Default for Previews {
+    fn default() -> Self {
+        Self {
+            slots: Mutex::default(),
+            encodes: AtomicU64::new(0),
+            share: PREVIEW_SHARE,
+        }
+    }
+}
+type PreviewSlot = Arc<Mutex<Option<Preview>>>;
+struct Preview {
+    key: PreviewKey,
+    /// The size the camera delivered.
+    size: (u32, u32),
+    body: Vec<u8>,
+    encoded: Instant,
+}
 impl Previews {
-    fn slot(&self, key: PreviewKey) -> Arc<PreviewSlot> {
+    fn slot(&self, camera: &str, format: PreviewFormat) -> PreviewSlot {
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
-        let owner = (key.worker, key.format);
         let slot = match slots
             .iter()
-            .position(|(slot_owner, _)| *slot_owner == owner)
+            .position(|((owner, owned), _)| owner == camera && *owned == format)
         {
             Some(index) => slots.remove(index).expect("position is in range").1,
             None => Arc::default(),
@@ -936,26 +983,8 @@ impl Previews {
         if slots.len() >= PREVIEW_SLOTS {
             slots.pop_front();
         }
-        slots.push_back((owner, slot.clone()));
+        slots.push_back(((camera.to_owned(), format), slot.clone()));
         slot
-    }
-
-    fn get(
-        &self,
-        key: PreviewKey,
-        encode: impl FnOnce() -> std::result::Result<Vec<u8>, Response>,
-    ) -> std::result::Result<Vec<u8>, Response> {
-        let slot = self.slot(key);
-        let mut cached = slot.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((cached_key, body)) = cached.as_ref()
-            && *cached_key == key
-        {
-            return Ok(body.clone());
-        }
-        self.encodes.fetch_add(1, Ordering::Relaxed);
-        let body = encode()?;
-        *cached = Some((key, body.clone()));
-        Ok(body)
     }
 }
 
@@ -969,7 +998,11 @@ fn encode_preview(frame: &Frame, format: PreviewFormat) -> std::result::Result<V
     let data: Vec<u8> = if gray {
         pixels.iter().map(|p| p[0]).collect()
     } else {
-        pixels.iter().flat_map(|p| [p[0], p[1], p[2]]).collect()
+        let mut rgb = Vec::with_capacity(pixels.len() * 3);
+        for pixel in pixels {
+            rgb.extend_from_slice(&pixel[..3]);
+        }
+        rgb
     };
     let encoded = match format {
         PreviewFormat::Jpeg => crate::jpeg::software(&crate::jpeg::Raster {
@@ -1194,7 +1227,11 @@ mod tests {
             web_root,
             quitting: Arc::new(AtomicBool::new(false)),
             activity_waits: Arc::new(AtomicUsize::new(0)),
-            previews: Previews::default(),
+            // Every request sees the newest frame unless a test shares encodes.
+            previews: Previews {
+                share: Duration::ZERO,
+                ..Previews::default()
+            },
         }
     }
 
@@ -1326,42 +1363,71 @@ mod tests {
 
     #[test]
     fn clients_asking_for_the_same_new_frame_share_one_encode() {
-        let previews = Arc::new(Previews::default());
-        let key = PreviewKey {
-            worker: 7,
-            frame: 1,
-            timestamp_ns: 0,
-            format: PreviewFormat::Png,
-        };
+        let root = TempWebRoot::new();
+        let (handle, mut writer) = SessionHandle::fed(1 << 16);
+        let service = Arc::new(service(handle.clone(), WebRoot::Folder(root.0.clone())));
+        writer.write(&color(1), true).unwrap();
         let clients: Vec<_> = (0..4)
             .map(|_| {
-                let previews = previews.clone();
-                thread::spawn(move || {
-                    previews.get(key, || {
-                        thread::sleep(Duration::from_millis(50));
-                        Ok(vec![1, 2, 3])
-                    })
-                })
+                let service = service.clone();
+                thread::spawn(move || service.preview("camera=cam&format=png", None))
             })
             .collect();
-        for client in clients {
-            assert_eq!(client.join().unwrap().ok(), Some(vec![1, 2, 3]));
-        }
-        assert_eq!(previews.encodes.load(Ordering::Relaxed), 1);
-        // Each worker and format has a slot; the least recently used goes.
-        for worker in 0..PREVIEW_SLOTS as u32 {
-            let other = PreviewKey {
-                worker: 100 + worker,
-                ..key
-            };
-            let _ = previews.get(other, || Ok(Vec::new()));
-        }
-        let _ = previews.get(key, || Ok(Vec::new()));
+        let bodies: Vec<_> = clients
+            .into_iter()
+            .map(|client| client.join().unwrap().body)
+            .collect();
+        assert!(bodies.iter().all(|body| *body == bodies[0]));
+        assert_eq!(service.previews.encodes.load(Ordering::Relaxed), 1);
+        handle.shutdown();
+    }
+
+    #[test]
+    fn clients_share_a_recent_encode_while_the_camera_streams() {
+        let root = TempWebRoot::new();
+        let (handle, mut writer) = SessionHandle::fed(1 << 16);
+        let mut service = service(handle.clone(), WebRoot::Folder(root.0.clone()));
+        service.previews.share = Duration::from_millis(200);
+        writer.write(&color(1), true).unwrap();
+        let first = service.preview("", None);
+        writer.write(&color(2), true).unwrap();
+        // A newer frame, but the last encode is recent.
+        let shared = service.preview("", None);
+        assert_eq!(header(&shared, "ETag"), header(&first, "ETag"));
+        assert_eq!(header(&shared, "X-Frame-Id"), Some("1"));
         assert_eq!(
-            previews.encodes.load(Ordering::Relaxed),
-            2 + PREVIEW_SLOTS as u64
+            service.preview("", header(&first, "ETag")).status,
+            304,
+            "a client that has the shared preview needs nothing new"
         );
+        assert_eq!(service.previews.encodes.load(Ordering::Relaxed), 1);
+        thread::sleep(Duration::from_millis(250));
+        let next = service.preview("", None);
+        assert_eq!(header(&next, "X-Frame-Id"), Some("2"));
+        assert_eq!(service.previews.encodes.load(Ordering::Relaxed), 2);
+        handle.shutdown();
+    }
+
+    #[test]
+    fn each_camera_and_format_has_a_cached_preview_until_newer_ones_need_room() {
+        let previews = Previews::default();
+        let first = previews.slot("sim:0", PreviewFormat::Png);
+        assert!(Arc::ptr_eq(
+            &first,
+            &previews.slot("sim:0", PreviewFormat::Png)
+        ));
+        assert!(!Arc::ptr_eq(
+            &first,
+            &previews.slot("sim:0", PreviewFormat::Jpeg)
+        ));
+        for camera in 0..PREVIEW_SLOTS {
+            previews.slot(&format!("other:{camera}"), PreviewFormat::Png);
+        }
         assert_eq!(previews.slots.lock().unwrap().len(), PREVIEW_SLOTS);
+        assert!(!Arc::ptr_eq(
+            &first,
+            &previews.slot("sim:0", PreviewFormat::Png)
+        ));
     }
 
     #[test]

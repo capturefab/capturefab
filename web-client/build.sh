@@ -17,4 +17,4 @@ mkdir -p dist
 wasm-bindgen "${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/release/capturefab_web.wasm" \
     --target web --out-dir dist --out-name capturefab_web --no-typescript
 cp index.html style.css bootstrap.js dist/
-echo 'Built web-client/dist. Serve it with capturefab serve --web-dir web-client/dist.'
+echo 'Built web-client/dist. Build it into capturefab with --features embedded-web, or serve it with --web-dir web-client/dist.'
