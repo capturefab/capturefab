@@ -1407,14 +1407,16 @@ mod tests {
 
     /// The simulator with two registers only a full feature walk reads:
     /// Gain's maximum, which counts walks, and a lock on Width that holds
-    /// while the camera streams.
+    /// while the camera streams. Height can be made unavailable.
     struct Walked {
         simulator: crate::transport::simulator::Simulator,
         walks: Arc<AtomicU64>,
         streaming: bool,
+        hidden: Arc<AtomicBool>,
     }
     const GAIN_MAX: u64 = 0x1f0;
     const LOCKED: u64 = 0x1f8;
+    const AVAILABLE: u64 = 0x1fc;
     impl crate::types::RegisterIo for Walked {
         fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
             match address {
@@ -1423,6 +1425,10 @@ mod tests {
                     Ok(24f64.to_le_bytes().to_vec())
                 }
                 LOCKED => Ok(u32::from(self.streaming).to_le_bytes().to_vec()),
+                AVAILABLE => {
+                    let available = !self.hidden.load(Ordering::Relaxed);
+                    Ok(u32::from(available).to_le_bytes().to_vec())
+                }
                 _ => self.simulator.read_memory(address, length),
             }
         }
@@ -1435,6 +1441,7 @@ mod tests {
             let registers = concat!(
                 "<FloatReg Name='GainMax'><Address>0x1f0</Address><Length>8</Length><AccessMode>RO</AccessMode><Endianess>LittleEndian</Endianess></FloatReg>",
                 "<IntReg Name='Locked'><Address>0x1f8</Address><Length>4</Length><AccessMode>RO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>",
+                "<IntReg Name='Available'><Address>0x1fc</Address><Length>4</Length><AccessMode>RO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>",
                 "</RegisterDescription>"
             );
             Ok(self
@@ -1444,6 +1451,10 @@ mod tests {
                 .replace(
                     "<pValue>WidthReg</pValue>",
                     "<pIsLocked>Locked</pIsLocked><pValue>WidthReg</pValue>",
+                )
+                .replace(
+                    "<pValue>HeightReg</pValue>",
+                    "<pIsAvailable>Available</pIsAvailable><pValue>HeightReg</pValue>",
                 )
                 .replace("</RegisterDescription>", registers))
         }
@@ -1460,21 +1471,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_edit_walks_the_features_once_and_starting_walks_none() {
-        let walks = Arc::new(AtomicU64::new(0));
-        let h = WorkerHandle::new();
-        let mut camera = Some(
+    fn walked(walks: &Arc<AtomicU64>, hidden: &Arc<AtomicBool>) -> Option<Camera> {
+        Some(
             Camera::from_backend(
                 crate::transport::simulator::info(),
                 Box::new(Walked {
                     simulator: Default::default(),
                     walks: walks.clone(),
                     streaming: false,
+                    hidden: hidden.clone(),
                 }),
             )
             .unwrap(),
-        );
+        )
+    }
+
+    #[test]
+    fn an_edit_walks_the_features_once_and_starting_walks_none() {
+        let walks = Arc::new(AtomicU64::new(0));
+        let h = WorkerHandle::new();
+        let mut camera = walked(&walks, &Arc::default());
         // Connecting walks the features once.
         refresh(&h, &mut camera, true);
         let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
@@ -1520,6 +1536,40 @@ mod tests {
         // Undo still reads every value it restores, and walks once.
         assert_eq!(walked(&mut camera, SessionCommand::Undo).0, 1);
         assert!(camera.as_ref().unwrap().is_streaming());
+        h.shutdown();
+    }
+
+    #[test]
+    fn a_feature_that_became_unreadable_since_the_last_walk_is_left_out() {
+        let hidden = Arc::new(AtomicBool::new(false));
+        let h = WorkerHandle::new();
+        let mut camera = walked(&Arc::default(), &hidden);
+        refresh(&h, &mut camera, true);
+        assert!(
+            h.snapshot()
+                .features
+                .iter()
+                .any(|f| f.name == "Height" && f.value.is_some())
+        );
+        hidden.store(true, Ordering::Relaxed);
+        let result = process(
+            &h,
+            &mut camera,
+            &mut None,
+            &mut None,
+            &mut Vec::new(),
+            &mut 1,
+            &mut false,
+            SessionCommand::Set {
+                feature: "Width".into(),
+                value: "128".into(),
+            },
+        )
+        .unwrap();
+        // As a fresh walk would, the checkpoint skips Height instead of
+        // giving up on undo.
+        assert!(result.get("history_unavailable").is_none(), "{result}");
+        assert!(result["camera_change"]["token"].is_string());
         h.shutdown();
     }
 }
