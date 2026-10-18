@@ -23,6 +23,31 @@ const ACTIONS_INSET: f32 = 8.0;
 /// buttons 2 apart, on glass padded by 3, and their inset.
 const ACTIONS: f32 = 3.0 * 24.0 + 2.0 * 2.0 + 2.0 * 3.0 + ACTIONS_INSET;
 
+/// Where the overview's tiles went at the last layout, so frames convert at
+/// the size their tiles show, and only for tiles in view.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Grid {
+    pub columns: usize,
+    /// A tile's picture, in layout units.
+    pub tile: Size,
+    /// Height of the scrolled area.
+    pub viewport: f32,
+}
+
+impl Grid {
+    /// Whether any of the `index`th of `count` tiles is in view with the
+    /// grid scrolled `offset` down.
+    pub fn shows(&self, index: usize, count: usize, offset: f32) -> bool {
+        let columns = self.columns.max(1);
+        let pitch = self.tile.height + 2.0 * OUTSET;
+        let content = count.div_ceil(columns) as f32 * pitch;
+        // A scrollable keeps its offset within content that shrinks under it.
+        let offset = offset.clamp(0.0, (content - self.viewport).max(0.0));
+        let top = (index / columns) as f32 * pitch;
+        top < offset + self.viewport && top + pitch > offset
+    }
+}
+
 /// Columns and tile size for `count` images of `aspect` in `area`: as
 /// large as possible (see `layout`), unless that leaves tiles shorter than
 /// `MIN_TILE_HEIGHT`. Then as many columns of that height as fit the width,
@@ -83,6 +108,11 @@ impl Workbench {
             (size.height - 2.0 * OUTSET).max(1.0),
         );
         let (columns, tile) = tiles(cameras.len(), aspect, pictures);
+        self.grid.set(Some(Grid {
+            columns,
+            tile,
+            viewport: size.height,
+        }));
         let rows = cameras.len().div_ceil(columns).max(1);
         // Adjacent outsets make up the gap between pictures.
         let height = rows as f32 * (tile.height + 2.0 * OUTSET);
@@ -100,6 +130,7 @@ impl Workbench {
                 .center_x(size.width)
                 .center_y(size.height.max(height)),
         )
+        .on_scroll(|viewport| Message::OverviewScrolled(viewport.absolute_offset().y))
         .style(style::scroll)
         .into()
     }
@@ -450,6 +481,31 @@ mod tests {
                 assert!(columns >= 1 && columns <= count);
             }
         }
+    }
+
+    #[test]
+    fn only_tiles_in_view_show() {
+        // Two columns of 300-tall tiles (308 apart) in a 500-tall view.
+        let grid = Grid {
+            columns: 2,
+            tile: Size::new(400.0, 300.0),
+            viewport: 500.0,
+        };
+        let shown = |offset| {
+            (0..9)
+                .filter(|&i| grid.shows(i, 9, offset))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shown(0.0), [0, 1, 2, 3]);
+        assert_eq!(shown(400.0), [2, 3, 4, 5]);
+        assert_eq!(shown(1040.0), [6, 7, 8]);
+        // An offset left over from a taller grid or a smaller window.
+        assert_eq!(shown(5000.0), [6, 7, 8]);
+        let roomy = Grid {
+            viewport: 2000.0,
+            ..grid
+        };
+        assert!((0..9).all(|i| roomy.shows(i, 9, 900.0)));
     }
 
     #[test]

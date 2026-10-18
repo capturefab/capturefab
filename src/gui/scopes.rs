@@ -965,7 +965,12 @@ impl canvas::Program<Message> for RegionEditor {
                             .and_capture(),
                     );
                 }
-                Some(canvas::Action::capture())
+                // Moves score the region at most once a frame; this scores
+                // where it was let go.
+                Some(match drag.moved {
+                    true => canvas::Action::publish(Message::FocusRegionEnd).and_capture(),
+                    false => canvas::Action::capture(),
+                })
             }
             _ => None,
         }
@@ -1163,6 +1168,42 @@ mod tests {
             Some(Grip::Sides([false, false, true, true]))
         );
         assert_eq!(grip(150.0, 200.0), None);
+    }
+
+    #[test]
+    fn letting_go_of_a_drag_scores_the_region_where_it_landed() {
+        use canvas::Program;
+        let editor = editor();
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(600.0, 400.0));
+        let mut drag = Drag::default();
+        let mut send = |event, x, y| {
+            let cursor = mouse::Cursor::Available(Point::new(x, y));
+            editor
+                .update(&mut drag, &canvas::Event::Mouse(event), bounds, cursor)
+                .and_then(|action| action.into_inner().0)
+        };
+        let (press, release) = (
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        );
+        let moved = mouse::Event::CursorMoved {
+            position: Point::new(350.0, 220.0),
+        };
+        assert!(matches!(
+            send(press, 300.0, 200.0),
+            Some(Message::FocusRegionStart)
+        ));
+        assert!(matches!(
+            send(moved, 350.0, 220.0),
+            Some(Message::FocusRegion(_))
+        ));
+        assert!(matches!(
+            send(release, 350.0, 220.0),
+            Some(Message::FocusRegionEnd)
+        ));
+        // Pressed and let go in place: nothing moved, nothing to score again.
+        assert!(send(press, 300.0, 200.0).is_some());
+        assert!(send(release, 300.0, 200.0).is_none());
     }
 
     #[test]
