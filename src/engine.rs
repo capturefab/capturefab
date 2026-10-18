@@ -57,6 +57,9 @@ pub struct WorkerHandle {
     quitting: Arc<AtomicBool>,
     thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     ring: Option<Arc<Mutex<crate::shared_memory::SharedRing>>>,
+    /// The shared-ring problem last logged, so one that every frame of a
+    /// stream hits is logged once.
+    ring_note: Arc<Mutex<Option<String>>>,
     history: Arc<Mutex<history::Journal>>,
     capture_session: Arc<Mutex<Option<crate::autocapture::CaptureSession>>>,
     /// Files saved since the coordinator last collected them.
@@ -88,6 +91,7 @@ impl WorkerHandle {
             quitting: Arc::new(AtomicBool::new(false)),
             thread: Arc::new(Mutex::new(None)),
             ring,
+            ring_note: Arc::default(),
             history: Arc::default(),
             capture_session: Arc::default(),
             saved: Arc::default(),
@@ -185,15 +189,25 @@ impl WorkerHandle {
             s.logs.remove(0);
         }
     }
-    /// Publish the latest frame. With a shared ring the frame is copied into
+    /// Publish the latest frame. With a shared ring the frame is offered to
     /// it and handed back, so a consumer such as the forwarder can take its
     /// buffer; without one it is retained here.
     fn record(&self, frame: Frame) -> Option<Frame> {
+        self.publish(frame, false)
+    }
+    /// Publish a frame a command captured. It always reaches the ring, so a
+    /// reader such as `capture -o -` gets this frame, not a keep-alive.
+    fn record_capture(&self, frame: Frame) -> Option<Frame> {
+        self.publish(frame, true)
+    }
+    fn publish(&self, frame: Frame, force: bool) -> Option<Frame> {
         self.observe_capture(&frame);
-        if let Some(ring) = &self.ring
-            && let Err(e) = ring.lock().unwrap_or_else(|e| e.into_inner()).write(&frame)
-        {
-            self.log("error", format!("Shared frame buffer: {e:#}"));
+        if let Some(ring) = &self.ring {
+            let mut ring = ring.lock().unwrap_or_else(|e| e.into_inner());
+            let published = ring.write(&frame, force);
+            let capacity = ring.capacity();
+            drop(ring);
+            self.note_ring(published, frame.data.len(), capacity);
         }
         self.counters.frames.fetch_add(1, Ordering::Relaxed);
         self.counters
@@ -204,6 +218,38 @@ impl WorkerHandle {
             return None;
         }
         Some(frame)
+    }
+    /// Log a frame the ring could not take as it was, once while that keeps
+    /// happening rather than for every frame.
+    fn note_ring(
+        &self,
+        published: Result<crate::shared_memory::Published>,
+        bytes: usize,
+        capacity: usize,
+    ) {
+        use crate::{analytics::human_bytes, shared_memory::Published};
+        let (level, message) = match published {
+            Ok(Published::Frame) => {
+                *self.ring_note.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                return;
+            }
+            Ok(Published::Skipped) => return,
+            Ok(Published::Preview) => (
+                "warn",
+                format!(
+                    "Frames of {} are larger than the {} preview buffer, so previews show them downscaled; saved files keep full resolution. Set CAPTUREFAB_FRAME_BYTES for full-resolution previews.",
+                    human_bytes(bytes as u64),
+                    human_bytes(capacity as u64)
+                ),
+            ),
+            Err(e) => ("error", format!("Shared frame buffer: {e:#}")),
+        };
+        let mut note = self.ring_note.lock().unwrap_or_else(|e| e.into_inner());
+        if note.as_deref() != Some(&message) {
+            *note = Some(message.clone());
+            drop(note);
+            self.log(level, message);
+        }
     }
     fn publish_capture(&self, session: &crate::autocapture::CaptureSession) -> Result<()> {
         let status = session.status()?;
@@ -567,7 +613,7 @@ fn process_plain(
                 let frame = next_frame(h, c, auto, Instant::now() + timeout(timeout_ms)?)?
                     .context("frame timeout")?;
                 let id = h.teach_capture(&frame)?.context("capture session closed")?;
-                let _ = h.record(frame);
+                let _ = h.record_capture(frame);
                 Ok(json!({"id":id,"capture_session":h.snapshot().capture_session}))
             })();
             let stopped = if !was_streaming { c.stop() } else { Ok(()) };
@@ -1167,7 +1213,7 @@ fn process_plain(
                             format!("Capture saved but session learning failed: {error:#}"),
                         );
                     }
-                    let _ = h.record(frame);
+                    let _ = h.record_capture(frame);
                 }
                 let mut value = json!({"files":files,"frames":frames,"count":count});
                 if !context.is_empty() {
@@ -1869,6 +1915,71 @@ mod tests {
         assert!(h.latest_frame().is_some());
         h.request(SessionCommand::Disconnect).unwrap();
         assert!(h.snapshot().connected.is_none());
+        h.shutdown();
+    }
+    #[test]
+    fn captures_reach_an_unwatched_ring_and_oversize_frames_log_once() {
+        let writer = crate::shared_memory::SharedRing::create(&std::env::temp_dir(), 4096).unwrap();
+        let mut reader = writer.reader().unwrap();
+        let h = WorkerHandle::with_ring(Arc::new(Mutex::new(writer)));
+        let size = |side: &str| {
+            for feature in ["Width", "Height"] {
+                h.request(SessionCommand::Set {
+                    feature: feature.into(),
+                    value: side.into(),
+                })
+                .unwrap();
+            }
+        };
+        h.request(SessionCommand::Connect {
+            camera: "sim:0".into(),
+            timeout_ms: 100,
+        })
+        .unwrap();
+        size("64");
+        // Nobody reads while it streams, so only a keep-alive is published,
+        // and without force the capture would be skipped as well.
+        h.request(SessionCommand::Start).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        h.request(SessionCommand::Stop).unwrap();
+        let v = h
+            .request(SessionCommand::Capture {
+                output: "-".into(),
+                count: 1,
+                timeout_ms: 1000,
+                format: "raw".into(),
+                storage: Default::default(),
+                destination: None,
+                on_exists: Default::default(),
+                context: Default::default(),
+            })
+            .unwrap();
+        let captured = reader.take_latest().unwrap().unwrap();
+        assert_eq!(Some(captured.id), v["frames"][0]["id"].as_u64());
+        assert_eq!(captured.data.len(), 4096);
+        // A watched stream of frames larger than the ring previews every
+        // frame downscaled and says so once.
+        size("128");
+        h.request(SessionCommand::Start).unwrap();
+        let until = Instant::now() + Duration::from_millis(400);
+        let mut previews = 0;
+        while Instant::now() < until {
+            if reader.take_latest().unwrap().is_some() {
+                assert!(reader.preview_only());
+                previews += 1;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        h.request(SessionCommand::Stop).unwrap();
+        assert!(previews > 1, "{previews} previews");
+        let snapshot = h.snapshot();
+        let notes = snapshot
+            .logs
+            .iter()
+            .filter(|entry| entry.message.contains("preview buffer"))
+            .count();
+        assert_eq!(notes, 1, "{:?}", snapshot.logs);
+        assert!(snapshot.last_error.is_none(), "{:?}", snapshot.last_error);
         h.shutdown();
     }
     #[test]

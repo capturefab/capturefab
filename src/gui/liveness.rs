@@ -27,7 +27,7 @@ pub(super) const LOSS_RECENT: Duration = Duration::from_secs(10);
 /// skipped because a newer one was already waiting are not losses.
 pub(super) fn camera_loss(camera: &CameraSnapshot) -> u64 {
     camera.transport.as_ref().map_or(
-        camera.dropped.saturating_sub(camera.ring_dropped),
+        camera.dropped.saturating_sub(camera.preview_skipped),
         transport_loss,
     )
 }
@@ -372,7 +372,8 @@ pub(super) fn streaming_camera(frames: u64, dropped: u64, fps: f64) -> CameraSna
         capture_session: None,
         transport: None,
         history: crate::session::CameraHistoryStatus::default(),
-        ring_dropped: 0,
+        lost: 0,
+        preview_skipped: 0,
         stale: false,
         error_logged: None,
         forwarding_since_ms: None,
@@ -688,7 +689,7 @@ mod tests {
         assert_eq!(bench.liveness[id].lost, 0);
         // Frames this window skipped are not losses.
         let mut skipped = streaming_camera(40, 25, 30.0);
-        skipped.ring_dropped = 20;
+        skipped.preview_skipped = 20;
         report(&mut bench, start, ms(1000), skipped);
         assert!(!bench.recent_loss(id));
         report(&mut bench, start, ms(2000), streaming_camera(70, 7, 30.0));

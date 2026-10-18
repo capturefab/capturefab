@@ -9,7 +9,7 @@ repository = "https://github.com/capturefab/capturefab"
 
 [features]
 default = ["gui", "usb", "scanner", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "s3", "ftp", "sftp", "parquet", "modbus", "mqtt", "opcua", "mtconnect"]
-gui = ["ai", "dep:iced", "dep:bytemuck", "dep:rfd", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:mundy", "dep:accesskit", "dep:accesskit_macos", "dep:accesskit_windows", "dep:accesskit_unix", "dep:raw-window-handle", "dep:windows", "dep:x11-dl", "dep:libloading", "dep:libc"]
+gui = ["ai", "dep:iced", "dep:bytemuck", "dep:rfd", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:mundy", "dep:accesskit", "dep:accesskit_macos", "dep:accesskit_windows", "dep:accesskit_unix", "dep:raw-window-handle", "dep:windows", "dep:x11-dl", "dep:libloading"]
 usb = ["dep:nusb"]
 # Document scanners: SANE scanimage, Windows WIA and macOS ImageCaptureCore.
 # Drivers run in disposable helper processes, never in the UI.
@@ -120,7 +120,11 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32
 [target.'cfg(target_os = "linux")'.dependencies]
 accesskit_unix = { version = "0.17.2", optional = true }
 x11-dl = { version = "2.21", optional = true }
-libc = { version = "0.2", optional = true }
+
+# Anonymous shared memory for frame rings (memfd_create, shm_open) and
+# descriptor inheritance by camera workers.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }
