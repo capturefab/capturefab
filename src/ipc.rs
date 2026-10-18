@@ -316,7 +316,8 @@ fn move_state(old: &Path, new: &Path, names: &[&str], lock: Option<&str>) -> Res
     let mut placed = Vec::new();
     let result = (|| -> Result<()> {
         for name in &moving {
-            let copy = new.join(format!(".{name}.moving"));
+            // Named per process: a set without a lock can race another.
+            let copy = new.join(format!(".{name}.{}.moving", std::process::id()));
             copies.push(copy.clone());
             copy_private(&old.join(name), &copy)?;
         }
@@ -344,7 +345,7 @@ fn copy_private(from: &Path, to: &Path) -> Result<()> {
         "{} is not a regular file",
         from.display()
     );
-    // Left by an interrupted move.
+    // Left by an interrupted move of a process with the same id.
     let _ = fs::remove_file(to);
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
