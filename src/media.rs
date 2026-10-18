@@ -4110,7 +4110,7 @@ impl Forwarder {
                     };
                     let queued = match &self.destination {
                         Some(destination) => destination
-                            .finished(&path)
+                            .finished(&path, Some(&recorded.sha256))
                             .context("recording saved but not queued for upload"),
                         None => Ok(None),
                     };

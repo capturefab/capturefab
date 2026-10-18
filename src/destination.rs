@@ -998,8 +998,9 @@ pub struct Queued {
 impl Resolved {
     /// Queue a file this resolution produced for upload, if it has a network
     /// target. Called after the file is complete and recorded in the storage
-    /// ledger. Returns what was queued, or `None` for a local destination.
-    pub fn finished(&self, path: &Path) -> Result<Option<Queued>> {
+    /// ledger, with the SHA-256 its writer computed when the caller has it.
+    /// Returns what was queued, or `None` for a local destination.
+    pub fn finished(&self, path: &Path, sha256: Option<&str>) -> Result<Option<Queued>> {
         let (Some(remote), Some(root), Some(name)) = (&self.upload, &self.root, &self.destination)
         else {
             return Ok(None);
@@ -1008,13 +1009,13 @@ impl Resolved {
         ensure_compiled(remote)?;
         #[cfg(feature = "uploads")]
         {
-            let id = crate::upload::enqueue(name, remote, path, &key)?;
+            let id = crate::upload::enqueue(name, remote, path, &key, sha256)?;
             let url = remote.object_url(&key);
             Ok(Some(Queued { id, key, url }))
         }
         #[cfg(not(feature = "uploads"))]
         {
-            let _ = (name, key);
+            let _ = (name, key, sha256);
             anyhow::bail!("uploads are unsupported in this build")
         }
     }

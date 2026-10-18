@@ -113,15 +113,19 @@ impl Item {
             "queued upload path must be absolute without control characters"
         );
         ensure!(
-            self.sha256.len() == 64
-                && self
-                    .sha256
-                    .bytes()
-                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            is_sha256(&self.sha256),
             "queued upload checksum must be a lowercase SHA-256 hash (64 hexadecimal digits)"
         );
         Ok(())
     }
+}
+
+/// Whether `hex` is a lowercase SHA-256 hash, 64 hexadecimal digits.
+fn is_sha256(hex: &str) -> bool {
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 pub fn validate_id(id: &str) -> Result<()> {
@@ -693,8 +697,15 @@ fn id() -> Result<String> {
 
 /// Queue a finished, ledger-recorded file for upload as `key` and return its
 /// upload ID. Queueing the same file for the same upload again returns the
-/// existing ID.
-pub fn enqueue(destination: &str, remote: &Remote, path: &Path, key: &str) -> Result<String> {
+/// existing ID. `written` is the SHA-256 the caller's storage writer computed,
+/// when it has one, so a busy ledger never makes the caller read the file again.
+pub fn enqueue(
+    destination: &str,
+    remote: &Remote,
+    path: &Path,
+    key: &str,
+    written: Option<&str>,
+) -> Result<String> {
     crate::destination::validate_name(destination)?;
     remote.validate()?;
     crate::destination::validate_object_key(key)?;
@@ -719,13 +730,18 @@ pub fn enqueue(destination: &str, remote: &Remote, path: &Path, key: &str) -> Re
     if let Some(id) = read(|uploads| Ok(queued(uploads)))? {
         return id;
     }
-    // Holding waits while the storage ledger is busy, and the fallback reads
-    // the whole file, so neither keeps the queue locked.
+    // Holding waits while the storage ledger is busy, and the fallback may
+    // read the whole file, so neither keeps the queue locked.
     let (sha256, unheld) = match hold(&path) {
         Ok(sha256) => (sha256, false),
         // Queue the file anyway and let the uploader hold it, rather than
         // leave a capture that retention may remove before it ever uploads.
-        Err(error) if busy(&error) => (file_sha256(&path, bytes).map_err(|_| error)?, true),
+        // The writer's checksum is the one the ledger recorded; only a
+        // caller without one pays for reading the file back.
+        Err(error) if busy(&error) => match written.filter(|sha256| is_sha256(sha256)) {
+            Some(sha256) => (sha256.to_owned(), true),
+            None => (file_sha256(&path, bytes).map_err(|_| error)?, true),
+        },
         Err(error) => return Err(error),
     };
     let mut release = !unheld;
@@ -1519,10 +1535,13 @@ mod tests {
             return;
         }
         let path = staged("shot.png");
-        let id = enqueue("line", &ftp(), &path, "shot.png").unwrap();
-        assert_eq!(enqueue("line", &ftp(), &path, "shot.png").unwrap(), id);
-        assert!(enqueue("line", &ftp(), &path, "other.png").is_err());
-        assert!(enqueue("line", &Remote::S3(bucket()), &path, "shot.png").is_err());
+        let id = enqueue("line", &ftp(), &path, "shot.png", None).unwrap();
+        assert_eq!(
+            enqueue("line", &ftp(), &path, "shot.png", None).unwrap(),
+            id
+        );
+        assert!(enqueue("line", &ftp(), &path, "other.png", None).is_err());
+        assert!(enqueue("line", &Remote::S3(bucket()), &path, "shot.png", None).is_err());
         let status = status().unwrap();
         assert_eq!(status["pending"], 1);
         assert_eq!(status["items"][0]["remote"]["kind"], "ftp");
@@ -1594,7 +1613,7 @@ mod tests {
         }
         status().unwrap();
         assert_eq!(versions(), (None, None), "status creates no queue");
-        enqueue("line", &ftp(), &staged("shot.png"), "shot.png").unwrap();
+        enqueue("line", &ftp(), &staged("shot.png"), "shot.png", None).unwrap();
         // Its next attempt is an hour away, so the uploader has nothing to do.
         back_off_first();
         let (before, writes) = (versions(), WRITTEN.load(Ordering::Relaxed));
@@ -1812,7 +1831,7 @@ mod tests {
         }
         let path = staged("shot.png");
         HOLD_FAILS.store(true, Ordering::Relaxed);
-        let id = enqueue("line", &ftp(), &path, "shot.png").unwrap();
+        let id = enqueue("line", &ftp(), &path, "shot.png", None).unwrap();
         let first = || status().unwrap()["items"][0].clone();
         assert_eq!(first()["id"], id.as_str());
         assert_eq!(first()["unheld"], true);
@@ -1836,6 +1855,33 @@ mod tests {
         let error = crate::storage::save_bytes(b"next", &next, &policy).unwrap_err();
         assert!(error.to_string().contains("Storage full"), "{error:#}");
         assert!(path.exists());
+    }
+
+    #[test]
+    fn a_busy_ledger_queues_the_writers_checksum_without_reading_the_file() {
+        if !isolated("a_busy_ledger_queues_the_writers_checksum_without_reading_the_file") {
+            return;
+        }
+        let content = crate::transfer::hex(&<sha2::Sha256 as sha2::Digest>::digest(b"0123456789"));
+        HOLD_FAILS.store(true, Ordering::Relaxed);
+        // A checksum the file does not have shows that nothing read it back.
+        let written = "b".repeat(64);
+        let shot = staged("shot.png");
+        enqueue("line", &ftp(), &shot, "shot.png", Some(&written)).unwrap();
+        // A malformed one is never queued; the file is read instead.
+        enqueue("line", &ftp(), &staged("next.png"), "next.png", Some("B")).unwrap();
+        let sha256 = |key: &str| {
+            let queue = status().unwrap();
+            let items = queue["items"].as_array().unwrap();
+            let item = items.iter().find(|item| item["key"] == key).unwrap();
+            item["sha256"].as_str().unwrap().to_owned()
+        };
+        assert_eq!(sha256("shot.png"), written);
+        assert_eq!(sha256("next.png"), content);
+        // Holding it later still takes the checksum the ledger recorded.
+        HOLD_FAILS.store(false, Ordering::Relaxed);
+        hold_unheld().unwrap();
+        assert_eq!(sha256("shot.png"), content);
     }
 
     #[test]
@@ -1893,7 +1939,7 @@ mod tests {
             return;
         }
         HOLD_FAILS.store(true, Ordering::Relaxed);
-        enqueue("line", &ftp(), &staged("shot.png"), "shot.png").unwrap();
+        enqueue("line", &ftp(), &staged("shot.png"), "shot.png", None).unwrap();
         back_off_first();
         start_uploading();
         // Its first try is refused; the next comes while it waits.
@@ -1911,7 +1957,7 @@ mod tests {
         }
         let path = staged("shot.png");
         HOLD_FAILS.store(true, Ordering::Relaxed);
-        enqueue("line", &ftp(), &path, "shot.png").unwrap();
+        enqueue("line", &ftp(), &path, "shot.png", None).unwrap();
         HOLD_FAILS.store(false, Ordering::Relaxed);
         // Removed before the uploader could hold it: there is nothing left
         // to hold, so the uploader has no reason to come back for it.
@@ -1923,7 +1969,7 @@ mod tests {
         // refused.
         let stray = crate::ipc::session_dir().join("stray.png");
         fs::write(&stray, b"0123456789").unwrap();
-        let error = enqueue("line", &ftp(), &stray, "stray.png").unwrap_err();
+        let error = enqueue("line", &ftp(), &stray, "stray.png", None).unwrap_err();
         assert!(error.to_string().contains("not a finished"), "{error:#}");
         assert_eq!(pending(), 1);
     }
@@ -1954,7 +2000,7 @@ mod tests {
         let queue = |files: std::ops::Range<usize>| {
             for n in files {
                 let name = format!("{n}.png");
-                enqueue("line", &remote, &staged(&name), &name).unwrap();
+                enqueue("line", &remote, &staged(&name), &name, None).unwrap();
             }
         };
         let attempts = |status: &Value| -> Vec<u64> {

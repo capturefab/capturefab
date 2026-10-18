@@ -551,13 +551,15 @@ fn report_image(
     job_id: Option<u64>,
     context: &crate::context::Context,
 ) -> Option<crate::destination::Queued> {
-    let queued = resolved.finished(path).unwrap_or_else(|e| {
-        h.log(
-            "error",
-            format!("{} saved but not queued for upload: {e:#}", path.display()),
-        );
-        None
-    });
+    let queued = resolved
+        .finished(path, Some(&stored.sha256))
+        .unwrap_or_else(|e| {
+            h.log(
+                "error",
+                format!("{} saved but not queued for upload: {e:#}", path.display()),
+            );
+            None
+        });
     h.push_saved(crate::dataset::SavedFile {
         seq: 0,
         wall_ms,
