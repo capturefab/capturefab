@@ -2,7 +2,7 @@
 //! UVCP/UVSP wire fields and bootstrap register addresses follow USB3 Vision.
 use crate::{
     genicam::decode_xml,
-    types::{Backend, CameraInfo, Frame, RegisterIo, Transport, TransportStats},
+    types::{Backend, CameraInfo, Frame, RegisterIo, Transport},
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use nusb::{
@@ -639,6 +639,13 @@ impl Backend for UsbBackend {
         let mut stream = Stream::new(expected, schedule);
         stream.queue(&mut self.stream_in);
         stream.queue(&mut self.stream_in);
+        // Linux maps transfer buffers from usbfs memory, falling back to
+        // copies when its limit is reached; other systems always copy.
+        if cfg!(target_os = "linux") && !stream.zero_copy {
+            eprintln!(
+                "capturefab: USB transfers are copied because the kernel could not map usbfs memory for them; raise /sys/module/usbcore/parameters/usbfs_memory_mb (16 MB by default) above twice the frame size"
+            );
+        }
         self.stream = Some(stream);
         if let Err(error) = self.put32(SIRM_CONTROL, 1) {
             let _ = self.stop();
@@ -685,15 +692,6 @@ impl Backend for UsbBackend {
                 .context("USB transfer cancellation timed out")?;
         }
         result
-    }
-    fn stats(&self) -> Option<TransportStats> {
-        // Linux maps transfer buffers from usbfs memory, falling back to
-        // copies when its limit is reached; other systems always copy.
-        let copied = self.stream.as_ref().is_some_and(|stream| !stream.zero_copy);
-        (cfg!(target_os = "linux") && copied).then(|| TransportStats {
-            notes: vec!["USB transfers are copied because the kernel could not map usbfs memory for them; raise /sys/module/usbcore/parameters/usbfs_memory_mb (16 MB by default) above twice the frame size".into()],
-            ..Default::default()
-        })
     }
 }
 impl Drop for UsbBackend {
