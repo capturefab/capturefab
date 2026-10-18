@@ -235,6 +235,43 @@ fn main() {
             );
         }
     }
+    // A large sensor in the main view: converted whole, as at 1:1, against
+    // fitted to a 1600x1000 stage, and as an overview tile.
+    for (name, format) in [("Mono8", MONO8), ("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
+        let label = format!("/{name}/5472x3648");
+        if !["gui-new/main", "gui-new/fit", "gui-new/tile"]
+            .iter()
+            .any(|prefix| b.selected(&format!("{prefix}{label}")))
+        {
+            continue;
+        }
+        let f = frame(5472, 3648, format);
+        b.run(&format!("gui-new/main{label}"), f.data.len(), || {
+            frame::preview_rgba(&f, f.width, f.height).unwrap()
+        });
+        b.run(&format!("gui-new/fit{label}"), f.data.len(), || {
+            frame::preview_rgba(&f, 1600, 1000).unwrap()
+        });
+        b.run(&format!("gui-new/tile{label}"), f.data.len(), || {
+            frame::preview_rgba(&f, 640, 480).unwrap()
+        });
+    }
+    // The stage's scopes on a common 5 MP industrial sensor: the histogram,
+    // and focus in the default quarter region and over the whole frame.
+    let f = frame(2448, 2048, 0x0108_0009);
+    b.run("scopes/exposure/BayerRG8/2448x2048", f.data.len(), || {
+        frame::exposure(&f).unwrap()
+    });
+    for (label, region) in [
+        ("quarter", [918, 768, 612, 512]),
+        ("full", [0, 0, 2448, 2048]),
+    ] {
+        b.run(
+            &format!("scopes/sharpness/{label}/BayerRG8/2448x2048"),
+            f.data.len(),
+            || frame::sharpness(&f, region).unwrap(),
+        );
+    }
     let mono = frame(1920, 1200, MONO8);
     b.run("encode/pgm/Mono8/1920x1200", mono.data.len(), || {
         frame::encode(&mono, "pgm").unwrap()

@@ -253,12 +253,52 @@ fn convert_to<'a, P: Copy + Default + Send + 'a>(
 }
 
 /// Threads for CPU-bound per-pixel work: one below half a megapixel, where
-/// spawning costs more than it saves, else up to eight available cores.
+/// spawning costs more than it saves, else up to eight cores, always leaving
+/// one for the camera workers and the window.
 pub(crate) fn worker_threads(pixels: usize) -> usize {
     if pixels < 512 * 1024 {
         return 1;
     }
-    std::thread::available_parallelism().map_or(1, |n| n.get().min(8))
+    std::thread::available_parallelism().map_or(1, |n| (n.get() - 1).clamp(1, 8))
+}
+fn is_bayer(pixel_format: u32) -> bool {
+    matches!(pixel_format, 0x0108_0008..=0x0108_000b)
+}
+/// A Bayer frame read as whole 2x2 quads, one color each: red, the mean of
+/// both greens, blue. As good as a demosaic for statistics over many samples
+/// and several times cheaper.
+struct Quads<'a> {
+    data: &'a [u8],
+    width: usize,
+    pattern: [usize; 4],
+    columns: usize,
+    rows: usize,
+}
+impl<'a> Quads<'a> {
+    /// None for other formats, or a mosaic without a whole quad. The frame
+    /// must have passed `validated_bytes_per_pixel`.
+    fn of(frame: &'a Frame) -> Option<Self> {
+        let (width, height) = (frame.width as usize, frame.height as usize);
+        (is_bayer(frame.pixel_format) && width >= 2 && height >= 2).then(|| Self {
+            data: &frame.data,
+            width,
+            pattern: bayer_pattern(frame.pixel_format),
+            columns: width / 2,
+            rows: height / 2,
+        })
+    }
+    fn color(&self, x: usize, y: usize) -> [u8; 3] {
+        let (i, w, data) = (2 * y * self.width + 2 * x, self.width, self.data);
+        let mut sums = [0u16; 3];
+        for (c, v) in
+            self.pattern
+                .into_iter()
+                .zip([data[i], data[i + 1], data[i + w], data[i + w + 1]])
+        {
+            sums[c] += u16::from(v);
+        }
+        [sums[0] as u8, ((sums[1] + 1) >> 1) as u8, sums[2] as u8]
+    }
 }
 /// Color filter layout as the channel (0 R, 1 G, 2 B) at (x & 1, y & 1),
 /// indexed `[(y & 1) * 2 + (x & 1)]`.
@@ -357,8 +397,9 @@ const CRUSHED: u8 = 1;
 /// A sample at or above this in any channel is blown out.
 const BLOWN: u8 = 254;
 
-/// How a frame is exposed, from at most 65,536 evenly strided pixels decoded
-/// individually so no full RGB image is needed.
+/// How a frame is exposed, from at most 65,536 evenly strided pixels (whole
+/// quads of a Bayer mosaic) decoded individually so no full RGB image is
+/// needed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Exposure {
     /// 64-bin luminance histogram.
@@ -388,8 +429,7 @@ pub fn exposure(frame: &Frame) -> Result<Exposure> {
     );
     let (mut luma_bins, mut channels) = ([0; 64], [[0; 64]; 3]);
     let (mut sum, mut samples, mut shadows, mut highlights) = (0u64, 0u32, 0u32, 0u32);
-    for i in (0..pixels).step_by((pixels / 65_536).max(1)) {
-        let rgb = pixel_at(frame, i % w, i / w);
+    let mut add = |rgb: [u8; 3]| {
         let y = luma(rgb);
         luma_bins[y >> 2] += 1;
         for (bins, value) in channels.iter_mut().zip(rgb) {
@@ -399,6 +439,19 @@ pub fn exposure(frame: &Frame) -> Result<Exposure> {
         samples += 1;
         shadows += u32::from(rgb.iter().all(|&v| v <= CRUSHED));
         highlights += u32::from(rgb.iter().any(|&v| v >= BLOWN));
+    };
+    match Quads::of(frame) {
+        Some(quads) => {
+            let count = quads.columns * quads.rows;
+            for i in (0..count).step_by((count / 65_536).max(1)) {
+                add(quads.color(i % quads.columns, i / quads.columns));
+            }
+        }
+        None => {
+            for i in (0..pixels).step_by((pixels / 65_536).max(1)) {
+                add(pixel_at(frame, i % w, i / w));
+            }
+        }
     }
     let share = |count: u32| count as f32 / samples.max(1) as f32;
     Ok(Exposure {
@@ -428,25 +481,50 @@ pub struct Sharpness {
 /// Sharpness of the `[x, y, width, height]` pixel region, clamped to the frame.
 /// At most 65,536 evenly spaced pixels are measured, each against its
 /// full-resolution neighbours, so fine detail still counts in large regions.
+/// A Bayer mosaic is measured over its 2x2 quads, the finest whole colors it has.
 pub fn sharpness(frame: &Frame, region: [u32; 4]) -> Result<Sharpness> {
     validated_bytes_per_pixel(frame)?;
     checked_pixels(frame)?;
-    let (w, h) = (frame.width, frame.height);
+    if let Some(quads) = Quads::of(frame).filter(|q| q.columns >= 3 && q.rows >= 3) {
+        let [x, y, w, h] = region;
+        let region = [
+            x / 2,
+            y / 2,
+            (x % 2 + w).div_ceil(2),
+            (y % 2 + h).div_ceil(2),
+        ];
+        return Ok(sharpness_over(
+            (quads.columns, quads.rows),
+            region,
+            |x, y| luma(quads.color(x, y)) as f64,
+        ));
+    }
+    let (w, h) = (frame.width as usize, frame.height as usize);
     ensure!(w >= 3 && h >= 3, "frame is too small to measure sharpness");
+    Ok(sharpness_over((w, h), region, |x, y| {
+        luma(pixel_at(frame, x, y)) as f64
+    }))
+}
+/// `sharpness` of a region of a `w` × `h` grid, at least 3 × 3, whose
+/// luminance at (x, y) is `at`.
+fn sharpness_over(
+    (w, h): (usize, usize),
+    region: [u32; 4],
+    at: impl Fn(usize, usize) -> f64,
+) -> Sharpness {
+    let [x, y, width, height] = region.map(|v| v as usize);
     // Keep a one-pixel border so every 3×3 neighbourhood is inside the frame.
-    let x0 = region[0].clamp(1, w - 2);
-    let y0 = region[1].clamp(1, h - 2);
-    let x1 = region[0].saturating_add(region[2]).clamp(x0 + 1, w - 1);
-    let y1 = region[1].saturating_add(region[3]).clamp(y0 + 1, h - 1);
+    let x0 = x.clamp(1, w - 2);
+    let y0 = y.clamp(1, h - 2);
+    let x1 = x.saturating_add(width).clamp(x0 + 1, w - 1);
+    let y1 = y.saturating_add(height).clamp(y0 + 1, h - 1);
     let area = (x1 - x0) as f64 * (y1 - y0) as f64;
     let step = (area / 65_536.0).sqrt().ceil().max(1.0) as usize;
-    let at = |x: usize, y: usize| luma(pixel_at(frame, x, y)) as f64;
     let (mut n, mut lap, mut lap2, mut ten, mut bren, mut sum, mut sum2) =
         (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     // Shift each row and column of the sampling grid by a different phase
     // within the stride, so periodic detail (a one-pixel checkerboard or
     // stripes) is never sampled at only one of its phases.
-    let (x0, y0, x1, y1) = (x0 as usize, y0 as usize, x1 as usize, y1 as usize);
     let grid = (0..(y1 - y0).div_ceil(step))
         .flat_map(|row| (0..(x1 - x0).div_ceil(step)).map(move |column| (row, column)));
     for (row, column) in grid {
@@ -475,18 +553,31 @@ pub fn sharpness(frame: &Frame, region: [u32; 4]) -> Result<Sharpness> {
     }
     let mean = sum / n;
     let variance = (sum2 / n - mean * mean).max(0.0);
-    Ok(Sharpness {
+    Sharpness {
         laplacian: (lap2 / n - (lap / n).powi(2)).max(0.0) as f32,
         tenengrad: (ten / n) as f32,
         brenner: (bren / n) as f32,
         variance: if mean > 0.0 { variance / mean } else { 0.0 } as f32,
-    })
+    }
 }
+/// RGBA of at most `max_width` × `max_height` for display: the frame itself
+/// when it fits, else `shrink` by the smallest factor that does, so every
+/// pixel is the mean of what it covers.
 pub fn preview_rgba(frame: &Frame, max_width: u32, max_height: u32) -> Result<(u32, u32, Vec<u8>)> {
+    let bounds = (max_width.max(1), max_height.max(1));
+    let small = shrink_to(frame, bounds);
+    let (width, height, rgba) = sampled(small.as_ref().unwrap_or(frame), bounds)?;
+    Ok((width, height, rgba))
+}
+/// A preview of at most `max_width` × `max_height` that keeps one pixel, or
+/// one Bayer quad, every few rather than averaging them. Auto capture
+/// descriptors are computed from this, so sessions learned earlier stay
+/// comparable; anything shown uses `preview_rgba`.
+pub fn sampled_rgba(frame: &Frame, max_width: u32, max_height: u32) -> Result<(u32, u32, Vec<u8>)> {
     let (max_width, max_height) = (max_width.max(1), max_height.max(1));
     // Sample complete Bayer quads so every retained pixel keeps its CFA phase.
     // Count quads rather than pixels to keep odd requested bounds bounded too.
-    let factor = if matches!(frame.pixel_format, 0x0108_0008..=0x0108_000b) {
+    let factor = if is_bayer(frame.pixel_format) {
         (frame.width / 2)
             .div_ceil((max_width / 2).max(1))
             .max((frame.height / 2).div_ceil((max_height / 2).max(1)))
@@ -499,9 +590,12 @@ pub fn preview_rgba(frame: &Frame, max_width: u32, max_height: u32) -> Result<(u
     let small = (factor > 1)
         .then(|| decimate(frame, factor as usize))
         .flatten();
-    let source = small.as_ref().unwrap_or(frame);
-    // One-pixel bounds or a one-row Bayer source cannot retain complete quads.
-    // Finish those cases by sampling after conversion.
+    sampled(small.as_ref().unwrap_or(frame), (max_width, max_height))
+}
+/// `source` as RGBA, taking every few pixels of its conversion when it is
+/// still larger than `bounds`: one-pixel bounds, or a Bayer source without a
+/// whole quad, cannot be reduced before converting.
+fn sampled(source: &Frame, (max_width, max_height): (u32, u32)) -> Result<(u32, u32, Vec<u8>)> {
     let step = source
         .width
         .div_ceil(max_width)
@@ -548,6 +642,174 @@ fn decimate(frame: &Frame, factor: usize) -> Option<Frame> {
     Some(Frame {
         width: (columns * unit) as u32,
         height: (rows * unit) as u32,
+        data,
+        ..*frame
+    })
+}
+
+/// Bounds for `preview_rgba` that keep at least `shown` pixels each way, so
+/// a view that many pixels across never enlarges the picture, while
+/// shrinking it as far as whole factors allow.
+pub fn covering(frame: &Frame, (shown_width, shown_height): (u32, u32)) -> (u32, u32) {
+    let factor = (frame.width / shown_width.max(1))
+        .min(frame.height / shown_height.max(1))
+        .max(1);
+    // A mosaic shrinks by whole quads, two pixels at a time.
+    let factor = if is_bayer(frame.pixel_format) {
+        factor & !1
+    } else {
+        factor
+    };
+    shrunk_size(frame, factor.max(1))
+}
+/// The size `shrink` makes `frame` by `factor`: in whole quads for a mosaic.
+fn shrunk_size(frame: &Frame, factor: u32) -> (u32, u32) {
+    if factor <= 1 {
+        return (frame.width, frame.height);
+    }
+    let unit = if is_bayer(frame.pixel_format) { 2 } else { 1 };
+    let blocks = factor / unit;
+    (
+        (frame.width / unit).div_ceil(blocks),
+        (frame.height / unit).div_ceil(blocks),
+    )
+}
+/// `shrink` by the smallest factor that fits `frame` within `bounds`; None
+/// when it already fits or cannot be shrunk.
+pub(crate) fn shrink_to(frame: &Frame, (max_width, max_height): (u32, u32)) -> Option<Frame> {
+    let (max_width, max_height) = (max_width.max(1), max_height.max(1));
+    if frame.width <= max_width && frame.height <= max_height {
+        return None;
+    }
+    let factor = if is_bayer(frame.pixel_format) {
+        2 * (frame.width / 2)
+            .div_ceil(max_width)
+            .max((frame.height / 2).div_ceil(max_height))
+            .max(1)
+    } else {
+        frame
+            .width
+            .div_ceil(max_width)
+            .max(frame.height.div_ceil(max_height))
+    };
+    shrink(frame, factor)
+}
+/// `frame` made `factor` times smaller each way for display, as RGB8 or
+/// Mono8. Each pixel is the rounded mean of the block it covers, so detail
+/// finer than a pixel averages out instead of aliasing. A Bayer mosaic is
+/// read in whole quads (red, the mean of both greens, blue) rather than
+/// demosaiced, so its colors never mix samples from far apart, and `factor`
+/// must be even. None for other formats, a factor below 2, or a frame
+/// without a whole block.
+pub(crate) fn shrink(frame: &Frame, factor: u32) -> Option<Frame> {
+    let (bytes, channels) = match frame.pixel_format {
+        MONO8 | 0x0108_00b1 | 0x0108_00c6 => (1, 1),
+        0x0110_0003 | 0x0110_0005 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => (2, 1),
+        RGB8 | 0x0218_0015 => (3, 3),
+        0x0108_0008..=0x0108_000b => (1, 3),
+        _ => return None,
+    };
+    let bayer = is_bayer(frame.pixel_format);
+    // Pixels of the source per unit: a quad for a mosaic, else one pixel.
+    let unit = if bayer { 2 } else { 1 };
+    let pixels = checked_pixels(frame).ok()?;
+    if factor < 2 || !(factor as usize).is_multiple_of(unit) || frame.data.len() < pixels * bytes {
+        return None;
+    }
+    let (columns, rows) = (frame.width as usize / unit, frame.height as usize / unit);
+    let blocks = factor as usize / unit;
+    let (width, height) = (columns.div_ceil(blocks), rows.div_ceil(blocks));
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let line = frame.width as usize * bytes;
+    let pattern = bayer_pattern(frame.pixel_format);
+    let shift = match frame.pixel_format {
+        0x0110_0003 => 2,
+        0x0110_0005 => 4,
+        _ => 8,
+    };
+    // Bytes of whole units in one source line, and the samples they hold:
+    // bytes, or pixels of a 16-bit format.
+    let used = columns * unit * bytes;
+    let samples = if bytes == 2 { used / 2 } else { used };
+    // Adds the block of source rows behind output row `y` sample by sample,
+    // then each output pixel's columns of those sums.
+    let shrink_row = |y: usize, sums: &mut Vec<u32>, out: &mut [u8]| {
+        sums.clear();
+        sums.resize(unit * samples, 0);
+        let first = y * blocks;
+        let last = (first + blocks).min(rows);
+        for source in first..last {
+            for (dy, sums) in sums.chunks_exact_mut(samples).enumerate() {
+                let line = &frame.data[(source * unit + dy) * line..][..used];
+                if bytes == 2 {
+                    for (sum, &p) in sums.iter_mut().zip(line.as_chunks::<2>().0) {
+                        *sum += u32::from((u16::from_le_bytes(p) >> shift).min(255));
+                    }
+                } else {
+                    for (sum, &v) in sums.iter_mut().zip(line) {
+                        *sum += u32::from(v);
+                    }
+                }
+            }
+        }
+        let total = |values: &[u32]| values.iter().map(|&v| u64::from(v)).sum::<u64>();
+        for (x, pixel) in out.chunks_exact_mut(channels).enumerate() {
+            let (from, to) = (x * blocks, ((x + 1) * blocks).min(columns));
+            let count = ((last - first) * (to - from)) as u64;
+            let mut channel = [0u64; 3];
+            if bayer {
+                // Each quad is two samples of each line.
+                for (half, phase) in [(&sums[..samples], 0), (&sums[samples..], 2)] {
+                    let pairs = half[2 * from..2 * to].as_chunks::<2>().0;
+                    channel[pattern[phase]] += pairs.iter().map(|p| u64::from(p[0])).sum::<u64>();
+                    channel[pattern[phase + 1]] +=
+                        pairs.iter().map(|p| u64::from(p[1])).sum::<u64>();
+                }
+            } else if channels == 3 {
+                let order = if frame.pixel_format == RGB8 {
+                    [0, 1, 2]
+                } else {
+                    [2, 1, 0]
+                };
+                let pixels = sums[3 * from..3 * to].as_chunks::<3>().0;
+                for (c, source) in order.into_iter().enumerate() {
+                    channel[c] = pixels.iter().map(|p| u64::from(p[source])).sum();
+                }
+            } else {
+                channel[0] = total(&sums[from..to]);
+            }
+            for (c, value) in pixel.iter_mut().enumerate() {
+                // Each quad holds two greens.
+                let count = if bayer && c == 1 { 2 * count } else { count };
+                *value = ((channel[c] + count / 2) / count) as u8;
+            }
+        }
+    };
+    let mut data = vec![0u8; width * height * channels];
+    let threads = worker_threads(pixels).min(height);
+    let block = height.div_ceil(threads) * width * channels;
+    std::thread::scope(|scope| {
+        for (i, lines) in data.chunks_mut(block).enumerate() {
+            let shrink_row = &shrink_row;
+            let mut work = move || {
+                let mut sums = Vec::new();
+                for (j, out) in lines.chunks_exact_mut(width * channels).enumerate() {
+                    shrink_row(i * block / (width * channels) + j, &mut sums, out);
+                }
+            };
+            if threads > 1 {
+                scope.spawn(work);
+            } else {
+                work();
+            }
+        }
+    });
+    Some(Frame {
+        width: width as u32,
+        height: height as u32,
+        pixel_format: if channels == 3 { RGB8 } else { MONO8 },
         data,
         ..*frame
     })
@@ -783,11 +1045,17 @@ mod tests {
                     .zip(full.as_chunks::<3>().0)
                     .all(|(a, b)| a[..3] == b[..] && a[3] == 255)
             );
+            // Shrunk 4 times: each pixel the mean of the block it covers.
             let (w, h, rgba) = preview_rgba(&frame, 10, 10).unwrap();
             assert_eq!((w, h), (9, 5));
-            for (i, p) in rgba.as_chunks::<4>().0.iter().enumerate() {
-                let source = (i / 9 * 4 * 33 + i % 9 * 4) * 3;
-                assert_eq!(p[..3], full[source..source + 3]);
+            let expected = box_mean(&full, 33, 17, 4);
+            for (p, want) in rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(expected.as_chunks::<3>().0)
+            {
+                assert_eq!((&p[..3], p[3]), (&want[..], 255));
             }
         }
         let patterns = [[1, 0, 2, 1], [0, 1, 1, 2], [1, 2, 0, 1], [2, 1, 1, 0]];
@@ -822,6 +1090,288 @@ mod tests {
         }
         assert!(preview_rgba(&f(MONO8, vec![1]), 1, 1).is_err());
         assert!(preview_rgba(&f(0, vec![0; 6]), 1, 1).is_err());
+    }
+    /// Rounded means of `factor` × `factor` blocks of an RGB image, edge
+    /// blocks over the pixels they have.
+    fn box_mean(rgb: &[u8], width: usize, height: usize, factor: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for by in (0..height).step_by(factor) {
+            for bx in (0..width).step_by(factor) {
+                let mut sums = [0usize; 3];
+                let mut n = 0;
+                for y in by..(by + factor).min(height) {
+                    for x in bx..(bx + factor).min(width) {
+                        for c in 0..3 {
+                            sums[c] += rgb[(y * width + x) * 3 + c] as usize;
+                        }
+                        n += 1;
+                    }
+                }
+                out.extend(sums.map(|sum| ((sum + n / 2) / n) as u8));
+            }
+        }
+        out
+    }
+    #[test]
+    fn shrinking_averages_blocks_and_reads_mosaics_in_whole_quads() {
+        let formats = [
+            (MONO8, 1),
+            (0x0108_00b1, 1),
+            (RGB8, 3),
+            (0x0218_0015, 3),
+            (0x0110_0005, 2),
+            (0x0110_0007, 2),
+        ];
+        for (format, bytes) in formats {
+            let frame = Frame {
+                width: 33,
+                height: 17,
+                ..f(format, random(format as u64, 33 * 17 * bytes))
+            };
+            let full = rgb(&frame).unwrap();
+            for factor in [2, 3, 4, 5, 40] {
+                let small = shrink(&frame, factor).unwrap();
+                let size = (33u32.div_ceil(factor), 17u32.div_ceil(factor));
+                assert_eq!((small.width, small.height), size, "{format:x} by {factor}");
+                assert_eq!(small.pixel_format, if bytes == 3 { RGB8 } else { MONO8 });
+                assert_eq!(
+                    rgb(&small).unwrap(),
+                    box_mean(&full, 33, 17, factor as usize),
+                    "{format:x} by {factor}"
+                );
+            }
+            assert!(shrink(&frame, 1).is_none());
+            let mut short = frame.clone();
+            short.data.pop();
+            assert!(shrink(&short, 2).is_none());
+        }
+        // Each quad its own color: R, two different greens, B.
+        let (width, height) = (35usize, 23usize);
+        let colors = random(7, (width / 2) * (height / 2) * 4);
+        for (format, cfa) in (0x0108_0008..=0x0108_000b).zip(0..) {
+            let pattern = bayer_pattern(format);
+            let data = (0..width * height)
+                .map(|i| {
+                    let (x, y) = (i % width, i / width);
+                    let quad =
+                        (y / 2).min(height / 2 - 1) * (width / 2) + (x / 2).min(width / 2 - 1);
+                    let phase = (y & 1) * 2 + (x & 1);
+                    // Which of the quad's four samples: red, first green, second green, blue.
+                    let slot = match pattern[phase] {
+                        0 => 0,
+                        2 => 3,
+                        _ if pattern[..phase].contains(&1) => 2,
+                        _ => 1,
+                    };
+                    colors[quad * 4 + slot]
+                })
+                .collect();
+            let frame = Frame {
+                width: width as u32,
+                height: height as u32,
+                ..f(format, data)
+            };
+            let quad = |i: usize| {
+                let c = &colors[i * 4..i * 4 + 4];
+                [c[0] as usize, c[1] as usize + c[2] as usize, c[3] as usize]
+            };
+            for blocks in [1, 2, 3, 11] {
+                let small = shrink(&frame, 2 * blocks as u32).unwrap();
+                let (columns, rows) = (width / 2, height / 2);
+                assert_eq!(
+                    (small.width as usize, small.height as usize),
+                    (columns.div_ceil(blocks), rows.div_ceil(blocks))
+                );
+                for (i, p) in small.data.as_chunks::<3>().0.iter().enumerate() {
+                    let (bx, by) = (i % small.width as usize, i / small.width as usize);
+                    let mut sums = [0; 3];
+                    let mut n = 0;
+                    for y in by * blocks..((by + 1) * blocks).min(rows) {
+                        for x in bx * blocks..((bx + 1) * blocks).min(columns) {
+                            let q = quad(y * columns + x);
+                            for c in 0..3 {
+                                sums[c] += q[c];
+                            }
+                            n += 1;
+                        }
+                    }
+                    let mean = |sum: usize, n: usize| ((sum + n / 2) / n) as u8;
+                    let want = [mean(sums[0], n), mean(sums[1], 2 * n), mean(sums[2], n)];
+                    assert_eq!(*p, want, "cfa {cfa} blocks {blocks} at {bx},{by}");
+                }
+            }
+            assert!(
+                shrink(&frame, 3).is_none(),
+                "a mosaic shrinks by whole quads"
+            );
+            assert!(
+                shrink(
+                    &Frame {
+                        width: 1,
+                        ..frame.clone()
+                    },
+                    2
+                )
+                .is_none()
+            );
+        }
+        assert!(shrink(&f(0x0120_00bf, vec![0; 8]), 2).is_none());
+    }
+    #[test]
+    fn covering_bounds_never_enlarge_a_view() {
+        for format in [MONO8, RGB8, 0x0108_0009] {
+            let bytes = if format == RGB8 { 3 } else { 1 };
+            let frame = Frame {
+                width: 2448,
+                height: 2048,
+                ..f(format, vec![90; 2448 * 2048 * bytes])
+            };
+            for shown in [
+                (2448, 2048),
+                (2000, 1700),
+                (1224, 1024),
+                (1000, 900),
+                (700, 600),
+                (300, 200),
+                (1, 1),
+            ] {
+                let bounds = covering(&frame, shown);
+                let (w, h, rgba) = preview_rgba(&frame, bounds.0, bounds.1).unwrap();
+                assert_eq!((w, h), bounds, "{format:x} {shown:?}");
+                assert!(
+                    w >= shown.0 && h >= shown.1,
+                    "{format:x} {shown:?}: {w}x{h}"
+                );
+                // As small as whole factors allow: twice as many is too many.
+                assert!(
+                    w < 2 * shown.0.max(1224) || h < 2 * shown.1,
+                    "{format:x} {shown:?}: {w}x{h}"
+                );
+                assert!(rgba.iter().all(|&v| v == 90 || v == 255));
+            }
+            assert_eq!(covering(&frame, (3000, 3000)), (2448, 2048));
+        }
+        // A mosaic shown at more than half its size keeps every pixel.
+        let bayer = Frame {
+            width: 2448,
+            height: 2048,
+            ..f(0x0108_0009, vec![])
+        };
+        assert_eq!(covering(&bayer, (1300, 1100)), (2448, 2048));
+        assert_eq!(covering(&bayer, (800, 700)), (1224, 1024));
+    }
+    #[test]
+    fn quad_scopes_agree_with_the_demosaic() {
+        // A smooth scene with fine texture, sampled through each mosaic, against
+        // the same pixels demosaiced, which is what the scopes measured before.
+        let (width, height) = (640usize, 480usize);
+        let scene = |x: usize, y: usize, c: usize| {
+            // Blown out along the top, crushed along the bottom.
+            if !(48..432).contains(&y) {
+                return if y < 48 { 255 } else { 0 };
+            }
+            let (fx, fy) = (x as f32 / width as f32, y as f32 / height as f32);
+            let base = [
+                90.0 + 70.0 * (fx * 3.1 + fy * 1.7).sin(),
+                110.0 + 60.0 * (fy * 4.3 - fx * 0.9).cos(),
+                80.0 + 50.0 * (fx * fy * 9.0).sin(),
+            ][c];
+            (base + 18.0 * (x as f32 * 0.21).sin() * (y as f32 * 0.17).cos()).clamp(0.0, 255.0)
+                as u8
+        };
+        for format in 0x0108_0008..=0x0108_000b {
+            let pattern = bayer_pattern(format);
+            let mosaic = Frame {
+                width: width as u32,
+                height: height as u32,
+                ..f(
+                    format,
+                    (0..width * height)
+                        .map(|i| {
+                            scene(
+                                i % width,
+                                i / width,
+                                pattern[((i / width) & 1) * 2 + ((i % width) & 1)],
+                            )
+                        })
+                        .collect(),
+                )
+            };
+            let demosaiced = Frame {
+                pixel_format: RGB8,
+                data: rgb(&mosaic).unwrap(),
+                ..mosaic.clone()
+            };
+            let (quads, bilinear) = (exposure(&mosaic).unwrap(), exposure(&demosaiced).unwrap());
+            assert!((quads.mean - bilinear.mean).abs() < 0.005, "{format:x}");
+            assert!(quads.highlights > 0.05 && quads.shadows > 0.05);
+            assert!((quads.highlights - bilinear.highlights).abs() < 0.01);
+            assert!((quads.shadows - bilinear.shadows).abs() < 0.01);
+            let share = |bins: &[u32; 64]| {
+                let total = bins.iter().sum::<u32>() as f32;
+                bins.map(|n| n as f32 / total)
+            };
+            let (a, b) = (share(&quads.luma), share(&bilinear.luma));
+            // Earth mover's distance between the two, in bins.
+            let (mut carried, mut distance) = (0.0f32, 0.0f32);
+            for (a, b) in a.iter().zip(&b) {
+                carried += a - b;
+                distance += carried.abs();
+            }
+            assert!(
+                distance < 0.25,
+                "{format:x}: histograms {distance} bins apart"
+            );
+            // Focus scores rank a focus sweep the same way.
+            let sweep: Vec<(f32, f32)> = [0usize, 1, 2, 4]
+                .into_iter()
+                .map(|blur| {
+                    let soft = Frame {
+                        data: (0..width * height)
+                            .map(|i| {
+                                let (x, y) = (i % width, i / width);
+                                let c = pattern[(y & 1) * 2 + (x & 1)];
+                                let (x0, x1) = (x.saturating_sub(blur), (x + blur).min(width - 1));
+                                let sum: usize = (x0..=x1)
+                                    .map(|x| (x / 8 % 2) * 200 + scene(x, y, c) as usize / 8)
+                                    .sum();
+                                (sum / (x1 - x0 + 1)) as u8
+                            })
+                            .collect(),
+                        ..mosaic.clone()
+                    };
+                    let region = [100, 100, 400, 300];
+                    let reference = Frame {
+                        pixel_format: RGB8,
+                        data: rgb(&soft).unwrap(),
+                        ..soft.clone()
+                    };
+                    (
+                        sharpness(&soft, region).unwrap().tenengrad,
+                        sharpness(&reference, region).unwrap().tenengrad,
+                    )
+                })
+                .collect();
+            for pair in sweep.windows(2) {
+                assert!(
+                    pair[0].0 > pair[1].0 && pair[0].1 > pair[1].1,
+                    "{format:x}: {sweep:?}"
+                );
+            }
+        }
+        // Too small for quads: measured pixel by pixel as before.
+        let tiny = Frame {
+            width: 4,
+            height: 4,
+            ..f(0x0108_0009, (0..16).map(|i| i * 15).collect())
+        };
+        assert!(sharpness(&tiny, [0, 0, 4, 4]).is_ok());
+    }
+    #[test]
+    fn conversions_leave_a_core_free() {
+        assert_eq!(worker_threads(1000), 1);
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert!(worker_threads(64 << 20) <= (cores - 1).clamp(1, 8));
     }
     #[test]
     fn direct_conversions_match_rgb() {
@@ -904,6 +1454,10 @@ mod tests {
                         let i = (y * width as usize + x) * 3;
                         assert_eq!(pixel_at(&frame, x, y), full[i..i + 3], "{format:x} {x},{y}");
                     }
+                }
+                // Bayer exposure reads whole quads; see quad_scopes_agree_with_the_demosaic.
+                if is_bayer(format) {
+                    continue;
                 }
                 let mut bins = [0u32; 64];
                 let pixels = full.as_chunks::<3>().0;
