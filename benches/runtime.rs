@@ -236,7 +236,8 @@ fn main() {
         }
     }
     // A large sensor in the main view: converted whole, as at 1:1, against
-    // fitted to a 1600x1000 stage, and as an overview tile.
+    // fitted to a 1600x1000 stage (1500x1000 shown, converted as the main
+    // view does), and as an overview tile.
     for (name, format) in [("Mono8", MONO8), ("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
         let label = format!("/{name}/5472x3648");
         if !["gui-new/main", "gui-new/fit", "gui-new/tile"]
@@ -249,8 +250,9 @@ fn main() {
         b.run(&format!("gui-new/main{label}"), f.data.len(), || {
             frame::preview_rgba(&f, f.width, f.height).unwrap()
         });
+        let (width, height) = frame::covering(&f, (1500, 1000));
         b.run(&format!("gui-new/fit{label}"), f.data.len(), || {
-            frame::preview_rgba(&f, 1600, 1000).unwrap()
+            frame::preview_rgba(&f, width, height).unwrap()
         });
         b.run(&format!("gui-new/tile{label}"), f.data.len(), || {
             frame::preview_rgba(&f, 640, 480).unwrap()
