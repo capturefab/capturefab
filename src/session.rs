@@ -446,7 +446,7 @@ impl SessionCommand {
                 validate_selector(camera)?;
                 validate_timeout(*timeout_ms)?;
                 maximum_cameras()?;
-                frame_capacity(false)?;
+                frame_capacity(FrameClass::Default)?;
             }
             Self::Select { camera } => validate_selector(camera)?,
             Self::Get { feature } | Self::Execute { feature } | Self::Set { feature, .. } => {
@@ -628,13 +628,22 @@ fn maximum_cameras() -> Result<usize> {
     );
     Ok(maximum)
 }
-fn frame_capacity(scanner: bool) -> Result<usize> {
+/// What a worker's frames look like, which sizes its shared ring.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FrameClass {
+    Default,
+    /// Hub cameras deliver RGB frames of whatever size the server sends;
+    /// 32 MiB slots hold 4096x2160.
+    Hub,
+    Scanner,
+}
+fn frame_capacity(class: FrameClass) -> Result<usize> {
     let capacity = env_usize(
         "CAPTUREFAB_FRAME_BYTES",
-        if scanner {
-            128 * 1024 * 1024
-        } else {
-            DEFAULT_CAPACITY
+        match class {
+            FrameClass::Scanner => 128 * 1024 * 1024,
+            FrameClass::Hub => 32 * 1024 * 1024,
+            FrameClass::Default => DEFAULT_CAPACITY,
         },
     )?;
     ensure!(
@@ -1064,6 +1073,10 @@ struct WorkerReply<'a> {
     result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// The error's category (`usage` or an `ErrorKind` code), so the parent
+    /// reports it with the same exit code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
     snapshot: &'a SessionSnapshot,
     #[serde(skip_serializing_if = "Kept::is_nothing")]
     kept: Kept,
@@ -1080,6 +1093,8 @@ struct ParentReply<S = SessionSnapshot> {
     result: Option<Value>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
     #[serde(default)]
     snapshot: Option<S>,
     #[serde(default)]
@@ -1299,8 +1314,8 @@ fn worker_command(
 }
 
 impl Process {
-    fn spawn(scanner: bool, revision: Arc<AtomicU64>) -> Result<Self> {
-        let capacity = frame_capacity(scanner)?;
+    fn spawn(class: FrameClass, revision: Arc<AtomicU64>) -> Result<Self> {
+        let capacity = frame_capacity(class)?;
         let dir = crate::ipc::runtime_dir();
         crate::ipc::ensure_private_dir(&dir)?;
         // Ring files are left behind only when a process dies; clear them
@@ -1406,6 +1421,7 @@ impl Process {
                     ok: reply.ok,
                     result: reply.result,
                     error: reply.error,
+                    code: reply.code,
                     snapshot: None,
                     kept: Kept::default(),
                     saved: reply.saved,
@@ -1415,18 +1431,22 @@ impl Process {
         // Before the ok check: a failed command may already have saved files.
         self.keep_saved(std::mem::take(&mut reply.saved));
         if let Some(snapshot) = reply.snapshot {
-            self.quiet = reply.kept.features && reply.kept.history && snapshot.logs.is_empty();
+            self.quiet =
+                reply.ok && reply.kept.features && reply.kept.history && snapshot.logs.is_empty();
             self.report.apply(snapshot, reply.kept, full);
             self.revision.fetch_add(1, Ordering::Relaxed);
         } else {
             self.quiet = false;
         }
         self.reply = data;
-        ensure!(
-            reply.ok,
-            "{}",
-            reply.error.as_deref().unwrap_or("worker command failed")
-        );
+        if !reply.ok {
+            return Err(crate::types::error_from_transport(
+                reply.code.as_deref(),
+                reply
+                    .error
+                    .unwrap_or_else(|| "worker command failed".into()),
+            ));
+        }
         Ok(reply.result)
     }
     /// This worker's camera as session snapshots show it.
@@ -1790,6 +1810,41 @@ impl SessionHandle {
             .insert(id, Arc::new(Mutex::new(p)));
         // The poller may have just seen no workers, at whatever pace.
         self.wake();
+    }
+    /// The worker already showing hub camera `camera`, if any. One camera
+    /// has one worker, so asking for it with other options is refused rather
+    /// than replacing the stream others are using.
+    fn connected_hub_camera(&self, camera: &str) -> Result<Option<Value>> {
+        let Some(selector) = crate::hubs::Selector::parse(camera).ok() else {
+            return Ok(None);
+        };
+        let id = selector.id();
+        let Some((_, worker)) = self.workers().into_iter().find(|(key, _)| *key == id) else {
+            return Ok(None);
+        };
+        let p = worker.lock().unwrap_or_else(|e| e.into_inner());
+        let info = p
+            .report
+            .snapshot
+            .connected
+            .clone()
+            .context("worker has no camera")?;
+        let address = info.address.clone().unwrap_or_else(|| info.id.clone());
+        if address != selector.address() {
+            let options = address
+                .split_once('?')
+                .map_or("default options".to_owned(), |(_, options)| {
+                    options.replace('&', ", ")
+                });
+            return Err(crate::types::Categorized::error(
+                crate::types::ErrorKind::Unavailable,
+                format!(
+                    "{id} is already connected ({options}); disconnect it before connecting with other options"
+                ),
+            ));
+        }
+        self.edit_state().active_camera = Some(info.id.clone());
+        Ok(Some(json!({"connected":info,"worker_pid":p.child.id()})))
     }
     fn workers(&self) -> Vec<(String, Arc<Mutex<Process>>)> {
         self.inner
@@ -2513,8 +2568,11 @@ impl SessionHandle {
                     (1..=60000).contains(&timeout_ms),
                     "timeout must be 1..60000 milliseconds"
                 );
-                let (devices, warnings) =
-                    crate::camera::discover(Duration::from_millis(timeout_ms), simulated)?;
+                let (devices, warnings) = crate::camera::discover_with(
+                    Duration::from_millis(timeout_ms),
+                    simulated,
+                    true,
+                )?;
                 self.edit_state().devices = devices.clone();
                 let mut log = locked(&self.inner.log);
                 for warning in &warnings {
@@ -2529,6 +2587,27 @@ impl SessionHandle {
                     .connecting
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
+                // A discovered hub camera named by its serial opens by its
+                // address, so the worker never has to list hubs.
+                let camera = if crate::hubs::is_source(&camera) {
+                    camera
+                } else {
+                    self.inner
+                        .state
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .devices
+                        .iter()
+                        .find(|device| {
+                            crate::hubs::is_source(&device.id)
+                                && (device.serial == camera || device.id == camera)
+                        })
+                        .map(|device| device.address.clone().unwrap_or_else(|| device.id.clone()))
+                        .unwrap_or(camera)
+                };
+                if let Some(connected) = self.connected_hub_camera(&camera)? {
+                    return Ok(connected);
+                }
                 if let Ok(w) = self.target(Some(&camera)) {
                     let p = w.lock().unwrap_or_else(|e| e.into_inner());
                     let info = p
@@ -2558,7 +2637,14 @@ impl SessionHandle {
                             device.transport == crate::types::Transport::Scanner
                                 && (device.id == camera || device.serial == camera)
                         });
-                let mut p = Process::spawn(scanner, self.inner.revision.clone())?;
+                let class = if scanner {
+                    FrameClass::Scanner
+                } else if crate::hubs::is_source(&camera) {
+                    FrameClass::Hub
+                } else {
+                    FrameClass::Default
+                };
+                let mut p = Process::spawn(class, self.inner.revision.clone())?;
                 let result = p.call(SessionCommand::Connect { camera, timeout_ms })?;
                 let info = p
                     .report
@@ -2930,17 +3016,40 @@ pub fn run_worker(ring: &std::ffi::OsStr) -> Result<()> {
             // One snapshot clone per reply, serialized straight to the pipe; the
             // clone keeps the state lock out of the blocking write.
             let mut snapshot = handle.snapshot();
-            let kept = sent.strip(&mut snapshot);
-            let (ok, result, error) = match result {
-                Ok(result) => (true, result, None),
-                Err(e) => (false, None, Some(format!("{e:#}"))),
+            let (ok, result, error, code) = match result {
+                Ok(result) => (true, result, None, None),
+                Err(e) => (
+                    false,
+                    None,
+                    Some(format!("{e:#}")),
+                    crate::types::error_transport_code(&e),
+                ),
             };
+            // Hub secrets this worker holds never leave it, even in text a
+            // dependency produced.
+            let scrub = |text: &mut String| {
+                if let std::borrow::Cow::Owned(clean) = crate::hubs::scrub::scrub(text) {
+                    *text = clean;
+                }
+            };
+            let mut error = error;
+            if crate::hubs::scrub::active() {
+                error.iter_mut().for_each(scrub);
+                snapshot.last_error.iter_mut().for_each(scrub);
+                snapshot
+                    .logs
+                    .iter_mut()
+                    .for_each(|entry| scrub(&mut entry.message));
+            }
+            // Compare and retain the same scrubbed fields the parent receives.
+            let kept = sent.strip(&mut snapshot);
             serde_json::to_writer(
                 &mut output,
                 &WorkerReply {
                     ok,
                     result,
                     error,
+                    code,
                     snapshot: &snapshot,
                     kept,
                     saved: handle.take_saved(2048),
@@ -3830,6 +3939,7 @@ mod tests {
             ok: true,
             result: None,
             error: None,
+            code: None,
             snapshot: &reply,
             kept,
             saved: Default::default(),
@@ -4176,6 +4286,29 @@ mod tests {
             assert_ne!(read, 0, "test worker did not start");
         }
         worker
+    }
+    #[test]
+    #[cfg(unix)]
+    fn worker_error_categories_survive_status_deltas() {
+        let mut worker = test_worker(crate::efficiency::for_workers());
+        worker.exchange(SessionCommand::Status).unwrap();
+        assert!(worker.quiet);
+        for _ in 0..2 {
+            // The camera name mentions timeout, but the malformed option is
+            // a usage error. Its type must survive the worker pipe alongside
+            // the unchanged snapshot's kept fields.
+            let error = worker
+                .call(SessionCommand::Connect {
+                    camera: "hub:merge-test/camera.timeout?invalid=1".into(),
+                    timeout_ms: 100,
+                })
+                .unwrap_err();
+            assert_eq!(crate::types::error_transport_code(&error), Some("usage"));
+            assert!(!worker.quiet, "failed replies must always be read");
+            assert!(!worker.report.resync);
+            worker.exchange(SessionCommand::Status).unwrap();
+            assert!(worker.quiet);
+        }
     }
     #[test]
     #[cfg(unix)]

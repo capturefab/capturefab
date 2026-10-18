@@ -314,6 +314,23 @@ Active recordings, forwarding or schedules prevent tuning.
 It does not change host IP addresses, routes or MTUs.
 See the agent instructions for network health values and RPC fields.
 
+## Open cameras from hubs
+
+```sh
+capturefab hub cameras --json
+capturefab --camera 'hub:home/camera.front_door' capture -o front.png --json
+capturefab --camera 'hub:home/camera.porch?stream=snapshot&fps=0.5' capture --interval 1m -n 60 -o porch --json
+```
+
+A hub is a Home Assistant, Frigate, go2rtc or UniFi Protect server saved with `capturefab hub add-home-assistant`, `add-frigate`, `add-go2rtc` or `add-unifi-protect`.
+Ask the user before you add or replace a hub or store a token; a Home Assistant token carries that user's access.
+Selectors are `hub:NAME/CAMERA[?stream=auto|mjpeg|snapshot|rtsp&fps=F]`; always quote them.
+`discover` and `hub cameras` list cameras on saved hubs; each `id` is a `--camera` selector.
+Secrets come from the OS credential store (`--secret-stdin`) or a `CAPTUREFAB_HUB_*` variable (`--secret-env VAR`) in the process that opens the camera, never from the command line.
+Hub camera settings are read-only; Home Assistant MJPEG sends nothing while the image is unchanged, so use `stream=snapshot` for time-lapses.
+`serve --listen` refuses hub cameras unless it was started with `--allow-hubs`.
+Exit codes: 1 secret or certificate refused, 2 invalid name, URL, flags or selector, 3 hub or camera unavailable, 4 timeout, 5 hubs or the credential store not compiled in.
+
 ## Camera types and limits
 
 Identity JSON includes `profile:{kind,source,evidence,capabilities}`.

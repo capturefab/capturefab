@@ -511,7 +511,22 @@ fn camera_mut(camera: &mut Option<Camera>) -> Result<&mut Camera> {
         .as_mut()
         .context("no camera connected; select --camera or use connect in a session")
 }
+/// Whether a failed frame read only means no frame was ready yet. A stream
+/// that ended is never a timeout, even when FFmpeg's reason says "timed out":
+/// its decoder fails every later read at once, so treating it as a wait would
+/// spin the worker forever.
 fn timed_out(e: &anyhow::Error) -> bool {
+    for cause in e.chain() {
+        if cause.is::<crate::types::FrameWait>() {
+            return true;
+        }
+        if cause.is::<crate::media::StreamEnded>() {
+            return false;
+        }
+        if let Some(categorized) = cause.downcast_ref::<crate::types::Categorized>() {
+            return categorized.kind == crate::types::ErrorKind::Timeout;
+        }
+    }
     let message = format!("{e:#}").to_ascii_lowercase();
     message.contains("timeout") || message.contains("timed out")
 }
@@ -997,6 +1012,7 @@ fn process_plain(
                 && !crate::scanner::is_source(&selector)
                 && !crate::media::is_source(&selector)
                 && !crate::onvif::is_source(&selector)
+                && !crate::hubs::is_source(&selector)
                 && selector
                     .trim_start_matches("gige:")
                     .parse::<std::net::Ipv4Addr>()
@@ -2161,6 +2177,34 @@ mod autocapture_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ended_streams_count_as_errors_even_when_they_mention_timeouts() {
+        use crate::types::{Categorized, ErrorKind, FrameWait};
+        let ended: anyhow::Error = crate::media::StreamEnded(
+            "media stream ended: Error during demuxing: Operation timed out".into(),
+        )
+        .into();
+        assert!(!timed_out(&ended));
+        assert!(!timed_out(&ended.context("read rtsp://camera/live")));
+        assert!(timed_out(&FrameWait.into()));
+        assert!(timed_out(
+            &anyhow::Error::from(FrameWait).context("hub:home/camera.timeout")
+        ));
+        assert!(timed_out(&Categorized::error(
+            ErrorKind::Timeout,
+            "no answer"
+        )));
+        assert!(!timed_out(&Categorized::error(
+            ErrorKind::Unavailable,
+            "camera camera.timeout on hub home is offline (HTTP 503)"
+        )));
+        // Backends that predate the typed errors keep their meaning.
+        assert!(timed_out(&anyhow::anyhow!("frame timeout")));
+        assert!(timed_out(&anyhow::anyhow!(
+            "media frame capture timed out: x"
+        )));
+        assert!(!timed_out(&anyhow::anyhow!("truncated GVSP frame")));
+    }
     #[test]
     fn active_jobs_reject_overlapping_output_files() {
         let handle = WorkerHandle::new();

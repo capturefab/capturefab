@@ -6,14 +6,31 @@ use anyhow::{Context, Result, ensure};
 use std::{net::Ipv4Addr, time::Duration};
 
 pub fn discover(timeout: Duration, simulated: bool) -> Result<(Vec<CameraInfo>, Vec<String>)> {
+    discover_with(timeout, simulated, false)
+}
+
+/// Discover cameras, adding cameras on saved hubs when `hubs` is set. Only
+/// the session coordinator lists hubs; camera workers never contact them.
+pub fn discover_with(
+    timeout: Duration,
+    simulated: bool,
+    hubs: bool,
+) -> Result<(Vec<CameraInfo>, Vec<String>)> {
     let mut devices = Vec::new();
     let mut warnings = Vec::new();
-    let (gige, onvif, native, scanners) = std::thread::scope(|s| {
+    let (gige, onvif, native, scanners, hub_cameras) = std::thread::scope(|s| {
         let g = s.spawn(|| crate::transport::gige::discover(timeout));
         let o = s.spawn(|| crate::onvif::camera_infos(timeout));
         let n = s.spawn(|| crate::media::native_devices_with_timeout(timeout));
         let d = s.spawn(|| crate::scanner::discover(timeout));
-        (g.join(), o.join(), n.join(), d.join())
+        let h = hubs.then(|| s.spawn(|| crate::hubs::discovered(timeout)));
+        (
+            g.join(),
+            o.join(),
+            n.join(),
+            d.join(),
+            h.map(|h| h.join().unwrap_or_default()),
+        )
     });
     for (label, result) in [("GigE", gige), ("ONVIF", onvif), ("Scanner", scanners)] {
         match result {
@@ -53,6 +70,12 @@ pub fn discover(timeout: Duration, simulated: bool) -> Result<(Vec<CameraInfo>, 
     }
     devices.sort_by(|a, b| a.id.cmp(&b.id));
     devices.dedup_by(|a, b| a.id == b.id);
+    // Hub cameras come after local ones, so they never push USB or GigE
+    // cameras off the welcome screen.
+    if let Some((hub_devices, hub_warnings)) = hub_cameras {
+        devices.extend(hub_devices);
+        warnings.extend(hub_warnings);
+    }
     for info in &mut devices {
         info.profile = crate::camera_profile::detect(info, &[]);
     }
@@ -102,6 +125,8 @@ pub fn validate_selector_shape(selector: &str) -> Result<()> {
         crate::scanner::validate_selector_shape(selector)?;
     } else if crate::onvif::is_source(selector) {
         crate::onvif::validate_source_shape(selector)?;
+    } else if crate::hubs::is_source(selector) {
+        crate::hubs::validate_shape(selector)?;
     } else if crate::media::is_url_source(selector) || selector.contains("://") {
         crate::media::validate_source_shape(selector)?;
     }
@@ -117,6 +142,8 @@ pub fn validate_selector(selector: &str) -> Result<()> {
         crate::scanner::info(selector)?;
     } else if crate::onvif::is_source(selector) {
         crate::onvif::validate_source(selector)?;
+    } else if crate::hubs::is_source(selector) {
+        crate::hubs::validate(selector)?;
     } else if (crate::media::is_source(selector) || selector.contains("://"))
         && !crate::onvif::is_source(selector)
     {
@@ -129,6 +156,10 @@ impl Camera {
         validate_selector(selector)?;
         if crate::onvif::is_source(selector) {
             let (info, backend) = crate::onvif::connect(selector, timeout)?;
+            return Self::from_backend(info, backend);
+        }
+        if crate::hubs::is_source(selector) {
+            let (info, backend) = crate::hubs::connect(selector, timeout)?;
             return Self::from_backend(info, backend);
         }
         let info = if selector.starts_with("sim:") {
@@ -165,6 +196,13 @@ impl Camera {
             Transport::Media => {
                 if crate::onvif::is_source(&info.id) {
                     let (info, backend) = crate::onvif::connect(&info.id, timeout)?;
+                    return Self::from_backend(info, backend);
+                }
+                // A hub camera opened by its serial keeps the options its
+                // discovered address carries.
+                if crate::hubs::is_source(&info.id) {
+                    let address = info.address.as_deref().unwrap_or(&info.id);
+                    let (info, backend) = crate::hubs::connect(address, timeout)?;
                     return Self::from_backend(info, backend);
                 }
                 if crate::media::is_source(selector) {

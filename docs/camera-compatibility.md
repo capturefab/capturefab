@@ -13,6 +13,7 @@ network streams as well as industrial cameras. Run `capturefab doctor --json` an
 | Built-in laptop camera or USB webcam/UVC capture device | AVFoundation on macOS, V4L2 on Linux, DirectShow on Windows | Capture; configure native size/frame rate and advertised `VideoMode` choices before acquisition; host device exposure/focus controls are not currently exposed |
 | Driver-backed Linux CSI camera | A usable `v4l2:/dev/videoN` endpoint | Same host capture path; platform driver and pipeline setup are required |
 | ONVIF camera | `onvif:http://HOST/onvif/device_service` or authenticated locator | Discovery and Media1 profile/RTSP URI resolution; ONVIF PTZ and imaging configuration are not implemented |
+| Camera on a Home Assistant, Frigate, go2rtc or UniFi Protect server | `hub:NAME/CAMERA` after `capturefab hub add-…` saves the server | Read-only frames from the hub's MJPEG stream, snapshots or RTSP restream; camera settings stay in the hub; `hubs` build feature required; not validated against physical cameras or particular hub versions |
 | RTSP, SRT, HTTP, RTMP, UDP, or supported video file | Direct URL or file path | Decode and capture; source configuration belongs to its camera/server |
 | DSLR/mirrorless clean HDMI | HDMI capture device visible to the operating system | Capture the HDMI video; camera menus configure exposure, focus, and HDMI output |
 | DSLR/mirrorless native USB/PTP tethering | No Capturefab implementation | Vendor-specific PTP commands, shutter triggering, RAW download, and tethered live view are not implemented |
@@ -184,6 +185,35 @@ http://HOST/onvif/device_service --profile TOKEN`, its failure is reported direc
 error includes the last stream-resolution failure. Connecting automatically tries
 resolved streams in the camera's advertised order until one supplies a decodable
 frame. If every stream fails to open, the error retains the last opening failure.
+
+## Camera hubs
+
+A camera hub is a Home Assistant, Frigate, go2rtc or UniFi Protect server that
+already shows the cameras. Capturefab reads frames from the hub's HTTP API and
+RTSP restream; it never contacts the cameras behind it, so it reaches only the
+cameras and streams the hub itself offers. Save the server, then list its
+cameras:
+
+```sh
+capturefab hub add-frigate nvr --url http://nvr.local:5000
+capturefab hub cameras nvr --json
+capturefab --camera 'hub:nvr/front?stream=snapshot&fps=0.5' capture -o front.png
+```
+
+| Hub | Frames, in `stream=auto` order | Notes |
+| --- | --- | --- |
+| Home Assistant | MJPEG camera stream, then snapshots | Long-lived access token; the stream sends nothing while the image is unchanged, so use `stream=snapshot` for static scenes |
+| Frigate | RTSP restream when the camera has one, then snapshots; MJPEG on request | Port 5000 without a user, or 8971 with `--user`; the restream port (8554, `--rtsp-port`) must allow unauthenticated RTSP |
+| go2rtc | RTSP restream when its RTSP server is reachable, then snapshots; MJPEG on request for JPEG sources | Optional API user and password |
+| UniFi Protect | Snapshots only, at most one per second | API key for the integration API over HTTPS; Capturefab does not create RTSPS streams on the console |
+
+Hub cameras are read-only: `features` lists their size and frame rate, and
+settings are changed in the hub. JPEG and PNG stills and MJPEG are decoded in
+the camera worker; RTSP restreams are decoded by FFmpeg. The first frame can
+take up to 12 seconds (15 seconds over RTSP). Streams reconnect with backoff;
+a refused secret or certificate stops acquisition. Hub recordings, events and
+PTZ are not implemented. Listing a hub kind here is not a compatibility claim
+for any hub version or camera; check a frame before relying on a hub camera.
 
 ## Storage and acceleration
 

@@ -147,6 +147,7 @@ impl LeftBehind {
 static STATE_SETS: &[&StateSet] = &[
     &crate::storage::STATE,
     &crate::destination::STATE,
+    &crate::hubs::registry::STATE,
     #[cfg(feature = "uploads")]
     &crate::upload::STATE,
     #[cfg(feature = "gui")]

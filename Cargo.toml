@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/capturefab/capturefab"
 
 [features]
-default = ["gui", "usb", "scanner", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "s3", "ftp", "sftp", "parquet", "modbus", "mqtt", "opcua", "mtconnect", "dinov2"]
+default = ["gui", "usb", "scanner", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "s3", "ftp", "sftp", "parquet", "modbus", "mqtt", "opcua", "mtconnect", "dinov2", "hubs"]
 gui = ["ai", "dep:iced", "dep:bytemuck", "dep:rfd", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:mundy", "dep:accesskit", "dep:accesskit_macos", "dep:accesskit_windows", "dep:accesskit_unix", "dep:raw-window-handle", "dep:windows", "dep:x11-dl", "dep:libloading"]
 usb = ["dep:nusb"]
 # Document scanners: SANE scanimage, Windows WIA and macOS ImageCaptureCore.
@@ -21,8 +21,11 @@ nvjpeg = ["dep:libloading"]
 # VA-API hardware JPEG (Intel iHD and other drivers), libva loaded at runtime in
 # an isolated helper process; libjpeg-turbo verifies its output at start-up.
 vaapi = ["dep:libloading", "jpeg"]
-# Upload queue and OS credential store shared by every network destination.
-uploads = ["dep:keyring"]
+# OS credential store (Keychain / Credential Manager / Secret Service) shared by
+# network destinations, AI provider keys and camera hubs.
+keychain = ["dep:keyring"]
+# Upload queue shared by every network destination.
+uploads = ["keychain"]
 # S3-compatible upload destinations (AWS, MinIO, RustFS, ...): a pure-Rust HTTPS
 # client (rustls, trusting the OS certificate store) and the OS credential store for keys.
 s3 = ["uploads", "dep:ureq"]
@@ -42,11 +45,17 @@ opcua = ["dep:async-opcua", "dep:tokio"]
 mtconnect = ["dep:ureq"]
 # Prompt measurements use HTTPS with the OS certificate store and native
 # Keychain / Credential Manager / Secret Service credentials.
-ai = ["dep:ureq", "dep:keyring", "dep:zeroize"]
+ai = ["dep:ureq", "keychain", "dep:zeroize"]
 # Bundled DINOv2 ViT-S/14 embeddings for auto capture (Apache-2.0 weights from
 # scripts/fetch-dinov2.py): wgpu compute shaders in an isolated helper process
 # (Metal, Vulkan, DX12), with a native CPU fallback.
 dinov2 = ["dep:matrixmultiply", "dep:half", "dep:libm", "dep:wgpu"]
+# Camera hubs (Home Assistant, Frigate, go2rtc, UniFi Protect): a hand-rolled
+# HTTP/1.1 client with rustls (ring; the OS trust store or a pinned certificate)
+# in the camera worker, JPEG/PNG decoded there with libjpeg-turbo and png, and
+# RTSP restreams through FFmpeg. Secrets come from the environment, or from the
+# OS credential store when `keychain` is also enabled.
+hubs = ["jpeg", "dep:rustls", "dep:rustls-platform-verifier", "dep:zeroize"]
 # Apple's hardware JPEG engine through VideoToolbox (system frameworks; no-op off macOS).
 videotoolbox = []
 # The browser client (web-client/dist, or CAPTUREFAB_WEB_DIST) built into the
