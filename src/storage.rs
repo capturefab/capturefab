@@ -387,6 +387,22 @@ impl Manager {
                 });
             }
         }
+        // A file removed outside Capturefab keeps its entry until a full
+        // pass drops it. An entry whose writer is still live keeps its name.
+        // Recorded paths are canonical, so comparing bytes is enough.
+        let tracked = |locked: &Locked| {
+            locked
+                .ledger
+                .entries
+                .iter()
+                .any(|entry| entry.path.as_os_str() == path.as_os_str())
+        };
+        if tracked(&locked) {
+            locked.reconcile(true)?;
+            if tracked(&locked) {
+                return Err(OutputExists(path).into());
+            }
+        }
         locked.make_room(&policy, reserve, &base)?;
         let id = nonce()?;
         let lease_name = format!("storage-{id}.lease");
@@ -2280,6 +2296,38 @@ mod tests {
         assert!(error.contains("maximum age reached"), "{error}");
         assert!(temp.path("old").exists());
         drop(live);
+    }
+    #[test]
+    fn a_name_freed_outside_capturefab_can_be_saved_again() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        let policy = policy(100, 10, "stop");
+        let path = temp.path("a.png");
+        completed(&manager, &path, &policy, b"first");
+        fs::remove_file(&path).unwrap();
+        // A new process, whose lock does not compare finished files with
+        // the disk yet.
+        forget(&manager);
+        completed(&manager, &path, &policy, b"second");
+        forget(&manager);
+        let locked = manager.lock().unwrap();
+        assert_eq!(locked.ledger.entries.len(), 1);
+        assert_eq!(locked.allocated().unwrap(), 6);
+        drop(locked);
+        // A live writer keeps its name even when its file is removed.
+        let live = manager.writer(&temp.path("live"), &policy, 10).unwrap();
+        fs::remove_file(temp.path("live")).unwrap();
+        let error = manager
+            .writer(&temp.path("live"), &policy, 1)
+            .err()
+            .unwrap();
+        assert!(error.downcast_ref::<OutputExists>().is_some(), "{error:#}");
+        drop(live);
+        drop(without_leases(&manager));
+        forget(&manager);
+        completed(&manager, &temp.path("live"), &policy, b"again");
+        forget(&manager);
+        assert_eq!(manager.lock().unwrap().ledger.entries.len(), 2);
     }
     #[test]
     fn replaced_file_and_tampered_ledger_fail_closed() {
