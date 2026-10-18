@@ -528,3 +528,24 @@ fn expired_samples_are_deleted_once_a_minute() {
     store.prune(now + day + 60_000).unwrap();
     assert_eq!((count(&store), store.rows), (0, 0));
 }
+
+#[test]
+fn the_last_cameras_final_counts_are_charted_and_the_clock_runs_on_without_cameras() {
+    let analytics = Analytics::new();
+    let mut busy = camera("a", 1, 0, 0, 0);
+    analytics.observe(&session(vec![busy.clone()]));
+    // Disconnected well within a second of that sample.
+    busy.frames = 18;
+    analytics.observe_final(&session(vec![busy]));
+    analytics.observe(&session(vec![]));
+    let summary = analytics.snapshot().unwrap();
+    assert_eq!(summary.totals.frames, 18);
+    assert_eq!(
+        summary.points.iter().map(|point| point.frames).sum::<u64>(),
+        18,
+        "{summary:?}"
+    );
+    // Nothing observes the session now, but its clock keeps running.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(analytics.snapshot().unwrap().collected_at_ms >= summary.collected_at_ms + 20);
+}

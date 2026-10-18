@@ -753,6 +753,14 @@ fn analytics_keeps_short_capture_and_same_camera_reconnect_totals() {
     let first_bytes = first["totals"]["bytes"].as_u64().unwrap();
     assert!(first_frames > 0, "short acquisition vanished: {first}");
     assert_eq!(first_bytes, first_frames * 64 * 64, "{first}");
+    // Charted at once, not when the next camera connects.
+    let charted: u64 = first["points"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|point| point["frames"].as_u64().unwrap())
+        .sum();
+    assert_eq!(charted, first_frames, "{first}");
     assert_eq!(
         fixture.http("GET", "/health", None, b"").json()["cameras"]["connected"],
         0

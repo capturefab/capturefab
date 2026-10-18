@@ -285,7 +285,7 @@ impl Workbench {
                 );
             }
             if report.truncated {
-                summary = summary.push(text("High camera activity reached the history limit. The chart shows the retained portion of this session.").size(style::SMALL).color(p.ink(p.warn)));
+                summary = summary.push(text("The history limit was reached. The chart shows the retained portion of this session.").size(style::SMALL).color(p.ink(p.warn)));
             }
             if self.analytics.error.is_some() {
                 summary = summary.push(

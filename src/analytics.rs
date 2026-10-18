@@ -166,8 +166,9 @@ struct Store {
     cameras: BTreeMap<String, CameraState>,
 }
 
-/// Observation never waits for chart rendering or a database query. The next
-/// snapshot catches up counters after a busy analytics lock is released.
+/// Observation never waits for chart rendering or a database query while a
+/// camera is connected. The next snapshot catches up counters after a busy
+/// analytics lock is released.
 pub struct Analytics {
     store: Mutex<Store>,
 }
@@ -201,14 +202,18 @@ impl Analytics {
     }
 
     pub fn observe(&self, snapshot: &SessionSnapshot) {
-        let Ok(mut store) = self.store.try_lock() else {
-            return;
-        };
-        Self::observe_locked(&mut store, snapshot);
+        if snapshot.cameras.is_empty() {
+            // No frames wait on this, and the last camera's final counts
+            // must not be skipped.
+            self.observe_final(snapshot);
+        } else if let Ok(mut store) = self.store.try_lock() {
+            Self::observe_locked(&mut store, snapshot);
+        }
     }
 
-    /// Preserve the last counter deltas before a worker is removed. Used only
-    /// during command completion, away from frame acquisition and UI polling.
+    /// Preserve the last counter deltas, waiting for a busy lock, before a
+    /// worker is removed or after the last one was. Used away from frame
+    /// acquisition and UI polling.
     pub fn observe_final(&self, snapshot: &SessionSnapshot) {
         let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
         Self::observe_locked(&mut store, snapshot);
@@ -218,9 +223,13 @@ impl Analytics {
         let now = store.now();
         store.observe_counters(snapshot, now);
         let instant = Instant::now();
-        if store
-            .last_sample
-            .is_some_and(|last| instant.duration_since(last).as_secs() < SAMPLE_INTERVAL_SECONDS)
+        // The last camera's final counts are sampled at once: with no camera
+        // the status poller rests, and they would wait for the next one.
+        let last = !store.present() && !store.pending.is_zero();
+        if !last
+            && store.last_sample.is_some_and(|last| {
+                instant.duration_since(last).as_secs() < SAMPLE_INTERVAL_SECONDS
+            })
         {
             return;
         }
@@ -574,6 +583,11 @@ impl Store {
         }
     }
 
+    /// Whether the last snapshot observed had a camera.
+    fn present(&self) -> bool {
+        self.cameras.values().any(|c| c.present)
+    }
+
     /// The database, opened when first needed. A failed open is not retried.
     fn connection(&mut self) -> Result<&mut Connection> {
         if self.opened()?.is_none() {
@@ -598,7 +612,7 @@ impl Store {
             .map(|last| now.saturating_sub(last).max(1) as f64 / 1000.0)
             .unwrap_or(1.0);
         self.last_sample_ms = Some(now);
-        if !self.cameras.values().any(|c| c.present) && self.pending.is_zero() {
+        if !self.present() && self.pending.is_zero() {
             return Ok(());
         }
         let (sequence, counts, rates) = (
@@ -666,6 +680,11 @@ impl Store {
 
     fn report(&mut self, now: u64) -> Result<AnalyticsSnapshot> {
         self.prune(now)?;
+        if !self.present() {
+            // With no camera nothing is left to collect, so the counts are
+            // current and the session clock runs on while nothing observes.
+            self.collected_at_ms = now;
+        }
         let cutoff = now.saturating_sub(RETENTION_SECONDS * 1000);
         let points = match self.opened()? {
             Some(db) => points(db, cutoff)?,
