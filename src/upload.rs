@@ -786,17 +786,16 @@ pub fn enqueue(destination: &str, remote: &Remote, path: &Path, key: &str) -> Re
 /// ledger recorded for it.
 fn hold(path: &Path) -> Result<String> {
     #[cfg(test)]
-    ensure!(
-        !tests::HOLD_FAILS.load(std::sync::atomic::Ordering::Relaxed),
-        "storage manager is busy"
-    );
+    if tests::HOLD_FAILS.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(crate::storage::Busy.into());
+    }
     crate::storage::hold_for_upload(path, true)
 }
 
 /// Whether a hold failed only because the storage ledger was busy, so a
 /// later try may succeed.
 fn busy(error: &anyhow::Error) -> bool {
-    format!("{error:#}").contains("storage manager is busy")
+    crate::storage::is_busy(error)
 }
 
 /// The SHA-256 of a file that should hold `bytes` bytes.

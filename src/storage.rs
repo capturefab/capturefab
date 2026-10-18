@@ -311,16 +311,31 @@ fn contended(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::WouldBlock
         || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
+/// Other processes held the storage lock for the whole wait; a later try
+/// may succeed. Callers that retry recognize it with [`is_busy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Busy;
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "storage manager is busy; retry after other capture processes finish bookkeeping",
+        )
+    }
+}
+impl std::error::Error for Busy {}
+/// Whether an error, or one it wraps, is the storage lock timing out.
+pub fn is_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<Busy>())
+}
 fn lock_wait(file: &File) -> Result<()> {
     let deadline = Instant::now() + LOCK_TIMEOUT;
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(()),
             Err(e) if contended(&e) => {
-                ensure!(
-                    Instant::now() < deadline,
-                    "storage manager is busy; retry after other capture processes finish bookkeeping"
-                );
+                if Instant::now() >= deadline {
+                    return Err(Busy.into());
+                }
                 thread::sleep(Duration::from_millis(10));
             }
             Err(e) => return Err(e).context("lock storage manager"),
@@ -1829,6 +1844,28 @@ mod tests {
             max_age_seconds: None,
             on_full: retention.into(),
         }
+    }
+    #[test]
+    fn a_lock_held_past_the_timeout_is_busy_through_any_context() {
+        let temp = Temp::new();
+        let path = temp.path("storage.lock");
+        let held = File::create(&path).unwrap();
+        held.lock_exclusive().unwrap();
+        let waiting = File::open(&path).unwrap();
+        let started = Instant::now();
+        let error = lock_wait(&waiting)
+            .context("hold capture for upload")
+            .unwrap_err();
+        assert!(started.elapsed() >= LOCK_TIMEOUT);
+        assert!(is_busy(&error), "{error:#}");
+        // The wording callers and exit codes saw before stays the same.
+        assert!(
+            format!("{error:#}").ends_with(
+                "storage manager is busy; retry after other capture processes finish bookkeeping"
+            ),
+            "{error:#}"
+        );
+        assert!(!is_busy(&anyhow!("lock storage manager")));
     }
     fn completed(manager: &Manager, path: &Path, policy: &StoragePolicy, data: &[u8]) {
         let mut writer = manager.writer(path, policy, data.len() as u64).unwrap();
