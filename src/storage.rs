@@ -627,7 +627,7 @@ impl Locked {
                 .ledger
                 .entries
                 .iter()
-                .any(|entry| self.expired(entry, &policy));
+                .any(|entry| self.expiring(entry, &policy));
         Ok(json!({
             "ledger": self.directory.join("storage.json"),
             "policy": policy,
@@ -647,6 +647,12 @@ impl Locked {
     }
     fn removable(entry: &Entry) -> bool {
         entry.lease.is_none() && !entry.changed && entry.sha256.is_some() && !entry.pending_upload
+    }
+    /// Expired and removable. A protected file past the age limit, such as a
+    /// live or interrupted recording or one awaiting upload, must not block
+    /// saves that fit the budget.
+    fn expiring(&self, entry: &Entry, policy: &StoragePolicy) -> bool {
+        Self::removable(entry) && self.expired(entry, policy)
     }
     /// The ledger entry for a finished file, by its resolved path.
     fn find(&self, path: &Path) -> Result<usize> {
@@ -695,7 +701,7 @@ impl Locked {
                 .ledger
                 .entries
                 .iter()
-                .position(|entry| self.expired(entry, policy));
+                .position(|entry| self.expiring(entry, policy));
             let full = allocated
                 .checked_add(reserve)
                 .is_none_or(|sum| sum > policy.max_bytes)
@@ -1546,20 +1552,88 @@ mod tests {
         let mut policy = policy(20, 4, "delete-oldest");
         policy.max_age_seconds = Some(10);
         completed(&manager, &temp.path("old"), &policy, b"old");
-        {
-            let mut locked = manager.lock().unwrap();
-            locked.ledger.entries[0].created = now().saturating_sub(100);
-            locked.persist().unwrap();
-        }
+        age(&manager, "old", 100);
         let live = manager.writer(&temp.path("live"), &policy, 10).unwrap();
         assert!(!temp.path("old").exists());
+        age(&manager, "live", 100);
+        // An expired live recording is protected and must not block a save
+        // that fits the budget.
+        completed(&manager, &temp.path("next"), &policy, b"1");
+        assert!(temp.path("live").exists());
+        drop(live);
+    }
+    fn age(manager: &Manager, name: &str, seconds: u64) {
+        let mut locked = manager.lock().unwrap();
+        let entry = locked
+            .ledger
+            .entries
+            .iter_mut()
+            .find(|entry| entry.path.ends_with(name))
+            .unwrap();
+        entry.created = now().saturating_sub(seconds);
+        locked.persist().unwrap();
+    }
+    #[test]
+    fn protected_expired_files_do_not_block_saves_below_budget() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        let mut policy = policy(100, 10, "delete-oldest");
+        policy.max_age_seconds = Some(10);
+        completed(&manager, &temp.path("interrupted"), &policy, b"partial");
+        completed(&manager, &temp.path("queued"), &policy, b"queued");
+        completed(&manager, &temp.path("expired"), &policy, b"old");
+        fs::write(temp.path("interrupted"), b"changed elsewhere").unwrap();
         {
             let mut locked = manager.lock().unwrap();
-            locked.ledger.entries[0].created = now().saturating_sub(100);
+            let queued = locked
+                .ledger
+                .entries
+                .iter_mut()
+                .find(|entry| entry.path.ends_with("queued"))
+                .unwrap();
+            queued.pending_upload = true;
             locked.persist().unwrap();
         }
-        assert!(manager.writer(&temp.path("next"), &policy, 1).is_err());
-        assert!(temp.path("live").exists());
+        for name in ["interrupted", "queued", "expired"] {
+            age(&manager, name, 100);
+        }
+        completed(&manager, &temp.path("next"), &policy, b"new");
+        assert!(!temp.path("expired").exists(), "expired files still go");
+        assert_eq!(
+            fs::read(temp.path("interrupted")).unwrap(),
+            b"changed elsewhere"
+        );
+        assert!(temp.path("queued").exists());
+        assert_eq!(
+            manager.lock().unwrap().status().unwrap()["over_limit"],
+            false
+        );
+        // Protected files only stop a save the budget cannot hold.
+        let error = manager
+            .writer(&temp.path("huge"), &policy, 90)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("Storage full: no unchanged"), "{error}");
+    }
+    #[test]
+    fn stop_policy_with_an_age_limit_stops_only_for_removable_files() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        let mut policy = policy(100, 10, "stop");
+        policy.max_age_seconds = Some(10);
+        completed(&manager, &temp.path("old"), &policy, b"old");
+        let live = manager.writer(&temp.path("live"), &policy, 10).unwrap();
+        age(&manager, "live", 100);
+        completed(&manager, &temp.path("next"), &policy, b"next");
+        age(&manager, "old", 100);
+        let error = manager
+            .writer(&temp.path("blocked"), &policy, 1)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("maximum age reached"), "{error}");
+        assert!(temp.path("old").exists());
         drop(live);
     }
     #[test]
