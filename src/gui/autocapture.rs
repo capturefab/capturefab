@@ -172,6 +172,7 @@ impl Workbench {
             blocked_storage: false,
             state: "watching".into(),
             model: "Session exemplar kNN + background novelty".into(),
+            note: None,
         };
         if let Some(selected) = self
             .snapshot
@@ -601,7 +602,11 @@ impl Workbench {
                                 p.secondary
                             },
                         ),
-                )
+                );
+            if let Some(note) = &status.note {
+                content = content.push(text(note.clone()).size(style::SMALL).color(p.ink(p.warn)));
+            }
+            content = content
                 .push(
                     text(format!(
                         "{} · {} kept · {} discarded",
@@ -642,7 +647,7 @@ impl Workbench {
                     }),
                 )
                 .push(
-                    text("Saves the frame in this database. Capture & save also teaches it.")
+                    text("Saves the frame with this session. Capture & save also teaches it.")
                         .size(style::SMALL)
                         .color(p.secondary),
                 );
@@ -1056,6 +1061,7 @@ mod tests {
             blocked_storage: false,
             state: "Learning".into(),
             model: "kNN".into(),
+            note: None,
         });
         app.sync_capture_session();
         app.auto_capture.open = true;

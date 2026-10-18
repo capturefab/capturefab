@@ -17,10 +17,23 @@ impl SessionFile {
         CaptureSession::open(&self.0, "test-camera", true).unwrap()
     }
 }
+impl SessionFile {
+    fn frames(&self) -> PathBuf {
+        self.0.with_extension("frames")
+    }
+    fn frame_files(&self) -> Vec<PathBuf> {
+        let mut files: Vec<_> = std::fs::read_dir(self.frames())
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default();
+        files.sort();
+        files
+    }
+}
 impl Drop for SessionFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
         let _ = std::fs::remove_file(format!("{}.wal", self.0.display()));
+        let _ = std::fs::remove_dir_all(self.frames());
     }
 }
 fn solid(value: u8) -> Frame {
@@ -51,11 +64,19 @@ fn ready(session: &mut CaptureSession) {
 fn observe(session: &mut CaptureSession, frame: &Frame) -> Option<u64> {
     session.last_sample = None;
     session.last_capture = None;
-    session.observe(frame).unwrap()
+    let id = session.observe(frame).unwrap();
+    session.flush();
+    id
+}
+/// Observe, then wait for the writer, which the camera thread never does.
+fn observe_at(session: &mut CaptureSession, frame: &Frame, at: Instant) -> Option<u64> {
+    let id = session.observe_at(frame, at).unwrap();
+    session.flush();
+    id
 }
 
 #[test]
-fn session_is_a_single_resumable_duckdb_with_exact_sensor_frames() {
+fn session_is_a_resumable_database_and_frames_folder_with_exact_sensor_frames() {
     let file = SessionFile::new();
     let raw = solid(120);
     let candidate = solid(140);
@@ -81,7 +102,15 @@ fn session_is_a_single_resumable_duckdb_with_exact_sensor_frames() {
     assert!(file.0.is_file());
     assert!(
         !Path::new(&format!("{}.wal", file.0.display())).exists(),
-        "clean session consists of one file"
+        "a cleanly closed database needs no WAL"
+    );
+    assert_eq!(
+        file.frame_files()
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect::<Vec<_>>(),
+        vec![raw.data.clone(), candidate.data.clone()],
+        "each frame is one raw file beside the database"
     );
     let mut resumed = CaptureSession::open(&file.0, "test-camera", false).unwrap();
     assert!(resumed.status().unwrap().enabled);
@@ -140,13 +169,15 @@ fn manual_preference_novelty_and_rejection_drive_scoring() {
             .unwrap()
             .is_some()
     );
-    let stored: Option<Vec<u8>> = session
-        .db
-        .query_row("SELECT data FROM captures WHERE id = ?", params![id], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert!(stored.is_none(), "discard removes sensor pixels");
+    let stored: (Option<String>, u64) = session.sql(move |db| {
+        db.query_row(
+            "SELECT frame_path, data_bytes FROM captures WHERE id = ?",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+    });
+    assert_eq!(stored, (None, 0), "discard removes sensor pixels");
+    assert!(!file.frames().join(format!("{id:08}.raw")).exists());
     assert!(
         session.review(id, true).is_err(),
         "a stale review cannot change a final decision"
@@ -167,48 +198,26 @@ fn sampling_cooldown_and_near_duplicates_bound_work_and_capture_volume() {
     ready(&mut session);
     let t = Instant::now();
     assert!(
-        session.observe_at(&solid(120), t).unwrap().is_none(),
+        observe_at(&mut session, &solid(120), t).is_none(),
         "manual example is suppressed as duplicate"
     );
     assert!(
-        session
-            .observe_at(&solid(140), t + Duration::from_millis(100))
-            .unwrap()
-            .is_none(),
+        observe_at(&mut session, &solid(140), t + Duration::from_millis(100)).is_none(),
         "sampler caps at 4Hz"
     );
-    assert!(
-        session
-            .observe_at(&solid(140), t + Duration::from_millis(250))
-            .unwrap()
-            .is_some()
-    );
+    assert!(observe_at(&mut session, &solid(140), t + Duration::from_millis(250)).is_some());
     session.cooldown_ms = 2000;
     assert!(
-        session
-            .observe_at(&solid(100), t + Duration::from_millis(500))
-            .unwrap()
-            .is_none(),
+        observe_at(&mut session, &solid(100), t + Duration::from_millis(500)).is_none(),
         "capture cooldown applies independently of sampler"
     );
+    assert!(observe_at(&mut session, &solid(100), t + Duration::from_millis(2250)).is_some());
     assert!(
-        session
-            .observe_at(&solid(100), t + Duration::from_millis(2250))
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        session
-            .observe_at(&solid(140), t + Duration::from_millis(4500))
-            .unwrap()
-            .is_none(),
+        observe_at(&mut session, &solid(140), t + Duration::from_millis(4500)).is_none(),
         "recent candidate does not create a duplicate card"
     );
     assert!(
-        session
-            .observe_at(&solid(140), t + Duration::from_secs(10))
-            .unwrap()
-            .is_some(),
+        observe_at(&mut session, &solid(140), t + Duration::from_secs(10)).is_some(),
         "duplicate suppression expires so a later recurrence remains capturable"
     );
 }
@@ -235,8 +244,13 @@ fn out_of_order_reviews_use_the_same_bounded_example_bank_after_resume() {
     let newer = solid(100);
     {
         let mut session = file.create();
-        session.db.execute("INSERT INTO captures SELECT i + 100, 0, 'manual', 'manual', 1, 32, 32, ?, 0, ?, 1024, ?, 1.0, 'test', NULL FROM range(256) t(i)",params![MONO8,&newer.data,encode(&descriptor(&newer).unwrap())]).unwrap();
-        session.db.execute("INSERT INTO captures VALUES (1, 0, 'automatic', 'pending', 1, 32, 32, ?, 0, ?, 1024, ?, 0.9, 'test', NULL)",params![MONO8,&old.data,encode(&descriptor(&old).unwrap())]).unwrap();
+        let (newer_data, newer_feature) =
+            (newer.data.clone(), encode(&descriptor(&newer).unwrap()));
+        let (old_data, old_feature) = (old.data.clone(), encode(&descriptor(&old).unwrap()));
+        session.sql(move |db| {
+            db.execute("INSERT INTO captures SELECT i + 100, 0, 'manual', 'manual', 1, 32, 32, ?, 0, ?, 1024, ?, 1.0, 'test', NULL, NULL, NULL FROM range(256) t(i)",params![MONO8,newer_data,newer_feature])?;
+            db.execute("INSERT INTO captures VALUES (1, 0, 'automatic', 'pending', 1, 32, 32, ?, 0, ?, 1024, ?, 0.9, 'test', NULL, NULL, NULL)",params![MONO8,old_data,old_feature])
+        });
         session.review(1, true).unwrap();
         assert_eq!(session.positive.len(), 256);
         assert!(
@@ -245,7 +259,7 @@ fn out_of_order_reviews_use_the_same_bounded_example_bank_after_resume() {
                 .iter()
                 .all(|feature| feature == &descriptor(&newer).unwrap())
         );
-        session.checkpoint().unwrap();
+        session.close().unwrap();
     }
     let resumed = CaptureSession::open(&file.0, "test-camera", false).unwrap();
     assert_eq!(resumed.positive.len(), 256);
@@ -263,32 +277,35 @@ fn full_review_queue_and_pixel_budget_apply_backpressure() {
     let mut session = file.create();
     session.manual(&solid(120)).unwrap();
     ready(&mut session);
-    let feature = descriptor(&solid(140)).unwrap();
-    session.db.execute("INSERT INTO captures SELECT i + 100, 0, 'automatic', 'pending', 1, 32, 32, ?, 0, ?, 1024, ?, 0.9, 'test', NULL FROM range(200) t(i)",params![MONO8,solid(140).data,encode(&feature)]).unwrap();
+    let feature = encode(&descriptor(&solid(140)).unwrap());
+    session.sql(move |db| db.execute("INSERT INTO captures SELECT i + 100, 0, 'automatic', 'pending', 1, 32, 32, ?, 0, ?, 1024, ?, 0.9, 'test', NULL, NULL, NULL FROM range(200) t(i)",params![MONO8,solid(140).data,feature]));
+    session.recount();
     assert_eq!(session.status().unwrap().state, "review_queue_full");
     assert!(observe(&mut session, &solid(140)).is_none());
-    session
-        .db
-        .execute("DELETE FROM captures WHERE label = 'pending'", [])
-        .unwrap();
+    session.sql(|db| db.execute("DELETE FROM captures WHERE label = 'pending'", []));
     // Exercise the scalar accounting boundary without allocating 2 GiB.
-    session
-        .db
-        .execute(
+    session.sql(|db| {
+        db.execute(
             "UPDATE captures SET data_bytes = ?",
             params![MAX_STORED_BYTES],
         )
-        .unwrap();
+    });
+    session.recount();
     assert_eq!(session.status().unwrap().state, "storage_full");
     assert!(observe(&mut session, &solid(140)).is_none());
-    assert!(session.manual(&solid(100)).is_err());
-    session
-        .db
-        .execute(
+    let full = session.manual(&solid(100)).unwrap_err();
+    assert_eq!(
+        crate::cli::error_code(&full),
+        ("storage_full", 6),
+        "{full:#}"
+    );
+    session.sql(|db| {
+        db.execute(
             "UPDATE captures SET data_bytes = ?",
             params![MAX_STORED_BYTES - 100],
         )
-        .unwrap();
+    });
+    session.recount();
     assert!(observe(&mut session, &solid(140)).is_none());
     assert_eq!(
         session.status().unwrap().state,
@@ -334,8 +351,11 @@ fn malformed_session_settings_identity_versions_and_descriptors_are_rejected() {
     assert!(CaptureSession::open(&file.0, "test-camera", false).is_err());
     {
         let db = Connection::open(&file.0).unwrap();
-        db.execute("UPDATE capture_session SET schema_version = 1", [])
-            .unwrap();
+        db.execute(
+            "UPDATE capture_session SET schema_version = ?",
+            params![SCHEMA_VERSION],
+        )
+        .unwrap();
         db.execute("UPDATE captures SET descriptor = ?", params![vec![0_u8; 3]])
             .unwrap();
     }
@@ -391,4 +411,338 @@ fn descriptor_handles_supported_raw_formats_and_is_bounded() {
         })
         .is_err()
     );
+}
+
+/// Incompressible frame bytes, as a real sensor gives.
+fn noise(seed: u64, width: u32, height: u32) -> Frame {
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let data = (0..width as usize * height as usize)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    Frame {
+        id: seed,
+        width,
+        height,
+        pixel_format: MONO8,
+        timestamp_ns: seed,
+        data,
+    }
+}
+
+/// Store `count` 4 MiB frames under a 32 MB DuckDB limit, then review two
+/// suggestions. Schema 1 kept pixels in the database and failed fatally
+/// after 16 MiB with this limit ("could not allocate block").
+fn store_beyond_memory_limit(count: u64) {
+    let file = SessionFile::new();
+    let mut session = file.create();
+    session.sql(|db| db.execute_batch("SET memory_limit = '32MB'"));
+    for seed in 1..=count - 2 {
+        session.manual(&noise(seed, 2048, 2048)).unwrap();
+    }
+    session.configure(true, 0.5, 250).unwrap();
+    let start = Instant::now() + Duration::from_secs(31);
+    let kept = observe_at(&mut session, &noise(count - 1, 2048, 2048), start)
+        .expect("a frame like the examples is suggested");
+    let later = start + Duration::from_secs(31);
+    let discarded = observe_at(&mut session, &noise(count, 2048, 2048), later)
+        .expect("a frame like the examples is suggested");
+    let review = session.next_review().unwrap().unwrap();
+    assert_eq!(review.id, kept);
+    assert_eq!(review.frame.data, noise(count - 1, 2048, 2048).data);
+    session.review(kept, true).unwrap();
+    session.review(discarded, false).unwrap();
+    session.close().unwrap();
+    let stored: u64 = file
+        .frame_files()
+        .iter()
+        .map(|path| std::fs::metadata(path).unwrap().len())
+        .sum();
+    assert_eq!(stored, (count - 1) * 4 * 1024 * 1024);
+    let resumed = CaptureSession::open(&file.0, "test-camera", false).unwrap();
+    let status = resumed.status().unwrap();
+    assert_eq!(
+        (
+            status.manual_count,
+            status.kept_count,
+            status.discarded_count,
+            status.pending_count
+        ),
+        (count - 2, 1, 1, 0)
+    );
+}
+
+#[test]
+fn sessions_hold_frames_far_beyond_the_database_memory_limit() {
+    store_beyond_memory_limit(16);
+}
+
+#[test]
+#[ignore = "writes 300 MiB of frames"]
+fn sessions_hold_hundreds_of_megabytes_of_frames() {
+    store_beyond_memory_limit(75);
+}
+
+#[test]
+fn suggestions_never_wait_for_a_busy_writer() {
+    let file = SessionFile::new();
+    let mut session = file.create();
+    session.manual(&solid(120)).unwrap();
+    ready(&mut session);
+    // A writer stalled by a slow card holds its current job until released.
+    let (release, stalled) = std::sync::mpsc::channel::<()>();
+    let (running, started) = std::sync::mpsc::channel::<()>();
+    session
+        .writer
+        .post(move |_| {
+            running.send(()).unwrap();
+            let _ = stalled.recv();
+            Ok(())
+        })
+        .unwrap();
+    started.recv().unwrap();
+    let t = Instant::now();
+    let started = Instant::now();
+    let queued = session.observe_at(&solid(140), t).unwrap();
+    let first = started.elapsed();
+    let started = Instant::now();
+    let skipped = session
+        .observe_at(&solid(100), t + Duration::from_secs(3))
+        .unwrap();
+    let second = started.elapsed();
+    assert!(
+        first < Duration::from_millis(5) && second < Duration::from_millis(5),
+        "observe waited for the writer: {first:?}, {second:?}"
+    );
+    let status = session.status().unwrap();
+    assert!(queued.is_some(), "one suggestion waits in the queue");
+    assert!(skipped.is_none(), "a full writer skips the suggestion");
+    assert_eq!(status.note.as_deref(), Some(BUSY_NOTE));
+    assert_eq!(
+        status.pending_count, 1,
+        "a queued suggestion counts toward the limits"
+    );
+    release.send(()).unwrap();
+    assert_eq!(session.next_review().unwrap().unwrap().id, queued.unwrap());
+}
+
+#[test]
+fn keep_changes_only_the_label_and_discard_deletes_the_frame_file() {
+    let file = SessionFile::new();
+    let mut session = file.create();
+    session.manual(&solid(120)).unwrap();
+    ready(&mut session);
+    let kept = observe(&mut session, &solid(140)).unwrap();
+    let discarded = observe(&mut session, &solid(100)).unwrap();
+    let kept_path = file.frames().join(format!("{kept:08}.raw"));
+    let discarded_path = file.frames().join(format!("{discarded:08}.raw"));
+    let before = std::fs::metadata(&kept_path).unwrap().modified().unwrap();
+    session.review(kept, true).unwrap();
+    session.review(discarded, false).unwrap();
+    assert_eq!(std::fs::read(&kept_path).unwrap(), solid(140).data);
+    assert_eq!(
+        std::fs::metadata(&kept_path).unwrap().modified().unwrap(),
+        before
+    );
+    assert!(!discarded_path.exists(), "discard deletes the frame file");
+    let rows: Vec<(u64, String, Option<String>, u64)> = session.sql(|db| {
+        db.prepare("SELECT id, label, frame_path, data_bytes FROM captures ORDER BY id")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect()
+    });
+    assert_eq!(
+        rows[1..],
+        [
+            (kept, "kept".into(), Some(format!("{kept:08}.raw")), 1024),
+            (discarded, "discarded".into(), None, 0),
+        ]
+    );
+    // The ledger no longer tracks the deleted frame.
+    assert!(!crate::storage::remove(&discarded_path).unwrap());
+}
+
+#[test]
+fn discard_leaves_a_frame_file_that_changed_after_saving() {
+    let file = SessionFile::new();
+    let mut session = file.create();
+    session.manual(&solid(120)).unwrap();
+    ready(&mut session);
+    let id = observe(&mut session, &solid(140)).unwrap();
+    let path = file.frames().join(format!("{id:08}.raw"));
+    std::fs::write(&path, vec![7_u8; 1024]).unwrap();
+    assert!(
+        session.next_review().is_err(),
+        "a changed frame is never shown as the capture"
+    );
+    session.review(id, false).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), vec![7_u8; 1024]);
+    let status = session.status().unwrap();
+    assert_eq!((status.discarded_count, status.pending_count), (1, 0));
+    assert!(status.note.unwrap().contains("left"));
+}
+
+#[test]
+fn a_pending_capture_whose_frame_was_deleted_leaves_the_review_queue() {
+    let file = SessionFile::new();
+    let mut session = file.create();
+    session.manual(&solid(120)).unwrap();
+    ready(&mut session);
+    let gone = observe(&mut session, &solid(140)).unwrap();
+    let next = observe(&mut session, &solid(100)).unwrap();
+    // A missing folder, as when only the database was copied, drops nothing.
+    let moved = file.0.with_extension("moved");
+    std::fs::rename(file.frames(), &moved).unwrap();
+    assert!(session.next_review().is_err());
+    std::fs::rename(&moved, file.frames()).unwrap();
+    assert_eq!(session.status().unwrap().pending_count, 2);
+    // Retention, or a user, deleted one frame.
+    std::fs::remove_file(file.frames().join(format!("{gone:08}.raw"))).unwrap();
+    assert_eq!(session.next_review().unwrap().unwrap().id, next);
+    let status = session.status().unwrap();
+    assert_eq!(status.pending_count, 1);
+    assert!(status.note.unwrap().contains(&format!("capture {gone}")));
+    assert!(session.review(gone, false).is_err());
+}
+
+#[test]
+fn storage_refusals_pause_suggestions_and_other_write_failures_stop_them() {
+    let file = SessionFile::new();
+    let mut session = file.create();
+    session.manual(&solid(120)).unwrap();
+    ready(&mut session);
+    lock(&session.shared).failure = Some(anyhow!("Storage full: test budget"));
+    assert!(observe(&mut session, &solid(140)).is_none());
+    let status = session.status().unwrap();
+    assert_eq!(status.state, "storage_full");
+    assert!(status.blocked_storage);
+    assert_eq!(status.note.as_deref(), Some("Storage full: test budget"));
+    session.last_sample = None;
+    assert!(
+        observe_at(&mut session, &solid(140), Instant::now() + STORAGE_RETRY).is_some(),
+        "storage is tried again later"
+    );
+    assert_eq!(session.status().unwrap().note, None);
+    lock(&session.shared).failure = Some(anyhow!("disk failed"));
+    session.last_sample = None;
+    assert!(session.observe(&solid(100)).is_err());
+}
+
+#[test]
+fn a_new_session_never_reuses_a_frames_folder() {
+    let file = SessionFile::new();
+    std::fs::create_dir(file.frames()).unwrap();
+    assert!(CaptureSession::open(&file.0, "test-camera", true).is_err());
+    assert!(!file.0.exists());
+}
+
+#[test]
+fn close_finishes_even_when_duckdb_cannot_checkpoint() {
+    let file = SessionFile::new();
+    let mut session = file.create();
+    session.manual(&solid(120)).unwrap();
+    let blocker = session.block_checkpoints();
+    assert!(session.close().is_err());
+    drop(blocker);
+    // The WAL keeps every committed write.
+    let resumed = CaptureSession::open(&file.0, "test-camera", false).unwrap();
+    assert_eq!(resumed.status().unwrap().manual_count, 1);
+}
+
+const SCHEMA_1: &str = "CREATE TABLE capture_session (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        schema_version UINTEGER NOT NULL, descriptor_version UINTEGER NOT NULL,
+        camera VARCHAR NOT NULL, created_ms UBIGINT NOT NULL,
+        enabled BOOLEAN NOT NULL, sensitivity DOUBLE NOT NULL, cooldown_ms UBIGINT NOT NULL
+    );
+    CREATE TABLE captures (
+        id UBIGINT PRIMARY KEY, created_ms UBIGINT NOT NULL,
+        source VARCHAR NOT NULL CHECK (source IN ('manual', 'automatic')),
+        label VARCHAR NOT NULL CHECK (label IN ('manual', 'pending', 'kept', 'discarded')),
+        frame_id UBIGINT NOT NULL, width UINTEGER NOT NULL, height UINTEGER NOT NULL,
+        pixel_format UINTEGER NOT NULL, timestamp_ns UBIGINT NOT NULL,
+        data BLOB, data_bytes UBIGINT NOT NULL, descriptor BLOB NOT NULL, score DOUBLE NOT NULL,
+        reason VARCHAR NOT NULL, reviewed_ms UBIGINT
+    );
+    CREATE TABLE background (id UINTEGER PRIMARY KEY, descriptor BLOB NOT NULL);
+    INSERT INTO capture_session VALUES (1, 1, 1, 'test-camera', 0, true, 0.5, 250);";
+
+#[test]
+fn schema_1_sessions_with_pixels_in_the_database_still_review() {
+    let file = SessionFile::new();
+    let frames = [
+        (1, "manual", "manual", solid(120)),
+        (2, "automatic", "pending", solid(140)),
+        (3, "automatic", "pending", solid(100)),
+    ];
+    {
+        let db = Connection::open(&file.0).unwrap();
+        db.execute_batch(SCHEMA_1).unwrap();
+        for (id, source, label, frame) in &frames {
+            db.execute(
+                "INSERT INTO captures VALUES (?, 0, ?, ?, 42, 32, 32, ?, 7, ?, ?, ?, 0.9, 'v1', NULL)",
+                params![
+                    id,
+                    source,
+                    label,
+                    MONO8,
+                    &frame.data,
+                    frame.data.len() as u64,
+                    encode(&descriptor(frame).unwrap())
+                ],
+            )
+            .unwrap();
+        }
+    }
+    let mut session = CaptureSession::open(&file.0, "test-camera", false).unwrap();
+    let status = session.status().unwrap();
+    assert_eq!((status.manual_count, status.pending_count), (1, 2));
+    assert!(status.enabled);
+    let review = session.next_review().unwrap().unwrap();
+    assert_eq!((review.id, review.frame.data), (2, solid(140).data));
+    assert_eq!(
+        session.review_capture(3).unwrap().unwrap().frame.data,
+        solid(100).data
+    );
+    session.review(2, true).unwrap();
+    session.review(3, false).unwrap();
+    let rows: Vec<(u64, Option<Vec<u8>>, u64)> = session.sql(|db| {
+        db.prepare("SELECT id, data, data_bytes FROM captures ORDER BY id")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect()
+    });
+    assert_eq!(
+        rows,
+        [
+            (1, Some(solid(120).data), 1024),
+            (2, Some(solid(140).data), 1024),
+            (3, None, 0),
+        ],
+        "keep leaves stored pixels in place; discard releases them"
+    );
+    let id = session.manual(&solid(60)).unwrap();
+    assert_eq!(id, 4);
+    assert_eq!(file.frame_files(), [file.frames().join("00000004.raw")]);
+    drop(session);
+    let version: u32 = Connection::open(&file.0)
+        .unwrap()
+        .query_row("SELECT schema_version FROM capture_session", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    let resumed = CaptureSession::open(&file.0, "test-camera", false).unwrap();
+    let status = resumed.status().unwrap();
+    assert_eq!(
+        (
+            status.manual_count,
+            status.kept_count,
+            status.discarded_count
+        ),
+        (2, 1, 1)
+    );
+    assert_eq!(resumed.positive.len(), 3);
 }

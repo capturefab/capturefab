@@ -62,13 +62,14 @@ fn exact_manual_sensor_frame_survives_close_and_resume() {
         .request(SessionCommand::CaptureSessionClose)
         .unwrap();
     let db = duckdb::Connection::open(f.root.join("session.duckdb")).unwrap();
-    let (pixels, width, stamp): (Vec<u8>, u32, u64) = db
+    let (name, width, stamp): (String, u32, u64) = db
         .query_row(
-            "SELECT data,width,timestamp_ns FROM captures WHERE source = 'manual'",
+            "SELECT frame_path,width,timestamp_ns FROM captures WHERE source = 'manual'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .unwrap();
+    let pixels = std::fs::read(f.root.join("session.frames").join(name)).unwrap();
     assert_eq!(
         (pixels, width, stamp),
         (frame.data, frame.width, frame.timestamp_ns)
@@ -81,6 +82,40 @@ fn exact_manual_sensor_frame_survives_close_and_resume() {
             .unwrap()["capture"]
             .is_null()
     );
+}
+
+#[test]
+fn close_and_disconnect_succeed_after_the_database_fails() {
+    let f = Fixture::new();
+    let blocked = |f: &Fixture| {
+        f.worker
+            .capture_session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .block_checkpoints()
+    };
+    f.open(true);
+    let blocker = blocked(&f);
+    f.worker
+        .request(SessionCommand::CaptureSessionClose)
+        .unwrap();
+    assert!(f.worker.snapshot().capture_session.is_none());
+    assert!(
+        f.worker
+            .snapshot()
+            .logs
+            .iter()
+            .any(|entry| entry.message.contains("without a final checkpoint"))
+    );
+    drop(blocker);
+    f.open(false);
+    let blocker = blocked(&f);
+    f.worker.request(SessionCommand::Disconnect).unwrap();
+    assert!(f.worker.snapshot().capture_session.is_none());
+    assert!(f.worker.snapshot().connected.is_none());
+    drop(blocker);
 }
 
 #[test]

@@ -999,6 +999,15 @@ pub fn remove_uploaded(path: &Path) -> Result<bool> {
     locked.ledger.entries[index].pending_upload = false;
     locked.delete(index)
 }
+/// Delete a finished capture only if it is still exactly the file Capturefab
+/// wrote. False when the ledger does not track it or it changed; it is kept.
+pub fn remove(path: &Path) -> Result<bool> {
+    let mut locked = Manager::global().lock()?;
+    match locked.find(path) {
+        Ok(index) => locked.delete(index),
+        Err(_) => Ok(false),
+    }
+}
 pub fn quota_status() -> Result<Value> {
     Manager::global().lock()?.status()
 }

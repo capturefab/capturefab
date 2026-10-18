@@ -225,6 +225,28 @@ impl WorkerHandle {
         self.publish_capture(session)?;
         Ok(Some(id))
     }
+    /// Close the capture session even after its database failed: the user
+    /// must always be able to close it and disconnect. DuckDB replays the
+    /// WAL when the session is resumed.
+    fn close_capture(&self) {
+        let session = self
+            .capture_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(session) = session
+            && let Err(error) = session.close()
+        {
+            self.log(
+                "warn",
+                format!("Capture session closed without a final checkpoint: {error:#}"),
+            );
+        }
+        self.state
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .capture_session = None;
+    }
     fn observe_capture(&self, frame: &Frame) {
         let mut guard = self
             .capture_session
@@ -521,15 +543,7 @@ fn process_plain(
             Ok(json!({"capture_session":h.snapshot().capture_session}))
         }
         SessionCommand::CaptureSessionClose => {
-            let mut guard = h.capture_session.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(session) = guard.as_ref() {
-                session.checkpoint()?;
-            }
-            guard.take();
-            h.state
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .capture_session = None;
+            h.close_capture();
             Ok(json!({"capture_session":null}))
         }
         SessionCommand::AutoCapture {
@@ -804,17 +818,7 @@ fn process_plain(
             Ok(json!({"connected":h.snapshot().connected}))
         }
         SessionCommand::Disconnect => {
-            {
-                let mut guard = h.capture_session.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(session) = guard.as_ref() {
-                    session.checkpoint()?;
-                }
-                guard.take();
-            }
-            h.state
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .capture_session = None;
+            h.close_capture();
             cancel_jobs(jobs);
             sync_jobs(h, jobs);
             *scheduled_stream = false;
