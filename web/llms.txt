@@ -93,9 +93,9 @@ Use `--actor NAME --actor-kind agent` for an automation agent.
 `CAPTUREFAB_ACTOR` and `CAPTUREFAB_ACTOR_KIND` provide defaults; the default kind is `human`.
 Actor metadata is display attribution, not authentication.
 
-`status --json` includes global `result.activity` and `result.activity_revision`, even for a busy target camera.
-
 In `status --json`, `lost` counts frames lost on the camera link or in the worker; use it for acquisition health. `preview_skipped` counts preview frames a viewer missed because a newer one was ready. `dropped` keeps its v1 meaning: worker receive errors plus `preview_skipped`.
+
+`status --json` includes global `result.activity` and `result.activity_revision`, even for a busy target camera.
 Activity retains the latest 200 completed entries plus active commands and schedules.
 Sequences include `file_count` and at most eight path previews; capture results still return the full file list.
 `target_camera` identifies the requested camera; `active_camera` identifies the session default.
