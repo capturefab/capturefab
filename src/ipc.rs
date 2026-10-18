@@ -116,7 +116,7 @@ pub fn validate_name(name: &str) -> Result<()> {
     ensure!(
         !matches!(
             lower.as_str(),
-            "storage" | "storage-policy" | "destinations" | "uploads"
+            "storage" | "storage-policy" | "storage-summary" | "destinations" | "uploads"
         ),
         "session name is reserved for application bookkeeping; choose a different name"
     );
@@ -1201,6 +1201,7 @@ mod tests {
         assert!(validate_name("bench-01").is_ok());
         assert!(validate_name("storage").is_err());
         assert!(validate_name("storage-policy").is_err());
+        assert!(validate_name("storage-summary").is_err());
         assert!(validate_name("Storage").is_err());
         assert!(validate_name("destinations").is_err());
         assert!(validate_name("uploads").is_err());

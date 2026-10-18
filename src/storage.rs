@@ -1,6 +1,20 @@
 //! Cross-process capture quotas and conservative retention of Capturefab-owned files.
 //! Reservations are protected by OS locks, so an interrupted writer cannot leave
 //! an unlimited recording or prevent its unused reservation being reclaimed.
+//!
+//! The ledger is a snapshot, storage.json, plus storage.journal: one JSON line
+//! per changed entry, appended and made durable with fdatasync. A save appends a
+//! few hundred bytes instead of rewriting every entry, and each process keeps
+//! the parsed ledger and reads only the records appended since its last lock.
+//! Records are numbered and the snapshot names the last one it includes.
+//! Compaction writes a new snapshot and then starts a new journal, once the
+//! journal is over COMPACT_BYTES and larger than the snapshot, so the bytes
+//! written per save stay constant however many files are kept. A crash between
+//! those two steps leaves records that loading skips by number. A crash during
+//! an append leaves an unterminated last line, which the next locker truncates;
+//! any other unreadable record fails closed. Version 2 marks this format, so
+//! older binaries refuse the ledger as unsupported instead of ignoring the
+//! journal; a version 1 ledger is converted on its first lock.
 use crate::types::Frame;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use fs2::FileExt;
@@ -10,13 +24,25 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     fs::{self, File, Metadata, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{Mutex, PoisonError},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const LEDGER_LIMIT: u64 = 64 * 1024 * 1024;
+const LEDGER_VERSION: u32 = 2;
+const SNAPSHOT: &str = "storage.json";
+const JOURNAL: &str = "storage.journal";
+const POLICY: &str = "storage-policy.json";
+const SUMMARY: &str = "storage-summary.json";
+/// Tests compact far sooner, so that they exercise it.
+const COMPACT_BYTES: u64 = if cfg!(test) { 64 * 1024 } else { 1024 * 1024 };
+/// Entries without a live reservation only change when something else touches
+/// their files, so they are compared with the disk at most this often, and
+/// always before retention, a Storage full refusal or a status report.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,16 +162,68 @@ struct Entry {
 #[derive(Debug, Serialize, Deserialize)]
 struct Ledger {
     version: u32,
+    /// The last journal record included.
+    #[serde(default)]
+    sequence: u64,
     entries: Vec<Entry>,
 }
 impl Default for Ledger {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: LEDGER_VERSION,
+            sequence: 0,
             entries: Vec::new(),
         }
     }
 }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalHeader {
+    version: u32,
+    /// Random per journal file, so a cached read position is never applied
+    /// to a different journal.
+    journal: String,
+}
+/// One changed entry: its new state, or its removal.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Record {
+    seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    put: Option<Entry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remove: Option<String>,
+}
+/// How a file looked when it was read, to tell whether it was replaced since.
+#[derive(Clone, PartialEq)]
+struct Stamp {
+    identity: Identity,
+    bytes: u64,
+    modified_ns: Option<u64>,
+}
+/// What the parsed ledger was read from.
+#[derive(Clone, Default)]
+struct Position {
+    snapshot: Option<Stamp>,
+    journal: Option<String>,
+    /// Journal bytes applied, including the header.
+    offset: u64,
+}
+/// A process's parsed ledger, reused by its next lock while the snapshot and
+/// journal it was read from are still in place.
+struct Cached {
+    directory: PathBuf,
+    ledger: Ledger,
+    position: Position,
+    reconciled: Option<Instant>,
+}
+static CACHE: Mutex<Vec<Cached>> = Mutex::new(Vec::new());
+fn take_cached(directory: &Path) -> Option<Cached> {
+    let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+    let index = cache.iter().position(|c| c.directory == directory)?;
+    Some(cache.swap_remove(index))
+}
+
 struct Manager {
     directory: PathBuf,
 }
@@ -153,9 +231,30 @@ struct Locked {
     directory: PathBuf,
     lock: File,
     ledger: Ledger,
+    position: Position,
+    journal: Option<File>,
+    /// Ids changed since the last commit.
+    dirty: Vec<String>,
+    /// When every entry was last compared with the disk, and whether that
+    /// happened under this lock.
+    reconciled: Option<Instant>,
+    checked: bool,
+    /// Memory matches the files on disk, so the next lock may reuse it.
+    cacheable: bool,
 }
 impl Drop for Locked {
     fn drop(&mut self) {
+        if self.cacheable && self.dirty.is_empty() {
+            CACHE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Cached {
+                    directory: self.directory.clone(),
+                    ledger: std::mem::take(&mut self.ledger),
+                    position: std::mem::take(&mut self.position),
+                    reconciled: self.reconciled,
+                });
+        }
         let _ = FileExt::unlock(&self.lock);
     }
 }
@@ -209,6 +308,8 @@ fn lock_wait(file: &File) -> Result<()> {
     }
 }
 impl Manager {
+    /// The one place the storage bookkeeping directory is chosen; every
+    /// ledger, policy and summary path is resolved from it.
     fn global() -> Self {
         Self {
             directory: crate::ipc::session_dir(),
@@ -229,25 +330,19 @@ impl Manager {
         };
         regular_private(&lock_path, 0)?;
         lock_wait(&lock)?;
-        let ledger_path = directory.join("storage.json");
-        let ledger = if ledger_path.exists() {
-            regular_private(&ledger_path, LEDGER_LIMIT)?;
-            serde_json::from_slice(&fs::read(&ledger_path)?).with_context(|| {
-                format!(
-                    "invalid storage ledger {}; preserve it and inspect before resetting ownership",
-                    ledger_path.display()
-                )
-            })?
-        } else {
-            Ledger::default()
-        };
         let mut result = Locked {
             directory,
             lock,
-            ledger,
+            ledger: Ledger::default(),
+            position: Position::default(),
+            journal: None,
+            dirty: Vec::new(),
+            reconciled: None,
+            checked: false,
+            cacheable: false,
         };
-        result.validate()?;
-        result.reconcile()?;
+        result.load()?;
+        result.reconcile(false)?;
         Ok(result)
     }
     fn writer(&self, path: &Path, policy: &StoragePolicy, reserve: u64) -> Result<StorageWriter> {
@@ -296,7 +391,7 @@ impl Manager {
             }
         };
         let file_identity = identity(&file.metadata()?);
-        locked.ledger.entries.push(Entry {
+        locked.push(Entry {
             id: id.clone(),
             path: path.clone(),
             base,
@@ -427,114 +522,428 @@ fn hash_file(path: &Path) -> Result<String> {
     }
     Ok(format!("{:x}", hash.finalize()))
 }
+/// The persisted policy. It is only ever replaced whole, by rename, so it can
+/// be read without the storage lock.
+fn read_policy(directory: &Path) -> Result<StoragePolicy> {
+    let path = directory.join(POLICY);
+    match regular_private(&path, 4096) {
+        Ok(_) => {
+            let config: PolicyFile = serde_json::from_slice(&fs::read(&path)?).context(
+                "invalid persisted storage policy; inspect storage-policy.json before changing it",
+            )?;
+            ensure!(
+                config.version == 1,
+                "unsupported persisted storage policy version"
+            );
+            config.policy.validate()?;
+            Ok(config.policy)
+        }
+        Err(error) if not_found(&error) => Ok(StoragePolicy::default()),
+        Err(error) => Err(error),
+    }
+}
+fn not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<io::Error>()
+        .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+}
+fn check_entry(entry: &Entry) -> Result<()> {
+    ensure!(
+        entry.id.len() == 32 && entry.id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid storage ledger reservation id"
+    );
+    ensure!(
+        entry.path.is_absolute()
+            && entry.base.is_absolute()
+            && entry.path.parent() == Some(entry.base.as_path()),
+        "invalid storage ledger capture path"
+    );
+    ensure!(
+        entry
+            .lease
+            .as_ref()
+            .is_none_or(|name| name == &format!("storage-{}.lease", entry.id)),
+        "invalid storage reservation lease"
+    );
+    ensure!(
+        entry.sha256.as_ref().is_none_or(
+            |hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        ),
+        "invalid storage capture hash"
+    );
+    Ok(())
+}
+/// A journal's header and the length of its line.
+fn read_header(journal: &mut File) -> Result<(JournalHeader, u64)> {
+    journal.seek(SeekFrom::Start(0))?;
+    let mut line = Vec::new();
+    BufReader::new(Read::by_ref(journal).take(4096)).read_until(b'\n', &mut line)?;
+    let header = line
+        .ends_with(b"\n")
+        .then(|| serde_json::from_slice::<JournalHeader>(&line).ok())
+        .flatten()
+        .ok_or_else(|| anyhow!("invalid storage journal header; preserve storage.json and storage.journal and inspect them before resetting ownership"))?;
+    ensure!(
+        header.version == LEDGER_VERSION,
+        "unsupported storage journal version"
+    );
+    Ok((header, line.len() as u64))
+}
 impl Locked {
     fn configured_policy(&self) -> Result<StoragePolicy> {
-        let path = self.directory.join("storage-policy.json");
-        match regular_private(&path, 4096) {
-            Ok(_) => {
-                let config: PolicyFile = serde_json::from_slice(&fs::read(&path)?).context("invalid persisted storage policy; inspect storage-policy.json before changing it")?;
-                ensure!(
-                    config.version == 1,
-                    "unsupported persisted storage policy version"
-                );
-                config.policy.validate()?;
-                Ok(config.policy)
-            }
-            Err(error)
-                if error
-                    .downcast_ref::<io::Error>()
-                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
-            {
-                Ok(StoragePolicy::default())
-            }
-            Err(error) => Err(error),
-        }
+        read_policy(&self.directory)
     }
     fn configure_policy(&self, policy: &StoragePolicy) -> Result<()> {
         policy.validate()?;
         self.persist_bytes(
-            "storage-policy.json",
+            POLICY,
             &serde_json::to_vec(&PolicyFile {
                 version: 1,
                 policy: policy.clone(),
             })?,
         )
     }
-    fn validate(&self) -> Result<()> {
+    /// The snapshot as it is now, or None before the first commit.
+    fn stamp(&self) -> Result<Option<Stamp>> {
+        match regular_private(&self.directory.join(SNAPSHOT), LEDGER_LIMIT) {
+            Ok(meta) => Ok(Some(Stamp {
+                identity: identity(&meta),
+                bytes: meta.len(),
+                modified_ns: meta.modified().ok().and_then(nanos),
+            })),
+            Err(error) if not_found(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+    fn open_journal(&self) -> Result<Option<File>> {
+        let path = self.directory.join(JOURNAL);
+        match regular_private(&path, 2 * LEDGER_LIMIT) {
+            Ok(_) => Ok(Some(private_options().open(&path)?)),
+            Err(error) if not_found(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+    fn load(&mut self) -> Result<()> {
+        let snapshot = self.stamp()?;
+        let resumed = match take_cached(&self.directory) {
+            Some(cached) if cached.position.snapshot == snapshot => {
+                self.ledger = cached.ledger;
+                self.position = cached.position;
+                self.reconciled = cached.reconciled;
+                // Anything unexpected falls back to reading everything,
+                // which fails closed.
+                self.resume().unwrap_or(false)
+            }
+            _ => false,
+        };
+        if !resumed {
+            self.load_all(snapshot)?;
+        }
+        self.cacheable = true;
+        Ok(())
+    }
+    /// Apply what other processes appended since this one last held the lock.
+    fn resume(&mut self) -> Result<bool> {
+        let Some(mut journal) = self.open_journal()? else {
+            return Ok(false);
+        };
+        let (header, _) = read_header(&mut journal)?;
+        if self.position.journal.as_ref() != Some(&header.journal)
+            || journal.metadata()?.len() < self.position.offset
+        {
+            return Ok(false);
+        }
+        self.replay(&mut journal, self.position.offset)?;
+        self.journal = Some(journal);
+        Ok(true)
+    }
+    fn load_all(&mut self, snapshot: Option<Stamp>) -> Result<()> {
+        let path = self.directory.join(SNAPSHOT);
+        self.ledger = match snapshot {
+            Some(_) => serde_json::from_slice(&fs::read(&path)?).with_context(|| {
+                format!(
+                    "invalid storage ledger {}; preserve it and inspect before resetting ownership",
+                    path.display()
+                )
+            })?,
+            None => Ledger::default(),
+        };
         ensure!(
-            self.ledger.version == 1 && self.ledger.entries.len() <= 100_000,
+            matches!(self.ledger.version, 1 | LEDGER_VERSION)
+                && self.ledger.entries.len() <= 100_000,
             "unsupported or oversized storage ledger"
         );
-        let mut ids = std::collections::HashSet::new();
-        let mut paths = std::collections::HashSet::new();
-        for entry in &self.ledger.entries {
+        self.validate()?;
+        self.position = Position {
+            snapshot,
+            ..Position::default()
+        };
+        self.journal = None;
+        if self.ledger.version == 1 {
+            // Version 1 had no journal. Rewriting it in this format makes
+            // older binaries refuse it from now on.
+            self.ledger.version = LEDGER_VERSION;
+            self.compact()?;
+            self.write_summary();
+            return Ok(());
+        }
+        if let Some(mut journal) = self.open_journal()? {
+            let (header, offset) = read_header(&mut journal)?;
+            self.position.journal = Some(header.journal);
+            self.replay(&mut journal, offset)?;
+            self.journal = Some(journal);
+        }
+        Ok(())
+    }
+    /// Apply the complete records after `offset`. Records the snapshot already
+    /// includes are skipped. An unterminated last line is an append that a
+    /// crash cut short before anything relied on it, so it is cut off.
+    fn replay(&mut self, journal: &mut File, offset: u64) -> Result<()> {
+        journal.seek(SeekFrom::Start(offset))?;
+        let mut tail = Vec::new();
+        journal.read_to_end(&mut tail)?;
+        let complete = tail
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |end| end + 1);
+        for line in tail[..complete].split_inclusive(|&byte| byte == b'\n') {
+            let record: Record = serde_json::from_slice(line).context("invalid storage journal record; preserve storage.json and storage.journal and inspect them before resetting ownership")?;
+            if record.seq <= self.ledger.sequence {
+                continue;
+            }
             ensure!(
-                entry.id.len() == 32
-                    && entry.id.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    && ids.insert(&entry.id),
+                record.seq == self.ledger.sequence + 1,
+                "storage journal is missing records; preserve storage.json and storage.journal and inspect them before resetting ownership"
+            );
+            self.apply(record)?;
+        }
+        let end = offset + complete as u64;
+        if complete < tail.len() {
+            journal.set_len(end)?;
+            journal.sync_data()?;
+        }
+        self.position.offset = end;
+        Ok(())
+    }
+    fn apply(&mut self, record: Record) -> Result<()> {
+        match (record.put, record.remove) {
+            (Some(entry), None) => {
+                check_entry(&entry)?;
+                let mut index = None;
+                for (i, existing) in self.ledger.entries.iter().enumerate() {
+                    if existing.id == entry.id {
+                        index = Some(i);
+                    } else {
+                        ensure!(
+                            existing.path != entry.path,
+                            "invalid storage ledger capture path"
+                        );
+                    }
+                }
+                match index {
+                    Some(index) => self.ledger.entries[index] = entry,
+                    None => self.ledger.entries.push(entry),
+                }
+            }
+            (None, Some(id)) => self.ledger.entries.retain(|entry| entry.id != id),
+            _ => bail!("invalid storage journal record"),
+        }
+        ensure!(
+            self.ledger.entries.len() <= 100_000,
+            "unsupported or oversized storage ledger"
+        );
+        self.ledger.sequence = record.seq;
+        Ok(())
+    }
+    fn validate(&self) -> Result<()> {
+        let mut ids = HashSet::new();
+        let mut paths = HashSet::new();
+        for entry in &self.ledger.entries {
+            check_entry(entry)?;
+            ensure!(
+                ids.insert(&entry.id),
                 "invalid storage ledger reservation id"
             );
             ensure!(
-                entry.path.is_absolute()
-                    && entry.base.is_absolute()
-                    && entry.path.parent() == Some(entry.base.as_path())
-                    && paths.insert(&entry.path),
+                paths.insert(&entry.path),
                 "invalid storage ledger capture path"
-            );
-            ensure!(
-                entry
-                    .lease
-                    .as_ref()
-                    .is_none_or(|name| name == &format!("storage-{}.lease", entry.id)),
-                "invalid storage reservation lease"
-            );
-            ensure!(
-                entry
-                    .sha256
-                    .as_ref()
-                    .is_none_or(|hash| hash.len() == 64
-                        && hash.bytes().all(|byte| byte.is_ascii_hexdigit())),
-                "invalid storage capture hash"
             );
         }
         Ok(())
     }
-    fn persist(&self) -> Result<()> {
+    /// Changes go through these three, so that persist() can journal them.
+    fn push(&mut self, entry: Entry) {
+        self.dirty.push(entry.id.clone());
+        self.ledger.entries.push(entry);
+    }
+    fn entry_mut(&mut self, index: usize) -> &mut Entry {
+        let entry = &mut self.ledger.entries[index];
+        self.dirty.push(entry.id.clone());
+        entry
+    }
+    fn remove(&mut self, index: usize) {
+        let entry = self.ledger.entries.remove(index);
+        self.dirty.push(entry.id);
+    }
+    /// Commit changed entries to the journal; the first commit, or one that
+    /// leaves the journal larger than the snapshot, writes a new snapshot.
+    fn persist(&mut self) -> Result<()> {
+        if self.dirty.is_empty() {
+            return Ok(());
+        }
+        if self.journal.is_some() {
+            self.append()?;
+            let snapshot = self
+                .position
+                .snapshot
+                .as_ref()
+                .map_or(0, |stamp| stamp.bytes);
+            if self.position.offset >= COMPACT_BYTES.max(snapshot) {
+                // The records are already durable; a failed compaction only
+                // means the next lock reads everything again.
+                let _ = self.compact();
+            }
+        } else {
+            self.compact()?;
+        }
+        self.write_summary();
+        Ok(())
+    }
+    fn append(&mut self) -> Result<()> {
+        let mut lines = Vec::new();
+        let mut sequence = self.ledger.sequence;
+        let mut seen = HashSet::new();
+        for id in self.dirty.iter().filter(|id| seen.insert(*id)) {
+            let entry = self.ledger.entries.iter().find(|entry| &entry.id == id);
+            sequence += 1;
+            serde_json::to_writer(
+                &mut lines,
+                &Record {
+                    seq: sequence,
+                    put: entry.cloned(),
+                    remove: entry.is_none().then(|| id.clone()),
+                },
+            )?;
+            lines.push(b'\n');
+        }
+        let offset = self.position.offset;
+        let journal = self
+            .journal
+            .as_mut()
+            .ok_or_else(|| anyhow!("storage journal is not open"))?;
+        journal
+            .seek(SeekFrom::Start(offset))
+            .and_then(|_| journal.write_all(&lines))
+            .and_then(|()| journal.sync_data())
+            .context("commit storage ledger; check private session directory permissions and free disk space")?;
+        self.ledger.sequence = sequence;
+        self.position.offset += lines.len() as u64;
+        self.dirty.clear();
+        Ok(())
+    }
+    /// Write every entry as a new snapshot, then start an empty journal.
+    fn compact(&mut self) -> Result<()> {
+        let result = self.rewrite();
+        if result.is_err() {
+            self.cacheable = false;
+        }
+        result
+    }
+    fn rewrite(&mut self) -> Result<()> {
         let bytes = serde_json::to_vec(&self.ledger)?;
         ensure!(
             bytes.len() as u64 <= LEDGER_LIMIT,
             "storage ledger exceeds bookkeeping limit; reduce retained file count"
         );
-        self.persist_bytes("storage.json", &bytes)
+        // Closed first: Windows may refuse to replace an open file.
+        self.journal = None;
+        self.persist_bytes(SNAPSHOT, &bytes)?;
+        // The snapshot holds every change now. If the old journal is not
+        // replaced below, its records are numbered at or before the
+        // snapshot's sequence, so loading skips them.
+        self.dirty.clear();
+        self.position = Position {
+            snapshot: self.stamp()?,
+            ..Position::default()
+        };
+        let header = JournalHeader {
+            version: LEDGER_VERSION,
+            journal: nonce()?,
+        };
+        let mut bytes = serde_json::to_vec(&header)?;
+        bytes.push(b'\n');
+        self.persist_bytes(JOURNAL, &bytes)?;
+        self.journal = self.open_journal()?;
+        self.position.journal = Some(header.journal);
+        self.position.offset = bytes.len() as u64;
+        Ok(())
     }
     fn persist_bytes(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.replace(name, bytes, true).context(
+            "commit storage ledger; check private session directory permissions and free disk space",
+        )
+    }
+    /// Replace a bookkeeping file whole. Only a `durable` one waits for the
+    /// disk, so a crash can at worst lose a derived file.
+    fn replace(&self, name: &str, bytes: &[u8], durable: bool) -> Result<()> {
         let temp = self.directory.join(format!("storage-{}.tmp", nonce()?));
         let result = (|| -> Result<()> {
             let mut file = private_options().create_new(true).open(&temp)?;
             file.write_all(bytes)?;
-            file.sync_all()?;
+            if durable {
+                file.sync_all()?;
+            }
             drop(file);
             fs::rename(&temp, self.directory.join(name))?;
             #[cfg(unix)]
-            File::open(&self.directory)?.sync_all()?;
+            if durable {
+                File::open(&self.directory)?.sync_all()?;
+            }
             Ok(())
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temp);
         }
-        result.context("commit storage ledger; check private session directory permissions and free disk space")
+        result
     }
-    fn reconcile(&mut self) -> Result<()> {
-        let mut changed = false;
+    /// Totals for readers that must not take the lock, such as the GUI. Best
+    /// effort: the ledger is the record, and the next commit rewrites this.
+    fn write_summary(&self) {
+        let Ok(allocated_bytes) = self.allocated() else {
+            return;
+        };
+        let summary = UsageFile {
+            version: 1,
+            usage: Usage {
+                allocated_bytes,
+                files: self.ledger.entries.len() as u64,
+            },
+        };
+        if let Ok(bytes) = serde_json::to_vec(&summary) {
+            let _ = self.replace(SUMMARY, &bytes, false);
+        }
+    }
+    /// Compare entries with their files. Live reservations are always read:
+    /// their growth counts and a crashed writer's lease must be reclaimed. The
+    /// rest only on a `full` pass, or when RECONCILE_INTERVAL has passed.
+    fn reconcile(&mut self, full: bool) -> Result<()> {
+        let due = self.reconciled.get_or_insert_with(Instant::now).elapsed() >= RECONCILE_INTERVAL;
+        let full = (full || due) && !self.checked;
+        // An error part way leaves changes that are not yet in dirty.
+        self.cacheable = false;
         let mut missing = Vec::new();
         let mut verified = HashSet::new();
         for (index, entry) in self.ledger.entries.iter_mut().enumerate() {
+            if !full && entry.lease.is_none() {
+                continue;
+            }
+            let mut touched = false;
             let meta = current_meta(entry, &mut verified)?;
             let current_bytes = meta.as_ref().map_or(0, Metadata::len);
             if let Some(meta) = &meta {
                 if identity(meta) != entry.identity && !entry.changed {
                     entry.changed = true;
-                    changed = true;
+                    touched = true;
                 }
                 if entry.lease.is_none()
                     && (entry.bytes != meta.len()
@@ -542,14 +951,14 @@ impl Locked {
                     && !entry.changed
                 {
                     entry.changed = true;
-                    changed = true;
+                    touched = true;
                 }
             }
             if entry.bytes != current_bytes {
                 entry.bytes = current_bytes;
                 // Live lengths are read again on each lock; the durable
                 // reservation already covers growth until finalization.
-                changed |= entry.lease.is_none();
+                touched |= entry.lease.is_none();
             }
             let mut stale = entry.lease.is_none();
             let mut stale_lease = None;
@@ -569,48 +978,43 @@ impl Locked {
                             }
                         }
                     }
-                    Err(error)
-                        if error
-                            .downcast_ref::<io::Error>()
-                            .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) =>
-                    {
-                        stale = true;
-                    }
+                    Err(error) if not_found(&error) => stale = true,
                     Err(error) => return Err(error),
                 }
             }
-            if !stale {
-                continue;
-            }
-            match meta {
-                None => {
-                    missing.push(index);
-                    changed = true;
+            if stale {
+                match meta {
+                    None => missing.push(index),
+                    Some(meta) if entry.lease.is_some() => {
+                        entry.reserved = 0;
+                        entry.lease = None;
+                        // An interrupted writer has no committed content hash.
+                        // Reclaim its unused reservation but preserve the file.
+                        entry.changed = true;
+                        entry.sha256 = None;
+                        entry.modified_ns = meta.modified().ok().and_then(nanos);
+                        touched = true;
+                    }
+                    Some(_) => {}
                 }
-                Some(meta) if entry.lease.is_some() => {
-                    entry.reserved = 0;
-                    entry.lease = None;
-                    // An interrupted writer has no committed content hash.
-                    // Reclaim its unused reservation but preserve the file.
-                    entry.changed = true;
-                    entry.sha256 = None;
-                    entry.modified_ns = meta.modified().ok().and_then(nanos);
-                    changed = true;
+                if let Some((lease, path)) = stale_lease {
+                    drop(lease);
+                    let _ = fs::remove_file(path);
                 }
-                Some(_) => {}
             }
-            if let Some((lease, path)) = stale_lease {
-                drop(lease);
-                let _ = fs::remove_file(path);
+            if touched {
+                self.dirty.push(entry.id.clone());
             }
         }
         for index in missing.into_iter().rev() {
-            self.ledger.entries.remove(index);
+            self.remove(index);
         }
-        if changed {
-            self.persist()?;
+        if full {
+            self.reconciled = Some(Instant::now());
+            self.checked = true;
         }
-        Ok(())
+        self.cacheable = true;
+        self.persist()
     }
     fn allocated(&self) -> Result<u64> {
         self.ledger.entries.iter().try_fold(0u64, |sum, entry| {
@@ -618,7 +1022,8 @@ impl Locked {
                 .ok_or_else(|| anyhow!("storage quota accounting overflow"))
         })
     }
-    fn status(&self) -> Result<Value> {
+    fn status(&mut self) -> Result<Value> {
+        self.reconcile(true)?;
         let allocated = self.allocated()?;
         let policy = self.configured_policy()?;
         let over_limit = allocated > policy.max_bytes
@@ -629,7 +1034,7 @@ impl Locked {
                 .iter()
                 .any(|entry| self.expiring(entry, &policy));
         Ok(json!({
-            "ledger": self.directory.join("storage.json"),
+            "ledger": self.directory.join(SNAPSHOT),
             "policy": policy,
             "over_limit": over_limit,
             "tracked_bytes": self.ledger.entries.iter().map(|entry| entry.bytes).sum::<u64>(),
@@ -664,9 +1069,9 @@ impl Locked {
             .ok_or_else(|| anyhow!("{} is not a finished Capturefab capture", path.display()))
     }
     fn delete(&mut self, index: usize) -> Result<bool> {
-        let entry = &mut self.ledger.entries[index];
+        let entry = &self.ledger.entries[index];
         let Some(meta) = current_meta(entry, &mut HashSet::new())? else {
-            self.ledger.entries.remove(index);
+            self.remove(index);
             self.persist()?;
             return Ok(true);
         };
@@ -676,6 +1081,7 @@ impl Locked {
             || meta.modified().ok().and_then(nanos) != entry.modified_ns
             || hash_file(&entry.path)? != entry.sha256.as_deref().unwrap()
         {
+            let entry = self.entry_mut(index);
             entry.changed = true;
             entry.bytes = meta.len();
             self.persist()?;
@@ -690,7 +1096,7 @@ impl Locked {
             "capture changed during retention verification; deletion stopped"
         );
         fs::remove_file(&entry.path).with_context(|| format!("retention cannot remove {}; check directory permissions or select a different output directory", entry.path.display()))?;
-        self.ledger.entries.remove(index);
+        self.remove(index);
         self.persist()?;
         Ok(true)
     }
@@ -708,6 +1114,12 @@ impl Locked {
                 || self.ledger.entries.len() >= policy.max_files as usize;
             if !full && expired.is_none() {
                 return Ok(());
+            }
+            if !self.checked {
+                // Decide on current facts: files removed since the last full
+                // pass may already make room, and changed ones are protected.
+                self.reconcile(true)?;
+                continue;
             }
             if policy.on_full == "stop" {
                 bail!(
@@ -863,13 +1275,13 @@ impl StorageWriter {
             );
         }
         let mut locked = self.manager.lock()?;
-        let entry = locked
+        let index = locked
             .ledger
             .entries
-            .iter_mut()
-            .find(|entry| entry.id == self.id)
+            .iter()
+            .position(|entry| entry.id == self.id)
             .ok_or_else(|| anyhow!("capture reservation disappeared from storage ledger"))?;
-        let meta = current_meta(entry, &mut HashSet::new())?
+        let meta = current_meta(&locked.ledger.entries[index], &mut HashSet::new())?
             .ok_or_else(|| anyhow!("capture output disappeared: {}", self.path.display()))?;
         ensure!(
             identity(&meta) == self.identity && meta.len() == self.written,
@@ -882,6 +1294,7 @@ impl StorageWriter {
             "capture content changed externally; preserving {} without enabling retention deletion",
             self.path.display()
         );
+        let entry = locked.entry_mut(index);
         entry.bytes = self.written;
         entry.reserved = 0;
         entry.lease = None;
@@ -906,9 +1319,9 @@ impl StorageWriter {
                 .is_some_and(|meta| identity(&meta) == self.identity && meta.len() == self.written);
             if owned && hash_file(&self.path)? == format!("{:x}", self.hash.clone().finalize()) {
                 fs::remove_file(&self.path)?;
-                locked.ledger.entries.remove(index);
+                locked.remove(index);
             } else {
-                let entry = &mut locked.ledger.entries[index];
+                let entry = locked.entry_mut(index);
                 entry.changed = true;
                 entry.reserved = 0;
                 entry.lease = None;
@@ -986,13 +1399,13 @@ pub fn save(frame: &Frame, path: &Path, format: &str, policy: &StoragePolicy) ->
 pub fn hold_for_upload(path: &Path, held: bool) -> Result<String> {
     let mut locked = Manager::global().lock()?;
     let index = locked.find(path)?;
-    let entry = &mut locked.ledger.entries[index];
+    let entry = &locked.ledger.entries[index];
     let sha256 = entry
         .sha256
         .clone()
         .ok_or_else(|| anyhow!("{} has no recorded checksum", entry.path.display()))?;
     if entry.pending_upload != held {
-        entry.pending_upload = held;
+        locked.entry_mut(index).pending_upload = held;
         locked.persist()?;
     }
     Ok(sha256)
@@ -1002,17 +1415,53 @@ pub fn hold_for_upload(path: &Path, held: bool) -> Result<String> {
 pub fn remove_uploaded(path: &Path) -> Result<bool> {
     let mut locked = Manager::global().lock()?;
     let index = locked.find(path)?;
-    locked.ledger.entries[index].pending_upload = false;
+    locked.entry_mut(index).pending_upload = false;
     locked.delete(index)
 }
 pub fn quota_status() -> Result<Value> {
     Manager::global().lock()?.status()
 }
+/// The persisted global policy, read without waiting for the storage lock.
 pub fn configured_policy() -> Result<StoragePolicy> {
-    Manager::global().lock()?.configured_policy()
+    let manager = Manager::global();
+    crate::ipc::ensure_private_dir(&manager.directory)?;
+    read_policy(&manager.directory)
+}
+/// Ledger totals as of the last commit, read without the storage lock.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub allocated_bytes: u64,
+    pub files: u64,
+}
+#[derive(Serialize, Deserialize)]
+struct UsageFile {
+    version: u32,
+    usage: Usage,
+}
+/// Current totals for displays that refresh often, without the storage lock
+/// or reading the ledger. None while unknown, until the next commit.
+pub fn usage() -> Result<Option<Usage>> {
+    let manager = Manager::global();
+    crate::ipc::ensure_private_dir(&manager.directory)?;
+    read_usage(&manager.directory)
+}
+fn read_usage(directory: &Path) -> Result<Option<Usage>> {
+    let path = directory.join(SUMMARY);
+    match regular_private(&path, 4096) {
+        Ok(_) => {
+            let summary: UsageFile = serde_json::from_slice(&fs::read(&path)?)
+                .context("invalid storage usage summary")?;
+            Ok((summary.version == 1).then_some(summary.usage))
+        }
+        // Nothing saved yet, or written by a version without the summary.
+        Err(error) if not_found(&error) => Ok(fs::symlink_metadata(directory.join(SNAPSHOT))
+            .is_err()
+            .then(Usage::default)),
+        Err(error) => Err(error),
+    }
 }
 pub fn configure_policy(policy: &StoragePolicy) -> Result<Value> {
-    let locked = Manager::global().lock()?;
+    let mut locked = Manager::global().lock()?;
     locked.configure_policy(policy)?;
     Ok(json!({ "policy": policy, "quota": locked.status()? }))
 }
@@ -1231,7 +1680,7 @@ mod tests {
                 .is_err()
         );
         {
-            let locked = manager.lock().unwrap();
+            let mut locked = manager.lock().unwrap();
             assert_eq!(locked.configured_policy().unwrap().max_bytes, 6);
             locked.configure_policy(&policy(2, 1, "stop")).unwrap();
             assert_eq!(locked.status().unwrap()["over_limit"], true);
@@ -1352,26 +1801,7 @@ mod tests {
         crashed.file.take();
         crashed.lease.take();
         drop(crashed);
-        // Another test can be between fork and exec, temporarily retaining
-        // this close-on-exec lease. Reclaim only after that reference closes.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let locked = loop {
-            let locked = manager.lock().unwrap();
-            if locked
-                .ledger
-                .entries
-                .iter()
-                .all(|entry| entry.lease.is_none())
-            {
-                break locked;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "dropped writer lease did not close"
-            );
-            drop(locked);
-            thread::sleep(Duration::from_millis(10));
-        };
+        let locked = without_leases(&manager);
         assert_eq!(locked.allocated().unwrap(), 5);
         assert_eq!(
             locked
@@ -1393,6 +1823,28 @@ mod tests {
         );
         drop(locked);
         completed(&manager, &temp.path("next"), &policy, b"45678");
+    }
+    /// Another test can be between fork and exec, temporarily retaining a
+    /// dropped writer's close-on-exec lease. Reclaim only after it closes.
+    fn without_leases(manager: &Manager) -> Locked {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let locked = manager.lock().unwrap();
+            if locked
+                .ledger
+                .entries
+                .iter()
+                .all(|entry| entry.lease.is_none())
+            {
+                return locked;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dropped writer lease did not close"
+            );
+            drop(locked);
+            thread::sleep(Duration::from_millis(10));
+        }
     }
     #[test]
     #[cfg(unix)]
@@ -1538,10 +1990,15 @@ mod tests {
             .writer(&temp.path("live"), &policy(10, 2, "stop"), 8)
             .unwrap();
         writer.write_all(b"abc").unwrap();
-        let ledger = manager.directory.join("storage.json");
+        let ledger = manager.directory.join(SNAPSHOT);
         let before = identity(&fs::metadata(&ledger).unwrap());
+        let journal = fs::metadata(manager.directory.join(JOURNAL)).unwrap().len();
         assert_eq!(manager.lock().unwrap().ledger.entries[0].bytes, 3);
         assert_eq!(identity(&fs::metadata(&ledger).unwrap()), before);
+        assert_eq!(
+            fs::metadata(manager.directory.join(JOURNAL)).unwrap().len(),
+            journal
+        );
         writer.finish().unwrap();
         assert_eq!(manager.lock().unwrap().ledger.entries[0].bytes, 3);
     }
@@ -1563,14 +2020,19 @@ mod tests {
         drop(live);
     }
     fn age(manager: &Manager, name: &str, seconds: u64) {
+        edit(manager, name, |entry| {
+            entry.created = now().saturating_sub(seconds);
+        });
+    }
+    fn edit(manager: &Manager, name: &str, change: impl FnOnce(&mut Entry)) {
         let mut locked = manager.lock().unwrap();
-        let entry = locked
+        let index = locked
             .ledger
             .entries
-            .iter_mut()
-            .find(|entry| entry.path.ends_with(name))
+            .iter()
+            .position(|entry| entry.path.ends_with(name))
             .unwrap();
-        entry.created = now().saturating_sub(seconds);
+        change(locked.entry_mut(index));
         locked.persist().unwrap();
     }
     #[test]
@@ -1583,17 +2045,7 @@ mod tests {
         completed(&manager, &temp.path("queued"), &policy, b"queued");
         completed(&manager, &temp.path("expired"), &policy, b"old");
         fs::write(temp.path("interrupted"), b"changed elsewhere").unwrap();
-        {
-            let mut locked = manager.lock().unwrap();
-            let queued = locked
-                .ledger
-                .entries
-                .iter_mut()
-                .find(|entry| entry.path.ends_with("queued"))
-                .unwrap();
-            queued.pending_upload = true;
-            locked.persist().unwrap();
-        }
+        edit(&manager, "queued", |entry| entry.pending_upload = true);
         for name in ["interrupted", "queued", "expired"] {
             age(&manager, name, 100);
         }
@@ -1651,5 +2103,241 @@ mod tests {
         fs::write(ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
         assert!(manager.lock().is_err());
         assert_eq!(fs::read(temp.path("capture")).unwrap(), b"original");
+    }
+    /// What a new process would see: its next lock reads everything again.
+    fn forget(manager: &Manager) {
+        take_cached(&fs::canonicalize(&manager.directory).unwrap());
+    }
+    /// Track `count` small finished files without a durable save for each.
+    fn populate(manager: &Manager, temp: &Temp, count: usize) {
+        let base = fs::canonicalize(&temp.0).unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(b"x"));
+        let mut locked = manager.lock().unwrap();
+        for index in 0..count {
+            let path = base.join(format!("filler-{index}"));
+            fs::write(&path, b"x").unwrap();
+            let meta = fs::metadata(&path).unwrap();
+            locked.push(Entry {
+                id: nonce().unwrap(),
+                path,
+                base: base.clone(),
+                identity: identity(&meta),
+                created: now(),
+                bytes: 1,
+                reserved: 0,
+                lease: None,
+                sha256: Some(sha256.clone()),
+                modified_ns: meta.modified().ok().and_then(nanos),
+                changed: false,
+                pending_upload: false,
+            });
+        }
+        locked.compact().unwrap();
+    }
+    /// Bytes `action` writes to the ledger files: what the journal grew by, or
+    /// the new snapshot and journal when it compacted.
+    fn ledger_writes(manager: &Manager, action: impl FnOnce()) -> (u64, bool) {
+        let file = |name| fs::metadata(manager.directory.join(name)).unwrap();
+        let (snapshot, journal) = (identity(&file(SNAPSHOT)), file(JOURNAL).len());
+        action();
+        let (after, grown) = (file(SNAPSHOT), file(JOURNAL).len());
+        if identity(&after) == snapshot {
+            (grown - journal, false)
+        } else {
+            (after.len() + grown, true)
+        }
+    }
+    #[test]
+    fn a_save_writes_the_same_ledger_bytes_however_many_files_are_kept() {
+        let per_save = |kept: usize| {
+            let temp = Temp::new();
+            let manager = temp.manager();
+            populate(&manager, &temp, kept);
+            let policy = policy(1 << 30, 100_000, "stop");
+            let saves = 10;
+            let written: u64 = (0..saves)
+                .map(|index| {
+                    let path = temp.path(&format!("frame-{index}"));
+                    ledger_writes(&manager, || completed(&manager, &path, &policy, &[7; 4096])).0
+                })
+                .sum();
+            written / saves
+        };
+        let (few, many) = (per_save(10), per_save(5_000));
+        assert!(
+            many < 2048 && many <= few + 64,
+            "{few} bytes per save with 10 files kept, {many} with 5,000"
+        );
+    }
+    #[test]
+    fn compaction_keeps_ledger_writes_proportional_to_changes() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        populate(&manager, &temp, 100);
+        let (mut total, mut largest, mut compactions) = (0, 0, 0);
+        let rounds = 200;
+        for round in 0..rounds {
+            let (bytes, compacted) = ledger_writes(&manager, || {
+                edit(&manager, "filler-7", |entry| {
+                    entry.pending_upload = round % 2 == 0;
+                });
+            });
+            total += bytes;
+            if compacted {
+                compactions += 1;
+            } else {
+                largest = largest.max(bytes);
+            }
+        }
+        assert!(compactions >= 1, "the journal was never compacted");
+        assert!(
+            total <= 3 * rounds * largest,
+            "{total} bytes for {rounds} changes of at most {largest} bytes"
+        );
+        let snapshot = fs::metadata(manager.directory.join(SNAPSHOT))
+            .unwrap()
+            .len();
+        let journal = fs::metadata(manager.directory.join(JOURNAL)).unwrap().len();
+        assert!(journal <= COMPACT_BYTES.max(snapshot) + largest);
+    }
+    #[test]
+    fn a_torn_append_is_cut_off_and_an_interrupted_reservation_reclaimed() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        let policy = policy(100, 10, "stop");
+        completed(&manager, &temp.path("kept"), &policy, b"kept");
+        let mut crashed = manager.writer(&temp.path("crashed"), &policy, 50).unwrap();
+        crashed.write_all(b"partial").unwrap();
+        // The process dies between reserve and finalize, part way through
+        // its next append.
+        crashed.finalized = true;
+        crashed.file.take();
+        crashed.lease.take();
+        drop(crashed);
+        let journal = manager.directory.join(JOURNAL);
+        OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap()
+            .write_all(br#"{"seq":99,"put":{"id":"#)
+            .unwrap();
+        forget(&manager);
+        let mut locked = without_leases(&manager);
+        let text = fs::read_to_string(&journal).unwrap();
+        assert!(text.ends_with('\n') && !text.contains(r#""seq":99"#));
+        assert_eq!(locked.allocated().unwrap(), 11);
+        locked.compact().unwrap();
+        drop(locked);
+        forget(&manager);
+        let locked = manager.lock().unwrap();
+        assert_eq!(locked.allocated().unwrap(), 11);
+        assert!(
+            locked
+                .ledger
+                .entries
+                .iter()
+                .any(|entry| entry.path.ends_with("crashed") && entry.changed)
+        );
+        assert_eq!(fs::read_to_string(&journal).unwrap().lines().count(), 1);
+    }
+    #[test]
+    fn records_already_in_the_snapshot_are_skipped_after_an_interrupted_compaction() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        let policy = policy(100, 10, "stop");
+        completed(&manager, &temp.path("first"), &policy, b"first");
+        let journal = manager.directory.join(JOURNAL);
+        let old = fs::read(&journal).unwrap();
+        // Stop after the new snapshot, before the journal is replaced.
+        manager.lock().unwrap().compact().unwrap();
+        fs::write(&journal, old).unwrap();
+        forget(&manager);
+        assert_eq!(manager.lock().unwrap().ledger.entries.len(), 1);
+        completed(&manager, &temp.path("second"), &policy, b"second");
+        forget(&manager);
+        let locked = manager.lock().unwrap();
+        assert_eq!(locked.ledger.entries.len(), 2);
+        assert_eq!(locked.allocated().unwrap(), 11);
+    }
+    #[test]
+    fn altered_or_unreadable_journal_records_fail_closed() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        completed(
+            &manager,
+            &temp.path("capture"),
+            &policy(100, 10, "stop"),
+            b"data",
+        );
+        let journal = manager.directory.join(JOURNAL);
+        let original = fs::read_to_string(&journal).unwrap();
+        let (head, last) = original.trim_end().rsplit_once('\n').unwrap();
+        let mut record: Value = serde_json::from_str(last).unwrap();
+        record["put"]["base"] = json!(temp.path("elsewhere"));
+        for altered in [
+            format!("{head}\n{record}\n"),
+            format!("{head}\nnot a record\n{last}\n"),
+        ] {
+            fs::write(&journal, altered).unwrap();
+            forget(&manager);
+            assert!(manager.lock().is_err());
+        }
+        assert_eq!(fs::read(temp.path("capture")).unwrap(), b"data");
+    }
+    #[test]
+    fn a_version_1_ledger_is_converted_and_newer_versions_are_refused() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        completed(
+            &manager,
+            &temp.path("capture"),
+            &policy(100, 10, "stop"),
+            b"data",
+        );
+        let entries = manager.lock().unwrap().ledger.entries.clone();
+        let snapshot = manager.directory.join(SNAPSHOT);
+        let journal = manager.directory.join(JOURNAL);
+        fs::write(
+            &snapshot,
+            json!({"version": 1, "entries": entries}).to_string(),
+        )
+        .unwrap();
+        fs::remove_file(&journal).unwrap();
+        forget(&manager);
+        assert_eq!(manager.lock().unwrap().allocated().unwrap(), 4);
+        let converted: Value = serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
+        assert_eq!(converted["version"], LEDGER_VERSION);
+        assert!(journal.exists());
+        fs::write(&snapshot, json!({"version": 3, "entries": []}).to_string()).unwrap();
+        forget(&manager);
+        let error = manager.lock().err().unwrap().to_string();
+        assert!(error.contains("unsupported"), "{error}");
+    }
+    #[test]
+    fn usage_and_policy_are_read_without_the_lock() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        crate::ipc::ensure_private_dir(&manager.directory).unwrap();
+        assert_eq!(
+            read_usage(&manager.directory).unwrap(),
+            Some(Usage::default())
+        );
+        let policy = policy(100, 10, "stop");
+        completed(&manager, &temp.path("one"), &policy, b"1234");
+        completed(&manager, &temp.path("two"), &policy, b"56");
+        let held = manager.lock().unwrap();
+        held.configure_policy(&policy).unwrap();
+        // Either read would wait for the lock, and time out, if it took it.
+        assert_eq!(
+            read_usage(&manager.directory).unwrap(),
+            Some(Usage {
+                allocated_bytes: 6,
+                files: 2
+            })
+        );
+        assert_eq!(read_policy(&manager.directory).unwrap().max_files, 10);
+        drop(held);
+        fs::remove_file(manager.directory.join(SUMMARY)).unwrap();
+        assert_eq!(read_usage(&manager.directory).unwrap(), None);
     }
 }

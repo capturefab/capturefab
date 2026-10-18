@@ -2219,7 +2219,10 @@ fn dataset_records_direct_captures() {
         .as_str()
         .unwrap()
         .to_owned();
-    let ledger = std::fs::read_to_string(dir.join("storage.json")).unwrap();
+    // The ledger is a snapshot plus a journal of later changes.
+    let ledger = ["storage.json", "storage.journal"]
+        .map(|name| std::fs::read_to_string(dir.join(name)).unwrap_or_default())
+        .concat();
     assert!(ledger.contains(&sha), "{sha}");
     let status = json(
         &dir,
