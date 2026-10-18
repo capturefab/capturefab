@@ -1406,8 +1406,9 @@ mod tests {
     }
 
     /// The simulator with two registers only a full feature walk reads:
-    /// Gain's maximum, which counts walks, and a lock on Width that holds
-    /// while the camera streams. Height can be made unavailable.
+    /// Gain's maximum, which counts walks, and a lock on Width and the frame
+    /// rate that holds while the camera streams. Height can be made
+    /// unavailable.
     struct Walked {
         simulator: crate::transport::simulator::Simulator,
         walks: Arc<AtomicU64>,
@@ -1451,6 +1452,10 @@ mod tests {
                 .replace(
                     "<pValue>WidthReg</pValue>",
                     "<pIsLocked>Locked</pIsLocked><pValue>WidthReg</pValue>",
+                )
+                .replace(
+                    "<pValue>RateReg</pValue>",
+                    "<pIsLocked>Locked</pIsLocked><pValue>RateReg</pValue>",
                 )
                 .replace(
                     "<pValue>HeightReg</pValue>",
@@ -1527,12 +1532,13 @@ mod tests {
                 .unwrap()
                 .writable
         };
-        // A walk while streaming sees Width locked; stopping unlocks it
-        // without another walk.
+        // A walk while streaming sees the geometry and the frame rate locked;
+        // stopping unlocks both without another walk.
         assert_eq!(walked(&mut camera, set("ExposureTime", "5000")).0, 1);
-        assert!(!writable(&h, "Width"));
+        assert!(!writable(&h, "Width") && !writable(&h, "AcquisitionFrameRate"));
         assert_eq!(walked(&mut camera, SessionCommand::Stop).0, 0);
-        assert!(writable(&h, "Width"));
+        assert!(writable(&h, "Width") && writable(&h, "AcquisitionFrameRate"));
+        assert!(!writable(&h, "DeviceScanType"));
         // Undo still reads every value it restores, and walks once.
         assert_eq!(walked(&mut camera, SessionCommand::Undo).0, 1);
         assert!(camera.as_ref().unwrap().is_streaming());

@@ -385,8 +385,9 @@ fn refresh(h: &WorkerHandle, camera: &mut Option<Camera>, features: bool) {
         s.features.clear();
     }
 }
-/// Stopping unlocks the image geometry and format: read whether those
-/// features are writable again, without walking every feature.
+/// Stopping unlocks what the camera locked while it streamed, the image
+/// geometry and often more: read again whether each feature last seen
+/// read-only is writable, without walking every feature.
 fn unlock_features(h: &WorkerHandle, camera: &mut Option<Camera>) {
     let Some(c) = camera.as_mut() else {
         return;
@@ -397,7 +398,7 @@ fn unlock_features(h: &WorkerHandle, camera: &mut Option<Camera>) {
         .unwrap_or_else(|e| e.into_inner())
         .features
         .iter()
-        .filter(|feature| crate::camera::stream_locked(&feature.name))
+        .filter(|feature| !feature.writable)
         .map(|feature| feature.name.clone())
         .collect::<Vec<_>>();
     let writable = names
