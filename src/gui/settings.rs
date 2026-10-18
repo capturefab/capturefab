@@ -125,6 +125,8 @@ impl Workbench {
             rule::horizontal(1).style(style::line),
             interface,
             rule::horizontal(1).style(style::line),
+            self.performance_section(p),
+            rule::horizontal(1).style(style::line),
             discovery,
             rule::horizontal(1).style(style::line),
             self.api_keys_section(p),

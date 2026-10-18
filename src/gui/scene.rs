@@ -333,6 +333,7 @@ impl Workbench {
             || self.scene_autocapture(word, late)
             || self.scene_network(word, late)
             || self.scene_video_analytics(word, late)
+            || self.scene_performance(word, late)
             || self.scene_sheets(word, late)
     }
 

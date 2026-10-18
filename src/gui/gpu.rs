@@ -224,6 +224,13 @@ struct Uniforms {
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
 static MAX_SIDE: AtomicU32 = AtomicU32::new(0);
 
+/// Whether wgpu built the preview pipeline. Still false after the main
+/// window's first draws means iced's software renderer draws.
+#[cfg_attr(test, allow(dead_code))]
+pub fn available() -> bool {
+    AVAILABLE.load(Ordering::Relaxed)
+}
+
 #[derive(Default)]
 struct Shared {
     /// Newest frame per view awaiting upload; held by reference, never copied.

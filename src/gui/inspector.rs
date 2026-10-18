@@ -45,6 +45,10 @@ const ACCEPTED: Duration = Duration::from_millis(450);
 const CONTEXT: Duration = Duration::from_millis(280);
 /// The panel's scrollable, for jumping back to its top.
 pub(super) const SCROLL: &str = "inspector";
+/// Rows an open feature group lays out until asked for the rest. The panel
+/// is rebuilt with every camera frame, and hundreds of rows cost a small
+/// computer more than its preview.
+const GROUP_ROWS: usize = 80;
 /// The feature groups retain every advertised control, including vendor
 /// extensions. Specialized controls come first for their camera type.
 fn feature_groups(kind: CameraKind) -> &'static [&'static str] {
@@ -631,6 +635,8 @@ pub(super) struct InspectorState {
     /// Disclosures are view preferences; searching temporarily reveals matches
     /// without changing them or discarding camera drafts.
     feature_groups_open: HashSet<&'static str>,
+    /// Long open groups shown whole; folding one shortens it again.
+    feature_groups_whole: HashSet<&'static str>,
     camera_details_open: bool,
     capture_options_open: bool,
     automation_open: bool,
@@ -687,6 +693,7 @@ impl Default for InspectorState {
     fn default() -> Self {
         Self {
             feature_groups_open: HashSet::new(),
+            feature_groups_whole: HashSet::new(),
             camera_details_open: false,
             capture_options_open: false,
             automation_open: false,
@@ -864,7 +871,9 @@ impl Workbench {
     pub(super) fn toggle_inspector_section(&mut self, section: Section) {
         match section {
             Section::Features(group) => {
-                if !self.inspect.feature_groups_open.remove(group) {
+                if self.inspect.feature_groups_open.remove(group) {
+                    self.inspect.feature_groups_whole.remove(group);
+                } else {
                     self.inspect.feature_groups_open.insert(group);
                 }
             }
@@ -955,8 +964,36 @@ impl Workbench {
                 self.inspect.feature_groups_open.insert(group);
             } else {
                 self.inspect.feature_groups_open.remove(group);
+                self.inspect.feature_groups_whole.remove(group);
             }
         }
+    }
+
+    /// Show every row of a long open group.
+    pub(super) fn show_whole_group(&mut self, group: &'static str) {
+        self.inspect.feature_groups_whole.insert(group);
+    }
+
+    /// The rows of open group `group` that show: the first `GROUP_ROWS`,
+    /// and any later one being edited or refused, unless it shows whole;
+    /// and how many more it holds.
+    fn shown_rows(&self, group: &'static str, members: &[usize]) -> (Vec<usize>, usize) {
+        if members.len() <= GROUP_ROWS || self.inspect.feature_groups_whole.contains(group) {
+            return (members.to_vec(), 0);
+        }
+        let features = &self.snapshot.features;
+        let rows: Vec<usize> = members
+            .iter()
+            .enumerate()
+            .filter(|&(n, &i)| {
+                n < GROUP_ROWS
+                    || self.edits.contains_key(&features[i].name)
+                    || self.inspect.write_errors.contains_key(&features[i].name)
+            })
+            .map(|(_, &i)| i)
+            .collect();
+        let more = members.len() - rows.len();
+        (rows, more)
     }
 
     /// Point the settings panel's motions at what they show; from
@@ -1485,7 +1522,7 @@ fn error_caption<'a>(message: String, quiet: bool, p: &'static Palette) -> Eleme
 /// An accent text action.
 /// A text action, set in the medium weight so it reads apart from the
 /// counts and notes beside it.
-fn link<'a>(label: &'a str, on: Option<Message>) -> Element<'a, Message> {
+fn link<'a>(label: impl text::IntoFragment<'a>, on: Option<Message>) -> Element<'a, Message> {
     button(text(label).size(style::SMALL).font(style::MEDIUM))
         .padding([3, 8])
         .style(style::link)
@@ -1757,7 +1794,14 @@ impl Workbench {
                     if let Some(guidance) = group_guidance(group, kind) {
                         content = content.push(reason(guidance, p));
                     }
-                    content = content.push(self.feature_rows(&members, p));
+                    let (rows, more) = self.shown_rows(group, &members);
+                    content = content.push(self.feature_rows(&rows, p));
+                    if more > 0 {
+                        content = content.push(link(
+                            format!("Show {} more", grouped(more as u64)),
+                            Some(Message::ShowFeatures(group)),
+                        ));
+                    }
                 }
                 groups = groups.push(*group, content);
             }
@@ -3620,6 +3664,51 @@ impl Workbench {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn long_feature_groups_show_their_first_rows_until_asked_for_the_rest() {
+        let mut bench = bench();
+        bench.snapshot.features = (0..200)
+            .map(|n| FeatureInfo {
+                name: format!("Feature{n}"),
+                display_name: format!("Feature {n}"),
+                kind: "Integer".into(),
+                value: Some(json!(n)),
+                writable: true,
+                description: String::new(),
+                unit: None,
+                min: None,
+                max: None,
+                inc: None,
+                choices: Vec::new(),
+                error: None,
+            })
+            .collect();
+        let group = "Image Format Control";
+        let members: Vec<usize> = (0..200).collect();
+        let (rows, more) = bench.shown_rows(group, &members[..GROUP_ROWS]);
+        assert_eq!(
+            (rows.len(), more),
+            (GROUP_ROWS, 0),
+            "short groups show whole"
+        );
+        // A row being edited or refused shows wherever it is.
+        bench.edits.insert("Feature150".into(), "7".into());
+        bench
+            .inspect
+            .write_errors
+            .insert("Feature199".into(), "refused".into());
+        let (rows, more) = bench.shown_rows(group, &members);
+        assert_eq!(rows.len(), GROUP_ROWS + 2);
+        assert_eq!(&rows[GROUP_ROWS..], [150, 199]);
+        assert_eq!(more, 118);
+        let _ = bench.update(Message::ShowFeatures(group));
+        assert_eq!(bench.shown_rows(group, &members), (members.clone(), 0));
+        // Folding the group shortens it for the next time it opens.
+        bench.inspect.feature_groups_open.insert(group);
+        bench.toggle_inspector_section(Section::Features(group));
+        assert_eq!(bench.shown_rows(group, &members).1, 118);
+    }
 
     #[test]
     fn actual_capture_and_recording_fields_expose_precise_invalid_drafts_and_recovery() {

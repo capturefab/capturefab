@@ -26,6 +26,8 @@ mod motion;
 mod network;
 mod notice;
 mod oneline;
+mod pacing;
+mod performance;
 mod pick_list;
 mod prefs;
 mod preview;
@@ -114,10 +116,12 @@ const SIDEBAR: f32 = 240.0;
 const TOOLBAR: f32 = 45.0;
 const INSPECTOR: f32 = 316.0;
 const GUTTER: f32 = 18.0;
-/// Longest wait between checks for a new camera frame.
-const FRAME_POLL: Duration = Duration::from_millis(2);
 /// Small overview tiles gain nothing from more than 30 redraws a second.
 const OVERVIEW_INTERVAL: Duration = Duration::from_micros(33_333);
+/// Efficiency mode draws at most 15 frames a second in a camera's view, and
+/// 5 in the overview.
+const EFFICIENT_INTERVAL: Duration = Duration::from_micros(66_667);
+const EFFICIENT_OVERVIEW_INTERVAL: Duration = Duration::from_millis(200);
 
 pub fn run(handle: SessionHandle, session_label: String, simulated: bool) -> Result<()> {
     run_capture(handle, session_label, simulated, None, 0)
@@ -290,44 +294,6 @@ pub fn run_capture(
         anyhow::bail!(error);
     }
     Ok(())
-}
-
-/// The session whose shared frame rings the frame watcher polls, and the
-/// shortest gap between its signals. A window has one session, and the gap is
-/// read live rather than hashed, so following the display never restarts the
-/// watcher.
-struct FrameWatch {
-    handle: SessionHandle,
-    /// Nanoseconds; see `Workbench::frame_gap`.
-    gap: Arc<AtomicU64>,
-}
-
-impl std::hash::Hash for FrameWatch {
-    fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {}
-}
-
-/// Sends `FrameArrived` when any camera publishes a frame: at most once per
-/// gap, and not again until the workbench has taken the last one.
-fn watch_frames(watch: &FrameWatch) -> impl iced::futures::Stream<Item = Message> + use<> {
-    let handle = watch.handle.clone();
-    let gap = watch.gap.clone();
-    iced::stream::channel(0, async move |mut output| {
-        std::thread::spawn(move || {
-            let mut seen = handle.frame_sequence();
-            while !output.is_closed() {
-                let gap = Duration::from_nanos(gap.load(Ordering::Relaxed));
-                // Finer checks at high refresh rates keep frames on their vsync.
-                let poll = (gap / 8).clamp(Duration::from_millis(1), FRAME_POLL);
-                std::thread::sleep(poll);
-                let sequence = handle.frame_sequence();
-                if sequence != seen && output.try_send(Message::FrameArrived).is_ok() {
-                    seen = sequence;
-                    std::thread::sleep(gap.saturating_sub(poll));
-                }
-            }
-        });
-        std::future::pending::<()>().await;
-    })
 }
 
 /// Session activity has its own condition variable, so even an idle window
@@ -610,6 +576,11 @@ enum Message {
     /// A redraw paced by the display, at the given time.
     Frame(Instant),
     FrameArrived,
+    /// The main window drew after frame work paused for want of draws.
+    Redrawn,
+    /// Whether the main window is out of sight, where the platform says;
+    /// see `pacing::out_of_sight`.
+    Hidden(Option<bool>),
     /// The window opened, moved or changed scale, perhaps onto another display.
     Displaced,
     /// The refresh interval the window's screen reports, if any.
@@ -629,6 +600,7 @@ enum Message {
     Settings(bool),
     Appearance(Appearance),
     UiScale(UiScale),
+    Performance(crate::efficiency::Mode),
     ScaledViewport(Size),
     CloseRequested(window::Id),
     WindowOpened(window::Id),
@@ -701,6 +673,8 @@ enum Message {
     InspectorDisclosure(inspector::Section),
     /// Open every feature group, or close them all.
     ExpandFeatureGroups(bool),
+    /// Show every row of a long feature group.
+    ShowFeatures(&'static str),
     RefreshFeatures,
     Auto(bool),
     Balance(f64),
@@ -845,6 +819,9 @@ struct Workbench {
     system_dark: bool,
     appearance: Appearance,
     ui_scale: UiScale,
+    /// Settings › Performance, as chosen here.
+    performance: crate::efficiency::Mode,
+    performance_state: performance::PerformanceState,
     screenshot: Option<ScreenshotRequest>,
     logs_open: bool,
     help_open: bool,
@@ -871,8 +848,16 @@ struct Workbench {
     shown: Option<Shown>,
     gpu: GpuFrames,
     refresh: refresh::Refresh,
-    /// Nanoseconds between new-frame announcements, read by the frame watcher.
-    frame_gap: Arc<AtomicU64>,
+    /// What the frame watcher follows.
+    cadence: Arc<pacing::Cadence>,
+    draws: Arc<pacing::Draws>,
+    /// The first change of the view since the main window last drew; see
+    /// `frames_paused`.
+    undrawn: Option<Instant>,
+    /// The main window is out of sight, as far as the platform tells.
+    hidden: bool,
+    /// When frame work last took the newest frames; see `tick_frames`.
+    frames_taken: Option<Instant>,
     frame_meta: Option<(u64, u32, u32, u32, u64)>,
     /// When the frame shown is a downscaled preview of one larger than the
     /// camera's ring, that frame's width, height and pixel format.
@@ -1060,6 +1045,8 @@ impl Workbench {
                 Ok("larger") => UiScale::Larger,
                 _ => prefs.ui_scale,
             },
+            performance: prefs.performance,
+            performance_state: Default::default(),
             screenshot: None,
             logs_open: prefs.logs_open,
             help_open: false,
@@ -1087,7 +1074,11 @@ impl Workbench {
             shown: None,
             gpu: GpuFrames::new(),
             refresh: refresh::Refresh::default(),
-            frame_gap: Arc::default(),
+            cadence: Arc::default(),
+            draws: Arc::default(),
+            undrawn: None,
+            hidden: false,
+            frames_taken: None,
             frame_meta: None,
             frame_source: None,
             frame_id: None,
@@ -1178,6 +1169,8 @@ impl Workbench {
             sheets: Default::default(),
         };
         bench.restore_open_sections(&open_sections);
+        performance::start(bench.performance);
+        bench.sync_performance();
         bench
     }
 
@@ -1185,6 +1178,7 @@ impl Workbench {
         Prefs {
             appearance: self.appearance,
             ui_scale: self.ui_scale,
+            performance: self.performance,
             include_simulator: self.include_simulator,
             tab: self.tab,
             exposure_open: self.exposure_open,
@@ -1346,6 +1340,10 @@ impl Workbench {
             || self.record_to.busy();
         let interval = if busy {
             Duration::from_millis(60)
+        } else if self.frames_paused() || self.key_window.is_none() && !streaming {
+            // Nothing on screen, or nothing changing in the background:
+            // status, notices and saving still keep up.
+            Duration::from_secs(1)
         } else if streaming {
             Duration::from_millis(250)
         } else {
@@ -1357,13 +1355,13 @@ impl Workbench {
         } else {
             Subscription::none()
         };
-        let arrivals = if streaming {
+        let arrivals = if self.shown_streaming() {
             Subscription::run_with(
-                FrameWatch {
+                pacing::FrameWatch {
                     handle: self.handle.clone(),
-                    gap: self.frame_gap.clone(),
+                    cadence: self.cadence.clone(),
                 },
-                watch_frames,
+                pacing::watch_frames,
             )
         } else {
             Subscription::none()
@@ -1659,18 +1657,24 @@ impl Workbench {
         if self.fullscreen { 0.0 } else { LIGHTS }
     }
 
-    /// How long the frame watcher waits between announcing new frames: one
-    /// refresh, or the overview's slower interval, less a quarter refresh.
-    /// Sleep overshoot and polling would otherwise often land just after a
-    /// vsync and hold the frame for a whole extra refresh.
-    fn frame_gap(&self) -> Duration {
-        let period = self.refresh.period();
-        let interval = if self.overview() {
-            period.max(OVERVIEW_INTERVAL)
-        } else {
-            period
+    /// How often new frames are shown at most: once a refresh, or the
+    /// overview's slower interval; efficiency mode slows both.
+    fn frame_interval(&self) -> Duration {
+        let floor = match (self.overview(), performance::efficient()) {
+            (false, false) => Duration::ZERO,
+            (true, false) => OVERVIEW_INTERVAL,
+            (false, true) => EFFICIENT_INTERVAL,
+            (true, true) => EFFICIENT_OVERVIEW_INTERVAL,
         };
-        interval - period / 4
+        self.refresh.period().max(floor)
+    }
+
+    /// How long the frame watcher waits between announcing new frames: the
+    /// frame interval less a quarter refresh. Sleep overshoot and polling
+    /// would otherwise often land just after a vsync and hold the frame for
+    /// a whole extra refresh.
+    fn frame_gap(&self) -> Duration {
+        self.frame_interval() - self.refresh.period() / 4
     }
 
     fn overview(&self) -> bool {
@@ -1845,7 +1849,9 @@ impl Workbench {
         self.sync_client_activity();
         self.sample_throughput();
         self.observe_liveness();
-        self.update_frames();
+        self.tick_frames();
+        self.refresh.settle(self.now);
+        self.tick_performance();
         let destination_before = local_history::LocalState::capture(self);
         self.capture_to.tick(&mut self.output);
         self.record_to.tick(&mut self.forward_output);
@@ -1868,6 +1874,12 @@ impl Workbench {
         Task::batch([
             pages,
             self.screenshot_tick(),
+            // An unseen window may still draw.
+            if self.sight_unknown() {
+                pacing::out_of_sight(self.main_window)
+            } else {
+                Task::none()
+            },
             if self.screenshot.is_none() {
                 // A destination's own picker shows its free space.
                 let folder = self
@@ -1909,6 +1921,16 @@ impl Workbench {
     }
 
     fn update_frames(&mut self) {
+        if self.frames_paused() {
+            // Frames, and the watcher with them, wait until the window
+            // draws again; a hidden one may draw without showing.
+            if !self.hidden {
+                self.draws.pause();
+            }
+            return;
+        }
+        self.cadence.taken();
+        self.frames_taken = Some(self.now);
         self.camera_views.retain(|id, _| {
             self.snapshot
                 .cameras
@@ -2566,16 +2588,23 @@ impl Workbench {
             message => message,
         };
         self.now = Instant::now();
+        self.note_undrawn();
         let scale_before = self.ui_scale;
         let sheet_before = self.sheet_open();
-        let menus_changed = !matches!(
+        let frame_only = matches!(
             message,
             Message::Frame(_)
                 | Message::FrameArrived
+                | Message::Redrawn
                 | Message::Pointer
                 | Message::OverControls(_)
                 | Message::HoverTile(_)
         );
+        // An assistive technology hears of new state on the next draw. New
+        // frames alone wait for its throttle; pointer input tells it itself.
+        if !frame_only && !matches!(message, Message::AccessibilityChanged(_)) {
+            self.accessibility.changed();
+        }
         // Apply ready completions before capturing this gesture. A destination
         // replay must never overwrite input before its history entry exists.
         self.poll_destination_history();
@@ -2608,10 +2637,10 @@ impl Workbench {
                 auxiliary,
             ]);
         }
+        self.sync_performance();
         self.sync_animations();
-        self.frame_gap
-            .store(self.frame_gap().as_nanos() as u64, Ordering::Relaxed);
-        if menus_changed {
+        self.follow_frames();
+        if !frame_only {
             menus::sync(self);
         }
         task
@@ -2682,18 +2711,33 @@ impl Workbench {
                 {
                     return window::gain_focus(error.window);
                 }
+                let sight = if id == self.main_window && std::mem::take(&mut self.hidden) {
+                    self.update_frames();
+                    Task::none()
+                } else if self.hidden {
+                    // Another window brought the app forward, and the main
+                    // window perhaps with it.
+                    pacing::out_of_sight(self.main_window)
+                } else {
+                    Task::none()
+                };
                 self.focused_window = id;
                 self.key_window = Some(id);
                 self.menu_editor = self.window_editor_focus.get(&id).copied().unwrap_or(false);
                 self.popup_open = false;
-                return self.accessibility.focused(id, true).discard();
+                return Task::batch([self.accessibility.focused(id, true).discard(), sight]);
             }
             Message::WindowUnfocused(id) => {
                 if self.key_window == Some(id) {
                     self.key_window = None;
                 }
                 self.desktop_menu = Default::default();
-                return self.accessibility.focused(id, false).discard();
+                let hidden = if id == self.main_window {
+                    pacing::out_of_sight(id)
+                } else {
+                    Task::none()
+                };
+                return Task::batch([self.accessibility.focused(id, false).discard(), hidden]);
             }
             Message::CloseRequested(_) if self.close_error.is_some() => {
                 self.dismiss_close_error();
@@ -2808,6 +2852,7 @@ impl Workbench {
             }
             Message::Appearance(value) => self.appearance = value,
             Message::UiScale(value) => self.ui_scale = value,
+            Message::Performance(mode) => self.performance = mode,
             Message::ScaledViewport(size) => {
                 self.width = size.width;
                 self.height = size.height;
@@ -2836,7 +2881,7 @@ impl Workbench {
             Message::Tick => return self.tick(),
             Message::Frame(at) => self.refresh.redraw(at),
             Message::Displaced => {
-                self.refresh.recalibrate();
+                self.refresh.moved(self.now);
                 let id = self.main_window;
                 return Task::batch([
                     screen_refresh(id),
@@ -2844,8 +2889,14 @@ impl Workbench {
                 ]);
             }
             Message::ScreenRefresh(period) => self.refresh.report(period),
-            Message::FrameArrived if !self.shot_staged() => self.update_frames(),
-            Message::FrameArrived => {}
+            Message::FrameArrived | Message::Redrawn if !self.shot_staged() => self.update_frames(),
+            Message::FrameArrived | Message::Redrawn => {}
+            Message::Hidden(Some(hidden)) => {
+                if std::mem::replace(&mut self.hidden, hidden) && !hidden {
+                    self.update_frames();
+                }
+            }
+            Message::Hidden(None) => {}
             Message::SystemTheme(mode) => self.system_dark = mode == theme::Mode::Dark,
             Message::Key { chord, captured } => {
                 self.desktop_menu.cancel_alt();
@@ -2901,7 +2952,8 @@ impl Workbench {
             Message::ZoomWindow => {
                 return Task::done(self.main_window).then(|id| {
                     match prefs::double_click_action() {
-                        prefs::DoubleClickAction::Minimize => window::minimize(id, true),
+                        prefs::DoubleClickAction::Minimize => window::minimize(id, true)
+                            .chain(Task::done(Message::Hidden(Some(true)))),
                         prefs::DoubleClickAction::None => Task::none(),
                         prefs::DoubleClickAction::Fill => {
                             window::run(id, prefs::fill_window).discard()
@@ -3069,6 +3121,7 @@ impl Workbench {
             Message::Search(value) => self.search = value,
             Message::InspectorDisclosure(section) => self.toggle_inspector_section(section),
             Message::ExpandFeatureGroups(open) => self.expand_feature_groups(open),
+            Message::ShowFeatures(group) => self.show_whole_group(group),
             Message::RefreshFeatures => {
                 self.edits.clear();
                 self.edit_sources.clear();
@@ -3487,7 +3540,7 @@ impl Workbench {
         } else {
             container(self.view()).id("workbench-root").into()
         };
-        accessibility::wrap(
+        let view = accessibility::wrap(
             self.close_error_view(
                 keyboard_history::background(content, self.closing.is_some()),
                 id,
@@ -3502,7 +3555,12 @@ impl Workbench {
             self.window_scales.get(&id).copied().unwrap_or(1.0) * self.ui_scale.factor(),
             Message::AccessibilityChanged,
         )
-        .map(move |message| Message::InWindow(id, Box::new(message)))
+        .map(move |message| Message::InWindow(id, Box::new(message)));
+        if id == self.main_window {
+            pacing::observe(view, self.draws.clone(), self.frames_shown())
+        } else {
+            view
+        }
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -3678,7 +3736,6 @@ fn num_requirement(key: Num) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iced::futures::{FutureExt, StreamExt};
 
     #[test]
     fn opening_panels_build_their_editors_before_animation_frames() {
@@ -3937,18 +3994,6 @@ mod tests {
         }
         bench.forward_output = "rtsp://127.0.0.1:8554/live".into();
         assert_eq!(bench.prefs().forward_output, "rtsp://127.0.0.1:8554/live");
-    }
-
-    #[test]
-    fn frame_watcher_stays_quiet_without_new_frames() {
-        let watch = FrameWatch {
-            handle: SessionHandle::new(),
-            gap: Arc::new(AtomicU64::new(16_000_000)),
-        };
-        let mut frames = Box::pin(watch_frames(&watch));
-        assert!(frames.next().now_or_never().is_none());
-        std::thread::sleep(FRAME_POLL * 10);
-        assert!(frames.next().now_or_never().is_none());
     }
 
     #[test]

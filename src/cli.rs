@@ -79,7 +79,7 @@ pub struct Cli {
         default_value = "auto"
     )]
     pub hwaccel: String,
-    /// Efficiency mode for this process and the camera workers it starts (default: CAPTUREFAB_EFFICIENCY, then auto, which is efficient on small or low-power computers)
+    /// Efficiency mode for this process and the camera workers it starts (default: CAPTUREFAB_EFFICIENCY, the desktop setting, then auto, which is efficient on small or low-power computers)
     #[arg(
         long,
         global = true,
@@ -3008,9 +3008,9 @@ fn schema() -> Value {
     contract["efficiency"] = json!({
         "cli":"--efficiency auto|smooth|efficient (global)",
         "environment":crate::efficiency::ENV,
-        "precedence":"--efficiency, then CAPTUREFAB_EFFICIENCY, then auto; an unknown CAPTUREFAB_EFFICIENCY value means auto",
-        "auto":"efficient with at most 2 CPU cores, at most 2 GiB of memory, or the OS low-power or battery-saver mode; running on battery alone stays smooth",
-        "scope":"The process that parses it, such as the desktop window, serve or a direct command, and the camera workers it starts, which are told efficient whenever that process resolved efficient; a running session keeps its own setting, and its workers follow when it changes, for decoders they start afterwards and from the next embedding. In workers, efficient decodes each live stream with one thread, picks a faster libx264 preset and limits automatic capture's CPU embedding to a fifth of one core instead of half; the session polls its workers for status every 500 ms instead of 250 ms while a camera streams or a view watches, and every 2 s instead of 1 s otherwise. Captures and recordings keep every frame in every mode.",
+        "precedence":"--efficiency, then CAPTUREFAB_EFFICIENCY, then the desktop setting (Settings > Performance), then auto; an unknown CAPTUREFAB_EFFICIENCY value means auto",
+        "auto":"efficient with at most 2 CPU cores, at most 2 GiB of memory, the OS low-power or battery-saver mode, or a desktop runtime hint (software rendering, or a preview that keeps falling behind); running on battery alone stays smooth",
+        "scope":"The process that parses it, such as the desktop window, serve or a direct command, and the camera workers it starts, which are told efficient whenever that process resolved efficient; a running session keeps its own setting, and its workers follow when it changes, for decoders they start afterwards and from the next embedding. In workers, efficient decodes each live stream with one thread, picks a faster libx264 preset and limits automatic capture's CPU embedding to a fifth of one core instead of half; the session polls its workers for status every 500 ms instead of 250 ms while a camera streams or a view watches, and every 2 s instead of 1 s otherwise. In the desktop window it draws at most 15 camera frames a second in a camera's view and 5 per overview tile, checks for new frames less often and skips animations. Captures and recordings keep every frame in every mode.",
         "status":"doctor --json efficiency {setting,efficient,reasons}"
     });
     contract["doctor"] = json!({
