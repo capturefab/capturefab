@@ -438,7 +438,7 @@ fn runtime_dir_check(login: &Path, why: LoginDir, runtime: &Place, state: &Place
             "XDG_RUNTIME_DIR is unset and {why}, so sessions are on disk in {runtime}, while logins look for them in {dir}/capturefab."
         ),
         format!(
-            "{fix} Settings, destinations, the upload queue and the storage ledger stay in {state} either way."
+            "{fix} Settings, destinations, the upload queue and the storage ledger stay in {state} either way. A service unit that does this: {LINE_COMPUTER}"
         ),
     )
 }
@@ -1104,6 +1104,7 @@ mod tests {
             "{fix}"
         );
         assert!(!fix.contains("export XDG_RUNTIME_DIR"), "{fix}");
+        assert!(fix.ends_with("/docs/line-computer.md"), "{fix}");
         // A lingering service that started before logind made the directory
         // needs only to wait for it.
         let early = runtime_dir_check(login, LoginDir::Missing, &runtime, &state);
