@@ -305,7 +305,7 @@ Explicit `--delete-oldest` retention only removes completed Capturefab files who
 
 ## Install the correct release
 
-Read [`releases.json`](releases.json). Its schema is version 1. Each available asset identifies its operating system, architecture, desktop/headless variant, file name, download URL, SHA-256 checksum, and optional signature/application bundle. An empty releases list is not a published release. Assets marked `available: false` must not be offered as downloads. A release may also link `sbom_url`, a CycloneDX software bill of materials, and its files carry GitHub build-provenance and SBOM attestations (`gh attestation verify FILE --repo capturefab/capturefab`).
+Read [`releases.json`](releases.json). Its schema is version 1. Each available asset identifies its operating system, architecture, desktop/headless variant, file name, download URL, SHA-256 checksum, and optional signature/application bundle; `browser_client: true` marks an executable with the browser client for `serve --listen` built in. An empty releases list is not a published release. Assets marked `available: false` must not be offered as downloads. A release may also link `sbom_url`, a CycloneDX software bill of materials, and its files carry GitHub build-provenance and SBOM attestations (`gh attestation verify FILE --repo capturefab/capturefab`).
 
 Use `uname -m` on Linux and macOS or the operating system's system information on Windows. `x86_64` is x64, `aarch64` is ARM64, and `armv7l` is ARMv7. Apple Silicon uses ARM64. Raspberry Pi and Jetson builds must match the installed OS architecture; a 64-bit processor can run a 32-bit OS. Verify the release checksum before running a downloaded binary.
 
