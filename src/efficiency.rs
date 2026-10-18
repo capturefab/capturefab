@@ -190,6 +190,12 @@ pub(crate) fn pin(efficient: bool) {
     PINNED.set(Some(efficient));
 }
 
+/// What `pin` holds `efficient` at on this test's thread, if anything.
+#[cfg(test)]
+pub(crate) fn pinned() -> Option<bool> {
+    PINNED.get()
+}
+
 /// The `--efficiency` flag of this process, if given.
 pub fn configure(flag: Option<Mode>) {
     STATE.update(|overrides| overrides.flag = flag);

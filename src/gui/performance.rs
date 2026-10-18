@@ -69,9 +69,12 @@ pub(super) mod process {
     }
     thread_local! { static STATE: RefCell<State> = RefCell::default(); }
 
+    /// A forced answer, else one pinned for code outside the GUI too, such
+    /// as `frame::shrink`, else this thread's setting.
     pub(in super::super) fn efficient() -> bool {
         STATE
             .with_borrow(|state| state.forced)
+            .or_else(crate::efficiency::pinned)
             .unwrap_or_else(|| current().efficient)
     }
     pub(in super::super) fn current() -> Resolved {
@@ -484,7 +487,7 @@ impl Workbench {
                 index as f32,
             ),
             text(
-                "Efficient draws up to 15 camera frames a second, 5 in the overview, and skips animations. Captures and recordings keep every frame."
+                "Efficient draws up to 15 camera frames a second, 5 in the overview, keeps scaled-down pictures to 1280 pixels and skips animations. Captures and recordings keep every frame."
             )
             .size(style::SMALL)
             .color(p.secondary),

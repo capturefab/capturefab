@@ -134,6 +134,37 @@ fn efficiency_mode_keeps_1280_pixels_a_side_on_the_gpu_too_short_of_one_to_one()
 }
 
 #[test]
+fn choosing_efficient_in_settings_caps_the_preview_size_and_rate_together() {
+    // Not bench(), whose pin would answer for Settings › Performance.
+    let (handle, mut writer) = SessionHandle::fed(8 << 20);
+    let mut bench = Workbench::new(handle, "test".into(), true, None);
+    let gpu = GpuFrames::limited(8192);
+    bench.gpu = gpu.clone();
+    bench.snapshot.active_camera = Some("cam".into());
+    bench.stage.set(Size::new(800.0, 600.0));
+    bench.window_scales.insert(bench.main_window, 2.0);
+    let mosaic = |id| Frame {
+        id,
+        width: 2448,
+        height: 2048,
+        pixel_format: 0x0108_0009,
+        timestamp_ns: id,
+        data: vec![90; 2448 * 2048],
+    };
+    let _ = bench.update(Message::Performance(crate::efficiency::Mode::Smooth));
+    writer.write(&mosaic(1), false).unwrap();
+    bench.update_frames();
+    assert_eq!(uploaded(&gpu, MAIN_VIEW), Some((2448, 2048)));
+    assert!(bench.frame_interval() < EFFICIENT_INTERVAL);
+    let _ = bench.update(Message::Performance(crate::efficiency::Mode::Efficient));
+    assert_eq!(bench.frame_interval(), EFFICIENT_INTERVAL, "15 a second");
+    writer.write(&mosaic(2), false).unwrap();
+    bench.update_frames();
+    assert_eq!(uploaded(&gpu, MAIN_VIEW), Some((1224, 1024)), "1280 a side");
+    bench.handle.shutdown();
+}
+
+#[test]
 fn scopes_measure_a_stream_at_their_own_pace() {
     let (mut bench, mut writer) = bench();
     bench.exposure_open = true;

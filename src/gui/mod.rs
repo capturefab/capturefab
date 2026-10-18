@@ -2006,7 +2006,7 @@ impl Workbench {
         });
         let grid = self.grid.get();
         let (count, scale) = (snapshot.cameras.len(), self.main_scale());
-        let (most, shrink_for_gpu) = if crate::efficiency::efficient() {
+        let (most, shrink_for_gpu) = if performance::efficient() {
             (EFFICIENT_SIDE, preview::Shrink::Larger)
         } else {
             (TILE_SIDE, preview::Shrink::UnderHalf)
@@ -2148,7 +2148,7 @@ impl Workbench {
         } else {
             self.zoom
         };
-        let (most, shrink_for_gpu) = if crate::efficiency::efficient() {
+        let (most, shrink_for_gpu) = if performance::efficient() {
             (EFFICIENT_SIDE, preview::Shrink::Larger)
         } else {
             (u32::MAX, preview::Shrink::Never)
