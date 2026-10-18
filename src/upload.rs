@@ -850,33 +850,99 @@ fn queue_status(queue: &Queue) -> Result<Value> {
         "uploaded_bytes": totals.uploaded_bytes,
         "failures": totals.failures,
         "last_error": totals.last_error,
+        "destinations": destinations(queue),
         "items": recent,
     }))
 }
 
-/// Move failed uploads (all, or one by id) back to pending.
-pub fn retry(id: Option<&str>) -> Result<usize> {
+/// One destination's uploads in the queue, all of them counted.
+#[derive(Default, Serialize)]
+struct Backlog {
+    pending: usize,
+    uploading: usize,
+    failed: usize,
+    waiting_bytes: u64,
+    /// When its next waiting upload may start, in Unix seconds: at or
+    /// before now while one is due, later while it waits to retry.
+    next_attempt: Option<u64>,
+    /// The newest error of a failed upload, or else of a waiting one.
+    last_error: Option<String>,
+}
+
+/// Each destination with queued uploads, by name. The caller has checked
+/// that the queue's bytes add up.
+fn destinations(queue: &Queue) -> BTreeMap<&str, Backlog> {
+    let mut destinations = BTreeMap::<&str, Backlog>::new();
+    for item in &queue.items {
+        let backlog = destinations.entry(&item.destination).or_default();
+        match item.state {
+            State::Pending => {
+                backlog.pending += 1;
+                let due = queue.due_at(item);
+                backlog.next_attempt = Some(backlog.next_attempt.map_or(due, |next| next.min(due)));
+            }
+            State::Uploading => backlog.uploading += 1,
+            State::Failed => backlog.failed += 1,
+        }
+        if item.state != State::Failed {
+            backlog.waiting_bytes += item.bytes;
+        }
+        if let Some(error) = &item.error
+            && (item.state == State::Failed || backlog.failed == 0)
+        {
+            backlog.last_error = Some(error.clone());
+        }
+    }
+    destinations
+}
+
+/// Move failed uploads (all, or one by ID) back to pending. With `waiting`,
+/// uploads waiting to retry start now too, and their destinations' backoff
+/// ends. Returns how many uploads this makes due.
+pub fn retry(id: Option<&str>, waiting: bool) -> Result<usize> {
     if let Some(id) = id {
         validate_id(id)?;
     }
     let changed = with_queue(|uploads| {
-        let put: Vec<Item> = uploads
-            .queue
+        let (queue, now) = (&uploads.queue, now());
+        let chosen: Vec<&Item> = queue
             .items
             .iter()
-            .filter(|item| item.state == State::Failed && id.is_none_or(|id| id == item.id))
+            .filter(|item| {
+                id.is_none_or(|id| id == item.id)
+                    && (item.state == State::Failed
+                        || (waiting && item.state == State::Pending && queue.due_at(item) > now))
+            })
+            .collect();
+        ensure!(
+            id.is_none() || !chosen.is_empty(),
+            "no {} upload with the requested ID; choose an ID from upload status",
+            if waiting {
+                "failed or waiting"
+            } else {
+                "failed"
+            }
+        );
+        let mut totals = queue.totals.clone();
+        for item in chosen.iter().filter(|_| waiting) {
+            totals.backoff.remove(&item.destination);
+        }
+        let put = chosen
+            .iter()
+            .filter(|item| item.state == State::Failed || item.next_attempt > now)
             .map(|item| Item {
                 state: State::Pending,
                 attempts: 0,
                 next_attempt: 0,
-                ..item.clone()
+                ..(*item).clone()
             })
             .collect();
-        ensure!(
-            id.is_none() || !put.is_empty(),
-            "no failed upload with the requested ID; choose an ID from upload status"
-        );
-        Ok((put.len(), Change::put(put)))
+        let change = Change {
+            put,
+            totals: (totals.backoff.len() < queue.totals.backoff.len()).then_some(totals),
+            ..Change::default()
+        };
+        Ok((chosen.len(), change))
     })?;
     WAKE.1.notify_all();
     Ok(changed)
@@ -1280,7 +1346,7 @@ mod tests {
         assert!(invalid.validate().is_err());
         for id in ["", "bad", "0123456789ABCDEF", "0123456789abcdeg"] {
             assert!(validate_id(id).is_err());
-            assert!(retry(Some(id)).is_err());
+            assert!(retry(Some(id), false).is_err());
             assert!(forget(id).is_err());
         }
     }
@@ -1647,6 +1713,56 @@ mod tests {
         let next = path.with_file_name("next.png");
         let _ = crate::storage::save_bytes(b"next", &next, &policy);
         assert!(path.exists());
+    }
+
+    #[test]
+    fn status_counts_every_upload_of_each_destination() {
+        if !isolated("status_counts_every_upload_of_each_destination") {
+            return;
+        }
+        let mut queued = items(0..502);
+        for (item, state) in queued[500..]
+            .iter_mut()
+            .zip([State::Pending, State::Failed])
+        {
+            item.destination = "other".into();
+            item.state = state;
+            item.error = Some(format!("{state:?} error"));
+        }
+        put(queued.clone());
+        // The archive's first upload fails, and all 500 wait for its backoff.
+        let first = with_queue(next_due).unwrap().unwrap();
+        let error = Err(anyhow!("connection refused"));
+        with_queue(|uploads| Ok(((), update_after(uploads, &first, &error)))).unwrap();
+        let queue = status().unwrap();
+        assert_eq!(queue["items"].as_array().unwrap().len(), 200);
+        let archive = &queue["destinations"]["archive"];
+        assert_eq!(
+            (
+                &archive["pending"],
+                &archive["failed"],
+                &archive["waiting_bytes"]
+            ),
+            (&json!(500), &json!(0), &json!(5000))
+        );
+        assert!(archive["next_attempt"].as_u64().unwrap() >= now() + 9);
+        assert_eq!(archive["last_error"], "connection refused");
+        let other = &queue["destinations"]["other"];
+        assert_eq!(
+            (&other["pending"], &other["failed"]),
+            (&json!(1), &json!(1))
+        );
+        assert!(other["next_attempt"].as_u64().unwrap() <= now());
+        assert_eq!(other["last_error"], "Failed error");
+        // Waiting uploads are retried only on request.
+        let waiting = &queued[1].id;
+        assert!(retry(Some(waiting), false).is_err());
+        assert!(retry(Some(&queued[500].id), true).is_err(), "already due");
+        assert_eq!(retry(None, false).unwrap(), 1);
+        assert_eq!(retry(None, true).unwrap(), 500);
+        let archive = &status().unwrap()["destinations"]["archive"];
+        assert!(archive["next_attempt"].as_u64().unwrap() <= now());
+        assert!(read(|uploads| Ok(uploads.queue.totals.backoff.is_empty())).unwrap());
     }
 
     #[test]

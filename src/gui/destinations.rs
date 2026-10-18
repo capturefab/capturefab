@@ -1776,7 +1776,7 @@ impl Picker {
             Message::Retry => {
                 #[cfg(feature = "uploads")]
                 {
-                    let _ = crate::upload::retry(None);
+                    let _ = crate::upload::retry(None, false);
                     self.uploads_at = None;
                 }
             }

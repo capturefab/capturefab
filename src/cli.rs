@@ -601,7 +601,12 @@ pub enum UploadsCommand {
     /// Show waiting, failed and completed uploads
     Status,
     /// Retry failed uploads (all, or one by ID)
-    Retry { id: Option<String> },
+    Retry {
+        id: Option<String>,
+        /// Also start uploads waiting to retry, ending their destinations' backoff
+        #[arg(long)]
+        now: bool,
+    },
     /// Drop a failed upload from the queue, keeping its local file
     Forget { id: String },
     /// Upload everything that is due, then report
@@ -1458,7 +1463,8 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
             None
         }
         Some(Command::Uploads {
-            command: Some(UploadsCommand::Retry { id: Some(id) } | UploadsCommand::Forget { id }),
+            command:
+                Some(UploadsCommand::Retry { id: Some(id), .. } | UploadsCommand::Forget { id }),
         }) => {
             #[cfg(feature = "uploads")]
             crate::upload::validate_id(id)?;
@@ -2864,6 +2870,16 @@ fn schema() -> Value {
     });
     contract["scanners"] = json!({"enumeration":"scanners --json or discover --json; transport is scanner","backends":{"linux":"SANE scanimage (installed separately)","windows":"Windows Image Acquisition (WIA)","macos":"ImageCaptureCore (bundled native helper)"},"feature":"scanner; enabled by default","settings":{"ScanResolution":{"default":150,"range":[75,600],"unit":"dpi"},"ScanMode":{"default":"Color","choices":["Color","Gray","Lineart"]},"ScanSource":{"default":"Default","choices":["Default","Flatbed","Feeder"]}},"acquisition":"capture requests one page; count requests successive pages, including feeder pages; connecting/start never scans; forwarding and auto exposure are unsupported","timeout":"Use --timeout-ms 60000 for physical scans; GUI scanner timeout defaults to 60000. Each page has its own deadline and timeout cancels the helper.","outputs":"Existing capture image formats, destinations and storage quotas; no PDF/OCR conversion","limits":{"frame_bytes":134217728,"shared_ring_default_bytes_per_slot":134217728},"compatibility":"Driver-dependent settings; unsupported resolutions, modes and source names fail without silent fallback. SANE source names vary between drivers."});
     contract["storage"] = json!({"default":crate::storage::StoragePolicy::default(),"scope":"All Capturefab-owned capture and recording files across output directories in this user's session directory. Reservations count toward quota. Existing/unowned/modified files are never deleted.","recording_file_cap_default":crate::media::default_recording_cap(),"on_full":["stop","delete-oldest"],"status":"capturefab storage --json","error":"storage_full; exit 6"});
+    #[cfg(feature = "uploads")]
+    {
+        contract["uploads"] = json!({
+            "cli":"uploads [status] | retry [ID] [--now] | forget ID | wait [--timeout 10m]",
+            "status":"{pending,uploading,failed,waiting_bytes,uploaded,uploaded_bytes,failures,last_error,destinations:{NAME:{pending,uploading,failed,waiting_bytes,next_attempt,last_error}},items:[newest 200],uploader_running,completed_seq,recent_completed:[newest 20]}",
+            "destinations":"Counts every queued upload per destination. next_attempt is when its next waiting upload may start, in Unix seconds: at or before now while one is due, later while the destination backs off after a failure, null when none waits.",
+            "retry":"{retried}: failed uploads made due again; --now also starts uploads waiting to retry and ends their destinations' backoff",
+            "unheld":"An item queued while the storage ledger was busy carries unheld:true until the uploader holds it back from retention"
+        });
+    }
     contract["scheduling"] = json!({"cli":"capture --at RFC3339 | --delay 30s; --interval 10s -n 100","lifetime":"Schedules run while the GUI, serve session or direct CLI process remains running; jobs are not persisted across exit.","interval":"First time plus captured count times interval; zero interval captures consecutive frames. All frames must fall within 10 years. A past first timestamp starts immediately. Durations must resolve to whole milliseconds. Each job has a per-frame transport timeout.","states":["pending","running","complete","cancelled","failed"]});
     contract["auto"] = json!({"cli":"--session NAME auto [--balance B] | manual [--revert]; capture|forward|serve --auto [--balance B]","default":"manual; connecting never enables auto mode and it ends on disconnect","balance":"0 favors image quality, 1 favors frame rate; quality, balanced and frame-rate mean 0, 0.5 and 1; omitted keeps the current value, initially 0.5","status":"status.auto and cameras[].auto; null in manual mode","strategies":["firmware","software","video-mode","none"],"states":["waiting","converging","stable","limited"],"settled":["stable","limited"],"manual":"Setting a feature in auto.managed switches that camera to manual first and the set result adds \"auto\":null; manual turns ExposureAuto, GainAuto and BalanceWhiteAuto off so values hold","persistence":"Camera settings written by auto mode remain after manual, like set; manual --revert, disconnect and session exit restore their previous values (best effort)","capture":"--set applies before --auto; capture saves once exposure settles or after min(timeout_ms/2, 3 s) and result.auto reports the state; with --session auto mode stays on afterwards"});
     contract["history"] = json!({
@@ -3689,8 +3705,8 @@ fn uploads_command(command: Option<&UploadsCommand>) -> Result<Value> {
     {
         Ok(match command {
             None | Some(UploadsCommand::Status) => crate::upload::status()?,
-            Some(UploadsCommand::Retry { id }) => {
-                json!({"retried": crate::upload::retry(id.as_deref())?})
+            Some(UploadsCommand::Retry { id, now }) => {
+                json!({"retried": crate::upload::retry(id.as_deref(), *now)?})
             }
             Some(UploadsCommand::Forget { id }) => {
                 json!({"forgotten": crate::upload::forget(id)?})

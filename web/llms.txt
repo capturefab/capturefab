@@ -140,6 +140,8 @@ SFTP destinations must have a pinned host key: `--host-key SHA256:...` or `--acc
 `add-s3 --preset rustfs` or `--preset minio` must have `--endpoint`.
 A remote file is never replaced; FTP rename can replace on some servers, so use one writer per FTP folder.
 Persistent sessions return local capture results before upload completion; inspect the upload queue.
+`uploads --json` has `destinations:{NAME:{pending,uploading,failed,waiting_bytes,next_attempt,last_error}}` over every queued upload; `next_attempt` is in Unix seconds.
+A failing destination backs off as a whole; `uploads retry --now` retries waiting uploads at once, and `uploads retry` retries failed ones.
 
 Captures and recordings share a storage budget across processes with the same `CAPTUREFAB_SESSION_DIR`.
 Defaults are 10 GiB and 10,000 files; each recording defaults to a 512 MiB file limit.
