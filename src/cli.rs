@@ -2995,7 +2995,7 @@ fn schema() -> Value {
         "environment":crate::efficiency::ENV,
         "precedence":"--efficiency, then CAPTUREFAB_EFFICIENCY, then auto; an unknown CAPTUREFAB_EFFICIENCY value means auto",
         "auto":"efficient with at most 2 CPU cores, at most 2 GiB of memory, or the OS low-power or battery-saver mode; running on battery alone stays smooth",
-        "scope":"The process that parses it, such as the desktop window, serve or a direct command, and the camera workers it starts, which are told efficient whenever that process resolved efficient; a running session keeps its own setting. In workers, efficient decodes each live stream with one thread and picks a faster libx264 preset. Captures and recordings keep every frame in every mode.",
+        "scope":"The process that parses it, such as the desktop window, serve or a direct command, and the camera workers it starts, which are told efficient whenever that process resolved efficient; a running session keeps its own setting. In workers, efficient decodes each live stream with one thread, picks a faster libx264 preset and limits automatic capture's CPU embedding to a fifth of one core instead of half. Captures and recordings keep every frame in every mode.",
         "status":"doctor --json efficiency {setting,efficient,reasons}"
     });
     contract["doctor"] = json!({

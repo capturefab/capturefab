@@ -143,7 +143,7 @@ session continues on the CPU. Frames use the CPU until the helper is ready.
 **Speed.** On an Apple M4 Max the GPU path measured about 100 embeddings per
 second (10 ms) in isolation, and a live session followed a 30 fps simulated
 camera at 30.0 samples per second. The CPU path measured about 100 ms per
-frame (roughly 7-10 samples per second). Sampling uses a fixed grid of up to
+frame (roughly 7-10 samples per second before the pacing below). Sampling uses a fixed grid of up to
 30 per second that tolerates frames arriving a quarter interval early, so
 camera jitter does not halve the rate. Slower GPUs have not been measured.
 
