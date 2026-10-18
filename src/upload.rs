@@ -17,7 +17,7 @@
 //! Changes are appended to `uploads.journal` and folded into both files once
 //! it outgrows them, so queueing or finishing an upload costs a short append
 //! however long the backlog. Older versions read only the files, which can
-//! lag the journal by that much.
+//! lag the journal by that much; a GUI or `serve` folds it in as it exits.
 use crate::destination::{Bucket, Remote};
 use crate::transfer::{Permanent, Uploader};
 use anyhow::{Context, Result, anyhow, ensure};
@@ -1347,6 +1347,25 @@ pub fn drain(timeout: Duration) -> Result<Value> {
     }
 }
 
+/// Fold the journal into the queue file and completed log, so versions that
+/// read only those see every change; for a GUI or `serve` that is exiting.
+pub fn fold() {
+    let folded = with_lock(false, |dir| {
+        let mut cached = UPLOADS.lock().unwrap_or_else(PoisonError::into_inner);
+        let uploads = refresh(dir, &mut cached)?;
+        if uploads.seen.1.is_some_and(|journal| journal.len > 0)
+            && let Err(error) = uploads.compact(dir)
+        {
+            *cached = None;
+            return Err(error);
+        }
+        Ok(())
+    });
+    if let Err(error) = folded {
+        eprintln!("capturefab: cannot fold the upload journal into the queue: {error:#}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1980,6 +1999,27 @@ mod tests {
             let _ = done.send(());
         });
         assert!(waited.recv_timeout(Duration::from_secs(5)).is_ok());
+    }
+
+    #[test]
+    fn exiting_folds_the_journal_for_older_versions() {
+        if !isolated("exiting_folds_the_journal_for_older_versions") {
+            return;
+        }
+        put(items(0..3));
+        let dir = crate::ipc::session_dir();
+        assert!(dir.join(JOURNAL_FILE).exists());
+        fold();
+        assert!(!dir.join(JOURNAL_FILE).exists());
+        // Older versions read the queue file alone.
+        let file = fs::read(dir.join(QUEUE_FILE)).unwrap();
+        let queue: Queue = serde_json::from_slice(&file).unwrap();
+        assert_eq!(queue.items.len(), 3);
+        // With nothing journaled, it writes nothing.
+        let before = (versions(), WRITTEN.load(Ordering::Relaxed));
+        fold();
+        assert_eq!((versions(), WRITTEN.load(Ordering::Relaxed)), before);
+        assert_eq!(pending(), 3);
     }
 
     #[test]

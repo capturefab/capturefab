@@ -1792,6 +1792,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     screenshot,
                     demo_cameras,
                 )?;
+                #[cfg(feature = "uploads")]
+                crate::upload::fold();
                 return Ok(());
             }
             #[cfg(not(feature = "gui"))]
@@ -2005,6 +2007,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
             while !stopped.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(100));
             }
+            #[cfg(feature = "uploads")]
+            crate::upload::fold();
             return Ok(());
         }
         _ => {}
