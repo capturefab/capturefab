@@ -43,6 +43,8 @@ const CLIENT_IDLE: Duration = Duration::from_secs(60);
 const MAX_CLIENTS: usize = 16;
 /// How often an idle uploader looks for files other processes queued.
 const POLL: Duration = Duration::from_secs(2);
+/// How soon the uploader tries again to hold files queued unheld.
+const HOLD_RETRY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +75,10 @@ pub struct Item {
     pub state: State,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Queued while the storage ledger could not hold the file back from
+    /// retention; the uploader holds it as soon as it can.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unheld: bool,
 }
 impl Item {
     /// Where this item uploads to.
@@ -709,8 +715,16 @@ pub fn enqueue(destination: &str, remote: &Remote, path: &Path, key: &str) -> Re
             !queue.items.iter().any(|item| item.id == id),
             "upload ID collision; retry queueing this file"
         );
-        let sha256 = crate::storage::hold_for_upload(&path, true)?;
-        held = true;
+        let (sha256, unheld) = match hold(&path) {
+            Ok(sha256) => {
+                held = true;
+                (sha256, false)
+            }
+            // The storage ledger is busy, for one. Queue the file anyway and
+            // let the uploader hold it, rather than leave a capture that
+            // retention may remove before it ever uploads.
+            Err(error) => (file_sha256(&path, bytes).map_err(|_| error)?, true),
+        };
         let (bucket, other) = match remote {
             Remote::S3(bucket) => (Some(bucket.clone()), None),
             other => (None, Some(other.clone())),
@@ -729,6 +743,7 @@ pub fn enqueue(destination: &str, remote: &Remote, path: &Path, key: &str) -> Re
             next_attempt: 0,
             state: State::Pending,
             error: None,
+            unheld,
         };
         Ok((id, Change::put(vec![item])))
     });
@@ -745,6 +760,51 @@ pub fn enqueue(destination: &str, remote: &Remote, path: &Path, key: &str) -> Re
             Err(error)
         }
     }
+}
+
+/// Hold a queued file back from retention; returns the SHA-256 the storage
+/// ledger recorded for it.
+fn hold(path: &Path) -> Result<String> {
+    #[cfg(test)]
+    ensure!(
+        !tests::HOLD_FAILS.load(std::sync::atomic::Ordering::Relaxed),
+        "storage manager is busy"
+    );
+    crate::storage::hold_for_upload(path, true)
+}
+
+/// The SHA-256 of a file that should hold `bytes` bytes.
+fn file_sha256(path: &Path, bytes: u64) -> Result<String> {
+    let mut reader = crate::transfer::HashingReader::new(fs::File::open(path)?);
+    std::io::copy(&mut reader, &mut std::io::sink())?;
+    let (sha256, read) = reader.finish();
+    ensure!(
+        read == bytes,
+        "{} changed while it was queued",
+        path.display()
+    );
+    Ok(sha256)
+}
+
+/// Hold files that were queued unheld, for a second at most: a busy storage
+/// ledger makes a hold wait, and the next try comes soon.
+fn hold_unheld(uploads: &Uploads) -> Result<((), Change)> {
+    let started = Instant::now();
+    let mut put = Vec::new();
+    for item in uploads.queue.items.iter().filter(|i| i.unheld) {
+        if started.elapsed() > Duration::from_secs(1) {
+            break;
+        }
+        // The ledger's checksum is the one to upload against.
+        if let Ok(sha256) = hold(&item.path) {
+            put.push(Item {
+                sha256,
+                unheld: false,
+                ..item.clone()
+            });
+        }
+    }
+    Ok(((), Change::put(put)))
 }
 
 /// Queue summary and the most recent items, for status displays.
@@ -920,8 +980,13 @@ fn run() {
         Ok(((), Change::put(put)))
     });
     let mut clients: HashMap<String, (Box<dyn Uploader>, Instant)> = HashMap::new();
+    let mut held_at: Option<Instant> = None;
     loop {
         clients.retain(|_, (_, used)| used.elapsed() < CLIENT_IDLE);
+        if held_at.is_none_or(|at| at.elapsed() >= HOLD_RETRY) {
+            let _ = with_queue(hold_unheld);
+            held_at = Some(Instant::now());
+        }
         let item = match with_queue(next_due) {
             Ok(Some(item)) => item,
             Ok(None) | Err(_) => {
@@ -947,10 +1012,13 @@ fn run() {
 /// reading or locking them.
 fn idle() {
     let cached = UPLOADS.lock().unwrap_or_else(PoisonError::into_inner);
-    let Some((due, dir, seen)) = cached
-        .as_ref()
-        .map(|u| (u.next_due_at(), u.dir.clone(), u.seen))
-    else {
+    let Some((due, dir, seen)) = cached.as_ref().map(|u| {
+        // Files queued unheld are tried again soon, whatever is due.
+        let hold = u.queue.items.iter().any(|i| i.unheld);
+        let hold = hold.then(|| now() + HOLD_RETRY.as_secs());
+        let due = u.next_due_at().into_iter().chain(hold).min();
+        (due, u.dir.clone(), u.seen)
+    }) else {
         drop(cached);
         thread::sleep(POLL);
         return;
@@ -1148,7 +1216,10 @@ pub fn drain(timeout: Duration) -> Result<Value> {
 mod tests {
     use super::*;
     use crate::destination::{FtpServer, FtpTls, NoOverwrite, SecretSource};
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Make the storage ledger refuse to hold queued files.
+    pub(super) static HOLD_FAILS: AtomicBool = AtomicBool::new(false);
 
     fn bucket() -> Bucket {
         Bucket {
@@ -1190,6 +1261,7 @@ mod tests {
             next_attempt: 0,
             state: State::Pending,
             error: None,
+            unheld: false,
         }
     }
 
@@ -1543,6 +1615,38 @@ mod tests {
         finish(&queued[1], Ok(()));
         assert!(backoff().unwrap().is_none());
         assert_eq!(pending(), 1);
+    }
+
+    #[test]
+    fn a_capture_the_ledger_cannot_hold_is_queued_and_held_later() {
+        if !isolated("a_capture_the_ledger_cannot_hold_is_queued_and_held_later") {
+            return;
+        }
+        let path = staged("shot.png");
+        HOLD_FAILS.store(true, Ordering::Relaxed);
+        let id = enqueue("line", &ftp(), &path, "shot.png").unwrap();
+        let first = || status().unwrap()["items"][0].clone();
+        assert_eq!(first()["id"], id.as_str());
+        assert_eq!(first()["unheld"], true);
+        assert_eq!(
+            first()["sha256"],
+            crate::transfer::hex(&<sha2::Sha256 as sha2::Digest>::digest(b"0123456789"))
+        );
+        // The uploader's next try finds the ledger free.
+        with_queue(hold_unheld).unwrap();
+        assert_eq!(first()["unheld"], true, "still refused");
+        HOLD_FAILS.store(false, Ordering::Relaxed);
+        with_queue(hold_unheld).unwrap();
+        assert!(first().get("unheld").is_none());
+        // Held, so retention keeps it even when a new capture needs room.
+        let policy = crate::storage::StoragePolicy {
+            max_files: 1,
+            on_full: "delete-oldest".into(),
+            ..Default::default()
+        };
+        let next = path.with_file_name("next.png");
+        let _ = crate::storage::save_bytes(b"next", &next, &policy);
+        assert!(path.exists());
     }
 
     #[test]
