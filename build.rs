@@ -106,7 +106,14 @@ fn embed_web(out: &std::path::Path) {
             PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory"))
                 .join("web-client/dist")
         });
-        println!("cargo:rerun-if-changed={}", dist.display());
+        // Cargo counts a missing path as changed, rebuilding every time. Release
+        // builds must notice a client built after the previous build; others
+        // watch the folder once it exists, and until they embed it, serve
+        // finds web-client/dist in the working directory.
+        let release = env::var("PROFILE").is_ok_and(|p| p == "release");
+        if explicit.is_some() || release || dist.exists() {
+            println!("cargo:rerun-if-changed={}", dist.display());
+        }
         let built = ["index.html", "capturefab_web_bg.wasm"]
             .iter()
             .all(|name| dist.join(name).is_file());
@@ -122,7 +129,7 @@ fn embed_web(out: &std::path::Path) {
                 "CAPTUREFAB_WEB_DIST {} has no built browser client; run web-client/build.sh",
                 dist.display()
             );
-        } else if env::var("PROFILE").is_ok_and(|p| p == "release") {
+        } else if release {
             println!(
                 "cargo:warning=embedded-web found no browser client in {}; run web-client/build.sh",
                 dist.display()
