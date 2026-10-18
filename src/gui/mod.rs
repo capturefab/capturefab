@@ -2042,6 +2042,8 @@ impl Workbench {
         if !fresh && Some(limits) == self.frame_limits {
             return;
         }
+        // The first frame of a camera, or of a new view of it, measures at once.
+        let paced = self.frame_id.is_some();
         (self.frame_id, self.frame_limits) = (Some(frame.id), Some(limits));
         if fresh
             && arrival
@@ -2066,7 +2068,7 @@ impl Workbench {
             self.focus.reset();
         }
         if fresh {
-            self.measure(&frame, true);
+            self.measure(&frame, paced);
         }
         let kind = self.camera_kind();
         let id = self.snapshot.active_camera.clone().unwrap_or_default();
@@ -3183,7 +3185,12 @@ impl Workbench {
                     self.remeasure_focus();
                 }
             }
-            Message::FocusRegionStart => self.break_history_group(),
+            Message::FocusRegionStart => {
+                self.break_history_group();
+                // A new press scores its first region at once, such as a click
+                // that moves the region without a drag.
+                self.measured.1 = None;
+            }
             Message::FocusRegionEnd => self.remeasure_focus(),
             Message::AdjustExposure => return self.adjust_exposure(),
             Message::OverviewScrolled(offset) => {

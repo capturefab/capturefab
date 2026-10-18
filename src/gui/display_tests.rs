@@ -84,6 +84,12 @@ fn scopes_measure_a_stream_at_their_own_pace() {
     assert!((5..=6).contains(&histograms), "{histograms} histograms");
     assert!((15..=16).contains(&scores), "{scores} focus scores");
     assert!(bench.exposure.is_some() && bench.focus.latest().is_some());
+    // Another camera's first frame, as a switch leaves it, measures at once.
+    bench.frame_id = None;
+    writer.write(&frame(31), false).unwrap();
+    bench.now += Duration::from_millis(1);
+    bench.update_frames();
+    assert_eq!(bench.measured, (Some(bench.now), Some(bench.now)));
     bench.handle.shutdown();
 }
 
@@ -120,6 +126,10 @@ fn dragging_the_focus_region_scores_only_focus_and_once_more_on_release() {
     assert!(bench.measured.1.is_some_and(|at| Some(at) != just));
     assert!(bench.focus.latest().is_some());
     assert_eq!(bench.measured.0, histogram, "the histogram never changed");
+    // A click right after moves the region without a drag, and is scored.
+    let _ = bench.update(Message::FocusRegionStart);
+    let _ = bench.update(Message::FocusRegion(region(0.7)));
+    assert!(bench.focus.latest().is_some());
     bench.handle.shutdown();
 }
 
