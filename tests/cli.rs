@@ -2172,6 +2172,17 @@ fn doctor_reports_destination_features() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn storage_status_reports_free_space_and_the_schema_its_floor() {
+    let dir = temp_root("storage-status");
+    let status = json(&dir, &["--json", "storage"]);
+    assert!(status["free_bytes"].is_u64(), "{status}");
+    assert_eq!(status["files"], 0);
+    let schema = json(&dir, &["--json", "schema"]);
+    assert_eq!(schema["storage"]["free_space_floor"], 512 * 1024 * 1024);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn dataset_rows(dir: &PathBuf, file: &std::path::Path, sql: &str) -> Value {
     json(
         dir,
@@ -2219,7 +2230,10 @@ fn dataset_records_direct_captures() {
         .as_str()
         .unwrap()
         .to_owned();
-    let ledger = std::fs::read_to_string(dir.join("storage.json")).unwrap();
+    // The ledger is a snapshot plus a journal of later changes.
+    let ledger = ["storage.json", "storage.journal"]
+        .map(|name| std::fs::read_to_string(dir.join(name)).unwrap_or_default())
+        .concat();
     assert!(ledger.contains(&sha), "{sha}");
     let status = json(
         &dir,

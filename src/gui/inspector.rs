@@ -1201,6 +1201,18 @@ impl Workbench {
                 storage_policy::Policy::try_from(StoragePolicy::default()),
                 self.now,
             ),
+            // The default policy 85% full, again without the ledger.
+            ("inspector-storage-usage", _) => self.storage_status.update(
+                storage_policy::Reply {
+                    policy: storage_policy::Policy::try_from(StoragePolicy::default()),
+                    usage: Some(storage_policy::Usage {
+                        bytes: (8.5 * (1u64 << 30) as f64) as u64,
+                        files: 3_210,
+                        free: Some(120 << 30),
+                    }),
+                },
+                self.now,
+            ),
             ("inspector-noforward", _) => self.forward_output.clear(),
             ("forward-stream", _) => self.forward_output = "rtsp://127.0.0.1:8554/line-1".into(),
             ("inspector-nocapture", _) => self.output.clear(),
@@ -1426,6 +1438,15 @@ fn schedule_text_for(kind: CameraKind, count: u32, interval: f64) -> String {
         number(interval),
         if interval == 1.0 { "second" } else { "seconds" }
     )
+}
+
+/// The text color for a storage line of this tone.
+fn tone_color(tone: storage_policy::Tone, p: &Palette) -> iced::Color {
+    match tone {
+        storage_policy::Tone::Normal => p.secondary,
+        storage_policy::Tone::Warning => p.ink(p.warn),
+        storage_policy::Tone::Error => p.ink(p.danger),
+    }
 }
 
 /// A quiet line saying why the action above it cannot run.
@@ -3414,6 +3435,35 @@ impl Workbench {
             p
         )]
         .spacing(ROW_GAP);
+        // How full storage is; folded, only once it is nearly full.
+        if let Some(meter) = self
+            .storage_status
+            .state()
+            .meter(&self.storage_policy(), self.storage_status.usage())
+            && (open || meter.tone != storage_policy::Tone::Normal)
+        {
+            let color = tone_color(meter.tone, p);
+            let bar = match meter.tone {
+                storage_policy::Tone::Normal => p.accent,
+                storage_policy::Tone::Warning => p.warn,
+                storage_policy::Tone::Error => p.danger,
+            };
+            content = content.push(accessibility::group(
+                column![
+                    text(meter.text).size(style::SMALL).color(color),
+                    progress_bar(0.0..=1.0, meter.fraction)
+                        .girth(4)
+                        .style(move |theme| progress_bar::Style {
+                            bar: bar.into(),
+                            ..style::progress(theme)
+                        }),
+                ]
+                .spacing(4)
+                .into(),
+                meter.label,
+                accessibility::Role::Group,
+            ));
+        }
         if open {
             content = content
                 .push(reason(
@@ -3467,11 +3517,7 @@ impl Workbench {
             .into_iter()
             .filter(|caption| open || caption.tone != storage_policy::Tone::Normal)
         {
-            let color = match caption.tone {
-                storage_policy::Tone::Normal => p.secondary,
-                storage_policy::Tone::Warning => p.ink(p.warn),
-                storage_policy::Tone::Error => p.ink(p.danger),
-            };
+            let color = tone_color(caption.tone, p);
             content = content.push(text(caption.text).size(style::SMALL).color(color));
         }
         content.into()

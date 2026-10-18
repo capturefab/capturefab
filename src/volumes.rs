@@ -216,10 +216,65 @@ fn mounted(path: &Path) -> bool {
     }
 }
 
+/// Mount points /etc/fstab declares, other than the root file system, swap and
+/// bind mounts: drives that are expected to be there, such as an SSD mounted
+/// with `nofail`, whose mount point is an empty directory on the system disk
+/// while the drive is missing.
+#[cfg(any(target_os = "linux", test))]
+fn from_fstab(table: &str) -> Vec<PathBuf> {
+    table
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let [device, mount, fs, ref rest @ ..] = fields[..] else {
+                return None;
+            };
+            let bind = rest
+                .first()
+                .is_some_and(|options| options.split(',').any(|o| o == "bind" || o == "rbind"));
+            let path = PathBuf::from(unescape(mount));
+            (!device.starts_with('#')
+                && path.is_absolute()
+                && path != Path::new("/")
+                && fs != "swap"
+                && !bind)
+                .then_some(path)
+        })
+        .collect()
+}
+
+/// The declared mount points, read again only when /etc/fstab changes.
+#[cfg(target_os = "linux")]
+fn declared() -> Vec<PathBuf> {
+    use std::sync::{Mutex, PoisonError};
+    static CACHE: Mutex<Option<(std::time::SystemTime, Vec<PathBuf>)>> = Mutex::new(None);
+    let Ok(modified) = std::fs::metadata("/etc/fstab").and_then(|meta| meta.modified()) else {
+        return Vec::new();
+    };
+    let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+    match &*cache {
+        Some((at, points)) if *at == modified => points.clone(),
+        _ => {
+            let points = from_fstab(&std::fs::read_to_string("/etc/fstab").unwrap_or_default());
+            *cache = Some((modified, points.clone()));
+            points
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn declared() -> Vec<PathBuf> {
+    Vec::new()
+}
+
 /// The mount point an external volume path must be under: /Volumes/NAME on
 /// macOS, /media/USER/NAME or /run/media/USER/NAME on Linux, the drive root on
 /// Windows. `None` for paths elsewhere, which need no mount.
 pub fn mount_root(path: &Path) -> Option<PathBuf> {
+    root_in(path, &declared())
+}
+
+fn root_in(path: &Path, declared: &[PathBuf]) -> Option<PathBuf> {
     if cfg!(windows) {
         let mut components = path.components();
         if let Some(Component::Prefix(prefix)) = components.next() {
@@ -242,7 +297,12 @@ pub fn mount_root(path: &Path) -> Option<PathBuf> {
     }
     let depth = match parts.first().map(String::as_str) {
         Some("Volumes") if cfg!(target_os = "macos") => 2,
-        Some("media") if cfg!(target_os = "linux") => 3,
+        // usbmount and hand-written fstab entries mount drives at
+        // /media/NAME; desktops use /media/USER/NAME.
+        Some("media") if cfg!(target_os = "linux") => match parts.get(1) {
+            Some(name) if own_mount(&Path::new("/media").join(name), declared) => 2,
+            _ => 3,
+        },
         Some("run")
             if cfg!(target_os = "linux") && parts.get(1).map(String::as_str) == Some("media") =>
         {
@@ -257,10 +317,31 @@ pub fn mount_root(path: &Path) -> Option<PathBuf> {
     })
 }
 
-/// Refuse a path on an external volume that is not mounted, instead of
-/// silently creating its directories on the system disk.
+fn own_mount(path: &Path, declared: &[PathBuf]) -> bool {
+    #[cfg(unix)]
+    let mounted = mounted(path);
+    #[cfg(not(unix))]
+    let mounted = false;
+    mounted || declared.iter().any(|point| point == path)
+}
+
+/// Refuse a path on an external volume, or under a mount point fstab
+/// declares, that is not mounted, instead of silently creating its
+/// directories on the system disk.
 pub fn ensure_present(path: &Path) -> Result<()> {
-    let Some(root) = mount_root(path) else {
+    present_in(path, &declared())
+}
+
+fn present_in(path: &Path, declared: &[PathBuf]) -> Result<()> {
+    let under = || {
+        let path = std::path::absolute(path).ok()?;
+        declared
+            .iter()
+            .filter(|point| path.starts_with(point))
+            .max_by_key(|point| point.components().count())
+            .cloned()
+    };
+    let Some(root) = root_in(path, declared).or_else(under) else {
         return Ok(());
     };
     #[cfg(unix)]
@@ -335,6 +416,52 @@ mod tests {
             ensure_present(Path::new("/tmp/capturefab/a.png")).unwrap();
         }
         assert!(list().iter().all(|v| v.path.is_absolute()));
+    }
+
+    #[test]
+    fn fstab_declares_drives_but_not_root_swap_or_bind_mounts() {
+        let table = "# /etc/fstab\n\
+                     PARTUUID=1-02 / ext4 defaults,noatime 0 1\n\
+                     PARTUUID=1-01 /boot/firmware vfat defaults 0 2\n\
+                     UUID=ab /mnt/ssd ext4 defaults,nofail 0 2\n\
+                     /dev/sdb1 /media/usb0 vfat noauto\n\
+                     /swapfile none swap sw 0 0\n\
+                     /srv/data /mnt/data none bind 0 0\n\
+                     nas:/export /mnt/nas\\040share nfs4 defaults 0 0\n";
+        assert_eq!(
+            from_fstab(table),
+            [
+                PathBuf::from("/boot/firmware"),
+                PathBuf::from("/mnt/ssd"),
+                PathBuf::from("/media/usb0"),
+                PathBuf::from("/mnt/nas share"),
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn paths_under_a_declared_mount_need_it_mounted() {
+        // A plain directory standing in for a nofail drive that is missing.
+        let point =
+            std::env::temp_dir().join(format!("capturefab-unmounted-{}", std::process::id()));
+        std::fs::create_dir_all(&point).unwrap();
+        let declared = [point.clone()];
+        let error = present_in(&point.join("captures/a.png"), &declared).unwrap_err();
+        assert!(error.to_string().contains("is not mounted"), "{error}");
+        present_in(Path::new("/tmp/capturefab/a.png"), &declared).unwrap();
+        std::fs::remove_dir_all(&point).unwrap();
+        if cfg!(target_os = "linux") {
+            let usb = [PathBuf::from("/media/usb0")];
+            assert_eq!(
+                root_in(Path::new("/media/usb0/2026/a.png"), &usb),
+                Some(PathBuf::from("/media/usb0"))
+            );
+            assert_eq!(
+                root_in(Path::new("/media/ana/USB/a.png"), &usb),
+                Some(PathBuf::from("/media/ana/USB"))
+            );
+        }
     }
 
     #[test]

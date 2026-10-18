@@ -1864,8 +1864,14 @@ impl Workbench {
             pages,
             self.screenshot_tick(),
             if self.screenshot.is_none() {
+                // A destination's own picker shows its free space.
+                let folder = self
+                    .capture_to
+                    .selected
+                    .is_none()
+                    .then(|| storage_policy::folder(&self.output));
                 self.storage_status
-                    .refresh(self.now)
+                    .refresh(self.now, folder)
                     .map(Message::StoragePolicy)
             } else {
                 Task::none()

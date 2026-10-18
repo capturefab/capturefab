@@ -1,13 +1,37 @@
-//! Cached, read-only view of the policy merged by the storage backend.
-use crate::storage::StoragePolicy;
+//! Cached, read-only view of the policy merged by the storage backend, and of
+//! how full it and the capture disk are.
+use crate::storage::{FREE_SPACE_FLOOR, StoragePolicy};
 use iced::{Task, futures::channel::oneshot};
 use std::{
     future::Future,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-pub(super) type Reply = Result<Policy, String>;
+
+/// One refresh: the policy, and usage when the ledger has reported it.
+#[derive(Clone, Debug)]
+pub(super) struct Reply {
+    pub policy: Result<Policy, String>,
+    pub usage: Option<Usage>,
+}
+impl From<Result<Policy, String>> for Reply {
+    fn from(policy: Result<Policy, String>) -> Self {
+        Self {
+            policy,
+            usage: None,
+        }
+    }
+}
+
+/// The app-wide ledger's totals, and the free space where captures are saved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Usage {
+    pub bytes: u64,
+    pub files: u64,
+    pub free: Option<u64>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OnFull {
@@ -25,7 +49,7 @@ pub(super) struct Policy {
 
 impl TryFrom<StoragePolicy> for Policy {
     type Error = String;
-    fn try_from(policy: StoragePolicy) -> Reply {
+    fn try_from(policy: StoragePolicy) -> Result<Self, String> {
         policy.validate().map_err(|error| format!("{error:#}"))?;
         Ok(Self {
             max_bytes: policy.max_bytes,
@@ -72,6 +96,7 @@ pub(super) enum State {
 #[derive(Default)]
 pub(super) struct Cache {
     state: State,
+    usage: Option<Usage>,
     pending: bool,
     checked_at: Option<Instant>,
 }
@@ -81,19 +106,30 @@ impl Cache {
         &self.state
     }
 
-    /// At most one filesystem/lock read is in flight; refreshes are bounded
-    /// even when Tick runs once per frame. Work always runs on a worker thread.
-    pub fn refresh(&mut self, now: Instant) -> Task<Reply> {
+    pub fn usage(&self) -> Option<Usage> {
+        self.usage
+    }
+
+    /// At most one filesystem read is in flight; refreshes are bounded even
+    /// when Tick runs once per frame. Work always runs on a worker thread, and
+    /// reads small files the backend replaces whole, never the ledger itself.
+    /// Free space is measured in `folder`, when captures are saved locally.
+    pub fn refresh(&mut self, now: Instant, folder: Option<PathBuf>) -> Task<Reply> {
         if !self.begin(now) {
             return Task::none();
         }
         Task::perform(
-            read_on_worker(|| {
-                crate::storage::configured_policy()
+            read_on_worker(move || Reply {
+                policy: crate::storage::configured_policy()
                     .map_err(|error| format!("{error:#}"))
-                    .and_then(Policy::try_from)
+                    .and_then(Policy::try_from),
+                usage: crate::storage::usage().ok().flatten().map(|usage| Usage {
+                    bytes: usage.allocated_bytes,
+                    files: usage.files,
+                    free: folder.as_deref().and_then(crate::storage::free_bytes),
+                }),
             }),
-            std::convert::identity,
+            |reply| reply.unwrap_or_else(|error| Reply::from(Err(error))),
         )
     }
 
@@ -109,20 +145,38 @@ impl Cache {
         true
     }
 
-    pub fn update(&mut self, reply: Reply, now: Instant) {
+    pub fn update(&mut self, reply: impl Into<Reply>, now: Instant) {
+        let reply = reply.into();
         self.pending = false;
         self.checked_at = Some(now);
         // Failed reads must not present an old policy as the current one.
-        self.state = match reply {
+        self.state = match reply.policy {
             Ok(policy) => State::Available(policy),
             Err(error) => State::Unavailable(error),
         };
+        self.usage = reply.usage;
     }
 }
 
-fn read_on_worker(
-    work: impl FnOnce() -> Reply + Send + 'static,
-) -> impl Future<Output = Reply> + Send + 'static {
+/// The fixed folder of an output template, where its captures' free space is
+/// measured: the part before anything that fills in.
+pub(super) fn folder(template: &str) -> PathBuf {
+    let fixed: PathBuf = Path::new(template.trim())
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .take_while(|part| !part.as_os_str().to_string_lossy().contains('{'))
+        .collect();
+    if fixed.as_os_str().is_empty() {
+        crate::storage::capture_root()
+    } else {
+        fixed
+    }
+}
+
+fn read_on_worker<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> impl Future<Output = Result<T, String>> + Send + 'static {
     let (finished, result) = oneshot::channel();
     let spawned = std::thread::Builder::new()
         .name("capturefab-storage-policy".into())
@@ -134,7 +188,7 @@ fn read_on_worker(
         spawned?;
         result
             .await
-            .map_err(|_| "The app-wide storage policy reader stopped.".to_owned())?
+            .map_err(|_| "The app-wide storage policy reader stopped.".to_owned())
     }
 }
 
@@ -147,6 +201,14 @@ pub(super) enum Tone {
 
 pub(super) struct Caption {
     pub text: String,
+    pub tone: Tone,
+}
+
+pub(super) struct Meter {
+    pub text: String,
+    /// The text, with how full storage is, for assistive technology.
+    pub label: String,
+    pub fraction: f32,
     pub tone: Tone,
 }
 
@@ -176,6 +238,47 @@ impl State {
                 summary
             }
         }
+    }
+
+    /// How full the effective limits are, counting the capture disk as full
+    /// once only the free space every save must leave is left.
+    pub fn meter(&self, requested: &StoragePolicy, usage: Option<Usage>) -> Option<Meter> {
+        let (Self::Available(global), Some(usage)) = (self, usage) else {
+            return None;
+        };
+        let effective = global.effective(requested);
+        let capacity = usage.free.map_or(effective.max_bytes, |free| {
+            effective.max_bytes.min(
+                usage
+                    .bytes
+                    .saturating_add(free.saturating_sub(FREE_SPACE_FLOOR)),
+            )
+        });
+        let fraction =
+            share(usage.bytes, capacity).max(share(usage.files, effective.max_files.into()));
+        let tone = if fraction >= 0.95 {
+            Tone::Error
+        } else if fraction >= 0.8 {
+            Tone::Warning
+        } else {
+            Tone::Normal
+        };
+        let mut text = format!(
+            "{} of {} · {} of {} files",
+            rounded(usage.bytes),
+            bytes(effective.max_bytes),
+            super::format::grouped(usage.files),
+            super::format::grouped(effective.max_files.into())
+        );
+        if let Some(free) = usage.free {
+            text = format!("{text} · {} free on this disk", rounded(free));
+        }
+        Some(Meter {
+            label: format!("Storage {:.0}% full: {text}", fraction * 100.0),
+            text,
+            fraction,
+            tone,
+        })
     }
 
     pub fn captions(&self, requested: &StoragePolicy) -> Vec<Caption> {
@@ -253,6 +356,29 @@ fn bytes(bytes: u64) -> String {
         }
     }
     format!("{} bytes", super::format::grouped(bytes))
+}
+
+/// To one decimal in the largest binary unit it fills, as "4.2 GiB".
+fn rounded(bytes: u64) -> String {
+    for (unit, label) in [
+        (1u64 << 40, "TiB"),
+        (1 << 30, "GiB"),
+        (1 << 20, "MiB"),
+        (1 << 10, "KiB"),
+    ] {
+        if bytes >= unit {
+            return format!("{:.1} {label}", bytes as f64 / unit as f64);
+        }
+    }
+    format!("{} bytes", super::format::grouped(bytes))
+}
+
+fn share(used: u64, limit: u64) -> f32 {
+    if limit == 0 {
+        1.0
+    } else {
+        (used as f64 / limit as f64).min(1.0) as f32
+    }
 }
 
 fn age_label(seconds: u64) -> String {
@@ -356,6 +482,50 @@ mod tests {
                 .on_full,
             OnFull::DeleteOldest
         );
+    }
+
+    #[test]
+    fn the_meter_turns_amber_at_80_and_red_at_95_percent_counting_the_disk() {
+        let state =
+            State::Available(Policy::try_from(policy(10 << 30, 10_000, None, "stop")).unwrap());
+        let requested = policy(20 << 30, 20_000, None, "stop");
+        let meter = |bytes, files, free| {
+            state
+                .meter(&requested, Some(Usage { bytes, files, free }))
+                .unwrap()
+        };
+        let half = meter(5 << 30, 3_210, None);
+        assert_eq!(half.text, "5.0 GiB of 10 GiB · 3,210 of 10,000 files");
+        assert_eq!(half.label, format!("Storage 50% full: {}", half.text));
+        assert_eq!(half.tone, Tone::Normal);
+        assert_eq!(meter(8 << 30, 0, None).tone, Tone::Warning);
+        assert_eq!(meter(0, 9_600, None).tone, Tone::Error);
+        // Far below the budget, but the disk keeps only 100 MiB above the
+        // free space every save must leave.
+        let disk = meter(1 << 30, 10, Some(FREE_SPACE_FLOOR + (100 << 20)));
+        assert_eq!(disk.tone, Tone::Warning);
+        assert!(
+            disk.text.ends_with(" · 612.0 MiB free on this disk"),
+            "{}",
+            disk.text
+        );
+        assert!(state.meter(&requested, None).is_none());
+        assert!(
+            State::Loading
+                .meter(&requested, Some(Usage::default()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn free_space_is_measured_in_the_fixed_part_of_the_output() {
+        assert_eq!(
+            folder("/data/{date}/{camera}-{seq}.png"),
+            PathBuf::from("/data")
+        );
+        assert_eq!(folder("/data/run 1/shot.png"), PathBuf::from("/data/run 1"));
+        assert_eq!(folder("{camera}.png"), crate::storage::capture_root());
+        assert_eq!(folder(""), crate::storage::capture_root());
     }
 
     #[test]
