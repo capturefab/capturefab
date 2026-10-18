@@ -3810,6 +3810,50 @@ mod tests {
         assert_eq!(merged(&report), serde_json::to_value(&worker).unwrap());
     }
     #[test]
+    fn deltas_carry_skipped_shots_capture_notes_and_writability_read_on_stop() {
+        // A job's skipped and retried shots and an auto capture note change
+        // without anything else changing, and Stop re-reads writable flags
+        // without walking the features: each reaches the coordinator.
+        let (mut sent, mut report) = (Sent::default(), Report::new());
+        let job = serde_json::from_value(json!({
+            "id": 1, "status": "running", "output": "s-{seq}.png", "count": 10,
+            "captured": 3, "first_at_ms": 0, "interval_ms": 1000, "next_at_ms": 3000,
+            "last_file": null, "error": null
+        }))
+        .unwrap();
+        let capture = serde_json::from_value(json!({
+            "path": "line.duckdb", "camera": "sim:0", "enabled": true, "sensitivity": 0.5,
+            "cooldown_ms": 250, "manual_count": 0, "kept_count": 0, "discarded_count": 0,
+            "pending_count": 0, "blocked_storage": false, "state": "watching", "model": "native"
+        }))
+        .unwrap();
+        let mut worker = SessionSnapshot {
+            features: vec![feature("Width", 640)],
+            jobs: vec![job],
+            capture_session: Some(capture),
+            ..Default::default()
+        };
+        worker.features[0].writable = false;
+        relay(&mut sent, &mut report, &worker, false);
+        worker.jobs[0].skipped = 2;
+        worker.jobs[0].retries = 1;
+        worker.jobs[0].next_at_ms = 6000;
+        worker.capture_session.as_mut().unwrap().note = Some("Skipped a suggestion".into());
+        let reply = relay(&mut sent, &mut report, &worker, false);
+        assert_eq!(reply["snapshot"]["features"], json!([]), "unchanged");
+        assert_eq!(reply["snapshot"]["jobs"][0]["skipped"], 2);
+        assert_eq!(reply["snapshot"]["jobs"][0]["retries"], 1);
+        assert_eq!(
+            reply["snapshot"]["capture_session"]["note"],
+            "Skipped a suggestion"
+        );
+        assert_eq!(merged(&report), serde_json::to_value(&worker).unwrap());
+        worker.features[0].writable = true;
+        let reply = relay(&mut sent, &mut report, &worker, false);
+        assert_eq!(reply["snapshot"]["features"][0]["writable"], true);
+        assert_eq!(merged(&report), serde_json::to_value(&worker).unwrap());
+    }
+    #[test]
     fn sim_camera_reports_survive_status_deltas() {
         let worker = crate::engine::WorkerHandle::new();
         let (mut sent, mut report, mut whole) = (Sent::default(), Report::new(), Report::new());
