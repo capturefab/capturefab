@@ -1001,9 +1001,64 @@ impl Previews {
 
 /// A frame scaled to fit 1280x720, as Gray PNG or JPEG when every pixel is
 /// gray and RGB otherwise; display images need no alpha channel.
-fn encode_preview(frame: &Frame, format: PreviewFormat) -> std::result::Result<Vec<u8>, Response> {
-    let (width, height, rgba) = crate::frame::preview_rgba(frame, 1280, 720)
-        .map_err(|err| error(422, format!("preview unavailable: {err:#}")))?;
+/// Largest remote preview.
+const PREVIEW_BOUNDS: (u32, u32) = (1280, 720);
+
+/// A preview's size and pixels, gray or RGB, as the encoders take them.
+struct PreviewPixels {
+    width: u32,
+    height: u32,
+    gray: bool,
+    data: Vec<u8>,
+}
+
+/// A frame shrunk to the preview's bounds is gray or RGB already, so only
+/// frames that need no shrinking, or cannot be shrunk, are converted to an
+/// RGBA preview and packed again.
+fn preview_pixels(frame: &Frame) -> Result<PreviewPixels> {
+    let small = crate::frame::shrink_to(frame, PREVIEW_BOUNDS);
+    if let Some(small) = &small
+        && small.width <= PREVIEW_BOUNDS.0
+        && small.height <= PREVIEW_BOUNDS.1
+    {
+        let (width, height) = (small.width, small.height);
+        match small.pixel_format {
+            crate::types::MONO8 => {
+                return Ok(PreviewPixels {
+                    width,
+                    height,
+                    gray: true,
+                    data: small.data.clone(),
+                });
+            }
+            crate::types::RGB8 => {
+                let pixels = small.data.as_chunks::<3>().0;
+                let gray = pixels.iter().all(|[r, g, b]| r == g && g == b);
+                let data = if gray {
+                    pixels.iter().map(|p| p[0]).collect()
+                } else {
+                    small.data.clone()
+                };
+                return Ok(PreviewPixels {
+                    width,
+                    height,
+                    gray,
+                    data,
+                });
+            }
+            _ => {}
+        }
+    }
+    let (width, height, rgba) = crate::frame::preview_rgba(
+        small.as_ref().unwrap_or(frame),
+        PREVIEW_BOUNDS.0,
+        PREVIEW_BOUNDS.1,
+    )?;
+    Ok(packed(width, height, &rgba))
+}
+
+/// An RGBA preview as gray bytes when every pixel is gray, else RGB.
+fn packed(width: u32, height: u32, rgba: &[u8]) -> PreviewPixels {
     let pixels = rgba.as_chunks::<4>().0;
     let gray = pixels.iter().all(|[r, g, b, _]| r == g && g == b);
     let data: Vec<u8> = if gray {
@@ -1015,6 +1070,21 @@ fn encode_preview(frame: &Frame, format: PreviewFormat) -> std::result::Result<V
         }
         rgb
     };
+    PreviewPixels {
+        width,
+        height,
+        gray,
+        data,
+    }
+}
+
+fn encode_preview(frame: &Frame, format: PreviewFormat) -> std::result::Result<Vec<u8>, Response> {
+    let PreviewPixels {
+        width,
+        height,
+        gray,
+        data,
+    } = preview_pixels(frame).map_err(|err| error(422, format!("preview unavailable: {err:#}")))?;
     let encoded = match format {
         PreviewFormat::Jpeg => crate::jpeg::software(&crate::jpeg::Raster {
             width,
@@ -1209,6 +1279,39 @@ fn write_response(stream: &mut TcpStream, response: Response, head: bool) -> std
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn shrunk_previews_skip_the_rgba_copy_and_match_it() {
+        crate::efficiency::pin(false);
+        let cases = [
+            (crate::types::MONO8, 1, 2560, 1440),
+            (crate::types::RGB8, 3, 2600, 1500),
+            (0x0108_0009, 1, 5472, 3648),
+            (crate::types::MONO8, 1, 640, 480),
+        ];
+        for (pixel_format, bytes, width, height) in cases {
+            let frame = Frame {
+                id: 1,
+                width,
+                height,
+                pixel_format,
+                timestamp_ns: 0,
+                data: (0..(width * height) as usize * bytes)
+                    .map(|i| (i * 7 % 251) as u8)
+                    .collect(),
+            };
+            let fast = preview_pixels(&frame).unwrap();
+            let (w, h, rgba) = crate::frame::preview_rgba(&frame, 1280, 720).unwrap();
+            let slow = packed(w, h, &rgba);
+            assert_eq!(
+                (fast.width, fast.height, fast.gray),
+                (slow.width, slow.height, slow.gray),
+                "{pixel_format:#x}"
+            );
+            assert!(fast.data == slow.data, "{pixel_format:#x}");
+            assert!(fast.width <= 1280 && fast.height <= 720);
+        }
+    }
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
