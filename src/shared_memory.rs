@@ -78,7 +78,7 @@ impl RingFile {
         let file = self.file.as_ref().context("ring file is closed")?;
         #[cfg(unix)]
         fs2::FileExt::try_lock_exclusive(file)?;
-        file.set_len(length)?;
+        reserve(file, length)?;
         Ok(MmapRaw::map_raw(file)?)
     }
 }
@@ -88,6 +88,44 @@ impl Drop for RingFile {
         drop(self.file.take());
         let _ = std::fs::remove_file(&self.path);
     }
+}
+/// Size a ring file. On a disk its blocks are reserved now: in a sparse file
+/// a disk that fills up later kills the worker with SIGBUS when a frame first
+/// touches a page.
+fn reserve(file: &File, length: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    match allocate(file, length) {
+        Err(e) if e.kind() != std::io::ErrorKind::StorageFull => {}
+        reserved => return reserved,
+    }
+    file.set_len(length)
+}
+/// tmpfs is left sparse: reserving there would commit RAM for slot space
+/// smaller frames never use.
+#[cfg(target_os = "linux")]
+fn allocate(file: &File, length: u64) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    let fd = file.as_raw_fd();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: fstatfs fills `stat` for a valid descriptor; it is read only
+    // when that succeeded.
+    let tmpfs = unsafe {
+        libc::fstatfs(fd, stat.as_mut_ptr()) == 0 && stat.assume_init().f_type as u64 == TMPFS_MAGIC
+    };
+    if tmpfs {
+        return Err(std::io::ErrorKind::Unsupported.into());
+    }
+    // SAFETY: a valid descriptor. posix_fallocate returns its error rather
+    // than setting errno.
+    match unsafe { libc::posix_fallocate(fd, 0, length as libc::off_t) } {
+        0 => Ok(()),
+        error => Err(std::io::Error::from_raw_os_error(error)),
+    }
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+fn allocate(file: &File, length: u64) -> std::io::Result<()> {
+    fs2::FileExt::allocate(file, length)
 }
 
 /// A mapped ring. Fields drop in order, so a creator's file is removed only
@@ -210,7 +248,16 @@ impl SharedRing {
             file: Some(options.open(&staging)?),
             path: staging,
         };
-        let raw = file.map(length)?;
+        let raw = file.map(length).map_err(|e| {
+            let full = e
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::StorageFull);
+            if full {
+                storage_full(dir, fs2::available_space(dir).unwrap_or(0), length)
+            } else {
+                e
+            }
+        })?;
         if file.path != path {
             std::fs::rename(&file.path, &path)?;
             file.path = path;
@@ -553,14 +600,18 @@ fn preview(frame: &Frame, capacity: usize) -> Result<Frame> {
 /// A ring file must fit on its disk or tmpfs: a frame touching a page the
 /// filesystem cannot back kills the worker with SIGBUS instead of an error.
 fn enough_space(dir: &Path, free: u64, length: u64) -> Result<()> {
-    ensure!(
-        free >= length,
+    if free < length {
+        return Err(storage_full(dir, free, length));
+    }
+    Ok(())
+}
+fn storage_full(dir: &Path, free: u64, length: u64) -> anyhow::Error {
+    anyhow::anyhow!(
         "storage full: {} has {} free, and a camera frame ring needs {}; free space or lower CAPTUREFAB_FRAME_BYTES",
         dir.display(),
         crate::analytics::human_bytes(free),
         crate::analytics::human_bytes(length)
-    );
-    Ok(())
+    )
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -849,6 +900,30 @@ mod tests {
         drop(live);
         assert!(!live_path.exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn ring_files_reserve_their_blocks_except_on_tmpfs() {
+        use std::os::unix::fs::MetadataExt;
+        let allocated = |dir: &Path| {
+            let ring = SharedRing::create_file(dir, 1 << 20).unwrap();
+            let path = PathBuf::from(ring.worker_arg().unwrap());
+            let meta = std::fs::metadata(path).unwrap();
+            assert_eq!(meta.len(), ring_bytes(1 << 20) as u64);
+            meta.blocks() * 512
+        };
+        let dir = temp_dir("ring-reserve");
+        assert!(allocated(&dir) >= ring_bytes(1 << 20) as u64);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // Only the header page is touched in a ring on tmpfs.
+        #[cfg(target_os = "linux")]
+        {
+            let dir = Path::new("/dev/shm").join(dir.file_name().unwrap());
+            if std::fs::create_dir(&dir).is_ok() {
+                assert!(allocated(&dir) < 1 << 20);
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
     }
     #[test]
     fn a_full_disk_fails_with_storage_full() {
