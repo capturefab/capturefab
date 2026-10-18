@@ -578,8 +578,9 @@ enum Message {
     FrameArrived,
     /// The main window drew after frame work paused for want of draws.
     Redrawn,
-    /// Whether the main window is minimized, where the platform says.
-    Minimized(Option<bool>),
+    /// Whether the main window is out of sight, where the platform says;
+    /// see `pacing::out_of_sight`.
+    Hidden(Option<bool>),
     /// The size of the main window's monitor, where the platform says.
     Monitor(Option<Size>),
     /// The window opened, moved or changed scale, perhaps onto another display.
@@ -857,8 +858,8 @@ struct Workbench {
     /// The first change of the view since the main window last drew; see
     /// `frames_paused`.
     undrawn: Option<Instant>,
-    /// The main window is minimized, as far as the platform tells.
-    minimized: bool,
+    /// The main window is out of sight, as far as the platform tells.
+    hidden: bool,
     frame_meta: Option<(u64, u32, u32, u32, u64)>,
     /// When the frame shown is a downscaled preview of one larger than the
     /// camera's ring, that frame's width, height and pixel format.
@@ -1079,7 +1080,7 @@ impl Workbench {
             cadence: Arc::default(),
             draws: Arc::default(),
             undrawn: None,
-            minimized: false,
+            hidden: false,
             frame_meta: None,
             frame_source: None,
             frame_id: None,
@@ -1874,10 +1875,10 @@ impl Workbench {
         Task::batch([
             pages,
             self.screenshot_tick(),
-            // Minimizing or restoring a window in the background may not
-            // move the keyboard; X11 still draws a minimized window.
+            // A window in the background can be covered, hidden or restored
+            // without the keyboard moving, and may still draw meanwhile.
             if self.key_window.is_none() && self.screenshot.is_none() {
-                window::is_minimized(self.main_window).map(Message::Minimized)
+                pacing::out_of_sight(self.main_window)
             } else {
                 Task::none()
             },
@@ -1924,8 +1925,8 @@ impl Workbench {
     fn update_frames(&mut self) {
         if self.frames_paused() {
             // Frames, and the watcher with them, wait until the window
-            // draws again; a minimized one may draw without showing.
-            if !self.minimized {
+            // draws again; a hidden one may draw without showing.
+            if !self.hidden {
                 self.draws.pause();
             }
             return;
@@ -2714,7 +2715,7 @@ impl Workbench {
                 {
                     return window::gain_focus(error.window);
                 }
-                if id == self.main_window && std::mem::take(&mut self.minimized) {
+                if id == self.main_window && std::mem::take(&mut self.hidden) {
                     self.update_frames();
                 }
                 self.focused_window = id;
@@ -2728,12 +2729,12 @@ impl Workbench {
                     self.key_window = None;
                 }
                 self.desktop_menu = Default::default();
-                let minimized = if id == self.main_window {
-                    window::is_minimized(id).map(Message::Minimized)
+                let hidden = if id == self.main_window {
+                    pacing::out_of_sight(id)
                 } else {
                     Task::none()
                 };
-                return Task::batch([self.accessibility.focused(id, false).discard(), minimized]);
+                return Task::batch([self.accessibility.focused(id, false).discard(), hidden]);
             }
             Message::CloseRequested(_) if self.close_error.is_some() => {
                 self.dismiss_close_error();
@@ -2897,12 +2898,12 @@ impl Workbench {
             Message::ScreenRefresh(period) => self.refresh.report(period),
             Message::FrameArrived | Message::Redrawn if !self.shot_staged() => self.update_frames(),
             Message::FrameArrived | Message::Redrawn => {}
-            Message::Minimized(Some(minimized)) => {
-                if std::mem::replace(&mut self.minimized, minimized) && !minimized {
+            Message::Hidden(Some(hidden)) => {
+                if std::mem::replace(&mut self.hidden, hidden) && !hidden {
                     self.update_frames();
                 }
             }
-            Message::Minimized(None) => {}
+            Message::Hidden(None) => {}
             Message::SystemTheme(mode) => self.system_dark = mode == theme::Mode::Dark,
             Message::Key { chord, captured } => {
                 self.desktop_menu.cancel_alt();
@@ -2959,7 +2960,7 @@ impl Workbench {
                 return Task::done(self.main_window).then(|id| {
                     match prefs::double_click_action() {
                         prefs::DoubleClickAction::Minimize => window::minimize(id, true)
-                            .chain(Task::done(Message::Minimized(Some(true)))),
+                            .chain(Task::done(Message::Hidden(Some(true)))),
                         prefs::DoubleClickAction::None => Task::none(),
                         prefs::DoubleClickAction::Fill => {
                             window::run(id, prefs::fill_window).discard()

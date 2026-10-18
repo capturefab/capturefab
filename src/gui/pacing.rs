@@ -159,6 +159,32 @@ fn poll_after(since: Duration, interval: Duration, gap: Duration, fine: Duration
     wait.max(fine)
 }
 
+/// Ask whether main window `id` is out of sight. On macOS that is hidden,
+/// minimized, covered or on another Space, for winit draws such a window
+/// all the same; elsewhere minimized, which X11 draws too, while Wayland and
+/// Windows stop drawing on their own.
+pub(super) fn out_of_sight(id: window::Id) -> Task<Message> {
+    #[cfg(target_os = "macos")]
+    return window::run(id, occluded).map(Message::Hidden);
+    #[cfg(not(target_os = "macos"))]
+    window::is_minimized(id).map(Message::Hidden)
+}
+
+/// Whether no part of `window` can be seen, as AppKit tracks it.
+#[cfg(target_os = "macos")]
+fn occluded(window: &dyn iced::window::Window) -> Option<bool> {
+    use iced::window::raw_window_handle::RawWindowHandle;
+    use objc2_app_kit::{NSView, NSWindowOcclusionState};
+    let RawWindowHandle::AppKit(handle) = window.window_handle().ok()?.as_raw() else {
+        return None;
+    };
+    // SAFETY: iced runs this on the main thread with the window alive, and the
+    // handle's view is that window's content view.
+    let view: &NSView = unsafe { handle.ns_view.cast().as_ref() };
+    let state = view.window()?.occlusionState();
+    Some(!state.contains(NSWindowOcclusionState::Visible))
+}
+
 /// The main window's draws, as `observe` records them on the UI thread.
 #[derive(Default)]
 pub(super) struct Draws(Mutex<DrawLog>);
@@ -350,12 +376,12 @@ impl Widget<Message, Theme, iced::Renderer> for Observer<'_> {
 
 /// The frame path's side of the draw log.
 impl Workbench {
-    /// Whether frame work waits: the main window is minimized, or the view
-    /// changed `UNDRAWN` ago and it has not drawn since. Screenshots render
-    /// a hidden window that never draws, so they never wait.
+    /// Whether frame work waits: the main window is out of sight, or the
+    /// view changed `UNDRAWN` ago and it has not drawn since. Screenshots
+    /// render a hidden window that never draws, so they never wait.
     pub(super) fn frames_paused(&self) -> bool {
         self.screenshot.is_none()
-            && (self.minimized
+            && (self.hidden
                 || self
                     .undrawn
                     .is_some_and(|since| self.now.saturating_duration_since(since) >= UNDRAWN))
@@ -576,8 +602,8 @@ mod tests {
         bench.now += UNDRAWN;
         bench.note_undrawn();
         assert!(!bench.frames_paused(), "drawn since");
-        // Minimized, it waits however recently it drew.
-        bench.minimized = true;
+        // Out of sight, it waits however recently it drew.
+        bench.hidden = true;
         assert!(bench.frames_paused());
     }
 }
