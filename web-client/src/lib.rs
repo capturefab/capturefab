@@ -1369,13 +1369,19 @@ fn preview() {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let identity = format!("{worker}:{frame_id}:{timestamp}");
         let etag = response
             .headers()
             .get("ETag")
             .ok()
             .flatten()
             .unwrap_or_default();
+        // The tag names the frame even where camera frame ids repeat, as
+        // scanned pages' do; older servers send none.
+        let identity = if etag.is_empty() {
+            format!("{worker}:{frame_id}:{timestamp}")
+        } else {
+            etag.clone()
+        };
         let result = match response.blob() {
             Ok(promise) => JsFuture::from(promise)
                 .await
@@ -1395,7 +1401,6 @@ fn preview() {
                 return;
             }
             if !frame_id.is_empty() && app.preview_frame == identity {
-                app.preview_etag = etag;
                 return;
             }
             let Ok(blob) = result else {

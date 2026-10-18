@@ -717,15 +717,10 @@ impl Service {
             .as_ref()
             .is_none_or(|preview| preview.encoded.elapsed() >= self.previews.share)
         {
-            let Some((worker, frame)) = self.handle.latest_frame_from(&camera) else {
+            let Some((tag, frame)) = self.handle.latest_frame_tagged(&camera) else {
                 return Response::new(204, "image/png", Vec::new());
             };
-            let key = PreviewKey {
-                worker,
-                frame: frame.id,
-                timestamp_ns: frame.timestamp_ns,
-                format,
-            };
+            let key = PreviewKey { frame: tag, format };
             // A frame larger than the camera's ring arrives downscaled; the
             // headers give the size the camera delivered.
             let (width, height, _) = self.handle.preview_of(&camera).unwrap_or((
@@ -733,9 +728,15 @@ impl Service {
                 frame.height,
                 frame.pixel_format,
             ));
+            let delivered = Delivered {
+                id: frame.id,
+                timestamp_ns: frame.timestamp_ns,
+                width,
+                height,
+            };
             if cached.as_ref().is_none_or(|preview| preview.key != key) {
                 if if_none_match.is_some_and(|tags| etag_matches(tags, &key.etag())) {
-                    return preview_response(key, (width, height), None);
+                    return preview_response(key, delivered, None);
                 }
                 self.previews.encodes.fetch_add(1, Ordering::Relaxed);
                 let body = match encode_preview(&frame, format) {
@@ -744,7 +745,7 @@ impl Service {
                 };
                 *cached = Some(Preview {
                     key,
-                    size: (width, height),
+                    delivered,
                     body,
                     encoded: Instant::now(),
                 });
@@ -754,7 +755,7 @@ impl Service {
         let unchanged = if_none_match.is_some_and(|tags| etag_matches(tags, &preview.key.etag()));
         preview_response(
             preview.key,
-            preview.size,
+            preview.delivered,
             (!unchanged).then(|| preview.body.clone()),
         )
     }
@@ -903,12 +904,11 @@ impl PreviewFormat {
     }
 }
 
-/// One encoded preview: a frame of one camera worker in one format.
+/// One encoded preview: a frame, as `SessionHandle::latest_frame_tagged`
+/// names it, in one format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PreviewKey {
-    worker: u32,
     frame: u64,
-    timestamp_ns: u64,
     format: PreviewFormat,
 }
 impl PreviewKey {
@@ -917,29 +917,31 @@ impl PreviewKey {
             PreviewFormat::Png => "png",
             PreviewFormat::Jpeg => "jpeg",
         };
-        format!(
-            "\"{}-{}-{}-{extension}\"",
-            self.worker, self.frame, self.timestamp_ns
-        )
+        format!("\"{:x}-{extension}\"", self.frame)
     }
 }
 
+/// The frame a preview shows, as the camera delivered it.
+#[derive(Debug, Clone, Copy)]
+struct Delivered {
+    id: u64,
+    timestamp_ns: u64,
+    width: u32,
+    height: u32,
+}
+
 /// A preview with its frame headers, or 304 without a body.
-fn preview_response(
-    key: PreviewKey,
-    (width, height): (u32, u32),
-    body: Option<Vec<u8>>,
-) -> Response {
+fn preview_response(key: PreviewKey, frame: Delivered, body: Option<Vec<u8>>) -> Response {
     let mut response = match body {
         Some(body) => Response::new(200, key.format.content_type(), body),
         None => Response::new(304, key.format.content_type(), Vec::new()),
     };
     response.headers.extend([
         ("ETag", key.etag()),
-        ("X-Frame-Id", key.frame.to_string()),
-        ("X-Frame-Timestamp-Ns", key.timestamp_ns.to_string()),
-        ("X-Frame-Width", width.to_string()),
-        ("X-Frame-Height", height.to_string()),
+        ("X-Frame-Id", frame.id.to_string()),
+        ("X-Frame-Timestamp-Ns", frame.timestamp_ns.to_string()),
+        ("X-Frame-Width", frame.width.to_string()),
+        ("X-Frame-Height", frame.height.to_string()),
     ]);
     response
 }
@@ -965,8 +967,7 @@ impl Default for Previews {
 type PreviewSlot = Arc<Mutex<Option<Preview>>>;
 struct Preview {
     key: PreviewKey,
-    /// The size the camera delivered.
-    size: (u32, u32),
+    delivered: Delivered,
     body: Vec<u8>,
     encoded: Instant,
 }
@@ -1336,7 +1337,7 @@ mod tests {
         assert_eq!((first.status, second.status), (200, 200));
         assert_eq!(first.body, second.body);
         let etag = header(&first, "ETag").unwrap().to_owned();
-        assert_eq!(etag, "\"0-1-1000-png\"");
+        assert_eq!(etag, "\"1-png\"");
         assert_eq!(header(&second, "ETag"), Some(etag.as_str()));
         assert_eq!(service.previews.encodes.load(Ordering::Relaxed), 1);
         // A client that has the frame gets its headers and no body.
@@ -1349,15 +1350,38 @@ mod tests {
         }
         assert_eq!(service.previews.encodes.load(Ordering::Relaxed), 1);
         assert_eq!(
-            service
-                .preview("camera=cam", Some("\"0-1-1000-jpeg\""))
-                .status,
+            service.preview("camera=cam", Some("\"1-jpeg\"")).status,
             200
         );
         writer.write(&color(2), true).unwrap();
         let next = service.preview("camera=cam", Some(&etag));
         assert_eq!(next.status, 200);
-        assert_eq!(header(&next, "ETag"), Some("\"0-2-2000-png\""));
+        assert_eq!(header(&next, "ETag"), Some("\"2-png\""));
+        handle.shutdown();
+    }
+
+    #[test]
+    fn frames_that_repeat_an_id_and_timestamp_still_get_a_new_preview() {
+        let root = TempWebRoot::new();
+        let (handle, mut writer) = SessionHandle::fed(1 << 16);
+        let service = service(handle.clone(), WebRoot::Folder(root.0.clone()));
+        // Scanned pages all carry id 0 and timestamp 0.
+        let page = |shade: u8| Frame {
+            id: 0,
+            width: 64,
+            height: 48,
+            pixel_format: crate::types::MONO8,
+            timestamp_ns: 0,
+            data: vec![shade; 64 * 48],
+        };
+        writer.write(&page(10), true).unwrap();
+        let first = service.preview("", None);
+        writer.write(&page(200), true).unwrap();
+        let second = service.preview("", header(&first, "ETag"));
+        assert_eq!(second.status, 200);
+        assert_ne!(second.body, first.body);
+        assert_ne!(header(&second, "ETag"), header(&first, "ETag"));
+        assert_eq!(header(&second, "X-Frame-Id"), Some("0"));
         handle.shutdown();
     }
 
@@ -1462,7 +1486,7 @@ mod tests {
         if cfg!(feature = "jpeg") {
             assert_eq!(jpeg.content_type, "image/jpeg");
             assert!(jpeg.body.starts_with(&[0xff, 0xd8]));
-            assert_eq!(header(&jpeg, "ETag"), Some("\"0-2-2000-jpeg\""));
+            assert_eq!(header(&jpeg, "ETag"), Some("\"2-jpeg\""));
         } else {
             assert_eq!(jpeg.content_type, "image/png");
         }

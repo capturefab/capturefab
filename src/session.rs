@@ -1442,14 +1442,18 @@ impl SessionHandle {
     /// first poll may return a keep-alive frame up to a second old (see
     /// `shared_memory`).
     pub fn latest_frame_for(&self, id: &str) -> Option<Arc<Frame>> {
-        Some(self.latest_frame_from(id)?.1)
+        Some(self.latest_frame_tagged(id)?.1)
     }
-    /// `latest_frame_for` with the pid of the worker that sent it, which
-    /// together with the frame's id names one frame.
-    pub fn latest_frame_from(&self, id: &str) -> Option<(u32, Arc<Frame>)> {
+    /// `latest_frame_for` with a tag naming the frame: the worker's pid above
+    /// the ring sequence it was published under. Unlike the camera's frame
+    /// ids, which start over with a worker and repeat for scanned pages, it
+    /// changes with every frame.
+    pub fn latest_frame_tagged(&self, id: &str) -> Option<(u64, Arc<Frame>)> {
         let feed = self.feed(id)?;
-        let frame = locked(&feed.frames).poll(true)?;
-        Some((feed.worker, frame))
+        let mut frames = locked(&feed.frames);
+        let frame = frames.poll(true)?;
+        let sequence = frames.ring.taken_sequence().unwrap_or(0);
+        Some(((u64::from(feed.worker) << 32) | u64::from(sequence), frame))
     }
     /// When the frame a camera's feed last returned is a downscaled preview
     /// of a frame larger than its ring, the width, height and pixel format
