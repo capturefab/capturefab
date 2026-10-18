@@ -451,13 +451,19 @@ impl Workbench {
         }
     }
 
-    /// The cameras whose frames the main view shows.
+    /// The cameras whose frames the main view shows: in the overview, the
+    /// tiles in view, as tiles scrolled out take no frames.
     pub(super) fn cameras_shown(&self) -> Vec<&str> {
         if self.overview() {
+            let (grid, count) = (self.grid.get(), self.snapshot.cameras.len());
             self.snapshot
                 .cameras
                 .iter()
-                .map(|camera| camera.info.id.as_str())
+                .enumerate()
+                .filter(|(index, _)| {
+                    grid.is_none_or(|grid| grid.shows(*index, count, self.grid_scroll))
+                })
+                .map(|(_, camera)| camera.info.id.as_str())
                 .collect()
         } else {
             self.snapshot.active_camera.as_deref().into_iter().collect()
@@ -768,6 +774,35 @@ mod tests {
         assert_eq!(*cadence.shown.lock().unwrap(), ["sim:1"]);
         let handle = SessionHandle::new();
         assert_eq!(cadence.sequence(&handle), 0, "no feed, no frames");
+    }
+
+    #[test]
+    fn tiles_scrolled_out_of_view_are_neither_watched_nor_counted_as_shown() {
+        // A tile out of view takes no frames, so the watcher need not look
+        // for them and the keeping-up meter must not read it as behind.
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        bench.snapshot.cameras = (0..6)
+            .map(|i| {
+                let mut camera = liveness::streaming_camera(0, 0, 30.0);
+                camera.info.id = format!("tile{i}");
+                camera
+            })
+            .collect();
+        assert_eq!(bench.cameras_shown().len(), 6, "every tile before a layout");
+        // Two columns, three rows, two of them in view.
+        bench.grid.set(Some(grid::Grid {
+            columns: 2,
+            tile: Size::new(400.0, 300.0),
+            viewport: 600.0,
+        }));
+        assert_eq!(bench.cameras_shown(), ["tile0", "tile1", "tile2", "tile3"]);
+        let _ = bench.update(Message::OverviewScrolled(1000.0));
+        assert_eq!(bench.cameras_shown(), ["tile2", "tile3", "tile4", "tile5"]);
+        assert_eq!(
+            *bench.cadence.shown.lock().unwrap(),
+            ["tile2", "tile3", "tile4", "tile5"]
+        );
+        bench.handle.shutdown();
     }
 
     #[test]
