@@ -871,6 +871,79 @@ fn a_frame_that_cannot_be_saved_now_is_retried_without_pausing() {
     std::fs::rename(&moved, file.frames()).unwrap();
 }
 
+/// Run a test in a child with its own session directory, so it can change
+/// the global storage policy without affecting other tests.
+#[cfg(unix)]
+fn isolated(name: &str) -> bool {
+    if std::env::var_os("CAPTUREFAB_AUTOCAPTURE_STORAGE_TEST").is_some() {
+        return true;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "capturefab-autocapture-{}-{}",
+        std::process::id(),
+        epoch_ms()
+    ));
+    crate::ipc::ensure_private_dir(&dir).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &format!("autocapture::tests::{name}"),
+            "--nocapture",
+        ])
+        .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_AUTOCAPTURE_STORAGE_TEST", "1")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
+#[cfg(unix)]
+#[test]
+fn frames_keep_to_the_configured_storage_budget_not_the_default_one() {
+    if !isolated("frames_keep_to_the_configured_storage_budget_not_the_default_one") {
+        return;
+    }
+    // The user raised the budget to twice the default and lets the oldest
+    // captures go once it is full.
+    let default = crate::storage::StoragePolicy::default();
+    let configured = crate::storage::StoragePolicy {
+        max_bytes: default.max_bytes * 2,
+        on_full: "delete-oldest".into(),
+        ..default.clone()
+    };
+    crate::storage::configure_policy(&configured).unwrap();
+    let captures = crate::ipc::session_dir().join("captures");
+    std::fs::create_dir(&captures).unwrap();
+    let oldest = captures.join("oldest.png");
+    crate::storage::save_bytes(&[1; 8192], &oldest, &configured).unwrap();
+    // Stored captures fill all but 4 KiB of the default budget: a sparse
+    // file the ledger counts at its length once it reconciles.
+    let large = captures.join("large.raw");
+    crate::storage::save_bytes(&[2], &large, &configured).unwrap();
+    File::options()
+        .write(true)
+        .open(&large)
+        .unwrap()
+        .set_len(default.max_bytes - 4096)
+        .unwrap();
+    crate::storage::quota_status().unwrap();
+    let file = SessionFile::new();
+    let mut session = file.create();
+    session.manual(&solid(120)).unwrap();
+    assert!(
+        oldest.exists(),
+        "a frame within the configured budget removes no capture"
+    );
+    assert_eq!(file.frame_files().len(), 1);
+}
+
 #[test]
 fn changing_settings_forgets_failures_and_notes_from_earlier_writes() {
     let file = SessionFile::new();

@@ -1595,10 +1595,14 @@ impl Store {
     }
 
     /// Write a raw frame through the storage ledger, which applies the global
-    /// budget, volume checks and never-overwrite. A name left by an interrupted
-    /// session is skipped, not replaced.
+    /// budget, volume checks and never-overwrite. Frames have no limits of
+    /// their own: any other request policy could only tighten the one the
+    /// user configured, and delete-oldest would then remove captures that
+    /// budget keeps. A name left by an interrupted session is skipped, not
+    /// replaced.
     fn write_frame(&self, id: u64, data: &[u8]) -> Result<(String, String)> {
         self.check_folder()?;
+        let policy = storage::configured_policy()?;
         for attempt in 0..8 {
             let name = match attempt {
                 0 => format!("{id:08}.raw"),
@@ -1606,7 +1610,7 @@ impl Store {
             };
             let mut writer = match storage::create_writer(
                 &self.frames.join(&name),
-                &storage::StoragePolicy::default(),
+                &policy,
                 data.len() as u64,
             ) {
                 Ok(writer) => writer,
