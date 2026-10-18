@@ -38,6 +38,15 @@ sudo usermod -aG plugdev pi
 
 `TAG+="uaccess"` covers someone logged in at the computer; a service has no seat, so it relies on the `plugdev` group. A new group applies to new logins and to the service once it restarts. Unplugging and replugging the camera also applies the rule.
 
+Capturefab keeps two frames of transfers queued and maps them straight from the kernel's usbfs memory, 16 MB by default. When a high-resolution camera needs more, the stream still runs but copies every transfer, and the service log says `USB transfers are copied`. `doctor --json` reports the limit in `limits.usbfs_memory_mb`; raise it above twice the frame size, now and at every boot, for example to 256 MB:
+
+```sh
+echo 256 | sudo tee /sys/module/usbcore/parameters/usbfs_memory_mb
+echo 'options usbcore usbfs_memory_mb=256' | sudo tee /etc/modprobe.d/60-capturefab.conf
+```
+
+Where usbcore is built into the kernel, as on Raspberry Pi OS and Jetson Linux, the modprobe file has no effect: add `usbcore.usbfs_memory_mb=256` to the kernel command line instead, in `/boot/firmware/cmdline.txt` on Raspberry Pi OS or on the `APPEND` line of `/boot/extlinux/extlinux.conf` on Jetson.
+
 **GigE Vision.** Linux caps every socket's receive buffer at `net.core.rmem_max`, usually 208 KiB, which loses packets from larger frames. Raise it now and at every boot:
 
 ```sh
@@ -51,18 +60,20 @@ echo net.core.rmem_max=33554432 | sudo tee /etc/sysctl.d/60-capturefab.conf
 
 | What | Where on Linux | Notes |
 | --- | --- | --- |
-| Runtime: running sessions and their descriptors | `$XDG_RUNTIME_DIR/capturefab`, normally `/run/user/<uid>/capturefab` | Memory (tmpfs), so nothing here wears the SD card; gone at reboot |
-| State: settings, saved destinations, the upload queue and the storage ledger | `$XDG_STATE_HOME/capturefab`, normally `~/.local/state/capturefab` | On disk; survives reboots |
-| Cache: the extracted FFmpeg and encoder probe results | `$XDG_CACHE_HOME/capturefab`, normally `~/.cache/capturefab` | Safe to delete |
+| Runtime: running sessions and their descriptors | `$XDG_RUNTIME_DIR/capturefab`; without `XDG_RUNTIME_DIR`, `/run/user/<uid>/capturefab` for an account that lingers, otherwise `~/.cache/capturefab/sessions` on disk | Under `/run/user` it is memory (tmpfs), so nothing here wears the SD card; gone at reboot |
+| State: settings, saved destinations, the upload queue and the storage ledger | `$XDG_STATE_HOME/capturefab`, normally `~/.local/state/capturefab` | On disk; survives reboots. An older version's files move here once |
+| Cache: the extracted FFmpeg, encoder probe results and dataset export staging | `$XDG_CACHE_HOME/capturefab`, normally `~/.cache/capturefab` | Safe to delete |
 | Captures saved to a relative path | The directory the CLI command ran in; for the browser, the service's working directory | `doctor` and `storage` measure free space on the disk of `~/Capturefab` |
 
-Camera frame buffers are anonymous shared memory, not files in these folders. `CAPTUREFAB_SESSION_DIR=/some/folder` puts runtime and state together in that one folder instead; every process that should see the same sessions and storage budget must then set the same value, including your SSH shell.
+Camera frame buffers are anonymous shared memory, not files in these folders. `CAPTUREFAB_SESSION_DIR=/some/folder` puts runtime and state together in that one folder instead; every process that should see the same sessions and storage budget must then set the same value, including your SSH shell. `CAPTUREFAB_CACHE_DIR=/some/folder` moves the cache.
 
-A session is found by name in the runtime folder, so the service and your SSH login must agree on it. An SSH login sets `XDG_RUNTIME_DIR=/run/user/1000`, but a system service does not, and `/run/user/1000` exists only while the user is logged in unless the account lingers. Let it linger, so the folder exists from boot and survives logout:
+A session is found by name in the runtime folder, so the service and your SSH login must agree on it. An SSH login sets `XDG_RUNTIME_DIR=/run/user/1000`, but a system service does not, and logind keeps `/run/user/1000` only while the user is logged in unless the account lingers. Let it linger, so the folder exists from boot and survives logout:
 
 ```sh
 sudo loginctl enable-linger pi
 ```
+
+Without lingering, a service that sets no `XDG_RUNTIME_DIR` keeps its sessions on disk in `~/.cache/capturefab/sessions`, where an SSH login does not look, and `capturefab doctor` warns about `runtime_dir` with the fix. After an upgrade from an older version, its `old_state` check names any settings, destinations, upload queue or storage ledger that could not move into the state folder, and how to keep them.
 
 ## 4. Run serve as a service
 
@@ -71,8 +82,8 @@ Save this as `/etc/systemd/system/capturefab-line1.service`, with your account, 
 ```ini
 [Unit]
 Description=Capturefab session line1
-Wants=network-online.target user-runtime-dir@1000.service
-After=network-online.target user-runtime-dir@1000.service tailscaled.service
+Wants=network-online.target user@1000.service
+After=network-online.target user@1000.service tailscaled.service
 
 [Service]
 User=pi
@@ -97,6 +108,8 @@ sudo systemctl enable --now capturefab-line1
 systemctl status capturefab-line1
 journalctl -u capturefab-line1 -f
 ```
+
+`Wants=` and `After=user@1000.service` start the service once logind has made `/run/user/1000`. If no login needs to reach the session with `--session`, the service can keep a runtime folder of its own instead: replace the `XDG_RUNTIME_DIR` line with `RuntimeDirectory=capturefab`, `RuntimeDirectoryMode=0700` and `Environment=XDG_RUNTIME_DIR=/run/capturefab`, and leave out `user@1000.service`. The browser and its API still reach it through `--listen`, and state stays in `~/.local/state/capturefab`.
 
 Keep `KillSignal=SIGINT`: systemd's default SIGTERM ends `serve` without that cleanup. `Restart=on-failure` also retries when the Tailscale address is not up yet at boot. To connect a camera and start streaming when the service starts, put the camera before the command: `capturefab --camera ID serve --name line1 --stream ...`. Camera connections and schedules belong to the running process and do not survive a restart; reapply a [workflow file](../README.md#repeatable-workflows) to set them up again.
 
@@ -138,10 +151,12 @@ Put one `NAME=value` per line in it, such as `CAPTUREFAB_SFTP_PASSWORD=...`, or 
 
 ## 7. Efficiency mode
 
-Efficiency mode spends less CPU on camera workers: fewer FFmpeg decoding threads for webcams and network streams, and a faster libx264 preset for video, at some cost in smoothness and video file size. Captures and recordings keep every frame in every mode. The default, `auto`, chooses efficient on computers with at most two CPU cores or 2 GiB of memory, or with the Linux `low-power` power profile, so a 4 GB Raspberry Pi 4 or 5 stays smooth. With several cameras on a small board, choose it in the unit:
+Efficiency mode spends less CPU on camera workers: fewer FFmpeg decoding threads for webcams and network streams, a faster libx264 preset for video, at some cost in smoothness and video file size, and a fifth of one core instead of half for automatic capture's DINOv2 embeddings on the CPU. The session also asks its workers for their status half as often. Captures and recordings keep every frame in every mode. The default, `auto`, chooses efficient on computers with at most two CPU cores or 2 GiB of memory, or with the Linux `low-power` power profile, so a 4 GB Raspberry Pi 4 or 5 stays smooth. With several cameras on a small board, choose it in the unit:
 
 ```ini
 Environment=CAPTUREFAB_EFFICIENCY=efficient
 ```
 
 `capturefab doctor` shows the mode in force and why. See [host checks and efficiency mode](../README.md#host-checks-and-efficiency-mode).
+
+Without a GPU, [automatic capture](../README.md#automatic-capture-and-review) with the default DINOv2 encoder rests after each embedding to stay within that share of a core, so a small board samples it slowly; `status --json` reports the rate in `capture_session.samples_per_second`. Where frequent sampling matters more than recognizing what is in the picture, create the session with `capturefab --session line1 --camera ID capture-session new PATH --encoder native`, which samples four frames a second with a small fraction of a core.
