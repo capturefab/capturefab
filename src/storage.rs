@@ -54,7 +54,9 @@ impl StoragePolicy {
         );
         Ok(())
     }
-    fn constrained_by(&self, configured: &Self) -> Self {
+    /// This request policy within the configured one: the smaller limit of
+    /// each, and delete-oldest when either side asks for it.
+    pub(crate) fn constrained_by(&self, configured: &Self) -> Self {
         Self {
             max_bytes: self.max_bytes.min(configured.max_bytes),
             max_files: self.max_files.min(configured.max_files),

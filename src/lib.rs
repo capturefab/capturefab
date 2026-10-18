@@ -39,6 +39,7 @@ pub mod shared_memory;
 pub mod signals;
 pub mod simulation;
 pub mod storage;
+pub mod tools;
 #[cfg(feature = "uploads")]
 pub mod transfer;
 pub mod transport;

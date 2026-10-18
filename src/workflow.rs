@@ -274,24 +274,30 @@ impl Step {
     }
 
     fn redact_error(&self, message: &str) -> String {
-        let mut values = Vec::new();
+        let mut known =
+            serde_json::to_value(&self.command).expect("validated session command must serialize");
         if let Some(camera) = &self.camera {
-            values.push(camera.clone());
+            known = json!([camera, known]);
         }
-        collect_strings(
-            &serde_json::to_value(&self.command).expect("validated session command must serialize"),
-            &mut values,
-        );
-        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-        let mut message = message.to_owned();
-        for value in values {
-            let redacted = crate::media::redact_url(&value);
-            if redacted != value {
-                message = message.replace(&value, &redacted);
-            }
-        }
-        message
+        redact_error(message, &known)
     }
+}
+
+/// `message` with every string in `known` that carries URL credentials
+/// replaced by its redacted form, longest first, so an error that quotes a
+/// step's own camera or output shows no secret even where it is not a URL.
+pub(crate) fn redact_error(message: &str, known: &Value) -> String {
+    let mut values = Vec::new();
+    collect_strings(known, &mut values);
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    let mut message = message.to_owned();
+    for value in values {
+        let redacted = crate::media::redact_url(&value);
+        if redacted != value {
+            message = message.replace(&value, &redacted);
+        }
+    }
+    message
 }
 
 fn collect_strings(value: &Value, strings: &mut Vec<String>) {
@@ -307,7 +313,8 @@ fn collect_strings(value: &Value, strings: &mut Vec<String>) {
     }
 }
 
-fn redact_value(value: &mut Value) {
+/// Redact URL credentials in every string of `value`, in place.
+pub(crate) fn redact_value(value: &mut Value) {
     match value {
         Value::String(value) => *value = crate::media::redact_url(value),
         Value::Array(values) => values.iter_mut().for_each(redact_value),

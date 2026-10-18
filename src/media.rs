@@ -1967,7 +1967,9 @@ fn codec_family(codec: &str) -> Result<&'static str> {
         _ => bail!("unsupported forwarding codec {codec}; use h264, hevc or av1"),
     }
 }
-fn encoder_family(encoder: &str) -> Option<&'static str> {
+/// The codec an FFmpeg encoder writes, `h264`, `hevc` or `av1`, or None for
+/// encoders of other codecs.
+pub fn encoder_family(encoder: &str) -> Option<&'static str> {
     match encoder {
         "h264" | "libx264" | "libx264rgb" | "libopenh264" | "nvv4l2h264enc" => Some("h264"),
         "hevc" | "libx265" | "nvv4l2h265enc" => Some("hevc"),
