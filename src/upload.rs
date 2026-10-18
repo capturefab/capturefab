@@ -13,6 +13,11 @@
 //! uploads stay readable by older Capturefab versions; FTP and SFTP items use
 //! `remote`. Completed uploads are logged in their own file,
 //! `uploads-completed.json`, for status displays and the dataset catalog.
+//!
+//! Changes are appended to `uploads.journal` and folded into both files once
+//! it outgrows them, so queueing or finishing an upload costs a short append
+//! however long the backlog. Older versions read only the files, which can
+//! lag the journal by that much.
 use crate::destination::{Bucket, Remote};
 use crate::transfer::{Permanent, Uploader};
 use anyhow::{Context, Result, anyhow, ensure};
@@ -22,9 +27,9 @@ use serde_json::{Value, json};
 use std::{
     collections::{HashMap, VecDeque},
     fs,
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Condvar, Mutex, OnceLock},
+    sync::{Condvar, Mutex, OnceLock, PoisonError},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -125,6 +130,14 @@ pub fn validate_id(id: &str) -> Result<()> {
 struct Queue {
     version: u32,
     items: Vec<Item>,
+    #[serde(flatten)]
+    totals: Totals,
+}
+
+/// The queue's running totals; a journal change that alters them carries
+/// them whole.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct Totals {
     #[serde(default)]
     uploaded: u64,
     #[serde(default)]
@@ -149,97 +162,383 @@ fn dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Hold `uploads.lock` while `f` runs; it guards the queue and the completed
-/// log.
-fn with_lock<T>(f: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
+/// Hold `uploads.lock` while `f` runs; it guards the queue, its journal and
+/// the completed log. Readers share it.
+fn with_lock<T>(shared: bool, f: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
     let dir = dir()?;
     let lock = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(dir.join("uploads.lock"))?;
-    lock.lock_exclusive().context("lock the upload queue")?;
+    if shared {
+        FileExt::lock_shared(&lock)
+    } else {
+        FileExt::lock_exclusive(&lock)
+    }
+    .context("lock the upload queue")?;
     f(&dir)
 }
 
-/// Files written to the queue directory, so tests can prove idle paths
-/// write nothing.
+/// Bytes written to the queue files, so tests can bound them.
 #[cfg(test)]
-static WRITES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Write `bytes` to `dir/name` atomically, readable only by this user.
-fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
-    #[cfg(test)]
-    WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let temp = dir.join(format!("{name}.{}.tmp", std::process::id()));
+fn private_options() -> fs::OpenOptions {
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&temp)?;
+    options
+}
+
+/// Write `bytes` to `dir/name` atomically, readable only by this user.
+fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    #[cfg(test)]
+    WRITTEN.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let temp = dir.join(format!("{name}.{}.tmp", std::process::id()));
+    let mut file = private_options().truncate(true).open(&temp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(&temp, dir.join(name))?;
     Ok(())
 }
 
-/// Run `update` on the queue under an exclusive lock, persisting the result
-/// when it changed anything.
-fn with_queue<T>(update: impl FnOnce(&mut Queue) -> Result<T>) -> Result<T> {
-    with_lock(|dir| with_queue_locked(dir, update))
+/// Tells versions of a file apart: a replaced file has another inode (on
+/// Windows, creation time) and modification time; an appended one, length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    created: Option<SystemTime>,
+    modified: Option<SystemTime>,
+    len: u64,
 }
-
-fn with_queue_locked<T>(dir: &Path, update: impl FnOnce(&mut Queue) -> Result<T>) -> Result<T> {
-    let (mut queue, read) = read_queue(dir)?;
-    let result = update(&mut queue)?;
-    // An idle uploader and status displays change nothing; writing only real
-    // changes keeps them off the disk.
-    let bytes = serde_json::to_vec(&queue)?;
-    if bytes != read {
-        write_private(dir, "uploads.json", &bytes)?;
+impl Stamp {
+    fn of(meta: &fs::Metadata) -> Self {
+        Self {
+            #[cfg(unix)]
+            inode: std::os::unix::fs::MetadataExt::ino(meta),
+            #[cfg(not(unix))]
+            created: meta.created().ok(),
+            modified: meta.modified().ok(),
+            len: meta.len(),
+        }
     }
-    Ok(result)
+    fn read(path: &Path) -> Result<Option<Self>> {
+        match fs::metadata(path) {
+            Ok(meta) => Ok(Some(Self::of(&meta))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("inspect {}", path.display())),
+        }
+    }
+    fn same_file(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        return self.inode == other.inode;
+        #[cfg(not(unix))]
+        return self.created == other.created;
+    }
 }
 
-/// The queue and its bytes as last written, without creating the file. The
-/// caller holds `uploads.lock`.
-fn read_queue(dir: &Path) -> Result<(Queue, Vec<u8>)> {
-    let path = dir.join("uploads.json");
-    let (queue, bytes) = match fs::read(&path) {
-        Ok(bytes) => {
+const QUEUE_FILE: &str = "uploads.json";
+const COMPLETED_FILE: &str = "uploads-completed.json";
+const JOURNAL_FILE: &str = "uploads.journal";
+/// The journal is folded into the queue and completed log once it outgrows
+/// them, or this, so a change costs a short append however long the queue,
+/// and readers replay little.
+const JOURNAL_MIN: u64 = 64 * 1024;
+const MAX_QUEUE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// One change to the uploads: a line of the journal. It holds new values,
+/// never increments, so replaying it twice is harmless.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Change {
+    /// Items added or updated, matched by ID.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    put: Vec<Item>,
+    /// IDs of items that left the queue.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    remove: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    totals: Option<Totals>,
+    /// A verified upload for the completed log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed: Option<Completed>,
+    /// Harmless to lose in a crash, so not flushed: the uploading mark,
+    /// which the next uploader clears anyway.
+    #[serde(skip)]
+    volatile: bool,
+}
+impl Change {
+    fn put(put: Vec<Item>) -> Self {
+        Self {
+            put,
+            ..Self::default()
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.put.is_empty()
+            && self.remove.is_empty()
+            && self.totals.is_none()
+            && self.completed.is_none()
+    }
+}
+
+/// The queue and completed log as the files hold them: `uploads.json` and
+/// `uploads-completed.json` with the journal replayed. Kept between calls,
+/// so a process reads only what others appended since.
+struct Uploads {
+    dir: PathBuf,
+    queue: Queue,
+    log: CompletedLog,
+    /// The queue file and journal as last read or written.
+    seen: (Option<Stamp>, Option<Stamp>),
+    /// Journal bytes replayed, up to its last complete line.
+    replayed: u64,
+    /// Bytes in the queue file and completed log.
+    folded: u64,
+}
+
+static UPLOADS: Mutex<Option<Uploads>> = Mutex::new(None);
+
+impl Uploads {
+    /// Read the queue and completed log files, before any journal.
+    fn read(dir: &Path, stamp: Option<Stamp>) -> Result<Self> {
+        let path = dir.join(QUEUE_FILE);
+        let (queue, bytes) = match fs::read(&path) {
+            Ok(bytes) => {
+                ensure!(
+                    bytes.len() as u64 <= MAX_QUEUE_BYTES,
+                    "upload queue is too large (maximum 256 MiB)"
+                );
+                let queue: Queue = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("invalid upload queue {}", path.display()))?;
+                (queue, bytes.len() as u64)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+                Queue {
+                    version: 1,
+                    ..Queue::default()
+                },
+                0,
+            ),
+            Err(e) => return Err(e).context("read the upload queue"),
+        };
+        ensure!(queue.version == 1, "unsupported upload queue version");
+        ensure!(
+            queue.items.len() <= MAX_ITEMS,
+            "upload queue contains too many items (maximum {MAX_ITEMS})"
+        );
+        let mut ids = std::collections::HashSet::new();
+        for item in &queue.items {
+            item.validate()
+                .with_context(|| format!("invalid queued upload {}", item.id))?;
+            ensure!(ids.insert(&item.id), "duplicate upload ID {}", item.id);
+        }
+        // A damaged log is started again rather than blocking uploads.
+        let (log, logged) = read_completed(dir).unwrap_or_default();
+        Ok(Self {
+            dir: dir.into(),
+            queue,
+            log,
+            seen: (stamp, None),
+            replayed: 0,
+            folded: bytes + logged,
+        })
+    }
+
+    /// Whether `journal` is the one replayed so far, perhaps longer.
+    fn continues(&self, journal: Option<Stamp>) -> bool {
+        match (self.seen.1, journal) {
+            (Some(seen), Some(journal)) => seen.same_file(&journal) && journal.len >= self.replayed,
+            _ => self.replayed == 0,
+        }
+    }
+
+    /// Apply the journal's complete lines after those already replayed.
+    fn replay(&mut self, dir: &Path, journal: Option<Stamp>) -> Result<()> {
+        if let Some(stamp) = journal {
             ensure!(
-                bytes.len() <= 256 * 1024 * 1024,
-                "upload queue is too large (maximum 256 MiB)"
+                stamp.len <= MAX_QUEUE_BYTES,
+                "upload queue journal is too large (maximum 256 MiB)"
             );
-            let queue: Queue = serde_json::from_slice(&bytes)
-                .with_context(|| format!("invalid upload queue {}", path.display()))?;
-            (queue, bytes)
+            let path = dir.join(JOURNAL_FILE);
+            let mut file = fs::File::open(&path).context("read the upload queue journal")?;
+            file.seek(SeekFrom::Start(self.replayed))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            // A writer that stopped mid-line left the rest; the next one
+            // writes over it.
+            let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+            let mut changes = Vec::new();
+            for line in bytes[..complete]
+                .split(|&b| b == b'\n')
+                .filter(|l| !l.is_empty())
+            {
+                let change: Change = serde_json::from_slice(line)
+                    .with_context(|| format!("invalid upload queue journal {}", path.display()))?;
+                for item in &change.put {
+                    item.validate()
+                        .with_context(|| format!("invalid queued upload {}", item.id))?;
+                }
+                changes.push(change);
+            }
+            self.apply(changes);
+            ensure!(
+                self.queue.items.len() <= MAX_ITEMS,
+                "upload queue contains too many items (maximum {MAX_ITEMS})"
+            );
+            self.replayed += complete as u64;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let queue = Queue {
-                version: 1,
-                ..Queue::default()
-            };
-            let bytes = serde_json::to_vec(&queue)?;
-            (queue, bytes)
-        }
-        Err(e) => return Err(e).context("read the upload queue"),
-    };
-    ensure!(queue.version == 1, "unsupported upload queue version");
-    ensure!(
-        queue.items.len() <= MAX_ITEMS,
-        "upload queue contains too many items (maximum {MAX_ITEMS})"
-    );
-    let mut ids = std::collections::HashSet::new();
-    for item in &queue.items {
-        item.validate()
-            .with_context(|| format!("invalid queued upload {}", item.id))?;
-        ensure!(ids.insert(&item.id), "duplicate upload ID {}", item.id);
+        self.seen.1 = journal;
+        Ok(())
     }
-    Ok((queue, bytes))
+
+    /// Apply changes in order, in one pass over the queue.
+    fn apply(&mut self, changes: impl IntoIterator<Item = Change>) {
+        let mut latest: HashMap<String, Option<Item>> = HashMap::new();
+        let mut order = Vec::new();
+        for change in changes {
+            for item in change.put {
+                if !latest.contains_key(&item.id) {
+                    order.push(item.id.clone());
+                }
+                latest.insert(item.id.clone(), Some(item));
+            }
+            for id in change.remove {
+                latest.insert(id, None);
+            }
+            if let Some(totals) = change.totals {
+                self.queue.totals = totals;
+            }
+            if let Some(entry) = change.completed {
+                self.log.add(entry);
+            }
+        }
+        if latest.is_empty() {
+            return;
+        }
+        self.queue
+            .items
+            .retain_mut(|item| match latest.remove(&item.id) {
+                Some(Some(new)) => {
+                    *item = new;
+                    true
+                }
+                Some(None) => false,
+                None => true,
+            });
+        // What is left was not queued before.
+        self.queue.items.extend(
+            order
+                .into_iter()
+                .filter_map(|id| latest.remove(&id).flatten()),
+        );
+    }
+
+    /// Append `change` to the journal, durably, and apply it.
+    fn append(&mut self, dir: &Path, change: Change) -> Result<()> {
+        let mut line = serde_json::to_vec(&change)?;
+        line.push(b'\n');
+        #[cfg(test)]
+        WRITTEN.fetch_add(line.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let mut file = private_options()
+            .read(true)
+            .open(dir.join(JOURNAL_FILE))
+            .context("open the upload queue journal")?;
+        // Drop a line left unfinished by a writer that stopped.
+        file.set_len(self.replayed)?;
+        file.seek(SeekFrom::Start(self.replayed))?;
+        let written = file.write_all(&line).and_then(|()| {
+            if change.volatile {
+                Ok(())
+            } else {
+                file.sync_data()
+            }
+        });
+        if let Err(error) = written {
+            let _ = file.set_len(self.replayed);
+            return Err(error).context("write the upload queue journal");
+        }
+        self.seen.1 = Some(Stamp::of(&file.metadata()?));
+        self.replayed += line.len() as u64;
+        self.apply([change]);
+        Ok(())
+    }
+
+    /// Fold the journal into the queue file and completed log.
+    fn compact(&mut self, dir: &Path) -> Result<()> {
+        let log = serde_json::to_vec(&self.log)?;
+        let queue = serde_json::to_vec(&self.queue)?;
+        write_private(dir, COMPLETED_FILE, &log)?;
+        write_private(dir, QUEUE_FILE, &queue)?;
+        // Both must be in place before the journal goes.
+        #[cfg(unix)]
+        fs::File::open(dir)?.sync_all()?;
+        fs::remove_file(dir.join(JOURNAL_FILE))?;
+        self.seen = (Stamp::read(&dir.join(QUEUE_FILE))?, None);
+        self.replayed = 0;
+        self.folded = (log.len() + queue.len()) as u64;
+        Ok(())
+    }
+}
+
+/// Bring the cached uploads up to date: read everything when the queue file
+/// was replaced, and otherwise only the journal's new lines. The caller
+/// holds `uploads.lock`.
+fn refresh<'a>(dir: &Path, cached: &'a mut Option<Uploads>) -> Result<&'a mut Uploads> {
+    let queue = Stamp::read(&dir.join(QUEUE_FILE))?;
+    let journal = Stamp::read(&dir.join(JOURNAL_FILE))?;
+    let mut uploads = match cached.take() {
+        Some(uploads)
+            if uploads.dir == dir && uploads.seen.0 == queue && uploads.continues(journal) =>
+        {
+            uploads
+        }
+        _ => Uploads::read(dir, queue)?,
+    };
+    if uploads.seen.1 != journal {
+        uploads.replay(dir, journal)?;
+    }
+    Ok(cached.insert(uploads))
+}
+
+/// Read the uploads under a shared lock.
+fn read<T>(f: impl FnOnce(&Uploads) -> Result<T>) -> Result<T> {
+    with_lock(true, |dir| {
+        let mut cached = UPLOADS.lock().unwrap_or_else(PoisonError::into_inner);
+        f(refresh(dir, &mut cached)?)
+    })
+}
+
+/// Change the uploads under an exclusive lock: `update` reads them and says
+/// what changes, which is journaled and applied. Nothing is written when
+/// nothing changes.
+fn with_queue<T>(update: impl FnOnce(&Uploads) -> Result<(T, Change)>) -> Result<T> {
+    with_lock(false, |dir| {
+        let mut cached = UPLOADS.lock().unwrap_or_else(PoisonError::into_inner);
+        let uploads = refresh(dir, &mut cached)?;
+        let (result, change) = update(uploads)?;
+        if change.is_empty() {
+            return Ok(result);
+        }
+        if let Err(error) = uploads.append(dir, change) {
+            *cached = None;
+            return Err(error);
+        }
+        if uploads.replayed > uploads.folded.max(JOURNAL_MIN)
+            && let Err(error) = uploads.compact(dir)
+        {
+            // The change is safe in the journal; read everything next time.
+            *cached = None;
+            eprintln!("capturefab: cannot fold the upload journal into the queue: {error:#}");
+        }
+        Ok(result)
+    })
 }
 
 /// A verified upload, as recorded in the completed log.
@@ -260,17 +559,37 @@ pub struct Completed {
     pub uploaded_ms: u64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CompletedLog {
     version: u32,
     seq: u64,
     entries: VecDeque<Completed>,
 }
+impl Default for CompletedLog {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            seq: 0,
+            entries: VecDeque::new(),
+        }
+    }
+}
+impl CompletedLog {
+    /// Add a newer entry, keeping the newest `MAX_COMPLETED`.
+    fn add(&mut self, entry: Completed) {
+        if entry.seq <= self.seq {
+            return;
+        }
+        self.seq = entry.seq;
+        self.entries.push_back(entry);
+        while self.entries.len() > MAX_COMPLETED {
+            self.entries.pop_front();
+        }
+    }
+}
 
-const COMPLETED_FILE: &str = "uploads-completed.json";
-
-/// Read the completed log; the caller holds `uploads.lock`.
-fn read_completed(dir: &Path) -> Result<CompletedLog> {
+/// The completed log file and its size, before any journal.
+fn read_completed(dir: &Path) -> Result<(CompletedLog, u64)> {
     let path = dir.join(COMPLETED_FILE);
     match fs::read(&path) {
         Ok(bytes) => {
@@ -281,42 +600,26 @@ fn read_completed(dir: &Path) -> Result<CompletedLog> {
             let log: CompletedLog = serde_json::from_slice(&bytes)
                 .with_context(|| format!("invalid completed upload log {}", path.display()))?;
             ensure!(log.version == 1, "unsupported completed upload log version");
-            Ok(log)
+            Ok((log, bytes.len() as u64))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CompletedLog {
-            version: 1,
-            ..CompletedLog::default()
-        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((CompletedLog::default(), 0)),
         Err(e) => Err(e).context("read the completed upload log"),
     }
 }
 
-/// Append to the completed log, keeping the newest `MAX_COMPLETED`; the
-/// caller holds `uploads.lock`. A damaged log is started again rather than
-/// blocking uploads.
-fn record_completed(dir: &Path, mut entry: Completed) -> Result<u64> {
-    let mut log = read_completed(dir).unwrap_or(CompletedLog {
-        version: 1,
-        ..CompletedLog::default()
-    });
-    log.seq += 1;
-    entry.seq = log.seq;
-    log.entries.push_back(entry);
-    while log.entries.len() > MAX_COMPLETED {
-        log.entries.pop_front();
-    }
-    write_private(dir, COMPLETED_FILE, &serde_json::to_vec(&log)?)?;
-    Ok(log.seq)
-}
-
 /// Uploads completed after `seq`, oldest first, and the latest sequence
-/// number. Reads only the completed log; the queue is not rewritten.
+/// number.
 pub fn completed_since(seq: u64) -> Result<(u64, Vec<Completed>)> {
-    with_lock(|dir| {
-        let log = read_completed(dir)?;
+    read(|uploads| {
         Ok((
-            log.seq,
-            log.entries.into_iter().filter(|e| e.seq > seq).collect(),
+            uploads.log.seq,
+            uploads
+                .log
+                .entries
+                .iter()
+                .filter(|e| e.seq > seq)
+                .cloned()
+                .collect(),
         ))
     })
 }
@@ -347,7 +650,8 @@ pub fn enqueue(destination: &str, remote: &Remote, path: &Path, key: &str) -> Re
     let path = fs::canonicalize(path)?;
     let bytes = fs::metadata(&path)?.len();
     let mut held = false;
-    let result = with_queue(|queue| {
+    let result = with_queue(|uploads| {
+        let queue = &uploads.queue;
         if let Some(existing) = queue.items.iter().find(|item| item.path == path) {
             ensure!(
                 existing.destination == destination
@@ -355,7 +659,7 @@ pub fn enqueue(destination: &str, remote: &Remote, path: &Path, key: &str) -> Re
                     && existing.key == key,
                 "this file is already queued for a different upload; retry or forget the existing upload first"
             );
-            return Ok(existing.id.clone());
+            return Ok((existing.id.clone(), Change::default()));
         }
         ensure!(
             queue.items.len() < MAX_ITEMS,
@@ -372,7 +676,7 @@ pub fn enqueue(destination: &str, remote: &Remote, path: &Path, key: &str) -> Re
             Remote::S3(bucket) => (Some(bucket.clone()), None),
             other => (None, Some(other.clone())),
         };
-        queue.items.push(Item {
+        let item = Item {
             id: id.clone(),
             destination: destination.into(),
             bucket,
@@ -386,8 +690,8 @@ pub fn enqueue(destination: &str, remote: &Remote, path: &Path, key: &str) -> Re
             next_attempt: 0,
             state: State::Pending,
             error: None,
-        });
-        Ok(id)
+        };
+        Ok((id, Change::put(vec![item])))
     });
     match result {
         Ok(id) => {
@@ -407,13 +711,19 @@ pub fn enqueue(destination: &str, remote: &Remote, path: &Path, key: &str) -> Re
 /// Queue summary and the most recent items, for status displays.
 pub fn status() -> Result<Value> {
     let active = uploader_active();
-    with_lock(|dir| {
-        let completed = read_completed(dir).unwrap_or_default();
-        let mut value = queue_status(&read_queue(dir)?.0)?;
+    read(|uploads| {
+        let mut value = queue_status(&uploads.queue)?;
         value["uploader_running"] = json!(active);
-        value["completed_seq"] = json!(completed.seq);
-        value["recent_completed"] =
-            json!(completed.entries.iter().rev().take(20).collect::<Vec<_>>());
+        value["completed_seq"] = json!(uploads.log.seq);
+        value["recent_completed"] = json!(
+            uploads
+                .log
+                .entries
+                .iter()
+                .rev()
+                .take(20)
+                .collect::<Vec<_>>()
+        );
         Ok(value)
     })
 }
@@ -431,15 +741,16 @@ fn queue_status(queue: &Queue) -> Result<Value> {
                 .context("queued upload byte count exceeds u64")
         })?;
     let recent: Vec<_> = queue.items.iter().rev().take(200).collect();
+    let totals = &queue.totals;
     Ok(json!({
         "pending": count(State::Pending),
         "uploading": count(State::Uploading),
         "failed": count(State::Failed),
         "waiting_bytes": waiting_bytes,
-        "uploaded": queue.uploaded,
-        "uploaded_bytes": queue.uploaded_bytes,
-        "failures": queue.failures,
-        "last_error": queue.last_error,
+        "uploaded": totals.uploaded,
+        "uploaded_bytes": totals.uploaded_bytes,
+        "failures": totals.failures,
+        "last_error": totals.last_error,
         "items": recent,
     }))
 }
@@ -449,21 +760,24 @@ pub fn retry(id: Option<&str>) -> Result<usize> {
     if let Some(id) = id {
         validate_id(id)?;
     }
-    let changed = with_queue(|queue| {
-        let mut changed = 0;
-        for item in &mut queue.items {
-            if item.state == State::Failed && id.is_none_or(|id| id == item.id) {
-                item.state = State::Pending;
-                item.attempts = 0;
-                item.next_attempt = 0;
-                changed += 1;
-            }
-        }
+    let changed = with_queue(|uploads| {
+        let put: Vec<Item> = uploads
+            .queue
+            .items
+            .iter()
+            .filter(|item| item.state == State::Failed && id.is_none_or(|id| id == item.id))
+            .map(|item| Item {
+                state: State::Pending,
+                attempts: 0,
+                next_attempt: 0,
+                ..item.clone()
+            })
+            .collect();
         ensure!(
-            id.is_none() || changed > 0,
+            id.is_none() || !put.is_empty(),
             "no failed upload with the requested ID; choose an ID from upload status"
         );
-        Ok(changed)
+        Ok((put.len(), Change::put(put)))
     })?;
     WAKE.1.notify_all();
     Ok(changed)
@@ -473,13 +787,19 @@ pub fn retry(id: Option<&str>) -> Result<usize> {
 /// to normal retention.
 pub fn forget(id: &str) -> Result<Item> {
     validate_id(id)?;
-    let item = with_queue(|queue| {
-        let index = queue
+    let item = with_queue(|uploads| {
+        let item = uploads
+            .queue
             .items
             .iter()
-            .position(|i| i.id == id && i.state == State::Failed)
-            .ok_or_else(|| anyhow!("no failed upload {id}"))?;
-        Ok(queue.items.remove(index))
+            .find(|i| i.id == id && i.state == State::Failed)
+            .ok_or_else(|| anyhow!("no failed upload {id}"))?
+            .clone();
+        let change = Change {
+            remove: vec![item.id.clone()],
+            ..Change::default()
+        };
+        Ok((item, change))
     })?;
     let _ = crate::storage::hold_for_upload(&item.path, false);
     Ok(item)
@@ -547,30 +867,23 @@ fn run() {
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = true;
     // A previous uploader may have stopped mid-upload.
-    let _ = with_queue(|queue| {
-        for item in &mut queue.items {
-            if item.state == State::Uploading {
-                item.state = State::Pending;
-            }
-        }
-        Ok(())
+    let _ = with_queue(|uploads| {
+        let put = uploads
+            .queue
+            .items
+            .iter()
+            .filter(|item| item.state == State::Uploading)
+            .map(|item| Item {
+                state: State::Pending,
+                ..item.clone()
+            })
+            .collect();
+        Ok(((), Change::put(put)))
     });
     let mut clients: HashMap<String, (Box<dyn Uploader>, Instant)> = HashMap::new();
     loop {
         clients.retain(|_, (_, used)| used.elapsed() < CLIENT_IDLE);
-        let next = with_queue(|queue| {
-            let now = now();
-            let due = queue
-                .items
-                .iter_mut()
-                .filter(|i| i.state == State::Pending && i.next_attempt <= now)
-                .min_by_key(|i| (i.next_attempt, i.queued));
-            Ok(due.map(|item| {
-                item.state = State::Uploading;
-                item.clone()
-            }))
-        });
-        let item = match next {
+        let item = match with_queue(next_due) {
             Ok(Some(item)) => item,
             Ok(None) | Err(_) => {
                 let guard = WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -579,29 +892,7 @@ fn run() {
             }
         };
         let result = upload_one(&mut clients, &item);
-        let _ = with_lock(|dir| {
-            if result.is_ok() {
-                let remote = item.remote();
-                if let Err(error) = record_completed(
-                    dir,
-                    Completed {
-                        seq: 0,
-                        id: item.id.clone(),
-                        destination: item.destination.clone(),
-                        kind: remote.kind().into(),
-                        path: item.path.clone(),
-                        key: item.key.clone(),
-                        url: remote.object_url(&item.key),
-                        bytes: item.bytes,
-                        sha256: item.sha256.clone(),
-                        uploaded_ms: now_ms(),
-                    },
-                ) {
-                    eprintln!("capturefab: cannot record a completed upload: {error:#}");
-                }
-            }
-            with_queue_locked(dir, |queue| update_after(queue, &item, &result))
-        });
+        let _ = with_queue(|uploads| Ok(((), update_after(uploads, &item, &result))));
         if result.is_ok() {
             finish_local(&item);
         } else {
@@ -612,36 +903,85 @@ fn run() {
     }
 }
 
-/// Record an upload attempt's outcome in the queue.
-fn update_after(queue: &mut Queue, item: &Item, result: &Result<()>) -> Result<()> {
-    let Some(index) = queue.items.iter().position(|i| i.id == item.id) else {
-        return Ok(());
+/// The upload to start now, marked as uploading.
+fn next_due(uploads: &Uploads) -> Result<(Option<Item>, Change)> {
+    let now = now();
+    let due = uploads
+        .queue
+        .items
+        .iter()
+        .filter(|i| i.state == State::Pending && i.next_attempt <= now)
+        .min_by_key(|i| (i.next_attempt, i.queued));
+    Ok(match due {
+        Some(item) => {
+            let item = Item {
+                state: State::Uploading,
+                ..item.clone()
+            };
+            let change = Change {
+                volatile: true,
+                ..Change::put(vec![item.clone()])
+            };
+            (Some(item), change)
+        }
+        None => (None, Change::default()),
+    })
+}
+
+/// What an upload attempt's outcome changes: a verified upload leaves the
+/// queue for the completed log; a failure waits or needs attention.
+fn update_after(uploads: &Uploads, item: &Item, result: &Result<()>) -> Change {
+    let queue = &uploads.queue;
+    let Some(entry) = queue.items.iter().find(|i| i.id == item.id) else {
+        return Change::default();
     };
+    let mut totals = queue.totals.clone();
     match result {
         Ok(()) => {
-            queue.items.remove(index);
-            queue.uploaded += 1;
-            queue.uploaded_bytes += item.bytes;
+            totals.uploaded += 1;
+            totals.uploaded_bytes += item.bytes;
             if !queue.items.iter().any(|i| i.state == State::Failed) {
-                queue.last_error = None;
+                totals.last_error = None;
+            }
+            let remote = item.remote();
+            Change {
+                remove: vec![item.id.clone()],
+                totals: Some(totals),
+                completed: Some(Completed {
+                    seq: uploads.log.seq + 1,
+                    id: item.id.clone(),
+                    destination: item.destination.clone(),
+                    kind: remote.kind().into(),
+                    path: item.path.clone(),
+                    key: item.key.clone(),
+                    url: remote.object_url(&item.key),
+                    bytes: item.bytes,
+                    sha256: item.sha256.clone(),
+                    uploaded_ms: now_ms(),
+                }),
+                ..Change::default()
             }
         }
         Err(error) => {
             let text = format!("{error:#}");
-            let entry = &mut queue.items[index];
+            let mut entry = entry.clone();
             entry.attempts = entry.attempts.saturating_add(1);
             if crate::transfer::retryable(error) {
                 entry.state = State::Pending;
                 entry.next_attempt = now() + (5u64 << entry.attempts.min(8)).min(MAX_BACKOFF);
             } else {
                 entry.state = State::Failed;
-                queue.failures += 1;
+                totals.failures += 1;
             }
             entry.error = Some(text.clone());
-            queue.last_error = Some(format!("{}: {text}", item.key));
+            totals.last_error = Some(format!("{}: {text}", item.key));
+            Change {
+                put: vec![entry],
+                totals: Some(totals),
+                ..Change::default()
+            }
         }
     }
-    Ok(())
 }
 
 fn client_key(item: &Item) -> String {
@@ -705,9 +1045,9 @@ pub fn drain(timeout: Duration) -> Result<Value> {
     start();
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let busy = with_lock(|dir| {
+        let busy = read(|uploads| {
             let now = now();
-            Ok(read_queue(dir)?.0.items.iter().any(|i| {
+            Ok(uploads.queue.items.iter().any(|i| {
                 i.state == State::Uploading || (i.state == State::Pending && i.next_attempt <= now)
             }))
         })?;
@@ -878,15 +1218,25 @@ mod tests {
         assert_eq!(status["completed_seq"], 0);
     }
 
-    /// A file's identity and version: inode (on Unix), size and
-    /// modification time.
-    fn version(path: &Path) -> (u64, u64, SystemTime) {
-        let meta = fs::metadata(path).unwrap();
-        #[cfg(unix)]
-        let inode = std::os::unix::fs::MetadataExt::ino(&meta);
-        #[cfg(not(unix))]
-        let inode = 0;
-        (inode, meta.len(), meta.modified().unwrap())
+    /// The queue file and journal as they stand.
+    fn versions() -> (Option<Stamp>, Option<Stamp>) {
+        let dir = crate::ipc::session_dir();
+        (
+            Stamp::read(&dir.join(QUEUE_FILE)).unwrap(),
+            Stamp::read(&dir.join(JOURNAL_FILE)).unwrap(),
+        )
+    }
+
+    /// Put off the first queued upload's next attempt by an hour.
+    fn back_off_first() {
+        with_queue(|uploads| {
+            let item = Item {
+                next_attempt: now() + 3600,
+                ..uploads.queue.items[0].clone()
+            };
+            Ok(((), Change::put(vec![item])))
+        })
+        .unwrap();
     }
 
     fn staged(name: &str) -> PathBuf {
@@ -907,17 +1257,12 @@ mod tests {
         if !isolated("status_and_an_idle_uploader_write_nothing") {
             return;
         }
-        let queue = crate::ipc::session_dir().join("uploads.json");
         status().unwrap();
-        assert!(!queue.exists(), "status creates no queue");
+        assert_eq!(versions(), (None, None), "status creates no queue");
         enqueue("line", &ftp(), &staged("shot.png"), "shot.png").unwrap();
         // Its next attempt is an hour away, so the uploader has nothing to do.
-        with_queue(|queue| {
-            queue.items[0].next_attempt = now() + 3600;
-            Ok(())
-        })
-        .unwrap();
-        let (before, writes) = (version(&queue), WRITES.load(Ordering::Relaxed));
+        back_off_first();
+        let (before, writes) = (versions(), WRITTEN.load(Ordering::Relaxed));
         status().unwrap();
         start();
         let owner = || *OWNER.get().unwrap().lock().unwrap();
@@ -929,8 +1274,112 @@ mod tests {
         // More than two idle passes of the uploader.
         thread::sleep(Duration::from_millis(4500));
         assert_eq!(status().unwrap()["pending"], 1);
-        assert_eq!(WRITES.load(Ordering::Relaxed), writes);
-        assert_eq!(version(&queue), before);
+        assert_eq!(WRITTEN.load(Ordering::Relaxed), writes);
+        assert_eq!(versions(), before);
+    }
+
+    /// Valid items for queue tests, with no files behind them.
+    fn items(range: std::ops::Range<usize>) -> Vec<Item> {
+        range
+            .map(|n| Item {
+                id: format!("{n:016x}"),
+                path: std::env::temp_dir().join(format!("capturefab-queued-{n}.png")),
+                key: format!("line-1/{n}.png"),
+                queued: n as u64,
+                ..item()
+            })
+            .collect()
+    }
+
+    fn put(items: Vec<Item>) {
+        with_queue(|_| Ok(((), Change::put(items)))).unwrap();
+    }
+
+    fn pending() -> Value {
+        status().unwrap()["pending"].clone()
+    }
+
+    #[test]
+    fn draining_a_backlog_writes_bytes_in_proportion_to_it() {
+        if !isolated("draining_a_backlog_writes_bytes_in_proportion_to_it") {
+            return;
+        }
+        const BACKLOG: usize = 5000;
+        put(items(0..BACKLOG));
+        let before = WRITTEN.load(Ordering::Relaxed);
+        for _ in 0..BACKLOG {
+            let item = with_queue(next_due).unwrap().expect("an upload is due");
+            with_queue(|uploads| {
+                // Flushing to disk is not what this measures.
+                let change = Change {
+                    volatile: true,
+                    ..update_after(uploads, &item, &Ok(()))
+                };
+                Ok(((), change))
+            })
+            .unwrap();
+        }
+        let written = WRITTEN.load(Ordering::Relaxed) - before;
+        let status = status().unwrap();
+        assert_eq!(
+            (status["pending"].clone(), status["uploaded"].clone()),
+            (json!(0), json!(BACKLOG))
+        );
+        assert_eq!(status["completed_seq"], BACKLOG);
+        // Rewriting the queue for each upload would take gigabytes.
+        assert!(
+            written < BACKLOG as u64 * 4096,
+            "{written} bytes written to drain {BACKLOG} uploads"
+        );
+    }
+
+    #[test]
+    fn readers_catch_up_through_the_journal() {
+        if !isolated("readers_catch_up_through_the_journal") {
+            return;
+        }
+        let take = || UPLOADS.lock().unwrap().take();
+        let journal = crate::ipc::session_dir().join(JOURNAL_FILE);
+        put(items(0..2));
+        // Another process's view, read before the changes below.
+        let stale = take();
+        put(items(2..3));
+        // A writer that stopped mid-line leaves part of one.
+        let mut file = fs::OpenOptions::new().append(true).open(&journal).unwrap();
+        file.write_all(b"{\"put\":[{\"id\"").unwrap();
+        *UPLOADS.lock().unwrap() = stale;
+        assert_eq!(pending(), 3, "replays only the new complete lines");
+        put(items(3..4));
+        take();
+        assert_eq!(pending(), 4, "the next change replaced the unfinished line");
+        // Folding the journal in replaces the queue file, so a stale view
+        // reads it again.
+        let stale = take();
+        with_lock(false, |dir| {
+            let mut cached = UPLOADS.lock().unwrap();
+            refresh(dir, &mut cached)?.compact(dir)
+        })
+        .unwrap();
+        assert!(!journal.exists());
+        *UPLOADS.lock().unwrap() = stale;
+        assert_eq!(pending(), 4);
+        put(items(4..5));
+        take();
+        assert_eq!(pending(), 5);
+        let ids: Vec<String> = status().unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            ids,
+            items(0..5)
+                .into_iter()
+                .rev()
+                .map(|i| i.id)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -950,13 +1399,20 @@ mod tests {
             sha256: "a".repeat(64),
             uploaded_ms: n,
         };
-        with_lock(|dir| {
-            for n in 1..=1005 {
-                assert_eq!(record_completed(dir, entry(n))?, n);
-            }
-            Ok(())
-        })
-        .unwrap();
+        for n in 1..=1005 {
+            let seq = with_queue(|uploads| {
+                let seq = uploads.log.seq + 1;
+                let completed = Some(Completed { seq, ..entry(n) });
+                Ok((
+                    seq,
+                    Change {
+                        completed,
+                        ..Change::default()
+                    },
+                ))
+            });
+            assert_eq!(seq.unwrap(), n);
+        }
         let (seq, all) = completed_since(0).unwrap();
         assert_eq!((seq, all.len()), (1005, MAX_COMPLETED));
         assert_eq!(all[0].seq, 6);
@@ -968,13 +1424,11 @@ mod tests {
         );
         // Status reads the log but never rewrites it.
         let path = crate::ipc::session_dir().join(COMPLETED_FILE);
-        let before = fs::read(&path).unwrap();
-        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let before = (fs::read(&path).unwrap(), versions());
         let status = status().unwrap();
         assert_eq!(status["completed_seq"], 1005);
         assert_eq!(status["recent_completed"].as_array().unwrap().len(), 20);
         assert_eq!(status["recent_completed"][0]["seq"], 1005);
-        assert_eq!(fs::read(&path).unwrap(), before);
-        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert_eq!((fs::read(&path).unwrap(), versions()), before);
     }
 }
