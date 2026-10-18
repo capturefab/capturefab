@@ -2438,6 +2438,8 @@ struct WriterQueue {
     late: AtomicU64,
     /// The writer is blocked handing a frame to FFmpeg.
     busy: AtomicBool,
+    /// Writing the encoded recording failed, for example on a full disk.
+    output_failed: AtomicBool,
     epoch: Instant,
     /// When the newest frame arrived, in milliseconds since `epoch`.
     arrived_ms: AtomicU64,
@@ -2458,6 +2460,7 @@ impl WriterQueue {
             dropped: AtomicU64::new(0),
             late: AtomicU64::new(0),
             busy: AtomicBool::new(false),
+            output_failed: AtomicBool::new(false),
             epoch: Instant::now(),
             arrived_ms: AtomicU64::new(0),
         }
@@ -3622,6 +3625,7 @@ impl Forwarder {
                     .map(|error| format!("write bounded recording: {error}"));
                 if let Some(error) = &error {
                     shared.fail(error.clone());
+                    shared.output_failed.store(true, Ordering::Release);
                     shared.running.store(false, Ordering::Release);
                     shared.changed.notify_all();
                 }
@@ -3693,9 +3697,10 @@ impl Forwarder {
         Ok(())
     }
     /// An automatically chosen encoder that exits within its first seconds
-    /// usually rejected this frame size or ran out of hardware sessions. Its
-    /// file is removed and the recording starts again, once, in a new file
-    /// with the next candidate.
+    /// of a local recording usually rejected this frame size or ran out of
+    /// hardware sessions. Its file is removed and the recording starts again,
+    /// once, in a new file with the next candidate. A stream's early exit is
+    /// more likely its server's doing, and a failed write the disk's.
     fn fall_back(&mut self, status: std::process::ExitStatus) -> Result<bool> {
         let Some(process) = self.process.as_ref() else {
             return Ok(false);
@@ -3703,6 +3708,8 @@ impl Forwarder {
         if status.success()
             || self.config.encoder != "auto"
             || self.failed.is_some()
+            || process.output_thread.is_none()
+            || process.queue.output_failed.load(Ordering::Acquire)
             || process.spawned.elapsed() > Duration::from_secs(10)
         {
             return Ok(false);
@@ -4545,6 +4552,31 @@ esac"#,
     }
     #[test]
     #[cfg(unix)]
+    fn a_stream_whose_encoder_exits_does_not_fall_back() {
+        let first = encoder_candidates("h264")[0];
+        let fake = Fake::new(
+            "stream-exit",
+            &format!(
+                r#"echo "$*" >> "$dir/argv"
+case "$*" in
+*-encoders*) printf ' V....D {first} first (codec h264)\n V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*) echo 'Connection refused' >&2; exit 1 ;;
+esac"#
+            ),
+        );
+        let mut forward = Forwarder::new(stream("auto", 30.0)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while forward.push(tiny(16, 16)).is_ok() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(30));
+        }
+        let _ = forward.stop();
+        assert_eq!(fake.launches(&["pipe:0"]), 1);
+        assert_eq!(fake.launches(&["-c:v libx264", "pipe:0"]), 0);
+    }
+    #[test]
+    #[cfg(unix)]
     fn an_encoder_that_exits_at_start_falls_back_once_to_a_new_file() {
         // Recording reserves storage, so run in a child with its own session
         // directory and ledger.
@@ -5147,6 +5179,12 @@ esac"#
     #[test]
     #[ignore = "requires FFmpeg"]
     fn ffmpeg_local_recording_reservation_is_bounded_and_removed_on_failure() {
+        // A full disk is not an encoder failure, so auto does not fall back.
+        for encoder in ["libx264", "auto"] {
+            bounded_recording_is_removed_on_failure(encoder);
+        }
+    }
+    fn bounded_recording_is_removed_on_failure(encoder: &str) {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -5155,7 +5193,7 @@ esac"#
         let mut forward = Forwarder::new(ForwardConfig {
             output: path.to_string_lossy().into(),
             codec: "h264".into(),
-            encoder: "libx264".into(),
+            encoder: encoder.into(),
             fps: 30.0,
             bitrate: "1M".into(),
             storage: Default::default(),
@@ -5177,8 +5215,10 @@ esac"#
             let _ = forward.push(frame.clone());
             thread::sleep(Duration::from_millis(20));
         }
+        let encoder = forward.stats().encoder;
         let error = forward.stop().unwrap_err().to_string();
         assert!(error.contains("Storage full"), "{error}");
+        assert_eq!(forward.stats().encoder, encoder);
         assert!(
             !path.exists(),
             "over-limit partial recordings must be removed"
