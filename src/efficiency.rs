@@ -191,7 +191,7 @@ pub(crate) fn pin(efficient: bool) {
 }
 
 /// What `pin` holds `efficient` at on this test's thread, if anything.
-#[cfg(test)]
+#[cfg(all(test, feature = "gui"))]
 pub(crate) fn pinned() -> Option<bool> {
     PINNED.get()
 }
