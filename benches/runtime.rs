@@ -450,8 +450,8 @@ fn main() {
             };
             saves += 1;
         });
-        if saves > 0 {
-            println!("{large:<40} ledger {:>7} bytes per save", written / saves);
+        if let Some(per_save) = written.checked_div(saves) {
+            println!("{large:<40} ledger {per_save:>7} bytes per save");
         }
     }
     for path in [dir, session, output] {

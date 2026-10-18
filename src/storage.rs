@@ -830,7 +830,8 @@ impl Locked {
         }
         Ok(())
     }
-    /// Changes go through these three, so that persist() can journal them.
+    /// Every change to an entry records its id in `dirty`, through these or
+    /// directly, so that persist() journals it.
     fn push(&mut self, entry: Entry) {
         self.dirty.push(entry.id.clone());
         self.ledger.entries.push(entry);
