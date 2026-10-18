@@ -198,6 +198,20 @@ pub fn clear_hint(reason: &'static str) {
     STATE.update(|overrides| overrides.hints.retain(|hint| *hint != reason));
 }
 
+/// The setting to give camera workers this process starts, so they resolve
+/// to the same answer: efficient whenever it is efficient here, including
+/// for a flag, desktop preference or hint a worker cannot see.
+pub fn for_workers() -> Mode {
+    worker_mode(&current())
+}
+fn worker_mode(resolved: &Resolved) -> Mode {
+    if resolved.efficient {
+        Mode::Efficient
+    } else {
+        resolved.setting
+    }
+}
+
 fn environment() -> Option<Mode> {
     static ENVIRONMENT: OnceLock<Option<Mode>> = OnceLock::new();
     *ENVIRONMENT.get_or_init(|| parse_environment(std::env::var_os(ENV)))
@@ -564,6 +578,26 @@ mod tests {
         // The environment beats what auto would choose.
         let (setting, source) = choose(None, Some(Efficient), None);
         assert!(resolve(setting, source.as_deref(), &host(8, 16), &[]).efficient);
+    }
+
+    #[test]
+    fn workers_resolve_to_the_same_answer() {
+        let big = host(8, 16);
+        let resolved = |setting, hints: &[&str]| resolve(setting, None, &big, hints);
+        // A hint only this process sees makes auto efficient: the worker is
+        // told efficient rather than auto, which it would resolve as smooth.
+        let hinted = resolved(Mode::Auto, &["software rendering"]);
+        assert_eq!(worker_mode(&hinted), Mode::Efficient);
+        let worker = parse_environment(Some(worker_mode(&hinted).name().into())).unwrap();
+        assert!(resolve(worker, None, &big, &[]).efficient);
+        // Otherwise the worker gets the setting and decides from the same host.
+        assert_eq!(worker_mode(&resolved(Mode::Auto, &[])), Mode::Auto);
+        assert_eq!(worker_mode(&auto(&host(2, 8))), Mode::Efficient);
+        assert_eq!(worker_mode(&resolved(Mode::Smooth, &[])), Mode::Smooth);
+        assert_eq!(
+            worker_mode(&resolved(Mode::Efficient, &[])),
+            Mode::Efficient
+        );
     }
 
     #[test]

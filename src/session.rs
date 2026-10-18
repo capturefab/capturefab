@@ -983,6 +983,23 @@ pub(crate) fn spawn_helper(
     }
 }
 
+/// A camera worker inherits this process's decoding and efficiency settings,
+/// including a `--efficiency` flag or desktop choice it cannot see itself.
+fn worker_command(executable: std::path::PathBuf) -> std::process::Command {
+    let mut command = std::process::Command::new(executable);
+    command
+        .env("CAPTUREFAB_HWACCEL", crate::media::hwaccel())
+        .env(
+            crate::efficiency::ENV,
+            crate::efficiency::for_workers().name(),
+        )
+        .arg("__worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    command
+}
+
 impl Process {
     fn spawn(scanner: bool) -> Result<Self> {
         let capacity = frame_capacity(scanner)?;
@@ -996,13 +1013,7 @@ impl Process {
         let executable = std::env::var_os("CAPTUREFAB_EXECUTABLE")
             .map(std::path::PathBuf::from)
             .unwrap_or(std::env::current_exe()?);
-        let mut command = std::process::Command::new(executable);
-        command
-            .env("CAPTUREFAB_HWACCEL", crate::media::hwaccel())
-            .arg("__worker")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+        let mut command = worker_command(executable);
         ring.pass_to(&mut command);
         let mut child = command.spawn().context("launch camera capture process")?;
         ring.passed();
@@ -2385,6 +2396,31 @@ impl SessionHandle {
 mod tests {
     use super::*;
     use crate::shared_memory::Published;
+    #[test]
+    fn workers_are_told_this_process_efficiency_setting() {
+        let command = worker_command("capturefab".into());
+        let env = |name: &str| {
+            command
+                .get_envs()
+                .find(|(key, _)| *key == name)
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        // Resolved here: efficient whenever this process is, otherwise the
+        // setting, which the worker then resolves on the same host.
+        assert_eq!(
+            env(crate::efficiency::ENV).as_deref(),
+            Some(crate::efficiency::for_workers().name())
+        );
+        assert_eq!(
+            env("CAPTUREFAB_HWACCEL").as_deref(),
+            Some(crate::media::hwaccel().as_str())
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [std::ffi::OsStr::new("__worker")]
+        );
+    }
     #[test]
     fn parent_replies_carry_saved_files_even_when_failed() {
         let old: ParentReply = serde_json::from_str(r#"{"ok":true,"snapshot":null}"#).unwrap();
