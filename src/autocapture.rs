@@ -37,6 +37,11 @@ const LEGACY_MEMORY_LIMIT: &str = "256MB";
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 /// How long a storage refusal pauses suggestions before the next attempt.
 const STORAGE_RETRY: Duration = Duration::from_secs(60);
+/// How long suggestions wait after a frame failed to save for another
+/// reason, such as a ledger busy with another process's bookkeeping.
+const WRITE_RETRY: Duration = Duration::from_secs(5);
+/// How long a note stays in the status.
+const NOTE_LIFETIME: Duration = Duration::from_secs(60);
 const BUSY_NOTE: &str = "Skipped a suggestion while the previous capture was still being saved";
 const MODEL: &str = "Session exemplar kNN + background novelty (spatial color/edge descriptor v1)";
 type Descriptor = Vec<f32>;
@@ -88,6 +93,8 @@ pub struct CaptureSession {
     blocked_storage: bool,
     /// When storage last refused a suggested frame.
     refused: Option<Instant>,
+    /// When a suggested frame last failed to save for another reason.
+    unsaved: Option<Instant>,
 }
 
 /// State shared by the camera thread and the writer. Counts are reserved when
@@ -100,7 +107,25 @@ struct Shared {
     queued: usize,
     /// A queued write's failure, reported by the next observe.
     failure: Option<anyhow::Error>,
-    note: Option<String>,
+    /// The latest note and when it was made; it fades after NOTE_LIFETIME.
+    note: Option<(Instant, String)>,
+}
+
+impl Shared {
+    fn note(&mut self, note: String) {
+        self.note = Some((Instant::now(), note));
+    }
+}
+
+/// Context for a frame file storage could not save. Storage can recover,
+/// so a suggestion that fails this way is retried instead of pausing.
+#[derive(Debug)]
+struct FrameNotSaved;
+
+impl std::fmt::Display for FrameNotSaved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("save capture frame file")
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -161,11 +186,19 @@ impl CaptureSession {
         if let Some(parent) = path.parent() {
             crate::volumes::ensure_present(parent)?;
         }
+        let frames = path.with_extension("frames");
+        ensure!(
+            frames != path,
+            "capture session file name must not end in .frames"
+        );
         if create {
             ensure!(
                 !path.exists(),
                 "capture session already exists; resume it instead"
             );
+            // Claim the folder before the database, so sessions whose names
+            // differ only in extension never share one.
+            claim(&frames)?;
         } else {
             ensure!(
                 path.is_file(),
@@ -173,13 +206,15 @@ impl CaptureSession {
                 path.display()
             );
         }
-        let frames = path.with_extension("frames");
-        // Never mix another session's frames into a new one.
-        ensure!(
-            !create || !frames.exists(),
-            "capture session frames folder already exists: {}; choose another session name",
-            frames.display()
-        );
+        let session = Self::load(path, &frames, camera, create);
+        // A failed `new` leaves no folder behind to block the next attempt.
+        if create && session.is_err() {
+            let _ = std::fs::remove_dir(&frames);
+        }
+        session
+    }
+
+    fn load(path: PathBuf, frames: &Path, camera: &str, create: bool) -> Result<Self> {
         let config = Config::default()
             .max_memory(MEMORY_LIMIT)?
             .threads(1)?
@@ -263,7 +298,25 @@ impl CaptureSession {
             db.execute_batch(&format!("SET memory_limit = '{LEGACY_MEMORY_LIMIT}'"))?;
         }
         if version == 1 {
-            upgrade(&db)?;
+            // Schema 1 sessions had no folder, so one by this name is another session's.
+            claim(frames)?;
+            upgrade(&db).inspect_err(|_| {
+                let _ = std::fs::remove_dir(frames);
+            })?;
+        } else if !frames.is_dir() {
+            // Saving a frame would recreate the folder, and the next review
+            // would then take every saved frame for deleted.
+            let files: u64 = db.query_row(
+                "SELECT COUNT(*) FROM captures WHERE frame_path IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?;
+            ensure!(
+                files == 0,
+                "capture session frames folder {} is missing; copy it beside the database, or create an empty folder there to drop the frames it held",
+                frames.display()
+            );
+            claim(frames)?;
         }
         let shared = Arc::new(Mutex::new(Shared {
             tally: counts(&db)?,
@@ -271,7 +324,7 @@ impl CaptureSession {
         }));
         let writer = Writer::spawn(Store {
             db,
-            frames,
+            frames: frames.to_owned(),
             dirty_since: None,
             shared: shared.clone(),
         })?;
@@ -301,6 +354,7 @@ impl CaptureSession {
             started_ms,
             blocked_storage: false,
             refused: None,
+            unsaved: None,
         })
     }
 
@@ -315,8 +369,18 @@ impl CaptureSession {
         self.sensitivity = sensitivity;
         self.cooldown_ms = cooldown_ms;
         // Changing settings is also how a user retries after freeing space.
-        self.refused = None;
+        self.retry_storage();
+        lock(&self.shared).note = None;
         Ok(())
+    }
+
+    /// Let the next suggestion try storage again. Every queued write has
+    /// landed by now, so a failure one left behind is stale.
+    fn retry_storage(&mut self) {
+        lock(&self.shared).failure = None;
+        self.refused = None;
+        self.unsaved = None;
+        self.blocked_storage = false;
     }
 
     pub fn status(&self) -> Result<SessionStatus> {
@@ -347,7 +411,11 @@ impl CaptureSession {
             blocked_storage,
             state: state.into(),
             model: MODEL.into(),
-            note: shared.note.clone(),
+            note: shared
+                .note
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < NOTE_LIFETIME)
+                .map(|(_, note)| note.clone()),
         })
     }
 
@@ -372,9 +440,12 @@ impl CaptureSession {
         self.refused = self
             .refused
             .filter(|at| now.saturating_duration_since(*at) < STORAGE_RETRY);
+        self.unsaved = self
+            .unsaved
+            .filter(|at| now.saturating_duration_since(*at) < WRITE_RETRY);
         self.blocked_storage = self.refused.is_some()
             || tally.bytes.saturating_add(frame.data.len() as u64) > MAX_STORED_BYTES;
-        if tally.pending >= MAX_PENDING || self.blocked_storage {
+        if tally.pending >= MAX_PENDING || self.blocked_storage || self.unsaved.is_some() {
             return Ok(None);
         }
         let feature = descriptor(frame)?;
@@ -400,7 +471,7 @@ impl CaptureSession {
         if !self.positive.is_empty() && !cooling && !duplicate && score >= threshold {
             // Copy the frame only when the writer can take it.
             if !self.writer.ready() {
-                lock(&self.shared).note = Some(BUSY_NOTE.into());
+                lock(&self.shared).note(BUSY_NOTE.into());
                 return Ok(None);
             }
             let row = self.row(
@@ -472,8 +543,7 @@ impl CaptureSession {
         self.positive = positive;
         self.negative = negative;
         if !keep {
-            self.blocked_storage = false;
-            self.refused = None;
+            self.retry_storage();
         }
         Ok(())
     }
@@ -493,16 +563,20 @@ impl CaptureSession {
         self.writer.close()
     }
 
-    /// Apply the outcome of queued writes. A storage refusal pauses suggestions
-    /// for a while; any other failure is returned so the caller can pause.
+    /// Apply the outcome of queued writes. A frame storage refused or could
+    /// not save holds suggestions back for a while; any other failure is
+    /// returned so the caller can pause.
     fn settle(&mut self, now: Instant) -> Result<Tally> {
         let mut shared = lock(&self.shared);
         if let Some(error) = shared.failure.take() {
-            if crate::cli::error_code(&error).0 != "storage_full" {
+            if crate::cli::error_code(&error).0 == "storage_full" {
+                self.refused = Some(now);
+            } else if error.downcast_ref::<FrameNotSaved>().is_some() {
+                self.unsaved = Some(now);
+            } else {
                 return Err(error);
             }
-            self.refused = Some(now);
-            shared.note = Some(format!("{error:#}"));
+            shared.note(format!("{error:#}"));
         }
         Ok(shared.tally)
     }
@@ -735,7 +809,9 @@ impl Store {
     }
 
     fn save(&mut self, row: &Row) -> Result<()> {
-        let (name, sha256) = self.write_frame(row.id, &row.frame.data)?;
+        let (name, sha256) = self
+            .write_frame(row.id, &row.frame.data)
+            .context(FrameNotSaved)?;
         let inserted = self.db.execute(
             "INSERT INTO captures (id, created_ms, source, label, frame_id, width, height, pixel_format,
                 timestamp_ns, data_bytes, descriptor, score, reason, frame_path, frame_sha256)
@@ -779,6 +855,7 @@ impl Store {
     /// budget, volume checks and never-overwrite. A name left by an interrupted
     /// session is skipped, not replaced.
     fn write_frame(&self, id: u64, data: &[u8]) -> Result<(String, String)> {
+        self.check_folder()?;
         for attempt in 0..8 {
             let name = match attempt {
                 0 => format!("{id:08}.raw"),
@@ -804,6 +881,18 @@ impl Store {
         )
     }
 
+    /// The folder must already exist. Writing never recreates a folder that
+    /// was moved away, so a review never takes its frames for deleted.
+    fn check_folder(&self) -> Result<()> {
+        crate::volumes::ensure_present(&self.frames)?;
+        ensure!(
+            self.frames.is_dir(),
+            "capture session frames folder {} is missing; keep it beside the database",
+            self.frames.display()
+        );
+        Ok(())
+    }
+
     /// A pending-only transaction prevents a double key press or stale review
     /// card from relabeling a capture.
     fn review(&mut self, id: u64, keep: bool) -> Result<()> {
@@ -817,38 +906,53 @@ impl Store {
             .optional()?;
         let (descriptor, bytes, frame_path) = row.context("capture is no longer pending review")?;
         decode(&descriptor)?;
+        let file = frame_path
+            .map(|name| frame_file(&self.frames, &name))
+            .transpose()?;
         let now = epoch_ms();
-        let changed = match (keep, &frame_path) {
-            (true, _) => tx.execute(
+        let changed = if keep {
+            tx.execute(
                 "UPDATE captures SET label = 'kept', reviewed_ms = ? WHERE id = ? AND label = 'pending'",
                 params![now, id],
-            )?,
-            (false, Some(name)) => {
-                let path = frame_file(&self.frames, name)?;
-                if !storage::remove(&path)? && path.exists() {
-                    lock(&self.shared).note = Some(format!(
-                        "Discarded capture {id} but left {} in place: it changed after saving or was saved on another computer",
-                        path.display()
-                    ));
-                }
-                tx.execute(
-                    "UPDATE captures SET label = 'discarded', reviewed_ms = ?, data_bytes = 0, frame_path = NULL, frame_sha256 = NULL WHERE id = ? AND label = 'pending'",
-                    params![now, id],
-                )?
-            }
-            // Schema 1 rows release the pixels stored in the database.
-            (false, None) => tx.execute(
-                "UPDATE captures SET label = 'discarded', reviewed_ms = ?, data = NULL, data_bytes = 0 WHERE id = ? AND label = 'pending'",
+            )?
+        } else {
+            // Release the pixels: schema 1 rows keep them in `data`, newer
+            // rows in the file deleted below.
+            tx.execute(
+                "UPDATE captures SET label = 'discarded', reviewed_ms = ?, data = NULL, data_bytes = 0, frame_path = NULL, frame_sha256 = NULL WHERE id = ? AND label = 'pending'",
                 params![now, id],
-            )?,
+            )?
         };
         ensure!(changed == 1, "capture is no longer pending review");
         tx.commit()?;
         self.wrote();
-        let mut shared = lock(&self.shared);
-        shared.tally.remove("pending", if keep { 0 } else { bytes });
-        shared.tally.add(if keep { "kept" } else { "discarded" }, 0);
+        {
+            let mut shared = lock(&self.shared);
+            shared.tally.remove("pending", if keep { 0 } else { bytes });
+            shared.tally.add(if keep { "kept" } else { "discarded" }, 0);
+        }
+        // Delete only once the decision is saved: a failed delete leaves a
+        // file the ledger still tracks, never a lost decision.
+        if let (false, Some(path)) = (keep, file) {
+            self.delete_frame(id, &path);
+        }
         Ok(())
+    }
+
+    /// Delete a discarded capture's frame through the ledger. A file that
+    /// changed after saving, or cannot be deleted now, stays with a note.
+    fn delete_frame(&self, id: u64, path: &Path) {
+        let left = match storage::remove(path) {
+            Ok(removed) => (!removed && path.exists())
+                .then(|| "it changed after saving or was saved on another computer".into()),
+            Err(error) => Some(format!("{error:#}")),
+        };
+        if let Some(reason) = left {
+            lock(&self.shared).note(format!(
+                "Discarded capture {id} but left {} in place: {reason}",
+                path.display()
+            ));
+        }
     }
 
     fn load_review(&mut self, id: Option<u64>) -> Result<Option<ReviewCapture>> {
@@ -866,10 +970,11 @@ impl Store {
                 return Ok(None);
             };
             if let Some(name) = frame_path {
-                match self.read_frame(&name, bytes, sha256.as_deref())? {
-                    Some(data) => capture.frame.data = data,
-                    None => {
-                        self.forget(capture.id, bytes)?;
+                let path = frame_file(&self.frames, &name)?;
+                match self.read_frame(&path, bytes, sha256.as_deref())? {
+                    Ok(data) => capture.frame.data = data,
+                    Err(lost) => {
+                        self.forget(capture.id, bytes, &path, lost)?;
                         continue;
                     }
                 }
@@ -886,42 +991,41 @@ impl Store {
         }
     }
 
-    /// A pending frame's bytes, or None once its file is gone, for example
-    /// after storage retention deleted it. A missing folder or volume is an
-    /// error, so copying only the database never empties the review queue.
-    fn read_frame(&self, name: &str, bytes: u64, sha256: Option<&str>) -> Result<Option<Vec<u8>>> {
-        let path = frame_file(&self.frames, name)?;
+    /// A pending frame's bytes, or why they are lost: storage retention or a
+    /// user deleted the file, or it no longer holds what was saved. A missing
+    /// folder or volume is an error, so it never empties the review queue.
+    fn read_frame(
+        &self,
+        path: &Path,
+        bytes: u64,
+        sha256: Option<&str>,
+    ) -> Result<Result<Vec<u8>, &'static str>> {
         ensure!(
             bytes <= MAX_FRAME_BYTES as u64,
             "stored frame exceeds capture size limit"
         );
-        crate::volumes::ensure_present(&self.frames)?;
-        ensure!(
-            self.frames.is_dir(),
-            "capture session frames folder {} is missing; keep it beside the database",
-            self.frames.display()
-        );
-        let file = match File::open(&path) {
+        self.check_folder()?;
+        let file = match File::open(path) {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Err("was deleted")),
             Err(error) => {
                 return Err(error).with_context(|| format!("read {}", path.display()));
             }
         };
         let mut data = Vec::with_capacity(bytes as usize);
         file.take(bytes + 1).read_to_end(&mut data)?;
-        ensure!(
-            data.len() as u64 == bytes
-                && sha256 == Some(format!("{:x}", Sha256::digest(&data)).as_str()),
-            "frame file {} changed outside Capturefab; discard the capture to continue",
-            path.display()
-        );
-        Ok(Some(data))
+        if data.len() as u64 != bytes
+            || sha256 != Some(format!("{:x}", Sha256::digest(&data)).as_str())
+        {
+            return Ok(Err("changed after saving and was left in place"));
+        }
+        Ok(Ok(data))
     }
 
-    /// Drop a pending capture whose frame file was deleted. Pending captures
-    /// never train the model, so nothing learned is lost.
-    fn forget(&mut self, id: u64, bytes: u64) -> Result<()> {
+    /// Drop a pending capture whose frame is lost, so it cannot block the
+    /// review queue. Pending captures never train the model, so nothing
+    /// learned is lost.
+    fn forget(&mut self, id: u64, bytes: u64, path: &Path, lost: &str) -> Result<()> {
         let removed = self.db.execute(
             "DELETE FROM captures WHERE id = ? AND label = 'pending'",
             params![id],
@@ -930,8 +1034,9 @@ impl Store {
         ensure!(removed == 1, "capture is no longer pending review");
         let mut shared = lock(&self.shared);
         shared.tally.remove("pending", bytes);
-        shared.note = Some(format!(
-            "Removed pending capture {id} because its frame file was deleted"
+        shared.note(format!(
+            "Removed pending capture {id}: its frame file {} {lost}",
+            path.display()
         ));
         Ok(())
     }
@@ -949,6 +1054,20 @@ fn upgrade(db: &Connection) -> Result<()> {
          CHECKPOINT;",
     )
     .context("upgrade capture session to frame files")
+}
+
+/// Create a session's frames folder. It must not exist yet, which reserves
+/// the name, so a session never mixes another's frames into its own.
+fn claim(frames: &Path) -> Result<()> {
+    match std::fs::create_dir(frames) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => bail!(
+            "capture session frames folder already exists: {}; choose another session name",
+            frames.display()
+        ),
+        Err(error) => Err(error)
+            .with_context(|| format!("create capture session frames folder {}", frames.display())),
+    }
 }
 
 /// A stored frame name resolved inside the frames folder; a modified

@@ -225,6 +225,7 @@ A capture session is `NAME.duckdb` plus a `NAME.frames` folder of raw frames bes
 Close it, then copy the database and its `.frames` folder together.
 `capture-session keep ID` only relabels; `discard ID` deletes the frame file if it is unchanged.
 Frames count against the storage budget; a full budget is exit 6.
+A refused suggestion is retried after a minute, or at once after `discard` or `auto`; free space or raise the budget.
 `status.capture_session.note` says why a suggestion was skipped.
 
 ## Apply workflow files

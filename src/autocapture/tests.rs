@@ -574,15 +574,38 @@ fn discard_leaves_a_frame_file_that_changed_after_saving() {
     let id = observe(&mut session, &solid(140)).unwrap();
     let path = file.frames().join(format!("{id:08}.raw"));
     std::fs::write(&path, vec![7_u8; 1024]).unwrap();
-    assert!(
-        session.next_review().is_err(),
-        "a changed frame is never shown as the capture"
-    );
     session.review(id, false).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), vec![7_u8; 1024]);
     let status = session.status().unwrap();
     assert_eq!((status.discarded_count, status.pending_count), (1, 0));
     assert!(status.note.unwrap().contains("left"));
+}
+
+#[test]
+fn a_changed_pending_frame_leaves_the_review_queue_instead_of_blocking_it() {
+    let file = SessionFile::new();
+    let mut session = file.create();
+    session.manual(&solid(120)).unwrap();
+    ready(&mut session);
+    let changed = observe(&mut session, &solid(140)).unwrap();
+    let next = observe(&mut session, &solid(100)).unwrap();
+    let path = file.frames().join(format!("{changed:08}.raw"));
+    std::fs::write(&path, vec![7_u8; 1024]).unwrap();
+    let review = session.next_review().unwrap().unwrap();
+    assert_eq!(
+        (review.id, review.frame.data),
+        (next, solid(100).data),
+        "a changed frame is never shown, and the next suggestion is"
+    );
+    let status = session.status().unwrap();
+    assert_eq!(status.pending_count, 1);
+    assert!(
+        status
+            .note
+            .unwrap()
+            .contains(&format!("capture {changed}: its frame file"))
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), vec![7_u8; 1024]);
 }
 
 #[test]
@@ -593,9 +616,13 @@ fn a_pending_capture_whose_frame_was_deleted_leaves_the_review_queue() {
     ready(&mut session);
     let gone = observe(&mut session, &solid(140)).unwrap();
     let next = observe(&mut session, &solid(100)).unwrap();
-    // A missing folder, as when only the database was copied, drops nothing.
+    // A missing folder, as when only the database was copied, drops nothing,
+    // even after another frame is saved.
     let moved = file.0.with_extension("moved");
     std::fs::rename(file.frames(), &moved).unwrap();
+    assert!(session.next_review().is_err());
+    assert!(session.manual(&solid(60)).is_err());
+    assert!(!file.frames().exists(), "a save never recreates the folder");
     assert!(session.next_review().is_err());
     std::fs::rename(&moved, file.frames()).unwrap();
     assert_eq!(session.status().unwrap().pending_count, 2);
@@ -632,11 +659,152 @@ fn storage_refusals_pause_suggestions_and_other_write_failures_stop_them() {
 }
 
 #[test]
+fn a_frame_that_cannot_be_saved_now_is_retried_without_pausing() {
+    let file = SessionFile::new();
+    let mut session = file.create();
+    session.manual(&solid(120)).unwrap();
+    ready(&mut session);
+    // Another process holds the ledger, as while a long recording finishes.
+    lock(&session.shared).failure = Some(
+        anyhow!("storage manager is busy; retry after other capture processes finish bookkeeping")
+            .context(FrameNotSaved),
+    );
+    let t = Instant::now();
+    assert!(observe_at(&mut session, &solid(140), t).is_none());
+    let status = session.status().unwrap();
+    assert_eq!(
+        (status.state.as_str(), status.blocked_storage),
+        ("watching", false)
+    );
+    assert!(status.note.unwrap().contains("storage manager is busy"));
+    assert!(
+        observe_at(&mut session, &solid(140), t + WRITE_RETRY).is_some(),
+        "the next attempt comes soon"
+    );
+    // A frames folder moved away fails each save the same way.
+    let moved = file.0.with_extension("moved");
+    std::fs::rename(file.frames(), &moved).unwrap();
+    assert!(observe_at(&mut session, &solid(100), t + WRITE_RETRY * 2).is_some());
+    assert_eq!(
+        session.status().unwrap().pending_count,
+        1,
+        "a failed save releases its count"
+    );
+    assert!(
+        session
+            .observe_at(&solid(60), t + WRITE_RETRY * 3)
+            .unwrap()
+            .is_none()
+    );
+    let status = session.status().unwrap();
+    assert!(status.enabled);
+    assert!(status.note.unwrap().contains("is missing"));
+    std::fs::rename(&moved, file.frames()).unwrap();
+}
+
+#[test]
+fn changing_settings_forgets_failures_and_notes_from_earlier_writes() {
+    let file = SessionFile::new();
+    let mut session = file.create();
+    session.manual(&solid(120)).unwrap();
+    ready(&mut session);
+    // A queued write fails while the user pauses auto capture.
+    session
+        .writer
+        .post(|_| bail!("Storage full: old refusal"))
+        .unwrap();
+    session.configure(false, 0.5, 250).unwrap();
+    ready(&mut session);
+    assert!(
+        observe(&mut session, &solid(140)).is_some(),
+        "turning auto capture on tries storage again"
+    );
+    assert_eq!(session.status().unwrap().state, "watching");
+    lock(&session.shared).failure = Some(anyhow!("Storage full: test budget"));
+    assert!(observe(&mut session, &solid(100)).is_none());
+    session.configure(false, 0.5, 250).unwrap();
+    assert_eq!(session.status().unwrap().note, None);
+    // Other notes fade.
+    lock(&session.shared).note = Some((
+        Instant::now().checked_sub(NOTE_LIFETIME).unwrap(),
+        BUSY_NOTE.into(),
+    ));
+    assert_eq!(session.status().unwrap().note, None);
+}
+
+#[test]
+fn a_discard_that_cannot_be_saved_keeps_the_frame() {
+    let file = SessionFile::new();
+    let mut session = file.create();
+    session.manual(&solid(120)).unwrap();
+    ready(&mut session);
+    let id = observe(&mut session, &solid(140)).unwrap();
+    let path = file.frames().join(format!("{id:08}.raw"));
+    // An uncommitted change to the row makes the label update conflict.
+    let blocker = session.sql(move |db| {
+        let other = db.try_clone()?;
+        other.execute_batch(&format!(
+            "BEGIN; UPDATE captures SET label = 'kept' WHERE id = {id};"
+        ))?;
+        Ok(other)
+    });
+    assert!(session.review(id, false).is_err());
+    assert!(path.exists(), "the frame stays until the decision is saved");
+    drop(blocker);
+    assert_eq!(session.next_review().unwrap().unwrap().id, id);
+    session.review(id, false).unwrap();
+    assert!(!path.exists());
+}
+
+#[test]
 fn a_new_session_never_reuses_a_frames_folder() {
     let file = SessionFile::new();
     std::fs::create_dir(file.frames()).unwrap();
     assert!(CaptureSession::open(&file.0, "test-camera", true).is_err());
     assert!(!file.0.exists());
+    std::fs::remove_dir(file.frames()).unwrap();
+    // The folder is claimed with the session, before any frame is saved.
+    let _session = file.create();
+    let other = file.0.with_extension("db");
+    assert!(CaptureSession::open(&other, "test-camera", true).is_err());
+    assert!(!other.exists());
+    let unclaimed = SessionFile::new();
+    assert!(
+        CaptureSession::open(&unclaimed.frames(), "test-camera", true).is_err(),
+        "a session cannot be its own frames folder"
+    );
+    assert!(!unclaimed.frames().exists());
+}
+
+#[test]
+fn resuming_without_the_frames_folder_fails_instead_of_dropping_captures() {
+    let file = SessionFile::new();
+    {
+        let mut session = file.create();
+        session.manual(&solid(120)).unwrap();
+        ready(&mut session);
+        observe(&mut session, &solid(140)).unwrap();
+        observe(&mut session, &solid(100)).unwrap();
+    }
+    // As when only the database was copied.
+    let moved = file.0.with_extension("moved");
+    std::fs::rename(file.frames(), &moved).unwrap();
+    let missing = CaptureSession::open(&file.0, "test-camera", false)
+        .err()
+        .expect("a session whose frames are elsewhere does not open");
+    assert!(format!("{missing:#}").contains("is missing"), "{missing:#}");
+    assert!(!file.frames().exists());
+    std::fs::rename(&moved, file.frames()).unwrap();
+    let session = CaptureSession::open(&file.0, "test-camera", false).unwrap();
+    assert_eq!(session.status().unwrap().pending_count, 2);
+    assert!(session.next_review().unwrap().is_some());
+    drop(session);
+    // A session that never saved a frame claims a new folder.
+    let empty = SessionFile::new();
+    empty.create().close().unwrap();
+    std::fs::remove_dir(empty.frames()).unwrap();
+    CaptureSession::open(&empty.0, "test-camera", false).unwrap();
+    assert!(empty.frames().is_dir());
 }
 
 #[test]
@@ -697,6 +865,12 @@ fn schema_1_sessions_with_pixels_in_the_database_still_review() {
             .unwrap();
         }
     }
+    std::fs::create_dir(file.frames()).unwrap();
+    assert!(
+        CaptureSession::open(&file.0, "test-camera", false).is_err(),
+        "a schema 1 session never adopts another session's folder"
+    );
+    std::fs::remove_dir(file.frames()).unwrap();
     let mut session = CaptureSession::open(&file.0, "test-camera", false).unwrap();
     let status = session.status().unwrap();
     assert_eq!((status.manual_count, status.pending_count), (1, 2));

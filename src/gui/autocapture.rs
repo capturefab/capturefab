@@ -117,7 +117,9 @@ fn state_guidance(state: &str) -> &'static str {
     match state {
         "learning" => "Capture an example to start learning.",
         "watching" => "Watching for frames like your examples.",
-        "storage_full" => "Session storage is full. Discard suggestions or start a new session.",
+        "storage_full" => {
+            "Storage is full. Discard suggestions, free space or raise the storage budget; a session holds up to 2 GiB."
+        }
         "review_queue_full" => {
             "The review queue is full. Keep or discard suggestions to continue auto capture."
         }
