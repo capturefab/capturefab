@@ -306,13 +306,52 @@ impl WorkerHandle {
             self.log(level, message);
         }
     }
-    fn publish_capture(&self, session: &crate::autocapture::CaptureSession) -> Result<()> {
+    fn publish_capture(
+        &self,
+        session: &crate::autocapture::CaptureSession,
+    ) -> Result<crate::autocapture::SessionStatus> {
         let status = session.status()?;
         self.state
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .capture_session = Some(status);
-        Ok(())
+            .capture_session = Some(status.clone());
+        Ok(status)
+    }
+    /// Publish the session's status when it differs from the published one.
+    /// It also changes away from the camera thread's suggestions: the writer
+    /// refuses or fails a frame and frees its reserved count, a review drops
+    /// a capture whose frame is gone, the embedder measures its rate and
+    /// finds its accelerator, and notes fade.
+    fn sync_capture(&self, session: &crate::autocapture::CaptureSession) {
+        let Ok(status) = session.status() else {
+            return;
+        };
+        let current = self
+            .state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .capture_session
+            .as_ref()
+            == Some(&status);
+        if !current {
+            self.state
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .capture_session = Some(status);
+        }
+    }
+    /// `sync_capture` for a status request answered off the camera thread,
+    /// as a camera worker answers the coordinator's polls. A camera thread
+    /// that holds the session is busy with it and publishes it itself.
+    pub fn refresh_capture(&self) {
+        let guard = match self.capture_session.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        if let Some(session) = guard.as_ref() {
+            self.sync_capture(session);
+        }
     }
     fn teach_capture(&self, frame: &Frame) -> Result<Option<u64>> {
         let mut guard = self
@@ -373,7 +412,7 @@ impl WorkerHandle {
                     self.log("error", format!("Auto capture status: {error:#}"));
                 }
             }
-            Ok(None) => {}
+            Ok(None) => self.sync_capture(session),
             Err(error) => {
                 // Preserve the database and all labels; acquisition continues.
                 if let Ok(status) = session.status() {
@@ -767,12 +806,14 @@ fn process_plain(
                 Some(id) => session.review_capture(id)?,
                 None => session.next_review()?,
             };
+            // Loading drops captures whose frames are gone, with a note.
+            let status = h.publish_capture(session)?;
             let capture = capture.map(|capture| -> Result<Value> {
                 let (width, height, rgba) = crate::frame::preview_rgba(&capture.frame, 480, 360)?;
                 Ok(json!({"id":capture.id,"score":capture.score,"reason":capture.reason,
                     "width":width,"height":height,"rgba":base64::engine::general_purpose::STANDARD.encode(rgba)}))
             }).transpose()?;
-            Ok(json!({"capture":capture,"capture_session":session.status()?}))
+            Ok(json!({"capture":capture,"capture_session":status}))
         }
         SessionCommand::ReviewCapture { id, keep } => {
             let mut guard = h.capture_session.lock().unwrap_or_else(|e| e.into_inner());

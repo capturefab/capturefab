@@ -320,7 +320,9 @@ fn watch_activity(watch: &ActivityWatch) -> impl iced::futures::Stream<Item = Me
         std::thread::spawn(move || {
             let mut seen = 0;
             while !output.is_closed() {
-                let revision = handle.wait_for_activity(seen, Duration::from_secs(1));
+                // Waiting here is not looking: the window's ticks say when
+                // it shows.
+                let revision = handle.wait_for_activity_unwatched(seen, Duration::from_secs(1));
                 if revision > seen {
                     if output.try_send(Message::Tick).is_ok() {
                         seen = revision;
@@ -1875,7 +1877,13 @@ impl Workbench {
         self.prune_flashes();
         self.poll_accessibility();
         let selected = self.snapshot.active_camera.clone();
-        self.snapshot = self.handle.snapshot();
+        // Out of sight, with no command of its own on the way, nobody is
+        // looking: stopped cameras' workers are then polled at the idle rate.
+        self.snapshot = if self.frames_paused() && self.pending.is_empty() {
+            self.handle.snapshot_unwatched()
+        } else {
+            self.handle.snapshot()
+        };
         self.project_local_camera();
         self.scene.patch(&mut self.snapshot);
         self.sync_camera_history();
@@ -2557,19 +2565,27 @@ impl Workbench {
     }
 
     /// Open the Features tab on the exposure control, lit as when the
-    /// camera takes a value, and focus it when it is a field. Quick controls
-    /// show only while no search narrows the features.
+    /// camera takes a value, and focus it. Quick controls show only while no
+    /// search narrows the features; any other opens its group.
     fn adjust_exposure(&mut self) -> Task<Message> {
         let Some(name) = self.exposure_control() else {
             return Task::none();
         };
         self.search.clear();
         let tab = self.handle_message(Message::ShowTab(Tab::Features));
+        self.reveal_feature(name);
         self.flash_feature(name);
-        match name {
-            // A choice, which takes no focus by name.
-            "ExposureAuto" => tab,
-            _ => operation::focus(format!("feature:{name}")),
+        // A control the stream holds read-only leaves the keyboard on the tab.
+        let reachable = self
+            .snapshot
+            .features
+            .iter()
+            .find(|feature| feature.name == name)
+            .is_some_and(|feature| self.focusable_by_name(feature));
+        if reachable {
+            operation::focus(format!("feature:{name}"))
+        } else {
+            tab
         }
     }
 
@@ -3313,7 +3329,7 @@ impl Workbench {
             Message::Search(value) => self.search = value,
             Message::InspectorDisclosure(section) => self.toggle_inspector_section(section),
             Message::ExpandFeatureGroups(open) => self.expand_feature_groups(open),
-            Message::ShowFeatures(group) => self.show_whole_group(group),
+            Message::ShowFeatures(group) => return self.show_whole_group(group),
             Message::RefreshFeatures => {
                 self.edits.clear();
                 self.edit_sources.clear();

@@ -401,7 +401,7 @@ impl Workbench {
         process::hint(OVERLOAD);
         if !before && efficient() && !std::mem::replace(&mut state.noticed, true) {
             self.set_notice(
-                "Switched to Efficient preview because this computer was falling behind",
+                "Switched to Efficient mode because this computer was falling behind",
                 Some("Captures and recordings keep every frame. Settings › Performance can choose Smooth again.".into()),
                 Level::Done,
             );
@@ -426,12 +426,12 @@ impl Workbench {
     pub(super) fn preview_about(&self) -> String {
         let mut about = "This computer is drawing fewer frames than the camera sends. Captures and recordings still get every frame.".to_owned();
         if efficient() {
-            about.push_str(" Efficient preview is on.");
+            about.push_str(" Efficient mode is on.");
         } else if let Some(overridden) = self.performance_overridden() {
             about.push(' ');
             about.push_str(&overridden);
         } else {
-            about.push_str(" Use Efficient preview to lower the load.");
+            about.push_str(" Use Efficient mode to lower the load.");
         }
         about
     }
@@ -443,8 +443,9 @@ impl Workbench {
     }
 
     /// The neutral chip with the preview figure, whose press turns on
-    /// Efficient preview unless it is on or the command line or environment
-    /// decides; `shown` fades it with the controls.
+    /// Efficient mode unless it is on or the command line or environment
+    /// decides; `shown` fades it with the controls. Its explanation, a
+    /// tooltip, is also its accessible description.
     pub(super) fn preview_chip(&self, id: &str, shown: f32) -> Option<Element<'_, Message>> {
         let figure = self.preview_figure(id)?;
         let stage = style::stage_palette(self.key_window == Some(self.main_window));
@@ -455,10 +456,11 @@ impl Workbench {
             .wrapping(text::Wrapping::None);
         let chip = button(label)
             .name(if switch {
-                format!("{figure}. Use Efficient preview")
+                format!("{figure}. Use Efficient mode")
             } else {
                 figure
             })
+            .description(self.preview_about())
             .padding([0, 5])
             .style(style::on_glass(false, shown))
             .on_press_maybe(switch.then_some(Message::Performance(Mode::Efficient)));
@@ -487,7 +489,7 @@ impl Workbench {
                 index as f32,
             ),
             text(
-                "Efficient draws up to 15 camera frames a second, 5 in the overview, keeps scaled-down pictures to 1280 pixels and skips animations. Captures and recordings keep every frame."
+                "Efficient draws up to 15 camera frames a second, 5 in the overview, keeps scaled-down pictures to 1280 pixels and skips animations. Auto capture checks fewer frames on the CPU, and new recordings encode faster. Captures and recordings keep every frame."
             )
             .size(style::SMALL)
             .color(p.secondary),
@@ -663,7 +665,7 @@ mod tests {
         );
         assert!(efficient(), "Automatic heard it");
         let notice = bench.notice.clone().unwrap();
-        assert!(notice.text.starts_with("Switched to Efficient preview"));
+        assert!(notice.text.starts_with("Switched to Efficient mode"));
         assert!(notice.detail.unwrap().contains("keep every frame"));
         // Efficient preview draws at most 15 a second, which it manages.
         draw(&mut bench, 15, 5);
@@ -754,6 +756,9 @@ mod tests {
                 .iter()
                 .find(|(_, node)| node.role() == accessibility::Role::Button)
                 .unwrap();
+            // The tooltip's explanation reaches assistive technology too,
+            // pressable or not.
+            assert_eq!(button.description(), Some(bench.preview_about().as_str()));
             (button.label().unwrap().to_owned(), !button.is_disabled())
         };
         let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
@@ -766,7 +771,7 @@ mod tests {
         draw(&mut bench, 8, 5);
         assert_eq!(
             chip(&bench),
-            ("Preview 8 of 30 fps. Use Efficient preview".into(), true)
+            ("Preview 8 of 30 fps. Use Efficient mode".into(), true)
         );
         process::override_with(Mode::Smooth);
         bench.tick_performance();

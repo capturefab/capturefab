@@ -61,7 +61,7 @@ const EFFICIENT_CPU_SHARE: f64 = 0.2;
 const MODEL: &str = "Session exemplar kNN + background novelty";
 type Descriptor = Vec<f32>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionStatus {
     pub path: String,
     pub camera: String,
@@ -2019,13 +2019,56 @@ impl CaptureSession {
             .unwrap()
     }
     /// Wait until every queued write has landed.
-    fn flush(&self) {
+    pub(crate) fn flush(&self) {
         self.writer.call(|_| Ok(())).unwrap();
     }
     /// Recount after tests edit rows behind the session's back.
     fn recount(&self) {
         let tally = self.writer.call(|store| counts(&store.db)).unwrap();
         lock(&self.shared).tally = tally;
+    }
+    /// Queue a write that fails with `message`, as one storage refuses.
+    pub(crate) fn fail_next_write(&self, message: &'static str) {
+        self.flush();
+        self.writer.post(move |_| bail!(message)).unwrap();
+    }
+    /// Hold the writer in a task until the returned sender sends or drops.
+    pub(crate) fn stall_writer(&self) -> mpsc::Sender<()> {
+        self.flush();
+        let (release, stalled) = mpsc::channel::<()>();
+        let (running, started) = mpsc::channel::<()>();
+        self.writer
+            .post(move |_| {
+                let _ = running.send(());
+                let _ = stalled.recv();
+                Ok(())
+            })
+            .unwrap();
+        started.recv().unwrap();
+        release
+    }
+    /// Queue `frame` as an automatic suggestion, without scoring it, behind
+    /// at most a running write.
+    pub(crate) fn suggest(&mut self, frame: &Frame) -> u64 {
+        let feature = self.encoder.describe(frame).unwrap();
+        let row = self
+            .row(
+                Cow::Borrowed(frame),
+                feature,
+                "automatic",
+                "pending",
+                1.0,
+                "Test suggestion".into(),
+            )
+            .unwrap();
+        let id = row.id;
+        self.writer.post(move |store| store.insert(row)).unwrap();
+        id
+    }
+    /// Note `note` as if made long enough ago that it fades in `left`.
+    pub(crate) fn note_fading(&self, note: &str, left: Duration) {
+        let made = Instant::now().checked_sub(NOTE_LIFETIME - left).unwrap();
+        lock(&self.shared).note = Some((made, note.into()));
     }
     /// Hold a write transaction open on another connection, which makes
     /// DuckDB refuse to checkpoint until it is dropped.

@@ -710,6 +710,20 @@ mod tests {
     }
 
     #[test]
+    fn a_window_out_of_sight_lets_the_session_poll_idle_workers_slowly() {
+        let handle = SessionHandle::new();
+        let mut bench = Workbench::new(handle.clone(), "test".into(), true, None);
+        let _ = bench.handle_message(Message::Hidden(Some(true)));
+        handle.unwatch();
+        let _ = bench.tick();
+        assert!(!handle.watching(), "a hidden window's tick is not a look");
+        let _ = bench.handle_message(Message::Hidden(Some(false)));
+        let _ = bench.tick();
+        assert!(handle.watching(), "back in sight, it watches again");
+        handle.shutdown();
+    }
+
+    #[test]
     fn an_update_made_during_a_draw_is_drawn_by_it() {
         use iced::advanced::{clipboard, renderer::Headless};
         let renderer = iced::futures::executor::block_on(iced::Renderer::new(

@@ -1708,7 +1708,7 @@ impl SessionHandle {
             .store(self.elapsed_ms(), Ordering::Relaxed);
         self.hurry(SLOW);
     }
-    fn watching(&self) -> bool {
+    pub(crate) fn watching(&self) -> bool {
         let watched = self.inner.watched.load(Ordering::Relaxed);
         watched != 0 && self.elapsed_ms() - watched < WATCHING.as_millis() as u64
     }
@@ -1801,6 +1801,11 @@ impl SessionHandle {
     /// workers are polled often while views keep asking.
     pub fn snapshot(&self) -> SessionSnapshot {
         self.watch();
+        self.assemble().0
+    }
+    /// `snapshot` for a reader nobody is looking through, such as a window
+    /// that is hidden: workers are polled at the idle rate for it.
+    pub fn snapshot_unwatched(&self) -> SessionSnapshot {
         self.assemble().0
     }
     /// Build a snapshot from every worker's latest report, with the session
@@ -2043,6 +2048,11 @@ impl SessionHandle {
     }
     pub fn wait_for_activity(&self, after: u64, timeout: Duration) -> u64 {
         self.watch();
+        self.inner.activity.wait(after, timeout)
+    }
+    /// `wait_for_activity` for a window's own listener, which waits whether
+    /// or not anyone looks, so it is not watching.
+    pub fn wait_for_activity_unwatched(&self, after: u64, timeout: Duration) -> u64 {
         self.inner.activity.wait(after, timeout)
     }
     /// Resolve aliases from cached identities, without waiting for a busy
@@ -2880,6 +2890,9 @@ pub fn run_worker(ring: &std::ffi::OsStr) -> Result<()> {
                     command => handle.request(command).map(Some),
                 },
             };
+            // Auto capture's writer and embedder change its status off the
+            // camera thread, which may be waiting for frames or busy.
+            handle.refresh_capture();
             // One snapshot clone per reply, serialized straight to the pipe; the
             // clone keeps the state lock out of the blocking write.
             let mut snapshot = handle.snapshot();
@@ -2910,6 +2923,11 @@ pub fn run_worker(ring: &std::ffi::OsStr) -> Result<()> {
 
 #[cfg(test)]
 impl SessionHandle {
+    /// Forget that anyone looked, as three seconds without a look would.
+    #[cfg(feature = "gui")]
+    pub(crate) fn unwatch(&self) {
+        self.inner.watched.store(0, Ordering::Relaxed);
+    }
     /// A session whose selected camera, "cam", is fed by a ring without a
     /// worker, and that ring's writer, for tests of frame consumers.
     pub(crate) fn fed(capacity: usize) -> (Self, SharedRing) {
@@ -4080,6 +4098,9 @@ mod tests {
         assert!(!handle.watching(), "nobody has looked yet");
         handle.request(SessionCommand::Status).unwrap();
         assert!(!handle.watching(), "a status request is not a view");
+        handle.snapshot_unwatched();
+        handle.wait_for_activity_unwatched(0, Duration::ZERO);
+        assert!(!handle.watching(), "a hidden window's reads are not a view");
         handle.snapshot();
         assert!(handle.watching());
         assert_eq!(handle.next_poll(), None, "no worker: wait to be woken");

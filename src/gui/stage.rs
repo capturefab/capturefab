@@ -775,26 +775,33 @@ fn stall_badge<'a>(silent: Duration, whole: bool) -> Element<'a, Message> {
 
 /// A network stream being reopened, on the stage or a tile: calm, since it
 /// comes back by itself, with the worker's report on hover; unless `whole`,
-/// the mark alone.
+/// the mark alone. Either way assistive technology reads "Reconnecting…"
+/// with the report, which a tooltip alone would not give it.
 fn reconnect_badge<'a>(report: &str, whole: bool) -> Element<'a, Message> {
+    const NAME: &str = "Reconnecting…";
     let mark = icon(Icon::Refresh, 12.0, style::STAGE.secondary);
     let about = format!("{report}. Frames resume on their own once the stream is back.");
-    if !whole {
-        return tip(container(mark).padding([4, 6]).style(style::badge), about);
-    }
-    tip(
+    let badge = if whole {
         container(
             row![
                 mark,
-                text("Reconnecting…")
-                    .size(style::SMALL)
-                    .wrapping(text::Wrapping::None),
+                text(NAME).size(style::SMALL).wrapping(text::Wrapping::None),
             ]
             .spacing(5)
             .align_y(Alignment::Center),
         )
         .padding([2, 8])
-        .style(style::badge),
+    } else {
+        container(mark).padding([4, 6])
+    };
+    tip(
+        accessibility::label_description(
+            badge.style(style::badge).into(),
+            NAME.into(),
+            about.clone(),
+            accessibility::Role::Label,
+            None,
+        ),
         about,
     )
 }
@@ -1539,8 +1546,9 @@ mod tests {
     fn a_stream_being_reopened_shows_a_calm_badge_until_frames_flow() {
         use iced::advanced::{Layout, layout, widget::Tree};
         let renderer = destinations::layout_tests::renderer();
-        let labels = |bench: &Workbench| {
-            let mut badges = bench.badges("sim:0", false, 400.0, 0.0, 0.0);
+        // Each labelled node, with its description.
+        let described = |bench: &Workbench, room: f32| {
+            let mut badges = bench.badges("sim:0", false, room, 0.0, 0.0);
             let mut tree = Tree::new(badges.as_widget());
             let node = badges.as_widget_mut().layout(
                 &mut tree,
@@ -1556,9 +1564,13 @@ mod tests {
             native
                 .nodes
                 .into_iter()
-                .filter_map(|(_, node)| node.label().map(str::to_owned))
+                .filter_map(|(_, node)| {
+                    let label = node.label()?.to_owned();
+                    Some((label, node.description().map(str::to_owned)))
+                })
                 .collect::<Vec<_>>()
         };
+        let labels = |bench: &Workbench| described(bench, 400.0);
         let mut bench = bench();
         let start = bench.now;
         bench.observe_liveness();
@@ -1567,13 +1579,20 @@ mod tests {
         bench.now = start + Duration::from_secs(8);
         bench.tick_stage();
         assert!(bench.stalled("sim:0").is_some());
-        // It stands in for the stall and the error: no alarm, no Details.
-        assert_eq!(labels(&bench), ["Reconnecting…", "Capturefab"]);
+        // It stands in for the stall and the error: no alarm, no Details,
+        // and its report is read out as well as shown on hover. A small
+        // tile's mark alone says as much.
+        let about =
+            format!("{SCENE_RECONNECT}. Frames resume on their own once the stream is back.");
+        let badge = ("Reconnecting…".to_owned(), Some(about));
+        let window = ("Capturefab".to_owned(), None);
+        assert_eq!(labels(&bench), [badge.clone(), window.clone()]);
+        assert_eq!(described(&bench, 120.0), [badge, window.clone()]);
         // Frames flow again: the worker retires it, and so does the badge.
         bench.frame_seen("sim:0");
         bench.now += Duration::from_millis(100);
         bench.tick_stage();
-        assert_eq!(labels(&bench), ["Capturefab"]);
+        assert_eq!(labels(&bench), [window]);
     }
 
     #[test]

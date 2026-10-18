@@ -969,9 +969,98 @@ impl Workbench {
         }
     }
 
-    /// Show every row of a long open group.
-    pub(super) fn show_whole_group(&mut self, group: &'static str) {
+    /// Show every row of `group`. Its "Show more" link leaves with the rows
+    /// it stood for, so the keyboard moves on to the first of them it can
+    /// reach rather than to nowhere.
+    pub(super) fn show_whole_group(&mut self, group: &'static str) -> Task<Message> {
+        self.reveal_group(group)
+            .map_or_else(Task::none, operation::focus)
+    }
+
+    /// Make feature `name` show in the Features tab without a search: a
+    /// quick control always shows; any other needs its group open, and whole
+    /// if it sits past the rows a long group shows first.
+    pub(super) fn reveal_feature(&mut self, name: &str) {
+        let index = &self.inspect.index;
+        let Some(i) = self.snapshot.features.iter().position(|f| f.name == name) else {
+            return;
+        };
+        if index.is_quick.get(i).copied().unwrap_or(true) {
+            return;
+        }
+        let Some((group, members)) = index
+            .groups
+            .iter()
+            .find(|(_, members)| members.contains(&i))
+        else {
+            return;
+        };
+        let group = *group;
+        let late = self
+            .listed(members, "")
+            .iter()
+            .position(|&member| member == i)
+            .is_some_and(|row| row >= GROUP_ROWS);
+        self.inspect.feature_groups_open.insert(group);
+        if late {
+            self.inspect.feature_groups_whole.insert(group);
+        }
+    }
+
+    /// `show_whole_group`, with the id of the control to focus.
+    fn reveal_group(&mut self, group: &'static str) -> Option<String> {
+        let query = self.search.trim().to_lowercase();
+        let hidden: Vec<usize> = self
+            .inspect
+            .index
+            .groups
+            .iter()
+            .find(|(name, _)| *name == group)
+            .map(|(_, members)| {
+                let listed = self.listed(members, &query);
+                let shown: HashSet<usize> = self.shown_rows(group, &listed).0.into_iter().collect();
+                listed.into_iter().filter(|i| !shown.contains(i)).collect()
+            })
+            .unwrap_or_default();
         self.inspect.feature_groups_whole.insert(group);
+        hidden
+            .into_iter()
+            .map(|i| &self.snapshot.features[i])
+            .find(|feature| self.focusable_by_name(feature))
+            .map(|feature| format!("feature:{}", feature.name))
+    }
+
+    /// The features of a group's `members` that the Features tab lists:
+    /// those matching the lowercased `query`, or without one, those not
+    /// among the quick controls.
+    fn listed(&self, members: &[usize], query: &str) -> Vec<usize> {
+        let index = &self.inspect.index;
+        members
+            .iter()
+            .copied()
+            .filter(|&i| {
+                self.snapshot.features.get(i).is_some()
+                    && if query.is_empty() {
+                        !index.is_quick[i]
+                    } else {
+                        query
+                            .split_whitespace()
+                            .all(|term| index.words[i].contains(term))
+                    }
+            })
+            .collect()
+    }
+
+    /// Whether `feature`'s row holds a control with its `feature:` id: a
+    /// field, choice or checkbox it can write. See `feature`.
+    pub(super) fn focusable_by_name(&self, feature: &FeatureInfo) -> bool {
+        let managed = self
+            .snapshot
+            .auto
+            .as_ref()
+            .is_some_and(|auto| auto.managed.contains(&feature.name));
+        let writable = (feature.writable || managed) && !self.stream_locks(feature);
+        writable && feature.error.is_none() && !feature.kind.eq_ignore_ascii_case("command")
     }
 
     /// The rows of open group `group` that show: the first `GROUP_ROWS`,
@@ -1754,20 +1843,7 @@ impl Workbench {
         }
         let mut matched = 0;
         for (group, members) in &index.groups {
-            let members: Vec<_> = members
-                .iter()
-                .copied()
-                .filter(|&i| {
-                    snapshot.features.get(i).is_some()
-                        && if searching {
-                            query
-                                .split_whitespace()
-                                .all(|term| index.words[i].contains(term))
-                        } else {
-                            !index.is_quick[i]
-                        }
-                })
-                .collect();
+            let members = self.listed(members, &query);
             matched += members.len();
             if !members.is_empty() {
                 let failed = members.iter().any(|&i| {
@@ -1803,10 +1879,22 @@ impl Workbench {
                     let (rows, more) = self.shown_rows(group, &members);
                     content = content.push(self.feature_rows(&rows, p));
                     if more > 0 {
-                        content = content.push(link(
-                            format!("Show {} more", grouped(more as u64)),
-                            Some(Message::ShowFeatures(group)),
-                        ));
+                        content = content.push(
+                            button(
+                                text(format!("Show {} more", grouped(more as u64)))
+                                    .size(style::SMALL)
+                                    .font(style::MEDIUM),
+                            )
+                            // Clear on its own, as in a list of links.
+                            .name(format!(
+                                "Show {} more {group} {}",
+                                grouped(more as u64),
+                                if more == 1 { "feature" } else { "features" }
+                            ))
+                            .padding([3, 8])
+                            .style(style::link)
+                            .on_press(Message::ShowFeatures(group)),
+                        );
                     }
                 }
                 groups = groups.push(*group, content);
@@ -2347,9 +2435,13 @@ impl Workbench {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(current == "true" || current == "1"),
             };
-            widgets::checkbox_named("", label, checked, move |value| {
-                Message::Set(feature.name.clone(), value.to_string())
-            })
+            widgets::checkbox_named_id(
+                "",
+                label,
+                checked,
+                move |value| Message::Set(feature.name.clone(), value.to_string()),
+                format!("feature:{name}"),
+            )
         } else if !feature.choices.is_empty() {
             let glow = self.inspect.accepted.level(name, self.now);
             // What a write on its way asked for, else what the camera has.
@@ -2362,6 +2454,7 @@ impl Workbench {
                 move |value| Message::Set(feature.name.clone(), value),
             )
             .name(label)
+            .id(format!("feature:{name}"))
             .placeholder(current.clone())
             .width(CONTROL)
             .text_size(style::SMALL)
@@ -3714,6 +3807,132 @@ mod tests {
         bench.inspect.feature_groups_open.insert(group);
         bench.toggle_inspector_section(Section::Features(group));
         assert_eq!(bench.shown_rows(group, &members).1, 118);
+    }
+
+    /// The Features tab rendered as the window does, with `acts` applied to
+    /// its controls in turn; its accessible labels, and the id `acts` left
+    /// focused.
+    fn features_view(
+        bench: &Workbench,
+        acts: &mut [&mut dyn iced::advanced::widget::Operation],
+    ) -> (Vec<String>, Option<iced::advanced::widget::Id>) {
+        use iced::advanced::{
+            Layout,
+            widget::{Operation, Tree, operation},
+        };
+        let renderer = destinations::layout_tests::renderer();
+        let mut view = bench.features(Palette::of(false));
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &iced::advanced::layout::Limits::new(Size::ZERO, Size::new(420.0, 20_000.0)),
+        );
+        for act in acts {
+            view.as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, *act);
+        }
+        let mut found = operation::focusable::find_focused();
+        view.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::black_box(&mut found),
+        );
+        let focused = match found.finish() {
+            operation::Outcome::Some(id) => Some(id),
+            _ => None,
+        };
+        let (native, _, _) = accessibility::snapshot_widget(
+            view.as_widget_mut(),
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+        );
+        let labels = native
+            .nodes
+            .into_iter()
+            .filter_map(|(_, node)| node.label().map(str::to_owned))
+            .collect();
+        (labels, focused)
+    }
+
+    fn focus(id: &str) -> impl iced::advanced::widget::Operation {
+        iced::advanced::widget::operation::focusable::focus::<()>(id.to_owned().into())
+    }
+
+    #[test]
+    fn showing_the_rest_of_a_group_moves_the_keyboard_to_its_first_new_control() {
+        let mut bench = bench();
+        bench.snapshot.features = (0..120)
+            .map(|n| FeatureInfo {
+                name: format!("Feature{n}"),
+                display_name: format!("Feature {n}"),
+                kind: if n == GROUP_ROWS + 1 {
+                    "Boolean"
+                } else {
+                    "Integer"
+                }
+                .into(),
+                value: Some(json!(n)),
+                // The first hidden row shows a value only.
+                writable: n != GROUP_ROWS,
+                description: String::new(),
+                unit: None,
+                min: None,
+                max: None,
+                inc: None,
+                choices: Vec::new(),
+                error: None,
+            })
+            .collect();
+        bench.tick_inspector();
+        let (group, _) = bench.inspect.index.groups[0];
+        bench.inspect.feature_groups_open.insert(group);
+        let (labels, _) = features_view(&bench, &mut []);
+        assert!(
+            labels.contains(&format!("Show 40 more {group} features")),
+            "the link says what it shows on its own: {labels:?}"
+        );
+        // The link leaves; the keyboard skips the read-only row and lands
+        // on the checkbox after it.
+        let target = bench.reveal_group(group).unwrap();
+        assert_eq!(target, "feature:Feature81");
+        let (_, focused) = features_view(&bench, &mut [&mut focus(&target)]);
+        assert_eq!(
+            focused,
+            Some(target.into()),
+            "the control takes the keyboard"
+        );
+    }
+
+    #[test]
+    fn adjusting_exposure_shows_and_focuses_the_control_for_any_camera_kind() {
+        let mut bench = bench();
+        let mut camera = liveness::streaming_camera(0, 0, 0.0).info;
+        camera.profile.kind = CameraKind::Microscope;
+        bench.snapshot.connected = Some(camera);
+        let mut auto = sample_feature("ExposureAuto", "Enumeration", json!("Continuous"));
+        auto.choices = vec!["Off".into(), "Continuous".into()];
+        bench.snapshot.features = vec![
+            auto,
+            sample_feature("ExposureTime", "Float", json!(5000.0)),
+            sample_feature("Gain", "Float", json!(0.0)),
+        ];
+        bench.tick_inspector();
+        // A microscope's quick controls leave auto exposure in its group.
+        assert!(!bench.inspect.index.is_quick[0]);
+        assert_eq!(bench.exposure_control(), Some("ExposureAuto"));
+        let _ = bench.update(Message::AdjustExposure);
+        assert_eq!(bench.tab, Tab::Features);
+        let (labels, focused) = features_view(&bench, &mut [&mut focus("feature:ExposureAuto")]);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label == &bench.inspect.index.labels[0]),
+            "its group opens: {labels:?}"
+        );
+        assert_eq!(focused, Some("feature:ExposureAuto".to_owned().into()));
     }
 
     #[test]
