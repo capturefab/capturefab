@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use nusb::{
     DeviceInfo, Endpoint, Interface, MaybeFuture,
     descriptors::TransferType,
-    transfer::{Buffer, Bulk, In, Out},
+    transfer::{Buffer, Bulk, In, Out, TransferError},
 };
 use std::{
     collections::VecDeque,
@@ -209,8 +209,102 @@ struct Request {
 struct Stream {
     expected: usize,
     schedule: Vec<Request>,
+    /// The submitted transfers, in the order they complete.
     pending: VecDeque<Request>,
     frame: Option<Frame>,
+    /// Whether every transfer buffer is mapped for zero-copy transfers.
+    zero_copy: bool,
+}
+/// Where a stream's transfers are submitted: the camera's stream endpoint.
+trait Transfers {
+    fn allocate(&mut self, len: usize) -> Buffer;
+    fn submit(&mut self, buffer: Buffer);
+}
+impl Transfers for Endpoint<Bulk, In> {
+    fn allocate(&mut self, len: usize) -> Buffer {
+        Endpoint::allocate(self, len)
+    }
+    fn submit(&mut self, buffer: Buffer) {
+        Endpoint::submit(self, buffer)
+    }
+}
+impl Stream {
+    fn new(expected: usize, schedule: Vec<Request>) -> Self {
+        Self {
+            expected,
+            schedule,
+            pending: VecDeque::new(),
+            frame: None,
+            zero_copy: true,
+        }
+    }
+    /// Submit buffers for one whole frame, in schedule order. Allocating maps
+    /// memory, so this happens only when acquisition starts.
+    fn queue(&mut self, transfers: &mut impl Transfers) {
+        for request in &self.schedule {
+            let buffer = transfers.allocate(request.size);
+            self.zero_copy &= buffer.is_zero_copy();
+            transfers.submit(buffer);
+            self.pending.push_back(*request);
+        }
+    }
+    /// Take a completed transfer, then submit its buffer again for the same
+    /// part of a later frame, failed or not, so the queue keeps its order and
+    /// depth. Returns the frame a trailer completes.
+    fn receive(
+        &mut self,
+        transfers: &mut impl Transfers,
+        status: Result<(), TransferError>,
+        mut buffer: Buffer,
+    ) -> Result<Option<Frame>> {
+        let request = self
+            .pending
+            .pop_front()
+            .context("USB stream transfer queue exhausted")?;
+        let received = status
+            .context("USB stream transfer failed")
+            .and_then(|()| self.take(request, &buffer));
+        buffer.clear();
+        buffer.set_requested_len(request.size);
+        transfers.submit(buffer);
+        self.pending.push_back(request);
+        received
+    }
+    fn take(&mut self, request: Request, bytes: &[u8]) -> Result<Option<Frame>> {
+        match request.part {
+            Part::Leader => {
+                ensure!(
+                    self.frame.is_none(),
+                    "unexpected USB leader while receiving an image"
+                );
+                let mut frame = parse_leader(bytes)?;
+                frame.data.reserve(self.expected);
+                self.frame = Some(frame);
+            }
+            Part::Payload => {
+                let frame = self
+                    .frame
+                    .as_mut()
+                    .context("USB payload arrived before image leader")?;
+                let remaining = self.expected - frame.data.len();
+                let valid = remaining.min(request.size);
+                ensure!(
+                    bytes.len() >= valid && bytes.len() <= request.size,
+                    "short USB image payload transfer"
+                );
+                frame.data.extend_from_slice(&bytes[..valid]);
+            }
+            Part::Trailer => {
+                let frame = self
+                    .frame
+                    .take()
+                    .context("USB trailer arrived before image leader")?;
+                validate_trailer(bytes, &frame, self.expected)?;
+                return Ok(Some(frame));
+            }
+        }
+        Ok(None)
+    }
 }
 fn aligned(size: usize, alignment: usize) -> Result<usize> {
     ensure!(
@@ -338,12 +432,6 @@ impl UsbBackend {
             "stream register value exceeds u32"
         );
         self.write_memory(self.sirm + offset, &(value as u32).to_le_bytes())
-    }
-    fn queue(&mut self, requests: &[Request]) {
-        for request in requests {
-            let buffer = self.stream_in.allocate(request.size);
-            self.stream_in.submit(buffer);
-        }
     }
 }
 impl RegisterIo for UsbBackend {
@@ -548,15 +636,17 @@ impl Backend for UsbBackend {
         });
         // Queue two full frame requests before AcquisitionStart to keep the host
         // controller supplied with buffers while the consumer processes a frame.
-        self.queue(&schedule);
-        self.queue(&schedule);
-        let pending = schedule.iter().chain(schedule.iter()).copied().collect();
-        self.stream = Some(Stream {
-            expected,
-            schedule,
-            pending,
-            frame: None,
-        });
+        let mut stream = Stream::new(expected, schedule);
+        stream.queue(&mut self.stream_in);
+        stream.queue(&mut self.stream_in);
+        // Linux maps transfer buffers from usbfs memory, falling back to
+        // copies when its limit is reached; other systems always copy.
+        if cfg!(target_os = "linux") && !stream.zero_copy {
+            eprintln!(
+                "capturefab: USB transfers are copied because the kernel could not map usbfs memory for them; raise /sys/module/usbcore/parameters/usbfs_memory_mb (16 MB by default) above twice the frame size"
+            );
+        }
+        self.stream = Some(stream);
         if let Err(error) = self.put32(SIRM_CONTROL, 1) {
             let _ = self.stop();
             return Err(error);
@@ -573,48 +663,11 @@ impl Backend for UsbBackend {
                 .stream_in
                 .wait_next_complete(remaining)
                 .context("USB frame capture timed out")?;
-            let bytes = completed
-                .into_result()
-                .context("USB stream transfer failed")?;
             let stream = self.stream.as_mut().unwrap();
-            let request = stream
-                .pending
-                .pop_front()
-                .context("USB stream transfer queue exhausted")?;
-            match request.part {
-                Part::Leader => {
-                    ensure!(
-                        stream.frame.is_none(),
-                        "unexpected USB leader while receiving an image"
-                    );
-                    let mut frame = parse_leader(&bytes)?;
-                    frame.data.reserve(stream.expected);
-                    stream.frame = Some(frame);
-                }
-                Part::Payload => {
-                    let frame = stream
-                        .frame
-                        .as_mut()
-                        .context("USB payload arrived before image leader")?;
-                    let remaining = stream.expected - frame.data.len();
-                    let valid = remaining.min(request.size);
-                    ensure!(
-                        bytes.len() >= valid && bytes.len() <= request.size,
-                        "short USB image payload transfer"
-                    );
-                    frame.data.extend_from_slice(&bytes[..valid]);
-                }
-                Part::Trailer => {
-                    let frame = stream
-                        .frame
-                        .take()
-                        .context("USB trailer arrived before image leader")?;
-                    validate_trailer(&bytes, &frame, stream.expected)?;
-                    let schedule = stream.schedule.clone();
-                    stream.pending.extend(schedule.iter().copied());
-                    self.queue(&schedule);
-                    return Ok(frame);
-                }
+            if let Some(frame) =
+                stream.receive(&mut self.stream_in, completed.status, completed.buffer)?
+            {
+                return Ok(frame);
             }
         }
     }
@@ -694,6 +747,115 @@ mod tests {
         assert!(validate_trailer(&trailer, &frame, 8).is_err());
         leader[18] = 2;
         assert!(parse_leader(&leader).is_err());
+    }
+    /// Stands in for the stream endpoint: buffers wait in submission order.
+    #[derive(Default)]
+    struct Queue {
+        allocated: usize,
+        submitted: VecDeque<Buffer>,
+    }
+    impl Transfers for Queue {
+        fn allocate(&mut self, len: usize) -> Buffer {
+            self.allocated += 1;
+            Buffer::new(len)
+        }
+        fn submit(&mut self, buffer: Buffer) {
+            self.submitted.push_back(buffer);
+        }
+    }
+    impl Queue {
+        /// Complete the oldest transfer with `bytes` from the camera.
+        fn complete(&mut self, bytes: &[u8]) -> Buffer {
+            let mut buffer = self.submitted.pop_front().unwrap();
+            assert!(bytes.len() <= buffer.requested_len());
+            buffer.extend_from_slice(bytes);
+            buffer
+        }
+    }
+    fn leader(id: u64) -> Vec<u8> {
+        let mut leader = vec![0; 52];
+        leader[..4].copy_from_slice(&LEADER_MAGIC.to_le_bytes());
+        leader[6..8].copy_from_slice(&52u16.to_le_bytes());
+        leader[8..16].copy_from_slice(&id.to_le_bytes());
+        leader[18..20].copy_from_slice(&1u16.to_le_bytes());
+        leader[28..32].copy_from_slice(&crate::types::MONO8.to_le_bytes());
+        leader[32..36].copy_from_slice(&4u32.to_le_bytes());
+        leader[36..40].copy_from_slice(&2u32.to_le_bytes());
+        leader
+    }
+    fn trailer(id: u64) -> Vec<u8> {
+        let mut trailer = vec![0; 28];
+        trailer[..4].copy_from_slice(&TRAILER_MAGIC.to_le_bytes());
+        trailer[6..8].copy_from_slice(&28u16.to_le_bytes());
+        trailer[8..16].copy_from_slice(&id.to_le_bytes());
+        trailer[20..28].copy_from_slice(&8u64.to_le_bytes());
+        trailer
+    }
+    #[test]
+    fn streaming_resubmits_each_buffer_in_order_without_allocating() {
+        let request = |part, size| Request { part, size };
+        let schedule = vec![
+            request(Part::Leader, 64),
+            request(Part::Payload, 128),
+            request(Part::Trailer, 64),
+        ];
+        // The submitted buffers always match the pending requests one to
+        // one, as transfers complete in submission order.
+        let mirrored = |queue: &Queue, stream: &Stream| {
+            let submitted = queue.submitted.iter().map(Buffer::requested_len);
+            let pending = stream.pending.iter().map(|request| request.size);
+            submitted.eq(pending) && stream.pending.len() == 6
+        };
+        let mut queue = Queue::default();
+        let mut stream = Stream::new(8, schedule);
+        stream.queue(&mut queue);
+        stream.queue(&mut queue);
+        assert!(mirrored(&queue, &stream));
+        assert!(!stream.zero_copy, "Buffer::new copies");
+        for id in 1..=3 {
+            let parts = [leader(id), vec![id as u8; 8], trailer(id)];
+            for (index, bytes) in parts.iter().enumerate() {
+                let buffer = queue.complete(bytes);
+                let frame = stream.receive(&mut queue, Ok(()), buffer).unwrap();
+                assert_eq!(frame.is_some(), index == 2);
+                if let Some(frame) = frame {
+                    assert_eq!((frame.id, frame.data), (id, vec![id as u8; 8]));
+                }
+                assert!(mirrored(&queue, &stream));
+            }
+        }
+        // A failed transfer keeps its place, and the stream resumes with the
+        // next frame's leader.
+        let buffer = queue.complete(&[]);
+        assert!(
+            stream
+                .receive(&mut queue, Err(TransferError::Fault), buffer)
+                .is_err()
+        );
+        for bytes in [vec![4; 8], trailer(4)] {
+            let buffer = queue.complete(&bytes);
+            assert!(stream.receive(&mut queue, Ok(()), buffer).is_err());
+        }
+        for bytes in [leader(5), vec![5; 8]] {
+            let buffer = queue.complete(&bytes);
+            assert!(
+                stream
+                    .receive(&mut queue, Ok(()), buffer)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let buffer = queue.complete(&trailer(5));
+        assert_eq!(
+            stream
+                .receive(&mut queue, Ok(()), buffer)
+                .unwrap()
+                .unwrap()
+                .id,
+            5
+        );
+        assert!(mirrored(&queue, &stream));
+        assert_eq!(queue.allocated, 6);
     }
     #[test]
     fn malformed_packets_fail_without_panics() {

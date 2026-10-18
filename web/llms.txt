@@ -135,6 +135,9 @@ Durations and timestamp fractions must resolve to whole milliseconds.
 `1.001s` is valid; `1.1ms` fails.
 All scheduled frames must occur within 10 years.
 Keep the GUI, headless session or direct command active for the schedule lifetime.
+Scheduled frames are saved on their own thread, which holds at most two frames, so acquisition continues while they save.
+A job's `skipped` counts shots not taken because that thread was full; `retries` counts shots that failed because the storage ledger stayed busy or the disk timed out.
+Both are taken again at a later interval, so each one moves `next_at_ms` one interval later; Storage full and other save errors fail the job.
 
 `record` is an alias for `forward`.
 `record --duration 30s` keeps the CLI active and stops the encoder at the deadline or Ctrl-C.

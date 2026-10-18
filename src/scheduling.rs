@@ -12,6 +12,13 @@ pub struct CaptureJob {
     pub output: String,
     pub count: u32,
     pub captured: u32,
+    /// Shots not taken because the saver already held two frames.
+    #[serde(default)]
+    pub skipped: u32,
+    /// Shots that failed for a reason that may pass, such as a busy storage
+    /// ledger, and were taken again at a later interval.
+    #[serde(default)]
+    pub retries: u32,
     pub first_at_ms: u64,
     pub interval_ms: u64,
     pub next_at_ms: u64,

@@ -23,6 +23,7 @@ mod history;
 mod network_defaults;
 #[cfg(test)]
 mod network_tests;
+mod saver;
 use history::process;
 type Reply = Receiver<Result<Value>>;
 struct Envelope {
@@ -51,7 +52,8 @@ impl Counters {
 }
 #[derive(Clone)]
 pub struct WorkerHandle {
-    sender: SyncSender<Envelope>,
+    /// Commands for the camera thread; `None` only wakes it.
+    sender: SyncSender<Option<Envelope>>,
     state: Arc<RwLock<SessionSnapshot>>,
     counters: Arc<Counters>,
     frame: Arc<RwLock<Option<Frame>>>,
@@ -157,7 +159,7 @@ impl WorkerHandle {
         );
         let (reply, rx) = mpsc::channel();
         self.sender
-            .try_send(Envelope { command, reply })
+            .try_send(Some(Envelope { command, reply }))
             .context("camera command queue is full or closed")?;
         Ok(rx)
     }
@@ -168,10 +170,16 @@ impl WorkerHandle {
     }
     pub fn shutdown(&self) {
         self.quitting.store(true, Ordering::Relaxed);
+        self.wake();
         let thread = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(thread) = thread {
             let _ = thread.join();
         }
+    }
+    /// Have the camera thread look at its jobs and the quit flag now rather
+    /// than when its wait ends. A full queue wakes it anyway.
+    fn wake(&self) {
+        let _ = self.sender.try_send(None);
     }
     fn cancelled(&self) -> bool {
         self.quitting.load(Ordering::Relaxed)
@@ -252,6 +260,23 @@ impl WorkerHandle {
         let capacity = ring.capacity();
         drop(ring);
         self.note_ring(published, bytes, capacity);
+    }
+    /// Whether the ring holds back a frame it has yet to publish.
+    fn holding(&self) -> bool {
+        self.ring.as_ref().is_some_and(|ring| {
+            ring.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .held_bytes()
+                .is_some()
+        })
+    }
+    /// Whether an auto capture session is open; it may have embeddings to
+    /// finish while no frames arrive.
+    fn capturing(&self) -> bool {
+        self.capture_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
     /// Log a frame the ring could not take as it was, once while that keeps
     /// happening rather than for every frame.
@@ -358,6 +383,36 @@ fn refresh(h: &WorkerHandle, camera: &mut Option<Camera>, features: bool) {
         s.features = list;
     } else if camera.is_none() {
         s.features.clear();
+    }
+}
+/// Stopping unlocks what the camera locked while it streamed, the image
+/// geometry and often more: read again whether each feature last seen
+/// read-only is writable, without walking every feature.
+fn unlock_features(h: &WorkerHandle, camera: &mut Option<Camera>) {
+    let Some(c) = camera.as_mut() else {
+        return;
+    };
+    let names = h
+        .state
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .features
+        .iter()
+        .filter(|feature| !feature.writable)
+        .map(|feature| feature.name.clone())
+        .collect::<Vec<_>>();
+    let writable = names
+        .into_iter()
+        .map(|name| {
+            let writable = c.is_writable(&name);
+            (name, writable)
+        })
+        .collect::<Vec<_>>();
+    let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
+    for (name, writable) in writable {
+        if let Some(feature) = s.features.iter_mut().find(|f| f.name == name) {
+            feature.writable = writable;
+        }
     }
 }
 fn release_auto(
@@ -1055,6 +1110,8 @@ fn process_plain(
                 destination: resolved.destination.clone(),
                 count,
                 captured: 0,
+                skipped: 0,
+                retries: 0,
                 first_at_ms,
                 interval_ms,
                 next_at_ms: first_at_ms,
@@ -1075,6 +1132,7 @@ fn process_plain(
                 camera: label,
                 on_exists,
                 next: None,
+                saving: false,
             });
             trim_jobs(jobs);
             sync_jobs(h, jobs);
@@ -1140,6 +1198,7 @@ fn process_plain(
             let forward_result = stop_forward(h, forwarder, auto);
             let camera_result = camera_mut(camera)?.stop();
             refresh(h, camera, false);
+            unlock_features(h, camera);
             forward_result?;
             camera_result?;
             h.log("info", "Acquisition stopped".into());
@@ -1327,6 +1386,8 @@ struct Scheduled {
     on_exists: crate::naming::OnExists,
     /// The name picked for the frame being requested, with its clock time.
     next: Option<(PathBuf, chrono::DateTime<chrono::Local>)>,
+    /// A shot is with the saver; the next one waits for its outcome.
+    saving: bool,
 }
 impl Scheduled {
     /// Pick the next frame's name: a free one, inside the destination.
@@ -1349,6 +1410,39 @@ impl Scheduled {
             now,
             index: self.info.captured,
         }
+    }
+    /// This job's file for the frame being shot, at the name picked for it.
+    fn save(&self, path: PathBuf, now: chrono::DateTime<chrono::Local>) -> saver::Save {
+        saver::Save {
+            job: self.info.id,
+            path,
+            now,
+            index: self.info.captured,
+            camera: self.camera.clone(),
+            plan: self.plan.clone(),
+            on_exists: self.on_exists,
+            format: self.format.clone(),
+            resolved: self.resolved.clone(),
+            storage: self.storage.clone(),
+            context: self.info.context.clone(),
+        }
+    }
+    /// Schedule the next shot one interval after every shot so far: saved,
+    /// being saved, skipped or retried. A job that fell behind catches up.
+    fn advance(&mut self) {
+        let shots: u64 = [
+            self.info.captured,
+            self.info.skipped,
+            self.info.retries,
+            u32::from(self.saving),
+        ]
+        .into_iter()
+        .map(u64::from)
+        .sum();
+        self.info.next_at_ms = self
+            .info
+            .first_at_ms
+            .saturating_add(self.info.interval_ms.saturating_mul(shots));
     }
 }
 fn validate_capture(output: &str, count: u32, timeout_ms: u64, format: &str) -> Result<()> {
@@ -1542,11 +1636,13 @@ fn tick_jobs(
     auto: bool,
 ) {
     let now = crate::scheduling::now_ms();
-    for job in jobs.iter_mut().filter(|j| j.info.active()) {
+    let mut changed = false;
+    for job in jobs.iter_mut().filter(|j| j.info.active() && !j.saving) {
         if job.info.next_at_ms > now {
             continue;
         }
         if job.deadline.is_none() {
+            changed = true;
             let result = (|| -> Result<bool> {
                 let c = camera_mut(camera)?;
                 let stopped = !c.is_streaming();
@@ -1580,6 +1676,7 @@ fn tick_jobs(
                 .then(|| Instant::now() + (timeout / 2).min(Duration::from_secs(3)));
         }
         if job.deadline.is_some_and(|d| Instant::now() >= d) {
+            changed = true;
             job.info.status = "failed".into();
             job.info.error = Some("frame timeout".into());
             h.log(
@@ -1593,74 +1690,73 @@ fn tick_jobs(
             let _ = c.stop();
         }
         *started = false;
+        changed = true;
     }
+    if changed {
+        jobs_changed(h, camera, jobs);
+    }
+}
+/// Publish changed jobs. Scanners also read their features again, since a
+/// scan changes them.
+fn jobs_changed(h: &WorkerHandle, camera: &mut Option<Camera>, jobs: &mut Vec<Scheduled>) {
     trim_jobs(jobs);
     sync_jobs(h, jobs);
     let scanner = camera.as_ref().is_some_and(Camera::is_scanner);
     refresh(h, camera, scanner);
 }
-fn capture_jobs(h: &WorkerHandle, frame: &Frame, jobs: &mut [Scheduled], settled: bool) {
+/// Shoot the frame for every job due now: the saver encodes and writes its
+/// own copy. Without `room` the saver is full, and due jobs skip to their next
+/// interval instead of holding up acquisition.
+fn shoot(
+    h: &WorkerHandle,
+    frame: &Frame,
+    jobs: &mut [Scheduled],
+    settled: bool,
+    room: bool,
+) -> Option<saver::Shot> {
     let now = crate::scheduling::now_ms();
+    let mut saves = Vec::new();
+    let mut changed = false;
     for job in jobs.iter_mut().filter(|j| {
         j.info.active()
             && j.deadline.is_some()
             && j.info.next_at_ms <= now
             && (settled || j.warm.is_none_or(|w| Instant::now() >= w))
     }) {
-        let wall_ms = crate::scheduling::now_ms();
-        let saved = (|| {
-            let (first, now) = match job.next.take() {
-                Some(next) => next,
-                None => job.allocate(&h.names)?,
-            };
-            let bytes = crate::frame::encode(frame, &job.format)?;
-            crate::naming::save_named(
-                &h.names,
-                &job.plan,
-                &job.input(now),
-                job.on_exists,
-                first.clone(),
-                |path| {
-                    job.resolved.contain(path)?;
-                    crate::storage::save_bytes(&bytes, path, &job.storage)
-                },
-            )
-            .with_context(|| format!("save {}", first.display()))
-        })();
-        match saved {
-            Ok((path, stored)) => {
-                report_image(
-                    h,
-                    &job.resolved,
-                    &path,
-                    stored,
-                    frame,
-                    &job.format,
-                    wall_ms,
-                    Some(job.info.id),
-                    &job.info.context,
+        changed = true;
+        job.deadline = None;
+        job.warm = None;
+        let picked = job.next.take();
+        if !room {
+            job.info.skipped += 1;
+            job.info.status = "pending".into();
+            job.advance();
+            if job.info.skipped == 1 {
+                h.log(
+                    "warn",
+                    format!(
+                        "Capture job {} is skipping shots while earlier ones are still being saved",
+                        job.info.id
+                    ),
                 );
-                job.info.captured += 1;
-                job.info.last_file = Some(path.to_string_lossy().into_owned());
-                job.deadline = None;
-                job.warm = None;
-                if job.info.captured >= job.info.count {
-                    job.info.status = "complete".into();
-                    h.log(
-                        "info",
-                        format!(
-                            "Capture job {} complete: {} frame(s)",
-                            job.info.id, job.info.captured
-                        ),
-                    );
+            }
+            continue;
+        }
+        let named = match picked {
+            Some(picked) => Ok(picked),
+            None => job.allocate(&h.names),
+        };
+        match named {
+            Ok((path, at)) => {
+                saves.push(job.save(path, at));
+                job.saving = true;
+                job.advance();
+                job.info.status = if job.info.captured + 1 < job.info.count {
+                    "pending"
                 } else {
-                    job.info.status = "pending".into();
-                    job.info.next_at_ms = job.info.first_at_ms.saturating_add(
-                        job.info
-                            .interval_ms
-                            .saturating_mul(job.info.captured as u64),
-                    );
+                    "running"
                 }
+                .into();
             }
             Err(e) => {
                 job.info.status = "failed".into();
@@ -1672,7 +1768,87 @@ fn capture_jobs(h: &WorkerHandle, frame: &Frame, jobs: &mut [Scheduled], settled
             }
         }
     }
-    sync_jobs(h, jobs);
+    if changed {
+        sync_jobs(h, jobs);
+    }
+    (!saves.is_empty()).then(|| saver::Shot {
+        frame: frame.clone(),
+        wall_ms: now,
+        saves,
+    })
+}
+/// Apply the shots the saver finished to their jobs; whether any changed.
+fn saved(h: &WorkerHandle, jobs: &mut [Scheduled], saver: &saver::Saver) -> bool {
+    let mut changed = false;
+    loop {
+        match saver.saved.try_recv() {
+            Ok(saved) => {
+                if let Some(job) = jobs.iter_mut().find(|job| job.info.id == saved.job) {
+                    finish(h, job, saved.result);
+                    changed = true;
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => return changed,
+            // Its thread died, so no job can save another shot.
+            Err(mpsc::TryRecvError::Disconnected) => {
+                for job in jobs
+                    .iter_mut()
+                    .filter(|job| job.saving || job.info.active())
+                {
+                    finish(h, job, Err(anyhow::anyhow!("capture saver stopped")));
+                    changed = true;
+                }
+                return changed;
+            }
+        }
+    }
+}
+/// Record what became of a job's shot. A save that may work later is taken
+/// again at the job's next interval; any other failure stops the job.
+fn finish(h: &WorkerHandle, job: &mut Scheduled, result: Result<String>) {
+    job.saving = false;
+    let id = job.info.id;
+    match result {
+        Ok(path) => {
+            job.info.captured += 1;
+            job.info.last_file = Some(path);
+            if job.info.active() {
+                job.info.error = None;
+                if job.info.captured >= job.info.count {
+                    job.info.status = "complete".into();
+                    h.log(
+                        "info",
+                        format!("Capture job {id} complete: {} frame(s)", job.info.captured),
+                    );
+                }
+            }
+        }
+        Err(e) if !job.info.active() => h.log("error", format!("Capture job {id}: {e:#}")),
+        Err(e) if transient(&e) => {
+            job.info.retries += 1;
+            job.info.status = "pending".into();
+            job.info.error = Some(format!("{e:#}"));
+            h.log(
+                "warn",
+                format!("Capture job {id} retries at its next interval: {e:#}"),
+            );
+        }
+        Err(e) => {
+            job.info.status = "failed".into();
+            job.info.error = Some(format!("{e:#}"));
+            h.log("error", format!("Capture job {id} stopped: {e:#}"));
+        }
+    }
+}
+/// A failed save that may work later: the storage ledger stayed locked, or
+/// the disk, such as a network share, timed out.
+fn transient(error: &anyhow::Error) -> bool {
+    crate::storage::is_busy(error)
+        || error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
+        })
 }
 
 fn fail_scanner_jobs(h: &WorkerHandle, jobs: &mut [Scheduled], error: &anyhow::Error) {
@@ -1703,7 +1879,45 @@ fn output_path(output: &str, count: u32, index: u32, format: &str) -> PathBuf {
     }
 }
 
-fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
+/// The longest the camera thread waits while it receives no frames.
+/// Commands, saved shots and shutdown wake it sooner.
+const IDLE: Duration = Duration::from_secs(1);
+/// How often a frame the ring holds back, or a capture session's background
+/// work, is looked at while no frames arrive.
+const TICK: Duration = Duration::from_millis(100);
+/// How long the camera thread may wait for a command while it receives no
+/// frames: until the next job is due or a requested frame times out.
+fn idle_wait(h: &WorkerHandle, jobs: &[Scheduled]) -> Duration {
+    if h.holding() || h.capturing() {
+        return TICK;
+    }
+    let now = Instant::now();
+    let now_ms = crate::scheduling::now_ms();
+    jobs.iter()
+        .filter(|job| job.info.active() && !job.saving)
+        .map(|job| match job.deadline {
+            Some(deadline) => deadline.saturating_duration_since(now),
+            None => Duration::from_millis(job.info.next_at_ms.saturating_sub(now_ms)),
+        })
+        .fold(IDLE, Duration::min)
+}
+/// Publish the stream state and transport counters when they change, which
+/// for GigE is with every frame.
+fn sync_stream(h: &WorkerHandle, camera: &Option<Camera>) {
+    let streaming = camera.as_ref().is_some_and(Camera::is_streaming);
+    let transport = camera.as_ref().and_then(Camera::stats);
+    let current = {
+        let s = h.state.read().unwrap_or_else(|e| e.into_inner());
+        s.streaming == streaming && s.transport == transport
+    };
+    if !current {
+        let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
+        s.streaming = streaming;
+        s.transport = transport;
+    }
+}
+fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
+    let mut saver = saver::Saver::new(h.clone());
     let mut camera: Option<Camera> = None;
     let mut forwarder: Option<(Forwarder, f64)> = None;
     let mut auto: Option<AutoController> = None;
@@ -1722,9 +1936,9 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
         let envelope = if receiving {
             rx.try_recv().ok()
         } else {
-            rx.recv_timeout(Duration::from_millis(100)).ok()
+            rx.recv_timeout(idle_wait(&h, &jobs)).ok()
         };
-        if let Some(e) = envelope {
+        if let Some(e) = envelope.flatten() {
             let result = process(
                 &h,
                 &mut camera,
@@ -1743,6 +1957,9 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
             rate_count = 0;
             consecutive_errors = 0;
         }
+        if saved(&h, &mut jobs, &saver) {
+            jobs_changed(&h, &mut camera, &mut jobs);
+        }
         tick_jobs(
             &h,
             &mut camera,
@@ -1758,6 +1975,7 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
         }
         h.poll_capture();
         h.flush_ring();
+        sync_stream(&h, &camera);
         let scheduled_scan = jobs.iter().any(|j| j.info.active() && j.deadline.is_some());
         if let Some(c) = camera
             .as_mut()
@@ -1773,9 +1991,12 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
                         controller.observe(&frame, Instant::now());
                     }
                     let settled = auto.as_ref().is_none_or(AutoController::converged);
-                    capture_jobs(&h, &frame, &mut jobs, settled);
+                    // A scanned page is never skipped: it waits for room.
+                    let room = c.is_scanner() || saver.has_room();
+                    let shot = shoot(&h, &frame, &mut jobs, settled, room);
                     // Publish first: the forwarder then takes the sensor
-                    // buffer itself instead of a copy of it.
+                    // buffer itself instead of a copy of it, and the saver
+                    // works on its own copy.
                     let forward = forwarder.is_some();
                     if let (Some((f, _)), Some(frame)) =
                         (forwarder.as_mut(), h.record(frame, forward))
@@ -1783,6 +2004,9 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
                     {
                         h.log("error", format!("Forwarding stopped: {e:#}"));
                         let _ = stop_forward(&h, &mut forwarder, &mut auto);
+                    }
+                    if let Some(shot) = shot {
+                        saver.offer(shot);
                     }
                     rate_count += 1;
                     consecutive_errors = 0;
@@ -1849,6 +2073,7 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
             forget_lost(&h);
         }
     }
+    drop(saver);
     if let Some((mut f, _)) = forwarder {
         let _ = f.stop();
     }
@@ -2271,6 +2496,214 @@ mod tests {
         h.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }
+    /// A job armed for the next frame, saving two raw files into `dir`.
+    fn armed(id: u64, dir: &Path) -> Scheduled {
+        let output = dir
+            .join(format!("job{id}-{{frame}}.raw"))
+            .to_string_lossy()
+            .into_owned();
+        Scheduled {
+            info: crate::scheduling::CaptureJob {
+                id,
+                status: "running".into(),
+                output: output.clone(),
+                destination: None,
+                count: 2,
+                captured: 0,
+                skipped: 0,
+                retries: 0,
+                first_at_ms: 0,
+                interval_ms: 60_000,
+                next_at_ms: 0,
+                last_file: None,
+                error: None,
+                context: Default::default(),
+            },
+            resolved: crate::destination::resolve(None, &output).unwrap(),
+            plan: crate::naming::Plan::new(&output, 2, "raw"),
+            timeout_ms: 1000,
+            format: "raw".into(),
+            storage: Default::default(),
+            deadline: Some(Instant::now() + Duration::from_secs(10)),
+            warm: None,
+            camera: "camera".into(),
+            on_exists: Default::default(),
+            next: None,
+            saving: false,
+        }
+    }
+    fn small_frame(id: u64) -> Frame {
+        Frame {
+            id,
+            width: 8,
+            height: 8,
+            pixel_format: crate::types::MONO8,
+            timestamp_ns: id,
+            data: vec![id as u8; 64],
+        }
+    }
+    #[test]
+    fn slow_saves_hold_up_no_frames_and_the_saver_holds_two() {
+        fn slow(_: &WorkerHandle, _: &saver::Shot, save: &saver::Save) -> Result<String> {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(save.path.to_string_lossy().into_owned())
+        }
+        let writer = crate::shared_memory::SharedRing::create(&std::env::temp_dir(), 4096).unwrap();
+        let mut reader = writer.reader().unwrap();
+        let h = WorkerHandle::with_ring(Arc::new(Mutex::new(writer)));
+        let mut saver = saver::Saver::with(h.clone(), slow);
+        let dir = temp_dir("slow-saves");
+        let mut jobs = (1..=3).map(|id| armed(id, &dir)).collect::<Vec<_>>();
+        for job in &mut jobs[1..] {
+            job.deadline = None;
+        }
+        // A watching reader gets every frame.
+        assert!(reader.take_latest().unwrap().is_none());
+        for id in 1..=3u64 {
+            // Each frame finds one more job due.
+            let job = &mut jobs[id as usize - 1];
+            job.deadline
+                .get_or_insert(Instant::now() + Duration::from_secs(10));
+            let frame = small_frame(id);
+            let started = Instant::now();
+            let shot = shoot(&h, &frame, &mut jobs, true, saver.has_room());
+            h.record(frame, false);
+            if let Some(shot) = shot {
+                saver.offer(shot);
+            }
+            let took = started.elapsed();
+            assert!(took < Duration::from_millis(5), "frame {id} took {took:?}");
+            assert_eq!(reader.take_latest().unwrap().map(|f| f.id), Some(id));
+        }
+        // Two shots fill the saver; the third job skips to its next interval.
+        assert!(jobs[0].saving && jobs[1].saving && !jobs[2].saving);
+        assert_eq!(jobs[2].info.skipped, 1);
+        assert_eq!(jobs[2].info.status, "pending");
+        assert_eq!(jobs[2].info.next_at_ms, 60_000);
+        assert!(jobs[2].deadline.is_none());
+        let until = Instant::now() + Duration::from_secs(5);
+        while jobs.iter().any(|job| job.saving) && Instant::now() < until {
+            saved(&h, &mut jobs, &saver);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for job in &jobs[..2] {
+            assert_eq!(
+                (job.info.captured, job.info.status.as_str()),
+                (1, "pending")
+            );
+            assert!(
+                job.info
+                    .last_file
+                    .as_ref()
+                    .unwrap()
+                    .ends_with("-000001.raw")
+            );
+            assert_eq!(job.info.next_at_ms, 60_000);
+        }
+        drop(saver);
+        h.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn a_busy_ledger_retries_the_shot_and_other_failures_stop_the_job() {
+        let h = WorkerHandle::new();
+        let dir = temp_dir("retry");
+        let mut job = armed(1, &dir);
+        let shoot_once = |job: &mut Scheduled, result: Result<String>| {
+            job.saving = true;
+            job.advance();
+            finish(&h, job, result);
+        };
+        let busy = anyhow::Error::from(crate::storage::Busy).context("save shot.raw");
+        shoot_once(&mut job, Err(busy));
+        assert!(job.info.active() && !job.saving);
+        assert_eq!((job.info.retries, job.info.captured), (1, 0));
+        assert_eq!(job.info.status, "pending");
+        assert!(
+            job.info
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("storage manager is busy")
+        );
+        // The same frame number, one interval later.
+        assert_eq!(job.info.next_at_ms, 60_000);
+        assert_eq!(job.input(chrono::Local::now()).index, 0);
+        let slow_disk = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        shoot_once(
+            &mut job,
+            Err(anyhow::Error::from(slow_disk).context("save shot.raw")),
+        );
+        assert_eq!((job.info.retries, job.info.next_at_ms), (2, 120_000));
+        // A later save clears the error.
+        shoot_once(&mut job, Ok("shot.raw".into()));
+        assert_eq!((job.info.captured, job.info.error.as_deref()), (1, None));
+        assert_eq!(job.info.next_at_ms, 180_000);
+        // A path that mentions timeouts does not make a refusal transient.
+        let refused = anyhow::anyhow!("Permission denied").context("save /data/timeouts/a.raw");
+        shoot_once(&mut job, Err(refused));
+        assert_eq!(job.info.status, "failed");
+        let mut full = armed(2, &dir);
+        shoot_once(
+            &mut full,
+            Err(anyhow::anyhow!("Storage full: 10 GiB budget reached")),
+        );
+        assert_eq!(full.info.status, "failed");
+        assert!(
+            full.info
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("Storage full")
+        );
+        h.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn an_idle_worker_waits_for_its_next_job_or_a_second() {
+        let writer = crate::shared_memory::SharedRing::create(&std::env::temp_dir(), 4096).unwrap();
+        let h = WorkerHandle::with_ring(Arc::new(Mutex::new(writer)));
+        assert_eq!(idle_wait(&h, &[]), IDLE);
+        let dir = temp_dir("idle");
+        let mut job = armed(1, &dir);
+        job.deadline = None;
+        job.info.next_at_ms = crate::scheduling::now_ms() + 300;
+        let wait = idle_wait(&h, std::slice::from_ref(&job));
+        assert!(wait > Duration::from_millis(200) && wait <= Duration::from_millis(300));
+        // A requested frame times out sooner.
+        job.deadline = Some(Instant::now() + Duration::from_millis(50));
+        assert!(idle_wait(&h, std::slice::from_ref(&job)) <= Duration::from_millis(50));
+        // A job waiting for the saver is woken by it.
+        job.deadline = None;
+        job.saving = true;
+        job.info.next_at_ms = 0;
+        assert_eq!(idle_wait(&h, std::slice::from_ref(&job)), IDLE);
+        // A frame the ring holds back keeps the short tick, so it is
+        // published once a reader turns up.
+        h.record(small_frame(1), false);
+        h.record(small_frame(2), false);
+        assert_eq!(idle_wait(&h, &[]), TICK);
+        h.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn shutdown_wakes_an_idle_worker_at_once() {
+        let fastest = (0..3)
+            .map(|_| {
+                let h = WorkerHandle::new();
+                h.request(SessionCommand::Connect {
+                    camera: "sim:0".into(),
+                    timeout_ms: 100,
+                })
+                .unwrap();
+                let started = Instant::now();
+                h.shutdown();
+                started.elapsed()
+            })
+            .min()
+            .unwrap();
+        assert!(fastest < Duration::from_millis(30), "{fastest:?}");
+    }
     #[test]
     fn numbered_scanner_capture_uses_one_page() {
         let h = WorkerHandle::new();
@@ -2669,6 +3102,7 @@ mod tests {
             camera: "camera".into(),
             on_exists: Default::default(),
             next: None,
+            saving: false,
             info: crate::scheduling::CaptureJob {
                 id: 1,
                 status: "pending".into(),
@@ -2676,6 +3110,8 @@ mod tests {
                 destination: None,
                 count: 1,
                 captured: 0,
+                skipped: 0,
+                retries: 0,
                 first_at_ms: now,
                 interval_ms: 0,
                 next_at_ms: now,

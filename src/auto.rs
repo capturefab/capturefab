@@ -468,9 +468,11 @@ impl AutoController {
     pub fn tick(&mut self, camera: &mut Camera, now: Instant) -> bool {
         let stall = Duration::from_secs_f64(3.0 * self.period.unwrap_or(0.0))
             .max(Duration::from_millis(250));
-        if self
-            .last_tick
-            .is_some_and(|t| now.saturating_duration_since(t) > stall)
+        // A stopped camera is ticked rarely and has no measurements to spoil.
+        if self.streaming
+            && self
+                .last_tick
+                .is_some_and(|t| now.saturating_duration_since(t) > stall)
         {
             self.taint(now);
         }

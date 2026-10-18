@@ -59,6 +59,24 @@ pub fn discover(timeout: Duration, simulated: bool) -> Result<(Vec<CameraInfo>, 
     Ok((devices, warnings))
 }
 
+/// Features a camera cannot change while it streams: the image's geometry
+/// and format.
+pub fn stream_locked(name: &str) -> bool {
+    matches!(
+        name,
+        "Width"
+            | "Height"
+            | "OffsetX"
+            | "OffsetY"
+            | "PixelFormat"
+            | "BinningHorizontal"
+            | "BinningVertical"
+            | "DecimationHorizontal"
+            | "DecimationVertical"
+            | "VideoMode"
+    )
+}
+
 pub struct Camera {
     pub info: CameraInfo,
     backend: Box<dyn Backend>,

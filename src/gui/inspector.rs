@@ -3551,6 +3551,13 @@ impl Workbench {
             let status = job["status"].as_str().unwrap_or("unknown");
             let captured = job["captured"].as_u64().unwrap_or_default();
             let count = job["count"].as_u64().unwrap_or(1);
+            let mut progress = format!("{captured} / {count} frames");
+            for (field, label) in [("skipped", "skipped"), ("retries", "retried")] {
+                let n = job[field].as_u64().unwrap_or_default();
+                if n > 0 {
+                    progress.push_str(&format!(" · {n} {label}"));
+                }
+            }
             let mut card = column![
                 row![
                     text(format!("Job {id}"))
@@ -3570,9 +3577,7 @@ impl Workbench {
                 progress_bar(0.0..=1.0, captured as f32 / count.max(1) as f32)
                     .girth(4)
                     .style(style::progress),
-                text(format!("{captured} / {count} frames"))
-                    .size(style::CAPTION)
-                    .color(p.secondary),
+                text(progress).size(style::CAPTION).color(p.secondary),
                 text(job["output"].as_str().unwrap_or("").to_owned())
                     .size(style::CAPTION)
                     .font(style::MONO)
