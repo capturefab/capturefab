@@ -2803,13 +2803,13 @@ fn schema() -> Value {
     });
     contract["forwarding"] = json!({"cli":"record|forward -o OUTPUT [--duration 30s] [--on-exists fail|number] [--context KEY=VALUE]...; a local file output accepts the capture placeholders","duration":"Works with direct workers and persistent sessions. A duration keeps the CLI alive and stops the encoder at the deadline or Ctrl-C. Without duration, persistent session forwarding returns immediately; direct forwarding runs until Ctrl-C.","request_timeout":"--request-timeout controls a session request deadline, not recording duration; a timed-out request may still complete in the session. Inspect status before retrying writes."});
     contract["forwarding"]["timeline"] = json!(
-        "Each new frame goes to FFmpeg once, stamped when FFmpeg reads it; the output repeats or drops frames to keep --fps constant, so a recording lasts as long as it ran"
+        "Each new frame goes to FFmpeg once, at most --fps a second, and keeps the time FFmpeg read it, so a recording lasts as long as it ran and a camera stall leaves a gap; streams repeat the last frame at --fps while the camera stalls. A recording whose encoder fails or must be stopped keeps the video it wrote"
     );
     contract["forwarding"]["encoders"] = json!(
-        "auto probes encoders at the frame size and remembers results for the FFmpeg build until reboot; an auto encoder that exits in the first seconds of a local recording is replaced once by the next in a new file; a codec with no working encoder fails before recording with unsupported (exit 5) and names the working codecs"
+        "auto probes encoders at the frame size and remembers working ones for the FFmpeg build until reboot, failures for 5 minutes and timed-out probes not at all; an auto encoder that exits in the first seconds of a local recording, before writing video, is replaced once by the next in a new file; a codec with no working encoder fails before recording with unsupported (exit 5) and names the working codecs"
     );
     contract["forwarding"]["sources"] = json!(
-        "Network streams reconnect after FFmpeg exits, backing off from 1 s to 30 s; frame waits meanwhile time out (exit 4), and five refusals in a row (rejected credentials, missing path) stop acquisition. Video files play at their frame rate unless PlaybackSpeed=Fastest and stop with 'Video file finished'."
+        "Network streams reconnect after FFmpeg exits, backing off from 1 s to 30 s until the stream stays up for 10 s; frame waits meanwhile time out (exit 4), and five credential rejections (401/403) in a row stop acquisition, while a missing path (404) keeps being retried. Local video files play at their frame rate in live view and recordings unless PlaybackSpeed=Fastest, and captures that start acquisition read them as fast as they ask. Local files and http(s) URLs naming a video file stop with 'Video file finished'."
     );
     contract["remote"] = json!({
         "start":"serve --listen HOST:PORT [--web-dir web-client/dist]",

@@ -313,9 +313,13 @@ fn timed_out(e: &anyhow::Error) -> bool {
     message.contains("timeout") || message.contains("timed out")
 }
 /// A media stream came back after a reconnect: say so, and retire the
-/// reconnecting error unless a newer error replaced it.
+/// reconnecting error.
 fn resumed(h: &WorkerHandle) {
     h.log("info", "Stream resumed".into());
+    forget_lost(h);
+}
+/// Retire the reconnecting error unless a newer error replaced it.
+fn forget_lost(h: &WorkerHandle) {
     let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
     if s.last_error
         .as_deref()
@@ -1745,6 +1749,9 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
                 rate_epoch = Instant::now();
                 rate_count = 0;
             }
+        } else if std::mem::take(&mut reconnecting) {
+            // Stopped or disconnected while the stream was being reopened.
+            forget_lost(&h);
         }
     }
     if let Some((mut f, _)) = forwarder {
@@ -2724,5 +2731,105 @@ mod tests {
         assert!(snapshot.frames >= 29, "{}", snapshot.frames);
         h.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A worker whose network stream drops, returns, drops again and is
+    /// stopped while reconnecting, with a stand-in FFmpeg in a child process.
+    #[test]
+    #[cfg(unix)]
+    fn a_lost_stream_resumes_and_stopping_ends_its_reconnecting() {
+        const TEST: &str = "a_lost_stream_resumes_and_stopping_ends_its_reconnecting";
+        if std::env::var_os("CAPTUREFAB_RECONNECT_TEST").is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir().join(format!(
+                "capturefab-engine-reconnect-{}-{}",
+                std::process::id(),
+                crate::scheduling::now_ms()
+            ));
+            let session = dir.join("session");
+            crate::ipc::ensure_private_dir(&session).unwrap();
+            // Two launches that end after half a second, then a steady one.
+            let ffmpeg = dir.join("ffmpeg");
+            let script = r#"case "$*" in *rtsp*) ;; *) exit 0 ;; esac
+n=$(($(cat "$dir/launches" 2>/dev/null || echo 0) + 1)); echo $n > "$dir/launches"
+frame() { printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; }
+case $n in
+1|2) for i in 1 2 3 4 5 6 7 8 9 10; do frame; sleep 0.05; done ;;
+*) while frame; do sleep 0.05; done ;;
+esac"#;
+            std::fs::write(
+                &ffmpeg,
+                format!("#!/bin/sh\ndir='{}'\n{script}\n", dir.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &format!("engine::tests::{TEST}"), "--nocapture"])
+                .env("CAPTUREFAB_RECONNECT_TEST", "1")
+                .env("CAPTUREFAB_FFMPEG", &ffmpeg)
+                .env("CAPTUREFAB_SESSION_DIR", &session)
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let h = WorkerHandle::new();
+        let said = |text: &str| {
+            h.snapshot()
+                .logs
+                .iter()
+                .filter(|log| log.message.contains(text))
+                .count()
+        };
+        let wait = |what: &str, done: &dyn Fn() -> bool| {
+            let started = Instant::now();
+            while !done() {
+                assert!(started.elapsed() < Duration::from_secs(10), "{what}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        h.request(SessionCommand::Connect {
+            camera: "rtsp://user:secret@127.0.0.1:9/live".into(),
+            timeout_ms: 2000,
+        })
+        .unwrap();
+        h.request(SessionCommand::Start).unwrap();
+        wait("first loss", &|| said("Stream lost") == 1);
+        let error = h.snapshot().last_error.unwrap();
+        assert!(
+            error.starts_with(
+                "Stream lost; reconnecting to rtsp://<redacted>@127.0.0.1:9/live (attempt 1): timed out"
+            ),
+            "{error}"
+        );
+        assert!(h.snapshot().streaming);
+        wait("resume", &|| said("Stream resumed") == 1);
+        assert_eq!(h.snapshot().last_error, None);
+        // It drops again before settling: reported again, backing off longer.
+        wait("second loss", &|| said("Stream lost") == 2);
+        let error = h.snapshot().last_error.unwrap();
+        assert!(error.contains("(attempt 2): timed out"), "{error}");
+        // Stopping meanwhile ends the outage without a resume.
+        h.request(SessionCommand::Stop).unwrap();
+        wait("outage ended", &|| h.snapshot().last_error.is_none());
+        h.request(SessionCommand::Start).unwrap();
+        let frames = h.snapshot().frames;
+        wait("frames", &|| h.snapshot().frames > frames + 5);
+        assert_eq!(said("Stream resumed"), 1);
+        assert_eq!(said("Stream lost"), 2);
+        assert_eq!(said("repeated transport errors"), 0);
+        assert!(
+            h.snapshot()
+                .logs
+                .iter()
+                .all(|log| !log.message.contains("secret"))
+        );
+        h.shutdown();
     }
 }

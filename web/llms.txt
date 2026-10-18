@@ -134,10 +134,10 @@ Without a duration, a session command returns immediately and records until `sto
 A direct recording command stays active until Ctrl-C.
 `stop-forward` returns final `stats`: `accepted`, `written`, `dropped`, `late`, `stalled`, `encoder`, `error`; `record --duration` adds them as `stopped`.
 `late` counts frames lost while the encoder was busy; `stalled` means no new camera frame for 2 s.
-Recordings keep wall-clock time, so a file lasts as long as its recording.
+Recordings keep wall-clock time, so a file lasts as long as its recording and a camera stall leaves a gap.
 H.265 or AV1 without a working hardware encoder fails before recording with exit 5 and names the working codecs.
-Network stream sources reconnect by themselves, backing off from 1 s to 30 s; frame waits meanwhile time out (exit 4).
-Video file sources play at their frame rate; set `PlaybackSpeed=Fastest` to decode every frame as fast as possible.
+Network stream sources reconnect by themselves, backing off from 1 s to 30 s; frame waits meanwhile time out (exit 4). Only repeated credential rejections stop them.
+Video file sources play at their frame rate in live view; captures that start acquisition read them as fast as they ask; `PlaybackSpeed=Fastest` decodes every frame as fast as possible.
 
 Saved destinations include folders, external drives, network folders, S3-compatible buckets, FTP/FTPS servers and SFTP servers.
 Use `destination list --json`, `volumes --json` and `uploads --json` to inspect them.
