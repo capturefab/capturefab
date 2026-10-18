@@ -434,8 +434,9 @@ fn usb_check(cameras: &[UsbCamera]) -> Option<Check> {
             "No read/write access to USB3 Vision camera {}.",
             names.join(", ")
         ),
+        // The note is a shell comment, so the whole line still pastes and runs.
         format!(
-            "{} && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb; services also need their user in the plugdev group ({LINE_COMPUTER})",
+            "{} && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb  # services also need their user in the plugdev group; see {LINE_COMPUTER}",
             rules.join(" && ")
         ),
     ))
@@ -1003,7 +1004,23 @@ mod tests {
         assert_eq!(fix.matches("idVendor").count(), 1, "{fix}");
         assert!(fix.contains(r#"ATTR{idVendor}=="2676""#), "{fix}");
         assert!(fix.contains("udevadm trigger"), "{fix}");
-        assert!(fix.ends_with("plugdev group (https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md)"), "{fix}");
+        assert!(
+            fix.ends_with("  # services also need their user in the plugdev group; see https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md"),
+            "{fix}"
+        );
+        // Pasted into a shell, it parses as commands; `sh -n` reads without running.
+        #[cfg(unix)]
+        {
+            let parsed = std::process::Command::new("sh")
+                .args(["-n", "-c", &fix])
+                .output()
+                .unwrap();
+            assert!(
+                parsed.status.success(),
+                "{fix}: {}",
+                String::from_utf8_lossy(&parsed.stderr)
+            );
+        }
         // Each vendor gets its own file, so fixing a camera plugged in later
         // keeps the rule that already gives this one access.
         let other = UsbCamera {
