@@ -93,6 +93,75 @@ fn bundle_dinov2() {
     }
 }
 
+/// The `embedded-web` feature builds the browser client into the executable,
+/// so `serve --listen` needs no --web-dir: every file of `CAPTUREFAB_WEB_DIST`
+/// (release builds set it), or else of web-client/dist when it has been
+/// built. Without the feature, or a built client, the table is empty.
+fn embed_web(out: &std::path::Path) {
+    println!("cargo:rerun-if-env-changed=CAPTUREFAB_WEB_DIST");
+    let mut files = Vec::new();
+    if env::var_os("CARGO_FEATURE_EMBEDDED_WEB").is_some() {
+        let explicit = env::var_os("CAPTUREFAB_WEB_DIST").map(PathBuf::from);
+        let dist = explicit.clone().unwrap_or_else(|| {
+            PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory"))
+                .join("web-client/dist")
+        });
+        println!("cargo:rerun-if-changed={}", dist.display());
+        let built = ["index.html", "capturefab_web_bg.wasm"]
+            .iter()
+            .all(|name| dist.join(name).is_file());
+        if built {
+            // include_bytes! needs absolute paths.
+            let dist = dist
+                .canonicalize()
+                .expect("resolve the browser client folder");
+            web_files(&dist, &dist, &mut files);
+            files.sort();
+        } else if explicit.is_some() {
+            panic!(
+                "CAPTUREFAB_WEB_DIST {} has no built browser client; run web-client/build.sh",
+                dist.display()
+            );
+        } else if env::var("PROFILE").is_ok_and(|p| p == "release") {
+            println!(
+                "cargo:warning=embedded-web found no browser client in {}; run web-client/build.sh",
+                dist.display()
+            );
+        }
+    }
+    let entries: String = files
+        .iter()
+        .map(|(name, path)| {
+            println!("cargo:rerun-if-changed={}", path.display());
+            format!(
+                "({name:?}, include_bytes!({:?})),",
+                path.display().to_string()
+            )
+        })
+        .collect();
+    fs::write(out.join("web-assets.rs"), format!("&[{entries}]"))
+        .expect("write embedded web assets");
+}
+
+/// Files under `dir`, named by their path inside `root` with `/` separators.
+fn web_files(root: &std::path::Path, dir: &std::path::Path, files: &mut Vec<(String, PathBuf)>) {
+    for entry in fs::read_dir(dir).expect("read the browser client folder") {
+        let path = entry.expect("read the browser client folder").path();
+        if path.is_dir() {
+            web_files(root, &path, files);
+        } else if path.is_file() {
+            let name = path
+                .strip_prefix(root)
+                .expect("inside the browser client folder")
+                .components()
+                .map(|part| part.as_os_str().to_str().expect("UTF-8 web asset name"))
+                .collect::<Vec<_>>()
+                .join("/");
+            files.push((name, path));
+        }
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=CAPTUREFAB_FFMPEG_BINARY");
     println!("cargo:rerun-if-env-changed=CAPTUREFAB_FFMPEG_LICENSE");
@@ -108,6 +177,7 @@ fn main() {
         println!("cargo:rustc-link-arg-bin=capturefab={}", resource.display());
     }
     build_macos_scanner(&out, &target);
+    embed_web(&out);
     if env::var_os("CARGO_FEATURE_DINOV2").is_some() {
         bundle_dinov2();
     }

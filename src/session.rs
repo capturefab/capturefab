@@ -880,12 +880,15 @@ type Reply = Receiver<Result<Value>>;
 struct Feed {
     counters: RingCounters,
     frames: Mutex<FrameFeed>,
+    /// The worker process writing the ring; frame ids start over in a new one.
+    worker: u32,
 }
 impl Feed {
-    fn new(ring: SharedRing) -> Self {
+    fn new(ring: SharedRing, worker: u32) -> Self {
         Self {
             counters: ring.counters(),
             frames: Mutex::new(FrameFeed { ring, latest: None }),
+            worker,
         }
     }
 }
@@ -1019,11 +1022,12 @@ impl Process {
         ring.passed();
         let input = child.stdin.take().context("worker stdin")?;
         let output = BufReader::new(child.stdout.take().context("worker stdout")?);
+        let feed = Arc::new(Feed::new(ring, child.id()));
         Ok(Self {
             child,
             input,
             output,
-            feed: Arc::new(Feed::new(ring)),
+            feed,
             snapshot: SessionSnapshot::default(),
             saved: Vec::new(),
             saved_camera: None,
@@ -1438,8 +1442,14 @@ impl SessionHandle {
     /// first poll may return a keep-alive frame up to a second old (see
     /// `shared_memory`).
     pub fn latest_frame_for(&self, id: &str) -> Option<Arc<Frame>> {
+        Some(self.latest_frame_from(id)?.1)
+    }
+    /// `latest_frame_for` with the pid of the worker that sent it, which
+    /// together with the frame's id names one frame.
+    pub fn latest_frame_from(&self, id: &str) -> Option<(u32, Arc<Frame>)> {
         let feed = self.feed(id)?;
-        locked(&feed.frames).poll(true)
+        let frame = locked(&feed.frames).poll(true)?;
+        Some((feed.worker, frame))
     }
     /// When the frame a camera's feed last returned is a downscaled preview
     /// of a frame larger than its ring, the width, height and pixel format
@@ -2381,12 +2391,10 @@ impl SessionHandle {
     pub(crate) fn fed(capacity: usize) -> (Self, SharedRing) {
         let writer = SharedRing::create(&std::env::temp_dir(), capacity).unwrap();
         let handle = Self::new();
-        handle
-            .inner
-            .feeds
-            .write()
-            .unwrap()
-            .insert("cam".into(), Arc::new(Feed::new(writer.reader().unwrap())));
+        handle.inner.feeds.write().unwrap().insert(
+            "cam".into(),
+            Arc::new(Feed::new(writer.reader().unwrap(), 0)),
+        );
         handle.inner.state.write().unwrap().active_camera = Some("cam".into());
         (handle, writer)
     }

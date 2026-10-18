@@ -6,18 +6,19 @@
 //! socket deadlines, body limit, and connection limit bound untrusted clients
 //! without introducing a second asynchronous runtime into the camera process.
 use crate::session::{ActivityOrigin, ActorKind, SessionActor, SessionCommand, SessionHandle};
+use crate::types::Frame;
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs,
     io::{Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream},
     path::{Component, Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::RecvTimeoutError,
     },
     thread::{self, JoinHandle},
@@ -32,7 +33,52 @@ const MAX_BODY: usize = 1024 * 1024;
 const MAX_ASSET: u64 = 64 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
+// Out of descriptors and similar accept failures repeat at once; pause instead of spinning.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+// One cached preview per camera worker and format; a viewer of a camera
+// beyond this re-encodes as before.
+const PREVIEW_SLOTS: usize = 16;
+/// The source build's client, relative to the working directory.
+const DEFAULT_WEB_DIR: &str = "web-client/dist";
+
+/// Browser client files built into the executable by the `embedded-web`
+/// feature (see build.rs), by path inside the web root; empty without it.
+static EMBEDDED: &[(&str, &[u8])] = include!(concat!(env!("OUT_DIR"), "/web-assets.rs"));
+
+/// Where the browser client is served from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WebRoot {
+    /// A built web-client folder, canonicalized.
+    Folder(PathBuf),
+    /// Files built into the executable.
+    Embedded(&'static [(&'static str, &'static [u8])]),
+}
+
+/// Whether this executable carries the browser client.
+pub fn embedded() -> bool {
+    !EMBEDDED.is_empty()
+}
+
+/// The browser client to serve: `--web-dir` when given, otherwise the copy
+/// built into the executable, a `web` folder beside the executable, then
+/// the source build's `web-client/dist` in the working directory.
+pub fn web_root(web_dir: Option<&Path>) -> Result<WebRoot> {
+    if let Some(dir) = web_dir {
+        return validate_web_root(dir).map(WebRoot::Folder);
+    }
+    if embedded() {
+        return Ok(WebRoot::Embedded(EMBEDDED));
+    }
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join("web")));
+    if let Some(root) = beside.and_then(|dir| validate_web_root(&dir).ok()) {
+        return Ok(WebRoot::Folder(root));
+    }
+    validate_web_root(Path::new(DEFAULT_WEB_DIR))
+        .map(WebRoot::Folder)
+        .context("this executable has no browser client built in or in a web folder beside it; pass --web-dir")
+}
 
 /// Fail early if the browser build is absent or links outside the asset root.
 pub fn validate_web_root(root: &Path) -> Result<PathBuf> {
@@ -56,7 +102,8 @@ pub fn validate_web_root(root: &Path) -> Result<PathBuf> {
 }
 
 /// Owns the listener and its bounded connection handlers. Dropping it stops
-/// accepting requests and interrupts command waits; the session is independent.
+/// accepting requests and interrupts command waits; activity waits end when
+/// the session stops, which is independent.
 pub struct Server {
     address: SocketAddr,
     quitting: Arc<AtomicBool>,
@@ -65,86 +112,86 @@ pub struct Server {
 
 struct Service {
     handle: SessionHandle,
-    web_root: PathBuf,
+    web_root: WebRoot,
     quitting: Arc<AtomicBool>,
     activity_waits: Arc<AtomicUsize>,
+    previews: Previews,
 }
 
 impl Server {
     /// Bind an explicit address. The CLI opts in with `--listen`; publishing on
     /// a tailnet uses the server's Tailscale address or a local HTTPS proxy.
-    pub fn start(handle: SessionHandle, address: SocketAddr, web_root: PathBuf) -> Result<Self> {
-        let web_root = validate_web_root(&web_root)?;
+    pub fn start(handle: SessionHandle, address: SocketAddr, web_root: WebRoot) -> Result<Self> {
         let listener = TcpListener::bind(address).context("bind remote HTTP listener")?;
         let address = listener.local_addr()?;
-        listener.set_nonblocking(true)?;
         let quitting = Arc::new(AtomicBool::new(false));
         let service = Arc::new(Service {
             handle,
             web_root,
             quitting: quitting.clone(),
             activity_waits: Arc::new(AtomicUsize::new(0)),
+            previews: Previews::default(),
         });
         let active = Arc::new(AtomicUsize::new(0));
+        // Accept blocks instead of polling; Drop wakes it with a loopback connect.
+        // Client handlers use blocking I/O with deadlines so partial reads and
+        // backpressure cannot truncate requests or responses.
         let server_thread = thread::Builder::new()
             .name("capturefab-http".into())
             .spawn(move || {
                 let mut clients = Vec::<JoinHandle<()>>::new();
-                while !service.quitting.load(Ordering::Acquire) {
-                    let mut remaining = Vec::with_capacity(clients.len());
-                    for client in clients.drain(..) {
-                        if client.is_finished() {
-                            let _ = client.join();
-                        } else {
-                            remaining.push(client);
-                        }
+                for stream in listener.incoming() {
+                    if service.quitting.load(Ordering::Acquire) {
+                        break;
                     }
-                    clients = remaining;
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            // Accepted sockets inherit nonblocking mode on
-                            // macOS. Client handlers use blocking I/O with
-                            // deadlines so partial reads and backpressure
-                            // cannot truncate requests or responses.
-                            if stream.set_nonblocking(false).is_err() {
-                                continue;
-                            }
-                            if active.load(Ordering::Acquire) >= MAX_CONNECTIONS {
-                                let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
-                                let _ = write_response(
-                                    &mut stream,
-                                    error(503, "remote server is busy; retry shortly"),
-                                    false,
-                                );
-                                continue;
-                            }
-                            active.fetch_add(1, Ordering::AcqRel);
-                            let service = service.clone();
-                            let count = active.clone();
-                            match thread::Builder::new()
-                                .name("capturefab-http-client".into())
-                                .spawn(move || {
-                                    let _guard = ConnectionGuard(count);
-                                    let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
-                                    let _ = stream.set_nodelay(true);
-                                    let request = read_request(&mut stream);
-                                    let head = request.as_ref().is_ok_and(|r| r.method == "HEAD");
-                                    let response = match request {
-                                        Ok(request) => service.respond(request),
-                                        Err((status, message)) => error(status, message),
-                                    };
-                                    let _ = write_response(&mut stream, response, head);
-                                }) {
-                                Ok(client) => clients.push(client),
-                                Err(_) => {
-                                    active.fetch_sub(1, Ordering::AcqRel);
-                                }
-                            }
+                    clients.retain(|client| !client.is_finished());
+                    let mut stream = match stream {
+                        Ok(stream) => stream,
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::Interrupted
+                            ) =>
+                        {
+                            continue;
                         }
-                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::park_timeout(POLL_INTERVAL);
+                        Err(_) => {
+                            thread::sleep(ACCEPT_RETRY);
+                            continue;
                         }
-                        Err(_) => thread::park_timeout(POLL_INTERVAL),
+                    };
+                    if active.load(Ordering::Acquire) >= MAX_CONNECTIONS {
+                        let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+                        let _ = write_response(
+                            &mut stream,
+                            error(503, "remote server is busy; retry shortly"),
+                            false,
+                        );
+                        continue;
+                    }
+                    active.fetch_add(1, Ordering::AcqRel);
+                    let service = service.clone();
+                    let count = active.clone();
+                    match thread::Builder::new()
+                        .name("capturefab-http-client".into())
+                        .spawn(move || {
+                            let _guard = ConnectionGuard(count);
+                            let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
+                            let _ = stream.set_nodelay(true);
+                            let request = read_request(&mut stream);
+                            let head = request.as_ref().is_ok_and(|r| r.method == "HEAD");
+                            let response = match request {
+                                Ok(request) => service.respond(request),
+                                Err((status, message)) => error(status, message),
+                            };
+                            let _ = write_response(&mut stream, response, head);
+                        }) {
+                        Ok(client) => clients.push(client),
+                        Err(_) => {
+                            active.fetch_sub(1, Ordering::AcqRel);
+                        }
                     }
                 }
                 for client in clients {
@@ -168,10 +215,26 @@ impl Drop for Server {
     fn drop(&mut self) {
         self.quitting.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
-            thread.thread().unpark();
-            let _ = thread.join();
+            // Unblock accept(). If even a loopback connect fails, detach rather
+            // than risk joining a thread that can never wake.
+            if TcpStream::connect_timeout(&wake_address(self.address), Duration::from_secs(1))
+                .is_ok()
+            {
+                let _ = thread.join();
+            }
         }
     }
+}
+
+/// An address that reaches the listener from this host: loopback of the
+/// same family when it listens on every interface.
+fn wake_address(address: SocketAddr) -> SocketAddr {
+    let ip = match address.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    SocketAddr::new(ip, address.port())
 }
 
 struct ConnectionGuard(Arc<AtomicUsize>);
@@ -449,7 +512,10 @@ impl Service {
                     Ok(quota) => success(quota),
                     Err(err) => error(500, format!("{err:#}")),
                 },
-                ("GET", "/api/preview") => self.preview(query),
+                ("GET", "/api/preview") => self.preview(
+                    query,
+                    request.headers.get("if-none-match").map(String::as_str),
+                ),
                 ("GET" | "HEAD", "/api/signals") => match signals_query(query) {
                     Ok(history) => {
                         let signals = self.handle.signals();
@@ -621,31 +687,27 @@ impl Service {
         if previous >= MAX_ACTIVITY_WAITS {
             return error(503, "too many activity watchers; retry shortly");
         }
-        let deadline = Instant::now() + timeout;
-        while self.handle.activity_revision() == after && Instant::now() < deadline {
-            if self.quitting.load(Ordering::Acquire) {
-                return error(503, "remote server is stopping");
-            }
-            self.handle.wait_for_activity(
-                after,
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_millis(100)),
-            );
+        if self.quitting.load(Ordering::Acquire) {
+            return error(503, "remote server is stopping");
         }
+        // Wakes on a change, or when the session stops.
+        self.handle.wait_for_activity(after, timeout);
         success(self.handle.activity())
     }
 
-    fn preview(&self, query: &str) -> Response {
-        let camera = match camera_query(query) {
-            Ok(camera) => camera,
+    /// The newest frame as a bounded display image. Every client shares one
+    /// encode per frame and format, and a client that already has the frame
+    /// gets 304 with no encode at all.
+    fn preview(&self, query: &str, if_none_match: Option<&str>) -> Response {
+        let (camera, format) = match preview_query(query) {
+            Ok(query) => query,
             Err(message) => return error(400, message),
         };
         let camera = camera.or_else(|| self.handle.active_camera());
         let frame = camera
             .as_deref()
-            .and_then(|camera| self.handle.latest_frame_for(camera));
-        let (Some(camera), Some(frame)) = (camera, frame) else {
+            .and_then(|camera| self.handle.latest_frame_from(camera));
+        let (Some(camera), Some((worker, frame))) = (camera, frame) else {
             return Response::new(204, "image/png", Vec::new());
         };
         // A frame larger than the camera's ring arrives downscaled; the
@@ -655,26 +717,26 @@ impl Service {
             frame.height,
             frame.pixel_format,
         ));
-        let (width, height, rgba) = match crate::frame::preview_rgba(&frame, 1280, 720) {
-            Ok(image) => image,
-            Err(err) => return error(422, format!("preview unavailable: {err:#}")),
+        let key = PreviewKey {
+            worker,
+            frame: frame.id,
+            timestamp_ns: frame.timestamp_ns,
+            format: format.served(),
         };
-        let mut data = Vec::new();
-        let encoded = (|| -> Result<()> {
-            let mut encoder = png::Encoder::new(&mut data, width, height);
-            encoder.set_color(png::ColorType::Rgba);
-            encoder.set_depth(png::BitDepth::Eight);
-            encoder.set_compression(png::Compression::Fast);
-            let mut writer = encoder.write_header()?;
-            writer.write_image_data(&rgba)?;
-            writer.finish()?;
-            Ok(())
-        })();
-        if let Err(err) = encoded {
-            return error(500, format!("could not encode preview: {err:#}"));
-        }
-        let mut response = Response::new(200, "image/png", data);
+        let etag = key.etag();
+        let mut response = if if_none_match.is_some_and(|tags| etag_matches(tags, &etag)) {
+            Response::new(304, key.format.content_type(), Vec::new())
+        } else {
+            match self
+                .previews
+                .get(key, || encode_preview(&frame, key.format))
+            {
+                Ok(body) => Response::new(200, key.format.content_type(), body),
+                Err(response) => return response,
+            }
+        };
         response.headers.extend([
+            ("ETag", etag),
             ("X-Frame-Id", frame.id.to_string()),
             ("X-Frame-Timestamp-Ns", frame.timestamp_ns.to_string()),
             ("X-Frame-Width", frame_width.to_string()),
@@ -684,7 +746,21 @@ impl Service {
     }
 
     fn asset(&self, encoded_path: &str) -> Response {
-        let path = match asset_path(&self.web_root, encoded_path) {
+        let root = match &self.web_root {
+            WebRoot::Folder(root) => root,
+            WebRoot::Embedded(files) => {
+                return match asset_name(encoded_path) {
+                    Ok(name) => match files.iter().find(|(file, _)| *file == name) {
+                        Some((_, data)) => {
+                            Response::new(200, asset_type(Path::new(&name)), data.to_vec())
+                        }
+                        None => error(404, "web asset not found"),
+                    },
+                    Err((status, message)) => error(status, message),
+                };
+            }
+        };
+        let path = match asset_path(root, encoded_path) {
             Ok(path) => path,
             Err((status, message)) => return error(status, message),
         };
@@ -750,19 +826,175 @@ fn analytics_width(query: &str) -> std::result::Result<Option<u32>, String> {
         .map_err(|_| "analytics width is too large".into())
 }
 
-fn camera_query(query: &str) -> std::result::Result<Option<String>, String> {
-    if query.is_empty() {
-        return Ok(None);
+/// `/api/preview` accepts one optional `camera` selector and one optional
+/// `format`, in either order.
+fn preview_query(query: &str) -> std::result::Result<(Option<String>, PreviewFormat), String> {
+    let mut camera = None;
+    let mut format = None;
+    if !query.is_empty() {
+        for field in query.split('&') {
+            let (name, value) = field
+                .split_once('=')
+                .ok_or("preview query requires key=value")?;
+            match name {
+                "camera" if camera.is_none() => {
+                    let selector = percent_decode(value)?;
+                    crate::session::validate_selector(&selector)
+                        .map_err(|err| format!("{err:#}"))?;
+                    camera = Some(selector);
+                }
+                "format" if format.is_none() => {
+                    format = Some(match value {
+                        "png" => PreviewFormat::Png,
+                        "jpeg" => PreviewFormat::Jpeg,
+                        _ => return Err("preview format must be png or jpeg".into()),
+                    });
+                }
+                _ => return Err("preview query accepts one camera and one format".into()),
+            }
+        }
     }
-    let (name, value) = query
-        .split_once('=')
-        .ok_or_else(|| "preview query must be camera=<selector>".to_owned())?;
-    if name != "camera" || value.contains('&') {
-        return Err("preview query only accepts one camera selector".into());
+    Ok((camera, format.unwrap_or(PreviewFormat::Png)))
+}
+
+/// Whether an `If-None-Match` list names this entity tag. The header
+/// compares weakly, so a `W/` prefix does not matter.
+fn etag_matches(header: &str, etag: &str) -> bool {
+    header
+        .split(',')
+        .map(str::trim)
+        .any(|tag| tag == "*" || tag.trim_start_matches("W/") == etag)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewFormat {
+    Png,
+    Jpeg,
+}
+impl PreviewFormat {
+    /// JPEG needs libjpeg-turbo (the `jpeg` feature); without it previews
+    /// stay PNG, and the content type says so.
+    fn served(self) -> Self {
+        if cfg!(feature = "jpeg") {
+            self
+        } else {
+            Self::Png
+        }
     }
-    let camera = percent_decode(value)?;
-    crate::session::validate_selector(&camera).map_err(|err| format!("{err:#}"))?;
-    Ok(Some(camera))
+    fn content_type(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+        }
+    }
+}
+
+/// One encoded preview: a frame of one camera worker in one format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreviewKey {
+    worker: u32,
+    frame: u64,
+    timestamp_ns: u64,
+    format: PreviewFormat,
+}
+impl PreviewKey {
+    fn etag(&self) -> String {
+        let extension = match self.format {
+            PreviewFormat::Png => "png",
+            PreviewFormat::Jpeg => "jpeg",
+        };
+        format!(
+            "\"{}-{}-{}-{extension}\"",
+            self.worker, self.frame, self.timestamp_ns
+        )
+    }
+}
+
+/// The newest preview encoded for each camera worker and format, most
+/// recently used last. Each slot has its own lock, held while encoding, so
+/// clients asking for the same new frame wait for one encode while other
+/// cameras' previews go ahead.
+#[derive(Default)]
+struct Previews {
+    slots: Mutex<VecDeque<(SlotOwner, Arc<PreviewSlot>)>>,
+    encodes: AtomicU64,
+}
+/// A camera worker's pid and a format.
+type SlotOwner = (u32, PreviewFormat);
+type PreviewSlot = Mutex<Option<(PreviewKey, Vec<u8>)>>;
+impl Previews {
+    fn slot(&self, key: PreviewKey) -> Arc<PreviewSlot> {
+        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        let owner = (key.worker, key.format);
+        let slot = match slots
+            .iter()
+            .position(|(slot_owner, _)| *slot_owner == owner)
+        {
+            Some(index) => slots.remove(index).expect("position is in range").1,
+            None => Arc::default(),
+        };
+        if slots.len() >= PREVIEW_SLOTS {
+            slots.pop_front();
+        }
+        slots.push_back((owner, slot.clone()));
+        slot
+    }
+
+    fn get(
+        &self,
+        key: PreviewKey,
+        encode: impl FnOnce() -> std::result::Result<Vec<u8>, Response>,
+    ) -> std::result::Result<Vec<u8>, Response> {
+        let slot = self.slot(key);
+        let mut cached = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((cached_key, body)) = cached.as_ref()
+            && *cached_key == key
+        {
+            return Ok(body.clone());
+        }
+        self.encodes.fetch_add(1, Ordering::Relaxed);
+        let body = encode()?;
+        *cached = Some((key, body.clone()));
+        Ok(body)
+    }
+}
+
+/// A frame scaled to fit 1280x720, as Gray PNG or JPEG when every pixel is
+/// gray and RGB otherwise; display images need no alpha channel.
+fn encode_preview(frame: &Frame, format: PreviewFormat) -> std::result::Result<Vec<u8>, Response> {
+    let (width, height, rgba) = crate::frame::preview_rgba(frame, 1280, 720)
+        .map_err(|err| error(422, format!("preview unavailable: {err:#}")))?;
+    let pixels = rgba.as_chunks::<4>().0;
+    let gray = pixels.iter().all(|[r, g, b, _]| r == g && g == b);
+    let data: Vec<u8> = if gray {
+        pixels.iter().map(|p| p[0]).collect()
+    } else {
+        pixels.iter().flat_map(|p| [p[0], p[1], p[2]]).collect()
+    };
+    let encoded = match format {
+        PreviewFormat::Jpeg => crate::jpeg::software(&crate::jpeg::Raster {
+            width,
+            height,
+            channels: if gray { 1 } else { 3 },
+            data,
+        }),
+        PreviewFormat::Png => (|| -> Result<Vec<u8>> {
+            let mut png = Vec::new();
+            let mut encoder = png::Encoder::new(&mut png, width, height);
+            encoder.set_color(if gray {
+                png::ColorType::Grayscale
+            } else {
+                png::ColorType::Rgb
+            });
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::Fast);
+            let mut writer = encoder.write_header()?;
+            writer.write_image_data(&data)?;
+            writer.finish()?;
+            Ok(png)
+        })(),
+    };
+    encoded.map_err(|err| error(500, format!("could not encode preview: {err:#}")))
 }
 
 fn activity_query(query: &str) -> std::result::Result<(Option<u64>, Duration), String> {
@@ -802,25 +1034,30 @@ fn signals_query(query: &str) -> std::result::Result<bool, &'static str> {
     }
 }
 
-fn asset_path(root: &Path, encoded_path: &str) -> HttpResult<PathBuf> {
+/// A request path as a file path inside the web root, `/` naming index.html.
+fn asset_name(encoded_path: &str) -> HttpResult<String> {
     let decoded = percent_decode(encoded_path).map_err(|message| (400, message))?;
     if !decoded.starts_with('/') || decoded.starts_with("//") || decoded.contains('\\') {
         return Err((400, "invalid web asset path".into()));
     }
     let relative = if decoded == "/" {
-        Path::new("index.html")
+        "index.html"
     } else {
-        Path::new(&decoded[1..])
+        &decoded[1..]
     };
-    if relative
+    if Path::new(relative)
         .components()
         .any(|component| !matches!(component, Component::Normal(_)))
         || decoded.split('/').any(|part| matches!(part, "." | ".."))
     {
         return Err((403, "web assets must stay inside the web root".into()));
     }
+    Ok(relative.to_owned())
+}
+
+fn asset_path(root: &Path, encoded_path: &str) -> HttpResult<PathBuf> {
     let path = root
-        .join(relative)
+        .join(asset_name(encoded_path)?)
         .canonicalize()
         .map_err(|_| (404, "web asset not found".into()))?;
     if !path.starts_with(root) || !path.is_file() {
@@ -884,6 +1121,7 @@ fn write_response(stream: &mut TcpStream, response: Response, head: bool) -> std
     let reason = match response.status {
         200 => "OK",
         204 => "No Content",
+        304 => "Not Modified",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
@@ -901,11 +1139,17 @@ fn write_response(stream: &mut TcpStream, response: Response, head: bool) -> std
     };
     write!(
         stream,
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n",
-        response.status,
-        reason,
-        response.content_type,
-        response.body.len()
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n",
+        response.status, reason, response.content_type
+    )?;
+    // These responses never have a body; a length would describe the one a
+    // 200 sends.
+    if !matches!(response.status, 204 | 304) {
+        write!(stream, "Content-Length: {}\r\n", response.body.len())?;
+    }
+    write!(
+        stream,
+        "Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n",
     )?;
     for (name, value) in response.headers {
         write!(stream, "{name}: {value}\r\n")?;
@@ -924,8 +1168,8 @@ mod tests {
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
-    struct WebRoot(PathBuf);
-    impl WebRoot {
+    struct TempWebRoot(PathBuf);
+    impl TempWebRoot {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
                 "capturefab-remote-unit-{}-{}",
@@ -938,9 +1182,19 @@ mod tests {
             Self(path.canonicalize().unwrap())
         }
     }
-    impl Drop for WebRoot {
+    impl Drop for TempWebRoot {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn service(handle: SessionHandle, web_root: WebRoot) -> Service {
+        Service {
+            handle,
+            web_root,
+            quitting: Arc::new(AtomicBool::new(false)),
+            activity_waits: Arc::new(AtomicUsize::new(0)),
+            previews: Previews::default(),
         }
     }
 
@@ -985,15 +1239,10 @@ mod tests {
 
     #[test]
     fn previews_report_the_size_the_camera_delivered() {
-        let root = WebRoot::new();
+        let root = TempWebRoot::new();
         let (handle, mut writer) = SessionHandle::fed(4096);
-        let service = Service {
-            handle: handle.clone(),
-            web_root: root.0.clone(),
-            quitting: Arc::new(AtomicBool::new(false)),
-            activity_waits: Arc::new(AtomicUsize::new(0)),
-        };
-        assert_eq!(service.preview("").status, 204);
+        let service = service(handle.clone(), WebRoot::Folder(root.0.clone()));
+        assert_eq!(service.preview("", None).status, 204);
         // Larger than the ring, so the ring holds a downscaled preview.
         let large = crate::types::Frame {
             id: 1,
@@ -1005,7 +1254,7 @@ mod tests {
         };
         writer.write(&large, true).unwrap();
         for query in ["", "camera=cam"] {
-            let response = service.preview(query);
+            let response = service.preview(query, None);
             assert_eq!(response.status, 200);
             let header = |name| {
                 response
@@ -1020,16 +1269,221 @@ mod tests {
         handle.shutdown();
     }
 
+    fn header<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
+        response
+            .headers
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn color(id: u64) -> Frame {
+        Frame {
+            id,
+            width: 64,
+            height: 48,
+            pixel_format: crate::types::RGB8,
+            timestamp_ns: id * 1000,
+            data: (0..64 * 48 * 3).map(|i| (i * 7 % 251) as u8).collect(),
+        }
+    }
+
+    #[test]
+    fn previews_are_encoded_once_per_frame_for_every_client() {
+        let root = TempWebRoot::new();
+        let (handle, mut writer) = SessionHandle::fed(1 << 16);
+        let service = service(handle.clone(), WebRoot::Folder(root.0.clone()));
+        writer.write(&color(1), true).unwrap();
+        let first = service.preview("camera=cam", None);
+        let second = service.preview("", None);
+        assert_eq!((first.status, second.status), (200, 200));
+        assert_eq!(first.body, second.body);
+        let etag = header(&first, "ETag").unwrap().to_owned();
+        assert_eq!(etag, "\"0-1-1000-png\"");
+        assert_eq!(header(&second, "ETag"), Some(etag.as_str()));
+        assert_eq!(service.previews.encodes.load(Ordering::Relaxed), 1);
+        // A client that has the frame gets its headers and no body.
+        for tags in [etag.clone(), format!("\"other\", W/{etag}"), "*".into()] {
+            let unchanged = service.preview("camera=cam", Some(&tags));
+            assert_eq!(unchanged.status, 304, "{tags}");
+            assert!(unchanged.body.is_empty());
+            assert_eq!(header(&unchanged, "ETag"), Some(etag.as_str()));
+            assert_eq!(header(&unchanged, "X-Frame-Id"), Some("1"));
+        }
+        assert_eq!(service.previews.encodes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            service
+                .preview("camera=cam", Some("\"0-1-1000-jpeg\""))
+                .status,
+            200
+        );
+        writer.write(&color(2), true).unwrap();
+        let next = service.preview("camera=cam", Some(&etag));
+        assert_eq!(next.status, 200);
+        assert_eq!(header(&next, "ETag"), Some("\"0-2-2000-png\""));
+        handle.shutdown();
+    }
+
+    #[test]
+    fn clients_asking_for_the_same_new_frame_share_one_encode() {
+        let previews = Arc::new(Previews::default());
+        let key = PreviewKey {
+            worker: 7,
+            frame: 1,
+            timestamp_ns: 0,
+            format: PreviewFormat::Png,
+        };
+        let clients: Vec<_> = (0..4)
+            .map(|_| {
+                let previews = previews.clone();
+                thread::spawn(move || {
+                    previews.get(key, || {
+                        thread::sleep(Duration::from_millis(50));
+                        Ok(vec![1, 2, 3])
+                    })
+                })
+            })
+            .collect();
+        for client in clients {
+            assert_eq!(client.join().unwrap().ok(), Some(vec![1, 2, 3]));
+        }
+        assert_eq!(previews.encodes.load(Ordering::Relaxed), 1);
+        // Each worker and format has a slot; the least recently used goes.
+        for worker in 0..PREVIEW_SLOTS as u32 {
+            let other = PreviewKey {
+                worker: 100 + worker,
+                ..key
+            };
+            let _ = previews.get(other, || Ok(Vec::new()));
+        }
+        let _ = previews.get(key, || Ok(Vec::new()));
+        assert_eq!(
+            previews.encodes.load(Ordering::Relaxed),
+            2 + PREVIEW_SLOTS as u64
+        );
+        assert_eq!(previews.slots.lock().unwrap().len(), PREVIEW_SLOTS);
+    }
+
+    #[test]
+    fn previews_are_gray_for_mono_frames_and_rgb_for_color() {
+        let root = TempWebRoot::new();
+        let (handle, mut writer) = SessionHandle::fed(1 << 16);
+        let service = service(handle.clone(), WebRoot::Folder(root.0.clone()));
+        // The IHDR color type: 0 gray, 2 RGB, 6 RGBA.
+        let color_type = |response: &Response| response.body[25];
+        let mono = Frame {
+            id: 1,
+            width: 64,
+            height: 48,
+            pixel_format: crate::types::MONO8,
+            timestamp_ns: 0,
+            data: (0..64 * 48).map(|i| i as u8).collect(),
+        };
+        writer.write(&mono, true).unwrap();
+        let gray = service.preview("", None);
+        assert_eq!(gray.content_type, "image/png");
+        assert_eq!(color_type(&gray), 0);
+        let decoded = png::Decoder::new(std::io::Cursor::new(&gray.body))
+            .read_info()
+            .unwrap()
+            .info()
+            .clone();
+        assert_eq!((decoded.width, decoded.height), (64, 48));
+        writer.write(&color(2), true).unwrap();
+        assert_eq!(color_type(&service.preview("", None)), 2);
+        let jpeg = service.preview("format=jpeg&camera=cam", None);
+        assert_eq!(jpeg.status, 200);
+        if cfg!(feature = "jpeg") {
+            assert_eq!(jpeg.content_type, "image/jpeg");
+            assert!(jpeg.body.starts_with(&[0xff, 0xd8]));
+            assert_eq!(header(&jpeg, "ETag"), Some("\"0-2-2000-jpeg\""));
+        } else {
+            assert_eq!(jpeg.content_type, "image/png");
+        }
+        handle.shutdown();
+    }
+
+    #[test]
+    fn preview_queries_take_one_camera_and_one_format_in_either_order() {
+        assert_eq!(preview_query("").unwrap(), (None, PreviewFormat::Png));
+        assert_eq!(
+            preview_query("format=jpeg&camera=sim%3A0").unwrap(),
+            (Some("sim:0".into()), PreviewFormat::Jpeg)
+        );
+        assert_eq!(
+            preview_query("format=png").unwrap(),
+            (None, PreviewFormat::Png)
+        );
+        for query in [
+            "format=gif",
+            "format=jpeg&format=png",
+            "camera=a&camera=b",
+            "camera=a&",
+            "size=1",
+            "camera",
+        ] {
+            assert!(preview_query(query).is_err(), "{query}");
+        }
+        assert!(etag_matches("\"a\", \"b\"", "\"b\""));
+        assert!(etag_matches("W/\"b\"", "\"b\""));
+        assert!(!etag_matches("\"a\"", "\"b\""));
+    }
+
+    #[test]
+    fn embedded_assets_are_served_by_path_and_stay_inside_the_root() {
+        static FILES: &[(&str, &[u8])] = &[
+            ("index.html", b"<html>embedded</html>"),
+            ("pkg/app.js", b"export {}"),
+        ];
+        let service = service(SessionHandle::new(), WebRoot::Embedded(FILES));
+        let index = service.asset("/");
+        assert_eq!(index.status, 200);
+        assert_eq!(index.body, b"<html>embedded</html>");
+        assert_eq!(index.content_type, "text/html; charset=utf-8");
+        let script = service.asset("/pkg/app.js");
+        assert_eq!(script.content_type, "text/javascript; charset=utf-8");
+        assert_eq!(service.asset("/missing.js").status, 404);
+        for path in ["/../index.html", "/%2e%2e/index.html", "//index.html"] {
+            assert!(matches!(service.asset(path).status, 400 | 403), "{path}");
+        }
+        service.handle.shutdown();
+    }
+
+    #[test]
+    fn dropping_the_server_wakes_its_blocked_accept() {
+        let root = TempWebRoot::new();
+        let handle = SessionHandle::new();
+        let server = Server::start(
+            handle.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+            WebRoot::Folder(root.0.clone()),
+        )
+        .unwrap();
+        let address = server.local_addr();
+        let started = Instant::now();
+        drop(server);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_err());
+        assert_eq!(
+            wake_address("0.0.0.0:8787".parse().unwrap()),
+            "127.0.0.1:8787".parse().unwrap()
+        );
+        assert_eq!(
+            wake_address("[::]:8787".parse().unwrap()),
+            "[::1]:8787".parse().unwrap()
+        );
+        assert_eq!(
+            wake_address("100.64.0.1:8787".parse().unwrap()),
+            "100.64.0.1:8787".parse().unwrap()
+        );
+        handle.shutdown();
+    }
+
     #[test]
     fn health_distinguishes_ready_session_from_shutdown() {
-        let root = WebRoot::new();
+        let root = TempWebRoot::new();
         let handle = SessionHandle::new();
-        let service = Service {
-            handle: handle.clone(),
-            web_root: root.0.clone(),
-            quitting: Arc::new(AtomicBool::new(false)),
-            activity_waits: Arc::new(AtomicUsize::new(0)),
-        };
+        let service = service(handle.clone(), WebRoot::Folder(root.0.clone()));
         let ready = service.health();
         assert_eq!(ready.status, 200);
         let ready: Value = serde_json::from_slice(&ready.body).unwrap();
@@ -1056,14 +1510,9 @@ mod tests {
     #[cfg(feature = "ai")]
     #[test]
     fn measurement_routes_expose_structured_history_and_enforce_origin() {
-        let root = WebRoot::new();
+        let root = TempWebRoot::new();
         let handle = SessionHandle::new();
-        let service = Service {
-            handle: handle.clone(),
-            web_root: root.0.clone(),
-            quitting: Arc::new(AtomicBool::new(false)),
-            activity_waits: Arc::new(AtomicUsize::new(0)),
-        };
+        let service = service(handle.clone(), WebRoot::Folder(root.0.clone()));
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1116,13 +1565,8 @@ mod tests {
 
     #[test]
     fn analytics_chart_route_adapts_to_the_requested_width_and_rejects_ambiguous_queries() {
-        let root = WebRoot::new();
-        let service = Service {
-            handle: SessionHandle::new(),
-            web_root: root.0.clone(),
-            quitting: Arc::new(AtomicBool::new(false)),
-            activity_waits: Arc::new(AtomicUsize::new(0)),
-        };
+        let root = TempWebRoot::new();
+        let service = service(SessionHandle::new(), WebRoot::Folder(root.0.clone()));
         for (query, width, height) in [
             ("width=320", 320, 1040),
             ("width=0", 180, 1040),
@@ -1170,7 +1614,7 @@ mod tests {
 
     #[test]
     fn assets_cannot_escape_the_root_including_encoded_traversal() {
-        let root = WebRoot::new();
+        let root = TempWebRoot::new();
         assert_eq!(validate_web_root(&root.0).unwrap(), root.0);
         assert_eq!(asset_path(&root.0, "/").unwrap(), root.0.join("index.html"));
         for path in [
@@ -1220,10 +1664,10 @@ mod tests {
         };
         assert!(validate_remote_command(&command).is_err());
         assert_eq!(
-            camera_query("camera=simulator%3Atest").unwrap().as_deref(),
-            Some("simulator:test")
+            preview_query("camera=simulator%3Atest").unwrap(),
+            (Some("simulator:test".into()), PreviewFormat::Png)
         );
-        assert!(camera_query("camera=a&camera=b").is_err());
+        assert!(preview_query("camera=a&camera=b").is_err());
     }
 }
 #[test]

@@ -148,7 +148,7 @@ Relative capture and recording paths resolve beside the workflow file; stdin wor
 
 ## Remote browser control
 
-Build the WebAssembly client with `./web-client/build.sh`, then run a headless server with `capturefab serve --name remote --listen 100.101.102.103:8787 --web-dir web-client/dist`. Open the server URL from another laptop on the same tailnet to discover cameras, edit settings, preview frames and set up captures or schedules. Anyone who can reach the listener can control captures; tailnet policy and the host firewall provide the access boundary. Capture files and jobs stay on the server; the local CLI can control the same session. See [remote setup and Tailscale HTTPS](docs/remote-control.md).
+Release executables have the WebAssembly browser client built in. Run a headless server with `capturefab serve --name remote --listen 100.101.102.103:8787` and open the server URL from another laptop on the same tailnet to discover cameras, edit settings, preview frames and set up captures or schedules. Anyone who can reach the listener can control captures; tailnet policy and the host firewall provide the access boundary. Capture files and jobs stay on the server; the local CLI can control the same session. Each tab costs the server one JPEG encode per new frame, shared with every other tab, and nothing while the frame is unchanged or the tab is hidden. Source builds build the client with `./web-client/build.sh` and either the `embedded-web` feature or `--web-dir web-client/dist`. See [remote setup and Tailscale HTTPS](docs/remote-control.md).
 
 ## Session analytics
 

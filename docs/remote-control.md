@@ -4,9 +4,11 @@ Capturefab's WebAssembly client runs in a laptop's browser and controls a native
 
 The HTTP listener is opt-in. Ordinary `capturefab serve --name bench` keeps its private local IPC interface. With a remote listener, the local CLI and the browser control the same session and cameras.
 
-## Build the server and browser client
+## Get the server and browser client
 
-Install the browser build tools once, using the same Rust toolchain as the client build:
+Release executables, desktop and headless, have the browser client built in, so a downloaded archive needs nothing else: `capturefab serve --listen ...` serves it. `capturefab doctor --json` reports `features.embedded_web: true` for such an executable. To run Capturefab as a service on a Raspberry Pi, Jetson or industrial PC, follow the [line computer guide](line-computer.md).
+
+From source, install the browser build tools once, using the same Rust toolchain as the client build:
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -16,11 +18,11 @@ cargo install wasm-bindgen-cli --version 0.2.129 --locked
 Then build from the repository root:
 
 ```sh
-cargo build --release --no-default-features --features usb,scanner,jpeg
 ./web-client/build.sh
+cargo build --release --no-default-features --features usb,scanner,jpeg,s3,ftp,sftp,embedded-web
 ```
 
-The native build needs the usual [Capturefab build dependencies](../README.md#build-test-and-release) and produces `target/release/capturefab`. Add `s3` to its features if the server will upload to bucket destinations. The browser build produces `web-client/dist`, which must be copied alongside the native executable on the capture server, or supplied with an absolute `--web-dir` path. The server does not compile the client at startup. The pinned `wasm-bindgen-cli` version must match the client's Rust dependency; no Node.js or npm is required.
+The native build needs the usual [Capturefab build dependencies](../README.md#build-test-and-release) and produces `target/release/capturefab`. The browser build produces `web-client/dist`; the `embedded-web` feature builds it into the executable (`CAPTUREFAB_WEB_DIST` names another built folder). Without that feature, copy `dist` next to the executable as a folder named `web`, or pass `--web-dir`. Without `--web-dir`, `serve` uses the built-in client, then a `web` folder beside the executable, then `web-client/dist` in the working directory. The server does not compile the client at startup. The pinned `wasm-bindgen-cli` version must match the client's Rust dependency; no Node.js or npm is required.
 
 ## Start a server reachable through Tailscale
 
@@ -33,9 +35,7 @@ tailscale ip -4
 Start Capturefab with the address printed by `tailscale ip -4`, replacing the example below:
 
 ```sh
-capturefab serve --name remote \
-  --listen 100.101.102.103:8787 \
-  --web-dir /path/to/web-client/dist
+capturefab serve --name remote --listen 100.101.102.103:8787
 ```
 
 The server reports the browser URL when ready. Keep the process running; camera connections and schedules belong to this process. Use your normal service manager for unattended operation.
@@ -65,9 +65,7 @@ Several browser users and AI agents can drive the same cameras at once. Each tab
 For a Tailscale HTTPS URL, bind Capturefab to loopback instead:
 
 ```sh
-capturefab serve --name remote \
-  --listen 127.0.0.1:8787 \
-  --web-dir /path/to/web-client/dist
+capturefab serve --name remote --listen 127.0.0.1:8787
 tailscale serve --bg http://127.0.0.1:8787
 tailscale serve status
 ```
@@ -84,7 +82,7 @@ The client uses same-origin HTTP endpoints without authentication headers. Reque
 | `GET /api/activity` | Shared `{revision, activity}` history, including actor and scheduled job progress |
 | `GET /api/activity?after=REV&timeout_ms=20000` | Wait for an activity change; all watchers wake when commands or jobs change |
 | `POST /api/command` | A native session command result |
-| `GET /api/preview?camera=ID` | Latest camera preview as PNG, or HTTP 204 while no frame is available |
+| `GET /api/preview?camera=ID&format=png\|jpeg` | Latest camera preview, scaled to fit 1280×720: PNG by default, JPEG with `format=jpeg`; HTTP 204 while no frame is available, 304 for the frame named in `If-None-Match` |
 | `GET /api/destinations` | Saved server destinations without credentials; each row has `kind` (`folder`, `s3`, `ftp` or `sftp`) |
 | `GET /api/storage` | Server storage usage and policy |
 | `GET`, `HEAD /health` | JSON readiness, uptime, camera counts and analytics health; HTTP 503 when stopping or analytics is unavailable |
@@ -103,6 +101,8 @@ Command requests wrap an existing `SessionCommand`:
   "command": {"op": "set", "feature": "ExposureTime", "value": "5000"}
 }
 ```
+
+Previews are display images. A gray image is a Gray PNG and anything else an RGB PNG; `format=jpeg` asks for a much smaller JPEG, which the bundled client uses, where the server build has the `jpeg` feature (release builds do); otherwise the reply stays PNG, so check `Content-Type`. Each preview has an `ETag` naming the camera worker, frame and format, and `X-Frame-Id`, `X-Frame-Timestamp-Ns`, `X-Frame-Width` and `X-Frame-Height` describe the frame the camera delivered. Send the last `ETag` back in `If-None-Match`: while the newest frame is still that one, the server answers 304 with the same headers and no image, so polling a stopped or slow camera costs almost nothing. The server encodes each new frame once per format however many clients ask. Responses carry `Cache-Control: no-store`, so clients keep the tag themselves rather than relying on a browser cache.
 
 Omit `camera` for session-wide operations such as `{"op":"connect","camera":"sim:0","timeout_ms":2000}`. JSON responses use `{ "version": 1, "ok": true, "result": ... }`, or `ok: false` with an error message. Run `capturefab schema` for the session command contract. Captures write files on the server; the preview endpoint supplies a bounded display image rather than the original measurement data.
 
@@ -141,4 +141,6 @@ curl http://100.101.102.103:8787/api/analytics
 curl -o session-analytics.svg http://100.101.102.103:8787/api/analytics.svg
 ```
 
-If the laptop cannot load the page, check the listener address, host firewall and tailnet policy. If WASM fails to load, rebuild the client and copy the whole `dist` directory, including its `.wasm` and JavaScript files.
+If the laptop cannot load the page, check the listener address, host firewall and tailnet policy. If WASM fails to load from a source build, rebuild the client and copy the whole `dist` directory, including its `.wasm` and JavaScript files.
+
+The browser client pauses its preview, session and activity requests while its tab is hidden, and resumes when it is shown again.

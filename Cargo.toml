@@ -49,6 +49,9 @@ ai = ["dep:ureq", "dep:keyring", "dep:zeroize"]
 dinov2 = ["dep:matrixmultiply", "dep:half", "dep:libm", "dep:wgpu"]
 # Apple's hardware JPEG engine through VideoToolbox (system frameworks; no-op off macOS).
 videotoolbox = []
+# The browser client (web-client/dist, or CAPTUREFAB_WEB_DIST) built into the
+# executable for `serve --listen`; release builds enable it when it is built.
+embedded-web = []
 # The GUI always renders with wgpu (falling back to tiny-skia without a GPU);
 # kept so existing `--features wgpu` builds keep working.
 wgpu = ["gui"]

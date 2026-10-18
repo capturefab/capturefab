@@ -44,6 +44,7 @@ struct App {
     preview_busy: bool,
     preview_url: Option<String>,
     preview_frame: String,
+    preview_etag: String,
     analytics_busy: bool,
     analytics_layout_dirty: bool,
     analytics_layout_width: Option<i32>,
@@ -220,7 +221,13 @@ fn update_disabled(app: &App) {
     }
 }
 
-async fn fetch(path: &str, body: Option<&Value>) -> Result<Response, String> {
+/// `if_none_match` names the preview this tab shows, so the server answers
+/// 304 instead of sending the same frame again.
+async fn fetch(
+    path: &str,
+    body: Option<&Value>,
+    if_none_match: Option<&str>,
+) -> Result<Response, String> {
     let options = RequestInit::new();
     options.set_method(if body.is_some() { "POST" } else { "GET" });
     options.set_mode(RequestMode::SameOrigin);
@@ -236,6 +243,12 @@ async fn fetch(path: &str, body: Option<&Value>) -> Result<Response, String> {
             .set("Content-Type", "application/json")
             .map_err(js_error)?;
     }
+    if let Some(tag) = if_none_match {
+        request
+            .headers()
+            .set("If-None-Match", tag)
+            .map_err(js_error)?;
+    }
     JsFuture::from(window().fetch_with_request(&request))
         .await
         .map_err(js_error)?
@@ -243,7 +256,7 @@ async fn fetch(path: &str, body: Option<&Value>) -> Result<Response, String> {
         .map_err(js_error)
 }
 async fn request(path: &str, body: Option<&Value>) -> Result<Value, String> {
-    let response = fetch(path, body).await?;
+    let response = fetch(path, body, None).await?;
     let status = response.status();
     let body = JsFuture::from(response.text().map_err(js_error)?)
         .await
@@ -779,6 +792,7 @@ fn clear_preview(app: &mut App) {
         let _ = Url::revoke_object_url(&url);
     }
     app.preview_frame.clear();
+    app.preview_etag.clear();
     let _ = element("preview").remove_attribute("src");
     visible("preview", false);
     visible("preview-empty", true);
@@ -966,7 +980,7 @@ fn analytics_chart_width() -> i32 {
 async fn analytics_chart_url() -> Result<String, String> {
     let width = analytics_chart_width();
     APP.with(|state| state.borrow_mut().analytics_layout_width = Some(width));
-    let response = fetch(&format!("/api/analytics.svg?width={width}"), None).await?;
+    let response = fetch(&format!("/api/analytics.svg?width={width}"), None, None).await?;
     if !response.ok() {
         return Err(
             "The capture timeline could not be loaded. It will retry automatically.".into(),
@@ -1150,7 +1164,8 @@ fn destination_description(app: &App) {
 fn refresh() {
     let ticket = APP.with(|state| {
         let mut app = state.borrow_mut();
-        if app.snapshot_busy {
+        // A hidden tab waits; showing it again refreshes at once.
+        if app.snapshot_busy || document().hidden() {
             return None;
         }
         app.snapshot_busy = true;
@@ -1206,7 +1221,11 @@ fn sync_snapshot_activity(app: &mut App, snapshot: &Value) {
 fn refresh_activity() {
     let ticket = APP.with(|state| {
         let mut app = state.borrow_mut();
-        if !app.connected || app.activity_busy || js_sys::Date::now() < app.activity_next_at {
+        if !app.connected
+            || app.activity_busy
+            || document().hidden()
+            || js_sys::Date::now() < app.activity_next_at
+        {
             return None;
         }
         app.activity_busy = true;
@@ -1276,17 +1295,38 @@ fn preview() {
         }
         app.preview_busy = true;
         let worker = camera(&app).map(|c| number(c, "worker_pid")).unwrap_or(0);
-        Some((app.generation, app.selected.clone(), worker))
+        Some((
+            app.generation,
+            app.selected.clone(),
+            worker,
+            app.preview_etag.clone(),
+        ))
     });
-    let Some((generation, selected, worker)) = ticket else {
+    let Some((generation, selected, worker, shown)) = ticket else {
         return;
     };
     spawn_local(async move {
         let encoded = js_sys::encode_uri_component(&selected)
             .as_string()
             .unwrap_or_default();
-        let response = fetch(&format!("/api/preview?camera={encoded}"), None).await;
+        // JPEG is a fraction of PNG's size, and the tag of the image shown
+        // turns an unchanged frame into a bodiless 304.
+        let response = fetch(
+            &format!("/api/preview?camera={encoded}&format=jpeg"),
+            None,
+            Some(shown.as_str()).filter(|tag| !tag.is_empty()),
+        )
+        .await;
         let response = match response {
+            Ok(response) if response.status() == 304 => {
+                APP.with(|state| {
+                    let mut app = state.borrow_mut();
+                    if app.generation == generation {
+                        app.preview_busy = false;
+                    }
+                });
+                return;
+            }
             Ok(response) if response.status() == 204 => {
                 APP.with(|state| {
                     let mut app = state.borrow_mut();
@@ -1330,6 +1370,12 @@ fn preview() {
             .flatten()
             .unwrap_or_default();
         let identity = format!("{worker}:{frame_id}:{timestamp}");
+        let etag = response
+            .headers()
+            .get("ETag")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let result = match response.blob() {
             Ok(promise) => JsFuture::from(promise)
                 .await
@@ -1349,6 +1395,7 @@ fn preview() {
                 return;
             }
             if !frame_id.is_empty() && app.preview_frame == identity {
+                app.preview_etag = etag;
                 return;
             }
             let Ok(blob) = result else {
@@ -1361,6 +1408,7 @@ fn preview() {
                 let _ = Url::revoke_object_url(&old);
             }
             app.preview_frame = identity;
+            app.preview_etag = etag;
             element("preview")
                 .unchecked_into::<HtmlImageElement>()
                 .set_src(&url);

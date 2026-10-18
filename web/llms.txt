@@ -117,6 +117,7 @@ Activity responses contain `{revision,activity}` inside the versioned result.
 These read-only calls bypass camera queues and create no Activity entries.
 RPC supports `{"op":"activity","after":12,"timeout_ms":20000}`.
 HTTP observers use `/api/activity?after=REV&timeout_ms=20000`; the maximum timeout is 25000 ms.
+HTTP previews: `/api/preview?camera=ID&format=jpeg` (PNG by default); send the returned `ETag` as `If-None-Match` to get 304 while the frame is unchanged.
 All observers wake on shared command and scheduled-job changes.
 See the agent instructions for actor fields, log timestamps and HTTP command envelopes.
 

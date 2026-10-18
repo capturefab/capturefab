@@ -51,8 +51,17 @@ impl Fixture {
     fn start() -> Self {
         let root = root("session");
         assets(&root);
-        let child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
-            .current_dir(&root)
+        Self::serve(
+            root.clone(),
+            Path::new(env!("CARGO_BIN_EXE_capturefab")),
+            &root,
+            &["--web-dir", "web"],
+        )
+    }
+    /// `serve --listen` from `executable` in `cwd`, with sessions under `root`.
+    fn serve(root: PathBuf, executable: &Path, cwd: &Path, args: &[&str]) -> Self {
+        let child = Command::new(executable)
+            .current_dir(cwd)
             .env("CAPTUREFAB_SESSION_DIR", root.join("sessions"))
             .env_remove("CAPTUREFAB_SESSION")
             .env("CAPTUREFAB_FRAME_BYTES", "1048576")
@@ -63,9 +72,8 @@ impl Fixture {
                 "remote-ci",
                 "--listen",
                 "127.0.0.1:0",
-                "--web-dir",
-                "web",
             ])
+            .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -104,6 +112,16 @@ impl Fixture {
         fixture
     }
     fn http(&self, method: &str, path: &str, origin: Option<&str>, body: &[u8]) -> Response {
+        let origin = origin.map(|origin| ("Origin", origin));
+        self.http_with(method, path, origin.as_slice(), body)
+    }
+    fn http_with(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Response {
         let mut stream = TcpStream::connect_timeout(&self.address, Duration::from_secs(5)).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -118,8 +136,8 @@ impl Fixture {
             body.len()
         )
         .unwrap();
-        if let Some(origin) = origin {
-            write!(stream, "Origin: {origin}\r\n").unwrap();
+        for (name, value) in headers {
+            write!(stream, "{name}: {value}\r\n").unwrap();
         }
         if method == "POST" {
             write!(stream, "Content-Type: application/json\r\n").unwrap();
@@ -878,6 +896,109 @@ fn remote_network_access_and_wasm_assets() {
             String::from_utf8_lossy(&response.body)
         );
         assert_eq!(response.json()["ok"], false);
+    }
+}
+
+#[test]
+fn previews_answer_a_frame_the_client_has_with_304_and_send_jpeg_on_request() {
+    let fixture = Fixture::start();
+    fixture.command(
+        None,
+        json!({"op":"connect","camera":"sim:0","timeout_ms":2000}),
+    );
+    for (feature, value) in [("Width", "64"), ("Height", "64")] {
+        fixture.command(
+            Some("sim:0"),
+            json!({"op":"set","feature":feature,"value":value}),
+        );
+    }
+    fixture.command(Some("sim:0"), json!({"op":"start"}));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fixture
+        .http("GET", "/api/preview?camera=sim%3A0", None, b"")
+        .status
+        != 200
+    {
+        assert!(Instant::now() < deadline, "preview did not receive a frame");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    fixture.command(Some("sim:0"), json!({"op":"stop"}));
+    for (query, content_type) in [
+        ("camera=sim%3A0", "image/png"),
+        (
+            "camera=sim%3A0&format=jpeg",
+            if cfg!(feature = "jpeg") {
+                "image/jpeg"
+            } else {
+                "image/png"
+            },
+        ),
+    ] {
+        let path = format!("/api/preview?{query}");
+        // A stopped stream ends on its newest frame, which the next polls keep.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (frame, unchanged) = loop {
+            let frame = fixture.http("GET", &path, None, b"");
+            assert_eq!(frame.status, 200);
+            let etag = frame.header("ETag").unwrap().to_owned();
+            let unchanged = fixture.http_with("GET", &path, &[("If-None-Match", &etag)], b"");
+            if unchanged.status == 304 {
+                break (frame, unchanged);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the stopped preview kept changing"
+            );
+        };
+        assert_eq!(frame.header("Content-Type"), Some(content_type));
+        assert_eq!(unchanged.header("ETag"), frame.header("ETag"));
+        assert_eq!(unchanged.header("X-Frame-Id"), frame.header("X-Frame-Id"));
+        assert_eq!(unchanged.header("Content-Length"), None);
+        assert!(unchanged.body.is_empty());
+        if content_type == "image/jpeg" {
+            assert!(frame.body.starts_with(&[0xff, 0xd8]));
+            assert!(frame.header("ETag").unwrap().ends_with("-jpeg\""));
+        } else {
+            assert!(frame.body.starts_with(b"\x89PNG\r\n\x1a\n"));
+        }
+    }
+}
+
+#[test]
+fn serve_finds_the_browser_client_beside_its_executable_from_any_directory() {
+    let root = root("beside");
+    let bin = root.join("bin");
+    let elsewhere = root.join("elsewhere");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&elsewhere).unwrap();
+    let source = Path::new(env!("CARGO_BIN_EXE_capturefab"));
+    let executable = bin.join(source.file_name().unwrap());
+    if fs::hard_link(source, &executable).is_err() {
+        fs::copy(source, &executable).unwrap();
+    }
+    assets(&bin);
+    let embedded = Command::new(&executable)
+        .env("CAPTUREFAB_SESSION_DIR", root.join("sessions"))
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    let embedded = serde_json::from_slice::<Value>(&embedded.stdout).unwrap()["result"]["features"]
+        ["embedded_web"]
+        .as_bool()
+        .expect("doctor reports whether the browser client is built in");
+    let fixture = Fixture::serve(root, &executable, &elsewhere, &[]);
+    let index = fixture.http("GET", "/", None, b"");
+    assert_eq!(index.status, 200);
+    assert_eq!(
+        index.header("Content-Type"),
+        Some("text/html; charset=utf-8")
+    );
+    let wasm = fixture.http("GET", "/capturefab_web_bg.wasm", None, b"");
+    assert_eq!(wasm.header("Content-Type"), Some("application/wasm"));
+    assert!(wasm.body.starts_with(b"\0asm"));
+    if !embedded {
+        assert_eq!(index.body, INDEX.as_bytes());
+        assert_eq!(wasm.body, WASM);
     }
 }
 
