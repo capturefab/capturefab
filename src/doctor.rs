@@ -1,12 +1,13 @@
-//! Host checks for `doctor`: where session state, frame buffers and
-//! temporary files live, kernel limits that cap camera throughput and the
-//! graphics adapter the desktop window would get, each turned into a check
-//! with a copyable fix.
+//! Host checks for `doctor`: where session state and temporary files live,
+//! kernel limits that cap camera throughput, the storage budget against the
+//! capture disk and the graphics adapter the desktop window would get, each
+//! turned into a check with a copyable fix.
 #![allow(unsafe_code)]
 
 use crate::analytics::human_bytes;
 use crate::efficiency::{self, Mode, Resolved};
-use serde::{Deserialize, Serialize};
+use crate::storage::{FREE_SPACE_FLOOR, StoragePolicy};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     io::{self, Write},
@@ -112,15 +113,6 @@ struct UsbCamera {
     accessible: bool,
 }
 
-/// What the storage ledger holds.
-#[derive(Debug, Default, Clone, PartialEq)]
-struct Usage {
-    /// Bytes counted against the budget, reservations included.
-    allocated: u64,
-    /// The folder of the newest capture.
-    latest: Option<PathBuf>,
-}
-
 /// What the checks look at, gathered once.
 struct Facts {
     efficiency: Resolved,
@@ -133,32 +125,28 @@ struct Facts {
     limits: Limits,
     usb: Vec<UsbCamera>,
     budget: u64,
-    /// None when the ledger cannot be read.
-    usage: Option<Usage>,
+    /// Bytes counted against the budget, reservations included; None while
+    /// the ledger's usage is unknown.
+    used: Option<u64>,
     working_directory: Place,
-    /// Where the newest capture landed, else where relative paths land.
+    /// The default capture folder's disk, where `storage --json` measures.
     captures: Place,
 }
 impl Facts {
     fn gather() -> Self {
         let session = crate::ipc::session_dir();
-        let usage = ledger_usage(&session);
-        let working_directory = Place::of(std::env::current_dir().unwrap_or_else(|_| ".".into()));
-        let captures = capture_place(
-            usage.as_ref().and_then(|usage| usage.latest.clone()),
-            &working_directory,
-        );
+        let (budget, used) = ledger(&session);
         Self {
             efficiency: efficiency::current(),
             graphics: None,
-            budget: storage_budget(&session),
-            usage,
+            budget,
+            used,
             session: Place::of(session),
             unused_runtime_dir: unused_runtime_dir(),
             limits: limits(),
             usb: usb_cameras(),
-            working_directory,
-            captures,
+            working_directory: Place::of(std::env::current_dir().unwrap_or_else(|_| ".".into())),
+            captures: capture_place(),
         }
     }
 }
@@ -274,9 +262,8 @@ fn checks(facts: &Facts) -> Vec<Check> {
     checks.extend(usb_check(&facts.usb));
     checks.extend(
         facts
-            .usage
-            .as_ref()
-            .and_then(|usage| budget_check(facts.budget, usage.allocated, &facts.captures)),
+            .used
+            .and_then(|used| budget_check(facts.budget, used, &facts.captures)),
     );
     checks
 }
@@ -333,9 +320,10 @@ fn graphics_check(graphics: &Value) -> Check {
     }
 }
 
-/// The fix moves the whole session directory, so it says what stays behind;
-/// logind creates the runtime directory only for a logged-in or lingering
-/// user and removes it at logout otherwise.
+/// Frame buffers stay in memory either way; what differs is where sessions
+/// are found. The fix moves the whole session directory, so it says what
+/// stays behind; logind creates the runtime directory only for a logged-in
+/// or lingering user and removes it at logout otherwise.
 fn runtime_dir_check(runtime_dir: &Path, session: &Place) -> Check {
     let dir = runtime_dir.display();
     let session = session.path.display();
@@ -345,7 +333,7 @@ fn runtime_dir_check(runtime_dir: &Path, session: &Place) -> Check {
     Check::warn(
         "runtime_dir",
         format!(
-            "XDG_RUNTIME_DIR is unset, so camera frame buffers in {session} are written to disk instead of memory."
+            "XDG_RUNTIME_DIR is unset, so session state is on disk in {session}, while logins that set it look for sessions in {dir}/capturefab."
         ),
         format!(
             "In a shell, export XDG_RUNTIME_DIR={dir}; a service needs `sudo loginctl enable-linger {user}` before Environment=XDG_RUNTIME_DIR={dir}, so {dir} exists at boot and survives logout. Either way the session directory moves into memory: saved destinations, the upload queue and the storage budget in {session} stay behind, and new ones are cleared at reboot."
@@ -353,8 +341,9 @@ fn runtime_dir_check(runtime_dir: &Path, session: &Place) -> Check {
     )
 }
 
-/// Informational rather than a warning: keeping this state on disk puts the
-/// frame buffers there too.
+/// Informational rather than a warning: memory suits a session's short-lived
+/// files, and only the user knows whether the rest must outlive a reboot.
+/// Camera frame buffers are anonymous shared memory wherever this is.
 fn session_check(session: &Place) -> Check {
     if !session.ram_backed {
         return Check::ok(
@@ -370,7 +359,7 @@ fn session_check(session: &Place) -> Check {
         ),
     );
     check.fix = Some(
-        "To keep them, set CAPTUREFAB_SESSION_DIR to a folder on disk such as ~/.local/state/capturefab; camera frame buffers then live on disk too, which wears SD cards."
+        "To keep them, set CAPTUREFAB_SESSION_DIR to a folder on disk such as ~/.local/state/capturefab; camera frame buffers stay in memory."
             .into(),
     );
     check
@@ -443,24 +432,27 @@ fn usb_check(cameras: &[UsbCamera]) -> Option<Check> {
 }
 
 /// Whether the part of the budget not yet used fits on the disk captures
-/// land on; what is already stored is on that disk too.
+/// land on, less the floor every save leaves free there; what is already
+/// stored is on that disk too.
 fn budget_check(budget: u64, used: u64, place: &Place) -> Option<Check> {
     let free = place.free_bytes?;
+    let usable = free.saturating_sub(FREE_SPACE_FLOOR);
     let path = place.path.display();
     let room = budget.saturating_sub(used);
-    Some(if room > free {
+    Some(if room > usable {
         Check::warn(
             "storage_budget",
             format!(
-                "The storage budget leaves room for {} more ({} of {} used), but only {} is free on {path}, so the disk can fill first.",
+                "The storage budget leaves room for {} more ({} of {} used), but only {} is free on {path} and saves keep {} of it free, so the disk can fill first.",
                 human_bytes(room),
                 human_bytes(used),
                 human_bytes(budget),
-                human_bytes(free)
+                human_bytes(free),
+                human_bytes(FREE_SPACE_FLOOR)
             ),
             format!(
                 "capturefab storage configure --max-space {}",
-                suggested_budget(used, free)
+                suggested_budget(used, usable)
             ),
         )
     } else {
@@ -475,7 +467,7 @@ fn budget_check(budget: u64, used: u64, place: &Place) -> Option<Check> {
         )
     })
 }
-/// What is stored plus three quarters of the free space, in whole units
+/// What is stored plus three quarters of the usable space, in whole units
 /// `storage configure` accepts. Never below what is stored: retention would
 /// delete the oldest captures to get under it, or stop every capture.
 fn suggested_budget(used: u64, free: u64) -> String {
@@ -488,61 +480,33 @@ fn suggested_budget(used: u64, free: u64) -> String {
     }
 }
 
-/// The configured byte budget, read without the ledger lock so `doctor`
-/// never waits behind capture bookkeeping.
-fn storage_budget(session: &Path) -> u64 {
-    std::fs::read(session.join("storage-policy.json"))
+/// The configured budget and the bytes counted against it, from the storage
+/// ledger's lock-free reads, so `doctor` never waits behind capture
+/// bookkeeping; its usage summary includes the journal's tail. Usage is None
+/// while unknown, such as after an older version saved, which omits the
+/// check. Without a session directory nothing is stored yet, and `doctor`
+/// does not create one to find that out.
+fn ledger(session: &Path) -> (u64, Option<u64>) {
+    let default = StoragePolicy::default().max_bytes;
+    if !session.is_dir() {
+        return (default, Some(0));
+    }
+    let budget = crate::storage::configured_policy().map_or(default, |policy| policy.max_bytes);
+    let used = crate::storage::usage()
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|policy| policy["policy"]["max_bytes"].as_u64())
-        .unwrap_or_else(|| crate::storage::StoragePolicy::default().max_bytes)
+        .flatten()
+        .map(|usage| usage.allocated_bytes);
+    (budget, used)
 }
 
-/// The newest capture's folder while it exists, else the working directory:
-/// a folder that is gone, or on a drive that is not mounted, would report
-/// another disk's free space under its name.
-fn capture_place(latest: Option<PathBuf>, working_directory: &Place) -> Place {
-    latest
-        .map(Place::of)
-        .filter(|place| place.exists)
-        .unwrap_or_else(|| working_directory.clone())
-}
-
-/// The fields of storage.json `doctor` needs.
-#[derive(Deserialize)]
-struct LedgerFile {
-    entries: Vec<LedgerEntry>,
-}
-#[derive(Deserialize)]
-struct LedgerEntry {
-    base: PathBuf,
-    created: u64,
-    bytes: u64,
-    reserved: u64,
-}
-
-/// The ledger's usage, also read without the lock: it is replaced by a
-/// rename, so a read sees one whole version. No ledger means nothing is
-/// stored yet; an unreadable one means the usage is unknown.
-fn ledger_usage(session: &Path) -> Option<Usage> {
-    let path = session.join("storage.json");
-    let bytes = match std::fs::metadata(&path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(Usage::default()),
-        // The ledger's own size limit.
-        Ok(meta) if meta.len() <= 64 << 20 => std::fs::read(&path).ok()?,
-        _ => return None,
-    };
-    let ledger: LedgerFile = serde_json::from_slice(&bytes).ok()?;
-    Some(Usage {
-        allocated: ledger.entries.iter().fold(0, |sum: u64, entry| {
-            sum.saturating_add(entry.bytes.max(entry.reserved))
-        }),
-        latest: ledger
-            .entries
-            .into_iter()
-            .max_by_key(|entry| entry.created)
-            .map(|entry| entry.base),
-    })
+/// The default capture folder, or its nearest existing parent, where
+/// `storage --json` reports free space too.
+fn capture_place() -> Place {
+    let root = crate::storage::capture_root();
+    Place {
+        free_bytes: crate::storage::free_bytes(&root),
+        ..Place::of(root)
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -856,7 +820,7 @@ mod tests {
         assert_eq!(check.level, Level::Warn);
         assert_eq!(
             check.message,
-            "The storage budget leaves room for 10.00 GiB more (0.0 KiB of 10.00 GiB used), but only 6.00 GiB is free on /home/pi, so the disk can fill first."
+            "The storage budget leaves room for 10.00 GiB more (0.0 KiB of 10.00 GiB used), but only 6.00 GiB is free on /home/pi and saves keep 512.0 MiB of it free, so the disk can fill first."
         );
         assert_eq!(
             check.fix.as_deref(),
@@ -866,6 +830,16 @@ mod tests {
             budget_check(budget, 0, &place("/data", "xfs", 100 << 30))
                 .unwrap()
                 .level,
+            Level::Ok
+        );
+        // Saves keep the floor free, so a budget that fits only into it warns.
+        let tight = place("/home/pi", "ext4", 10 << 30);
+        assert_eq!(
+            budget_check(10 << 30, 0, &tight).unwrap().level,
+            Level::Warn
+        );
+        assert_eq!(
+            budget_check(10 << 30, 512 << 20, &tight).unwrap().level,
             Level::Ok
         );
         assert_eq!(suggested_budget(0, 100 << 20), "75MiB");
@@ -918,47 +892,31 @@ mod tests {
     }
 
     #[test]
-    fn ledger_usage_reads_bytes_and_the_newest_capture_folder() {
-        let dir = std::env::temp_dir().join(format!(
-            "capturefab-doctor-ledger-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+    fn storage_is_measured_on_the_capture_folder_disk_without_creating_a_session() {
+        let missing = std::env::temp_dir().join(format!(
+            "capturefab-doctor-ledger-{}/sessions",
+            std::process::id()
         ));
-        assert_eq!(ledger_usage(&dir), Some(Usage::default()), "no ledger yet");
-        std::fs::create_dir_all(&dir).unwrap();
-        let entry = |base: &str, created: u64, bytes: u64, reserved: u64| json!({"id":"a","path":format!("{base}/a.png"),"base":base,"identity":{"created_ns":null},"created":created,"bytes":bytes,"reserved":reserved,"lease":null,"sha256":null,"modified_ns":null});
-        let ledger = json!({"version":1,"entries":[
-            entry("/data/old", 10, 300, 0),
-            entry("/data/new", 20, 0, 1000),
-            entry("/data/middle", 15, 50, 40),
-        ]});
-        std::fs::write(dir.join("storage.json"), ledger.to_string()).unwrap();
         assert_eq!(
-            ledger_usage(&dir),
-            Some(Usage {
-                allocated: 1350,
-                latest: Some("/data/new".into()),
-            })
+            ledger(&missing),
+            (StoragePolicy::default().max_bytes, Some(0)),
+            "nothing is stored before a session directory exists"
         );
-        std::fs::write(dir.join("storage.json"), "{").unwrap();
-        assert_eq!(ledger_usage(&dir), None, "unreadable means unknown");
-        // Free space is measured in the newest capture's folder while it
-        // exists, else in the working directory.
-        let working = place("/home/pi", "ext4", 6 << 30);
-        assert_eq!(capture_place(Some(dir.clone()), &working).path, dir);
-        let unmounted = dir.join("unmounted/drive");
-        assert_eq!(capture_place(Some(unmounted), &working), working);
-        assert_eq!(capture_place(None, &working), working);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!missing.exists());
+        // Where storage --json reports free space: the default capture
+        // folder, or its nearest existing parent.
+        let captures = capture_place();
+        assert_eq!(captures.path, crate::storage::capture_root());
+        assert_eq!(
+            captures.free_bytes,
+            crate::storage::free_bytes(&captures.path)
+        );
     }
 
     #[test]
     fn session_state_on_tmpfs_informs_and_a_missing_runtime_dir_warns() {
-        // The default on a Linux login: worth knowing, but moving it puts
-        // frame buffers on disk, so it is not a warning.
+        // The default on a Linux login: worth knowing, but whether the state
+        // must outlive a reboot is the user's call, so it is not a warning.
         let runtime = place("/run/user/1000/capturefab", "tmpfs", 400 << 20);
         let check = session_check(&runtime);
         assert_eq!(check.level, Level::Ok);
@@ -966,7 +924,7 @@ mod tests {
         assert!(check.message.contains("cleared at reboot"));
         let fix = check.fix.unwrap();
         assert!(fix.contains("CAPTUREFAB_SESSION_DIR"), "{fix}");
-        assert!(fix.contains("frame buffers then live on disk"), "{fix}");
+        assert!(fix.contains("frame buffers stay in memory"), "{fix}");
         let disk = place("/home/pi/.cache/capturefab/sessions", "ext4", 6 << 30);
         assert_eq!(session_check(&disk).level, Level::Ok);
         assert_eq!(session_check(&disk).fix, None);
@@ -977,6 +935,14 @@ mod tests {
                 .message
                 .contains("/home/pi/.cache/capturefab/sessions")
         );
+        // Frame rings are anonymous memory, so only where sessions are
+        // found differs.
+        assert!(
+            fallback.message.contains("/run/user/1000/capturefab"),
+            "{}",
+            fallback.message
+        );
+        assert!(!fallback.message.contains("frame"), "{}", fallback.message);
         // A service cannot rely on the runtime directory without lingering,
         // and moving the session directory leaves its saved state behind.
         let fix = fallback.fix.unwrap();

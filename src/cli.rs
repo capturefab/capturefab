@@ -3003,6 +3003,7 @@ fn schema() -> Value {
         "limits":"{rmem_max,usbfs_memory_mb}; null outside Linux",
         "graphics":"{available,adapter,backend,device_type,driver,max_texture_dimension_2d,software} from a helper process with a 3 s deadline in desktop builds, or {available:false,reason}",
         "checks":"[{id,level:ok|warn,message,fix}]; ids include efficiency, graphics, runtime_dir, session_storage, receive_buffer, usb_access and storage_budget; checks that do not apply are omitted",
+        "ring_backing":"memfd|posix-shm|file: where camera frame rings live; file only on Windows or where anonymous shared memory is unavailable",
         "human":"Plain doctor prints the host summary and one line per check with its fix"
     });
     contract

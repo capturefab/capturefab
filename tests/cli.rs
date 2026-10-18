@@ -2356,14 +2356,19 @@ fn doctor_prints_a_checklist_and_follows_the_efficiency_setting() {
 }
 
 #[test]
-fn doctor_measures_the_storage_budget_where_captures_land() {
+fn doctor_measures_the_storage_budget_on_the_capture_folder_disk() {
     let root = temp_root("doctor-budget");
     let dir = root.join("sessions");
     let shots = root.join("shots");
     std::fs::create_dir_all(&shots).unwrap();
     let shot = shots.join("a.png");
-    json(
+    // The default capture folder is ~/Capturefab; it need not exist yet.
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let env = [("HOME", home.to_str().unwrap())];
+    json_env(
         &dir,
+        &env,
         &[
             "--json",
             "--camera",
@@ -2373,7 +2378,7 @@ fn doctor_measures_the_storage_budget_where_captures_land() {
             shot.to_str().unwrap(),
         ],
     );
-    let doctor = json(&dir, &["--json", "doctor"]);
+    let doctor = json_env(&dir, &env, &["--json", "doctor"]);
     let budget = doctor["checks"]
         .as_array()
         .unwrap()
@@ -2381,11 +2386,11 @@ fn doctor_measures_the_storage_budget_where_captures_land() {
         .find(|check| check["id"] == "storage_budget")
         .unwrap();
     let message = budget["message"].as_str().unwrap();
-    // doctor reads the ledger storage.rs writes: the capture's folder is
-    // where free space is measured, and its bytes count as used.
-    let folder = std::fs::canonicalize(&shots).unwrap();
+    // doctor reads the storage ledger's usage summary, so the capture's
+    // bytes count as used, and measures free space where `storage --json`
+    // does.
     assert!(
-        message.contains(&format!("free on {}", folder.display())),
+        message.contains(&format!("free on {}", home.join("Capturefab").display())),
         "{message}"
     );
     assert!(
