@@ -20,19 +20,28 @@ pub static NVJPEG: Kind = Kind {
     argument: "__nvjpeg",
     variable: "CAPTUREFAB_NVJPEG",
     platform: !cfg!(target_os = "macos"),
-    present: || nvidia_nodes(std::path::Path::new("/dev")),
+    present: || nvidia(std::path::Path::new("/")),
     environment: &[],
     accelerator: OnceLock::new(),
 };
 
-/// NVIDIA driver nodes: a discrete GPU's `nvidiactl`, or Jetson's `nvmap`,
-/// `nvhost-ctrl-gpu` or `nvgpu`. Names vary between driver releases, so a
-/// host is skipped only when none exists; hosts without /dev always try.
-fn nvidia_nodes(dev: &std::path::Path) -> bool {
+/// An NVIDIA driver under `root`: a discrete GPU's `nvidiactl`, Jetson's
+/// `nvmap`, `nvhost-ctrl-gpu` or `nvgpu`, or a loaded kernel driver whose
+/// nodes CUDA creates on first use, as it does without udev rules or the
+/// persistence daemon. Names vary between driver releases, so a host is
+/// skipped only when none exists; hosts without /dev always try.
+fn nvidia(root: &std::path::Path) -> bool {
     !cfg!(unix)
-        || ["nvidiactl", "nvmap", "nvhost-ctrl-gpu", "nvgpu"]
-            .iter()
-            .any(|node| dev.join(node).exists())
+        || [
+            "dev/nvidiactl",
+            "dev/nvmap",
+            "dev/nvhost-ctrl-gpu",
+            "dev/nvgpu",
+            "proc/driver/nvidia/version",
+            "sys/module/nvidia",
+        ]
+        .iter()
+        .any(|path| root.join(path).exists())
 }
 
 /// Encode on the GPU when the helper is ready; `None` means use the CPU.
@@ -473,18 +482,23 @@ impl Drop for Encoder {
 #[cfg(all(test, unix))]
 mod tests {
     #[test]
-    fn helper_is_skipped_without_nvidia_device_nodes() {
-        let dev = std::env::temp_dir().join(format!(
+    fn helper_is_skipped_without_an_nvidia_driver() {
+        let root = std::env::temp_dir().join(format!(
             "capturefab-nvidia-nodes-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
+        let dev = root.join("dev");
         std::fs::create_dir_all(&dev).unwrap();
         std::fs::write(dev.join("null"), b"").unwrap();
-        assert!(!super::nvidia_nodes(&dev));
+        assert!(!super::nvidia(&root));
         // Jetson exposes its integrated GPU without nvidiactl.
         std::fs::write(dev.join("nvmap"), b"").unwrap();
-        assert!(super::nvidia_nodes(&dev));
-        std::fs::remove_dir_all(dev).unwrap();
+        assert!(super::nvidia(&root));
+        std::fs::remove_file(dev.join("nvmap")).unwrap();
+        // A loaded driver whose nodes appear when CUDA first starts.
+        std::fs::create_dir_all(root.join("sys/module/nvidia")).unwrap();
+        assert!(super::nvidia(&root));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
