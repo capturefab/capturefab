@@ -66,6 +66,7 @@ pub fn has_secret(access_key_id: &str) -> bool {
 /// Read a key for an in-memory undo transaction. Missing keys differ from a
 /// locked or unavailable credential store: a save must never mistake an
 /// unreadable existing key for an empty slot and then overwrite it.
+#[cfg(feature = "gui")]
 pub(crate) fn read_secret(access_key_id: &str) -> Result<Option<String>> {
     Credentials::Keychain {
         access_key_id: access_key_id.into(),

@@ -206,6 +206,13 @@ capturefab --camera sim:0 capture --destination qa-sftp -o '{date}/{camera}-{seq
 capturefab uploads --json
 ```
 
+A server with no desktop login has no OS credential store (Linux Secret
+Service needs a D-Bus session), so saving with `--password-stdin` or
+`--secret-stdin` fails there. Use `--password-env` with
+`CAPTUREFAB_FTP_PASSWORD` or `CAPTUREFAB_SFTP_PASSWORD` set for the process
+that uploads (`serve`, or its service unit), an SFTP `--key-file`, or S3
+`--env` or `--profile` instead.
+
 A queued upload's ID, remote key and URL are stored in the capture row. See the
 [README](../README.md#save-to-drives-folders-s3-ftp-or-sftp) for the
 no-overwrite rules of each server type.

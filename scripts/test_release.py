@@ -186,7 +186,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(bom['components'][1]['hashes'], [dict(alg='SHA-256', content='d' * 64)])
         self.assertIn('pkg:cargo/wasm-bindgen@1.0.0', bom['dependencies'][0]['dependsOn'])
 
-    def test_build_embeds_the_browser_client_once_it_is_built(self):
+    def test_build_embeds_the_browser_client_once_it_is_built_and_headless_uploads(self):
         with tempfile.TemporaryDirectory() as temp:
             temp = Path(temp)
             source = temp / 'media-sources.tar.gz'
@@ -210,6 +210,8 @@ class ReleaseTests(unittest.TestCase):
                     self.assertEqual(env.get('CAPTUREFAB_WEB_DIST'), str(dist.resolve()) if web else None)
                 self.assertIn('wgpu', builds[0][0][-1].split(','))
                 self.assertIn('--no-default-features', builds[1][0])
+                # Headless line computers upload too.
+                self.assertTrue({'s3', 'ftp', 'sftp'} <= set(builds[1][0][-1].split(',')))
 
     def test_package_records_and_licenses_an_embedded_browser_client(self):
         with tempfile.TemporaryDirectory() as temp:
