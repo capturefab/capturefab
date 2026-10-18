@@ -10,6 +10,8 @@ mod client_activity;
 mod close_error;
 mod dataset;
 mod destinations;
+#[cfg(test)]
+mod display_tests;
 mod format;
 mod gpu;
 mod grid;
@@ -122,6 +124,14 @@ const OVERVIEW_INTERVAL: Duration = Duration::from_micros(33_333);
 /// 5 in the overview.
 const EFFICIENT_INTERVAL: Duration = Duration::from_micros(66_667);
 const EFFICIENT_OVERVIEW_INTERVAL: Duration = Duration::from_millis(200);
+/// Least time between histograms of a stream's frames, and between focus
+/// scores: a histogram reads as well at 5 Hz, and focusing by hand wants more.
+const EXPOSURE_EVERY: Duration = Duration::from_millis(200);
+const FOCUS_EVERY: Duration = Duration::from_millis(66);
+/// Most pixels a side of a shrunk overview tile keeps, and of any view short
+/// of 1:1 in efficiency mode, on the GPU too.
+const TILE_SIDE: u32 = 1920;
+const EFFICIENT_SIDE: u32 = 1280;
 
 pub fn run(handle: SessionHandle, session_label: String, simulated: bool) -> Result<()> {
     run_capture(handle, session_label, simulated, None, 0)
@@ -486,9 +496,26 @@ const MAIN_VIEW: &str = "\0main";
 #[derive(Default)]
 struct CameraPreview {
     frame_id: Option<u64>,
+    /// What `shown` was converted for; the tile's size can change under it.
+    limits: Option<preview::Limits>,
     shown: Option<Shown>,
     meta: Option<(u64, u32, u32, u32)>,
     error: Option<String>,
+}
+
+/// When a scope last measured a frame of the stream, and which.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Measured {
+    at: Option<Instant>,
+    frame: Option<u64>,
+}
+
+impl Measured {
+    /// Whether `frame` is due a measurement: one not yet measured, no sooner
+    /// than `every` after the last.
+    fn due(self, frame: u64, now: Instant, every: Duration) -> bool {
+        self.frame != Some(frame) && self.at.is_none_or(|at| now >= at + every)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -655,6 +682,12 @@ enum Message {
     /// The focus region, normalized to the frame.
     FocusRegion(iced::Rectangle),
     FocusRegionStart,
+    /// A drag of the focus region let go.
+    FocusRegionEnd,
+    /// The overview scrolled this far down.
+    OverviewScrolled(f32),
+    /// Show the control that changes the histogram's exposure.
+    AdjustExposure,
     FocusMetric(scopes::Metric),
     ResetFocusPeak,
     ToggleActivity,
@@ -840,9 +873,14 @@ struct Workbench {
     /// Size of the preview stage at the last layout, so zooming from Fit
     /// starts where the image already is.
     stage: Cell<Size>,
+    /// The overview's tiles at the last layout, and how far it is scrolled.
+    grid: Cell<Option<grid::Grid>>,
+    grid_scroll: f32,
     exposure_open: bool,
     focus_camera: bool,
     exposure: Option<frame::Exposure>,
+    /// What the histogram and the focus score last measured.
+    measured: (Measured, Measured),
     /// The focus region and its scores.
     focus: scopes::FocusMeter,
     shown: Option<Shown>,
@@ -863,6 +901,8 @@ struct Workbench {
     /// camera's ring, that frame's width, height and pixel format.
     frame_source: Option<(u32, u32, u32)>,
     frame_id: Option<u64>,
+    /// What the main view's frame was converted for.
+    frame_limits: Option<preview::Limits>,
     display_error: Option<String>,
     previews: HashMap<String, CameraPreview>,
     camera_views: HashMap<String, camera_view::CameraView>,
@@ -1063,9 +1103,12 @@ impl Workbench {
             fit: true,
             zoom: 1.0,
             stage: Cell::new(Size::new(800.0, 600.0)),
+            grid: Cell::new(None),
+            grid_scroll: 0.0,
             exposure_open: prefs.exposure_open,
             focus_camera: false,
             exposure: None,
+            measured: (Measured::default(), Measured::default()),
             focus: scopes::FocusMeter::new(
                 prefs.focus_open,
                 prefs.focus_region,
@@ -1082,6 +1125,7 @@ impl Workbench {
             frame_meta: None,
             frame_source: None,
             frame_id: None,
+            frame_limits: None,
             display_error: None,
             previews: HashMap::new(),
             camera_views: HashMap::new(),
@@ -1960,31 +2004,55 @@ impl Workbench {
             }
             kept
         });
-        for camera in &snapshot.cameras {
-            let Some(frame) = self.handle.latest_frame_for(&camera.info.id) else {
-                continue;
-            };
-            let preview = self.previews.entry(camera.info.id.clone()).or_default();
-            if preview.frame_id == Some(frame.id) {
+        let grid = self.grid.get();
+        let (count, scale) = (snapshot.cameras.len(), self.main_scale());
+        let (most, shrink_for_gpu) = if crate::efficiency::efficient() {
+            (EFFICIENT_SIDE, preview::Shrink::Larger)
+        } else {
+            (TILE_SIDE, preview::Shrink::UnderHalf)
+        };
+        for (index, camera) in snapshot.cameras.iter().enumerate() {
+            let id = &camera.info.id;
+            if grid.is_some_and(|grid| !grid.shows(index, count, self.grid_scroll)) {
+                // Scrolled out: nothing pulled from the ring or converted, and
+                // no frame held for a GPU view that is not drawn. Shown again
+                // when it scrolls back in, without counting as a new frame.
+                if let Some(preview) = self.previews.get_mut(id)
+                    && matches!(preview.shown, Some(Shown::Gpu { .. }))
+                    && preview.limits.take().is_some()
+                {
+                    gpu.retire(id);
+                }
                 continue;
             }
-            preview.frame_id = Some(frame.id);
-            liveness::seen(
-                &mut self.liveness,
-                self.scene.frozen.as_ref(),
-                &camera.info.id,
-                self.now,
-            );
+            let Some(frame) = self.handle.latest_frame_for(id) else {
+                continue;
+            };
+            let tile = grid.map_or(Size::new(640.0, 480.0), |grid| grid.tile);
+            let native = Size::new(frame.width as f32, frame.height as f32);
+            let limits = preview::Limits {
+                shrink_for_gpu,
+                ..preview::Limits::shown(&frame, preview::fit_scale(tile, native) * scale, most)
+            };
+            let preview = self.previews.entry(id.clone()).or_default();
+            let fresh = preview.frame_id != Some(frame.id);
+            if !fresh && preview.limits == Some(limits) {
+                continue;
+            }
+            (preview.frame_id, preview.limits) = (Some(frame.id), Some(limits));
+            if fresh {
+                liveness::seen(&mut self.liveness, self.scene.frozen.as_ref(), id, self.now);
+            }
             let meta = (frame.id, frame.width, frame.height, frame.pixel_format);
-            let state = self.camera_views.entry(camera.info.id.clone()).or_default();
+            let state = self.camera_views.entry(id.clone()).or_default();
             let shown = camera_view::present(
                 gpu,
                 &mut preview.shown,
                 state,
                 (camera.info.profile.kind, &camera.features),
-                &camera.info.id,
+                id,
                 frame,
-                (640, 480),
+                limits,
             );
             match shown {
                 Ok(()) => {
@@ -1996,15 +2064,28 @@ impl Workbench {
         }
     }
 
+    /// Show the selected camera's newest frame, and its current frame again
+    /// when the main view now shows more or less of it: after a zoom, a
+    /// resize or a change of scale.
     fn update_frame(&mut self, arrival: bool) {
         let Some(frame) = self.selected_frame() else {
             return;
         };
-        if Some(frame.id) == self.frame_id {
+        let limits = self.main_limits(&frame);
+        let fresh = Some(frame.id) != self.frame_id;
+        if !fresh && Some(limits) == self.frame_limits {
+            // A frame the scopes passed over while paced, such as the last
+            // before a stream stopped, once each is due.
+            self.measure(&frame, true);
             return;
         }
-        self.frame_id = Some(frame.id);
-        if arrival && let Some(id) = &self.observed_camera {
+        // The first frame of a camera, or of a new view of it, measures at once.
+        let paced = self.frame_id.is_some();
+        (self.frame_id, self.frame_limits) = (Some(frame.id), Some(limits));
+        if fresh
+            && arrival
+            && let Some(id) = &self.observed_camera
+        {
             liveness::seen(&mut self.liveness, self.scene.frozen.as_ref(), id, self.now);
         }
         let meta = (
@@ -2023,7 +2104,9 @@ impl Workbench {
         {
             self.focus.reset();
         }
-        self.measure(&frame);
+        if fresh {
+            self.measure(&frame, paced);
+        }
         let kind = self.camera_kind();
         let id = self.snapshot.active_camera.clone().unwrap_or_default();
         let source = self.handle.preview_of(&id);
@@ -2035,7 +2118,7 @@ impl Workbench {
             (kind, &self.snapshot.features),
             MAIN_VIEW,
             frame,
-            (u32::MAX, u32::MAX),
+            limits,
         );
         match shown {
             Ok(()) => {
@@ -2047,20 +2130,70 @@ impl Workbench {
         }
     }
 
-    /// Update the open scopes from `frame`. A frame they cannot measure
-    /// still shows; presenting it reports any real decoding problem.
-    fn measure(&mut self, frame: &crate::types::Frame) {
+    /// Physical pixels per layout unit in the main window.
+    fn main_scale(&self) -> f32 {
+        self.window_scales
+            .get(&self.main_window)
+            .copied()
+            .unwrap_or(1.0)
+            * self.ui_scale.factor()
+    }
+
+    /// How much of `frame` the main view converts: what the picture covers
+    /// on screen at the zoom it settles at, every pixel from 1:1 up.
+    fn main_limits(&self, frame: &crate::types::Frame) -> preview::Limits {
+        let native = Size::new(frame.width as f32, frame.height as f32);
+        let zoom = if self.fit {
+            preview::fit_scale(self.stage.get(), native)
+        } else {
+            self.zoom
+        };
+        let (most, shrink_for_gpu) = if crate::efficiency::efficient() {
+            (EFFICIENT_SIDE, preview::Shrink::Larger)
+        } else {
+            (u32::MAX, preview::Shrink::Never)
+        };
+        preview::Limits {
+            shrink_for_gpu,
+            ..preview::Limits::shown(frame, zoom * self.main_scale(), most)
+        }
+    }
+
+    /// Update the open scopes from `frame`; `paced` while frames stream, so
+    /// each scope measures no more often than it needs, and each frame once.
+    /// A frame they cannot measure still shows; presenting it reports any
+    /// real decoding problem.
+    fn measure(&mut self, frame: &crate::types::Frame, paced: bool) {
         if !self.intensity_image() || self.camera_kind() == CameraKind::LineScan {
             self.exposure = None;
             self.focus.reset();
             return;
         }
-        if self.exposure_open {
+        let now = self.now;
+        let due = |measured: Measured, every| !paced || measured.due(frame.id, now, every);
+        if self.exposure_open && due(self.measured.0, EXPOSURE_EVERY) {
+            self.measured.0 = Measured {
+                at: Some(now),
+                frame: Some(frame.id),
+            };
             self.exposure = frame::exposure(frame).ok();
         }
-        if self.focus.open
-            && let Ok(score) = frame::sharpness(frame, self.focus.pixels(frame.width, frame.height))
-        {
+        if due(self.measured.1, FOCUS_EVERY) {
+            self.measure_focus(frame);
+        }
+    }
+
+    /// Score the focus region of `frame`, when it is open.
+    fn measure_focus(&mut self, frame: &crate::types::Frame) {
+        if !self.focus.open {
+            return;
+        }
+        // A frame that cannot be scored is not tried again.
+        self.measured.1 = Measured {
+            at: Some(self.now),
+            frame: Some(frame.id),
+        };
+        if let Ok(score) = frame::sharpness(frame, self.focus.pixels(frame.width, frame.height)) {
             self.focus.record(score);
         }
     }
@@ -2069,7 +2202,20 @@ impl Workbench {
     /// stream still shows current values.
     fn remeasure(&mut self) {
         if let Some(frame) = self.selected_frame() {
-            self.measure(&frame);
+            self.measure(&frame, false);
+        }
+    }
+
+    /// Score the latest frame's focus region after it moved, unless scored
+    /// since or within `every` of the last score; the histogram does not
+    /// depend on it.
+    fn remeasure_focus(&mut self, every: Duration) {
+        if self.intensity_image()
+            && self.camera_kind() != CameraKind::LineScan
+            && let Some(frame) = self.selected_frame()
+            && self.measured.1.due(frame.id, self.now, every)
+        {
+            self.measure_focus(&frame);
         }
     }
 
@@ -2410,6 +2556,23 @@ impl Workbench {
         }
     }
 
+    /// Open the Features tab on the exposure control, lit as when the
+    /// camera takes a value, and focus it when it is a field. Quick controls
+    /// show only while no search narrows the features.
+    fn adjust_exposure(&mut self) -> Task<Message> {
+        let Some(name) = self.exposure_control() else {
+            return Task::none();
+        };
+        self.search.clear();
+        let tab = self.handle_message(Message::ShowTab(Tab::Features));
+        self.flash_feature(name);
+        match name {
+            // A choice, which takes no focus by name.
+            "ExposureAuto" => tab,
+            _ => operation::focus(format!("feature:{name}")),
+        }
+    }
+
     fn zoom_by(&mut self, factor: f32) {
         let from = if self.fit {
             self.shown.as_ref().map_or(1.0, |shown| {
@@ -2418,8 +2581,23 @@ impl Workbench {
         } else {
             self.zoom
         };
-        self.fit = false;
-        self.zoom = (from * factor).clamp(stage::ZOOM_MIN, stage::ZOOM_MAX);
+        self.zoom_to(Some(
+            (from * factor).clamp(stage::ZOOM_MIN, stage::ZOOM_MAX),
+        ));
+    }
+
+    /// Show the picture at `zoom`, or fitted for None. The frame shown is
+    /// converted again at once if the new zoom needs more or fewer of its
+    /// pixels, so even a stopped stream is sharp at 1:1, and the zoom eases
+    /// in on that picture.
+    fn zoom_to(&mut self, zoom: Option<f32>) {
+        self.fit = zoom.is_none();
+        if let Some(zoom) = zoom {
+            self.zoom = zoom;
+        }
+        if !self.overview() {
+            self.update_frame(false);
+        }
     }
 
     fn storage_policy(&self) -> StoragePolicy {
@@ -3058,11 +3236,8 @@ impl Workbench {
                 let _ = self.handle_message(Message::Balance(value));
                 return self.handle_message(Message::BalanceReleased);
             }
-            Message::Fit => self.fit = true,
-            Message::Actual => {
-                self.fit = false;
-                self.zoom = 1.0;
-            }
+            Message::Fit => self.zoom_to(None),
+            Message::Actual => self.zoom_to(Some(1.0)),
             Message::Zoom(factor) => self.zoom_by(factor),
             Message::ToggleCameraView => {
                 if let Some(id) = &self.snapshot.active_camera {
@@ -3074,11 +3249,28 @@ impl Workbench {
             Message::ToggleExposure => self.toggle_exposure(),
             Message::ToggleFocusRegion => self.toggle_focus_region(),
             Message::FocusRegion(region) => {
-                self.focus.region = region;
-                self.focus.reset();
-                self.remeasure();
+                self.focus.move_to(region);
+                // The frame shown is unscored for the new region: scored at
+                // most once a frame's time while dragging, here or on the next
+                // tick, and where it lands on release.
+                self.measured.1.frame = None;
+                self.remeasure_focus(FOCUS_EVERY);
             }
-            Message::FocusRegionStart => self.break_history_group(),
+            Message::FocusRegionStart => {
+                self.break_history_group();
+                // A new press scores its first region at once, such as a click
+                // that moves the region without a drag.
+                self.measured.1 = Measured::default();
+            }
+            Message::FocusRegionEnd => self.remeasure_focus(Duration::ZERO),
+            Message::AdjustExposure => return self.adjust_exposure(),
+            Message::OverviewScrolled(offset) => {
+                self.grid_scroll = offset;
+                // Tiles scrolled into view show their newest frame at once.
+                if self.overview() {
+                    self.update_previews();
+                }
+            }
             Message::FocusMetric(metric) => self.focus.set_metric(metric),
             Message::ResetFocusPeak => {
                 self.focus.reset();
@@ -3508,11 +3700,8 @@ impl Workbench {
             Action::ForwardTab => return self.handle_message(Message::ShowTab(Tab::Forward)),
             Action::ZoomIn => self.zoom_by(1.25),
             Action::ZoomOut => self.zoom_by(1.0 / 1.25),
-            Action::ZoomFit => self.fit = true,
-            Action::ZoomActual => {
-                self.fit = false;
-                self.zoom = 1.0;
-            }
+            Action::ZoomFit => self.zoom_to(None),
+            Action::ZoomActual => self.zoom_to(Some(1.0)),
             Action::ToggleActivity => self.logs_open = !self.logs_open,
             // Pressed where it does not apply, e.g. Space with no camera connected.
             _ => {}

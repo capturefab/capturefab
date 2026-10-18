@@ -1927,7 +1927,7 @@ fn descriptor(frame: &Frame) -> Result<Descriptor> {
         frame.data.len() <= MAX_FRAME_BYTES,
         "frame exceeds 256 MiB session capture limit"
     );
-    let (w, h, rgba) = frame::preview_rgba(frame, 64, 64)?;
+    let (w, h, rgba) = frame::sampled_rgba(frame, 64, 64)?;
     ensure!(
         w > 0 && h > 0 && w <= 64 && h <= 64,
         "invalid descriptor preview dimensions"

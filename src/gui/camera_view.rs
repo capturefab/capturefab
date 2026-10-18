@@ -14,10 +14,10 @@ pub(super) fn present(
     context: (CameraKind, &[FeatureInfo]),
     key: &str,
     source: Arc<Frame>,
-    limits: (u32, u32),
+    limits: super::preview::Limits,
 ) -> Result<()> {
     let (kind, features) = context;
-    if let Some(display) = state.transform(kind, &source, features)? {
+    if let Some(display) = state.transform(kind, &source, features, limits.size)? {
         gpu.retire(key);
         *shown = Some(super::preview::Shown::Image {
             handle: iced::widget::image::Handle::from_rgba(
@@ -29,9 +29,7 @@ pub(super) fn present(
         });
         return Ok(());
     }
-    super::preview::present(gpu, shown, key, source, |source| {
-        frame::preview_rgba(source, limits.0, limits.1)
-    })
+    super::preview::present(gpu, shown, key, source, limits)
 }
 
 #[derive(Default)]
@@ -64,17 +62,24 @@ impl CameraView {
     /// Returns a CPU display image and its placement size, or None for the
     /// ordinary GPU/CPU sensor preview. Unsupported depth formats stay on
     /// the ordinary path, which explains the format and offers raw capture.
+    /// Depth and thermal images keep no more than `bounds` pixels each way.
     pub fn transform(
         &mut self,
         kind: CameraKind,
         source: &Frame,
         features: &[FeatureInfo],
+        bounds: (u32, u32),
     ) -> Result<Option<DisplayImage>> {
         self.legend = None;
         if self.sensor {
             if source.pixel_format == 0x0120_00bf {
-                let (image, low, high) =
-                    scalar_image(source, true, false, invalid_sample(source, features))?;
+                let (image, low, high) = scalar_image(
+                    source,
+                    true,
+                    false,
+                    invalid_sample(source, features),
+                    bounds,
+                )?;
                 self.legend = Some(format!("Auto grayscale range: raw {low:.1}–{high:.1}"));
                 return Ok(Some(image));
             }
@@ -101,6 +106,7 @@ impl CameraView {
                     kind == CameraKind::Depth,
                     true,
                     invalid_sample(source, features),
+                    bounds,
                 )?;
                 self.legend = Some(format!(
                     "Auto color range: raw {low:.1}–{high:.1} · {} · save raw for measurements",
@@ -160,11 +166,18 @@ pub(super) struct DisplayImage {
     pub native: Size,
 }
 
+/// The newest `HISTORY_ROWS` rows received, kept in a ring, so a block
+/// costs copying its own rows rather than moving the whole history.
 #[derive(Default)]
 struct LineHistory {
     shape: Option<(u32, u32, u32)>,
     last: Option<(u64, u64)>,
-    rows: Vec<u8>,
+    /// `HISTORY_ROWS` rows of RGBA once a block has arrived.
+    ring: Vec<u8>,
+    /// The ring row the next row goes in.
+    next: usize,
+    /// Rows held, at most `HISTORY_ROWS`.
+    rows: usize,
 }
 
 impl LineHistory {
@@ -182,12 +195,13 @@ impl LineHistory {
         );
         let shape = (source.width, source.height, source.pixel_format);
         if self.shape != Some(shape)
+            || self.ring.len() != stride * HISTORY_ROWS
             || self
                 .last
                 .is_some_and(|(id, stamp)| source.id < id || source.timestamp_ns < stamp)
         {
-            self.rows.clear();
-            self.last = None;
+            self.ring = vec![0; stride * HISTORY_ROWS];
+            (self.next, self.rows, self.last) = (0, 0, None);
         }
         self.shape = Some(shape);
         // Shared memory is newest-frame-wins: make skipped blocks visible,
@@ -200,26 +214,36 @@ impl LineHistory {
                 .last
                 .is_some_and(|(id, _)| source.id != id.saturating_add(1))
             {
-                self.rows.extend(std::iter::repeat_n(0, stride));
+                self.row(stride).fill(0);
             }
-            self.rows.extend_from_slice(&rgba);
+            // Only the newest rows of a tall block can stay.
+            for line in rgba.chunks_exact(stride).rev().take(HISTORY_ROWS).rev() {
+                self.row(stride).copy_from_slice(line);
+            }
         }
         self.last = Some((source.id, source.timestamp_ns));
-        let keep = stride * HISTORY_ROWS;
-        if self.rows.len() > keep {
-            self.rows.drain(..self.rows.len() - keep);
-        }
-        let rows = (self.rows.len() / stride) as u32;
-        // A stable canvas avoids zoom jumping as history fills.
-        let mut display = vec![0; keep];
-        let offset = stride * (HISTORY_ROWS - rows as usize);
-        display[offset..].copy_from_slice(&self.rows);
+        // A stable canvas avoids zoom jumping as history fills: empty rows on
+        // top, then the ring from its oldest row.
+        let mut display = Vec::with_capacity(stride * HISTORY_ROWS);
+        display.resize(stride * (HISTORY_ROWS - self.rows), 0);
+        let oldest = (self.next + HISTORY_ROWS - self.rows) % HISTORY_ROWS;
+        let end = oldest + self.rows;
+        display.extend_from_slice(&self.ring[oldest * stride..end.min(HISTORY_ROWS) * stride]);
+        display.extend_from_slice(&self.ring[..end.saturating_sub(HISTORY_ROWS) * stride]);
         Ok(DisplayImage {
             width,
             height: HISTORY_ROWS as u32,
             rgba: display,
             native: Size::new(width as f32, HISTORY_ROWS as f32),
         })
+    }
+
+    /// The ring row to write the next row into, now counted as held.
+    fn row(&mut self, stride: usize) -> &mut [u8] {
+        let at = self.next;
+        self.next = (at + 1) % HISTORY_ROWS;
+        self.rows = (self.rows + 1).min(HISTORY_ROWS);
+        &mut self.ring[at * stride..][..stride]
     }
 }
 
@@ -259,11 +283,15 @@ fn invalid_sample(source: &Frame, features: &[FeatureInfo]) -> Option<f32> {
         .filter(|v| v.is_finite())
 }
 
+/// A depth or thermal frame as colors (`colorized`, `depth` picking the
+/// ramp) or grays over its own range, keeping at most `bounds` pixels each
+/// way, and the range.
 fn scalar_image(
     source: &Frame,
     depth: bool,
     colorized: bool,
     invalid: Option<f32>,
+    bounds: (u32, u32),
 ) -> Result<(DisplayImage, f32, f32)> {
     let bytes = scalar_bytes(source.pixel_format).expect("checked scalar format");
     let pixels = (source.width as usize).checked_mul(source.height as usize);
@@ -283,10 +311,11 @@ fn scalar_image(
             _ => f32::from_le_bytes(source.data[offset..offset + 4].try_into().unwrap()),
         }
     };
+    // Point samples: averaging would blend valid values with invalid ones.
     let step = source
         .width
-        .div_ceil(2048)
-        .max(source.height.div_ceil(1536))
+        .div_ceil(bounds.0.clamp(1, 2048))
+        .max(source.height.div_ceil(bounds.1.clamp(1, 1536)))
         .max(1);
     let (width, height) = (source.width.div_ceil(step), source.height.div_ceil(step));
     let values: Vec<f32> = (0..source.height)
@@ -365,6 +394,7 @@ fn color(t: f32, depth: bool) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const ALL: (u32, u32) = (u32::MAX, u32::MAX);
     fn line(id: u64, width: u32, value: u8) -> Frame {
         Frame {
             id,
@@ -379,10 +409,10 @@ mod tests {
     #[test]
     fn line_history_keeps_rows_marks_loss_and_resets_on_geometry_changes() {
         let mut view = CameraView::default();
-        view.transform(CameraKind::LineScan, &line(1, 2, 40), &[])
+        view.transform(CameraKind::LineScan, &line(1, 2, 40), &[], ALL)
             .unwrap();
         let image = view
-            .transform(CameraKind::LineScan, &line(3, 2, 80), &[])
+            .transform(CameraKind::LineScan, &line(3, 2, 80), &[], ALL)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -393,22 +423,88 @@ mod tests {
             &image.rgba[image.rgba.len() - 16..image.rgba.len() - 8],
             &[0; 8]
         );
-        assert_eq!(view.lines.rows.len(), 24);
-        view.transform(CameraKind::LineScan, &line(3, 2, 80), &[])
+        assert_eq!(view.lines.rows, 3);
+        view.transform(CameraKind::LineScan, &line(3, 2, 80), &[], ALL)
             .unwrap();
         assert_eq!(
-            view.lines.rows.len(),
-            24,
+            view.lines.rows, 3,
             "re-rendering a stopped block cannot invent loss"
         );
-        view.transform(CameraKind::LineScan, &line(4, 3, 20), &[])
+        view.transform(CameraKind::LineScan, &line(4, 3, 20), &[], ALL)
             .unwrap();
-        assert_eq!(view.lines.rows.len(), 12);
+        assert_eq!(view.lines.rows, 1);
         for id in 5..600 {
-            view.transform(CameraKind::LineScan, &line(id, 3, 20), &[])
+            view.transform(CameraKind::LineScan, &line(id, 3, 20), &[], ALL)
                 .unwrap();
         }
-        assert_eq!(view.lines.rows.len(), 3 * 4 * HISTORY_ROWS);
+        assert_eq!(view.lines.rows, HISTORY_ROWS);
+    }
+
+    #[test]
+    fn line_history_wraps_its_ring_oldest_row_first() {
+        let mut view = CameraView::default();
+        let row = |image: &DisplayImage, i: usize| image.rgba[i * 4];
+        // Each row one darker than the next, past the ring's end.
+        let mut image = None;
+        for id in 1..=HISTORY_ROWS as u64 + 100 {
+            image = view
+                .transform(CameraKind::LineScan, &line(id, 1, id as u8), &[], ALL)
+                .unwrap();
+        }
+        let image = image.unwrap();
+        assert_eq!(image.rgba.len(), 4 * HISTORY_ROWS);
+        let newest = (HISTORY_ROWS + 100) as u8;
+        assert_eq!(row(&image, HISTORY_ROWS - 1), newest);
+        assert_eq!(
+            row(&image, 0),
+            newest.wrapping_sub((HISTORY_ROWS - 1) as u8)
+        );
+        for i in 1..HISTORY_ROWS {
+            assert_eq!(
+                row(&image, i),
+                row(&image, i - 1).wrapping_add(1),
+                "row {i}"
+            );
+        }
+        // A block taller than the history keeps its newest rows only.
+        let tall = Frame {
+            id: 9999,
+            width: 1,
+            height: HISTORY_ROWS as u32 + 7,
+            pixel_format: crate::types::MONO8,
+            timestamp_ns: 9999,
+            data: (0..HISTORY_ROWS + 7).map(|i| i as u8).collect(),
+        };
+        let mut fresh = CameraView::default();
+        let image = fresh
+            .transform(CameraKind::LineScan, &tall, &[], ALL)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.lines.rows, HISTORY_ROWS);
+        assert_eq!(row(&image, HISTORY_ROWS - 1), (HISTORY_ROWS + 6) as u8);
+        assert_eq!(row(&image, 0), 7);
+    }
+
+    #[test]
+    fn depth_and_thermal_images_keep_to_the_view() {
+        let source = Frame {
+            width: 4000,
+            height: 3000,
+            pixel_format: 0x0110_00b8,
+            data: vec![7; 4000 * 3000 * 2],
+            ..Frame::default()
+        };
+        let (image, ..) = scalar_image(&source, true, true, None, (640, 480)).unwrap();
+        assert!(
+            image.width <= 640 && image.height <= 480,
+            "{}x{}",
+            image.width,
+            image.height
+        );
+        assert_eq!(image.native, Size::new(4000.0, 3000.0));
+        // Still no larger than before for a large view.
+        let (image, ..) = scalar_image(&source, true, true, None, ALL).unwrap();
+        assert!(image.width <= 2048 && image.height <= 1536);
     }
 
     #[test]
@@ -424,13 +520,13 @@ mod tests {
             ..Frame::default()
         };
         let original = source.data.clone();
-        let (image, low, high) = scalar_image(&source, true, true, None).unwrap();
+        let (image, low, high) = scalar_image(&source, true, true, None, ALL).unwrap();
         assert_eq!((low, high), (1000.0, 1002.0));
         assert_ne!(image.rgba[..4], image.rgba[4..8]);
         assert_eq!(source.data, original);
         let mut short = source;
         short.data.pop();
-        assert!(scalar_image(&short, true, true, None).is_err());
+        assert!(scalar_image(&short, true, true, None, ALL).is_err());
     }
 
     #[test]
@@ -439,7 +535,7 @@ mod tests {
         let source = line(1, 2, 20);
         view.toggle();
         assert!(
-            view.transform(CameraKind::LineScan, &source, &[])
+            view.transform(CameraKind::LineScan, &source, &[], ALL)
                 .unwrap()
                 .is_none()
         );
@@ -449,7 +545,7 @@ mod tests {
         };
         assert!(
             CameraView::default()
-                .transform(CameraKind::Depth, &color, &[])
+                .transform(CameraKind::Depth, &color, &[], ALL)
                 .unwrap()
                 .is_none()
         );
@@ -467,7 +563,7 @@ mod tests {
                 .collect(),
             ..Frame::default()
         };
-        let (image, low, high) = scalar_image(&source, true, true, None).unwrap();
+        let (image, low, high) = scalar_image(&source, true, true, None, ALL).unwrap();
         assert_eq!((low, high), (4.0, 4.0));
         assert_eq!(&image.rgba[..4], &[0, 0, 0, 255]);
         assert_eq!(image.rgba[4..8], image.rgba[8..12]);
@@ -477,7 +573,7 @@ mod tests {
         };
         assert!(
             sensor
-                .transform(CameraKind::Depth, &source, &[])
+                .transform(CameraKind::Depth, &source, &[], ALL)
                 .unwrap()
                 .is_some()
         );
@@ -493,7 +589,7 @@ mod tests {
             ..Frame::default()
         };
         let image = CameraView::default()
-            .transform(CameraKind::LineScan, &source, &[])
+            .transform(CameraKind::LineScan, &source, &[], ALL)
             .unwrap()
             .unwrap();
         assert_eq!((image.width, image.height), (640, HISTORY_ROWS as u32));
@@ -518,7 +614,7 @@ mod tests {
         };
         let invalid = invalid_sample(&source, &features);
         assert_eq!(invalid, Some(0.0));
-        let (image, low, high) = scalar_image(&source, true, true, invalid).unwrap();
+        let (image, low, high) = scalar_image(&source, true, true, invalid, ALL).unwrap();
         assert_eq!((low, high), (1000.0, 1100.0));
         assert_eq!(&image.rgba[..4], &[0, 0, 0, 255]);
         features
@@ -527,6 +623,6 @@ mod tests {
             .unwrap()
             .value = Some(serde_json::json!(false));
         assert_eq!(invalid_sample(&source, &features), None);
-        assert_eq!(scalar_image(&source, true, true, None).unwrap().1, 0.0);
+        assert_eq!(scalar_image(&source, true, true, None, ALL).unwrap().1, 0.0);
     }
 }

@@ -30,6 +30,7 @@ struct Uniforms {
     shift: i32,
     cfa: vec4<i32>,
     // x: the target is sRGB, so output linear light.
+    // y: texels in a row of folded packed RGB/BGR.
     flags: vec4<i32>,
 };
 
@@ -83,13 +84,26 @@ fn channel(c: i32) -> vec3<u32> {
     return select(vec3<u32>(0u), vec3<u32>(1u), vec3<bool>(c == 0, c == 1, c == 2));
 }
 
+// The three bytes of packed pixel p: the frame's bytes in order, four to a
+// texel, folded into rows of u.flags.y texels.
+fn packed(p: vec2<i32>) -> vec3<u32> {
+    let at = (p.y * u.size.x + p.x) * 3;
+    let fold = u.flags.y;
+    let word = at >> 2;
+    let next = min(word + 1, (u.size.x * u.size.y * 3 - 1) >> 2);
+    let a = textureLoad(frame, vec2<i32>(word % fold, word / fold), 0);
+    let b = textureLoad(frame, vec2<i32>(next % fold, next / fold), 0);
+    var bytes = array<u32, 8>(a.r, a.g, a.b, a.a, b.r, b.g, b.b, b.a);
+    let i = at & 3;
+    return vec3<u32>(bytes[i], bytes[i + 1], bytes[i + 2]);
+}
+
 // Exactly frame::convert for one pixel: unpacked mono is shifted and clamped;
 // packed RGB/BGR is three bytes per pixel; Bayer averages the in-bounds 3x3
 // neighbors of each missing color with truncating integer division.
 fn decode(p: vec2<i32>) -> vec3<u32> {
     if (u.kind == 1 || u.kind == 2) {
-        let x = p.x * 3;
-        let a = vec3<u32>(texel(vec2<i32>(x, p.y)), texel(vec2<i32>(x + 1, p.y)), texel(vec2<i32>(x + 2, p.y)));
+        let a = packed(p);
         return select(a.zyx, a, u.kind == 1);
     }
     let t = texel(p);
@@ -165,9 +179,11 @@ const BAYER: i32 = 3;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Layout {
     format: wgpu::TextureFormat,
-    /// Texels per pixel along a row: 3 for packed RGB/BGR bytes.
-    texels: u32,
     bytes_per_texel: u32,
+    /// Packed RGB/BGR: the frame's bytes in order, four to a texel, folded
+    /// into rows as wide as a texture allows. Any width fits, wider than the
+    /// texture itself, up to four bytes for every texel it can hold.
+    folded: bool,
     kind: i32,
     shift: i32,
     cfa: [i32; 4],
@@ -177,8 +193,8 @@ impl Layout {
     fn of(pixel_format: u32) -> Option<Self> {
         let gray = |format, bytes_per_texel, shift| Self {
             format,
-            texels: 1,
             bytes_per_texel,
+            folded: false,
             kind: 0,
             shift,
             cfa: [0; 4],
@@ -188,9 +204,9 @@ impl Layout {
             cfg!(target_endian = "little").then(|| gray(wgpu::TextureFormat::R16Uint, 2, shift))
         };
         let packed = |kind| Self {
-            texels: 3,
+            folded: true,
             kind,
-            ..gray(wgpu::TextureFormat::R8Uint, 1, 0)
+            ..gray(wgpu::TextureFormat::Rgba8Uint, 4, 0)
         };
         match pixel_format {
             MONO8 | 0x0108_00b1 | 0x0108_00c6 => Some(gray(wgpu::TextureFormat::R8Uint, 1, 0)),
@@ -206,6 +222,31 @@ impl Layout {
             }),
             _ => None,
         }
+    }
+
+    /// The texture a `width` × `height` frame takes, if its sides fit in
+    /// `max` texels.
+    fn extent(&self, (width, height): (u32, u32), max: u32) -> Option<(u32, u32)> {
+        let (width, height) = if self.folded {
+            let bytes = self.bytes((width, height));
+            // The shader counts bytes in 32-bit integers.
+            if i32::try_from(bytes).is_err() {
+                return None;
+            }
+            let words = (bytes as u64).div_ceil(4);
+            let row = words.clamp(1, u64::from(max.max(1)));
+            (row, words.div_ceil(row))
+        } else {
+            (u64::from(width), u64::from(height))
+        };
+        let side = |v: u64| u32::try_from(v).ok().filter(|&v| v <= max);
+        Some((side(width)?, side(height)?))
+    }
+
+    /// Bytes of a `width` × `height` frame.
+    fn bytes(&self, (width, height): (u32, u32)) -> usize {
+        let per_pixel = if self.folded { 3 } else { self.bytes_per_texel };
+        width as usize * height as usize * per_pixel as usize
     }
 }
 
@@ -245,6 +286,9 @@ struct Shared {
 pub struct GpuFrames {
     shared: Arc<Mutex<Shared>>,
     disabled: bool,
+    /// A texture limit standing in for a built pipeline's, in tests.
+    #[cfg(test)]
+    limit: Option<u32>,
 }
 
 impl std::fmt::Debug for GpuFrames {
@@ -257,29 +301,74 @@ impl GpuFrames {
     /// `CAPTUREFAB_GPU_PREVIEW=0` keeps CPU conversion, e.g. to rule out a driver.
     pub fn new() -> Self {
         Self {
-            shared: Arc::default(),
             disabled: std::env::var_os("CAPTUREFAB_GPU_PREVIEW").is_some_and(|value| value == "0"),
+            ..Self::default()
         }
+    }
+
+    /// Decodes on the GPU as if its pipeline were built with this texture
+    /// limit, whichever renderer the tests run under.
+    #[cfg(test)]
+    pub fn limited(limit: u32) -> Self {
+        Self {
+            limit: Some(limit),
+            ..Self::default()
+        }
+    }
+
+    /// Converts every frame on the CPU, whichever renderer the tests run under.
+    #[cfg(test)]
+    pub fn cpu_only() -> Self {
+        Self {
+            disabled: true,
+            ..Self::default()
+        }
+    }
+
+    /// The frame awaiting upload under `key`.
+    #[cfg(test)]
+    pub fn pending(&self, key: &str) -> Option<Arc<Frame>> {
+        self.shared().pending.get(key).cloned()
+    }
+
+    #[cfg(test)]
+    pub fn is_retired(&self, key: &str) -> bool {
+        self.shared().retired.contains(key)
+    }
+
+    /// The largest texture side, once the pipeline is built.
+    fn limit(&self) -> Option<u32> {
+        #[cfg(test)]
+        if self.limit.is_some() {
+            return self.limit;
+        }
+        AVAILABLE
+            .load(Ordering::Relaxed)
+            .then(|| MAX_SIDE.load(Ordering::Relaxed))
     }
 
     fn shared(&self) -> std::sync::MutexGuard<'_, Shared> {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The largest texture side frames are decoded in, while the GPU
+    /// decodes them at all.
+    pub fn texture_side(&self) -> Option<u32> {
+        self.limit().filter(|_| !self.disabled)
+    }
+
     /// Whether this frame can be shown without CPU conversion.
     pub fn accepts(&self, frame: &Frame) -> bool {
-        let max = MAX_SIDE.load(Ordering::Relaxed);
-        !self.disabled
-            && AVAILABLE.load(Ordering::Relaxed)
-            && Layout::of(frame.pixel_format).is_some_and(|layout| {
-                frame.width > 0
-                    && frame.height > 0
-                    && frame.width.saturating_mul(layout.texels) <= max
-                    && frame.height <= max
-                    && frame.data.len()
-                        >= (frame.width * layout.texels * layout.bytes_per_texel) as usize
-                            * frame.height as usize
-            })
+        let Some(max) = self.texture_side() else {
+            return false;
+        };
+        let size = (frame.width, frame.height);
+        Layout::of(frame.pixel_format).is_some_and(|layout| {
+            frame.width > 0
+                && frame.height > 0
+                && layout.extent(size, max).is_some()
+                && frame.data.len() >= layout.bytes(size)
+        })
     }
 
     /// Queue `frame` for display under `key`; it is uploaded when next drawn.
@@ -575,7 +664,16 @@ impl shader::Primitive for Primitive {
             kind: slot.layout.kind,
             shift: slot.layout.shift,
             cfa: slot.layout.cfa,
-            flags: [i32::from(pipeline.srgb), 0, 0, 0],
+            flags: [
+                i32::from(pipeline.srgb),
+                if slot.layout.folded {
+                    slot.storage.0 as i32
+                } else {
+                    0
+                },
+                0,
+                0,
+            ],
         };
         queue.write_buffer(&slot.uniforms, 0, bytemuck::bytes_of(&uniforms));
         if !slot.once {
@@ -652,14 +750,16 @@ impl Pipeline {
         frame: &Frame,
     ) -> Result<(), String> {
         let layout = Layout::of(frame.pixel_format).ok_or("unsupported pixel format")?;
-        let (width, height) = (frame.width * layout.texels, frame.height);
-        let row = width * layout.bytes_per_texel;
+        let size = (frame.width, frame.height);
+        let (width, height) = layout
+            .extent(size, device.limits().max_texture_dimension_2d)
+            .ok_or("frame too large for a texture")?;
+        let row = (width * layout.bytes_per_texel) as usize;
         let pixels = frame
             .data
-            .get(..row as usize * height as usize)
+            .get(..layout.bytes(size))
             .ok_or("truncated frame")?;
         let storage = (width, height, layout.format);
-        let size = (frame.width, frame.height);
         if self
             .slots
             .get(key)
@@ -696,25 +796,42 @@ impl Pipeline {
         }
         let slot = self.slots.get_mut(key).ok_or("missing slot")?;
         slot.layout = layout;
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &slot.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(row),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+        let write = |y: usize, rows: &[u8]| {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &slot.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: y as u32,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                rows,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row as u32),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height: (rows.len() / row) as u32,
+                    depth_or_array_layers: 1,
+                },
+            );
+        };
+        // Whole rows, then what a folded frame leaves of its last row, padded.
+        let whole = pixels.len() / row;
+        let (rows, rest) = pixels.split_at(whole * row);
+        if whole > 0 {
+            write(0, rows);
+        }
+        if !rest.is_empty() {
+            let mut last = vec![0; row];
+            last[..rest.len()].copy_from_slice(rest);
+            write(whole, &last);
+        }
         Ok(())
     }
 }
@@ -742,7 +859,17 @@ mod tests {
                 assert!(Layout::of(format).is_some(), "{format:#x}");
             }
         }
-        assert_eq!(Layout::of(RGB8).unwrap().texels, 3);
+        // Packed bytes fold four to a texel into rows as wide as allowed, so
+        // 1080p fits a 2048-texel limit and 4K an 8192 one.
+        let packed = Layout::of(0x0218_0015).unwrap();
+        assert_eq!(packed.extent((37, 23), 2048), Some((639, 1)));
+        assert_eq!(packed.extent((1920, 1080), 2048), Some((2048, 760)));
+        assert_eq!(packed.extent((3840, 2160), 8192), Some((8192, 760)));
+        assert_eq!(packed.extent((3840, 2160), 2048), None);
+        // Others take a texel a pixel.
+        let mono = Layout::of(MONO8).unwrap();
+        assert_eq!(mono.extent((2048, 1536), 2048), Some((2048, 1536)));
+        assert_eq!(mono.extent((2049, 1536), 2048), None);
         assert_eq!(std::mem::size_of::<Uniforms>(), 64);
     }
 
@@ -769,11 +896,12 @@ mod tests {
 
     /// Renders every supported format through the real pipeline at 1:1, both
     /// decoded once and directly, and compares each pixel with
-    /// `frame::convert`. Skipped without a GPU.
+    /// `frame::convert`, including packed rows folded over several texture
+    /// rows and frames shrunk for the GPU. Skipped without a GPU.
     #[test]
     fn gpu_decode_matches_cpu_conversion() {
         use futures::executor::block_on;
-        use shader::{Pipeline as _, Primitive as _};
+        use shader::Pipeline as _;
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let Ok(adapter) =
             block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
@@ -785,14 +913,32 @@ mod tests {
             block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut pipeline = Pipeline::new(&device, &queue, format);
-        // Odd sizes exercise the edges of the Bayer neighborhood and row padding.
-        let (width, height) = (37u32, 23u32);
         let mut seed = 0x2545_f491_u32;
         let mut noise = move || {
             seed ^= seed << 13;
             seed ^= seed >> 17;
             seed ^= seed << 5;
             seed
+        };
+        let mut frame = |pixel_format, (width, height): (u32, u32), bytes_per_pixel, mask| {
+            let samples = (width * height) as usize * if bytes_per_pixel == 3 { 3 } else { 1 };
+            let data: Vec<u8> = (0..samples)
+                .flat_map(|_| {
+                    let value = noise() & mask;
+                    if bytes_per_pixel == 2 {
+                        (value as u16).to_le_bytes().to_vec()
+                    } else {
+                        vec![value as u8]
+                    }
+                })
+                .collect();
+            Frame {
+                width,
+                height,
+                pixel_format,
+                data,
+                ..Frame::default()
+            }
         };
         let formats = [
             (MONO8, 1, 0xff),
@@ -806,125 +952,146 @@ mod tests {
             (0x0108_000a, 1, 0xff),
             (0x0108_000b, 1, 0xff),
         ];
-        let cases = [false, true]
-            .into_iter()
-            .flat_map(|direct_only| formats.map(|format| (direct_only, format)));
-        for (direct_only, (pixel_format, bytes_per_pixel, mask)) in cases {
-            let samples = (width * height) as usize * if bytes_per_pixel == 3 { 3 } else { 1 };
-            let data: Vec<u8> = (0..samples)
-                .flat_map(|_| {
-                    let value = noise() & mask;
-                    if bytes_per_pixel == 2 {
-                        (value as u16).to_le_bytes().to_vec()
-                    } else {
-                        vec![value as u8]
-                    }
-                })
-                .collect();
-            let frame = Arc::new(Frame {
-                width,
-                height,
-                pixel_format,
-                data,
-                ..Frame::default()
-            });
-            let expected = crate::frame::convert(&frame, |rgb| rgb).expect("cpu conversion");
-            let gpu = GpuFrames::default();
-            gpu.submit("test", frame);
-            let bounds = Rectangle::new(
-                iced::Point::ORIGIN,
-                iced::Size::new(width as f32, height as f32),
-            );
-            let primitive = Primitive {
-                gpu,
-                key: "test".into(),
-                image: bounds,
-            };
-            let viewport = Viewport::with_physical_size(iced::Size::new(width, height), 1.0);
-            pipeline.direct_only = direct_only;
-            primitive.prepare(&mut pipeline, &device, &queue, &bounds, &viewport);
-            // A redraw without a new frame reuses the decoded texture.
-            primitive.prepare(&mut pipeline, &device, &queue, &bounds, &viewport);
-            let bayer = Layout::of(pixel_format).unwrap().kind == BAYER;
-            assert_eq!(pipeline.slots["test"].once, bayer && !direct_only);
-            let target = device.create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-            let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-            let readback = device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: u64::from(row * height),
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let mut encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: None,
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-                assert!(primitive.draw(&pipeline, &mut pass));
-            }
-            encoder.copy_texture_to_buffer(
-                target.as_image_copy(),
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &readback,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(row),
-                        rows_per_image: None,
-                    },
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
-            queue.submit([encoder.finish()]);
-            readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            device
-                .poll(wgpu::PollType::wait_indefinitely())
-                .expect("poll");
-            let pixels = readback.slice(..).get_mapped_range();
-            let mut worst = 0;
-            for y in 0..height as usize {
-                for x in 0..width as usize {
-                    let got = &pixels[y * row as usize + x * 4..][..3];
-                    let want = expected[y * width as usize + x];
-                    for c in 0..3 {
-                        worst = worst.max(got[c].abs_diff(want[c]));
-                    }
+        // Odd and even sizes exercise the edges of the Bayer neighborhood, row
+        // padding, and packed pixels split across texels.
+        for size in [(37, 23), (36, 23)] {
+            for direct_only in [false, true] {
+                for (pixel_format, bytes, mask) in formats {
+                    let frame = frame(pixel_format, size, bytes, mask);
+                    let bayer = Layout::of(pixel_format).unwrap().kind == BAYER;
+                    let worst = render(&mut pipeline, (&device, &queue), &frame, direct_only);
+                    assert_eq!(pipeline.slots["test"].once, bayer && !direct_only);
+                    assert!(
+                        worst <= 1,
+                        "{pixel_format:#010x} {size:?} (direct only: {direct_only}): off by {worst}"
+                    );
                 }
             }
-            assert!(
-                worst <= 1,
-                "{pixel_format:#010x} (direct only: {direct_only}): off by {worst}"
-            );
         }
+        // Packed rows wider than a third of the texture limit, folded over
+        // several texture rows and a part of one.
+        let max = device.limits().max_texture_dimension_2d;
+        for pixel_format in [RGB8, 0x0218_0015] {
+            let wide = frame(pixel_format, (max - 3, 3), 3, 0xff);
+            assert!(GpuFrames::default().accepts(&wide));
+            let worst = render(&mut pipeline, (&device, &queue), &wide, true);
+            assert!(worst <= 1, "{pixel_format:#010x} folded: off by {worst}");
+            assert_eq!(pipeline.slots["test"].storage.1, 3);
+        }
+        // Overview tiles shrink color and mono frames to RGB8 and Mono8.
+        for (pixel_format, bytes, mask, factor) in [
+            (0x0108_0009, 1, 0xff, 4),
+            (0x0218_0015, 3, 0xff, 3),
+            (0x0110_0005, 2, 0xfff, 2),
+        ] {
+            let source = frame(pixel_format, (75, 49), bytes, mask);
+            let small = crate::frame::shrink(&source, factor).unwrap();
+            assert!(matches!(small.pixel_format, RGB8 | MONO8));
+            let worst = render(&mut pipeline, (&device, &queue), &small, false);
+            assert!(worst <= 1, "{pixel_format:#010x} shrunk: off by {worst}");
+        }
+    }
+
+    /// Draws `frame` at 1:1 through `pipeline` and returns the largest
+    /// difference from `frame::convert` in any channel.
+    fn render(
+        pipeline: &mut Pipeline,
+        (device, queue): (&wgpu::Device, &wgpu::Queue),
+        frame: &Frame,
+        direct_only: bool,
+    ) -> u8 {
+        use shader::Primitive as _;
+        let (width, height) = (frame.width, frame.height);
+        let expected = crate::frame::convert(frame, |rgb| rgb).expect("cpu conversion");
+        let gpu = GpuFrames::default();
+        gpu.submit("test", Arc::new(frame.clone()));
+        let bounds = Rectangle::new(
+            iced::Point::ORIGIN,
+            iced::Size::new(width as f32, height as f32),
+        );
+        let primitive = Primitive {
+            gpu,
+            key: "test".into(),
+            image: bounds,
+        };
+        let viewport = Viewport::with_physical_size(iced::Size::new(width, height), 1.0);
+        pipeline.direct_only = direct_only;
+        primitive.prepare(pipeline, device, queue, &bounds, &viewport);
+        // A redraw without a new frame reuses the decoded texture.
+        primitive.prepare(pipeline, device, queue, &bounds, &viewport);
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(row * height),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            assert!(primitive.draw(pipeline, &mut pass));
+        }
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let pixels = readback.slice(..).get_mapped_range();
+        let mut worst = 0;
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let got = &pixels[y * row as usize + x * 4..][..3];
+                let want = expected[y * width as usize + x];
+                for c in 0..3 {
+                    worst = worst.max(got[c].abs_diff(want[c]));
+                }
+            }
+        }
+        worst
     }
 }

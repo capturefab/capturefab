@@ -171,7 +171,23 @@ pub fn current() -> Resolved {
 
 /// Whether to save work now; cheap enough for every frame.
 pub fn efficient() -> bool {
+    #[cfg(test)]
+    if let Some(efficient) = PINNED.get() {
+        return efficient;
+    }
     STATE.efficient(current)
+}
+
+#[cfg(test)]
+thread_local! {
+    static PINNED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Make `efficient` answer the same for this test's thread whatever the
+/// host is, such as a two-core runner or a laptop in Low Power Mode.
+#[cfg(test)]
+pub(crate) fn pin(efficient: bool) {
+    PINNED.set(Some(efficient));
 }
 
 /// The `--efficiency` flag of this process, if given.
