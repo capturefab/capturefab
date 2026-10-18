@@ -1288,6 +1288,13 @@ impl Decoder {
     fn ended(&self) -> bool {
         self.failure.is_some()
     }
+    /// FFmpeg exited successfully, for example at the end of a file.
+    fn succeeded(&mut self) -> bool {
+        if self.status.is_none() {
+            self.status = self.child.try_wait().ok().flatten();
+        }
+        self.status.is_some_and(|status| status.success())
+    }
     fn stop(&mut self) {
         self.queue.stopped.store(true, Ordering::Relaxed);
         self.queue.changed.notify_all();
@@ -1931,7 +1938,7 @@ impl MediaBackend {
                     });
                 }
                 if !reconnects {
-                    if file && decoder.status.is_some_and(|status| status.success()) {
+                    if file && decoder.succeeded() {
                         let path = local_file_path(&self.source)?;
                         return Err(Ended {
                             end: StreamEnd::Finished,
@@ -2587,22 +2594,25 @@ struct Probes {
     hwaccel: Option<bool>,
 }
 static PROBES: OnceLock<Mutex<std::collections::HashMap<PathBuf, Probes>>> = OnceLock::new();
+fn with_probes<T>(exe: &Executable, read: impl FnOnce(&mut Probes) -> T) -> T {
+    let mut memo = PROBES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    read(
+        memo.entry(exe.path.clone())
+            .or_insert_with(|| load_probes(exe)),
+    )
+}
 /// A remembered probe result of `exe`, or the result of running it once.
 fn probed<T: Clone>(
     exe: &Executable,
-    get: impl Fn(&Probes) -> Option<T>,
+    get: impl FnOnce(&Probes) -> Option<T>,
     set: impl FnOnce(&mut Probes, T),
     run: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    let memo = PROBES.get_or_init(Default::default);
-    {
-        let mut memo = memo.lock().unwrap_or_else(|e| e.into_inner());
-        let probes = memo
-            .entry(exe.path.clone())
-            .or_insert_with(|| load_probes(exe));
-        if let Some(value) = get(probes) {
-            return Ok(value);
-        }
+    if let Some(value) = with_probes(exe, |probes| get(probes)) {
+        return Ok(value);
     }
     // Probe unlocked: a test encode can take seconds.
     let value = run()?;
@@ -2610,15 +2620,10 @@ fn probed<T: Clone>(
     Ok(value)
 }
 fn remember(exe: &Executable, change: impl FnOnce(&mut Probes)) {
-    let mut memo = PROBES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let probes = memo
-        .entry(exe.path.clone())
-        .or_insert_with(|| load_probes(exe));
-    change(probes);
-    save_probes(exe, probes);
+    with_probes(exe, |probes| {
+        change(probes);
+        save_probes(exe, probes);
+    })
 }
 fn load_probes(exe: &Executable) -> Probes {
     let stored = exe
@@ -2741,7 +2746,10 @@ fn usable(exe: &Executable, encoder: &str, width: u32, height: u32) -> Result<bo
     if jetson_encoder(encoder) {
         return jetson_works(exe, encoder);
     }
+    // One that cannot encode the small check frame has no device here.
+    let small = probe_key(encoder, EncoderInput::Yuv, PROBE_SIZE.0, PROBE_SIZE.1);
     Ok(listed(&encoder_listing(exe)?, encoder)
+        && with_probes(exe, |probes| probes.encoders.get(&small).copied()) != Some(false)
         && encoder_works(exe, encoder, EncoderInput::Yuv, width, height)?)
 }
 /// The size probed before a recording's first frame says its real size.
@@ -3652,8 +3660,8 @@ impl Forwarder {
                 if !repeat {
                     last = None;
                 }
-                // Slots stay on a fixed grid, but a writer that fell behind
-                // starts again from now instead of sending a burst.
+                // Slots stay on a fixed grid; a writer that fell behind skips
+                // the slots it missed instead of catching up in a burst.
                 let now = Instant::now();
                 next = (next + interval).max(now.checked_sub(interval).unwrap_or(now));
             }
