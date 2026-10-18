@@ -1440,7 +1440,7 @@ fn schedule_text_for(kind: CameraKind, count: u32, interval: f64) -> String {
     )
 }
 
-/// A quiet line saying why the action above it cannot run.
+/// The text color for a storage line of this tone.
 fn tone_color(tone: storage_policy::Tone, p: &Palette) -> iced::Color {
     match tone {
         storage_policy::Tone::Normal => p.secondary,
@@ -1449,6 +1449,7 @@ fn tone_color(tone: storage_policy::Tone, p: &Palette) -> iced::Color {
     }
 }
 
+/// A quiet line saying why the action above it cannot run.
 fn reason<'a>(why: &'a str, p: &'static Palette) -> Element<'a, Message> {
     text(why).size(style::SMALL).color(p.secondary).into()
 }
