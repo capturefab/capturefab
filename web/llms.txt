@@ -293,7 +293,8 @@ A hub is a Home Assistant, Frigate, go2rtc or UniFi Protect server saved with `c
 Ask the user before you add or replace a hub or store a token; a Home Assistant token carries that user's access.
 Selectors are `hub:NAME/CAMERA[?stream=auto|mjpeg|snapshot|rtsp&fps=F]`; always quote them.
 `discover` and `hub cameras` list cameras on saved hubs; each `id` is a `--camera` selector.
-Secrets come from the OS credential store (`--secret-stdin`) or a `CAPTUREFAB_HUB_*` variable (`--secret-env VAR`) in the process that opens the camera, never from the command line.
+Secrets come from the OS credential store (`--secret-stdin`) or a `CAPTUREFAB_HUB_*` variable (`--secret-env VAR`) in the process that opens or lists the camera, never from the command line. Builds without the `keychain` feature take environment secrets only.
+`stream=auto` tries MJPEG then snapshots on Home Assistant, RTSP then snapshots on Frigate and go2rtc, and snapshots on UniFi Protect. Each attempt allows at least 12 seconds for its first frame (15 for RTSP); API checks and fallback add to the total connection time.
 Hub camera settings are read-only; Home Assistant MJPEG sends nothing while the image is unchanged, so use `stream=snapshot` for time-lapses.
 `serve --listen` refuses hub cameras unless it was started with `--allow-hubs`.
 Exit codes: 1 secret or certificate refused, 2 invalid name, URL, flags or selector, 3 hub or camera unavailable, 4 timeout, 5 hubs or the credential store not compiled in.

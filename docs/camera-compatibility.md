@@ -206,8 +206,9 @@ capturefab --camera 'hub:nvr/front?stream=snapshot&fps=0.5' capture -o front.png
 
 Hub cameras are read-only: `features` lists their size and frame rate, and
 settings are changed in the hub. JPEG and PNG stills and MJPEG are decoded in
-the camera worker; RTSP restreams are decoded by FFmpeg. The first frame can
-take up to 12 seconds (15 seconds over RTSP). Streams reconnect with backoff;
+the camera worker; RTSP restreams are decoded by FFmpeg. Each stream attempt allows
+at least 12 seconds for its first frame (15 seconds over RTSP); API checks
+and automatic fallback can extend the total connection time. Streams reconnect with backoff;
 a refused secret or certificate stops acquisition. Hub recordings, events and
 PTZ are not implemented. Listing a hub kind here is not a compatibility claim
 for any hub version or camera; check a frame before relying on a hub camera.
