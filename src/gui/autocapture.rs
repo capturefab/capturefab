@@ -611,11 +611,7 @@ impl Workbench {
                                 p.secondary
                             },
                         ),
-                );
-            if let Some(note) = &status.note {
-                content = content.push(text(note.clone()).size(style::SMALL).color(p.ink(p.warn)));
-            }
-            content = content
+                )
                 .push(
                     text(format!(
                         "{} · {} kept · {} discarded",
@@ -660,6 +656,11 @@ impl Workbench {
                         .size(style::SMALL)
                         .color(p.secondary),
                 );
+            // Notes come and go with suggestions, so they sit below the
+            // actions instead of moving them.
+            if let Some(note) = &status.note {
+                content = content.push(text(note.clone()).size(style::SMALL).color(p.ink(p.warn)));
+            }
             let sensitivity = if status.sensitivity < 0.4 {
                 SENSITIVITY[0]
             } else if status.sensitivity > 0.65 {
@@ -1000,12 +1001,26 @@ fn model_caption(status: &crate::autocapture::SessionStatus) -> String {
     }
     match status.samples_per_second {
         Some(rate) if rate > 0.0 && rate < 1.0 => {
-            caption.push_str(&format!(" · 1 frame every {:.0} s", 1.0 / rate));
+            caption.push_str(&format!(" · 1 frame every {} s", figure(1.0 / rate)));
         }
-        Some(rate) => caption.push_str(&format!(" · {rate:.0} frames/s")),
+        Some(rate) => {
+            let figure = figure(rate);
+            let noun = if figure == "1" { "frame" } else { "frames" };
+            caption.push_str(&format!(" · {figure} {noun}/s"));
+        }
         None => {}
     }
     caption
+}
+
+/// A whole number, with one decimal below 2, where rounding would read 1
+/// for anything from 0.5 to 1.5.
+fn figure(value: f64) -> String {
+    if value < 2.0 {
+        super::format::number((value * 10.0).round() / 10.0)
+    } else {
+        format!("{value:.0}")
+    }
 }
 
 #[cfg(test)]
@@ -1036,6 +1051,17 @@ mod tests {
         assert_eq!(model_caption(&status), "DINOv2 · CPU · 1 frame every 8 s");
         status.samples_per_second = Some(29.6);
         assert_eq!(model_caption(&status), "DINOv2 · CPU · 30 frames/s");
+        // Near one per second, whole numbers would hide the difference.
+        for (rate, caption) in [
+            (1.1, "1.1 frames/s"),
+            (1.0, "1 frame/s"),
+            (1.96, "2 frames/s"),
+            (0.7, "1 frame every 1.4 s"),
+            (0.5, "1 frame every 2 s"),
+        ] {
+            status.samples_per_second = Some(rate);
+            assert_eq!(model_caption(&status), format!("DINOv2 · CPU · {caption}"));
+        }
     }
 
     #[test]
