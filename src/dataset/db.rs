@@ -827,4 +827,20 @@ mod staging_tests {
         drop(held);
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn staging_stays_out_of_the_linux_runtime_directory() {
+        let staging = Staging::create().unwrap();
+        let base = if cfg!(target_os = "linux") {
+            crate::ipc::cache_dir().unwrap()
+        } else {
+            crate::ipc::runtime_dir()
+        };
+        let root = base.join("dataset-staging").canonicalize().unwrap();
+        assert!(staging.dir.starts_with(&root), "{}", staging.dir.display());
+        assert!(staging.dir.join("spill").is_dir());
+        let dir = staging.dir.clone();
+        drop(staging);
+        assert!(!dir.exists());
+    }
 }
