@@ -223,7 +223,12 @@ fn configure(conn: &Connection, staging: &Staging) -> Result<()> {
 /// Turn DuckDB errors into messages whose wording gives the right exit code.
 pub(crate) fn explain(error: duckdb::Error, path: &Path, op: &str) -> anyhow::Error {
     let text = error.to_string();
-    if text.contains("Could not set lock") || text.contains("Conflicting lock") {
+    if text.contains("Could not set lock")
+        || text.contains("Conflicting lock")
+        // Windows words a file another process holds open this way.
+        || text.contains("being used by another process")
+        || text.contains("locked a portion of the file")
+    {
         anyhow!("{}", locked_message(path))
     } else if op == "query"
         && ["Binder Error", "Parser Error", "Catalog Error"]

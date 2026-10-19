@@ -2501,7 +2501,7 @@ fn direct_capture_to_unreachable_ftp_destination_stays_queued() {
             .as_str()
             .unwrap()
             .to_lowercase()
-            .contains("connection refused"),
+            .contains("refused"),
         "{uploads}"
     );
     assert!(staging.join("down/shot.png").is_file());
@@ -2815,7 +2815,10 @@ fn doctor_measures_the_storage_budget_on_the_capture_folder_disk() {
     // The default capture folder is ~/Capturefab; it need not exist yet.
     let home = root.join("home");
     std::fs::create_dir_all(&home).unwrap();
-    let env = [("HOME", home.to_str().unwrap())];
+    let env = [
+        ("HOME", home.to_str().unwrap()),
+        ("USERPROFILE", home.to_str().unwrap()),
+    ];
     json_env(
         &dir,
         &env,
@@ -2900,6 +2903,7 @@ fn linux_state_moves_out_of_the_runtime_directory_once() {
         .unwrap();
     let shared = [
         ("HOME", home.to_str().unwrap()),
+        ("USERPROFILE", home.to_str().unwrap()),
         ("CAPTUREFAB_STAGING_DIR", staging.to_str().unwrap()),
         ("CAPTUREFAB_FTP_PASSWORD", "secret"),
     ];
@@ -3004,7 +3008,10 @@ fn linux_state_moves_from_whichever_folder_an_older_version_used() {
             .create(dir)
             .unwrap();
     }
-    let shared = [("HOME", home.to_str().unwrap())];
+    let shared = [
+        ("HOME", home.to_str().unwrap()),
+        ("USERPROFILE", home.to_str().unwrap()),
+    ];
     let configure = |dir: &PathBuf, args: &[&str]| {
         let mut command = vec!["--json", "storage", "configure"];
         command.extend(args);
@@ -3746,7 +3753,13 @@ fn signals_read_modbus_from_loopback_fake() {
             &format!("modbus-tcp://127.0.0.1:{closed}/1/holding/0"),
         ],
     );
-    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    // Windows reports a refusal only after its own two-second retry, which
+    // is also the connect timeout.
+    assert_eq!(
+        out.status.code(),
+        Some(if cfg!(windows) { 4 } else { 3 }),
+        "{out:?}"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -3913,7 +3926,7 @@ fn log_simulator_to_csv_and_dataset() {
     );
     assert_eq!(
         out.status.code(),
-        Some(3),
+        Some(if cfg!(windows) { 4 } else { 3 }),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
