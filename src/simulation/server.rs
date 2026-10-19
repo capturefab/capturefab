@@ -151,8 +151,11 @@ impl VirtualCameraServer {
                                 }
                             }
                         }
-                        // Give control requests a chance to acquire the source mutex.
-                        thread::yield_now();
+                        // Give control requests a chance to acquire the source
+                        // mutex. A yield is not enough: std's mutex is unfair,
+                        // and on Linux the producer takes the lock straight
+                        // back, starving a stop request for seconds.
+                        thread::sleep(Duration::from_millis(1));
                     }
                 })
                 .context("starting virtual camera source")?,

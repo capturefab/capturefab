@@ -341,7 +341,7 @@ fn notes_reach_status_polls_between_frames_and_fade_from_them() {
     f.open(true);
     // Paused: no frames, so the camera thread mostly sleeps.
     let note = "Skipped a suggestion while the previous capture was still being saved";
-    f.session(|session| session.note_fading(note, Duration::from_secs(2)));
+    f.session(|session| session.note_fading(note, Duration::from_secs(5)));
     // As a camera worker does before it answers a status poll.
     f.worker.refresh_capture();
     assert_eq!(
