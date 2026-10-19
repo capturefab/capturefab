@@ -151,6 +151,7 @@ fn compact_video_keeps_its_start_action_visible_before_encoding_details() {
 #[test]
 fn compact_purpose_guidance_and_primary_actions_fit_before_external_drive_shortcuts() {
     let mut renderer = renderer();
+    let mut failures = Vec::new();
     for kind in [
         CameraKind::AreaScan,
         CameraKind::LineScan,
@@ -220,14 +221,17 @@ fn compact_purpose_guidance_and_primary_actions_fit_before_external_drive_shortc
                         panic!("primary action missing at {kind:?}/{tab:?}/{scale}")
                     });
                 let bounds = action.1.bounds().unwrap();
-                assert!(
-                    bounds.height() >= 34.0
-                        && bounds.x0 >= 0.0
-                        && bounds.y0 >= 0.0
-                        && bounds.x1 <= f64::from(size.width) + 0.5
-                        && bounds.y1 <= f64::from(size.height) + 0.5,
-                    "primary action clipped at {kind:?}/{tab:?}/{scale}: {bounds:?}, viewport {size:?}"
-                );
+                if !(bounds.height() >= 34.0
+                    && bounds.x0 >= 0.0
+                    && bounds.y0 >= 0.0
+                    && bounds.x1 <= f64::from(size.width) + 0.5
+                    && bounds.y1 <= f64::from(size.height) + 0.5)
+                {
+                    failures.push(format!(
+                        "primary action clipped at {kind:?}/{tab:?}/{scale}: {bounds:?}, viewport {size:?}"
+                    ));
+                    continue;
+                }
                 let guidance = if tab == Tab::Capture {
                     capture_guidance(kind)
                 } else {
@@ -257,6 +261,7 @@ fn compact_purpose_guidance_and_primary_actions_fit_before_external_drive_shortc
             }
         }
     }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 #[test]
