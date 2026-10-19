@@ -52,6 +52,7 @@ BASELINE = (
     Scene("bucket-editor", "bucket-editor,noscopes", "S3 destination editor with checked example credentials"),
     Scene("help", "help-more,noscopes", "Quick guide steps with connection notes expanded beneath them"),
     Scene("settings", "settings-credentials,noscopes", "Settings sheet fixture including API-key controls"),
+    Scene("settings-assistant", "settings-assistant,noscopes", "AI assistant provider, model and credential setup with synthetic status"),
     Scene("network", "network,noscopes", "Camera network report with synthetic adapter and unreachable camera"),
     Scene("analytics", "analytics,noscopes", "Session acquisition analytics with live simulator statistics"),
     Scene("measurements", "analytics-measurements,noscopes", "Default prompt measurements form before collection starts"),
@@ -73,6 +74,8 @@ COMPACT = (
     Scene("bucket-bottom", "bucket-editor-advanced,noscopes,sheet-bottom", "S3 editor advanced controls and pinned Save/Cancel actions"),
     Scene("help", "help-more,noscopes,sheet-bottom", "Lower shortcut tables and the terminal or agent session commands"),
     Scene("settings", "settings-credential-error,noscopes,sheet-bottom", "API-key controls, credential error and pinned Settings footer"),
+    Scene("settings-assistant", "settings-assistant-error,noscopes", "Compact AI assistant setup with field validation and a synthetic provider refusal"),
+    Scene("settings-assistant-bottom", "settings-assistant,noscopes,sheet-bottom", "Lower assistant settings and pinned Settings footer after scrolling"),
     Scene("network", "network-error,noscopes,sheet-bottom", "Unreachable camera details and pinned Scan network action"),
     Scene("analytics", "analytics,noscopes,sheet-bottom", "Lower acquisition analytics and native camera statistics"),
     Scene("measurements", "analytics-invalid,noscopes", "Compact prompt measurement rows and invalid sample interval"),
@@ -87,6 +90,7 @@ VARIANTS = (
     Scene("stage-error", "stalled,stage-error,noscopes", "Stalled stream and camera error overlay"),
     Scene("notice-long", "notice-long,noscopes", "Long command-error notice with disclosure action"),
     Scene("measurement-history", "analytics-measurements-populated,noscopes,sheet-bottom", "Measurement chart, unknown value and wrapped result notes"),
+    Scene("settings-assistant-error", "settings-assistant-error,noscopes", "AI assistant field validation and synthetic provider error details"),
 )
 
 EXTRA_STATES = (
@@ -143,6 +147,21 @@ def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def isolated_environment():
+    """UI fixtures must never inherit provider credentials or cloud auth setup."""
+    provider_keys = {
+        "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
+        "OPENROUTER_API_KEY", "GROQ_API_KEY", "DEEPSEEK_API_KEY",
+        "CLOUDFLARE_API_TOKEN", "MISTRAL_API_KEY", "XAI_API_KEY",
+        "TOGETHER_API_KEY", "FIREWORKS_API_KEY", "CEREBRAS_API_KEY",
+        "HF_TOKEN", "MOONSHOT_API_KEY", "DASHSCOPE_API_KEY",
+        "PERPLEXITY_API_KEY", "OLLAMA_API_KEY", "LM_API_TOKEN",
+    }
+    prefixes = ("CAPTUREFAB_", "AWS_", "GOOGLE_", "AZURE_")
+    return {key: value for key, value in os.environ.items()
+            if not key.startswith(prefixes) and key not in provider_keys}
+
+
 def select_cases(kinds=False, only=None, all_screens=False):
     cases = list(matrix()) + list(matrix(True)) + list(extra_state_matrix()) if all_screens else list(matrix(kinds))
     if only:
@@ -197,8 +216,8 @@ def main():
     parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/capturefab")
     parser.add_argument("--output", type=Path, default=ROOT / "target/ui-review")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--kinds", action="store_true", help="Use the additional camera-purpose matrix; keeps the default 61-screen review unchanged")
-    mode.add_argument("--all", dest="all_screens", action="store_true", help="Capture all 95 baseline, compact, state and camera-purpose scenes in one manifest")
+    mode.add_argument("--kinds", action="store_true", help="Use the additional camera-purpose matrix instead of the baseline review")
+    mode.add_argument("--all", dest="all_screens", action="store_true", help="Capture all baseline, compact, state and camera-purpose scenes in one manifest")
     parser.add_argument("--only", action="append", choices=[case[0] for case in cases + list(matrix(True)) + list(extra_state_matrix())], help="Capture only these named images; repeat to select several")
     parser.add_argument("--list", action="store_true", help="Print the matrix without launching the app")
     parser.add_argument("--no-contact-sheets", action="store_true")
@@ -227,7 +246,7 @@ def main():
     for index, (name, scene, appearance, scale, size, group) in enumerate(cases, 1):
         path = output / f"{name}.png"
         with tempfile.TemporaryDirectory(prefix="capturefab-ui-review-") as temporary:
-            env = {key: value for key, value in os.environ.items() if not key.startswith("CAPTUREFAB_") and key not in {"OPENAI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY"}}
+            env = isolated_environment()
             env.update(CAPTUREFAB_SESSION_DIR=str(Path(temporary) / "sessions"),
                        CAPTUREFAB_SCREENSHOT_SCENE=f"{appearance},{scene.words}",
                        CAPTUREFAB_SCREENSHOT_SIZE=f"{size[0]}x{size[1]}",

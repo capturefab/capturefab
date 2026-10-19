@@ -1,9 +1,11 @@
 """The visual review matrix must cover complete screen families, not just crops."""
 
 import importlib.util
+import os
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -16,7 +18,7 @@ SPEC.loader.exec_module(REVIEW)
 
 class ReviewMatrixTests(unittest.TestCase):
     def test_camera_kind_matrix_is_opt_in_and_marks_real_and_display_profiles(self):
-        self.assertEqual(len(list(REVIEW.matrix())), 61)
+        self.assertEqual(len(list(REVIEW.matrix())), 66)
         cases = list(REVIEW.matrix(True))
         self.assertEqual(len(cases), 26)
         self.assertEqual(len({case[0] for case in cases}), len(cases))
@@ -35,8 +37,8 @@ class ReviewMatrixTests(unittest.TestCase):
 
     def test_all_matrix_combines_both_complete_matrices_without_duplicate_artifacts(self):
         cases = REVIEW.select_cases(all_screens=True)
-        self.assertEqual(len(cases), 96)
-        self.assertEqual(len({case[0] for case in cases}), 96)
+        self.assertEqual(len(cases), 101)
+        self.assertEqual(len({case[0] for case in cases}), 101)
         self.assertEqual({case[0] for case in cases}, {case[0] for case in REVIEW.matrix()} | {case[0] for case in REVIEW.matrix(True)} | {case[0] for case in REVIEW.extra_state_matrix()})
         self.assertEqual(len(REVIEW.select_cases(only=["welcome-light", "line-features-light"], all_screens=True)), 2)
 
@@ -64,8 +66,28 @@ class ReviewMatrixTests(unittest.TestCase):
         words = {word for _, scene, *_ in REVIEW.matrix() for word in scene.words.split(",")}
         self.assertTrue({
             "network", "destinations-remove", "bucket-editor-advanced", "close-error",
-            "settings-credential-error", "analytics-measurements", "analytics-measurements-populated",
+            "settings-credential-error", "settings-assistant", "settings-assistant-error",
+            "analytics-measurements", "analytics-measurements-populated",
         } <= words)
+
+    def test_review_drops_all_provider_and_cloud_credential_environment(self):
+        credentials = {
+            "CAPTUREFAB_AI_API_KEY": "secret", "OPENAI_API_KEY": "secret",
+            "ANTHROPIC_API_KEY": "secret", "GOOGLE_API_KEY": "secret",
+            "GEMINI_API_KEY": "secret", "OPENROUTER_API_KEY": "secret",
+            "GROQ_API_KEY": "secret", "DEEPSEEK_API_KEY": "secret",
+            "CLOUDFLARE_API_TOKEN": "secret", "MISTRAL_API_KEY": "secret",
+            "XAI_API_KEY": "secret", "TOGETHER_API_KEY": "secret",
+            "FIREWORKS_API_KEY": "secret", "CEREBRAS_API_KEY": "secret",
+            "HF_TOKEN": "secret", "MOONSHOT_API_KEY": "secret",
+            "DASHSCOPE_API_KEY": "secret", "PERPLEXITY_API_KEY": "secret",
+            "OLLAMA_API_KEY": "secret", "LM_API_TOKEN": "secret",
+            "AZURE_OPENAI_API_KEY": "secret", "AWS_SESSION_TOKEN": "secret",
+            "AWS_PROFILE": "real", "GOOGLE_APPLICATION_CREDENTIALS": "/real/adc.json",
+            "GOOGLE_CLOUD_PROJECT": "real", "CAPTUREFAB_SESSION_DIR": "/real/session",
+        }
+        with patch.dict(os.environ, {**credentials, "PATH": "/fixture/bin"}, clear=True):
+            self.assertEqual(REVIEW.isolated_environment(), {"PATH": "/fixture/bin"})
 
 
 if __name__ == "__main__":

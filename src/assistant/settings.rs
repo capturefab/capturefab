@@ -375,16 +375,32 @@ fn update_in(directory: &Path, update: impl FnOnce(&mut Settings) -> Result<()>)
 }
 /// Update just one entry under the lock, retaining other providers and prices.
 pub fn set_provider_settings(id: ProviderId, settings: ProviderSettings) -> Result<()> {
-    validate_provider(id, &settings)?;
-    update_in(&crate::ipc::session_dir(), |store| {
-        store.set_provider_settings(id, settings)
-    })
+    update_provider_in(&crate::ipc::session_dir(), id, settings, false)
 }
 pub fn select(id: ProviderId, settings: ProviderSettings) -> Result<()> {
+    select_in(&crate::ipc::session_dir(), id, settings)
+}
+fn select_in(directory: &Path, id: ProviderId, settings: ProviderSettings) -> Result<()> {
+    update_provider_in(directory, id, settings, true)
+}
+fn update_provider_in(
+    directory: &Path,
+    id: ProviderId,
+    mut settings: ProviderSettings,
+    select: bool,
+) -> Result<()> {
     validate_provider(id, &settings)?;
-    update_in(&crate::ipc::session_dir(), |store| {
+    update_in(directory, |store| {
+        // Credential-store operations own this hint. A delayed form save
+        // must not restore a stale hint after a key was saved or removed.
+        settings.saved_key = store
+            .providers
+            .get(&id)
+            .is_some_and(|entry| entry.saved_key);
         store.set_provider_settings(id, settings)?;
-        store.provider = Some(id);
+        if select {
+            store.provider = Some(id);
+        }
         Ok(())
     })
 }
@@ -415,6 +431,82 @@ mod tests {
     fn put(path: &Path, value: &Value) {
         let mut file = private_options().create_new(true).open(path).unwrap();
         file.write_all(&serde_json::to_vec(value).unwrap()).unwrap();
+    }
+    #[test]
+    fn selecting_preserves_the_latest_key_hint_and_other_providers() {
+        let root = directory();
+        let mut store = Settings::default();
+        store.providers.insert(
+            ProviderId::Anthropic,
+            ProviderSettings {
+                saved_key: true,
+                ..ProviderSettings::default()
+            },
+        );
+        store.providers.insert(
+            ProviderId::Gemini,
+            ProviderSettings {
+                model: Some("gemini-custom".into()),
+                ..ProviderSettings::default()
+            },
+        );
+        save_in(&root, &store).unwrap();
+        select_in(
+            &root,
+            ProviderId::Anthropic,
+            ProviderSettings {
+                model: Some("claude-custom".into()),
+                ..ProviderSettings::default()
+            },
+        )
+        .unwrap();
+        let loaded = load_in(&root).settings;
+        assert!(loaded.provider_settings(ProviderId::Anthropic).saved_key);
+        assert_eq!(
+            loaded
+                .provider_settings(ProviderId::Gemini)
+                .model
+                .as_deref(),
+            Some("gemini-custom")
+        );
+        update_in(&root, |store| {
+            store
+                .providers
+                .get_mut(&ProviderId::Anthropic)
+                .unwrap()
+                .saved_key = false;
+            Ok(())
+        })
+        .unwrap();
+        select_in(
+            &root,
+            ProviderId::Anthropic,
+            ProviderSettings {
+                saved_key: true,
+                ..ProviderSettings::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !load_in(&root)
+                .settings
+                .provider_settings(ProviderId::Anthropic)
+                .saved_key
+        );
+        update_provider_in(
+            &root,
+            ProviderId::Gemini,
+            ProviderSettings {
+                saved_key: true,
+                ..ProviderSettings::default()
+            },
+            false,
+        )
+        .unwrap();
+        let loaded = load_in(&root).settings;
+        assert_eq!(loaded.provider, Some(ProviderId::Anthropic));
+        assert!(!loaded.provider_settings(ProviderId::Gemini).saved_key);
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn missing_or_invalid_settings_never_block_loading() {

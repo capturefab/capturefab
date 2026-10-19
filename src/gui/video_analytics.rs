@@ -85,7 +85,8 @@ enum CredentialAction {
     Delete,
 }
 
-type CredentialReply = std::result::Result<(String, Option<&'static str>), &'static str>;
+type CredentialReply =
+    std::result::Result<(String, Option<&'static str>, Option<bool>), &'static str>;
 type Report =
     std::result::Result<(Vec<MeasurementSample>, String, crate::analytics::SvgOptions), String>;
 
@@ -198,7 +199,7 @@ impl State {
         } else if let Some(status) = &self.credential_status {
             format!("{} · {}", self.credential_provider, first_sentence(status))
         } else {
-            "Optional · for prompt measurements".into()
+            "Optional · shared with the assistant".into()
         }
     }
 
@@ -234,28 +235,67 @@ impl State {
         self.credential_notice = None;
         // Neither resolving credentials nor entering a native keychain
         // authorization dialog can block iced's event loop.
-        match spawn_credentials(move || {
-            let notice = match action {
-                CredentialAction::Status => None,
-                CredentialAction::Save(secret) => {
-                    ai::store_api_key(provider, &secret.0)
-                        .map_err(|_| "The OS credential store could not save this key.")?;
-                    Some("API key saved in the OS credential store.")
-                }
-                CredentialAction::Delete => {
-                    ai::delete_api_key(provider)
-                        .map_err(|_| "The OS credential store could not remove the saved key.")?;
-                    Some("Saved API key removed. Environment variables still take precedence.")
-                }
-            };
-            let status = ai::credential_status(provider)
-                .map_err(|_| "The OS credential store could not be read.")?;
-            Ok((status.to_string(), notice))
-        }) {
+        match spawn_credentials(move || credential_action(provider, action)) {
             Ok(receiver) => self.credential_pending = Some(receiver),
             Err(_) => self.credential_error = Some("Could not start the credential worker."),
         }
     }
+}
+
+#[cfg(not(test))]
+fn credential_action(provider: Provider, action: CredentialAction) -> CredentialReply {
+    let present = match &action {
+        CredentialAction::Status => None,
+        CredentialAction::Save(_) => Some(true),
+        CredentialAction::Delete => Some(false),
+    };
+    let notice = match action {
+        CredentialAction::Status => None,
+        CredentialAction::Save(secret) => {
+            crate::assistant::credentials::store_key(
+                assistant_provider(provider),
+                secret.0.to_string(),
+            )
+            .map_err(|_| "The OS credential store could not save this key.")?;
+            Some("API key saved in the OS credential store.")
+        }
+        CredentialAction::Delete => {
+            crate::assistant::credentials::delete_key(assistant_provider(provider))
+                .map_err(|_| "The OS credential store could not remove the saved key.")?;
+            Some("Saved API key removed. Environment variables still take precedence.")
+        }
+    };
+    let status = ai::credential_status(provider)
+        .map_err(|_| "The OS credential store could not be read.")?;
+    Ok((status.to_string(), notice, present))
+}
+
+fn assistant_provider(provider: Provider) -> crate::assistant::ProviderId {
+    match provider {
+        Provider::OpenAi => crate::assistant::ProviderId::OpenAi,
+        Provider::Gemini => crate::assistant::ProviderId::Gemini,
+        Provider::Claude => crate::assistant::ProviderId::Anthropic,
+    }
+}
+
+// GUI event/layout tests exercise the credential worker with an offline store.
+// They must never invoke the user's OS credential store.
+#[cfg(test)]
+fn credential_action(_: Provider, action: CredentialAction) -> CredentialReply {
+    let present = match &action {
+        CredentialAction::Status => None,
+        CredentialAction::Save(_) => Some(true),
+        CredentialAction::Delete => Some(false),
+    };
+    let notice = match action {
+        CredentialAction::Status => None,
+        CredentialAction::Save(secret) => {
+            drop(secret);
+            Some("API key saved in the test credential store.")
+        }
+        CredentialAction::Delete => Some("Saved API key removed from the test credential store."),
+    };
+    Ok(("Offline test credential store".into(), notice, present))
 }
 
 /// `text` up to the end of its first sentence, without the full stop.
@@ -457,7 +497,9 @@ impl Workbench {
             Input::RefreshKey => state.refresh_credentials(),
             Input::Keys(open) => {
                 state.preferences.keys_open = open;
-                if !open {
+                if open && self.settings_open {
+                    state.refresh_credentials();
+                } else if !open {
                     // Folding also dismisses what held it open, so the
                     // chevron always does what it says.
                     state.keys_shown = false;
@@ -498,7 +540,13 @@ impl Workbench {
                 Ok(result) => {
                     state.credential_pending = None;
                     match result {
-                        Ok((status, notice)) => {
+                        Ok((status, notice, present)) => {
+                            if let Some(present) = present {
+                                self.assistant.settings.saved_key_changed(
+                                    assistant_provider(state.credential_provider),
+                                    present,
+                                );
+                            }
                             state.credential_status = Some(status);
                             state.credential_notice = notice;
                             state.credential_error = None;
@@ -1078,7 +1126,7 @@ mod tests {
                 std::thread::current().name(),
                 Some("capturefab-api-credentials")
             );
-            Ok(("Missing".into(), None))
+            Ok(("Missing".into(), None, None))
         })
         .unwrap();
         assert_eq!(
@@ -1089,6 +1137,33 @@ mod tests {
                 .0,
             "Missing"
         );
+    }
+
+    #[test]
+    fn measurement_key_replies_update_the_assistants_shared_hint_without_credentials() {
+        let mut bench = Workbench::new(SessionHandle::new(), "shared-key-hints".into(), true, None);
+        bench.assistant.settings = super::super::assistant::settings::State::scene(false);
+        for provider in Provider::ALL {
+            bench.video_analytics.credential_provider = provider;
+            for present in [false, true] {
+                let (sender, receiver) = mpsc::channel();
+                sender
+                    .send(Ok(("Offline store".into(), None, Some(present))))
+                    .unwrap();
+                bench.video_analytics.credential_pending = Some(receiver);
+                bench.tick_video_analytics();
+                assert_eq!(
+                    bench
+                        .assistant
+                        .settings
+                        .settings()
+                        .provider_settings(assistant_provider(provider))
+                        .saved_key,
+                    present
+                );
+                assert!(!bench.assistant.settings.busy());
+            }
+        }
     }
 
     #[test]
@@ -1106,7 +1181,7 @@ mod tests {
     fn the_folded_keys_say_what_is_set() {
         let mut state = State::new(SessionHandle::new(), Preferences::default());
         // Before any check: what the keys are for, nothing to do.
-        assert_eq!(state.keys_summary(), "Optional · for prompt measurements");
+        assert_eq!(state.keys_summary(), "Optional · shared with the assistant");
         let (_sender, receiver) = mpsc::channel();
         state.credential_pending = Some(receiver);
         assert_eq!(state.keys_summary(), "Checking keys…");
@@ -1176,7 +1251,9 @@ mod tests {
             Provider::OpenAi,
             "not while the check is in flight"
         );
-        sender.send(Ok(("No saved key.".into(), None))).unwrap();
+        sender
+            .send(Ok(("No saved key.".into(), None, None)))
+            .unwrap();
         bench.tick_video_analytics();
         assert_eq!(bench.video_analytics.credential_provider, Provider::Gemini);
         assert_eq!(bench.video_analytics.requested_provider, None);

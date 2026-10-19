@@ -1,6 +1,7 @@
 //! The native workbench. Camera I/O lives on the session worker, never the UI thread.
 mod accessibility;
 mod analytics;
+mod assistant;
 mod autocapture;
 mod brand;
 mod button;
@@ -631,6 +632,7 @@ enum Message {
     ContentFocused(keyboard_history::Area),
     PopupOpen(bool),
     Settings(bool),
+    Assistant(assistant::Input),
     Appearance(Appearance),
     UiScale(UiScale),
     ScaledViewport(Size),
@@ -964,6 +966,7 @@ struct Workbench {
     stage_ui: stage::StageState,
     inspect: inspector::InspectorState,
     auto_capture: autocapture::State,
+    assistant: assistant::State,
     sheets: help::SheetState,
 }
 
@@ -1174,6 +1177,7 @@ impl Workbench {
             stage_ui: Default::default(),
             inspect: Default::default(),
             auto_capture: Default::default(),
+            assistant: Default::default(),
             sheets: Default::default(),
         };
         bench.restore_open_sections(&open_sections);
@@ -1265,11 +1269,27 @@ impl Workbench {
         }
         self.dismiss_close_error();
         self.closing = Some(target);
-        if self.saved.is_none() {
-            Task::done(Message::PrefsFlushed(Ok(())))
-        } else {
-            Task::perform(self.prefs_saver.flush(self.prefs()), Message::PrefsFlushed)
-        }
+        self.assistant.settings.clear_secret();
+        let assistant = self.assistant.settings.flush();
+        let prefs = self
+            .saved
+            .as_ref()
+            .map(|_| self.prefs_saver.flush(self.prefs()));
+        Task::perform(
+            async move {
+                // Both writers finish before exit; neither blocks the UI thread.
+                let preferences = async move {
+                    match prefs {
+                        Some(pending) => pending.await,
+                        None => Ok(()),
+                    }
+                };
+                let (preferences, assistant) = iced::futures::join!(preferences, assistant);
+                preferences?;
+                assistant
+            },
+            Message::PrefsFlushed,
+        )
     }
 
     /// A slow breath for transient pending indicators (connecting,
@@ -1342,7 +1362,8 @@ impl Workbench {
                 .any(|entry| entry.state.active())
             || self.screenshot.is_some()
             || self.capture_to.busy()
-            || self.record_to.busy();
+            || self.record_to.busy()
+            || self.assistant.settings.busy();
         let interval = if busy {
             Duration::from_millis(60)
         } else if streaming {
@@ -1861,6 +1882,7 @@ impl Workbench {
         self.tick_inspector();
         self.tick_analytics();
         self.tick_video_analytics();
+        self.tick_assistant();
         self.tick_autocapture();
         self.tick_signals();
         self.save_prefs();
@@ -2746,10 +2768,15 @@ impl Workbench {
             Message::ContentFocused(area) => self.content_focus = area,
             Message::PopupOpen(value) => self.popup_open = value,
             Message::Settings(open) => {
-                if open {
+                if open && !self.settings_open && self.sheet_open() {
+                    return Task::none();
+                }
+                self.assistant.settings.set_visible(open);
+                if open && self.video_analytics.keys_section_open() {
                     self.video_analytics.refresh_credentials();
-                } else {
+                } else if !open {
                     self.video_analytics.clear_secret();
+                    self.assistant.settings.clear_secret();
                 }
                 #[cfg(target_os = "macos")]
                 if self.screenshot.is_none() {
@@ -3180,6 +3207,7 @@ impl Workbench {
             }
             Message::CapturePicker(message) => return self.picker(false, message),
             Message::AutoCapture(input) => return self.update_autocapture(input),
+            Message::Assistant(input) => return self.update_assistant(input),
             Message::RecordPicker(message) => {
                 // Typing never switches between Record and Stream: once the
                 // form streams, it keeps streaming until the switch says so.

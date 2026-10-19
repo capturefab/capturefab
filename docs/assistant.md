@@ -6,6 +6,16 @@ Everything runs on the local computer. The optional AI assistant and prompt meas
 
 ## Set up a provider
 
+In the desktop app, open Settings and expand **AI assistant**. Choose a provider,
+model and any connection fields it needs. Valid settings apply automatically.
+Save key stores the secure draft in the OS credential store; Test connection
+sends one small tool round trip without camera information or images. Provider
+readiness labels use environment presence and a saved-key hint. Opening the
+section checks credentials only for the selected provider.
+
+OpenAI, Gemini and Claude keys are shared with the separate **Prompt measurement
+keys** section. Closing Settings clears unsaved key drafts.
+
 ```sh
 capturefab assistant providers --json
 capturefab assistant use anthropic --model claude-sonnet-5-5 --effort low --vision auto

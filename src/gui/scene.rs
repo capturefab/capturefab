@@ -193,7 +193,8 @@ impl Workbench {
     ///   section open
     /// - review fixtures: `network`, `network-empty`, `network-error`,
     ///   `destinations-remove`, `bucket-editor-advanced`, `settings-credentials`,
-    ///   `settings-credential-error`, `analytics-measurements`,
+    ///   `settings-credential-error`, `settings-assistant`,
+    ///   `settings-assistant-error`, `analytics-measurements`,
     ///   `analytics-measurements-populated`, `analytics-invalid`,
     ///   `close-error`;
     ///   `sheet-bottom` and `inspector-bottom` expose their lower content
@@ -342,6 +343,7 @@ impl Workbench {
             || self.scene_autocapture(word, late)
             || self.scene_network(word, late)
             || self.scene_video_analytics(word, late)
+            || self.scene_assistant_settings(word, late)
             || self.scene_sheets(word, late)
     }
 

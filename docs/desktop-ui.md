@@ -39,6 +39,25 @@ Its bottom-anchored history moves toward older entries with Up/Page Up/Home and
 newer entries with Down/Page Down/End, while Copy log remains pinned. Other
 panes, inactive windows and obscured content retain their own keyboard context.
 
+## AI assistant provider settings
+
+The AI assistant disclosure uses the shared provider catalog, field validation
+and credentials. Readiness labels use environment presence and saved-key hints;
+credential checks read only the selected provider while the section is shown.
+API key drafts are secure, redacted from messages and cleared when Settings
+closes. The separate Prompt measurement keys section shares the same three
+credential accounts and updates the assistant's hints after saves or removals.
+Settings writes run on a serial worker. Quit awaits both preferences and
+assistant settings, retaining errors from any unsaved provider entry.
+
+Actual-widget checks cover the fixed 520×500 Settings window and the sheet at
+all three interface scales in light and dark, including invalid fields,
+password roles, focus reveal, live announcements and the pinned footer. The
+72 software-rendered top, bottom and connection views were inspected, as were
+four simulator-backed 1440×900 light/dark valid/error scene screenshots. The
+scene screenshots present Settings as a sheet; native OS credential prompts
+were not exercised.
+
 ## Everyday controls and progressive disclosure
 
 The October 15, 2026 interface pass puts live adjustments and saving ahead of

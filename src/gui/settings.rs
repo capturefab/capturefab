@@ -121,6 +121,8 @@ impl Workbench {
         ]
         .spacing(9);
         column![
+            self.assistant_settings_section(p),
+            rule::horizontal(1).style(style::line),
             appearance,
             rule::horizontal(1).style(style::line),
             interface,
@@ -140,7 +142,7 @@ impl Workbench {
         let state = &self.video_analytics;
         let open = state.keys_section_open();
         let mut section = column![disclosure(
-            "AI provider API keys",
+            "Prompt measurement keys",
             (!open).then(|| state.keys_summary()),
             self.keys_chevron(),
             Message::VideoAnalytics(video_analytics::Input::Keys(!open)),
@@ -171,7 +173,7 @@ impl Workbench {
     /// The line under Settings: what applies at once, and while the keys
     /// show, what does not.
     fn settings_footer_text(&self) -> &'static str {
-        if self.video_analytics.keys_section_open() {
+        if self.video_analytics.keys_section_open() || self.assistant.settings.section_open() {
             "Preferences apply automatically. API keys require Save key."
         } else {
             "Preferences apply automatically."
