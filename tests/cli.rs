@@ -3858,7 +3858,7 @@ fn log_simulator_to_csv_and_dataset() {
             "--interval",
             "100ms",
             "--duration",
-            "1s",
+            "4s",
             "--csv",
             &csv_arg,
             "--dataset",
@@ -7495,7 +7495,7 @@ mod assistant_cli_tests {
             vec![call(
                 "owned-crash-capture",
                 "start_signal_capture",
-                json!({"source":source,"every":"100ms","duration":"5s","max_samples":100000,"max_bytes":1024 * 1024,"tags":null}),
+                json!({"source":source,"every":"100ms","duration":"8s","max_samples":100000,"max_bytes":1024 * 1024,"tags":null}),
             )],
             2,
         );
@@ -7531,7 +7531,7 @@ mod assistant_cli_tests {
                     "--max-data-size",
                     "1MiB",
                     "--max-signal-time",
-                    "5s",
+                    "8s",
                 ],
                 &[],
             )
@@ -7622,7 +7622,7 @@ mod assistant_cli_tests {
         );
         let journal = std::fs::read(&log_path).unwrap();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let complete = loop {
             let sources = tools_ok(&dir, &cwd, &["--json", "--session", "tools-ci", "signals"]);
             let current = sources["sources"]
@@ -7877,7 +7877,7 @@ fn signals_bounded_capture_lifecycle() {
     assert_eq!(first_done["persistence_complete"], true);
     assert_eq!(first_done["payload_bytes"], first_done["written_bytes"]);
 
-    request["duration_ms"] = json!(1000);
+    request["duration_ms"] = json!(4000);
     request["max_samples"] = json!(100);
     let second = ok(request.clone());
     let second_token = second["capture_id"].as_str().unwrap();

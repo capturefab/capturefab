@@ -578,9 +578,7 @@ fn camera_guidance(kind: CameraKind) -> &'static str {
         CameraKind::Microscope => {
             "Choose the objective and magnification, then adjust focus and illumination for the specimen."
         }
-        CameraKind::Thermal => {
-            "Configure temperature output, measurement range and emissivity before taking measurements."
-        }
+        CameraKind::Thermal => "Set temperature output, range and emissivity before measuring.",
         CameraKind::DocumentScanner => {
             "Each capture scans one page. Choose a source and resolution supported by your scanner."
         }

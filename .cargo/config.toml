@@ -1,8 +1,10 @@
 # Link the C runtime statically on Windows so release executables start on a
 # clean installation without the Visual C++ redistributable (VCRUNTIME140.dll).
 # libjpeg-turbo's static libraries already use the static runtime by default.
+# The 8 MiB stack is for the main thread: Windows gives it 1 MiB, which the
+# command-line parser alone overflows in unoptimized builds.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/STACK:8388608"]
 
 [target.aarch64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/STACK:8388608"]
