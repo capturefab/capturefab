@@ -94,22 +94,29 @@ fn footer(snapshot: &accesskit::TreeUpdate) -> accesskit::Rect {
                 .is_some_and(|label| label.starts_with("Preferences apply automatically."))
         })
         .unwrap_or_else(|| {
-            let labels: Vec<_> = snapshot
+            let nodes: Vec<_> = snapshot
                 .nodes
                 .iter()
-                .filter_map(|(_, node)| node.label())
-                .take(40)
+                .filter(|(_, node)| {
+                    matches!(
+                        node.role(),
+                        accessibility::Role::Label
+                            | accessibility::Role::Status
+                            | accessibility::Role::Alert
+                            | accessibility::Role::Heading
+                    )
+                })
+                .map(|(_, node)| {
+                    format!(
+                        "{:?} {:?} {:?}",
+                        node.role(),
+                        node.label()
+                            .map(|label| label.chars().take(24).collect::<String>()),
+                        node.bounds()
+                    )
+                })
                 .collect();
-            let texts: Vec<_> = snapshot
-                .nodes
-                .iter()
-                .filter_map(|(_, node)| node.value())
-                .take(40)
-                .collect();
-            panic!(
-                "the actual Settings footer is exposed; {} nodes, labels: {labels:?}, values: {texts:?}",
-                snapshot.nodes.len()
-            )
+            panic!("the actual Settings footer is exposed; {nodes:#?}")
         })
         .1
         .bounds()

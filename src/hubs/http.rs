@@ -349,7 +349,11 @@ struct Socket {
     stream: TcpStream,
     idle: Duration,
     deadline: Option<Instant>,
+    cancel: Option<Cancel>,
 }
+
+/// How often a read that can be cancelled looks at its flag.
+const CANCEL_POLL: Duration = Duration::from_millis(100);
 
 impl Socket {
     fn wait(&self) -> io::Result<Duration> {
@@ -365,8 +369,32 @@ impl Socket {
 
 impl Read for Socket {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.wait()?))?;
-        self.stream.read(buf)
+        let wait = self.wait()?;
+        let Some(cancel) = &self.cancel else {
+            self.stream.set_read_timeout(Some(wait))?;
+            return self.stream.read(buf);
+        };
+        // Windows does not wake a blocked read when another thread shuts the
+        // socket down, so wait in short slices and look at the flag between.
+        let started = Instant::now();
+        loop {
+            if cancel.is_cancelled() {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            let slice = wait.saturating_sub(started.elapsed()).min(CANCEL_POLL);
+            if slice.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            self.stream.set_read_timeout(Some(slice))?;
+            match self.stream.read(buf) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                result => return result,
+            }
+        }
     }
 }
 
@@ -958,6 +986,7 @@ pub(crate) fn send(
         stream: socket.try_clone().map_err(io_error)?,
         idle: limits.headers.max(Duration::from_millis(1)),
         deadline: Some(head_deadline),
+        cancel: cancel.cloned(),
     };
     let mut stream = match &endpoint.tls {
         None => Stream::Plain(clone),
@@ -1127,6 +1156,7 @@ pub(crate) fn fetch_fingerprint(
         stream: socket,
         idle: timeout.max(Duration::from_millis(1)),
         deadline: Some(deadline),
+        cancel: None,
     };
     // Drive the handshake until the capture verifier aborts it.
     while connection.is_handshaking() {
