@@ -342,11 +342,20 @@ fn notes_reach_status_polls_between_frames_and_fade_from_them() {
     // Paused: no frames, so the camera thread mostly sleeps.
     let note = "Skipped a suggestion while the previous capture was still being saved";
     f.session(|session| session.note_fading(note, Duration::from_secs(5)));
-    // As a camera worker does before it answers a status poll.
-    f.worker.refresh_capture();
-    assert_eq!(
-        f.worker.snapshot().capture_session.unwrap().note.as_deref(),
-        Some(note)
-    );
+    // As a camera worker does before it answers a status poll. The refresh
+    // skips a session the camera thread is holding, so ask again.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        f.worker.refresh_capture();
+        let published = f.worker.snapshot().capture_session.unwrap().note;
+        if published.as_deref() == Some(note) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the note was never published: {published:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     f.published(|status| status.note.is_none());
 }
