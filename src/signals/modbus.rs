@@ -523,7 +523,8 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap().port()
         };
-        let error = Client::connect("127.0.0.1", port, Duration::from_secs(2))
+        // Windows takes about two seconds to report a refused connection.
+        let error = Client::connect("127.0.0.1", port, Duration::from_secs(10))
             .err()
             .unwrap();
         assert!(

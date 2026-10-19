@@ -575,7 +575,12 @@ mod tests {
                 ..
             }]
         ));
-        assert!(result.summary.contains("~/Captures/line-1"));
+        assert!(
+            result
+                .summary
+                .replace('\\', "/")
+                .contains("~/Captures/line-1")
+        );
     }
     #[test]
     fn s3_defaults_egress_and_all_field_errors() {

@@ -3073,6 +3073,12 @@ mod tests {
         let started = Instant::now();
         let hash = hash_file(writer.path()).unwrap();
         let hashing = started.elapsed();
+        if hashing > Duration::from_secs(1) {
+            // The wait below is capped, so a read this slow cannot finish
+            // inside it and the comparison would only measure the disk.
+            crate::eprintln!("capturefab: skipping a timing test on a slow disk ({hashing:?})");
+            return;
+        }
         // Another process holds the lock for longer than the read takes.
         let held = manager.lock().unwrap();
         let finishing = thread::spawn(move || writer.finish().map(|()| Instant::now()));

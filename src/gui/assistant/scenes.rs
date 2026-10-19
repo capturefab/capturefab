@@ -236,7 +236,11 @@ pub(in crate::gui) fn context(mut snapshot: SessionSnapshot) -> Context {
         },
         media: MediaInfo::from_names(&["libx264".into(), "libx265".into()]),
         uploads: None,
-        capture_root: PathBuf::from("/tmp/capturefab-scene/captures"),
+        capture_root: PathBuf::from(if cfg!(windows) {
+            r"C:\tmp\capturefab-scene\captures"
+        } else {
+            "/tmp/capturefab-scene/captures"
+        }),
         compiled: Compiled::current(),
         defaults: RecordingDefaults::default(),
     }

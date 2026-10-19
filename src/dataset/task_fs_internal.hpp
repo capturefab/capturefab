@@ -138,6 +138,12 @@ struct Namespace {
         if (Id(stat) != expected) throw IOException("task namespace identity changed before native admission");
         if (stat.st_uid != ::geteuid() || (stat.st_mode & 0077)) throw IOException("task namespace must be private to its owner");
     }
+    /// Whether `candidate` is the namespace or below it. DuckDB probes system
+    /// files such as /proc/self/cgroup through its file system while it opens;
+    /// those answer "absent" rather than failing the open.
+    bool Contains(const std::string &candidate) const {
+        return candidate == path || (candidate.size() > path.size() && !candidate.compare(0, path.size(), path) && candidate[path.size()] == '/');
+    }
     std::vector<std::string> Relative(const std::string &candidate) {
         if (candidate == path) return {};
         if (candidate.size() <= path.size() || candidate.compare(0, path.size(), path) || candidate[path.size()] != '/') {
@@ -340,6 +346,7 @@ public:
     void FileSync(FileHandle &handle) override { if (::fsync(Get(handle).fd.value)) IoError("sync"); }
     bool Trim(FileHandle &, idx_t, idx_t) override { return false; }
     bool DirectoryExists(const string &path, optional_ptr<FileOpener> = nullptr) override {
+        if (!space->Contains(path)) return false;
         if (space->Relative(path).empty()) return true;
         auto parent = space->Resolve(path);
         struct stat stat;
@@ -352,6 +359,7 @@ public:
         if (::mkdirat(parent.fd.value, parent.name.c_str(), 0700)) IoError("directory create");
     }
     bool FileExists(const string &path, optional_ptr<FileOpener> = nullptr) override {
+        if (!space->Contains(path)) return false;
         auto parent = space->Resolve(path);
         struct stat stat;
         if (::fstatat(parent.fd.value, parent.name.c_str(), &stat, AT_SYMLINK_NOFOLLOW)) { if (errno == ENOENT) return false; IoError("file stat"); }

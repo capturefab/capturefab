@@ -327,7 +327,10 @@ mod tests {
                             let iced_runtime::Action::Output(Message::Copy(brief)) = output else {
                                 panic!("briefing activation only copies text");
                             };
-                            assert!(brief.contains("--session=inspection-bench"));
+                            assert!(
+                                brief.contains("--session=inspection-bench")
+                                    || brief.contains("--session='inspection-bench'")
+                            );
                             assert!(brief.contains("tools list --compact --json"));
                             assert!(brief.contains("Disruptive or HumanOnly"));
                         }

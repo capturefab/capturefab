@@ -973,7 +973,12 @@ fn destinations_and_storage_report_budget_and_locations() {
     let destinations = run(&host, &ctx, "list_destinations", json!({}), &opts)
         .unwrap()
         .value;
-    assert_eq!(destinations["default"]["location"], "~/Capturefab");
+    assert_eq!(
+        destinations["default"]["location"]
+            .as_str()
+            .map(|location| location.replace('\\', "/")),
+        Some("~/Capturefab".into())
+    );
     assert_eq!(
         destinations["destinations"][1]["location"],
         "s3://acme at https://minio.example:9000"
@@ -1781,7 +1786,10 @@ fn gathering_reads_destinations_storage_and_encoders_without_secrets() {
     )
     .unwrap();
     assert!(ctx.session && ctx.snapshot.cameras.len() == 5);
-    assert_eq!(ctx.destinations[0].location, "~/Captures/line-1");
+    assert_eq!(
+        ctx.destinations[0].location.replace('\\', "/"),
+        "~/Captures/line-1"
+    );
     assert_eq!(ctx.destinations[0].free_bytes, Some(42));
     assert_eq!(
         ctx.destinations[1].problem.as_deref(),

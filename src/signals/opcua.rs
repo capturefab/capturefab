@@ -531,7 +531,8 @@ mod tests {
             .build()
             .unwrap();
         let error = runtime
-            .block_on(probe(&addr, Duration::from_secs(2)))
+            // Windows takes about two seconds to report a refused connection.
+            .block_on(probe(&addr, Duration::from_secs(10)))
             .unwrap_err();
         assert_eq!(crate::cli::error_code(&error), ("unavailable", 3));
     }

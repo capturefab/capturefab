@@ -374,7 +374,11 @@ fn choosing_custom_pattern_moves_nothing_below_and_shows_what_a_template_holds()
         .find(|(_, node)| node.role() == Role::TextInput)
         .map(|(_, node)| node)
         .unwrap();
-    assert_eq!(field.description(), Some(output.as_str()));
+    // Windows writes no `~`, so the field has nothing to describe.
+    assert_eq!(
+        field.description(),
+        (!cfg!(windows)).then_some(output.as_str())
+    );
     assert_eq!(home_long(field.value().unwrap()), output);
 }
 
@@ -688,7 +692,10 @@ fn destination_rows_summarize_in_plain_words() {
         "Other S3-compatible · line-1/capturefab/"
     );
     let home = Path::new("/Users/ada");
-    assert_eq!(tilde(&home.join("Captures"), Some(home)), "~/Captures");
+    assert_eq!(
+        tilde(&home.join("Captures"), Some(home)).replace('\\', "/"),
+        "~/Captures"
+    );
     assert_eq!(tilde(home, Some(home)), "~");
     assert_eq!(tilde(Path::new("/Volumes/A"), Some(home)), "/Volumes/A");
     let ftp = Destination {

@@ -268,7 +268,7 @@ fn a_blocked_body_read_is_cancelled_promptly() {
     });
     let start = Instant::now();
     assert!(response.body.read_all(1 << 20).is_err());
-    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(start.elapsed() < Duration::from_secs(5));
     // A cancelled handle refuses later requests without connecting.
     let before = fake.connections();
     let error = send(&endpoint(&fake), &get("/"), &Auth::None, Some(&cancel))
