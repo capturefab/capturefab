@@ -58,7 +58,7 @@ FFmpeg: `build.rs` embeds `CAPTUREFAB_FFMPEG_BINARY` when set at build time, and
 
 The CLI is a public, versioned automation contract (see `capturefab schema`, `web/agents.md`, `web/llms.txt`):
 - `--json` prints `{"version":1,"ok":true,"result":...}` or `{"version":1,"ok":false,"error":{"code","message"}}` to stdout; diagnostics go to stderr.
-- Tool `CheckFailure` errors use the first Error issue's `IssueCode` before text classification: operation_failed 1, usage 2, unavailable 3, timeout 4, unsupported 5, storage_full 6. Other exit codes come from `cli::error_code`, which classifies by error message text: 1 operation_failed, 2 usage, 3 unavailable, 4 timeout, 5 unsupported, 6 storage_full. Wording of error messages therefore affects exit codes.
+- Tool `CheckFailure` errors use the first Error issue's `IssueCode` before text classification: operation_failed 1, usage 2, unavailable 3, timeout 4, unsupported 5, storage_full 6. With `ai`, typed `assistant::http::ProviderError` errors take precedence: Auth/Rejected/CutOff/Malformed exit 1, NotFound/RateLimited/Unavailable/Unreachable exit 3, Timeout exits 4. Their scrubbed provider text appears only in `error.details.provider_message`. Other exit codes come from `cli::error_code`, which classifies by error message text: 1 operation_failed, 2 usage, 3 unavailable, 4 timeout, 5 unsupported, 6 storage_full. Wording of those error messages therefore affects exit codes.
 - Credentials in URLs must be redacted (`media::redact_url`) in logs, status and UI.
 
 When changing commands or output shapes, keep `schema` output, `README.md`, `web/agents.md` and `web/llms.txt` consistent. Avoid publishing camera testing results or compatibility claims while the software is under rapid development.

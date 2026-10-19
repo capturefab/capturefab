@@ -3,6 +3,8 @@ pub mod accel;
 #[cfg(feature = "ai")]
 pub mod ai;
 pub mod analytics;
+#[cfg(feature = "ai")]
+pub mod assistant;
 pub mod auto;
 pub mod autocapture;
 #[cfg(any(feature = "s3", feature = "ai"))]
