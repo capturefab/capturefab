@@ -217,6 +217,10 @@ pub struct Frigate {
     pub cameras: Vec<Camera>,
     /// Restream names of go2rtc streams.
     pub restreams: Vec<String>,
+    /// The profile's camera restrictions; `None` allows every camera.
+    pub allowed_cameras: Option<Vec<String>>,
+    /// Older versions return 404; refusals and server failures must not be ignored.
+    pub profile_status: u16,
     pub frames: Vec<Vec<u8>>,
     pub offline: bool,
     /// Seconds a session lasts.
@@ -234,6 +238,8 @@ impl Frigate {
                 Camera::new("back_yard", "Back yard"),
             ],
             restreams: vec!["driveway".into()],
+            allowed_cameras: None,
+            profile_status: 200,
             frames,
             offline: false,
             session: 86400,
@@ -325,8 +331,15 @@ fn frigate(config: &Arc<Frigate>, counter: &Arc<AtomicUsize>, request: &Request)
     let path = request.path();
     match path {
         "/api/version" => Reply::text(200, "0.18.2-test"),
+        "/api/profile" if config.profile_status != 200 => Reply::new(config.profile_status),
         "/api/profile" => Reply::json(
-            r#"{"username":"viewer","role":"viewer","allowed_cameras":["driveway","back_yard"]}"#,
+            &serde_json::json!({
+                "username": "viewer", "role": "viewer",
+                "allowed_cameras": config.allowed_cameras.clone().unwrap_or_else(|| {
+                    config.cameras.iter().map(|camera| camera.id.clone()).collect()
+                }),
+            })
+            .to_string(),
         ),
         "/api/config" => {
             let cameras = config

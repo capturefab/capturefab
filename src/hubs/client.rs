@@ -59,12 +59,23 @@ pub(crate) fn limits(
 /// Text a server returned that is safe to show: printable, short, and
 /// stripped of anything that could hold a secret.
 pub(crate) fn display(text: &str, max: usize) -> String {
-    text.chars()
+    // A server can reflect a token in its name, version or camera labels.
+    // Scrub before truncating, which could otherwise cut a secret into a
+    // fragment the literal scrubber no longer recognizes.
+    super::scrub::scrub(text)
+        .chars()
         .filter(|c| !c.is_control())
         .take(max)
         .collect::<String>()
         .trim()
         .to_owned()
+}
+
+/// Identifiers are echoed in selectors, files and process boundaries. A
+/// server must not turn a reflected credential into one; unlike a display
+/// label, an identifier cannot be redacted and remain usable.
+pub(crate) fn public_identifier(text: &str) -> bool {
+    matches!(super::scrub::scrub(text), std::borrow::Cow::Borrowed(_))
 }
 
 /// `Retry-After` given in seconds.
@@ -289,9 +300,20 @@ pub(crate) mod tests {
             tls_server_name: None,
             rtsp_port: (kind == Kind::Frigate).then_some(8554),
             rejected: None,
+            revision: None,
         }
     }
     pub(crate) fn secret(kind: Kind, value: &str) -> Secret {
         Secret::new(kind, value.into()).unwrap()
+    }
+
+    #[test]
+    fn server_display_text_scrubs_secrets_before_truncating() {
+        let secret = secret(Kind::HomeAssistant, "display-test-CANARY-long-token");
+        let echoed = format!("Porch {} camera\n", secret.expose());
+        assert_eq!(display(&echoed, 128), "Porch <redacted> camera");
+        assert_eq!(display(&echoed, 16), "Porch <redacted>");
+        assert!(!public_identifier(secret.expose()));
+        assert!(public_identifier("front_door"));
     }
 }

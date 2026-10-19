@@ -13,7 +13,10 @@ use super::{Stream, http::Cancel, http::HttpError, registry::Store};
 use crate::types::{Backend, Categorized, ErrorKind, Frame, FrameWait, RegisterIo, TransportStats};
 use anyhow::Result;
 use std::{
-    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -109,6 +112,9 @@ pub(crate) enum Next {
 pub(crate) struct Wake {
     pending: Mutex<bool>,
     changed: Condvar,
+    /// Increased under the publication lock whenever capture asks for a
+    /// fresh snapshot, independently of the poller's current sequence.
+    request_generation: AtomicU64,
 }
 
 impl Wake {
@@ -122,6 +128,7 @@ impl Wake {
 pub(crate) struct Cx {
     pub cancel: Cancel,
     wake: Arc<Wake>,
+    snapshot_generation: AtomicU64,
 }
 
 impl Cx {
@@ -129,12 +136,14 @@ impl Cx {
         Self {
             cancel: Cancel::default(),
             wake: Arc::default(),
+            snapshot_generation: AtomicU64::new(0),
         }
     }
     fn with_wake(wake: Arc<Wake>) -> Self {
         Self {
             cancel: Cancel::default(),
             wake,
+            snapshot_generation: AtomicU64::new(0),
         }
     }
     /// Sleep until `at`, a wake-up, or cancellation; true when woken early.
@@ -165,6 +174,14 @@ impl Cx {
     }
     pub(crate) fn cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+    /// Called after the polling wait, immediately before a snapshot GET.
+    /// A capture while that GET is in flight must wait for its successor.
+    pub(crate) fn begin_snapshot(&self) {
+        self.snapshot_generation.store(
+            self.wake.request_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
     }
 }
 
@@ -215,7 +232,7 @@ struct State {
     failure: Option<(ErrorKind, String)>,
     running: bool,
     stop: bool,
-    /// Keep reading a continuous stream until then while not running.
+    /// Retain a continuous stream until then while not running.
     park_until: Option<Instant>,
     /// Frames of another size than the first after starting are dropped.
     size: Option<(u32, u32)>,
@@ -279,6 +296,13 @@ impl Pump {
                 .map_or(self.factory.stream() != Stream::Snapshot, |(session, _)| {
                     session.continuous()
                 });
+            if !running && parked && continuous {
+                // Keep the established session ready for start, but do not
+                // enter a potentially 120-second MJPEG read while parked:
+                // that would prevent closing it when PARK expires.
+                self.wait_parked();
+                continue;
+            }
             // Without acquisition, a stream is kept only while parked after
             // connecting, and a snapshot source polls only when asked.
             if !running && !(parked && continuous) && !(demand && !continuous) {
@@ -292,7 +316,21 @@ impl Pump {
                     continue;
                 }
                 let cx = Cx::with_wake(self.shared.wake.clone());
-                self.shared.lock().current = Some(cx.cancel.clone());
+                {
+                    let mut state = self.shared.lock();
+                    // Stop may have won the race since the loop checked
+                    // demand. Register cancellation while holding the same
+                    // lock stop uses, before starting any network work.
+                    let parked = state.park_until.is_some_and(|until| Instant::now() < until);
+                    if state.stop
+                        || (!state.running
+                            && !(parked && continuous)
+                            && !(state.demand.is_some() && !continuous))
+                    {
+                        continue;
+                    }
+                    state.current = Some(cx.cancel.clone());
+                }
                 match self.factory.open(&cx) {
                     Ok(opened) => {
                         session = Some((opened, cx));
@@ -301,6 +339,9 @@ impl Pump {
                         state.note = format!("streaming ({})", self.factory.stream().name());
                     }
                     Err(failure) => {
+                        if cx.cancelled() {
+                            continue;
+                        }
                         if !self.failed(failure, &mut attempts, &mut next_attempt) {
                             break;
                         }
@@ -310,10 +351,14 @@ impl Pump {
             };
             match current.next(cx) {
                 Ok(Next::Frame(frame)) => {
+                    if cx.cancelled() {
+                        session = None;
+                        continue;
+                    }
                     if healthy_since.is_some_and(|since| since.elapsed() >= HEALTHY) {
                         attempts = 0;
                     }
-                    self.publish(frame);
+                    self.publish(frame, cx);
                 }
                 Ok(Next::Skip(reason)) => {
                     let mut state = self.shared.lock();
@@ -377,8 +422,22 @@ impl Pump {
         true
     }
 
-    fn publish(&self, mut frame: Frame) {
+    fn publish(&self, mut frame: Frame, cx: &Cx) {
         let mut state = self.shared.lock();
+        // stop cancels under this lock. Recheck here so a frame finishing
+        // concurrently cannot repopulate the cleared slot after stop/start.
+        if cx.cancelled() {
+            return;
+        }
+        if self.factory.stream() == Stream::Snapshot
+            && cx.snapshot_generation.load(Ordering::SeqCst)
+                != self.shared.wake.request_generation.load(Ordering::SeqCst)
+        {
+            // This GET began before the latest capture request. Keep its
+            // demand pending and bypass the next polling delay.
+            self.shared.wake.wake();
+            return;
+        }
         if state.running {
             let size = (frame.width, frame.height);
             match state.size {
@@ -406,6 +465,21 @@ impl Pump {
                 .shared
                 .changed
                 .wait_timeout(state, Duration::from_millis(500))
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn wait_parked(&self) {
+        let state = self.shared.lock();
+        if !state.stop
+            && !state.running
+            && let Some(until) = state.park_until
+        {
+            let left = until.saturating_duration_since(Instant::now());
+            let _ = self
+                .shared
+                .changed
+                .wait_timeout(state, left)
                 .unwrap_or_else(PoisonError::into_inner);
         }
     }
@@ -451,7 +525,15 @@ impl HubBackend {
             let limit = first_frame.max(factory.first_frame());
             match first(factory.as_ref(), limit, &meta.id) {
                 Ok((session, cx, frame)) => {
-                    return Ok(Self::start_pump(factory, session, cx, frame, meta));
+                    // Clear the old refusal before the pump can observe and
+                    // record a new one. Clearing it after spawning the pump
+                    // could erase an immediate 401 from the next frame.
+                    if let Some((store, name, digest)) = &meta.latch {
+                        let _ = store.clear_rejected(name, digest);
+                    }
+                    // A thread failure is infrastructure failure, not a
+                    // reason to try another stream with the same camera.
+                    return Self::start_pump(factory, session, cx, frame, meta);
                 }
                 Err(failure) => {
                     if let (Some(status), Some((store, name, digest))) =
@@ -475,9 +557,24 @@ impl HubBackend {
         factory: Arc<dyn SourceFactory>,
         session: Box<dyn FrameSession>,
         cx: Cx,
+        frame: Frame,
+        meta: Meta,
+    ) -> Result<Self> {
+        Self::start_pump_with(factory, session, cx, frame, meta, |work| {
+            std::thread::Builder::new()
+                .name("capturefab-hub-pump".into())
+                .spawn(work)
+        })
+    }
+
+    fn start_pump_with(
+        factory: Arc<dyn SourceFactory>,
+        session: Box<dyn FrameSession>,
+        cx: Cx,
         mut frame: Frame,
         meta: Meta,
-    ) -> Self {
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>>,
+    ) -> Result<Self> {
         let wake = cx.wake.clone();
         let (width, height) = (frame.width, frame.height);
         let epoch = Instant::now();
@@ -500,21 +597,23 @@ impl HubBackend {
             meta: meta.clone(),
             epoch,
         };
-        let thread = std::thread::Builder::new()
-            .name("capturefab-hub-pump".into())
-            .spawn(move || pump.run(Some((session, cx))))
-            .ok();
-        Self {
+        let thread = spawn(Box::new(move || pump.run(Some((session, cx))))).map_err(|_| {
+            Categorized::error(
+                ErrorKind::OperationFailed,
+                "cannot start the hub camera frame pump",
+            )
+        })?;
+        Ok(Self {
             meta,
             shared,
-            thread,
+            thread: Some(thread),
             stream: factory.stream(),
             fps: factory.fps(),
             width,
             height,
             running: false,
             delivered: 0,
-        }
+        })
     }
 
     fn shutdown(&mut self) {
@@ -649,6 +748,10 @@ impl Backend for HubBackend {
     fn request_frame(&mut self) -> Result<()> {
         if self.stream == Stream::Snapshot {
             let mut state = self.shared.lock();
+            self.shared
+                .wake
+                .request_generation
+                .fetch_add(1, Ordering::SeqCst);
             let seq = state.seq;
             state.demand = Some(state.demand.map_or(seq, |pending| pending.max(seq)));
             drop(state);

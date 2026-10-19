@@ -306,6 +306,7 @@ mod tests {
             tls_server_name: None,
             rtsp_port: None,
             rejected: None,
+            revision: None,
         };
         let error = resolve(&hub).err().expect("unset");
         assert!(format!("{error}").contains("is not set in the process that opened hub home"));

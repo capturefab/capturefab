@@ -1762,6 +1762,11 @@ impl Drop for Client<'_> {
 }
 
 pub fn run(mut cli: Cli) -> Result<()> {
+    // Hub management never targets a camera. Ignore even a malformed stale
+    // environment selector before path resolution and shape validation.
+    if matches!(cli.command, Some(Command::Hub { .. })) {
+        cli.camera = None;
+    }
     let base = std::env::current_dir()?;
     if let Some(camera) = &mut cli.camera {
         input(crate::workflow::resolve_selector(camera, &base))?;

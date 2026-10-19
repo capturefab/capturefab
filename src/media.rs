@@ -833,10 +833,7 @@ pub(crate) fn command(exe: &Executable) -> Command {
     // Camera hub secrets may live in the environment of the process that
     // opens the camera; FFmpeg never needs them.
     for (name, _) in std::env::vars_os() {
-        if name
-            .to_str()
-            .is_some_and(|name| name.starts_with(HUB_SECRET_PREFIX))
-        {
+        if is_hub_secret_variable(&name) {
             cmd.env_remove(name);
         }
     }
@@ -844,6 +841,13 @@ pub(crate) fn command(exe: &Executable) -> Command {
 }
 /// Environment variables that hold camera hub secrets start with this.
 pub(crate) const HUB_SECRET_PREFIX: &str = "CAPTUREFAB_HUB_";
+fn is_hub_secret_variable(name: &std::ffi::OsStr) -> bool {
+    // Windows environment names are case-insensitive, including when the
+    // inherited spelling differs from the saved uppercase variable name.
+    name.to_str()
+        .and_then(|name| name.get(..HUB_SECRET_PREFIX.len()))
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(HUB_SECRET_PREFIX))
+}
 fn bounded_output(exe: &Executable, args: &[String], timeout: Duration) -> Result<(bool, String)> {
     let (success, output, _) = timed_output(exe, args, &[], timeout)?;
     Ok((success, output))
@@ -5301,16 +5305,16 @@ esac"#
     }
     #[test]
     fn ffmpeg_never_inherits_hub_secrets() {
-        let exe = Executable::external("ffmpeg".into());
-        // SAFETY: tests that read this variable do not run concurrently with
-        // it, and no other thread depends on its absence.
-        unsafe { std::env::set_var("CAPTUREFAB_HUB_TEST_SECRET", "CANARY") };
-        let cmd = command(&exe);
-        unsafe { std::env::remove_var("CAPTUREFAB_HUB_TEST_SECRET") };
-        assert!(
-            cmd.get_envs()
-                .any(|(name, value)| { name == "CAPTUREFAB_HUB_TEST_SECRET" && value.is_none() })
-        );
+        for name in [
+            "CAPTUREFAB_HUB_TEST_SECRET",
+            "capturefab_hub_test_secret",
+            "Capturefab_Hub_Secret",
+        ] {
+            assert!(is_hub_secret_variable(std::ffi::OsStr::new(name)));
+        }
+        assert!(!is_hub_secret_variable(std::ffi::OsStr::new(
+            "CAPTUREFAB_FFMPEG"
+        )));
     }
     #[test]
     fn backend_urls_lowercase_only_the_scheme_and_keep_credentials_redacted() {

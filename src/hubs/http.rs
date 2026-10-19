@@ -342,9 +342,58 @@ impl HttpError {
     }
 }
 
+/// Rearm the absolute deadline before every socket operation, including the
+/// reads rustls performs inside a handshake. A timeout set just once per HTTP
+/// line would restart with each successful read and let a slow drip run forever.
+struct Socket {
+    stream: TcpStream,
+    idle: Duration,
+    deadline: Option<Instant>,
+}
+
+impl Socket {
+    fn wait(&self) -> io::Result<Duration> {
+        let left = self
+            .deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        if left.is_some_and(|left| left.is_zero()) {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        Ok(left.map_or(self.idle, |left| left.min(self.idle)))
+    }
+}
+
+impl Read for Socket {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.wait()?))?;
+        self.stream.read(buf)
+    }
+}
+
+impl Write for Socket {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.wait()?))?;
+        self.stream.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 enum Stream {
-    Plain(TcpStream),
-    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+    Plain(Socket),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, Socket>>),
+}
+
+impl Stream {
+    fn body_limits(&mut self, idle: Duration, deadline: Option<Instant>) {
+        let socket = match self {
+            Self::Plain(socket) => socket,
+            Self::Tls(stream) => &mut stream.sock,
+        };
+        socket.idle = idle.max(Duration::from_millis(1));
+        socket.deadline = deadline;
+    }
 }
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -711,7 +760,11 @@ fn valid_header(value: &str) -> bool {
     !value.bytes().any(|b| b < 0x20 || b == 0x7f)
 }
 
-fn resolve(host: &str, port: u16, deadline: Instant) -> Result<Vec<SocketAddr>, Problem> {
+pub(crate) fn resolve(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+) -> Result<Vec<SocketAddr>, Problem> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
@@ -901,7 +954,11 @@ pub(crate) fn send(
             .map_err(|_| fail(Problem::Io("the network connection failed")))
     };
     arm(&socket)?;
-    let clone = socket.try_clone().map_err(io_error)?;
+    let clone = Socket {
+        stream: socket.try_clone().map_err(io_error)?,
+        idle: limits.headers.max(Duration::from_millis(1)),
+        deadline: Some(head_deadline),
+    };
     let mut stream = match &endpoint.tls {
         None => Stream::Plain(clone),
         Some((config, name)) => {
@@ -1003,7 +1060,8 @@ pub(crate) fn send(
             Some(Err(_)) => return Err(fail(Problem::Protocol("bad length"))),
         }
     };
-    let _ = socket.set_write_timeout(None);
+    let deadline = limits.total.map(|total| start + total);
+    reader.get_mut().body_limits(limits.idle, deadline);
     Ok(Response {
         status,
         headers,
@@ -1015,7 +1073,7 @@ pub(crate) fn send(
             received: 0,
             max: limits.max_body,
             idle: limits.idle,
-            deadline: limits.total.map(|total| start + total),
+            deadline,
             total: limits.total,
             cancel: cancel.cloned(),
             context: (
@@ -1060,17 +1118,16 @@ pub(crate) fn fetch_fingerprint(
         })
     })?;
     let socket = connect(&addrs, deadline, timeout).map_err(fail)?;
-    let left = deadline
-        .saturating_duration_since(Instant::now())
-        .max(Duration::from_millis(1));
-    let _ = socket.set_read_timeout(Some(left));
-    let _ = socket.set_write_timeout(Some(left));
     let Some((config, name)) = &endpoint.tls else {
         unreachable!("capturing endpoints use TLS")
     };
     let mut connection = rustls::ClientConnection::new(config.clone(), name.clone())
         .map_err(|_| fail(Problem::Tls("the TLS handshake failed")))?;
-    let mut socket = socket;
+    let mut socket = Socket {
+        stream: socket,
+        idle: timeout.max(Duration::from_millis(1)),
+        deadline: Some(deadline),
+    };
     // Drive the handshake until the capture verifier aborts it.
     while connection.is_handshaking() {
         if let Err(error) = connection.complete_io(&mut socket) {

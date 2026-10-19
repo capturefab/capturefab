@@ -1647,6 +1647,9 @@ fn poll_pace(workers: bool, quick: bool, efficient: bool) -> (u8, Option<Duratio
 #[derive(Clone)]
 pub struct SessionHandle {
     inner: Arc<Coordinator>,
+    /// A permission on this client handle, inherited by its command tasks.
+    /// Remote clients opt in separately from local IPC/GUI clients.
+    allow_hub_connect: bool,
 }
 impl Default for SessionHandle {
     fn default() -> Self {
@@ -1656,6 +1659,7 @@ impl Default for SessionHandle {
 impl SessionHandle {
     pub fn new() -> Self {
         let h = Self {
+            allow_hub_connect: true,
             inner: Arc::new(Coordinator {
                 analytics: crate::analytics::Analytics::new(),
                 started: Instant::now(),
@@ -1693,7 +1697,10 @@ impl SessionHandle {
                     if inner.quitting.load(Ordering::Acquire) {
                         break;
                     }
-                    let h = Self { inner };
+                    let h = Self {
+                        inner,
+                        allow_hub_connect: true,
+                    };
                     h.refresh_workers();
                     h.store_snapshot();
                     wait = h.next_poll();
@@ -1774,6 +1781,17 @@ impl SessionHandle {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
     }
+    pub(crate) fn without_hub_connect(mut self) -> Self {
+        self.allow_hub_connect = false;
+        self
+    }
+    fn check_hub_connect(&self, camera: &str) -> Result<()> {
+        ensure!(
+            self.allow_hub_connect || !crate::hubs::is_source(camera),
+            "hub cameras cannot be opened through the remote API; start serve with --allow-hubs to allow it"
+        );
+        Ok(())
+    }
     /// Refresh every idle worker's snapshot; busy workers report on their reply.
     fn refresh_workers(&self) {
         let workers = self.workers();
@@ -1815,9 +1833,13 @@ impl SessionHandle {
     /// has one worker, so asking for it with other options is refused rather
     /// than replacing the stream others are using.
     fn connected_hub_camera(&self, camera: &str) -> Result<Option<Value>> {
-        let Some(selector) = crate::hubs::Selector::parse(camera).ok() else {
+        if !crate::hubs::is_source(camera) {
             return Ok(None);
-        };
+        }
+        // Kind validation canonicalizes identifiers too (UniFi camera IDs
+        // are case-insensitive hex). Compare that identity before spawning
+        // so aliases cannot replace an already connected camera's worker.
+        let (_, selector) = crate::hubs::resolve(camera)?;
         let id = selector.id();
         let Some((_, worker)) = self.workers().into_iter().find(|(key, _)| *key == id) else {
             return Ok(None);
@@ -2605,6 +2627,10 @@ impl SessionHandle {
                         .map(|device| device.address.clone().unwrap_or_else(|| device.id.clone()))
                         .unwrap_or(camera)
                 };
+                // Discovery and queued commands can change aliases after
+                // the HTTP server validates a request. Enforce the client's
+                // permission on the identity actually being connected.
+                self.check_hub_connect(&camera)?;
                 if let Some(connected) = self.connected_hub_camera(&camera)? {
                     return Ok(connected);
                 }
@@ -2616,6 +2642,7 @@ impl SessionHandle {
                         .connected
                         .clone()
                         .context("worker has no camera")?;
+                    self.check_hub_connect(&info.id)?;
                     self.edit_state().active_camera = Some(info.id.clone());
                     return Ok(json!({"connected":info,"worker_pid":p.child.id()}));
                 }
@@ -3113,6 +3140,32 @@ mod tests {
             command.get_args().collect::<Vec<_>>(),
             [std::ffi::OsStr::new("__worker")]
         );
+    }
+    #[test]
+    fn remote_hub_permission_is_checked_after_a_queued_alias_is_resolved() {
+        let handle = SessionHandle::new();
+        let remote = handle.clone().without_hub_connect();
+        let command = SessionCommand::Connect {
+            camera: "home/camera.front_door".into(),
+            timeout_ms: 1000,
+        };
+        // Keep Connect queued while discovery publishes a previously
+        // unknown serial alias. An HTTP-only preflight check sees no hub.
+        let turn = handle.command_turn(None, &command).unwrap();
+        let reply = remote.submit(command).unwrap();
+        let mut camera = crate::transport::simulator::info_named("sim:0");
+        camera.id = "hub:home/camera.front_door".into();
+        camera.serial = "home/camera.front_door".into();
+        camera.address = Some(camera.id.clone());
+        handle.inner.state.write().unwrap().devices.push(camera);
+        drop(turn);
+        let error = reply
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("--allow-hubs"), "{error:#}");
+        assert!(handle.workers().is_empty());
+        handle.shutdown();
     }
     #[test]
     fn parent_replies_carry_saved_files_even_when_failed() {

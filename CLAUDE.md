@@ -58,7 +58,7 @@ FFmpeg: `build.rs` embeds `CAPTUREFAB_FFMPEG_BINARY` when set at build time, and
 
 The CLI is a public, versioned automation contract (see `capturefab schema`, `web/agents.md`, `web/llms.txt`):
 - `--json` prints `{"version":1,"ok":true,"result":...}` or `{"version":1,"ok":false,"error":{"code","message"}}` to stdout; diagnostics go to stderr.
-- Exit codes come from `cli::error_code`, which checks typed error categories before classifying by error message text: 1 operation_failed, 2 usage, 3 unavailable, 4 timeout, 5 unsupported, 6 storage_full. Wording of error messages therefore affects exit codes.
+- Exit codes come from `cli::error_code`, which checks usage and typed error categories before falling back to message text: 1 operation_failed, 2 usage, 3 unavailable, 4 timeout, 5 unsupported, 6 storage_full. For uncategorized errors, wording still affects exit codes. Categories survive worker and session IPC replies.
 - Credentials in URLs must be redacted (`media::redact_url`) in logs, status and UI.
 
 When changing commands or output shapes, keep `schema` output, `README.md`, `web/agents.md` and `web/llms.txt` consistent. Avoid publishing camera testing results or compatibility claims while the software is under rapid development.

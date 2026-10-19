@@ -36,6 +36,22 @@ struct Cache {
     entries: HashMap<(PathBuf, String), Entry>,
 }
 
+impl Cache {
+    fn completed(
+        &mut self,
+        key: &(PathBuf, String),
+        digest: [u8; 32],
+        result: Result<Vec<Listed>, String>,
+    ) {
+        if let Some(entry) = self.entries.get_mut(key)
+            && entry.digest == digest
+        {
+            entry.in_flight = false;
+            entry.result = Some((Instant::now(), result));
+        }
+    }
+}
+
 static CACHE: LazyLock<(Mutex<Cache>, Condvar)> = LazyLock::new(Default::default);
 
 fn info(hub: &Hub, camera: &Listed) -> CameraInfo {
@@ -83,6 +99,9 @@ pub(crate) fn discovered_in(store: &Store, timeout: Duration) -> (Vec<CameraInfo
     let mut waiting = Vec::new();
     {
         let mut cache = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        cache.entries.retain(|(dir, name), _| {
+            dir != store.dir() || hubs.iter().any(|hub| hub.name == *name)
+        });
         for hub in &hubs {
             if let Some(rejected) = &hub.rejected {
                 warnings.push(format!(
@@ -112,12 +131,7 @@ pub(crate) fn discovered_in(store: &Store, timeout: Duration) -> (Vec<CameraInfo
                         let result = list(&store, &hub);
                         let (lock, changed) = &*CACHE;
                         let mut cache = lock.lock().unwrap_or_else(PoisonError::into_inner);
-                        if let Some(entry) = cache.entries.get_mut(&key)
-                            && entry.digest == hub.digest()
-                        {
-                            entry.in_flight = false;
-                            entry.result = Some((Instant::now(), result));
-                        }
+                        cache.completed(&key, hub.digest(), result);
                         changed.notify_all();
                     });
                 if spawned.is_err() {
@@ -213,9 +227,48 @@ mod tests {
             tls_server_name: None,
             rtsp_port: None,
             rejected: None,
+            revision: None,
         };
         store.save_with(&hub, |_| Ok(()), |_| Ok(())).unwrap();
-        hub
+        store.get("home").unwrap()
+    }
+
+    #[test]
+    fn removed_hubs_release_cached_cameras_and_ignore_late_listings() {
+        let store = store("removed");
+        let hub = save(&store, "http://127.0.0.1:1", "CAPTUREFAB_HUB_REMOVED");
+        let key = (store.dir().to_path_buf(), hub.name.clone());
+        let listing = vec![Listed {
+            camera: "camera.front_door".into(),
+            name: "Front door".into(),
+            state: None,
+            online: true,
+            streams: vec![Stream::Snapshot],
+        }];
+        let (lock, _) = &*CACHE;
+        lock.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .insert(
+                key.clone(),
+                Entry {
+                    digest: hub.digest(),
+                    in_flight: true,
+                    started: Some(Instant::now()),
+                    result: Some((Instant::now(), Ok(listing.clone()))),
+                },
+            );
+        store.remove(&hub.name).unwrap();
+        let (devices, warnings) = discovered_in(&store, Duration::ZERO);
+        assert!(devices.is_empty() && warnings.is_empty());
+        let mut cache = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(!cache.entries.contains_key(&key));
+        // The callback from a listing already in flight uses this same
+        // completion path and cannot recreate the removed entry.
+        cache.completed(&key, hub.digest(), Ok(listing));
+        assert!(!cache.entries.contains_key(&key));
+        drop(cache);
+        std::fs::remove_dir_all(store.dir()).unwrap();
     }
 
     #[test]

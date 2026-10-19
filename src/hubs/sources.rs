@@ -212,6 +212,7 @@ impl FrameSession for SnapshotSession {
         if cx.cancelled() {
             return Err(Failure::transient(ErrorKind::OperationFailed, "cancelled"));
         }
+        cx.begin_snapshot();
         let started = Instant::now();
         let result = (|| {
             let response = self.access.media(&self.request, cx)?;
@@ -256,6 +257,9 @@ impl SourceFactory for RtspSource {
         RTSP_OPEN
     }
     fn open(&self, cx: &Cx) -> Result<Box<dyn FrameSession>, Failure> {
+        if cx.cancelled() {
+            return Err(Failure::transient(ErrorKind::OperationFailed, "cancelled"));
+        }
         let unreachable = || {
             Failure::transient(
                 ErrorKind::Unavailable,
@@ -267,13 +271,26 @@ impl SourceFactory for RtspSource {
         };
         // A quick check first, so a missing restream does not wait out
         // FFmpeg's timeout.
-        let addrs = std::net::ToSocketAddrs::to_socket_addrs(&(self.host.as_str(), self.port))
-            .map_err(|_| unreachable())?
-            .collect::<Vec<_>>();
-        if !addrs
-            .iter()
-            .any(|addr| std::net::TcpStream::connect_timeout(addr, Duration::from_secs(1)).is_ok())
-        {
+        // DNS and all resolved addresses share one budget. A synchronous
+        // getaddrinfo here could otherwise outlive the first-frame deadline.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let addrs =
+            super::http::resolve(&self.host, self.port, deadline).map_err(|_| unreachable())?;
+        let mut reachable = false;
+        for addr in addrs {
+            if cx.cancelled() {
+                return Err(Failure::transient(ErrorKind::OperationFailed, "cancelled"));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            if std::net::TcpStream::connect_timeout(&addr, left).is_ok() {
+                reachable = true;
+                break;
+            }
+        }
+        if !reachable {
             return Err(unreachable());
         }
         if cx.cancelled() {
@@ -364,5 +381,28 @@ impl FrameSession for RtspSession {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cancelled_rtsp_open_never_resolves_or_starts_ffmpeg() {
+        let source = RtspSource {
+            url: "rtsp://should-not-resolve.invalid:8554/live".into(),
+            host: "should-not-resolve.invalid".into(),
+            port: 8554,
+            label: "camera live on hub test".into(),
+        };
+        let cx = Cx::new();
+        cx.cancel.cancel();
+        let started = Instant::now();
+        let Err(failure) = source.open(&cx) else {
+            panic!("cancelled before DNS");
+        };
+        assert_eq!(failure.message, "cancelled");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

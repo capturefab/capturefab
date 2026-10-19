@@ -143,6 +143,11 @@ impl Server {
         web_root: WebRoot,
         allow_hubs: bool,
     ) -> Result<Self> {
+        let handle = if allow_hubs {
+            handle
+        } else {
+            handle.without_hub_connect()
+        };
         let listener = TcpListener::bind(address).context("bind remote HTTP listener")?;
         let address = listener.local_addr()?;
         let quitting = Arc::new(AtomicBool::new(false));
@@ -487,15 +492,17 @@ impl Service {
     /// Whether `camera` names a hub camera, directly or as the ID or serial
     /// of a discovered one.
     fn opens_hub(&self, camera: &str) -> bool {
+        let snapshot = self.handle.snapshot_unwatched();
         crate::hubs::is_source(camera)
-            || self
-                .handle
-                .snapshot_unwatched()
+            || snapshot
                 .devices
                 .iter()
+                .chain(snapshot.cameras.iter().map(|camera| &camera.info))
                 .any(|device| {
                     crate::hubs::is_source(&device.id)
-                        && (device.id == camera || device.serial == camera)
+                        && (device.id == camera
+                            || device.serial == camera
+                            || device.address.as_deref() == Some(camera))
                 })
     }
     fn respond(&self, request: Request) -> Response {

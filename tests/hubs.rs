@@ -21,6 +21,28 @@ use std::{
 
 const TOKEN: &str = "CANARY-hub-cli-token";
 
+struct Running(Child);
+
+impl std::ops::Deref for Running {
+    type Target = Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Running {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn temp_root(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "capturefab-hubs-{name}-{}-{}",
@@ -206,14 +228,16 @@ fn saved_hubs_never_hold_secrets() {
             .is_empty()
     );
     // Hub commands ignore a stale camera selector.
-    let output = command(
-        &bench.dir,
-        &[("CAPTUREFAB_CAMERA", "hub:missing/x")],
-        &["hub", "list"],
-    )
-    .output()
-    .unwrap();
-    assert!(output.status.success());
+    for selector in ["hub:missing/x", "hub:stale", "hub:stale/x?stream=hls"] {
+        let output = command(
+            &bench.dir,
+            &[("CAPTUREFAB_CAMERA", selector)],
+            &["hub", "list"],
+        )
+        .output()
+        .unwrap();
+        assert!(output.status.success(), "{selector}: {output:?}");
+    }
     bench.assert_no_canary();
 }
 
@@ -458,11 +482,10 @@ fn hub_cameras_capture_from_mjpeg_and_snapshots() {
         .map(|e| e.path())
         .collect::<Vec<_>>();
     assert_eq!(files.len(), 3);
-    let mut bytes = files
+    let bytes = files
         .iter()
         .map(|path| std::fs::read(path).unwrap())
-        .collect::<Vec<_>>();
-    bytes.dedup();
+        .collect::<std::collections::HashSet<_>>();
     assert_eq!(bytes.len(), 3, "the repeated first frame was dropped");
     assert_eq!(png_size(&files[0]), (64, 36));
     let snapshot = out.join("s-{seq}.png").to_string_lossy().into_owned();
@@ -585,11 +608,13 @@ fn sessions_reconnect_streams_and_stop_promptly() {
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect::<Vec<_>>();
-    let mut serve: Child = command(&bench.dir, &env, &["--json", "serve", "--name", "bench"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut serve = Running(
+        command(&bench.dir, &env, &["--json", "serve", "--name", "bench"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let mut ready = String::new();
     BufReader::new(serve.stdout.take().unwrap())
         .read_line(&mut ready)
@@ -639,33 +664,75 @@ fn sessions_reconnect_streams_and_stop_promptly() {
     bench.assert_no_canary();
 }
 
+#[cfg(unix)]
+#[test]
+fn ffmpeg_subprocesses_receive_neither_hub_secrets_nor_secret_environment() {
+    use std::os::unix::fs::PermissionsExt;
+    // Keep the restream port open so the reachability check reaches FFmpeg.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut config = fake_hub::Go2rtc::new(frames());
+    config.rtsp_listen = format!(":{}", listener.local_addr().unwrap().port());
+    let fake = config.start();
+    let mut bench = Bench::new("ffmpeg-environment");
+    bench.json(&["hub", "add-go2rtc", "g", "--url", &fake.url()]);
+    let stub = bench.dir.join("ffmpeg-stub");
+    let observed = bench.dir.join("ffmpeg-observed.txt");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\n{ printf 'invoked\\n'; printf '%s\\n' \"$@\"; printf '%s\\n' \"${CAPTUREFAB_HUB_HOME_TOKEN-unset}\" \"${capturefab_hub_lowercase-unset}\"; } >> \"$CAPTUREFAB_STUB_OUTPUT\"\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700)).unwrap();
+    bench.env.extend([
+        (
+            "CAPTUREFAB_FFMPEG".into(),
+            stub.to_string_lossy().into_owned(),
+        ),
+        (
+            "CAPTUREFAB_STUB_OUTPUT".into(),
+            observed.to_string_lossy().into_owned(),
+        ),
+        (
+            "capturefab_hub_lowercase".into(),
+            "CANARY-lowercase-secret".into(),
+        ),
+    ]);
+    bench.fails(&["--camera", "hub:g/porch?stream=rtsp", "info"]);
+    let invocation = std::fs::read_to_string(&observed).unwrap();
+    assert!(invocation.contains("invoked\n"), "the stub actually ran");
+    assert!(invocation.contains("unset\nunset\n"), "{invocation}");
+    bench.assert_no_canary();
+}
+
 #[test]
 #[ignore = "requires FFmpeg with libx264; set CAPTUREFAB_FFMPEG to the executable"]
 fn hub_restreams_play_through_ffmpeg() {
     // Capturefab's own RTSP simulator stands in for go2rtc's restream.
     let port = fake_http::refused_port();
     let mut bench = Bench::new("restream");
-    let mut simulator = command(
-        &bench.dir,
-        &[],
-        &[
-            "--json",
-            "simulate",
-            "run",
-            "--preset",
-            "rtsp",
-            "--rtsp-port",
-            &port.to_string(),
-            "--width",
-            "320",
-            "--height",
-            "240",
-        ],
-    )
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null())
-    .spawn()
-    .unwrap();
+    let mut simulator = Running(
+        command(
+            &bench.dir,
+            &[],
+            &[
+                "--json",
+                "simulate",
+                "run",
+                "--preset",
+                "rtsp",
+                "--rtsp-port",
+                &port.to_string(),
+                "--width",
+                "320",
+                "--height",
+                "240",
+            ],
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap(),
+    );
     let mut ready = String::new();
     BufReader::new(simulator.stdout.take().unwrap())
         .read_line(&mut ready)
