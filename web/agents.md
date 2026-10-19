@@ -271,7 +271,10 @@ Risk classes are Observe, Reversible, Bounded, Disruptive and HumanOnly.
 Disruptive and HumanOnly execution must include `--confirmed-by-user`.
 Pass this flag only after the user approved that exact action.
 Without it, the command exits 2 and includes `error.details.risk`.
-Dry runs do not need confirmation.
+This refusal takes precedence over checked validation and availability issues,
+including missing FFmpeg; `error.details.checked` retains those issues.
+Dry runs do not need confirmation. Dry runs and confirmed calls report checked
+issues using their normal exit codes.
 
 Action results are `{summary,results,watch}`; `results` contains the session replies.
 Read `result.results[0].camera_change.token` from the settings reply before a separate undo call. A separate invocation cannot prove ownership of that token; obtain human approval and use `--confirmed-by-user`. An autonomous task can undo its own recorded tokens without another approval.

@@ -413,6 +413,22 @@ pub(super) fn run(cli: &Cli, command: &ToolsCommand, prepared: PreparedTools) ->
     state.actor_id = host.actor_id();
     let present = |id, field: &str| secrets.secret(id, field).is_some();
     let checked = registry::check_plan_with(&ctx, &mut state, &steps, &present);
+    // Missing approval takes precedence over checked availability issues, so
+    // installing FFmpeg cannot change an unconfirmed action's error category.
+    if !dry_run
+        && !confirmed
+        && let Some(risk) = checked
+            .iter()
+            .map(|step| step.risk)
+            .filter(|risk| *risk >= Risk::Disruptive)
+            .max()
+    {
+        return Err(ToolsConfirmationRequired {
+            risk,
+            checked: json!(checked),
+        }
+        .into());
+    }
     if let Some(failure) = check_failure(&checked) {
         return Err(failure.into());
     }
@@ -427,19 +443,6 @@ pub(super) fn run(cli: &Cli, command: &ToolsCommand, prepared: PreparedTools) ->
         return Ok(registry::redact::for_output(
             json!({"checked":checked,"commands":checked.iter().flat_map(|step|step.ops.iter()).collect::<Vec<_>>()}),
         ));
-    }
-    if let Some(risk) = checked
-        .iter()
-        .map(|step| step.risk)
-        .filter(|risk| *risk >= Risk::Disruptive)
-        .max()
-        && !confirmed
-    {
-        return Err(ToolsConfirmationRequired {
-            risk,
-            checked: json!(checked),
-        }
-        .into());
     }
     let cancel = Arc::new(AtomicBool::new(false));
     let signal_cancel = cancel.clone();
@@ -691,7 +694,7 @@ pub(super) fn schema_contract() -> Value {
         "catalog":registry::catalog_json(),
         "plan":{"version":registry::PLAN_VERSION,"shape":{"version":1,"calls":[{"tool":"tool name","args":"complete argument object"}]},"max_calls":registry::MAX_PLAN_CALLS,"max_bytes":MAX_INPUT,"kinds":["control","capture","configure"],"unknown_fields":"refused","export":"0600; credential URLs refused"},
         "issues":{"shape":{"step":"1-based integer","field":"argument path or null","message":"redacted sentence","severity":"error or warning","code":"typed category"},"exit_codes":{"usage":2,"unavailable":3,"timeout":4,"unsupported":5,"storage_full":6,"operation_failed":1}},
-        "confirmation":{"risks":["disruptive","human_only"],"flag":"--confirmed-by-user","rule":"Pass only after the user approved this exact action.","dry_run":"confirmation is not necessary"},
+        "confirmation":{"risks":["disruptive","human_only"],"flag":"--confirmed-by-user","rule":"Pass only after the user approved this exact action.","missing":"usage (exit 2) with risk and checked steps, before checked validation or availability errors","dry_run":"confirmation is not necessary; checked issues determine the exit code"},
         "images":{"tool":"inspect_frame","default":"private ephemeral <session_dir>/inspect/ files outside the storage ledger","directory_mode":"0700","file_mode":"0600","max_files":MAX_IMAGES,"max_bytes":MAX_IMAGE_BYTES,"image_out":"storage-budgeted new file; existing files are never overwritten","inline_image":"image.base64 holds the encoded preview","metadata":["path","mime","width","height","bytes","sha256"]},
         "secrets":{"source":"--secret-stdin","count":"exactly one eligible step","fields":["create_s3_destination.secret","stream_to_url.password"],"schemas":"secret and password are UI/CLI-only and absent from schemas"},
         "redaction":"URL passwords, credential query values, RTMP stream keys and AWS access key IDs are removed from output; model output additionally removes serial, address, profile and full network URL paths."

@@ -3283,6 +3283,16 @@ fn tools_output(
     args: &[&str],
     input: Option<&str>,
 ) -> std::process::Output {
+    tools_output_env(dir, cwd, args, input, &[])
+}
+
+fn tools_output_env(
+    dir: &PathBuf,
+    cwd: &PathBuf,
+    args: &[&str],
+    input: Option<&str>,
+    env: &[(&str, &str)],
+) -> std::process::Output {
     use std::io::Write;
     let mut command = Command::new(env!("CARGO_BIN_EXE_capturefab"));
     command
@@ -3290,6 +3300,7 @@ fn tools_output(
         .env_remove("CAPTUREFAB_CAMERA")
         .env("CAPTUREFAB_SESSION_DIR", dir)
         .env("CAPTUREFAB_STAGING_DIR", dir.join("uploads"))
+        .envs(env.iter().copied())
         .current_dir(cwd)
         .args(args)
         .stdout(Stdio::piped())
@@ -3803,32 +3814,61 @@ fn tools_missing_destination_and_unconfirmed_stream_have_distinct_errors() {
         tools_response(&output)["error"]["details"]["issues"][0]["field"],
         "destination"
     );
-    let stream=serde_json::json!({"camera":"sim:0","url":"rtmp://uncontacted.example/live/","duration":null,"codec":null,"fps":null,"bitrate":null}).to_string();
-    let output = tools_output(
-        &dir,
-        &cwd,
-        &[
-            "--json",
-            "--session",
-            "tools-ci",
-            "tools",
-            "call",
-            "stream_to_url",
-            "--args",
-            &stream,
-        ],
-        None,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    assert_eq!(
-        tools_response(&output)["error"]["details"]["risk"],
-        "disruptive"
-    );
+    let stream = serde_json::json!({"camera":"sim:0","url":"rtmp://uncontacted.example/live/","duration":null,"codec":null,"fps":null,"bitrate":null});
+    let plan = cwd.join("stream.json");
+    std::fs::write(
+        &plan,
+        serde_json::json!({"version":1,"calls":[{"tool":"stream_to_url","args":stream}]})
+            .to_string(),
+    )
+    .unwrap();
+    let stream = stream.to_string();
+    let missing_ffmpeg = cwd.join("missing-ffmpeg");
+    let unavailable = [("CAPTUREFAB_FFMPEG", missing_ffmpeg.to_str().unwrap())];
+    // Exercise inherited FFmpeg configuration and an explicitly absent encoder,
+    // even on hosts/builds that normally provide FFmpeg. Never open the URL.
+    for env in [&[][..], &unavailable[..]] {
+        for command in [
+            vec!["call", "stream_to_url", "--args", &stream],
+            vec!["apply", plan.to_str().unwrap()],
+        ] {
+            let mut args = vec!["--json", "--session", "tools-ci", "tools"];
+            args.extend(command);
+            let output = tools_output_env(&dir, &cwd, &args, None, env);
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let response = tools_response(&output);
+            assert_eq!(response["error"]["code"], "usage");
+            assert_eq!(response["error"]["details"]["risk"], "disruptive");
+            if !env.is_empty() {
+                assert!(
+                    response["error"]["details"]["checked"][0]["issues"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|issue| issue["code"] == "unavailable")
+                );
+                for flag in ["--dry-run", "--confirmed-by-user"] {
+                    let mut args = args.clone();
+                    args.push(flag);
+                    let output = tools_output_env(&dir, &cwd, &args, None, env);
+                    assert_eq!(
+                        output.status.code(),
+                        Some(3),
+                        "{}",
+                        String::from_utf8_lossy(&output.stdout)
+                    );
+                    let response = tools_response(&output);
+                    assert_eq!(response["error"]["code"], "unavailable");
+                    assert!(response["error"]["details"]["risk"].is_null());
+                }
+            }
+        }
+    }
     let status = tools_ok(
         &dir,
         &cwd,
@@ -5294,14 +5334,13 @@ mod assistant_cli_tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
-        let pid = running.0.as_ref().unwrap().id().to_string();
-        assert!(
-            Command::new("kill")
-                .args(["-TERM", &pid])
-                .status()
-                .unwrap()
-                .success()
-        );
+        unsafe extern "C" {
+            fn kill(pid: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
+        }
+        let pid = std::ffi::c_int::try_from(running.0.as_ref().unwrap().id()).unwrap();
+        // SAFETY: this is our live child process, and 15 is SIGTERM on supported Unix targets.
+        let signaled = unsafe { kill(pid, 15) };
+        assert_eq!(signaled, 0, "{}", std::io::Error::last_os_error());
         let stop_deadline = std::time::Instant::now() + Duration::from_secs(10);
         while running.0.as_mut().unwrap().try_wait().unwrap().is_none() {
             assert!(
