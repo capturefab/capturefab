@@ -22,9 +22,7 @@ pub(super) enum Section {
     EncoderOptions,
     // Toggled from the dataset and signals views (Slices B and C).
     CaptureTags,
-    #[allow(dead_code)]
     Dataset,
-    #[allow(dead_code)]
     Signals,
     /// The Video tab's destination and file name, behind its preview.
     RecordLocation,

@@ -285,25 +285,6 @@ fn resolve_credentials(
         .transpose()
 }
 
-/// Store a key directly in the platform's native secure credential store.
-/// Environment values still take precedence over this saved value.
-pub fn store_api_key(provider: Provider, key: &str) -> Result<()> {
-    validate_api_key(key)?;
-    native_entry(provider)?.set_password(key).map_err(|_| {
-        anyhow!(
-            "cannot save {provider} API key in the OS credential store; unlock the credential store and try again"
-        )
-    })
-}
-
-/// Idempotently remove only Capturefab's saved key for this provider.
-pub fn delete_api_key(provider: Provider) -> Result<()> {
-    match native_entry(provider)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(_) => bail!("cannot remove {provider} API key from the OS credential store"),
-    }
-}
-
 /// Report the effective credential source without returning the secret.
 pub fn credential_status(provider: Provider) -> Result<CredentialStatus> {
     Ok(resolve_credentials(provider, &NativeCredentials)?

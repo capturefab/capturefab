@@ -51,8 +51,6 @@ pub fn has_secret(service: &str, account: &str) -> bool {
         .is_ok()
 }
 
-pub use crate::secret_input::read_stdin_secret;
-
 #[cfg(test)]
 mod tests {
     use super::*;

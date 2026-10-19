@@ -103,9 +103,6 @@ impl Settings {
         }
         Ok(())
     }
-    pub fn save(&self) -> Result<()> {
-        save_in(&dir(), self)
-    }
 }
 fn validate_provider(id: ProviderId, settings: &ProviderSettings) -> Result<()> {
     if let Err(issues) = settings.validate(id) {
@@ -142,9 +139,6 @@ pub struct Loaded {
 
 pub fn load() -> Loaded {
     load_in(&dir())
-}
-pub fn selected() -> Option<(ProviderId, ProviderSettings)> {
-    load().settings.selected()
 }
 
 /// Read-only; a missing settings file does not create the state directory.

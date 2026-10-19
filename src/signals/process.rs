@@ -241,10 +241,6 @@ fn spec(uri: &str, mode: Mode, timeout_ms: u64, protocol: Protocol) -> SignalSpe
     }
 }
 
-/// `signal_read`: one round of current values.
-pub fn read(uri: &str, timeout_ms: u64) -> Result<Json> {
-    read_inner(uri, timeout_ms, None)
-}
 pub fn read_bound(
     uri: &str,
     timeout_ms: u64,
@@ -284,10 +280,6 @@ fn read_inner(
     }))
 }
 
-/// `signal_browse`: nodes, topics or data items, at most `limit`.
-pub fn browse(uri: &str, duration_ms: u64, limit: u32) -> Result<Json> {
-    browse_inner(uri, duration_ms, limit, None)
-}
 pub fn browse_bound(
     uri: &str,
     duration_ms: u64,

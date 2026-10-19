@@ -405,13 +405,6 @@ impl Conversation {
             _ => Vec::new(),
         })
     }
-    pub fn request_bytes(
-        &self,
-        ctx: &super::protocol::BuildCtx<'_>,
-        wire: &dyn super::protocol::Wire,
-    ) -> Result<usize, ProviderError> {
-        Ok(wire.build(ctx, self)?.body.len())
-    }
     pub(crate) fn validate_request(&self) -> Result<(), ProviderError> {
         self.check_invariant()
             .map_err(|_| ProviderError::new(ProviderErrorKind::Rejected))

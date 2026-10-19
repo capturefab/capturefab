@@ -1,7 +1,7 @@
 //! Bounded PFNC image conversion and portable output without image codecs from the OS.
 use crate::types::{Frame, MONO8, RGB8};
 use anyhow::{Result, bail, ensure};
-use std::{io::Write, path::Path};
+use std::io::Write;
 
 pub fn pixel_format_name(format: u32) -> &'static str {
     match format {
@@ -948,15 +948,6 @@ pub fn encode(frame: &Frame, format: &str) -> Result<Vec<u8>> {
         _ => bail!("unknown image format {format}; use png, jpeg, raw, pgm or ppm"),
     }
     Ok(bytes)
-}
-
-pub fn save(frame: &Frame, path: &Path, format: &str) -> Result<()> {
-    crate::storage::save(
-        frame,
-        path,
-        format,
-        &crate::storage::StoragePolicy::default(),
-    )
 }
 
 #[cfg(test)]

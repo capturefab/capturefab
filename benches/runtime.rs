@@ -462,13 +462,12 @@ fn main() {
             f.data.len(),
             || {
                 index += 1;
-                storage::save(
-                    &f,
+                storage::save_bytes(
+                    &capturefab::frame::encode(&f, encoding).unwrap(),
                     &output.join(format!("{index}.{encoding}")),
-                    encoding,
                     &StoragePolicy::default(),
                 )
-                .unwrap()
+                .unwrap();
             },
         );
     }
@@ -492,7 +491,8 @@ fn main() {
         let large = format!("storage/save_bytes/5MB/ledger{entries}");
         let mut save = || {
             index += 1;
-            storage::save(&tiny, &output.join(format!("{index}.raw")), "raw", &policy).unwrap();
+            let bytes = capturefab::frame::encode(&tiny, "raw").unwrap();
+            storage::save_bytes(&bytes, &output.join(format!("{index}.raw")), &policy).unwrap();
             index
         };
         if b.selected(&name) || b.selected(&large) {

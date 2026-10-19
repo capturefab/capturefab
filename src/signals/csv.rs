@@ -35,9 +35,6 @@ impl CsvSink {
             discard_empty: AtomicBool::new(false),
         })
     }
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
     /// A run that failed before logging anything leaves no header-only file
     /// behind, so the same command can be run again.
     pub fn discard_if_empty(&self) {

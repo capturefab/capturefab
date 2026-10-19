@@ -138,10 +138,6 @@ const FOCUS_EVERY: Duration = Duration::from_millis(66);
 const TILE_SIDE: u32 = 1920;
 const EFFICIENT_SIDE: u32 = 1280;
 
-pub fn run(handle: SessionHandle, session_label: String, simulated: bool) -> Result<()> {
-    run_capture(handle, session_label, simulated, None, 0)
-}
-
 /// Quit on SIGINT, SIGTERM or SIGHUP as the Quit command does, so the
 /// session finishes its recordings, folds the upload queue and removes its
 /// descriptor: `requested` tells the next tick. A second signal exits at

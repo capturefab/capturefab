@@ -136,12 +136,10 @@ impl<'a, T: ToString + PartialEq + Clone + 'a, M: Clone + 'static, R: text::Rend
         self.menu_style = Box::new(style);
         self
     }
-    #[allow(dead_code)]
     pub(super) fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
     }
-    #[allow(dead_code)]
     pub(super) fn id(mut self, id: impl Into<Id>) -> Self {
         self.id = Some(id.into());
         self

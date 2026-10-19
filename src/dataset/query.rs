@@ -1,6 +1,6 @@
 //! Read-only access to a dataset: a cloned connection that runs one
 //! SELECT/WITH statement or an export, outside the writer's lock.
-use super::db::{Staging, explain, file_label};
+use super::db::{Staging, explain};
 use anyhow::{Result, bail, ensure};
 use base64::Engine as _;
 use duckdb::{Connection, InterruptHandle, types::Value as Db};
@@ -194,9 +194,6 @@ impl Reader {
             super::model_snapshot::ModelQueryLimits::bounded(limit, timeout_ms, max_result_bytes)?,
             &AtomicBool::new(false),
         )
-    }
-    pub fn label(&self) -> String {
-        file_label(&self.path)
     }
 }
 

@@ -190,10 +190,6 @@ impl Checked {
             "leaves_computer":self.leaves_computer,"commands":self.ops,
         }))
     }
-
-    pub fn json(&self) -> Value {
-        self.value()
-    }
 }
 
 impl fmt::Debug for Checked {
@@ -1343,7 +1339,6 @@ impl std::error::Error for ApplyError {
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProgressState {
-    Checking,
     Running,
     Completed,
 }

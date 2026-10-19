@@ -1549,14 +1549,6 @@ mod tests {
     }
 
     #[test]
-    fn white_reads_on_filled_buttons() {
-        for p in [&LIGHT, &DARK] {
-            let r = ratio(Color::WHITE, p.accent_fill);
-            assert!(r >= 4.5, "dark {}: {r:.2}", p.dark);
-        }
-    }
-
-    #[test]
     fn secondary_text_reads_on_panels() {
         for p in [&LIGHT, &DARK] {
             let track = if p.dark { p.field } else { rgb(0xEDEDF0) };

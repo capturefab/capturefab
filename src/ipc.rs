@@ -820,9 +820,6 @@ fn serve_client(
     Ok(())
 }
 impl Server {
-    pub fn start(h: SessionHandle, name: &str) -> Result<Self> {
-        Self::start_with_kind(h, name, SessionKind::Serve)
-    }
     pub fn start_with_kind(h: SessionHandle, name: &str, kind: SessionKind) -> Result<Self> {
         Self::start_in(h, name, kind, &runtime_dir())
     }

@@ -574,10 +574,6 @@ fn validate_aws_environment(source: &dyn Source, explicit_profile: bool) -> Resu
     Ok(())
 }
 
-pub fn resolve(id: ProviderId, settings: &ProviderSettings) -> Result<Auth> {
-    Ok(resolve_with_settings(id, settings)?.auth)
-}
-
 pub fn resolve_with_settings(
     id: ProviderId,
     settings: &ProviderSettings,

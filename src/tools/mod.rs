@@ -25,7 +25,7 @@ pub mod values;
 pub use check::{check, check_plan, check_plan_with};
 pub use exec::{
     ApplyError, CheckFailure, Checked, EmptySecrets, Executor, Op, PlanFailure, PlanState,
-    Progress, RunFacts, SecretSource, StepOutcome, apply, classify,
+    Progress, RunFacts, SecretSource, StepOutcome, apply,
 };
 #[cfg(test)]
 pub(crate) mod tests;

@@ -23,8 +23,8 @@ pub use http::{Http, ProviderError, ProviderErrorKind};
 pub use limits_defaults::Limits;
 pub use provider::{Effort, Protocol, ProviderId, ProviderSettings};
 pub use settings::Settings;
-pub use usage::{Prices, Usage};
-pub use vision::{VisionDecision, VisionMode};
+pub use usage::Usage;
+pub use vision::VisionMode;
 
 use serde_json::{Value, json};
 

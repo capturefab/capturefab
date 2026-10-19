@@ -160,10 +160,6 @@ impl IpcHost {
         }
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     /// The actor commands are credited to: the caller's, or this process
     /// as `ipc::call_to` would send it.
     fn actor(&self) -> SessionActor {

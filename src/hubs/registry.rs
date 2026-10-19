@@ -334,9 +334,6 @@ impl Url {
     pub fn origin(&self) -> String {
         format!("{}://{}", self.scheme.name(), self.authority())
     }
-    pub fn is_ip(&self) -> bool {
-        self.host.parse::<std::net::IpAddr>().is_ok()
-    }
 }
 
 const URL_HINT: &str = "hub URL must be http(s)://HOST[:PORT][/PATH] without a user name, password, query or fragment; give secrets with --secret-stdin or --secret-env";

@@ -98,10 +98,6 @@ fn var(vars: Vars<'_>, name: &str) -> Option<String> {
 /// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and, for temporary
 /// credentials, `AWS_SESSION_TOKEN`. The keys are not validated: each caller
 /// checks them with its own wording.
-pub fn keys_from_env() -> Result<Keys> {
-    keys_from_env_in(&process_vars)
-}
-
 pub(crate) fn keys_from_env_in(vars: Vars<'_>) -> Result<Keys> {
     match (
         var(vars, "AWS_ACCESS_KEY_ID"),
@@ -116,11 +112,7 @@ pub(crate) fn keys_from_env_in(vars: Vars<'_>) -> Result<Keys> {
 
 /// The `[name]` profile of the AWS shared credentials file
 /// (`AWS_SHARED_CREDENTIALS_FILE`, else `~/.aws/credentials`), with its
-/// session token. Not validated, like `keys_from_env`.
-pub fn keys_from_profile(name: &str) -> Result<Keys> {
-    keys_from_profile_in(name, &process_vars)
-}
-
+/// session token. Not validated, like `keys_from_env_in`.
 pub(crate) fn keys_from_profile_in(name: &str, vars: Vars<'_>) -> Result<Keys> {
     let path =
         credentials_file(vars).ok_or_else(|| anyhow!("cannot locate the AWS credentials file"))?;

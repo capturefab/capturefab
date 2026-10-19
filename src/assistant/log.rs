@@ -116,7 +116,6 @@ pub struct ActionLog {
     bytes: u64,
     ended: bool,
 }
-pub type Log = ActionLog;
 
 impl fmt::Debug for ActionLog {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

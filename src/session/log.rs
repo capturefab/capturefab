@@ -23,10 +23,6 @@ impl LogTimestamp {
     pub fn unix_ms(self) -> i64 {
         self.unix_ms
     }
-    /// Offset of the producer's legacy `time` string, not the viewer's zone.
-    pub fn utc_offset_seconds(self) -> i32 {
-        self.utc_offset_seconds
-    }
     pub fn datetime(self) -> DateTime<FixedOffset> {
         // Only constructors and the validating deserializer can create this.
         DateTime::from_timestamp_millis(self.unix_ms)

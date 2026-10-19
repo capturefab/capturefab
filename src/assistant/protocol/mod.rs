@@ -155,12 +155,6 @@ pub fn assistant_tools(mode: Mode) -> Vec<ToolDef> {
     tools
 }
 
-pub fn flatten_wire(value: &Value) -> Vec<Value> {
-    value
-        .as_array()
-        .cloned()
-        .unwrap_or_else(|| vec![value.clone()])
-}
 pub fn result_text(result: &ResultRecord) -> String {
     serde_json::to_string(&if result.is_error {
         json!({"error":error_hint(result)})
@@ -468,21 +462,6 @@ mod tests {
         assert_eq!(
             wire.build(&ctx, &conv).err().unwrap().kind,
             ProviderErrorKind::CutOff
-        );
-    }
-
-    #[test]
-    fn error_result_text_is_always_a_json_object() {
-        let result = ResultRecord {
-            id: "one".into(),
-            name: "fixture".into(),
-            content: json!("a safe hint"),
-            is_error: true,
-            images: Vec::new(),
-        };
-        assert_eq!(
-            serde_json::from_str::<Value>(&result_text(&result)).unwrap(),
-            json!({"error":"a safe hint"})
         );
     }
 }

@@ -17,7 +17,6 @@ pub mod sftp;
 #[cfg(all(test, feature = "sftp"))]
 mod sftp_test_server;
 
-pub use crate::destination::{FTP_SERVICE, SFTP_KEY_SERVICE, SFTP_SERVICE};
 pub use crate::secret_input::read_stdin_secret;
 
 /// An error that retrying will not fix: refused credentials, a missing

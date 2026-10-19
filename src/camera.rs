@@ -82,8 +82,6 @@ pub fn discover_with(
     Ok((devices, warnings))
 }
 
-pub use crate::genicam::stream_locked;
-
 pub struct Camera {
     pub info: CameraInfo,
     backend: Box<dyn Backend>,

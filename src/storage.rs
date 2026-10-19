@@ -19,7 +19,6 @@
 //! on its first lock.
 mod namespace;
 mod output_directory;
-use crate::types::Frame;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use fs2::FileExt;
 #[cfg(feature = "gui")]
@@ -1846,18 +1845,6 @@ pub fn save_bytes(bytes: &[u8], path: &Path, policy: &StoragePolicy) -> Result<S
     };
     writer.finish_written()?;
     Ok(stored)
-}
-pub fn save_hashed(
-    frame: &Frame,
-    path: &Path,
-    format: &str,
-    policy: &StoragePolicy,
-) -> Result<Stored> {
-    let bytes = crate::frame::encode(frame, format)?;
-    save_bytes(&bytes, path, policy)
-}
-pub fn save(frame: &Frame, path: &Path, format: &str, policy: &StoragePolicy) -> Result<()> {
-    save_hashed(frame, path, format, policy).map(drop)
 }
 /// Hold a finished capture back from retention while it waits for upload,
 /// or release it. Returns the SHA-256 recorded when the file was finished.

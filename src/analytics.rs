@@ -16,10 +16,7 @@ use unicode_segmentation::UnicodeSegmentation;
 #[cfg(feature = "ai")]
 mod measurements;
 #[cfg(feature = "ai")]
-pub use measurements::{
-    MAX_MEASUREMENT_SAMPLES, MeasurementSample, render_measurement_svg,
-    render_measurement_svg_with_options,
-};
+pub use measurements::{MeasurementSample, render_measurement_svg_with_options};
 
 pub const RETENTION_SECONDS: u64 = 24 * 60 * 60;
 pub const SAMPLE_INTERVAL_SECONDS: u64 = 1;
