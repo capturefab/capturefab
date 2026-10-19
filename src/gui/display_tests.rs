@@ -3,7 +3,9 @@ use super::*;
 use crate::{session::CameraSnapshot, shared_memory::SharedRing, types::Frame};
 
 /// A workbench showing the selected camera of a ring this test writes to,
-/// converting on the CPU, out of efficiency mode whatever the host.
+/// converting on the CPU, out of efficiency mode whatever the host. Steps
+/// clear `undrawn` first: a slow runner would otherwise outlast `UNDRAWN`
+/// between them and pause frame work.
 fn bench() -> (Workbench, SharedRing) {
     crate::efficiency::pin(false);
     let (handle, writer) = SessionHandle::fed(8 << 20);
@@ -48,6 +50,7 @@ fn cameras<const N: usize>(ids: [&str; N]) -> Vec<CameraSnapshot> {
 fn the_main_view_converts_what_the_stage_shows_and_every_pixel_at_one_to_one() {
     let (mut bench, mut writer) = bench();
     writer.write(&frame(1), false).unwrap();
+    bench.undrawn = None;
     bench.update_frames();
     // Fitted at 0.4 in an 800 x 600 stage.
     assert_eq!(converted(&bench), Some((1000, 750)));
@@ -56,26 +59,34 @@ fn the_main_view_converts_what_the_stage_shows_and_every_pixel_at_one_to_one() {
         Size::new(2000.0, 1500.0)
     );
     // Zooming converts the same, stopped, frame again at once.
+    bench.undrawn = None;
     let _ = bench.update(Message::Actual);
     assert_eq!(converted(&bench), Some((2000, 1500)));
+    bench.undrawn = None;
     let _ = bench.update(Message::Fit);
     assert_eq!(converted(&bench), Some((1000, 750)));
     // Half of fitted, 0.2: shrunk five times.
+    bench.undrawn = None;
     let _ = bench.update(Message::Zoom(0.5));
     assert_eq!(converted(&bench), Some((400, 300)));
+    bench.undrawn = None;
     let _ = bench.dispatch_action(Action::ZoomActual);
     assert_eq!(converted(&bench), Some((2000, 1500)));
+    bench.undrawn = None;
     let _ = bench.dispatch_action(Action::ZoomFit);
     // A display at twice the scale needs twice the pixels; the next tick
     // shows it.
     bench.window_scales.insert(bench.main_window, 2.0);
+    bench.undrawn = None;
     bench.update_frames();
     assert_eq!(converted(&bench), Some((2000, 1500)));
     // A larger stage while stopped, likewise.
     bench.window_scales.clear();
+    bench.undrawn = None;
     bench.update_frames();
     assert_eq!(converted(&bench), Some((1000, 750)));
     bench.stage.set(Size::new(1600.0, 1200.0));
+    bench.undrawn = None;
     bench.update_frames();
     assert_eq!(converted(&bench), Some((2000, 1500)));
     bench.handle.shutdown();
@@ -97,9 +108,11 @@ fn efficiency_mode_keeps_1280_pixels_a_side_on_the_gpu_too_short_of_one_to_one()
         data: vec![90; 2448 * 2048],
     };
     writer.write(&mosaic, false).unwrap();
+    bench.undrawn = None;
     bench.update_frames();
     assert_eq!(uploaded(&gpu, MAIN_VIEW), Some((2448, 2048)));
     crate::efficiency::pin(true);
+    bench.undrawn = None;
     bench.update_frames();
     assert_eq!(uploaded(&gpu, MAIN_VIEW), Some((1224, 1024)));
     assert_eq!(
@@ -107,6 +120,7 @@ fn efficiency_mode_keeps_1280_pixels_a_side_on_the_gpu_too_short_of_one_to_one()
         Size::new(2448.0, 2048.0),
         "placed at its full size"
     );
+    bench.undrawn = None;
     let _ = bench.update(Message::Actual);
     assert_eq!(
         uploaded(&gpu, MAIN_VIEW),
@@ -120,14 +134,17 @@ fn efficiency_mode_keeps_1280_pixels_a_side_on_the_gpu_too_short_of_one_to_one()
         tile: Size::new(800.0, 600.0),
         viewport: 600.0,
     }));
+    bench.undrawn = None;
     bench.update_previews();
     assert_eq!(uploaded(&gpu, "cam"), Some((1224, 1024)));
     crate::efficiency::pin(false);
+    bench.undrawn = None;
     bench.update_previews();
     assert_eq!(uploaded(&gpu, "cam"), Some((2448, 2048)));
     // Without a GPU it converts as much.
     crate::efficiency::pin(true);
     bench.gpu = GpuFrames::cpu_only();
+    bench.undrawn = None;
     let _ = bench.update(Message::Fit);
     assert_eq!(converted(&bench), Some((1224, 1024)));
     bench.handle.shutdown();
@@ -151,14 +168,18 @@ fn choosing_efficient_in_settings_caps_the_preview_size_and_rate_together() {
         timestamp_ns: id,
         data: vec![90; 2448 * 2048],
     };
+    bench.undrawn = None;
     let _ = bench.update(Message::Performance(crate::efficiency::Mode::Smooth));
     writer.write(&mosaic(1), false).unwrap();
+    bench.undrawn = None;
     bench.update_frames();
     assert_eq!(uploaded(&gpu, MAIN_VIEW), Some((2448, 2048)));
     assert!(bench.frame_interval() < EFFICIENT_INTERVAL);
+    bench.undrawn = None;
     let _ = bench.update(Message::Performance(crate::efficiency::Mode::Efficient));
     assert_eq!(bench.frame_interval(), EFFICIENT_INTERVAL, "15 a second");
     writer.write(&mosaic(2), false).unwrap();
+    bench.undrawn = None;
     bench.update_frames();
     assert_eq!(uploaded(&gpu, MAIN_VIEW), Some((1224, 1024)), "1280 a side");
     bench.handle.shutdown();
@@ -175,6 +196,7 @@ fn scopes_measure_a_stream_at_their_own_pace() {
         writer.write(&frame(id), false).unwrap();
         bench.now += Duration::from_micros(33_333);
         let before = bench.measured;
+        bench.undrawn = None;
         bench.update_frames();
         assert_eq!(bench.frame_id, Some(id), "every frame is shown");
         histograms += usize::from(bench.measured.0 != before.0);
@@ -187,6 +209,7 @@ fn scopes_measure_a_stream_at_their_own_pace() {
     bench.frame_id = None;
     writer.write(&frame(31), false).unwrap();
     bench.now += Duration::from_millis(1);
+    bench.undrawn = None;
     bench.update_frames();
     let now = Measured {
         at: Some(bench.now),
@@ -205,6 +228,7 @@ fn scopes_measure_the_frame_a_stream_stops_on() {
     for id in 1..=2 {
         writer.write(&frame(id), false).unwrap();
         bench.now += Duration::from_micros(33_333);
+        bench.undrawn = None;
         bench.update_frames();
     }
     assert_eq!(bench.measured.0.frame, Some(1));
@@ -214,6 +238,7 @@ fn scopes_measure_the_frame_a_stream_stops_on() {
     for _ in 0..12 {
         bench.now += Duration::from_micros(33_333);
         let before = bench.measured;
+        bench.undrawn = None;
         bench.update_frames();
         changes.0 += usize::from(bench.measured.0 != before.0);
         changes.1 += usize::from(bench.measured.1 != before.1);
@@ -230,6 +255,7 @@ fn dragging_the_focus_region_scores_only_focus_and_once_more_on_release() {
     bench.exposure_open = true;
     bench.focus.open = true;
     writer.write(&frame(1), false).unwrap();
+    bench.undrawn = None;
     bench.update_frames();
     let histogram = bench.measured.0;
     assert!(histogram.at.is_some());
@@ -240,6 +266,7 @@ fn dragging_the_focus_region_scores_only_focus_and_once_more_on_release() {
     // Moves within a frame's time of the last score are not scored, and
     // leave that score on show.
     bench.measured.1.at = Some(just);
+    bench.undrawn = None;
     let _ = bench.update(Message::FocusRegion(region(0.1)));
     assert_eq!(bench.measured.1.at, Some(just));
     assert!(!scored(&bench));
@@ -248,9 +275,11 @@ fn dragging_the_focus_region_scores_only_focus_and_once_more_on_release() {
         "the last score stays on show"
     );
     bench.measured.1.at = None;
+    bench.undrawn = None;
     let _ = bench.update(Message::FocusRegion(region(0.3)));
     assert!(scored(&bench) && bench.measured.1.at != Some(just));
     bench.measured.1.at = Some(just);
+    bench.undrawn = None;
     let _ = bench.update(Message::FocusRegion(region(0.5)));
     assert!(!scored(&bench) && bench.focus.latest().is_some());
     // Held still, the region is scored on the first tick a frame's time on.
@@ -260,20 +289,26 @@ fn dragging_the_focus_region_scores_only_focus_and_once_more_on_release() {
     bench.draws.drew(bench.now, &[]);
     bench.now = tick;
     bench.note_undrawn();
+    bench.undrawn = None;
     bench.update_frames();
     assert_eq!(bench.measured.1.at, Some(tick));
     assert!(scored(&bench));
     // Letting go scores where it landed, at once, unless scored there.
+    bench.undrawn = None;
     let _ = bench.update(Message::FocusRegionEnd);
     assert_eq!(bench.measured.1.at, Some(tick));
     bench.measured.1.at = Some(just);
+    bench.undrawn = None;
     let _ = bench.update(Message::FocusRegion(region(0.6)));
     bench.measured.1.at = Some(Instant::now());
+    bench.undrawn = None;
     let _ = bench.update(Message::FocusRegionEnd);
     assert!(scored(&bench));
     assert_eq!(bench.measured.0, histogram, "the histogram never changed");
     // A click right after moves the region without a drag, and is scored.
+    bench.undrawn = None;
     let _ = bench.update(Message::FocusRegionStart);
+    bench.undrawn = None;
     let _ = bench.update(Message::FocusRegion(region(0.7)));
     assert!(scored(&bench));
     bench.handle.shutdown();
@@ -313,6 +348,7 @@ fn tiles_scrolled_out_of_view_let_go_of_their_frames() {
         tile: Size::new(400.0, 300.0),
         viewport: 600.0,
     }));
+    bench.undrawn = None;
     bench.update_previews();
     for (i, camera) in bench.snapshot.cameras.iter().enumerate() {
         let id = &camera.info.id;
@@ -323,6 +359,7 @@ fn tiles_scrolled_out_of_view_let_go_of_their_frames() {
         assert_eq!(bench.previews[id].frame_id, Some(1), "{id}");
     }
     // Scrolling back shows them again with their newest frames.
+    bench.undrawn = None;
     let _ = bench.update(Message::OverviewScrolled(300.0));
     assert_eq!(bench.grid_scroll, 300.0);
 }
@@ -343,19 +380,23 @@ fn a_tile_scrolled_back_shows_its_frame_again_without_counting_it_as_new() {
     let started = bench.now;
     writer.write(&frame(1), false).unwrap();
     bench.grid_scroll = 1000.0;
+    bench.undrawn = None;
     bench.update_previews();
     assert!(gpu.pending("cam").is_some());
     bench.grid_scroll = 0.0;
+    bench.undrawn = None;
     bench.update_previews();
     assert!(gpu.is_retired("cam"));
     // The camera stalls meanwhile: its frame shows again but is no news.
     bench.now += Duration::from_secs(10);
     bench.grid_scroll = 1000.0;
+    bench.undrawn = None;
     bench.update_previews();
     assert!(!gpu.is_retired("cam") && gpu.pending("cam").is_some());
     assert_eq!(bench.liveness["cam"].frame_at, started);
     // A new frame is.
     writer.write(&frame(2), false).unwrap();
+    bench.undrawn = None;
     bench.update_previews();
     assert_eq!(bench.liveness["cam"].frame_at, bench.now);
     bench.handle.shutdown();
