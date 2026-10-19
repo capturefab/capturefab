@@ -6,9 +6,9 @@
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#1e1e20" media="(prefers-color-scheme: dark)">
-  <meta name="description" content="Capture images and video with your coding agent or Capturefab's built-in assistant. Collect plant data through the CLI. Share one workspace and step in when needed.">
+  <meta name="description" content="Open-source camera workbench for machine vision, webcams and network cameras. Capture images, video and plant data yourself, from your coding agent or with the built-in assistant.">
   <meta property="og:title" content="Capturefab — camera capture for people and agents">
-  <meta property="og:description" content="Drive camera captures from your coding agent, the built-in assistant or direct controls. Keep images, data and human review together.">
+  <meta property="og:description" content="One desktop app and CLI for GigE Vision, USB3 Vision, webcams and network cameras. Let an agent capture, and step in when needed.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://capturefab.com/">
   <meta property="og:image" content="https://capturefab.com/images/docs/workspace.png">
@@ -40,10 +40,10 @@
         <section class="hero-copy" aria-labelledby="hero-title">
           <p class="eyebrow"><span class="brand-dot" aria-hidden="true"></span> Cameras, agents and people in one workspace</p>
           <h1 id="hero-title">Let an agent capture.<br>Step in when needed.</h1>
-          <p class="lead">Let your coding agent or the built-in AI assistant examine cameras and capture images or video. Collect plant data through the CLI. Follow the work in the app.</p>
+          <p class="lead">Connect machine vision cameras, webcams and network streams. Your coding agent or the built-in assistant can set them up and capture images or video. Each step shows in the app, and you can take control at any time.</p>
           <div class="actions"><a class="button primary" href="#download">Download Capturefab <span aria-hidden="true">↓</span></a><a class="button" href="#start">Choose how to start <span aria-hidden="true">→</span></a></div>
           <p class="hero-note">Free and open source. MIT license.<br>Desktop app and CLI for macOS, Windows and Linux.</p>
-          <ul class="hero-facts"><li>Connect your existing agent through the CLI.</li><li>Give the built-in assistant a task and clear limits.</li><li>Try either route with a simulator camera.</li></ul>
+          <ul class="hero-facts"><li>GigE Vision and USB3 Vision without a vendor SDK.</li><li>A JSON CLI that coding agents and scripts can use.</li><li>Simulator cameras, so you can start without hardware.</li></ul>
         </section>
         <section id="download" class="download-card hero-download" aria-labelledby="download-title">
           <div class="download-heading"><p class="eyebrow">Get Capturefab</p><h2 id="download-title">Choose your download</h2><p>Latest release: <span id="release-version">see all downloads</span></p></div>
@@ -67,7 +67,7 @@
         </section>
       </div>
       <section id="start" class="start-section" aria-labelledby="start-title">
-        <div class="start-intro"><h2 id="start-title">Choose who drives.</h2><p>Use the same camera session for automation and manual controls. Keep the preview and Activity open for review.</p></div>
+        <div class="start-intro"><h2 id="start-title">Choose who drives.</h2><p>Agents, scripts and people use the same camera session. The preview and Activity log show each action, so you can review the work or take control.</p></div>
         <div class="start-routes">
           <article><h3>Your coding agent</h3><p>Use Claude Code, Codex, Antigravity or another harness that runs CLI commands. Capturefab supplies camera tools and JSON results.</p><p class="route-detail">No Capturefab AI provider setup. Your harness manages its own model access.</p><a href="docs.html#agent-setup">Set up an external agent</a><a href="agents.md" download="capturefab-agents.md">Download agent instructions</a></article>
           <article><h3>The built-in assistant</h3><p>Configure your provider in Settings → AI assistant. Open Quick Command and describe the capture task.</p><p class="route-detail">Review a plan, or select cameras and limits for a bounded task. Enable camera images only when wanted.</p><a href="docs.html#assistant">Set up the AI assistant</a></article>
@@ -94,7 +94,7 @@
           <article class="detail-card"><figure><a class="screenshot-link" href="images/docs/scopes.png" aria-label="Enlarge the focus and exposure screenshot"><img src="images/docs/scopes.png" alt="Simulator image with a focus region, focus metric chart and exposure histogram" width="1316" height="804" loading="lazy" decoding="async"></a></figure><div><h3>Examine focus and exposure</h3><p>Use the focus metric and histogram to examine changes in the live image.</p><a href="docs.html#scopes">Preview and image scopes →</a></div></article>
         </div>
         <p class="media-note">Screenshots show the actual development interface with simulator data. Features can differ from the published release.</p>
-        <div class="source-strip" aria-label="Supported source types"><span>GigE Vision</span><span>USB3 Vision</span><span>Webcams</span><span>ONVIF / RTSP / SRT</span><span>Video files</span><span>Document scanners</span></div>
+        <div class="source-strip" aria-label="Supported source types"><span>GigE Vision</span><span>USB3 Vision</span><span>Webcams</span><span>ONVIF / RTSP / SRT</span><span>Home Assistant / Frigate / UniFi Protect</span><span>Video files</span><span>Document scanners</span></div>
         <p class="compatibility-note">Camera support depends on the device, connection and operating system. <a href="docs.html#discovery">Read the connection guide →</a></p>
       </section>
       <section id="quickstart" class="section" aria-labelledby="quickstart-title">
@@ -118,6 +118,15 @@ capturefab --session bench --actor capture-agent --actor-kind agent connect sim:
 capturefab --session bench --actor capture-agent --actor-kind agent --camera sim:0 capture -o 'shot-{seq}.png' --json
 capturefab --session bench status --json</code></pre><button class="copy-button" type="button" aria-label="Copy the session commands">Copy</button></div><div class="text-links"><a href="docs.html#sessions">Sessions and automation →</a><a href="docs.html#cli-reference">CLI reference →</a></div></div><figure><a class="screenshot-link" href="images/cli.svg" aria-label="Enlarge the real terminal example"><img src="images/cli.svg" alt="Capturefab terminal commands for simulator discovery, feature changes and image capture with JSON results" width="1200" height="712" loading="lazy"></a><figcaption>Actual command output from the simulator. The CLI supplies JSON results and exit codes for scripts.</figcaption></figure></div>
       </section>
+      <section id="beyond" class="section" aria-labelledby="beyond-title">
+        <div class="section-heading"><p class="eyebrow">More than a camera viewer</p><h2 id="beyond-title">Keep images, signals and files together.</h2><p>Capturefab records the context of each capture and sends the files where your team uses them.</p></div>
+        <div class="start-routes capability-routes">
+          <article><h3>Sensors and PLCs</h3><p>Read Modbus, MQTT, OPC UA and MTConnect values. Store them with each image in one DuckDB dataset.</p><a href="docs.html#signals">Read sensors and PLCs</a><a href="docs.html#plant-data">Capture plant data</a></article>
+          <article><h3>Datasets and exports</h3><p>Each capture row has its camera, time, path, SHA-256 and tags. Export Parquet or CSV with a manifest for analysis tools.</p><a href="docs.html#datasets">Catalog and export datasets</a></article>
+          <article><h3>Camera hubs</h3><p>Save a Home Assistant, Frigate, go2rtc or UniFi Protect server. Its cameras then open as usual sources.</p><a href="docs.html#hubs">Open hub cameras</a></article>
+          <article><h3>Folders and servers</h3><p>Save to external drives, S3-compatible buckets, FTP or SFTP. Failed uploads keep their local files until you retry them.</p><a href="docs.html#destinations">Set up destinations</a><a href="docs.html#uploads">Upload queue</a></article>
+        </div>
+      </section>
       <section id="how" class="section" aria-labelledby="how-title"><div class="reliability"><div><p class="eyebrow">Capture with clear limits</p><h2 id="how-title">Keep control of files and storage.</h2><p>Each camera runs in a separate process. Live previews use the newest frame. Capture and recording use storage limits.</p><a href="docs.html#architecture">Read about the architecture →</a></div><dl><div><dt>Protect existing files</dt><dd>Capturefab does not replace an existing file when its name matches the output name.</dd></div><div><dt>Set storage limits</dt><dd>The defaults are 10 GiB and 10,000 files. Capture stops at the limit. Automatic deletion is optional.</dd></div><div><dt>Run locally</dt><dd>Capturefab has no telemetry or automatic update requests. You can capture camera images without a cloud account.</dd></div></dl></div></section>
       <section id="faq" class="section" aria-labelledby="faq-title">
         <div class="section-heading"><h2 id="faq-title">Before you download</h2></div>
@@ -125,6 +134,7 @@ capturefab --session bench status --json</code></pre><button class="copy-button"
           <details><summary>Which cameras can I connect?</summary><p>Capturefab supports GigE Vision, USB3 Vision, host cameras, network streams and other sources. Support depends on the device and operating system. This is an initial implementation with less feature coverage than some vendor SDKs. Read the <a href="docs.html#discovery">connection guide</a> and <a href="https://github.com/capturefab/capturefab/blob/main/docs/camera-compatibility.md">camera compatibility notes</a> for device requirements.</p></details>
           <details><summary>Must I install a vendor SDK or FFmpeg?</summary><p>No. Published downloads include FFmpeg for host cameras, streams and video encoding. You must supply the operating system's graphics, USB and camera drivers. USB3 Vision cameras on Windows must have WinUSB. Read the <a href="docs.html#installation">installation instructions</a>.</p></details>
           <details><summary>Can I use Capturefab for commercial work?</summary><p>Yes. Capturefab uses the MIT license. The separate FFmpeg executable uses GPLv3. Each release includes the corresponding source and license notices. Read the <a href="https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md">licensing details</a> before redistribution.</p></details>
+          <details><summary>Does Capturefab send my images to a cloud service?</summary><p>Only when you configure it. Camera acquisition, captures and datasets stay on this computer. The AI assistant sends a request to your selected provider only when you start a task. It sends camera images only if you enable them. Uploads go only to destinations that you save. Read about <a href="docs.html#assistant">the AI assistant</a> and <a href="docs.html#destinations">destinations</a>.</p></details>
           <details><summary>Can a script control an open desktop session?</summary><p>Yes. Camera commands automatically use the only desktop or headless session that is open. Use <code>capturefab sessions</code> to list sessions. Use <code>--session NAME</code> to select one when several sessions are open. Read about <a href="docs.html#sessions">sessions and automation</a>.</p></details>
           <details><summary>What occurs at the storage limit?</summary><p>Capturefab stops capture or recording. It returns exit code 6 and a message that identifies the limit. Capturefab disables automatic deletion by default. Use <code>--delete-oldest</code> to enable retention. Retention applies only to files that Capturefab created and whose checksums still match.</p></details>
           <details><summary>How do I verify a download?</summary><p>The download selector shows a SHA-256 command and the correct checksum. Run the command for the downloaded file. Compare its result with the correct checksum. The <a href="downloads.html">full download list</a> also includes checksums. You can verify GitHub build provenance with <code>gh attestation verify FILE --repo capturefab/capturefab</code>.</p></details>
@@ -142,7 +152,7 @@ target/release/capturefab --camera sim:0 capture -o first.png</code></pre><butto
     <footer class="site-footer">
       <div class="brand"><p><img class="logo" src="favicon.svg" width="128" height="128" alt="" aria-hidden="true">Capturefab</p><small>Capturefab uses the MIT license. The included FFmpeg uses GPLv3. Releases include its source. This site sets no cookies and loads nothing from third parties.</small></div>
       <div><h4>Project</h4><ul><li><a href="https://github.com/capturefab/capturefab">Source</a></li><li><a href="https://github.com/capturefab/capturefab/issues">Issues</a></li><li><a href="downloads.html">All downloads</a></li><li><a href="feed.xml">Releases feed</a></li></ul></div>
-      <div><h4>Documentation</h4><ul><li><a href="docs.html">Documentation hub</a></li><li><a href="docs.html#getting-started">Getting started</a></li><li><a href="docs.html#cli-reference">CLI reference</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md">FFmpeg build and licensing</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/release.md">Release process</a></li></ul></div>
+      <div><h4>Documentation</h4><ul><li><a href="docs.html">Documentation hub</a></li><li><a href="docs.html#getting-started">Getting started</a></li><li><a href="docs.html#plant-data">Plant data for analysis</a></li><li><a href="docs.html#cli-reference">CLI reference</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md">FFmpeg build and licensing</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/release.md">Release process</a></li></ul></div>
       <div><h4>For agents</h4><ul><li><a href="agents.md">Agent instructions</a></li><li><a href="llms.txt">llms.txt</a></li><li><a href="releases.json">Release manifest</a></li></ul></div>
     </footer>
   </div>
