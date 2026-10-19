@@ -780,6 +780,10 @@ pub struct CameraHistoryEntry {
     pub last_changed_at_us: u64,
     pub feature: Option<String>,
     pub kind: String,
+    /// Semantic feature assignments restored by this checkpoint. Old workers
+    /// omit this; bounded assistant runs must not assume an omitted count is zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setting_changes: Option<u32>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraSnapshot {

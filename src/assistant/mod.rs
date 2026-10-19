@@ -1,12 +1,19 @@
 //! Optional AI assistant infrastructure. Camera actions remain in `tools`;
 //! provider settings and credentials never enter a camera command or model body.
+pub mod agent;
+pub mod approval;
 pub mod conversation;
 pub mod credentials;
 pub mod google;
 pub mod http;
+pub mod limits;
 pub mod limits_defaults;
+pub mod log;
+pub mod prompt;
 pub mod protocol;
 pub mod provider;
+pub mod run;
+pub mod segment;
 pub mod settings;
 pub mod usage;
 pub mod vision;
@@ -61,3 +68,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod agent_plan_tests;

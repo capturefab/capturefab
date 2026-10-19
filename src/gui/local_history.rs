@@ -1196,6 +1196,7 @@ mod tests {
                 last_changed_at_us: i,
                 feature: Some("Gain".into()),
                 kind: "set".into(),
+                setting_changes: Some(1),
             })
             .collect();
         app.snapshot.cameras = vec![camera];

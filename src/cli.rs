@@ -2957,7 +2957,7 @@ fn schema() -> Value {
     contract["history"] = json!({
         "cli":"--session NAME [--camera ID] history | undo | redo",
         "scope":"Reversible camera changes are recorded by the camera worker, including changes made through the GUI, CLI and RPC; each connected camera has its own history.",
-        "status":"status.history and cameras[].history contain undo and redo labels, or null when unavailable; history returns the selected or addressed camera's labels.",
+        "status":"status.history and cameras[].history contain undo and redo labels, or null when unavailable, and entries with setting_changes (the semantic assignment count for bounded assistant undo); old workers may omit the count. history returns the selected or addressed camera's labels.",
         "lifetime":"History is bounded and lasts while the camera remains connected; a new change clears its redo history.",
         "checkpoints":"Successful reversible commands also return camera_change:{token,camera,label,last_changed_at_us}. replay_camera_change targets that token with undo:true or undo:false for desktop history; expired tokens and conflicting camera state fail.",
         "conflicts":"Replay checks current camera state before changing it. A conflicting or failed replay reports an error and retains the history entry.",

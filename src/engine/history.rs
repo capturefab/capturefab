@@ -95,6 +95,12 @@ impl Journal {
                     last_changed_at_us: change.last_changed_at_us,
                     feature: change.feature.clone(),
                     kind: change.kind.clone(),
+                    setting_changes: Some(match &change.checkpoint {
+                        Checkpoint::Stream { .. } => 0,
+                        Checkpoint::Configuration { fields, .. } => {
+                            u32::try_from(fields.len()).unwrap_or(u32::MAX).max(1)
+                        }
+                    }),
                 })
                 .collect(),
         }
@@ -914,6 +920,7 @@ mod tests {
         let history = h.snapshot().history;
         assert_eq!(history.entries.len(), entries + 1);
         let entry = history.entries.last().unwrap();
+        assert_eq!(entry.setting_changes, Some(2));
         assert_eq!(
             (entry.kind.as_str(), entry.feature.as_deref()),
             ("set_many", None)

@@ -47,7 +47,7 @@ Raw `logs` retain `time`, `level`, and `message` and may add `timestamp:{unix_ms
 
 For immediate agent observation over HTTP, fetch `/api/activity`, then repeat `/api/activity?after=REV&timeout_ms=20000` with the returned `result.revision`. All watchers wake on command and scheduled job changes. The response includes retained history; timeouts return current history, and stale or future revisions return immediately. Maximum timeout is 25000ms. `POST /api/command` optionally accepts `actor:{id,name,kind}` alongside `version`, `camera`, `command`; actor metadata is display attribution, not authentication. See [remote control](https://github.com/capturefab/capturefab/blob/main/docs/remote-control.md). Schedule state `succeeded` acknowledges creation; `entry.job` tracks `id`, `worker_pid`, `status`, `count`, `captured`, `last_file`, `error` through completion/cancellation/failure. Forward success acknowledges encoder start; consult camera status for ongoing forwarding.
 
-Reversible camera changes from GUI, CLI and RPC clients share each camera worker's bounded history. Use `capturefab --session NAME [--camera ID] history --json` to inspect the next undo/redo labels, and `undo` or `redo` to apply them. RPC accepts `{"op":"undo"}` and `{"op":"redo"}`; `status.history` and `cameras[].history` hold the labels. Replay detects conflicting state and retains the entry on failure. History lasts for the camera connection; a new change clears redo. Captures, uploads, recordings, schedules, connection changes, arbitrary commands and raw memory writes cannot be reversed by this camera history. Stopping a stream with schedules or forwarding is also excluded. Inspect the labels before undoing someone else's changes.
+Reversible camera changes from GUI, CLI and RPC clients share each camera worker's bounded history. Use `capturefab --session NAME [--camera ID] history --json` to inspect the next undo/redo labels, and `undo` or `redo` to apply them. RPC accepts `{"op":"undo"}` and `{"op":"redo"}`; `status.history` and `cameras[].history` hold the labels. History entries include `setting_changes`, the feature assignment count used to budget assistant undo; older workers may omit it. Replay detects conflicting state and retains the entry on failure. History lasts for the camera connection; a new change clears redo. Captures, uploads, recordings, schedules, connection changes, arbitrary commands and raw memory writes cannot be reversed by this camera history. Stopping a stream with schedules or forwarding is also excluded. Inspect the labels before undoing someone else's changes.
 
 Scanner settings are reversible. Scanner acquisition, including Start and Stop, may move or consume physical pages and cannot be undone or replayed.
 
@@ -93,7 +93,8 @@ capturefab --session bench --actor codex --actor-kind agent tools call wait_for 
 capturefab --session bench --actor codex --actor-kind agent tools call inspect_frame --args '{"camera":"sim:0","fresh":2,"max_dimension":1024,"region":null,"include_image":true}' --json
 capturefab --session bench --actor codex --actor-kind agent tools call capture_photos --args '{"camera":"sim:0","count":1,"format":"png","file_name":"verified-{seq}.png","destination":null,"tags":[{"key":"part","value":"A-100"}]}' --json
 # Replace TOKEN with result.results[0].camera_change.token from the settings call.
-capturefab --session bench --actor codex --actor-kind agent tools call undo_camera_change --args '{"camera":"sim:0","token":"TOKEN"}' --json
+# First obtain the person's approval of this exact undo.
+capturefab --session bench --actor codex --actor-kind agent tools call undo_camera_change --args '{"camera":"sim:0","token":"TOKEN"}' --confirmed-by-user --json
 ```
 
 Tool calls choose cameras through `args.camera`.
@@ -152,7 +153,7 @@ Without it, the command exits 2 and includes `error.details.risk`.
 Dry runs do not need confirmation.
 
 Action results are `{summary,results,watch}`; `results` contains the session replies.
-Read `result.results[0].camera_change.token` from the settings reply before a separate undo call.
+Read `result.results[0].camera_change.token` from the settings reply before a separate undo call. A separate invocation cannot prove ownership of that token; obtain human approval and use `--confirmed-by-user`. An autonomous task can undo its own recorded tokens without another approval.
 A null undo token uses this executor's latest token, such as an earlier step in one Apply.
 
 Camera commands cannot be undone.

@@ -328,6 +328,19 @@ pub fn classify(ctx: &Context, run: Option<&RunFacts>, checked: &mut Checked) {
     let Some(camera) = camera else {
         return;
     };
+    if tool == "undo_camera_change"
+        && let Some(token) = checked.call.args["token"].as_str()
+        && !run.is_some_and(|run| {
+            run.tokens
+                .iter()
+                .any(|(id, owned)| id == &camera && owned == token)
+        })
+    {
+        raise(
+            checked,
+            "This change token has not been recorded as this run's own change.",
+        );
+    }
     let state = ctx.snapshot.cameras.iter().find(|c| c.info.id == camera);
     let busy = state.is_some_and(|c| c.forwarding.is_some() || c.jobs.iter().any(|j| j.active()));
     if busy
@@ -476,6 +489,32 @@ pub fn classify(ctx: &Context, run: Option<&RunFacts>, checked: &mut Checked) {
     } else {
         Vec::new()
     };
+    // Auto controls and one-shot commands can change values indirectly.
+    // A person's writes remain protected for the whole task, including after
+    // the recent-activity window and when an auto policy releases a control.
+    let indirect_auto = tool == "set_auto_exposure"
+        || tool == "run_camera_command"
+            && checked.call.args["command"].as_str().is_some_and(|name| {
+                name.ends_with("AutoOnce") || name.starts_with("Auto") && name.ends_with("Once")
+            })
+        || features.iter().any(|name| name.ends_with("Auto"))
+        || state
+            .and_then(|camera| camera.auto.as_ref())
+            .is_some_and(|auto| {
+                features
+                    .iter()
+                    .any(|feature| auto.managed.contains(feature))
+            });
+    if indirect_auto && let Some(run) = run {
+        for (id, feature) in run.human_values.keys() {
+            if id == &camera && super::risk::image_quality(feature) {
+                raise(
+                    checked,
+                    &format!("May overwrite {feature}, which a person changed during this task."),
+                );
+            }
+        }
+    }
     for feature in features {
         if !super::risk::image_quality(&feature) {
             raise(
@@ -531,6 +570,7 @@ pub struct Executor<'a> {
     secrets: &'a dyn SecretSource,
     pub aliases: HashMap<String, String>,
     pub tokens: Vec<(String, String)>,
+    acknowledged: Vec<Value>,
     #[cfg(test)]
     destination_creator: Option<&'a DestinationCreator<'a>>,
 }
@@ -542,9 +582,17 @@ impl<'a> Executor<'a> {
             secrets,
             aliases: HashMap::new(),
             tokens: Vec::new(),
+            acknowledged: Vec::new(),
             #[cfg(test)]
             destination_creator: None,
         }
+    }
+
+    /// Acknowledged camera commands from the latest step remain available
+    /// when a later restart fails. They contain no stream command results,
+    /// whose temporary credentials require additional caller-side scrubbing.
+    pub fn acknowledged(&self) -> &[Value] {
+        &self.acknowledged
     }
 
     fn camera(&self, camera: &CameraRef) -> Result<String> {
@@ -599,6 +647,9 @@ impl<'a> Executor<'a> {
             .or_else(|| result["camera_change"].as_str())
         {
             self.tokens.push((camera.clone(), token.into()));
+        }
+        if !forward {
+            self.acknowledged.push(redact::for_output(result.clone()));
         }
         if let Some(before) = before.filter(|_| forward) {
             self.verify_forward(&camera, &before, duration_ms, started, &result)?;
@@ -664,6 +715,7 @@ impl<'a> Executor<'a> {
     }
 
     pub fn run_step(&mut self, checked: &Checked, cancel: &AtomicBool) -> Result<StepOutcome> {
+        self.acknowledged.clear();
         ensure!(
             checked.ready(),
             "Review the errors in this step before running it."
@@ -1138,7 +1190,7 @@ pub struct Progress {
     pub summary: String,
 }
 
-fn changed(approved: &Checked, current: &Checked) -> Option<&'static str> {
+pub(crate) fn changed(approved: &Checked, current: &Checked) -> Option<&'static str> {
     if approved.id != current.id || approved.call.tool != current.call.tool {
         return Some("the action");
     }
@@ -1174,6 +1226,13 @@ fn changed(approved: &Checked, current: &Checked) -> Option<&'static str> {
     }
     if approved.issues != current.issues {
         return Some("the warnings or errors");
+    }
+    if approved.title != current.title
+        || approved.summary != current.summary
+        || approved.facts != current.facts
+        || approved.reasons != current.reasons
+    {
+        return Some("the displayed camera facts");
     }
     // Binding all other arguments prevents changes to feature values,
     // duration, file names or stream paths being silently approved.
@@ -1380,6 +1439,47 @@ mod tests {
                 args,
             },
         )
+    }
+
+    #[test]
+    fn explicit_undo_needs_approval_unless_the_run_owns_the_token() {
+        let mut ctx = fixture_context(fixture_snapshot());
+        ctx.snapshot.activity.clear();
+        for camera in &mut ctx.snapshot.cameras {
+            camera.jobs.clear();
+            camera.forwarding = None;
+        }
+        let mut checked = step(
+            "undo_camera_change",
+            json!({"camera":"sim:0","token":"change-one"}),
+        );
+        checked.risk = Risk::Reversible;
+        classify(&ctx, None, &mut checked);
+        assert_eq!(checked.risk, Risk::Disruptive);
+        let facts = RunFacts {
+            scope: BTreeSet::from(["sim:0".into()]),
+            tokens: vec![("sim:0".into(), "change-one".into())],
+            ..RunFacts::default()
+        };
+        let mut owned = step(
+            "undo_camera_change",
+            json!({"camera":"sim:0","token":"change-one"}),
+        );
+        owned.risk = Risk::Reversible;
+        classify(&ctx, Some(&facts), &mut owned);
+        assert_eq!(owned.risk, Risk::Reversible);
+    }
+
+    #[test]
+    fn changed_displayed_facts_invalidate_the_exact_plan_approval() {
+        let mut approved = step("set_camera_features", json!({"camera":"sim:0"}));
+        approved.facts = vec![("Gain".into(), "1 → 3".into())];
+        let mut fresh = approved.clone();
+        fresh.facts[0].1 = "2 → 3".into();
+        assert_eq!(
+            changed(&approved, &fresh),
+            Some("the displayed camera facts")
+        );
     }
 
     fn forward(output: &str) -> SessionCommand {
@@ -1894,6 +1994,57 @@ mod tests {
         let mut replaced = step("stop_recording", json!({"camera":"sim:1"}));
         classify(&ctx, Some(&run), &mut replaced);
         assert_eq!(replaced.risk, Risk::Disruptive);
+    }
+
+    #[test]
+    fn indirect_auto_writes_keep_human_values_protected_without_recent_activity() {
+        let mut ctx = fixture_context(fixture_snapshot());
+        ctx.snapshot.activity.clear();
+        for camera in &mut ctx.snapshot.cameras {
+            camera.jobs.clear();
+            camera.forwarding = None;
+        }
+        let mut run = RunFacts {
+            actor_id: "assistant:1".into(),
+            ..RunFacts::default()
+        };
+        run.scope.insert("sim:0".into());
+        run.human_values
+            .insert(("sim:0".into(), "ExposureTime".into()), "5000".into());
+        for (tool, args) in [
+            ("set_auto_exposure", json!({"camera":"sim:0","mode":"auto"})),
+            (
+                "set_auto_exposure",
+                json!({"camera":"sim:0","mode":"revert"}),
+            ),
+            (
+                "run_camera_command",
+                json!({"camera":"sim:0","command":"ExposureAutoOnce"}),
+            ),
+            (
+                "set_camera_features",
+                json!({"camera":"sim:0","values":[{"feature":"ExposureAuto","value":"Continuous","expect":null}]}),
+            ),
+        ] {
+            let mut checked = step(tool, args);
+            checked.risk = Risk::Reversible;
+            classify(&ctx, Some(&run), &mut checked);
+            assert_eq!(checked.risk, Risk::Disruptive, "{tool}");
+            assert!(
+                checked
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.contains("person changed")),
+                "{tool}"
+            );
+        }
+        let mut trigger = step(
+            "run_camera_command",
+            json!({"camera":"sim:0","command":"TriggerSoftware"}),
+        );
+        trigger.risk = Risk::Reversible;
+        classify(&ctx, Some(&run), &mut trigger);
+        assert_eq!(trigger.risk, Risk::Reversible);
     }
 
     #[test]

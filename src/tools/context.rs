@@ -38,6 +38,11 @@ pub trait ToolHost: Send + Sync {
     fn actor_id(&self) -> Option<String> {
         None
     }
+    /// Bind a run's actual commands to its actor, rather than merely changing
+    /// the identity reported to risk classification. Unknown hosts refuse.
+    fn with_actor(&self, _actor: SessionActor) -> Result<Arc<dyn ToolHost>> {
+        anyhow::bail!("This tool host cannot attribute assistant task commands.")
+    }
 }
 
 /// The session in this process: the desktop app (origin Gui) or the CLI's
@@ -81,6 +86,9 @@ impl ToolHost for SessionHost {
 
     fn actor_id(&self) -> Option<String> {
         Some(self.actor.id.clone())
+    }
+    fn with_actor(&self, actor: SessionActor) -> Result<Arc<dyn ToolHost>> {
+        Ok(Arc::new(Self::new(self.handle.clone(), self.origin, actor)))
     }
 }
 
@@ -138,6 +146,13 @@ impl ToolHost for IpcHost {
 
     fn actor_id(&self) -> Option<String> {
         Some(self.actor().id)
+    }
+    fn with_actor(&self, actor: SessionActor) -> Result<Arc<dyn ToolHost>> {
+        Ok(Arc::new(Self::new(
+            self.name.clone(),
+            Some(actor),
+            self.timeout_override,
+        )))
     }
 }
 
