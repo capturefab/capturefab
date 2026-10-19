@@ -9,8 +9,8 @@ extern "C" int capturefab_task_fs_probes(void *handle, char **error) noexcept {
         auto &budget = *space->budget;
         auto require = [](bool condition, const char *message) { if (!condition) throw std::runtime_error(message); };
         auto open = [&](const char *name, bool append = false) {
-            auto flags = FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE;
-            if (append) flags |= FileFlags::FILE_FLAGS_APPEND;
+            auto flags = FileOpenFlags(FileOpenFlags::FILE_FLAGS_READ | FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE);
+            if (append) flags |= FileOpenFlags(FileOpenFlags::FILE_FLAGS_APPEND);
             return fs.OpenFile(space->path + "/" + name, flags);
         };
         auto remove = [&](const char *name) { fs.RemoveFile(space->path + "/" + name); };
@@ -82,7 +82,7 @@ extern "C" int capturefab_task_fs_probes(void *handle, char **error) noexcept {
         require(::unlinkat(space->root.value, "directory-symlink", 0) == 0, "directory symlink cleanup failed");
         auto original = open("hardlink-original"); fs.Write(*original, bytes, 4, 0);
         require(::linkat(space->root.value, "hardlink-original", space->root.value, "hardlink-alias", 0) == 0, "hardlink setup failed");
-        require(refused([&] { fs.OpenFile(space->path + "/hardlink-alias", FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW); }), "destructive open accepted a multiply linked file");
+        require(refused([&] { fs.OpenFile(space->path + "/hardlink-alias", FileOpenFlags(FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE_NEW)); }), "destructive open accepted a multiply linked file");
         require(fs.GetFileSize(*original) == 4, "hardlink refusal happened after destructive truncate");
         require(::unlinkat(space->root.value, "hardlink-alias", 0) == 0, "hardlink alias cleanup failed");
         original->Close(); remove("hardlink-original");
