@@ -174,6 +174,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CAPTUREFAB_FFMPEG_LICENSE");
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
     let target = env::var("TARGET").expect("Cargo TARGET");
+    build_task_filesystem();
     if target.ends_with("windows-msvc") {
         // Pre-exported, architecture-independent icon resources. LINK accepts
         // .res directly, so building needs no additional resource compiler.
@@ -249,4 +250,29 @@ fn main() {
     };
     fs::write(out.join("capturefab-ffmpeg-license.txt"), license)
         .expect("write bundled FFmpeg license");
+}
+
+fn build_task_filesystem() {
+    println!("cargo:rerun-if-changed=src/dataset/task_fs.cpp");
+    println!("cargo:rerun-if-changed=src/dataset/task_fs.h");
+    println!("cargo:rerun-if-changed=src/dataset/task_fs_internal.hpp");
+    println!("cargo:rerun-if-changed=src/dataset/task_fs_probes.cpp");
+    let include = env::var_os("DEP_DUCKDB_INCLUDE")
+        .expect("the pinned bundled DuckDB must provide its C++ headers");
+    let mut compiler = cc::Build::new();
+    compiler
+        .cpp(true)
+        .std("c++17")
+        .define("DUCKDB_STATIC_BUILD", None)
+        .include(include)
+        .file("src/dataset/task_fs.cpp")
+        .file("src/dataset/task_fs_probes.cpp")
+        .warnings(true)
+        .flag_if_supported("-Wno-unused-parameter");
+    // Match the pinned static engine's MSVC exception policy: Boundary must
+    // catch C++ failures rather than allowing them to escape the C ABI.
+    if compiler.get_compiler().is_like_msvc() {
+        compiler.flag("/EHsc");
+    }
+    compiler.compile("capturefab_task_fs");
 }

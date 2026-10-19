@@ -74,7 +74,7 @@ pub const GET_CAMERA_FEATURES: &[FieldSpec] = &[
     field(
         "names",
         "Features",
-        FieldKind::Features,
+        FieldKind::StringList,
         true,
         "Exact feature names to read.",
     ),

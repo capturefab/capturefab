@@ -5,9 +5,12 @@ use super::*;
 impl Workbench {
     pub(in crate::gui) fn scene_assistant_settings(&mut self, word: &str, _late: bool) -> bool {
         match word {
-            "settings-assistant" | "settings-assistant-error" => {
+            "settings-assistant" | "settings-assistant-error" | "settings-assistant-success" => {
                 self.settings_open = true;
                 self.assistant.settings = settings::State::scene(word.ends_with("-error"));
+                if word.ends_with("-success") {
+                    self.assistant.settings.show_connection_success();
+                }
                 true
             }
             _ => false,
@@ -21,7 +24,11 @@ mod tests {
 
     #[test]
     fn assistant_settings_scenes_stay_display_only_at_both_scene_passes() {
-        for word in ["settings-assistant", "settings-assistant-error"] {
+        for word in [
+            "settings-assistant",
+            "settings-assistant-error",
+            "settings-assistant-success",
+        ] {
             let mut app = Workbench::new(
                 SessionHandle::new(),
                 "assistant-settings-scene".into(),

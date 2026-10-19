@@ -19,6 +19,108 @@ fn photo_args() -> Value {
     json!({"camera":"sim:0","count":1,"format":null,"file_name":null,"destination":null,"tags":null,"replace_step":null})
 }
 
+#[test]
+fn revoked_data_consent_withholds_retained_plan_arguments() {
+    use crate::{
+        assistant::http::Headers,
+        tools::tests::{FakeHost, fixture_snapshot},
+    };
+
+    const PRIVATE: &str = "sensor-private-plan-marker";
+    for next_provider in [ProviderId::Anthropic, ProviderId::DeepSeek] {
+        let provider = ProviderId::Anthropic;
+        let mut args = photo_args();
+        args["tags"] = json!([{"key":"sample","value":PRIVATE}]);
+        let (mut deps, script, _) = deps(
+            provider,
+            vec![
+                tool_reply(provider, "overview", "get_overview", json!({})),
+                tool_reply(provider, "photo", "capture_photos", args),
+                end_reply(provider),
+            ],
+        );
+        let mut snapshot = fixture_snapshot();
+        snapshot.dataset = Some(crate::dataset::DatasetStatus {
+            slot_id: Some("a".repeat(32)),
+            last_error: Some(PRIVATE.into()),
+            ..Default::default()
+        });
+        deps.host = Arc::new(FakeHost::new(snapshot));
+        let mut request = PlanRequest::new("Tag a photo with the current sensor value.");
+        request.allow_data = true;
+        let first = plan_turn(request, &deps, &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        assert_eq!(first.plan.steps.len(), 1);
+        assert!(first.plan.steps[0].checked.as_ref().unwrap().ready());
+        assert!(first.conversation.data_permission);
+        assert!(
+            script
+                .requests
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .1
+                .to_string()
+                .contains(PRIVATE),
+            "The fixture must first disclose the data-derived plan with permission."
+        );
+
+        script.replies.lock().unwrap().push_back(HttpResponse {
+            status: 200,
+            headers: Headers::new(),
+            body: serde_json::to_vec(&end_reply(next_provider)).unwrap(),
+        });
+        let mut request = PlanRequest::new("Keep the local plan and discuss a camera photo.");
+        request.provider = Some(next_provider);
+        request.plan = first.plan;
+        request.conversation = Some(first.conversation);
+        let second = plan_turn(request, &deps, &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        assert!(!second.conversation.data_permission);
+        assert_eq!(second.plan.steps.len(), 1);
+        assert_eq!(second.plan.steps[0].call.args["tags"][0]["value"], PRIVATE);
+        assert!(second.plan.value().to_string().contains(PRIVATE));
+        let outgoing = script
+            .requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .1
+            .to_string();
+        assert!(
+            !outgoing.contains(PRIVATE),
+            "Revoking data permission must withhold retained data-derived plan arguments from {next_provider:?}."
+        );
+        assert!(outgoing.contains("Plan arguments and checked details are withheld"));
+
+        script.replies.lock().unwrap().push_back(HttpResponse {
+            status: 200,
+            headers: Headers::new(),
+            body: serde_json::to_vec(&end_reply(next_provider)).unwrap(),
+        });
+        let mut request = PlanRequest::new("Discuss the full plan with data permission restored.");
+        request.provider = Some(next_provider);
+        request.allow_data = true;
+        request.plan = second.plan;
+        request.conversation = Some(second.conversation);
+        let third = plan_turn(request, &deps, &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        assert!(third.conversation.data_permission);
+        assert!(
+            script
+                .requests
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .1
+                .to_string()
+                .contains(PRIVATE),
+            "Restoring permission may send the retained local plan again."
+        );
+        std::fs::remove_dir_all(deps.log_directory).unwrap();
+    }
+}
+
 struct CancelSecond {
     script: Arc<crate::assistant::agent::tests::Script>,
     cancel: Arc<AtomicBool>,
@@ -276,6 +378,7 @@ fn follow_up_with_accepted_image_history(reject: bool) {
         },
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+    const PRIVATE: &str = "private-plan-before-vision-rejection";
     let provider = ProviderId::DeepSeek;
     let args =
         json!({"camera":"sim:0","fresh":0,"max_dimension":256,"region":null,"include_image":true});
@@ -303,7 +406,9 @@ fn follow_up_with_accepted_image_history(reject: bool) {
     deps.host = host.clone();
     let mut first = PlanRequest::new("Inspect framing and keep my planned photograph");
     first.allow_images = true;
+    first.allow_data = true;
     let mut args = photo_args();
+    args["tags"] = json!([{"key":"sample","value":PRIVATE}]);
     args.as_object_mut().unwrap().remove("replace_step");
     first
         .plan
@@ -328,6 +433,7 @@ fn follow_up_with_accepted_image_history(reject: bool) {
     let mut follow_up =
         PlanRequest::new("Keep the planned photograph and continue with measurements");
     follow_up.allow_images = true;
+    follow_up.allow_data = true;
     follow_up.plan = accepted.plan;
     follow_up.conversation = Some(accepted.conversation);
     let mut events = Vec::new();
@@ -345,6 +451,10 @@ fn follow_up_with_accepted_image_history(reject: bool) {
     assert_eq!(outcome.plan.steps[0].call, expected_call);
     assert_eq!(outcome.plan.revision, expected_revision);
     assert!(outcome.conversation.images().next().is_none());
+    assert!(
+        outcome.conversation.data_permission,
+        "Rebuilding image history must retain data-permission lineage."
+    );
     outcome.conversation.check_invariant().unwrap();
     old_history.check_invariant().unwrap();
     assert_eq!(old_history.images().count(), 1);
@@ -371,6 +481,30 @@ fn follow_up_with_accepted_image_history(reject: bool) {
     assert!(current.contains("Keep the planned photograph and continue with measurements"));
     assert!(current.contains("capture_photos"));
     drop(requests);
+
+    script.replies.lock().unwrap().push_back(HttpResponse {
+        status: 200,
+        headers: crate::assistant::http::Headers::new(),
+        body: serde_json::to_vec(&end_reply(provider)).unwrap(),
+    });
+    let mut request = PlanRequest::new("Continue with data permission off.");
+    request.plan = outcome.plan;
+    request.conversation = Some(outcome.conversation);
+    let revoked = plan_turn(request, &deps, &mut |_| {}, &AtomicBool::new(false)).unwrap();
+    assert!(!revoked.conversation.data_permission);
+    assert_eq!(revoked.plan.steps[0].call.args["tags"][0]["value"], PRIVATE);
+    assert!(
+        !script
+            .requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .1
+            .to_string()
+            .contains(PRIVATE),
+        "Data-derived plan values must stay local after consent is revoked following image-history rebuild."
+    );
     std::fs::remove_dir_all(deps.log_directory).unwrap();
 }
 

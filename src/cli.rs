@@ -1,4 +1,5 @@
 pub(crate) mod assistant;
+mod signal_profiles;
 mod tools;
 pub use assistant::{AssistantCommand, AssistantTaskFailure};
 pub use tools::{ToolsCommand, ToolsConfirmationRequired};
@@ -353,8 +354,13 @@ pub enum DatasetCommand {
         storage: StorageArgs,
     },
 }
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum SignalsCommand {
+    /// Manage local source profiles and bind one to a running workbench
+    Profiles {
+        #[command(subcommand)]
+        command: signal_profiles::Command,
+    },
     /// Read current values once
     Read { uri: String },
     /// List OPC UA nodes, MQTT topics or MTConnect data items
@@ -376,6 +382,17 @@ pub enum SignalsCommand {
     },
     /// Stop logging (ID from `signals`, or `all`)
     Stop { id: String },
+}
+impl std::fmt::Debug for SignalsCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Profiles { .. } => "Signals::Profiles",
+            Self::Read { .. } => "Signals::Read",
+            Self::Browse { .. } => "Signals::Browse",
+            Self::Start { .. } => "Signals::Start",
+            Self::Stop { .. } => "Signals::Stop",
+        })
+    }
 }
 #[derive(Debug, Subcommand)]
 pub enum DestinationCommand {
@@ -633,10 +650,34 @@ pub enum UploadsCommand {
 pub enum StorageCommand {
     /// Show global policy, owned files and reservations
     Status,
+    /// Review or remove retained task workspaces, including after a restart
+    TaskData {
+        #[command(subcommand)]
+        command: TaskDataCommand,
+    },
     /// Persist the global storage ceiling for all cameras and future sessions
     Configure {
         #[command(flatten)]
         storage: StorageArgs,
+    },
+}
+#[derive(Debug, Subcommand)]
+pub enum TaskDataCommand {
+    /// List durable workspaces and whether their owner has released them
+    List,
+    /// Save the database and WAL together into a new ordinary folder
+    Copy {
+        id: String,
+        /// New folder; existing folders are refused
+        output: PathBuf,
+    },
+    /// Permanently remove one orphan workspace and release its reservation
+    Remove {
+        /// Reservation ID from storage task-data list; never a path
+        id: String,
+        /// Pass only after the user approved deleting this workspace
+        #[arg(long)]
+        confirmed_by_user: bool,
     },
 }
 #[derive(Debug, Subcommand)]
@@ -701,7 +742,7 @@ pub enum Command {
         #[command(subcommand)]
         command: AssistantCommand,
     },
-    /// List, check and run the shared camera tools for people and external agents
+    /// List, check and run shared image and data tools for people and external agents
     Tools {
         #[command(subcommand)]
         command: ToolsCommand,
@@ -723,7 +764,7 @@ pub enum Command {
         /// Save a real rendered workbench screenshot, then exit (release tooling)
         #[arg(long)]
         screenshot: Option<PathBuf>,
-        #[arg(long,default_value_t=1,value_parser=clap::value_parser!(u32).range(1..=16))]
+        #[arg(long,default_value_t=1,value_parser=clap::value_parser!(u32).range(0..=16))]
         screenshot_cameras: u32,
         #[command(flatten)]
         dataset: DatasetArg,
@@ -1263,6 +1304,12 @@ fn camera_command(command: Option<&Command>) -> bool {
 }
 
 fn uses_session(command: Option<&Command>) -> bool {
+    if let Some(Command::Signals {
+        command: Some(SignalsCommand::Profiles { command }),
+    }) = command
+    {
+        return command.needs_session();
+    }
     camera_command(command)
         || matches!(command,Some(Command::Assistant {command}) if assistant::uses_session(command))
         || matches!(
@@ -1785,6 +1832,16 @@ pub fn run(mut cli: Cli) -> Result<()> {
     if matches!(cli.command, Some(Command::Hub { .. })) {
         cli.camera = None;
     }
+    if let Some(Command::Signals {
+        command: Some(SignalsCommand::Profiles { command }),
+    }) = &cli.command
+    {
+        // Profiles are local data setup; a stale camera selector is irrelevant.
+        cli.camera = None;
+        if !command.needs_session() {
+            return output(&cli, input(signal_profiles::run_local(command))?);
+        }
+    }
     let base = std::env::current_dir()?;
     let is_tools = matches!(&cli.command, Some(Command::Tools { .. }));
     let is_assistant = matches!(&cli.command, Some(Command::Assistant { .. }));
@@ -1969,6 +2026,45 @@ pub fn run(mut cli: Cli) -> Result<()> {
         Some(Command::Doctor) => return output(&cli, doctor()),
         Some(Command::Storage { command }) => {
             let result = match command {
+                Some(StorageCommand::TaskData { command }) => {
+                    if let TaskDataCommand::Remove {
+                        confirmed_by_user: false,
+                        ..
+                    } = command
+                    {
+                        return Err(InvalidInput("Confirm this exact permanent workspace removal with --confirmed-by-user.".into()).into());
+                    }
+                    let rows = crate::storage::recover_task_namespaces()?;
+                    match command {
+                        TaskDataCommand::List => json!({"workspaces": rows.iter().map(|row| json!({
+                            "id":row.id,"path":row.path,"reserved_bytes":row.cap,
+                            "removable":row.handle.is_some(),"error":row.error,
+                        })).collect::<Vec<_>>()}),
+                        TaskDataCommand::Copy { id, output } => {
+                            let row = rows.iter().find(|row| row.id == *id)
+                                .context("No retained workspace has this reservation ID; refresh storage task-data list.")?;
+                            let handle = row.handle.as_ref().with_context(|| {
+                                row.error
+                                    .clone()
+                                    .unwrap_or_else(|| "Workspace is unavailable.".into())
+                            })?;
+                            let output = std::path::absolute(output)?;
+                            handle.save_copy(&output, &crate::storage::configured_policy()?)?;
+                            json!({"copied":id,"folder":output,"database":output.join("task.duckdb"),"recovery":"Keep any task.duckdb.wal beside task.duckdb when opening the copy."})
+                        }
+                        TaskDataCommand::Remove { id, .. } => {
+                            let row = rows.iter().find(|row| row.id == *id)
+                                .context("No retained workspace has this reservation ID; refresh storage task-data list.")?;
+                            let handle = row.handle.as_ref().with_context(|| {
+                                row.error
+                                    .clone()
+                                    .unwrap_or_else(|| "Workspace is unavailable.".into())
+                            })?;
+                            handle.remove()?;
+                            json!({"removed":id,"released_bytes":row.cap})
+                        }
+                    }
+                }
                 Some(StorageCommand::Configure { storage }) => {
                     crate::storage::configure_policy(&storage.policy()?)?
                 }
@@ -2151,7 +2247,11 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 }
                 | Command::Signals {
                     command: None
-                        | Some(SignalsCommand::Start { .. } | SignalsCommand::Stop { .. })
+                        | Some(
+                            SignalsCommand::Start { .. }
+                                | SignalsCommand::Stop { .. }
+                                | SignalsCommand::Profiles { .. }
+                        )
                 }
         )
     );
@@ -3437,8 +3537,10 @@ fn prepare_signals(cli: &Cli) -> Result<Option<SessionCommand>> {
     Ok(match &cli.command {
         Some(Command::Signals { command }) => Some(match command {
             None => SessionCommand::Signals,
+            Some(SignalsCommand::Profiles { command }) => command.prepare_binding()?,
             Some(SignalsCommand::Read { uri }) => SessionCommand::SignalRead {
                 uri: uri.clone(),
+                auth: None,
                 timeout_ms: cli.timeout_ms,
             },
             Some(SignalsCommand::Browse {
@@ -3447,6 +3549,7 @@ fn prepare_signals(cli: &Cli) -> Result<Option<SessionCommand>> {
                 limit,
             }) => SessionCommand::SignalBrowse {
                 uri: uri.clone(),
+                auth: None,
                 duration_ms: crate::scheduling::parse_duration(duration)?,
                 limit: *limit,
             },
@@ -3456,6 +3559,7 @@ fn prepare_signals(cli: &Cli) -> Result<Option<SessionCommand>> {
                 tags,
             }) => SessionCommand::SignalStart {
                 uri: uri.clone(),
+                auth: None,
                 interval_ms: crate::scheduling::parse_duration(interval)?,
                 tags: tags.clone(),
             },
@@ -4310,6 +4414,54 @@ pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_profile_setup_is_offline_until_explicit_bind_and_debug_hides_input() {
+        for (args, session) in [
+            (vec!["capturefab", "signals", "profiles", "list"], false),
+            (
+                vec![
+                    "capturefab",
+                    "signals",
+                    "profiles",
+                    "save",
+                    "line-one",
+                    "--uri",
+                    "mqtts://host/topic",
+                    "--credentials-stdin",
+                ],
+                false,
+            ),
+            (
+                vec!["capturefab", "signals", "profiles", "bind", "line-one"],
+                true,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(uses_session(cli.command.as_ref()), session);
+        }
+        for args in [
+            vec![
+                "capturefab",
+                "signals",
+                "read",
+                "mqtt://hidden-user:hidden-password@host/topic",
+            ],
+            vec![
+                "capturefab",
+                "signals",
+                "profiles",
+                "save",
+                "line-one",
+                "--uri",
+                "mqtt://hidden-user:hidden-password@host/topic",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let debug = format!("{:?}", cli.command);
+            assert!(!debug.contains("hidden-user"));
+            assert!(!debug.contains("hidden-password"));
+        }
+    }
     #[cfg(feature = "ai")]
     #[test]
     fn assistant_contract_has_all_providers_without_resolving_credentials() {
@@ -4663,8 +4815,10 @@ mod tests {
                 "dataset_status",
                 "dataset_note",
                 "dataset_query",
+                "dataset_model_query_if",
                 "dataset_export",
                 "signals",
+                "signal_bind",
                 "signal_read",
                 "signal_browse",
                 "signal_start",

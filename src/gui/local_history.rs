@@ -305,6 +305,7 @@ pub(super) fn group_barrier(message: &Message) -> bool {
         | Message::ScanNetwork
         | Message::NetworkReport(_)
         | Message::Help(_)
+        | Message::AgentSetup(_)
         | Message::CapturePicker(_)
         | Message::RecordPicker(_) => gesture(message).is_none(),
         _ => false,

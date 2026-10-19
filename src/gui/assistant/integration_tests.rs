@@ -55,6 +55,28 @@ fn quick_command_respects_the_other_sheet_and_hands_off_without_overlap() {
 }
 
 #[test]
+fn successful_provider_setup_closes_settings_before_opening_quick_command() {
+    use iced::futures::StreamExt;
+    let mut app = fixture("quick-command");
+    app.assistant.quick.open = false;
+    assert!(app.scene_assistant_settings("settings-assistant-success", false));
+    let task = app.update_assistant(Input::Settings(settings::Input::ContinueToQuick));
+    assert!(!app.settings_open && !app.assistant.quick.open);
+    let mut stream = iced_runtime::task::into_stream(task).unwrap();
+    let output = iced::futures::executor::block_on(stream.next()).unwrap();
+    let iced_runtime::Action::Output(message) = output else {
+        panic!("the Settings sheet closes before the Quick Command message");
+    };
+    let _ = app.handle_message(message);
+    assert!(app.assistant.quick.open && !app.settings_open);
+
+    app.assistant.quick.open = false;
+    app.scene_assistant_settings("settings-assistant-error", false);
+    let _ = app.update_assistant(Input::Settings(settings::Input::ContinueToQuick));
+    assert!(app.settings_open && !app.assistant.quick.open);
+}
+
+#[test]
 fn local_assistant_activity_keeps_its_agent_label_without_participant_notices() {
     let mut app = fixture("quick-command");
     let actor = SessionActor::new("assistant:desktop:test", "Assistant", ActorKind::Agent).unwrap();

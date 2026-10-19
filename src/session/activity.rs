@@ -332,6 +332,8 @@ impl Activity {
                 | SessionCommand::CaptureReview { .. }
                 | SessionCommand::DatasetStatus
                 | SessionCommand::DatasetQuery { .. }
+                | SessionCommand::DatasetQueryIf { .. }
+                | SessionCommand::DatasetModelQueryIf { .. }
                 | SessionCommand::Signals
                 | SessionCommand::SignalRead { .. }
                 | SessionCommand::SignalBrowse { .. }
@@ -627,15 +629,20 @@ fn describe(command: &SessionCommand) -> (&'static str, String) {
         StopForward | StopForwardIf { .. } => {
             ("stop_forward", "Stop forwarding / recording".into())
         }
-        DatasetOpen { path, .. } => ("dataset_open", format!("Open dataset {}", file_name(path))),
-        DatasetClose => ("dataset_close", "Close dataset".into()),
+        DatasetOpen { path, .. } | DatasetOpenIf { path, .. } => {
+            ("dataset_open", format!("Open dataset {}", file_name(path)))
+        }
+        DatasetClose | DatasetCloseIf { .. } => ("dataset_close", "Close dataset".into()),
         DatasetStatus => ("dataset_status", "Read dataset status".into()),
-        DatasetNote { .. } => ("dataset_note", "Add dataset note".into()),
-        DatasetQuery { .. } => ("dataset_query", "Query dataset".into()),
-        DatasetExport { output, .. } => (
+        DatasetNote { .. } | DatasetNoteIf { .. } => ("dataset_note", "Add dataset note".into()),
+        DatasetQuery { .. } | DatasetQueryIf { .. } | DatasetModelQueryIf { .. } => {
+            ("dataset_query", "Query dataset".into())
+        }
+        DatasetExport { output, .. } | DatasetExportIf { output, .. } => (
             "dataset_export",
             format!("Export dataset → {}", file_name(output)),
         ),
+        SignalBind { .. } => ("signal_bind", "Bind local signal credentials".into()),
         SignalRead { uri, .. } => (
             "signal_read",
             format!("Read {}", crate::media::redact_url(uri)),
@@ -648,7 +655,12 @@ fn describe(command: &SessionCommand) -> (&'static str, String) {
             "signal_start",
             format!("Log {}", crate::media::redact_url(uri)),
         ),
+        SignalCapture { uri, .. } => (
+            "signal_capture",
+            format!("Capture {}", crate::media::redact_url(uri)),
+        ),
         SignalStop { id } => ("signal_stop", format!("Stop logging {id}")),
+        SignalStopIf { id, .. } => ("signal_stop_if", format!("Stop capture {id}")),
         Signals => ("signals", "Signal status".into()),
     }
 }

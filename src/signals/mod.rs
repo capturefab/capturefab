@@ -2,6 +2,7 @@
 //! simulator. A separate subsystem from cameras: each source runs in its own
 //! `__signal` helper process and the coordinator's `SignalHub` collects its
 //! samples into a bounded in-memory view and an optional `SampleSink`.
+pub mod auth;
 pub mod csv;
 pub mod helper;
 pub mod hub;
@@ -111,6 +112,9 @@ pub enum Mode {
 #[serde(deny_unknown_fields)]
 pub struct SignalSpec {
     pub uri: String,
+    /// Resolved only for helper stdin; never part of a session command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<auth::SignalCredentials>,
     pub mode: Mode,
     pub interval_ms: u64,
     #[serde(default)]
@@ -260,6 +264,44 @@ pub struct SignalInfo {
     pub interval_ms: u64,
 }
 
+/// Independent coordinator limits for one capture instance. Bytes count the
+/// UTF-8 JSON encoding of each accepted `Sample`, excluding batch framing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureLimits {
+    pub duration_ms: u64,
+    pub max_samples: u64,
+    pub max_bytes: u64,
+}
+
+impl CaptureLimits {
+    pub fn validate(self) -> Result<()> {
+        ensure!(
+            (1..=86_400_000).contains(&self.duration_ms),
+            "signal capture duration must be 1ms..24h"
+        );
+        ensure!(
+            (1..=100_000_000).contains(&self.max_samples),
+            "signal capture samples must be 1..100000000"
+        );
+        ensure!(
+            (1..=1_099_511_627_776).contains(&self.max_bytes),
+            "signal capture bytes must be 1..1TiB"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureCompletion {
+    Duration,
+    MaxSamples,
+    MaxBytes,
+    Stopped,
+    Failed,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceState {
@@ -269,6 +311,23 @@ pub enum SourceState {
     Reconnecting,
     Failed,
     Stopped,
+}
+
+/// Cached coordinator persistence readiness; never opens or contacts a source.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignalSinkStatus {
+    #[serde(default)]
+    pub attached: bool,
+    /// Changes for every sink attachment/detachment, including the same Slot.
+    #[serde(default)]
+    pub generation: u64,
+    /// Read dynamically from the attached sink, including a lazily opened Slot.
+    #[serde(default)]
+    pub dataset_slot_id: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub dropped_total: u64,
 }
 
 /// The latest value of one tag, with recent numeric points on request.
@@ -290,11 +349,37 @@ pub struct TagStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SourceStatus {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<auth::AuthBinding>,
+    /// Opaque identity of this instance, retained through helper restarts.
+    #[serde(default)]
+    pub capture_id: String,
+    /// The dataset instance this bounded capture is allowed to persist into.
+    #[serde(default)]
+    pub dataset_slot_id: Option<String>,
     pub protocol: Protocol,
     pub uri: String,
     pub interval_ms: u64,
     pub state: SourceState,
     pub started_ms: u64,
+    #[serde(default)]
+    pub capture_limits: Option<CaptureLimits>,
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
+    /// Present only after admission closes and the final flush is acknowledged
+    /// or its failure/timeout has been recorded.
+    #[serde(default)]
+    pub completed_ms: Option<u64>,
+    #[serde(default)]
+    pub completion: Option<CaptureCompletion>,
+    #[serde(default)]
+    pub payload_bytes: u64,
+    #[serde(default)]
+    pub written_bytes: u64,
+    #[serde(default)]
+    pub persistence_complete: bool,
+    #[serde(default)]
+    pub persistence_error: Option<String>,
     #[serde(default)]
     pub last_sample_ms: Option<u64>,
     #[serde(default)]
@@ -388,6 +473,37 @@ pub enum Line {
 /// order; never call `SignalHub::set_sink` or `flush` while holding a lock
 /// that `write` takes.
 pub trait SampleSink: Send + Sync {
+    /// The exact open dataset instance this sink writes to. Other sink types
+    /// cannot satisfy a dataset-scoped capture merely by being attached.
+    fn dataset_slot_id(&self) -> Option<String> {
+        None
+    }
+    /// Dataset sinks override these checked methods to compare identity and
+    /// write under the same dataset lock.
+    fn register_for_dataset_slot(
+        &self,
+        slot_id: &str,
+        source: &SignalInfo,
+        tags: &[TagInfo],
+    ) -> Result<()> {
+        ensure!(
+            self.dataset_slot_id().as_deref() == Some(slot_id),
+            "signal capture dataset instance changed"
+        );
+        self.register(source, tags)
+    }
+    fn write_for_dataset_slot(
+        &self,
+        slot_id: &str,
+        source_id: &str,
+        batch: &[Sample],
+    ) -> Result<()> {
+        ensure!(
+            self.dataset_slot_id().as_deref() == Some(slot_id),
+            "signal capture dataset instance changed"
+        );
+        self.write(source_id, batch)
+    }
     fn register(&self, source: &SignalInfo, tags: &[TagInfo]) -> Result<()>;
     /// Write one batch (at most 5000 samples) in one transaction.
     fn write(&self, source_id: &str, batch: &[Sample]) -> Result<()>;
@@ -496,6 +612,14 @@ pub fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_capture_id(id: &str) -> Result<()> {
+    ensure!(
+        crate::session::valid_forwarding_id(id),
+        "signal capture ID must be 32 lowercase hex digits (see `capturefab signals`)"
+    );
+    Ok(())
+}
+
 /// Parse a URI that reads values: an OPC UA source needs nodes to read
 /// (only browse goes without).
 pub fn parse_readable(uri: &str) -> Result<SignalUri> {
@@ -512,8 +636,22 @@ pub fn parse_readable(uri: &str) -> Result<SignalUri> {
 /// Check the shape of a signal command's fields. Whether a protocol is
 /// compiled in is checked only when the command runs (exit code 5).
 pub fn validate_command(command: &SessionCommand) -> Result<()> {
+    let binding = match command {
+        SessionCommand::SignalRead { uri, auth, .. }
+        | SessionCommand::SignalBrowse { uri, auth, .. }
+        | SessionCommand::SignalStart { uri, auth, .. }
+        | SessionCommand::SignalCapture { uri, auth, .. } => Some((uri, auth)),
+        _ => None,
+    };
+    if let Some((uri, Some(binding))) = binding {
+        binding.validate()?;
+        auth::validate_endpoint(uri)?;
+    }
     match command {
-        SessionCommand::SignalRead { uri, timeout_ms } => {
+        SessionCommand::SignalBind { profile } => profile.validate()?,
+        SessionCommand::SignalRead {
+            uri, timeout_ms, ..
+        } => {
             parse_readable(uri)?;
             crate::session::validate_timeout(*timeout_ms)?;
         }
@@ -521,6 +659,7 @@ pub fn validate_command(command: &SessionCommand) -> Result<()> {
             uri,
             duration_ms,
             limit,
+            ..
         } => {
             parse(uri)?;
             ensure!(
@@ -536,12 +675,45 @@ pub fn validate_command(command: &SessionCommand) -> Result<()> {
             uri,
             interval_ms,
             tags,
+            ..
         } => {
             parse_readable(uri)?;
             validate_interval(*interval_ms)?;
             validate_tags(tags)?;
         }
+        SessionCommand::SignalCapture {
+            uri,
+            interval_ms,
+            tags,
+            duration_ms,
+            max_samples,
+            max_bytes,
+            slot_id,
+            ..
+        } => {
+            parse_readable(uri)?;
+            validate_interval(*interval_ms)?;
+            validate_tags(tags)?;
+            CaptureLimits {
+                duration_ms: *duration_ms,
+                max_samples: *max_samples,
+                max_bytes: *max_bytes,
+            }
+            .validate()?;
+            ensure!(
+                crate::session::valid_forwarding_id(slot_id),
+                "dataset slot ID must be 32 lowercase hex digits"
+            );
+        }
         SessionCommand::SignalStop { id } => validate_id(id)?,
+        SessionCommand::SignalStopIf { id, capture_id } => {
+            validate_id(id)?;
+            ensure!(
+                id != "all",
+                "conditional signal stop requires one source ID"
+            );
+            validate_capture_id(capture_id)?;
+        }
         _ => {}
     }
     Ok(())
@@ -551,6 +723,12 @@ pub fn validate_command(command: &SessionCommand) -> Result<()> {
 pub fn schema_contract() -> Json {
     json!({
         "protocols": compiled_protocols(),
+        "profiles": {
+            "commands": "signals profiles list|save|remove|bind; list/save/remove are local setup, bind requires the selected running workbench",
+            "credentials": "save accepts a credential-free endpoint and bounded credentials-stdin JSON; passwords use the OS credential store or a CAPTUREFAB_SIGNAL_ environment reference; usernames, passwords and environment names are omitted from public profile metadata",
+            "binding": "signal_bind explicitly resolves one exact profile id/revision and returns an opaque auth epoch plus source reference; it does not contact the endpoint. signal_read, signal_browse, signal_start and signal_capture accept optional auth from that receipt. Old epochs cannot adopt profile or password changes or another coordinator.",
+            "builtin_assistant": "assistant run --source-profile NAME --allow-data binds locally before model setup; its provider receives source references, never credential epochs or values"
+        },
         "uris": {
             "modbus-tcp": "modbus-tcp://HOST[:502]/UNIT_ID/coil|discrete|input|holding/ADDRESS[?count=N&type=u16|i16|u32|i32|f32|f64|bool&order=abcd|cdab|badc|dcba&scale=F&offset=F&name=TAG&unit=UNIT]; ADDRESS is the 0-based protocol address (Modicon 40001 is holding/0); value = raw*scale+offset; at most 125 registers or 2000 bits per source",
             "mqtt": "mqtt[s]://[USER[:PASS]@]BROKER[:1883|8883]/TOPIC_FILTER[?client_id=ID&qos=0|1]; '#' only as the last level, '+' as a whole level; numeric, true/false, JSON object (flattened to topic/field, depth 4, 256 leaves) or text payloads; binary payloads (not UTF-8, or with control characters other than tab, CR and LF) become bounded 'hex:...' text; a top-level ts, timestamp or time field (Unix s or ms, or RFC 3339 text) becomes source_ts_ms and other such fields stay tags",
@@ -564,6 +742,9 @@ pub fn schema_contract() -> Json {
             "tags_per_source": MAX_TAGS,
             "tag_filters": MAX_ALLOW,
             "interval_ms": [100, 3_600_000],
+            "capture_duration_ms": [1, 86_400_000],
+            "capture_samples": [1, 100_000_000],
+            "capture_bytes": [1, 1_099_511_627_776u64],
             "browse_ms": [100, 60_000],
             "browse_items": 5000,
             "mqtt_payload_bytes": MAX_PAYLOAD,
@@ -575,17 +756,24 @@ pub fn schema_contract() -> Json {
         },
         "time": "ts_ms is the host clock (UTC Unix ms) when the helper read the value; source_ts_ms is the device's own timestamp when the protocol has one",
         "drops": "samples dropped by a full helper queue (helper_dropped), the hub queue or sink errors (dropped) are counted; without an attached dataset or CSV sink samples are kept only as latest values and persisting is false",
-        "lifetime": "sources run while the GUI, serve or log process runs and restart up to 5 times after a helper exits; they are not persisted across sessions",
+        "lifetime": "legacy signal_start sources run while the GUI, serve or log process runs and restart up to 5 times after a helper exits; signal_capture requires the exact dataset slot_id and a sink, independently enforces duration/sample/payload-byte bounds and flushes before completed_ms is set; sources are not persisted across sessions",
+        "capture_identity": "capture_id is an opaque 32 lowercase hex instance token retained across helper restarts; a replacement of the same URI gets a new token; signal_stop_if refuses a mismatched replacement and never accepts all",
+        "sink_binding": "signal_capture and dataset_close_if can pin sink_generation from the dataset_open receipt or current signal_sink status; stale generations fail before acquisition or detachment, including a reattachment of the same dataset Slot",
+        "capture_bytes": "payload_bytes and written_bytes sum the UTF-8 JSON encoding of each accepted or successfully written Sample, excluding batch framing; these are payload budgets, not file sizes",
         "sample": {"ts_ms":"u64","source_ts_ms":"u64|null","tag":"string","value":"number|bool|string","quality":"good|uncertain|bad"},
         "results": {
+            "signal_bind": {"endpoint":"credential-free local endpoint","reference":"signal:<16 hex>","auth":{"profile":{"id":"32 lowercase hex","revision":"32 lowercase hex"},"epoch":"32 lowercase hex"}},
             "signal_read": {"id":"signal:<16 hex>","uri":"redacted","protocol":"string","tags":"[TagInfo]","samples":"[Sample]","dropped":"u64"},
             "signal_browse": {"id":"string","uri":"redacted","protocol":"string","items":"[{id,name,kind,data_type?,unit?,value?}]","truncated":"bool"},
             "signal_start": "SourceStatus",
+            "signal_capture": "SourceStatus (requires slot_id and duration_ms/max_samples/max_bytes; terminal status remains observable until replacement or stop)",
             "signal_stop": {"stopped":"[SourceStatus]"},
-            "signals": {"sources":"[SourceStatus]","persisting":"bool","dropped":"u64","sink_error":"string|null"},
+            "signal_stop_if": {"stopped":"[SourceStatus]"},
+            "signals": {"sources":"[SourceStatus]","persisting":"bool","dropped":"u64","sink_error":"string|null","sink":"SignalSinkStatus"},
             "log": {"sources":"[SourceStatus]","dataset":"path|null","csv":"path|null","samples":"u64","written":"u64","dropped":"u64","duration_ms":"u64","warnings":"[string], only when nothing was logged"}
         },
-        "source_status": "{id,protocol,uri,interval_ms,state:connecting|running|reconnecting|failed|stopped,started_ms,last_sample_ms,samples,written,dropped,helper_dropped,restarts,error,helper_pid,tags:[{tag,unit,value,quality,ts_ms,source_ts_ms,recent?}],tags_total,tags_truncated}",
+        "source_status": "{id,capture_id,dataset_slot_id,protocol,uri,interval_ms,state:connecting|running|reconnecting|failed|stopped,started_ms,capture_limits:{duration_ms,max_samples,max_bytes}|null,deadline_ms,completed_ms,completion:duration|max_samples|max_bytes|stopped|failed|null,payload_bytes,written_bytes,persistence_complete,persistence_error,last_sample_ms,samples,written,dropped,helper_dropped,restarts,error,helper_pid,tags:[{tag,unit,value,quality,ts_ms,source_ts_ms,recent?}],tags_total,tags_truncated}",
+        "sink_status": "{attached:bool,generation:u64,dataset_slot_id:string|null,error:string|null,dropped_total:u64}; generation changes on every sink attachment/detachment; attached with no dataset_slot_id can be a closed/lazy dataset or a foreign sink; inspect the current dataset before capturing",
         "errors": {"2":"bad URI or arguments","3":"connection refused or unknown source ID","4":"timed out","5":"protocol not compiled in, or browse on modbus-tcp","6":"storage full while writing CSV"},
     })
 }
@@ -594,10 +782,13 @@ pub fn schema_contract() -> Json {
 pub fn rpc_examples() -> Vec<Json> {
     vec![
         json!({"op":"signals"}),
+        json!({"op":"signal_bind","profile":{"id":"0123456789abcdef0123456789abcdef","revision":"abcdef0123456789abcdef0123456789"}}),
         json!({"op":"signal_read","uri":"sim-signal://line1","timeout_ms":5000}),
         json!({"op":"signal_browse","uri":"sim-signal://line1","duration_ms":1000,"limit":100}),
         json!({"op":"signal_start","uri":"sim-signal://line1","interval_ms":1000}),
+        json!({"op":"signal_capture","uri":"sim-signal://line1","interval_ms":1000,"duration_ms":5000,"max_samples":100,"max_bytes":100000,"slot_id":"0123456789abcdef0123456789abcdef","sink_generation":1}),
         json!({"op":"signal_stop","id":"all"}),
+        json!({"op":"signal_stop_if","id":"signal:0123456789abcdef","capture_id":"0123456789abcdef0123456789abcdef"}),
     ]
 }
 
@@ -615,6 +806,7 @@ mod tests {
         assert!(
             validate_command(&SessionCommand::SignalRead {
                 uri: bare.into(),
+                auth: None,
                 timeout_ms: 2000
             })
             .is_err()
@@ -630,6 +822,7 @@ mod tests {
         assert!(validate_id("signal:ABC").is_err());
         let spec = SignalSpec {
             uri: "mqtt://user:hunter2@h/t".into(),
+            credentials: None,
             mode: Mode::Read,
             interval_ms: 1000,
             tags: vec![],
@@ -682,6 +875,44 @@ mod tests {
         assert!(ok(r#"{"op":"signal_start","uri":"sim-signal://a","tags":[""]}"#).is_err());
         assert!(ok(r#"{"op":"signal_stop","id":"x"}"#).is_err());
         assert!(SessionCommand::from_json_slice(br#"{"op":"signals","x":1}"#).is_err());
+    }
+
+    #[test]
+    fn bounded_commands_require_finite_limits_and_exact_identities() {
+        let base = json!({"op":"signal_capture", "uri":"sim-signal://a", "duration_ms":1000, "max_samples":100, "max_bytes":10000, "slot_id":"0123456789abcdef0123456789abcdef"});
+        let parse = |value: &Json| -> Result<SessionCommand> {
+            let command = SessionCommand::from_json_slice(&serde_json::to_vec(value).unwrap())?;
+            command.validate()?;
+            Ok(command)
+        };
+        let command = parse(&base).unwrap();
+        assert!(command.is_signal());
+        for (field, value) in [
+            ("duration_ms", 0),
+            ("duration_ms", 86_400_001),
+            ("max_samples", 0),
+            ("max_samples", 100_000_001),
+            ("max_bytes", 0),
+            ("max_bytes", 1_099_511_627_777u64),
+        ] {
+            let mut invalid = base.clone();
+            invalid[field] = json!(value);
+            assert!(parse(&invalid).is_err(), "{field}: {value}");
+        }
+        let mut invalid = base.clone();
+        invalid["slot_id"] = json!("all");
+        assert!(parse(&invalid).is_err());
+        let stop = json!({"op":"signal_stop_if", "id":"signal:0123456789abcdef", "capture_id":"0123456789abcdef0123456789abcdef"});
+        assert!(parse(&stop).unwrap().is_signal());
+        for (field, value) in [
+            ("id", "all"),
+            ("capture_id", ""),
+            ("capture_id", "0123456789ABCDEF0123456789ABCDEF"),
+        ] {
+            let mut invalid = stop.clone();
+            invalid[field] = json!(value);
+            assert!(parse(&invalid).is_err());
+        }
     }
 
     #[test]

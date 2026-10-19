@@ -74,7 +74,15 @@ impl ResultRecord {
             .map_or(true, |bytes| bytes.len() > crate::tools::MAX_OUTPUT_BYTES)
             || super::protocol::result_text(&self).len() > crate::tools::MAX_OUTPUT_BYTES
         {
+            // Keep the runtime's small, typed budget receipt when a large
+            // observation is omitted. Arbitrary result fields stay omitted.
+            let remaining = self.content.get("limits_remaining").and_then(|value| {
+                serde_json::from_value::<super::limits::Remaining>(value.clone()).ok()
+            });
             self.content = json!({"truncated":true,"summary":"The tool result exceeded 24 KiB. Ask for a narrower observation."});
+            if let Some(remaining) = remaining {
+                self.content["limits_remaining"] = json!(remaining);
+            }
         }
         for image in &mut self.images {
             image.label = crate::tools::redact::for_model_text(&image.label);
@@ -130,6 +138,8 @@ pub struct Conversation {
     sent: Vec<[u8; 32]>,
     pub effort_suppressed: bool,
     pub vision_rejected: bool,
+    /// History assembled with permission to include source values and dataset results.
+    pub(crate) data_permission: bool,
 }
 impl fmt::Debug for Conversation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -177,6 +187,7 @@ impl Conversation {
             sent: Vec::new(),
             effort_suppressed: false,
             vision_rejected: false,
+            data_permission: false,
         }
     }
 
@@ -603,6 +614,30 @@ mod tests {
         escaped.content = json!({"value":"\"".repeat(10*1024)});
         let escaped = escaped.bounded();
         assert!(protocol::result_text(&escaped).len() <= crate::tools::MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn oversized_observations_retain_typed_remaining_limits_without_extra_fields() {
+        let limiter = super::super::limits::Limiter::new(
+            super::super::limits::Limits::default(),
+            100,
+            u64::MAX,
+            None,
+        )
+        .unwrap();
+        let remaining = json!(limiter.remaining(200));
+        let mut result = ResultRecord::error(&call(1), "fixture");
+        result.content = json!({"rows":"x".repeat(25*1024),"limits_remaining":remaining});
+        let bounded = result.clone().bounded();
+        assert_eq!(bounded.content["truncated"], true);
+        assert_eq!(bounded.content["limits_remaining"], remaining);
+        assert!(bounded.content.get("rows").is_none());
+        assert!(protocol::result_text(&bounded).len() <= crate::tools::MAX_OUTPUT_BYTES);
+
+        result.content["limits_remaining"]["extra"] = json!("private-source-text");
+        let bounded = result.bounded();
+        assert!(bounded.content.get("limits_remaining").is_none());
+        assert!(!bounded.content.to_string().contains("private-source-text"));
     }
     #[test]
     fn blocked_prompt_without_assistant_wire_keeps_a_usable_conversation() {

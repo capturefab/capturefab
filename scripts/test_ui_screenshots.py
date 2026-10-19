@@ -18,7 +18,7 @@ SPEC.loader.exec_module(REVIEW)
 
 class ReviewMatrixTests(unittest.TestCase):
     def test_camera_kind_matrix_is_opt_in_and_marks_real_and_display_profiles(self):
-        self.assertEqual(len(list(REVIEW.matrix())), 97)
+        self.assertEqual(len(list(REVIEW.matrix())), 141)
         cases = list(REVIEW.matrix(True))
         self.assertEqual(len(cases), 26)
         self.assertEqual(len({case[0] for case in cases}), len(cases))
@@ -37,8 +37,8 @@ class ReviewMatrixTests(unittest.TestCase):
 
     def test_all_matrix_combines_both_complete_matrices_without_duplicate_artifacts(self):
         cases = REVIEW.select_cases(all_screens=True)
-        self.assertEqual(len(cases), 132)
-        self.assertEqual(len({case[0] for case in cases}), 132)
+        self.assertEqual(len(cases), 176)
+        self.assertEqual(len({case[0] for case in cases}), 176)
         self.assertEqual({case[0] for case in cases}, {case[0] for case in REVIEW.matrix()} | {case[0] for case in REVIEW.matrix(True)} | {case[0] for case in REVIEW.extra_state_matrix()})
         self.assertEqual(len(REVIEW.select_cases(only=["welcome-light", "line-features-light"], all_screens=True)), 2)
 
@@ -61,16 +61,32 @@ class ReviewMatrixTests(unittest.TestCase):
             self.assertEqual(size, (900, 620), name)
         words = {word for _, scene, *_ in compact for word in scene.words.split(",")}
         self.assertTrue({"sheet-bottom", "inspector-bottom", "peek"} <= words)
+        self.assertTrue(any("quick-command-data-sources" in scene.words for _,scene,*_ in compact))
+        self.assertTrue({"quick-command-data-auth", "quick-command-task-data-auth", "signals-auth"} <= words)
+        exported=[scene for _,scene,*_ in REVIEW.matrix() if scene.name=="quick-command-exported"]
+        self.assertEqual(len(exported),3)
+        self.assertTrue(all("quick-command-exported" in scene.words for scene in exported))
+        empty=[scene for _,scene,*_ in REVIEW.matrix() if scene.name=="signals-empty"]
+        self.assertEqual(len(empty),2)
+        self.assertTrue(all(scene.cameras==0 and scene.camera is None for scene in empty))
+        failures=[scene for _,scene,*_ in REVIEW.matrix() if scene.name=="signals-persistence-error"]
+        self.assertEqual(len(failures),2)
+        self.assertTrue(all(scene.cameras==0 and scene.camera is None and "inspector-bottom" in scene.words for scene in failures))
 
     def test_review_includes_missing_sheets_and_plain_and_populated_measurements(self):
         words = {word for _, scene, *_ in REVIEW.matrix() for word in scene.words.split(",")}
         self.assertTrue({
-            "network", "destinations-remove", "bucket-editor-advanced", "close-error",
+            "network", "destinations-remove", "bucket-editor-advanced", "close-error", "agent-setup",
             "settings-credential-error", "settings-assistant", "settings-assistant-error",
-            "quick-command", "quick-command-plan", "quick-command-invalid",
-            "quick-command-running", "quick-command-done", "quick-command-setup",
+            "quick-command", "quick-command-data-consent", "quick-command-data-sources", "quick-command-plan", "quick-command-invalid",
+            "quick-command-data-auth", "quick-command-task-data-auth", "signals-auth",
+            "quick-command-running", "quick-command-done", "quick-command-setup", "quick-command-exported",
             "quick-command-task-setup", "quick-command-task-running", "quick-command-task-approval",
             "quick-command-task-paused-human", "quick-command-task-limit", "quick-command-task-done",
+            "quick-command-task-data-setup", "quick-command-task-data-running", "quick-command-task-mixed-running",
+            "quick-command-task-data-approval", "quick-command-task-data-paused-human",
+            "quick-command-task-data-error", "quick-command-task-data-done",
+            "quick-command-task-separate-setup", "quick-command-task-separate-done",
             "analytics-measurements", "analytics-measurements-populated",
         } <= words)
 
@@ -89,6 +105,8 @@ class ReviewMatrixTests(unittest.TestCase):
             "AZURE_OPENAI_API_KEY": "secret", "AWS_SESSION_TOKEN": "secret",
             "AWS_PROFILE": "real", "GOOGLE_APPLICATION_CREDENTIALS": "/real/adc.json",
             "GOOGLE_CLOUD_PROJECT": "real", "CAPTUREFAB_SESSION_DIR": "/real/session",
+            "capturefab_signal_line_password": "secret", "openai_api_key": "secret",
+            "aws_profile": "real",
         }
         with patch.dict(os.environ, {**credentials, "PATH": "/fixture/bin"}, clear=True):
             self.assertEqual(REVIEW.isolated_environment(), {"PATH": "/fixture/bin"})

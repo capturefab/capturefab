@@ -204,7 +204,16 @@ pub(crate) fn bedrock_chain_in(profile: Option<&str>, vars: Vars<'_>) -> Result<
 /// The `region` of a profile in the AWS config file (`AWS_CONFIG_FILE`, else
 /// `~/.aws/config`), if it is set to a plausible region name.
 pub fn profile_region(profile: &str) -> Option<String> {
-    profile_region_in(profile, &process_vars)
+    profile_region_from_env(profile, process_vars)
+}
+
+/// Non-secret profile configuration lookup with an explicit environment. This
+/// reads only the config file and never resolves keys or credential processes.
+pub(crate) fn profile_region_from_env(
+    profile: &str,
+    vars: impl Fn(&str) -> Option<OsString>,
+) -> Option<String> {
+    profile_region_in(profile, &vars)
 }
 
 fn profile_region_in(profile: &str, vars: Vars<'_>) -> Option<String> {

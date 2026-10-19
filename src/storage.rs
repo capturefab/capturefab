@@ -17,9 +17,19 @@
 //! Version 2 marks this format, so older binaries refuse the ledger as
 //! unsupported instead of ignoring the journal; a version 1 ledger is converted
 //! on its first lock.
+mod namespace;
+mod output_directory;
 use crate::types::Frame;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use fs2::FileExt;
+#[cfg(feature = "gui")]
+pub(crate) use namespace::{RecoveredNamespace, copy_task_namespace};
+pub(crate) use namespace::{
+    RetainedNamespaceLease, ensure_not_task_namespace, recover_task_namespaces,
+    reserve_task_namespace,
+};
+pub(crate) use output_directory::NamespaceRemovalReceipt;
+pub(crate) use output_directory::{OutputDirectory, OutputDirectoryPlan};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -28,13 +38,14 @@ use std::{
     fs::{self, File, Metadata, OpenOptions},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, PoisonError},
+    sync::{Arc, Mutex, PoisonError},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const LEDGER_LIMIT: u64 = 64 * 1024 * 1024;
 const LEDGER_VERSION: u32 = 2;
+const NAMESPACE_LEDGER_VERSION: u32 = 3;
 const SNAPSHOT: &str = "storage.json";
 const JOURNAL: &str = "storage.journal";
 const POLICY: &str = "storage-policy.json";
@@ -179,6 +190,8 @@ struct Entry {
     /// Queued for upload: retention must not delete it before then.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pending_upload: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    namespace: Option<namespace::NamespaceRecord>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct Ledger {
@@ -406,6 +419,15 @@ impl Manager {
         removed
     }
     fn writer(&self, path: &Path, policy: &StoragePolicy, reserve: u64) -> Result<StorageWriter> {
+        self.writer_anchored(path, policy, reserve, None)
+    }
+    fn writer_anchored(
+        &self,
+        path: &Path,
+        policy: &StoragePolicy,
+        reserve: u64,
+        directory: Option<Arc<OutputDirectory>>,
+    ) -> Result<StorageWriter> {
         policy.validate()?;
         ensure!(reserve > 0, "capture storage reservation must be positive");
         ensure!(
@@ -414,13 +436,22 @@ impl Manager {
             policy.max_bytes
         );
         let mut locked = self.lock()?;
+        namespace::ensure_write_allowed(&locked, path)?;
         let policy = policy.constrained_by(&locked.configured_policy()?);
         ensure!(
             reserve <= policy.max_bytes,
             "Storage full: reservation {reserve} bytes exceeds the configured {} byte global budget; lower the recording reservation or explicitly configure a larger storage policy",
             policy.max_bytes
         );
-        let (base, path) = output_path(path)?;
+        let (base, path) = if let Some(directory) = &directory {
+            directory.verify()?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| anyhow!("capture output must name a file"))?;
+            (directory.path().to_owned(), directory.path().join(name))
+        } else {
+            output_path(path)?
+        };
         match fs::symlink_metadata(&path) {
             Ok(_) => return Err(OutputExists(path).into()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -455,7 +486,11 @@ impl Manager {
         let lease_path = locked.directory.join(&lease_name);
         let lease = private_options().create_new(true).open(&lease_path)?;
         lease.lock_exclusive()?;
-        let file = match private_options().create_new(true).open(&path) {
+        let opened = match &directory {
+            Some(directory) => directory.create_new(path.file_name().expect("output file name")),
+            None => private_options().create_new(true).open(&path),
+        };
+        let file = match opened {
             Ok(file) => file,
             Err(error) => {
                 drop(lease);
@@ -480,16 +515,21 @@ impl Manager {
             modified_ns: None,
             changed: false,
             pending_upload: false,
+            namespace: None,
         });
         if let Err(error) = locked.persist() {
             drop(file);
             drop(lease);
-            if fs::symlink_metadata(&path)
-                .is_ok_and(|meta| identity(&meta) == file_identity && meta.len() == 0)
+            if directory.is_none()
+                && fs::symlink_metadata(&path)
+                    .is_ok_and(|meta| identity(&meta) == file_identity && meta.len() == 0)
             {
                 let _ = fs::remove_file(&path);
             }
             let _ = fs::remove_file(&lease_path);
+            if directory.is_some() {
+                return Err(error).with_context(|| format!("new empty export file {} remains without a confirmed storage record after the ledger failure; inspect this file before removing the export folder", path.display()));
+            }
             return Err(error);
         }
         Ok(StorageWriter {
@@ -509,6 +549,7 @@ impl Manager {
             failed: false,
             cut: false,
             finalized: false,
+            _directory: directory,
         })
     }
 }
@@ -705,6 +746,7 @@ fn check_entry(entry: &Entry) -> Result<()> {
         ),
         "invalid storage capture hash"
     );
+    namespace::validate_entry(entry)?;
     Ok(())
 }
 /// A journal's header and the length of its line.
@@ -718,7 +760,7 @@ fn read_header(journal: &mut File) -> Result<(JournalHeader, u64)> {
         .flatten()
         .ok_or_else(|| anyhow!("invalid storage journal header; preserve storage.json and storage.journal and inspect them before resetting ownership"))?;
     ensure!(
-        header.version == LEDGER_VERSION,
+        matches!(header.version, LEDGER_VERSION | NAMESPACE_LEDGER_VERSION),
         "unsupported storage journal version"
     );
     Ok((header, line.len() as u64))
@@ -803,8 +845,10 @@ impl Locked {
             None => Ledger::default(),
         };
         ensure!(
-            matches!(self.ledger.version, 1 | LEDGER_VERSION)
-                && self.ledger.entries.len() <= 100_000,
+            matches!(
+                self.ledger.version,
+                1 | LEDGER_VERSION | NAMESPACE_LEDGER_VERSION
+            ) && self.ledger.entries.len() <= 100_000,
             "unsupported or oversized storage ledger"
         );
         self.validate()?;
@@ -908,6 +952,10 @@ impl Locked {
         let mut paths = HashSet::new();
         for entry in &self.ledger.entries {
             check_entry(entry)?;
+            ensure!(
+                entry.namespace.is_none() || self.ledger.version == NAMESPACE_LEDGER_VERSION,
+                "task namespaces require storage ledger version 3"
+            );
             ensure!(
                 ids.insert(&entry.id),
                 "invalid storage ledger reservation id"
@@ -1020,7 +1068,7 @@ impl Locked {
             ..Position::default()
         };
         let header = JournalHeader {
-            version: LEDGER_VERSION,
+            version: self.ledger.version,
             journal: nonce()?,
         };
         let mut bytes = serde_json::to_vec(&header)?;
@@ -1087,6 +1135,15 @@ impl Locked {
         let mut missing = Vec::new();
         let mut verified = HashSet::new();
         for (index, entry) in self.ledger.entries.iter_mut().enumerate() {
+            if entry.namespace.is_some() {
+                let reconciled = namespace::reconcile_entry(entry, &self.directory)?;
+                if reconciled.unpublished {
+                    missing.push(index);
+                } else if reconciled.changed {
+                    self.dirty.push(entry.id.clone());
+                }
+                continue;
+            }
             if !full && entry.lease.is_none() {
                 continue;
             }
@@ -1197,6 +1254,8 @@ impl Locked {
             "active_reservations": self.ledger.entries.iter().filter(|entry| entry.lease.is_some()).count(),
             "externally_changed_files": self.ledger.entries.iter().filter(|entry| entry.changed).count(),
             "free_bytes": free_bytes(&capture_root()),
+            "namespace_accounting": "Full reserved logical EOF extent caps; retained after close or client loss until confirmed anchored removal. No physical disk quota or retained-size shrink.",
+            "retained_namespaces": namespace::status(&self.ledger),
         }))
     }
     fn expired(&self, entry: &Entry, policy: &StoragePolicy) -> bool {
@@ -1205,7 +1264,11 @@ impl Locked {
             .is_some_and(|age| now().saturating_sub(entry.created) >= age)
     }
     fn removable(entry: &Entry) -> bool {
-        entry.lease.is_none() && !entry.changed && entry.sha256.is_some() && !entry.pending_upload
+        entry.namespace.is_none()
+            && entry.lease.is_none()
+            && !entry.changed
+            && entry.sha256.is_some()
+            && !entry.pending_upload
     }
     /// Expired and removable. A protected file past the age limit, such as a
     /// live or interrupted recording or one awaiting upload, must not block
@@ -1219,7 +1282,9 @@ impl Locked {
         self.ledger
             .entries
             .iter()
-            .position(|entry| entry.path == path && entry.lease.is_none())
+            .position(|entry| {
+                entry.path == path && entry.lease.is_none() && entry.namespace.is_none()
+            })
             .ok_or_else(|| anyhow!("{} is not a finished Capturefab capture", path.display()))
     }
     /// Remove one capture if it is still exactly the file recorded; the
@@ -1384,7 +1449,10 @@ impl Locked {
             .ledger
             .entries
             .iter()
-            .filter(|entry| entry.lease.is_some() && on_disk(entry, device) != Some(false))
+            .filter(|entry| {
+                (entry.lease.is_some() || entry.namespace.is_some())
+                    && on_disk(entry, device) != Some(false)
+            })
             .map(|entry| entry.reserved.saturating_sub(entry.bytes))
             .sum();
         let needed = FREE_SPACE_FLOOR
@@ -1480,6 +1548,8 @@ pub struct StorageWriter {
     /// every byte before it intact; see `finish_cut`.
     cut: bool,
     finalized: bool,
+    /// Keep directory anchors (and Windows rename guards) through commit.
+    _directory: Option<Arc<OutputDirectory>>,
 }
 impl Write for StorageWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -1731,6 +1801,20 @@ pub fn create_writer(
     reserve_bytes: u64,
 ) -> Result<StorageWriter> {
     Manager::global().writer(path, policy, reserve_bytes)
+}
+
+pub(crate) fn create_writer_in(
+    directory: &Arc<OutputDirectory>,
+    name: &str,
+    policy: &StoragePolicy,
+    reserve_bytes: u64,
+) -> Result<StorageWriter> {
+    Manager::global().writer_anchored(
+        &directory.path().join(name),
+        policy,
+        reserve_bytes,
+        Some(directory.clone()),
+    )
 }
 /// A finished output's size and SHA-256, as recorded in the ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2712,6 +2796,7 @@ mod tests {
                 modified_ns: meta.modified().ok().and_then(nanos),
                 changed: false,
                 pending_upload: false,
+                namespace: None,
             });
         }
         locked.compact().unwrap();
@@ -2926,7 +3011,7 @@ mod tests {
         let converted: Value = serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
         assert_eq!(converted["version"], LEDGER_VERSION);
         assert!(journal.exists());
-        fs::write(&snapshot, json!({"version": 3, "entries": []}).to_string()).unwrap();
+        fs::write(&snapshot, json!({"version": 4, "entries": []}).to_string()).unwrap();
         forget(&manager);
         let error = manager.lock().err().unwrap().to_string();
         assert!(error.contains("unsupported"), "{error}");

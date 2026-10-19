@@ -48,6 +48,58 @@ impl PlanDocument {
     }
 }
 
+/// Prepare a separate local export without changing the in-app/model plan.
+/// Anonymous source references need their exact currently approved endpoint so
+/// another process can check this version-1 document. Protected account epochs
+/// and cached display locations must never become portable connection grants.
+pub fn for_local_export(
+    document: &PlanDocument,
+    approved_sources: &[super::context::DataSourceRef],
+) -> Result<PlanDocument> {
+    document.validate()?;
+    let mut exported = document.clone();
+    for (index, call) in exported.calls.iter_mut().enumerate() {
+        if !matches!(
+            call.tool.as_str(),
+            "browse_data_source"
+                | "read_data_source"
+                | "start_signal_capture"
+                | "stop_signal_capture"
+                | "wait_for_data"
+        ) {
+            continue;
+        }
+        let selected = call.args["source"]
+            .as_str()
+            .context("Choose a source before exporting this plan.")?;
+        let matches = approved_sources
+            .iter()
+            .filter(|binding| binding.reference == selected || binding.uri == selected)
+            .collect::<Vec<_>>();
+        ensure!(
+            matches.len() == 1,
+            "The source in step {} is no longer unambiguously approved for export. Select its current endpoint in Sources before exporting, or run the plan in the app.",
+            index + 1
+        );
+        let binding = matches[0];
+        ensure!(
+            binding.auth.is_none(),
+            "Protected source bindings cannot be exported. Run this plan in the app, or bind the saved profile locally in the target workbench and review the calls there."
+        );
+        ensure!(
+            !binding.uri.is_empty(),
+            "A cached source does not grant a fresh connection. Add its complete credential-free endpoint in Sources before exporting, or run the plan in the app."
+        );
+        binding.validate_local().context(
+            "The selected source binding changed. Add its current credential-free endpoint in Sources before exporting.",
+        )?;
+        call.args["source"] = binding.uri.clone().into();
+    }
+    // Keep credential and complete-document byte checks on the converted copy.
+    to_json(&exported)?;
+    Ok(exported)
+}
+
 pub fn parse(text: &str) -> Result<PlanDocument> {
     ensure!(
         text.len() <= MAX_PLAN_BYTES,
@@ -189,7 +241,7 @@ pub fn write(path: &Path, document: &PlanDocument) -> Result<()> {
     Ok(())
 }
 
-fn credential_value(value: &serde_json::Value) -> bool {
+pub(crate) fn credential_value(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::String(text) => {
             if !text.contains("://") {
@@ -212,6 +264,10 @@ fn credential_value(value: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::{
+        context::DataSourceRef,
+        tests::{fixture_context, fixture_snapshot},
+    };
     use serde_json::json;
 
     fn document() -> PlanDocument {
@@ -261,5 +317,124 @@ mod tests {
             );
             assert!(!error.contains(value));
         }
+    }
+
+    fn source_document(source: &str) -> PlanDocument {
+        PlanDocument::new(vec![ToolCall {
+            tool: "read_data_source".into(),
+            args: json!({"source":source,"timeout":"1s"}),
+        }])
+    }
+
+    #[test]
+    fn anonymous_source_export_round_trips_into_a_new_cli_context_without_contact() {
+        let source = DataSourceRef::approved("sim-signal://portable-plan").unwrap();
+        let document = source_document(&source.reference);
+        let local = for_local_export(&document, std::slice::from_ref(&source)).unwrap();
+        let parsed = parse(&to_json(&local).unwrap()).unwrap();
+        assert_eq!(document.calls[0].args["source"], source.reference);
+        assert_eq!(parsed.version, PLAN_VERSION);
+        assert_eq!(parsed.calls[0].args["source"], source.uri);
+
+        let mut context = fixture_context(fixture_snapshot());
+        context.data_sources.clear();
+        context.data_profiles.clear();
+        context.snapshot.signals.clear();
+        context.snapshot.signal_bindings.clear();
+        let steps = parsed
+            .calls
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, call)| (crate::tools::StepId(index as u64 + 1), call))
+            .collect::<Vec<_>>();
+        let checked = crate::tools::check_plan(&context, &steps, &|_, _| false);
+        assert!(
+            checked.iter().all(crate::tools::Checked::ready),
+            "{checked:?}"
+        );
+        assert!(checked[0].ops.iter().any(|operation| matches!(operation,crate::tools::Op::Session { command:crate::session::SessionCommand::SignalRead {uri,auth:None,..},..} if uri==&source.uri)));
+    }
+
+    #[test]
+    fn local_export_converts_only_known_source_arguments() {
+        let source = DataSourceRef::approved("sim-signal://portable-plan").unwrap();
+        let mut document = PlanDocument::new(vec![
+            ToolCall {
+                tool: "browse_data_source".into(),
+                args: json!({"source":source.reference,"timeout":"1s","limit":10}),
+            },
+            ToolCall {
+                tool: "read_data_source".into(),
+                args: json!({"source":source.reference,"timeout":"1s"}),
+            },
+            ToolCall {
+                tool: "start_signal_capture".into(),
+                args: json!({"source":source.reference,"every":"100ms","duration":"1s","max_samples":10,"max_bytes":1024,"tags":null}),
+            },
+            ToolCall {
+                tool: "wait_for_data".into(),
+                args: json!({"source":source.reference,"timeout":"1s","samples":null}),
+            },
+            ToolCall {
+                tool: "stop_signal_capture".into(),
+                args: json!({"source":source.reference}),
+            },
+            ToolCall {
+                tool: "capture_photos".into(),
+                args: json!({"camera":"sim:0","count":1,"format":"png","file_name":"photo.png","destination":null,"tags":[{"key":"source","value":source.reference}]}),
+            },
+            ToolCall {
+                tool: "annotate_dataset".into(),
+                args: json!({"text":source.reference}),
+            },
+        ]);
+        let original = document.clone();
+        let local = for_local_export(&document, std::slice::from_ref(&source)).unwrap();
+        for call in &local.calls[..5] {
+            assert_eq!(call.args["source"], source.uri);
+        }
+        assert_eq!(local.calls[5..], document.calls[5..]);
+        assert_eq!(document, original);
+        document.calls[0].args["source"] = source.uri.clone().into();
+        assert_eq!(for_local_export(&document, &[source]).unwrap(), local);
+    }
+
+    #[test]
+    fn local_export_refuses_missing_stale_cached_ambiguous_and_protected_bindings() {
+        let source = DataSourceRef::approved("sim-signal://portable-plan").unwrap();
+        let document = source_document(&source.reference);
+        let original = document.clone();
+        assert!(for_local_export(&document, &[]).is_err());
+        let replacement = DataSourceRef::approved("sim-signal://replacement-plan").unwrap();
+        assert!(for_local_export(&document, &[replacement]).is_err());
+        let mut stale = source.clone();
+        stale.uri = "sim-signal://replacement-plan".into();
+        assert!(for_local_export(&document, &[stale]).is_err());
+        assert!(for_local_export(&document, &[source.clone(), source.clone()]).is_err());
+        let cached = DataSourceRef::cached(source.reference.clone());
+        assert!(
+            for_local_export(&document, &[cached])
+                .unwrap_err()
+                .to_string()
+                .contains("cached")
+        );
+        let mut protected = source;
+        protected.auth = Some(crate::signals::auth::AuthBinding {
+            profile: crate::signals::auth::ProfileRef {
+                id: "a".repeat(32),
+                revision: "b".repeat(32),
+            },
+            epoch: "c".repeat(32),
+        });
+        let error = for_local_export(&document, &[protected])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Protected") && error.contains("in the app") && error.contains("bind"),
+            "{error}"
+        );
+        assert!(!error.contains(&"c".repeat(32)));
+        assert_eq!(document, original);
     }
 }

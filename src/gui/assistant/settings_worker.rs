@@ -34,10 +34,17 @@ pub(in crate::gui) trait Services: Send + Sync {
     fn store(&self, id: ProviderId, key: &str) -> Result<(), String>;
     fn remove(&self, id: ProviderId) -> Result<(), String>;
     fn test(&self, id: ProviderId, settings: ProviderSettings) -> Result<(), ConnectionFailure>;
+    /// Non-secret configuration only; this runs on the serial worker.
+    fn profile_region(&self, _profile: &str) -> Option<String> {
+        None
+    }
 }
 
 pub(in crate::gui) struct Native;
 impl Services for Native {
+    fn profile_region(&self, profile: &str) -> Option<String> {
+        crate::aws::profile_region(profile)
+    }
     fn load(&self) -> Loaded {
         let loaded = ai::settings::load();
         let present = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
@@ -153,17 +160,24 @@ pub(super) enum Work {
     Load,
     Save(ProviderId, ProviderSettings, bool),
     Status(ProviderId, ProviderSettings, u64),
+    ProfileRegion(String),
     Store(ProviderId, ProviderSettings, SecretDraft),
     Remove(ProviderId, ProviderSettings),
-    Test(ProviderId, ProviderSettings),
+    Test(ProviderId, ProviderSettings, Option<SecretDraft>),
     Flush(oneshot::Sender<Result<(), String>>),
 }
 pub(super) enum Reply {
     Loaded(Loaded),
     Saved(ProviderId, ProviderSettings, Result<(), String>),
     Status(ProviderId, Option<CredentialStatus>),
+    ProfileRegion(String, Option<String>),
     Credential(ProviderId, Option<bool>, Result<CredentialStatus, String>),
-    Tested(ProviderId, Result<(), ConnectionFailure>),
+    Tested {
+        id: ProviderId,
+        key_saved: bool,
+        status: Option<CredentialStatus>,
+        result: Result<(), ConnectionFailure>,
+    },
 }
 pub(super) struct Worker {
     pub send: Sender<Work>,
@@ -199,6 +213,10 @@ pub(super) fn start(
                             .then(|| services.status(id, &settings));
                         Reply::Status(id, status)
                     }
+                    Work::ProfileRegion(profile) => {
+                        let region = services.profile_region(&profile);
+                        Reply::ProfileRegion(profile, region)
+                    }
                     Work::Store(id, settings, key) => {
                         let result = services
                             .store(id, key.as_str())
@@ -209,7 +227,26 @@ pub(super) fn start(
                         let result = services.remove(id).map(|_| services.status(id, &settings));
                         Reply::Credential(id, result.is_ok().then_some(false), result)
                     }
-                    Work::Test(id, settings) => Reply::Tested(id, services.test(id, settings)),
+                    Work::Test(id, settings, key) => {
+                        let stored = key.as_ref().map(|key| services.store(id, key.as_str()));
+                        // Drop the zeroizing draft before a request can block.
+                        drop(key);
+                        let key_saved = matches!(stored, Some(Ok(())));
+                        let status = key_saved.then(|| services.status(id, &settings));
+                        let result = match stored {
+                            Some(Err(message)) => Err(ConnectionFailure {
+                                message,
+                                excerpt: None,
+                            }),
+                            _ => services.test(id, settings),
+                        };
+                        Reply::Tested {
+                            id,
+                            key_saved,
+                            status,
+                            result,
+                        }
+                    }
                     Work::Flush(done) => {
                         let _ = done.send(save_errors.values().next().cloned().map_or(Ok(()), Err));
                         continue;

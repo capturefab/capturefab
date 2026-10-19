@@ -188,6 +188,316 @@ fn ready_plan(state: &mut State, count: usize) -> Vec<StepId> {
 }
 
 #[test]
+fn local_source_bindings_need_consent_survive_refresh_and_follow_ups_and_clear_with_conversation() {
+    let services = Arc::new(Stub::new());
+    let mut state = state(services.clone());
+    let uri = "mqtt://line1.example/private-topic-in-local-binding";
+    state.input(Input::DataSourceDraft(uri.into()), Instant::now());
+    let revision = state.plan.revision;
+    state.input(Input::AddDataSource, Instant::now());
+    assert_eq!(state.plan.revision, revision + 1);
+    assert_eq!(state.data_sources.len(), 1);
+    assert!(state.context.as_ref().unwrap().data_sources.is_empty());
+    let source = state.data_sources[0].clone();
+    state.input(Input::DataSourceDraft(uri.into()), Instant::now());
+    let revision = state.plan.revision;
+    state.input(Input::AddDataSource, Instant::now());
+    assert_eq!(
+        state.plan.revision, revision,
+        "duplicate Add does not change the reviewed scope"
+    );
+    state.input(Input::SeeData(true), Instant::now());
+    assert_eq!(state.plan.revision, revision + 1);
+    assert_eq!(
+        state.context.as_ref().unwrap().data_sources,
+        vec![source.clone()]
+    );
+    state.refresh(Instant::now());
+    wait(&mut state, |state| state.gathering.is_none());
+    assert_eq!(
+        state.context.as_ref().unwrap().data_sources,
+        vec![source.clone()]
+    );
+    for prompt in ["Plan a source reading.", "Review the same source again."] {
+        state.prompt = prompt.into();
+        state.input(Input::Send, Instant::now());
+        wait(&mut state, |state| !state.thinking());
+        let seen = services.seen.lock().unwrap();
+        let request = seen.last().unwrap();
+        assert!(request.allow_data);
+        assert_eq!(request.data_sources, vec![source.clone()]);
+        assert!(!format!("{request:?}").contains("private-topic-in-local-binding"));
+    }
+    state.input(Input::SeeData(false), Instant::now());
+    assert!(state.conversation.is_none());
+    assert!(state.context.as_ref().unwrap().data_sources.is_empty());
+    assert_eq!(state.data_sources, vec![source]);
+    state.input(
+        Input::DataSourceDraft("sim-signal://draft".into()),
+        Instant::now(),
+    );
+    state.input(Input::NewConversation, Instant::now());
+    assert!(!state.allow_data);
+    assert!(state.data_sources.is_empty());
+    assert!(state.data_source_draft.is_empty());
+    assert!(!state.data_sources_open);
+    assert!(state.context.as_ref().unwrap().data_sources.is_empty());
+}
+
+#[test]
+fn protected_bindings_need_fresh_context_and_profile_edits_expire_the_review_once() {
+    let services = Arc::new(Stub::new());
+    let source =
+        crate::gui::source_setup::tests::bound_context(&mut services.context.lock().unwrap());
+    let mut state = state(services.clone());
+    state.allow_data = true;
+    state.conversation = Some(conversation());
+    let revision = state.plan.revision;
+    state.source_effects(vec![crate::gui::source_setup::Effect::Bound(
+        source.clone(),
+    )]);
+    assert_eq!(state.plan.revision, revision + 1);
+    assert!(state.conversation.is_none());
+    assert!(
+        state.context.is_none(),
+        "a credential receipt is never treated as a fresh session snapshot"
+    );
+    assert!(!state.ready_to_run());
+    wait(&mut state, |state| state.gathering.is_none());
+    let ctx = state.context.as_ref().unwrap();
+    assert_eq!(ctx.data_sources, vec![source.clone()]);
+    state
+        .plan
+        .propose(
+            ToolCall {
+                tool: "read_data_source".into(),
+                args: json!({"source":source.reference,"timeout":"1s"}),
+            },
+            None,
+        )
+        .unwrap();
+    state.recheck();
+    assert!(state.ready_to_run(), "{:?}", state.plan.steps[0].checked);
+    let revision = state.plan.revision;
+    state.source_effects(vec![crate::gui::source_setup::Effect::Invalidate(
+        source.profile_id().unwrap().into(),
+    )]);
+    assert_eq!(state.plan.revision, revision + 1);
+    assert!(!state.ready_to_run());
+    state.source_effects(vec![crate::gui::source_setup::Effect::Invalidate(
+        source.profile_id().unwrap().into(),
+    )]);
+    assert_eq!(
+        state.plan.revision,
+        revision + 1,
+        "one revoked binding invalidates one review"
+    );
+    state.input(Input::Run(revision), Instant::now());
+    assert_eq!(services.applies.load(Ordering::SeqCst), 0);
+    state.input(Input::NewConversation, Instant::now());
+    assert!(state.data_sources.is_empty());
+}
+
+#[test]
+fn a_filled_profile_draft_blocks_send_and_run_until_the_editor_is_closed() {
+    let services = Arc::new(Stub::new());
+    let mut state = state(services.clone());
+    ready_plan(&mut state, 1);
+    state.source_setup.fixture();
+    state.prompt = "Take one more photo.".into();
+    assert!(!state.ready_to_run());
+    state.input(Input::Send, Instant::now());
+    assert_eq!(services.turns.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        state.error.as_deref(),
+        Some(crate::gui::source_setup::UNCOMMITTED_DRAFT)
+    );
+    assert_eq!(state.prompt, "Take one more photo.");
+    state.input(
+        Input::SourceProfile(crate::gui::source_setup::Input::Open(false)),
+        Instant::now(),
+    );
+    assert!(state.ready_to_run());
+    state.input(Input::Send, Instant::now());
+    wait(&mut state, |state| !state.thinking());
+    assert_eq!(services.turns.load(Ordering::SeqCst), 1);
+    assert!(services.seen.lock().unwrap()[0].data_sources.is_empty());
+}
+
+#[test]
+fn source_binding_removal_invalidates_a_reviewed_fresh_read_once_and_refuses_stale_run() {
+    let services = Arc::new(Stub::new());
+    let mut state = state(services.clone());
+    state.input(
+        Input::DataSourceDraft("mqtt://line1.example/temperature".into()),
+        Instant::now(),
+    );
+    state.input(Input::AddDataSource, Instant::now());
+    state.input(Input::SeeData(true), Instant::now());
+    let source = state.data_sources[0].clone();
+    let id = state
+        .plan
+        .propose(
+            ToolCall {
+                tool: "read_data_source".into(),
+                args: json!({"source":source.reference,"timeout":"1s"}),
+            },
+            None,
+        )
+        .unwrap();
+    state.recheck();
+    assert!(state.ready_to_run(), "{:?}", state.plan.steps[0].checked);
+    let revision = state.plan.revision;
+    state.input(Input::RemoveDataSource(source.reference), Instant::now());
+    assert_eq!(state.plan.revision, revision + 1);
+    assert!(!state.ready_to_run());
+    assert!(
+        state
+            .plan
+            .steps
+            .iter()
+            .find(|step| step.id == id)
+            .unwrap()
+            .checked
+            .as_ref()
+            .unwrap()
+            .ops
+            .is_empty()
+    );
+    state.input(Input::Run(revision), Instant::now());
+    assert_eq!(services.applies.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn credentialed_source_entries_are_refused_and_source_messages_redact_drafts() {
+    let mut state = state(Arc::new(Stub::new()));
+    for uri in [
+        "mqtt://user:private-binding-password@host/topic",
+        "mqtt://host/topic?token=private-binding-token",
+        "mqtt://user@host/topic",
+    ] {
+        let message = Input::DataSourceDraft(uri.into());
+        assert!(!format!("{message:?}").contains(uri));
+        state.input(message, Instant::now());
+        assert!(state.source_draft_error().is_some());
+        state.input(Input::AddDataSource, Instant::now());
+        assert!(state.data_sources.is_empty());
+        assert!(!state.error.as_ref().unwrap().contains("private-binding"));
+    }
+}
+
+#[test]
+fn a_busy_source_turn_cannot_change_bindings_or_data_consent_and_late_replies_stay_stopped() {
+    let gate = Arc::new(Gate::default());
+    let mut stub = Stub::new();
+    stub.gate = Some(gate.clone());
+    let services = Arc::new(stub);
+    let mut state = state(services);
+    state.input(
+        Input::DataSourceDraft("sim-signal://line1".into()),
+        Instant::now(),
+    );
+    state.input(Input::AddDataSource, Instant::now());
+    state.input(Input::SeeData(true), Instant::now());
+    let source = state.data_sources[0].clone();
+    state.prompt = "Review the approved source.".into();
+    state.input(Input::Send, Instant::now());
+    wait(&mut state, |state| state.plan.steps.len() == 1);
+    let revision = state.plan.revision;
+    let generation = state.generation;
+    for input in [
+        Input::DataSourceDraft("sim-signal://line2".into()),
+        Input::AddDataSource,
+        Input::RemoveDataSource(source.reference.clone()),
+        Input::SeeData(false),
+    ] {
+        state.input(input, Instant::now());
+    }
+    assert_eq!(state.plan.revision, revision);
+    assert_eq!(state.generation, generation);
+    assert_eq!(state.data_sources, vec![source.clone()]);
+    assert!(state.allow_data);
+    state.input(Input::Stop, Instant::now());
+    gate.release.store(true, Ordering::SeqCst);
+    wait(&mut state, |state| !state.thinking());
+    assert!(state.plan.steps.is_empty());
+    state.input(Input::RemoveDataSource(source.reference), Instant::now());
+    assert!(state.data_sources.is_empty());
+    assert!(state.generation > generation);
+}
+
+#[test]
+fn string_list_add_edit_remove_preserves_json_and_focus_without_executing() {
+    let services = Arc::new(Stub::new());
+    let mut state = state(services.clone());
+    for (tool, key) in [
+        ("start_signal_capture", "tags"),
+        ("export_dataset", "tables"),
+        ("get_camera_features", "names"),
+    ] {
+        let id = state
+            .plan
+            .propose(
+                ToolCall {
+                    tool: tool.into(),
+                    args: json!({key:null}),
+                },
+                None,
+            )
+            .unwrap();
+        let edit = |remove| Input::StringList {
+            step: id,
+            key: key.into(),
+            remove,
+        };
+        for (index, name) in ["first", "second"].into_iter().enumerate() {
+            let effect = state.input(edit(None), Instant::now());
+            assert!(
+                matches!(effect,Effect::FocusField(ref field) if field == &format!("step-{}-{key}.{index}",id.0))
+            );
+            state.input(
+                Input::Field {
+                    step: id,
+                    key: format!("{key}.{index}"),
+                    value: name.into(),
+                },
+                Instant::now(),
+            );
+        }
+        let effect = state.input(edit(Some(0)), Instant::now());
+        assert!(
+            matches!(effect,Effect::FocusField(ref field) if field == &format!("step-{}-{key}.0",id.0))
+        );
+        let step = state.plan.steps.iter().find(|step| step.id == id).unwrap();
+        assert_eq!(step.call.args[key], json!(["second"]));
+        assert_eq!(
+            state.drafts.text(id, &format!("{key}.0"), &step.call.args),
+            "second"
+        );
+        let effect = state.input(edit(Some(0)), Instant::now());
+        assert!(
+            matches!(effect,Effect::FocusField(ref field) if field == &format!("step-{}-{key}-add",id.0))
+        );
+        assert_eq!(
+            state
+                .plan
+                .steps
+                .iter()
+                .find(|step| step.id == id)
+                .unwrap()
+                .call
+                .args[key],
+            json!([])
+        );
+        assert!(matches!(
+            state.input(edit(Some(0)), Instant::now()),
+            Effect::None
+        ));
+    }
+    assert_eq!(services.applies.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn a_default_model_is_inert_and_scoped_to_an_explicit_send() {
     let initial = State::default();
     assert!(!initial.busy());
@@ -466,6 +776,102 @@ fn exports_use_the_worker_and_keep_secrets_out_of_messages_and_plan_documents() 
     );
     state.input(Input::Open(false), Instant::now());
     assert!(state.drafts.snapshot().secret(id, "password").is_none());
+}
+
+#[test]
+fn exporting_a_fresh_source_plan_is_portable_without_changing_the_model_plan() {
+    let services = Arc::new(Stub::new());
+    let mut state = state(services.clone());
+    let uri = "sim-signal://exported-from-quick";
+    state.input(Input::DataSourceDraft(uri.into()), Instant::now());
+    state.input(Input::AddDataSource, Instant::now());
+    state.input(Input::SeeData(true), Instant::now());
+    let source = state.data_sources[0].clone();
+    state
+        .plan
+        .propose(
+            ToolCall {
+                tool: "read_data_source".into(),
+                args: json!({"source":source.reference,"timeout":"1s"}),
+            },
+            None,
+        )
+        .unwrap();
+    state.recheck();
+    assert!(state.ready_to_run(), "{:?}", state.plan.value());
+    let original = state.plan.value();
+    state.input(Input::ExportPlan, Instant::now());
+    wait(&mut state, |state| state.exporting.is_none());
+    let exported = services.exported.lock().unwrap()[0].clone();
+    assert_eq!(state.plan.value(), original, "export is not a plan edit");
+    assert_eq!(
+        state.plan.document().calls[0].args["source"],
+        source.reference
+    );
+    assert_eq!(exported.calls[0].args["source"], uri);
+    let exported = tools::plan::parse(&tools::plan::to_json(&exported).unwrap()).unwrap();
+    let mut fresh_cli = fixture_context(fixture_snapshot());
+    fresh_cli.data_sources.clear();
+    fresh_cli.snapshot.signals.clear();
+    fresh_cli.snapshot.signal_bindings.clear();
+    let calls = exported
+        .calls
+        .into_iter()
+        .map(|call| (StepId(1), call))
+        .collect::<Vec<_>>();
+    let dry_run = tools::check_plan(&fresh_cli, &calls, &|_, _| false);
+    assert!(dry_run.iter().all(Checked::ready), "{dry_run:?}");
+    assert!(dry_run[0].ops.iter().any(|operation|matches!(operation,tools::Op::Session {command:crate::session::SessionCommand::SignalRead {uri:target,auth:None,..},..} if target==uri)));
+    assert_eq!(services.applies.load(Ordering::SeqCst), 0);
+
+    // A later export click uses the current approved scope, not the source
+    // list from the earlier successful file export.
+    state.input(Input::RemoveDataSource(source.reference), Instant::now());
+    state.input(Input::ExportPlan, Instant::now());
+    assert!(state.exporting.is_none());
+    assert!(
+        state
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Sources"))
+    );
+    assert_eq!(services.exported.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn exporting_a_protected_source_requires_local_rebinding_and_never_exports_its_epoch() {
+    let services = Arc::new(Stub::new());
+    let mut state = state(services.clone());
+    let mut source = DataSourceRef::approved("mqtts://host/private-topic").unwrap();
+    source.auth = Some(crate::signals::auth::AuthBinding {
+        profile: crate::signals::auth::ProfileRef {
+            id: "a".repeat(32),
+            revision: "b".repeat(32),
+        },
+        epoch: "c".repeat(32),
+    });
+    state.data_sources.push(source.clone());
+    state
+        .plan
+        .propose(
+            ToolCall {
+                tool: "read_data_source".into(),
+                args: json!({"source":source.reference,"timeout":"1s"}),
+            },
+            None,
+        )
+        .unwrap();
+    let original = state.plan.document();
+    state.input(Input::ExportPlan, Instant::now());
+    assert!(state.exporting.is_none());
+    assert!(services.exported.lock().unwrap().is_empty());
+    let error = state.error.as_deref().unwrap();
+    assert!(
+        error.contains("Protected") && error.contains("in the app") && error.contains("bind"),
+        "{error}"
+    );
+    assert!(!error.contains(&"c".repeat(32)));
+    assert_eq!(state.plan.document(), original);
 }
 #[test]
 fn no_secret_is_copied_to_the_transcript_when_prompt_validation_refuses_it() {

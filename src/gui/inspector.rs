@@ -1085,6 +1085,11 @@ impl Workbench {
         (rows, more)
     }
 
+    /// Read current UI state even when the hidden panel is no longer rendered.
+    pub(super) fn signals_history_visible(&self) -> bool {
+        self.inspector_shown() && self.tab == Tab::Capture && self.inspect.signals_open
+    }
+
     /// Point the settings panel's motions at what they show; from
     /// `sync_animations`.
     pub(super) fn sync_inspector(&mut self) {

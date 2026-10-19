@@ -286,6 +286,18 @@ h3{letter-spacing:-.03em;font-size:18px}
 .install-hint{font-size:13px;color:var(--muted);line-height:1.6;margin:14px 0 0}
 .download-help{display:flex;gap:8px 20px;flex-wrap:wrap;border-top:1px solid var(--line);padding-top:14px;margin-top:16px;font-size:12px}
 .download-help a{padding:4px 0;text-decoration:underline;text-underline-offset:3px}
+.start-section{padding:16px 0 50px}
+.start-intro{display:grid;grid-template-columns:1fr 1.4fr;gap:50px;align-items:start;margin-bottom:24px}
+.start-intro h2{font-size:32px;margin:0}
+.start-intro p{font-size:15px;color:var(--muted);margin:0;max-width:40em}
+.start-routes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.start-routes article{min-width:0;padding:26px 28px 26px 0}
+.start-routes article+article{border-left:1px solid var(--line);padding-left:28px}
+.start-routes h3{font-size:19px;margin-bottom:12px}
+.start-routes p{font-size:14px;line-height:1.7;color:var(--muted);margin:0 0 14px;max-width:32em}
+.start-routes .route-detail{font-size:12px}
+.start-routes a{display:block;width:fit-content;font-size:13px;font-weight:600;text-decoration:underline;text-underline-offset:3px;padding:5px 0}
+@media(max-width:800px){.start-intro{grid-template-columns:1fr;gap:12px}.start-routes{grid-template-columns:1fr}.start-routes article{padding:22px 0}.start-routes article+article{border-left:0;border-top:1px solid var(--line);padding-left:0}.start-routes p{max-width:46em}.start-section{padding-bottom:36px}}
 .hero-download .verify-box{font-size:12px;margin-top:10px}
 .hero-download .verify-box summary{font-size:13px;padding:8px 0}
 .hero-download .verify-box pre{font-size:11px}

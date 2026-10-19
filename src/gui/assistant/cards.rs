@@ -34,10 +34,12 @@ pub(in crate::gui) fn blocking_focus_id(step: &PlanStep) -> String {
             .iter()
             .find(|issue| issue.is_error())
             .and_then(|issue| issue.field.as_deref())
+            .map(form_key)
     });
     let Some(key) = key else {
         return step_focus_id(step.id);
     };
+    let key = key.as_str();
     let root = key.split('.').next().unwrap_or(key);
     let Some(field) = spec
         .fields
@@ -56,13 +58,14 @@ pub(in crate::gui) fn blocking_focus_id(step: &PlanStep) -> String {
             .to_owned()
     } else if key == root {
         match field.kind {
-            FieldKind::Features | FieldKind::Tags
+            FieldKind::Features | FieldKind::Tags | FieldKind::StringList
                 if step.call.args[root].as_array().is_none_or(Vec::is_empty) =>
             {
                 format!("{root}-add")
             }
             FieldKind::Features => format!("{root}.0.feature"),
             FieldKind::Tags => format!("{root}.0.key"),
+            FieldKind::StringList => format!("{root}.0"),
             FieldKind::Region => format!("{root}.x"),
             _ => key.into(),
         }
@@ -390,15 +393,20 @@ fn card_issue(
     let Some(key) = issue.field.as_deref() else {
         return true;
     };
+    let key = form_key(key);
     let Some(field) = spec.and_then(|spec| {
         spec.fields
             .iter()
-            .find(|field| field.key == key.split('.').next().unwrap_or(key))
+            .find(|field| field.key == key.split('.').next().unwrap_or(&key))
     }) else {
         return true;
     };
     !show_field(step, field)
-        || (!state.drafts.visible(step.id, key, &step.call.args) && field.kind != FieldKind::Bool)
+        || (!state.drafts.visible(step.id, &key, &step.call.args) && field.kind != FieldKind::Bool)
+}
+
+fn form_key(key: &str) -> String {
+    key.replace('[', ".").replace(']', "")
 }
 
 fn field_issue<'a>(state: &'a quick::State, step: &'a PlanStep, key: &str) -> Option<&'a str> {
@@ -407,7 +415,14 @@ fn field_issue<'a>(state: &'a quick::State, step: &'a PlanStep, key: &str) -> Op
             checked
                 .issues
                 .iter()
-                .find(|issue| issue.is_error() && issue.field.as_deref() == Some(key))
+                .find(|issue| {
+                    issue.is_error()
+                        && issue.field.as_deref().is_some_and(|field| {
+                            let field = form_key(field);
+                            field == key
+                                || !key.contains('.') && field.starts_with(&format!("{key}."))
+                        })
+                })
                 .map(|issue| issue.message.as_str())
         })
     })
@@ -422,6 +437,7 @@ fn field_view<'a>(
 ) -> Element<'a, quick::Input> {
     match field.kind {
         FieldKind::Features | FieldKind::Tags => list_field(state, step, field, first, p),
+        FieldKind::StringList => string_list_field(state, step, field, first, p),
         FieldKind::Region => {
             let mut out =
                 column![text(field.label).size(style::SMALL).color(p.secondary)].spacing(6);
@@ -942,6 +958,80 @@ fn list_field<'a>(
     out.into()
 }
 
+pub(in crate::gui) fn string_list_focus_id(
+    step: &PlanStep,
+    key: &str,
+    index: Option<usize>,
+) -> String {
+    let first = tools::spec(&step.call.tool)
+        .and_then(|spec| spec.fields.iter().find(|field| show_field(step, field)))
+        .is_some_and(|field| field.key == key);
+    let first_control = index == Some(0)
+        || index.is_none() && step.call.args[key].as_array().is_none_or(Vec::is_empty);
+    let key = index.map_or_else(|| format!("{key}-add"), |index| format!("{key}.{index}"));
+    widget_id(step.id, &key, first && first_control)
+}
+
+fn string_list_field<'a>(
+    state: &'a quick::State,
+    step: &'a PlanStep,
+    field: &'static FieldSpec,
+    first: bool,
+    p: &'static Palette,
+) -> Element<'a, quick::Input> {
+    let entries = step.call.args[field.key].as_array();
+    let mut out = column![text(field.label).size(style::SMALL).color(p.secondary)].spacing(8);
+    for (index, _) in entries.into_iter().flatten().enumerate() {
+        let entry = column![
+            text_field(
+                state,
+                step,
+                field,
+                (
+                    &format!("{}.{index}", field.key),
+                    &format!("{} {}", field.label, index + 1),
+                    first && index == 0,
+                    false,
+                ),
+                p,
+            ),
+            button(text("Remove name").size(style::SMALL))
+                .name(format!(
+                    "Remove {} row {} from step {}",
+                    field.label,
+                    index + 1,
+                    step.id.0
+                ))
+                .id(field_id(step.id, &format!("{}.{index}-remove", field.key)))
+                .padding([4, 8])
+                .style(style::plain)
+                .on_press_maybe(state.editable().then_some(quick::Input::StringList {
+                    step: step.id,
+                    key: field.key.into(),
+                    remove: Some(index),
+                })),
+        ]
+        .spacing(6);
+        out = out.push(container(entry).padding(10).width(Fill).style(style::code));
+    }
+    out = out.push(
+        button(text("Add name").size(style::SMALL))
+            .name(format!("Add {} row to step {}", field.label, step.id.0))
+            .id(string_list_focus_id(step, field.key, None))
+            .padding([5, 10])
+            .style(style::secondary)
+            .on_press_maybe(state.editable().then_some(quick::Input::StringList {
+                step: step.id,
+                key: field.key.into(),
+                remove: None,
+            })),
+    );
+    if let Some(issue) = field_issue(state, step, field.key) {
+        out = out.push(caption(issue.into(), Level::Error, p));
+    }
+    out.into()
+}
+
 fn friendly_time(value: &str, context: Option<&tools::context::Context>) -> Option<String> {
     let context = context?;
     let time = chrono::DateTime::parse_from_rfc3339(value).ok()?;
@@ -996,6 +1086,32 @@ fn field_style(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn string_list_schema_errors_target_the_name_row_and_open_its_options() {
+        let mut state = super::super::scenes::fixture("quick-command", SessionSnapshot::default());
+        let id = state
+            .plan
+            .propose(
+                tools::ToolCall {
+                    tool: "start_signal_capture".into(),
+                    args: json!({"tags":["temperature",2]}),
+                },
+                None,
+            )
+            .unwrap();
+        state
+            .plan
+            .recheck(state.context.as_ref().unwrap(), None, &tools::EmptySecrets);
+        let step = &mut state.plan.steps[0];
+        step.checked.as_mut().unwrap().issues =
+            vec![tools::Issue::usage(Some("tags[1]"), "Use a tag name.")];
+        assert_eq!(blocking_focus_id(step), field_id(id, "tags.1"));
+        let step = &state.plan.steps[0];
+        assert_eq!(field_issue(&state, step, "tags.1"), Some("Use a tag name."));
+        assert_eq!(field_issue(&state, step, "tags"), Some("Use a tag name."));
+        assert_eq!(field_issue(&state, step, "tags.0"), None);
+    }
 
     #[test]
     fn read_only_fields_keep_the_normal_value_and_outline_paint() {

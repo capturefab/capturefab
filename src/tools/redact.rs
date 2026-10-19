@@ -14,7 +14,14 @@ use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 
 /// Keys `for_model` leaves out wherever they appear: identifiers that tell a
 /// provider about the user's accounts, hardware or network.
-const MODEL_DROPPED: [&str; 4] = ["access_key_id", "profile", "serial", "address"];
+const MODEL_DROPPED: [&str; 6] = [
+    "access_key_id",
+    "profile",
+    "serial",
+    "address",
+    "auth",
+    "signal_bindings",
+];
 /// UI-only Secret fields must never survive serialization, even when a
 /// caller accidentally puts them in a value before redacting it.
 const SECRET_FIELDS: [&str; 2] = ["secret", "password"];
@@ -92,6 +99,25 @@ fn reduce(text: &str, home: Option<&Path>) -> String {
     let reduced = words(text, &|word| {
         let word = map_urls(word, &|url| {
             if scheme_of(url).eq_ignore_ascii_case("file") {
+                // File URLs can put both authority slashes and percent
+                // escaping before the home prefix. Normalize that local
+                // path before projection, so later SQL cannot decode it.
+                if let Ok(path) = crate::media::local_file_path(url) {
+                    let path = path.to_string_lossy();
+                    // Windows file URLs use slashes, while USERPROFILE
+                    // commonly uses backslashes. Match the same prefix.
+                    #[cfg(windows)]
+                    let path = path.replace('\\', "/");
+                    #[cfg(windows)]
+                    let normalized_home =
+                        home.map(|home| PathBuf::from(home.to_string_lossy().replace('\\', "/")));
+                    #[cfg(windows)]
+                    let home = normalized_home.as_deref();
+                    let shortened = shorten_home(&path, home);
+                    if shortened != path {
+                        return format!("file:{shortened}");
+                    }
+                }
                 url.to_owned()
             } else {
                 host_only(url)
@@ -460,6 +486,35 @@ mod tests {
     }
 
     #[test]
+    fn file_url_home_prefix_is_projected_before_it_can_be_decoded() {
+        let home = Some(Path::new("/Users/ann"));
+        for url in [
+            "file:///Users/ann/a.mp4",
+            "file://localhost/Users/ann/a.mp4",
+            "file:///Users/%61nn/a.mp4",
+            "FILE:///Users/ann/a.mp4",
+        ] {
+            assert_eq!(reduce(url, home), "file:~/a.mp4", "{url}");
+        }
+        assert_eq!(
+            reduce("file:///Users/anna/a.mp4", home),
+            "file:///Users/anna/a.mp4"
+        );
+        assert_eq!(
+            reduce("saved file:///Users/ann/a.mp4", home),
+            "saved file:~/a.mp4"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            reduce(
+                "file:///C:/Users/ann/a.mp4",
+                Some(Path::new(r"C:\Users\ann"))
+            ),
+            "file:~/a.mp4"
+        );
+    }
+
+    #[test]
     fn ui_only_secret_fields_never_reach_output_or_models() {
         let value = json!({
             "password": "stream-password",
@@ -475,6 +530,17 @@ mod tests {
         for text in [output.to_string(), model.to_string()] {
             assert!(!text.contains("stream-password") && !text.contains("aws-secret"));
         }
+    }
+
+    #[test]
+    fn signal_profile_epochs_are_local_only() {
+        let model = for_model(
+            json!({"source":{"id":"signal:0123456789abcdef","auth":{"profile":{"id":"private-profile","revision":"private-revision"},"epoch":"private-epoch"}},"signal_bindings":[{"endpoint":"mqtts://host/private-topic"}]}),
+        );
+        assert_eq!(model["source"]["id"], "signal:0123456789abcdef");
+        assert!(model["source"].get("auth").is_none());
+        assert!(model.get("signal_bindings").is_none());
+        assert!(!model.to_string().contains("private-"));
     }
 
     #[test]

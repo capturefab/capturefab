@@ -293,6 +293,7 @@ fn fields_for(kind: &str) -> Option<&'static [&'static str]> {
             "activity_id",
             "actor",
             "camera",
+            "resource",
             "operation",
             "feature",
             "label",
@@ -300,7 +301,15 @@ fn fields_for(kind: &str) -> Option<&'static [&'static str]> {
         "rollover" => &["from", "to", "reason", "checkpoint_sha256"],
         "limit" => &["name", "used", "max"],
         "stop" => &["by", "reason"],
-        "end" => &["outcome", "summary", "totals", "leftovers"],
+        "task_data" => &["id", "phase", "catalog", "sink", "captures", "error"],
+        "end" => &[
+            "outcome",
+            "summary",
+            "totals",
+            "leftovers",
+            "signal_reports",
+            "task_data",
+        ],
         _ => return None,
     })
 }
@@ -757,6 +766,33 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn task_data_receipts_survive_local_journaling_with_secrets_removed() {
+        let root = Directory::new();
+        let mut log = ActionLog::create(&root.0, 1792324800000).unwrap();
+        let receipt = json!({
+            "id": "task-receipt",
+            "phase": "retained",
+            "catalog": {"closed": true, "extents": {"limit": 4096}},
+            "sink": {"written_total": 3},
+            "captures": {},
+            "error": null,
+            "credentials": {"password": "must-not-be-recorded"},
+        });
+        let recorded = log.record("task_data", receipt.clone(), 1000).unwrap();
+        assert_eq!(recorded["catalog"]["extents"]["limit"], 4096);
+        assert!(recorded.get("credentials").is_none());
+        let end = log
+            .finish(json!({"outcome":"failed", "task_data": receipt}), 1001)
+            .unwrap();
+        assert_eq!(end["task_data"]["catalog"]["closed"], true);
+        assert!(
+            !serde_json::to_string(&end)
+                .unwrap()
+                .contains("must-not-be-recorded")
+        );
     }
 
     #[test]

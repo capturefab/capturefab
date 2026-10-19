@@ -12,6 +12,7 @@ pub mod capture;
 pub mod check;
 pub mod context;
 pub mod control;
+pub mod data;
 pub mod destinations;
 pub mod exec;
 pub mod fields;
@@ -126,6 +127,8 @@ pub enum FieldKind {
     Url,
     Path,
     Tags,
+    /// A JSON array of strings, edited as one name per row.
+    StringList,
     Secret,
     Features,
     Region,
@@ -142,6 +145,18 @@ static CATALOG: &[ToolSpec] = &[
     read::GET_CAMERA_FEATURES,
     read::INSPECT_FRAME,
     read::WAIT_FOR,
+    data::LIST_DATA_SOURCES,
+    data::GET_DATASET,
+    data::QUERY_DATASET,
+    data::BROWSE_DATA_SOURCE,
+    data::READ_DATA_SOURCE,
+    data::OPEN_DATASET,
+    data::CLOSE_DATASET,
+    data::START_SIGNAL_CAPTURE,
+    data::STOP_SIGNAL_CAPTURE,
+    data::WAIT_FOR_DATA,
+    data::ANNOTATE_DATASET,
+    data::EXPORT_DATASET,
     control::CONNECT_CAMERA,
     control::START_LIVE_VIEW,
     control::STOP_LIVE_VIEW,
@@ -171,23 +186,29 @@ pub fn spec(name: &str) -> Option<&'static ToolSpec> {
 /// The catalog as JSON: `[{name, title, kind, risk, needs_session,
 /// needs_vision, description, input_schema}]`.
 pub fn catalog_json() -> Value {
-    Value::Array(
-        CATALOG
-            .iter()
-            .map(|spec| {
-                json!({
-                    "name": spec.name,
-                    "title": spec.title,
-                    "kind": spec.kind,
-                    "risk": spec.risk,
-                    "needs_session": spec.needs_session,
-                    "needs_vision": spec.needs_vision,
-                    "description": spec.description,
-                    "input_schema": (spec.schema)(),
-                })
-            })
-            .collect(),
-    )
+    Value::Array(CATALOG.iter().map(ToolSpec::description_json).collect())
+}
+
+impl ToolSpec {
+    /// A small discovery entry for agents which request schemas only as needed.
+    pub fn index_json(&self) -> Value {
+        json!({
+            "name": self.name,
+            "title": self.title,
+            "kind": self.kind,
+            "risk": self.risk,
+            "needs_session": self.needs_session,
+            "needs_vision": self.needs_vision,
+        })
+    }
+
+    /// The same complete entry used by the shared catalog and targeted discovery.
+    pub fn description_json(&self) -> Value {
+        let mut entry = self.index_json();
+        entry["description"] = json!(self.description);
+        entry["input_schema"] = (self.schema)();
+        entry
+    }
 }
 
 /// One tool call, as agents send it and plan documents store it.

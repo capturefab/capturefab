@@ -4,9 +4,13 @@
 pub mod coordinator;
 mod db;
 pub mod export;
+mod model_snapshot;
 mod query;
+mod snapshot;
+pub mod task;
 #[cfg(test)]
 mod tests;
+mod write;
 
 pub use db::Dataset;
 pub use query::Reader;
@@ -177,6 +181,10 @@ pub struct RecordedFile {
 pub struct DatasetStatus {
     pub path: String,
     pub dataset_id: String,
+    /// Coordinator-issued identity for this open instance, independent of the
+    /// persistent file identity. Closing and reopening always changes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<String>,
     pub name: String,
     pub created_ms: u64,
     pub captures: u64,
@@ -263,6 +271,30 @@ impl Slot {
         max_bytes: Option<u64>,
     ) -> Result<DatasetStatus> {
         let mut writer = lock(&self.writer);
+        self.open_locked(&mut writer, path, mode, max_bytes)
+    }
+    /// Open only if the approved instance is still current. `None` means
+    /// the caller approved an empty slot, including no automatic dataset.
+    pub fn open_if(
+        &self,
+        expected_slot_id: Option<&str>,
+        path: &Path,
+        mode: OpenMode,
+        max_bytes: Option<u64>,
+    ) -> Result<DatasetStatus> {
+        let mut writer = lock(&self.writer);
+        Self::check_slot(&writer, expected_slot_id)?;
+        // Do not disarm the GUI's automatic dataset on a stale request.
+        self.set_auto_path(None);
+        self.open_locked(&mut writer, path, mode, max_bytes)
+    }
+    fn open_locked(
+        &self,
+        writer: &mut Option<Dataset>,
+        path: &Path,
+        mode: OpenMode,
+        max_bytes: Option<u64>,
+    ) -> Result<DatasetStatus> {
         if let Some(open) = writer.as_ref() {
             let target = db::canonical_target(path, false).ok();
             if target.as_deref() == Some(open.path.as_path()) {
@@ -278,18 +310,36 @@ impl Slot {
                 db::file_label(&open.path)
             );
         }
-        let dataset = Dataset::open(path, mode, max_bytes)?;
+        let slot_id = new_slot_id()?;
+        let mut dataset = Dataset::open(path, mode, max_bytes)?;
+        dataset.status.slot_id = Some(slot_id);
         let status = dataset.status.clone();
         *writer = Some(dataset);
         self.publish(Some(status.clone()));
         Ok(status)
     }
+    fn check_slot(writer: &Option<Dataset>, expected_slot_id: Option<&str>) -> Result<()> {
+        let current = writer.as_ref().and_then(|d| d.status.slot_id.as_deref());
+        ensure!(
+            current == expected_slot_id,
+            "dataset slot changed; refresh session status and approve the current dataset"
+        );
+        Ok(())
+    }
+    /// Check while holding `lifecycle()` when a caller must also change the
+    /// signal sink. Readers and notes instead check under the writer lock.
+    pub fn ensure_slot(&self, expected_slot_id: Option<&str>) -> Result<()> {
+        Self::check_slot(&lock(&self.writer), expected_slot_id)
+    }
     /// Interrupt queries and exports, checkpoint and close.
     pub fn close(&self) -> Result<Option<DatasetStatus>> {
+        // Prevent a checked reader being cloned after the registry becomes
+        // idle but before the writer closes. Reader work never takes this
+        // lock, so outstanding readers can still observe cancellation/finish.
+        let mut writer = lock(&self.writer);
         if !self.readers.interrupt_and_wait(Duration::from_secs(5)) {
             eprintln!("capturefab: dataset readers still running after 5 s; closing anyway");
         }
-        let mut writer = lock(&self.writer);
         let Some(mut dataset) = writer.take() else {
             return Ok(None);
         };
@@ -299,7 +349,6 @@ impl Slot {
         dataset.status.bytes = dataset.size();
         let status = dataset.status.clone();
         drop(dataset);
-        drop(writer);
         self.publish(None);
         event.and(checkpoint).map(|()| Some(status))
     }
@@ -323,7 +372,16 @@ impl Slot {
         if writer.is_none() && auto {
             let path = lock(&self.auto_path).clone()?;
             match Dataset::open(&path, OpenMode::Auto, None) {
-                Ok(dataset) => *writer = Some(dataset),
+                Ok(mut dataset) => {
+                    match new_slot_id() {
+                        Ok(id) => dataset.status.slot_id = Some(id),
+                        Err(e) => {
+                            *lock(&self.auto_error) = Some(format!("{e:#}"));
+                            return None;
+                        }
+                    }
+                    *writer = Some(dataset);
+                }
                 Err(e) => {
                     // Stop retrying on every poll; the GUI shows the reason.
                     eprintln!("capturefab: automatic dataset {}: {e:#}", path.display());
@@ -339,7 +397,6 @@ impl Slot {
             dataset.status.last_error = Some(format!("{e:#}"));
         }
         let status = dataset.status.clone();
-        drop(writer);
         self.publish(Some(status));
         Some(result)
     }
@@ -433,10 +490,49 @@ impl Slot {
         })?;
         dataset.reader_with(Some(&self.readers))
     }
+    /// Clone a reader only for the exact approved open instance.
+    pub fn reader_if(&self, slot_id: &str) -> Result<Reader> {
+        let writer = lock(&self.writer);
+        Self::check_slot(&writer, Some(slot_id))?;
+        writer
+            .as_ref()
+            .expect("checked open dataset")
+            .reader_with(Some(&self.readers))
+    }
+    pub fn note_if(
+        &self,
+        slot_id: &str,
+        camera: Option<&str>,
+        text: &str,
+        context: &Context,
+    ) -> Result<u64> {
+        self.with_expected(slot_id, |dataset| {
+            dataset.record_event("note", camera, None, text, context)
+        })
+    }
+    fn with_expected<T>(
+        &self,
+        slot_id: &str,
+        f: impl FnOnce(&mut Dataset) -> Result<T>,
+    ) -> Result<T> {
+        let mut writer = lock(&self.writer);
+        Self::check_slot(&writer, Some(slot_id))?;
+        let dataset = writer.as_mut().expect("checked open dataset");
+        let result = f(dataset);
+        if let Err(error) = &result {
+            dataset.status.last_error = Some(format!("{error:#}"));
+        }
+        self.publish(Some(dataset.status.clone()));
+        result
+    }
     /// Checkpoint the open dataset, if any.
     pub fn checkpoint(&self) -> Result<()> {
         self.with_open(false, |d| d.checkpoint()).unwrap_or(Ok(()))
     }
+}
+
+fn new_slot_id() -> Result<String> {
+    Ok(format!("{}{}", db::random_name()?, db::random_name()?))
 }
 
 impl crate::signals::SampleSink for Slot {
@@ -478,6 +574,33 @@ impl crate::signals::SampleSink for Slot {
             .map(|s| format!("dataset {}", db::file_label(Path::new(&s.path))))
             .unwrap_or_else(|| "dataset".into())
     }
+    fn dataset_slot_id(&self) -> Option<String> {
+        lock(&self.writer)
+            .as_ref()
+            .and_then(|d| d.status.slot_id.clone())
+    }
+    fn register_for_dataset_slot(
+        &self,
+        expected_slot_id: &str,
+        source: &crate::signals::SignalInfo,
+        tags: &[crate::signals::TagInfo],
+    ) -> Result<()> {
+        self.with_expected(expected_slot_id, |dataset| dataset.register(source, tags))
+    }
+    fn write_for_dataset_slot(
+        &self,
+        expected_slot_id: &str,
+        source_id: &str,
+        batch: &[crate::signals::Sample],
+    ) -> Result<()> {
+        self.with_expected(expected_slot_id, |dataset| {
+            let result = dataset.append_samples(source_id, batch);
+            if result.is_err() {
+                dataset.status.dropped_samples += batch.len() as u64;
+            }
+            result.map(drop)
+        })
+    }
 }
 
 /// Tables an export can write, in order.
@@ -514,8 +637,64 @@ fn check_path(path: &str, what: &str) -> Result<()> {
 /// Check the shape of a dataset command's fields.
 pub fn validate_command(command: &crate::session::SessionCommand) -> Result<()> {
     use crate::session::SessionCommand as C;
+    let slot_id = match command {
+        C::DatasetOpenIf {
+            expected_slot_id, ..
+        } => expected_slot_id.as_deref(),
+        C::DatasetCloseIf { slot_id, .. }
+        | C::DatasetNoteIf { slot_id, .. }
+        | C::DatasetQueryIf { slot_id, .. }
+        | C::DatasetModelQueryIf { slot_id, .. }
+        | C::DatasetExportIf { slot_id, .. } => Some(slot_id.as_str()),
+        _ => None,
+    };
+    if let Some(id) = slot_id {
+        ensure!(
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "dataset slot identity must be the opaque 32-character token from dataset status"
+        );
+    }
+    if let C::DatasetQueryIf {
+        max_result_bytes, ..
+    }
+    | C::DatasetModelQueryIf {
+        max_result_bytes, ..
+    } = command
+    {
+        ensure!(
+            (query::MIN_RESULT_BYTES..=query::MAX_RESULT_BYTES)
+                .contains(&(*max_result_bytes as usize)),
+            "dataset query result limit must be 256..8388608 bytes"
+        );
+    }
+    if let C::DatasetExportIf {
+        max_bytes,
+        timeout_ms,
+        approved_root,
+        ..
+    } = command
+    {
+        if let Some(root) = approved_root {
+            check_path(root, "approved export root")?;
+            ensure!(
+                Path::new(root).is_absolute(),
+                "approved export root must be absolute"
+            );
+        }
+        ensure!(*max_bytes > 0, "dataset export byte limit must be positive");
+        ensure!(
+            (1..=export::MAX_TIMEOUT_MS).contains(timeout_ms),
+            "dataset export timeout must be 1..600000 milliseconds"
+        );
+    }
     match command {
         C::DatasetOpen {
+            path, max_bytes, ..
+        }
+        | C::DatasetOpenIf {
             path, max_bytes, ..
         } => {
             check_path(path, "dataset path")?;
@@ -535,6 +714,12 @@ pub fn validate_command(command: &crate::session::SessionCommand) -> Result<()> 
             text,
             context,
             camera,
+        }
+        | C::DatasetNoteIf {
+            text,
+            context,
+            camera,
+            ..
         } => {
             ensure!(
                 !text.is_empty()
@@ -553,6 +738,18 @@ pub fn validate_command(command: &crate::session::SessionCommand) -> Result<()> 
             sql,
             limit,
             timeout_ms,
+        }
+        | C::DatasetQueryIf {
+            sql,
+            limit,
+            timeout_ms,
+            ..
+        }
+        | C::DatasetModelQueryIf {
+            sql,
+            limit,
+            timeout_ms,
+            ..
         } => {
             ensure!(
                 !sql.trim().is_empty() && sql.len() <= query::MAX_SQL_BYTES,
@@ -574,6 +771,15 @@ pub fn validate_command(command: &crate::session::SessionCommand) -> Result<()> 
             since_ms,
             until_ms,
             storage,
+        }
+        | C::DatasetExportIf {
+            output,
+            formats,
+            tables,
+            since_ms,
+            until_ms,
+            storage,
+            ..
         } => {
             check_path(output, "export folder")?;
             ensure!(formats.len() <= 4, "export accepts at most 4 formats");
@@ -601,6 +807,8 @@ pub fn schema_contract() -> Value {
     json!({
         "schema_version": SCHEMA_VERSION,
         "file": "one .duckdb file per dataset, owned by one session; existing files are never overwritten",
+        "identity": "dataset_id identifies the persistent file; slot_id is an opaque coordinator token for one open instance and changes after close/reopen, including the same file",
+        "checked_commands": "dataset_open_if binds expected_slot_id (null means empty); dataset_close_if, dataset_note_if, dataset_query_if, dataset_model_query_if and dataset_export_if require the exact current slot_id; dataset_close_if can also bind sink_generation, refusing to detach a replacement sink; open and close receipts include the acknowledged sink_generation; stale requests have no effects on a replacement",
         "time_base": "UTC Unix milliseconds, host clock",
         "tables": {
             "captures": "one row per saved image: wall_ms, camera, frame, format, bytes, path, sha256, destination, object_key, context (JSON text)",
@@ -615,10 +823,16 @@ pub fn schema_contract() -> Value {
         "default_formats": if cfg!(feature = "parquet") { json!(["parquet", "csv"]) } else { json!(["csv"]) },
         "export": "a new folder with data files, manifest.json (schema, units, sha256) and README.md (loading snippets and a summary for AI tools); an existing folder is refused",
         "query": "one SELECT/WITH statement; read-only; external files blocked; rolled back",
+        "model_query": "dataset_model_query_if copies all six standard base tables into a bounded private in-memory engine, validates their exact schema before scanning, removes camera serials and normalizes private locator metadata before arbitrary SQL, and blocks external access, extensions, persistent secrets and target spill; transfer limits and engine memory settings are not a process-memory or shared-source disk quota; unsupported builds and exceeded limits fail without a raw-query fallback",
         "limits": {
             "query_limit": "1..10000 rows (default 1000)",
             "query_timeout_ms": "0..300000 (0 means 30000)",
             "query_result_bytes": query::MAX_RESULT_BYTES,
+            "checked_query_result_bytes": {"min": query::MIN_RESULT_BYTES, "max": query::MAX_RESULT_BYTES, "includes": "complete JSON response; truncated and truncation_reason mark omitted rows"},
+            "model_snapshot": {"max_rows": 100000, "max_arrow_bytes": 16777216, "max_batch_bytes": 8388608, "timeout": "one query_timeout_ms budget for engine setup, complete snapshot transfer and SQL"},
+            "checked_export_bytes": "positive finite max_bytes bounds generated data files, manifest and README together, including staging; DuckDB query scratch spill retains the separate session limit",
+            "checked_export_timeout_ms": format!("1..{}", export::MAX_TIMEOUT_MS),
+            "checked_export_default_formats": ["csv"],
             "sql_bytes": query::MAX_SQL_BYTES,
             "note_bytes": MAX_NOTE_BYTES,
             "max_bytes_default": db::DEFAULT_MAX_BYTES,
@@ -644,6 +858,12 @@ pub fn rpc_examples() -> Vec<Value> {
         json!({"op":"dataset_note","text":"shift B start","context":{"line":"L1"}}),
         json!({"op":"dataset_query","sql":"SELECT count(*) FROM captures"}),
         json!({"op":"dataset_export","output":"/data/export-1","formats":["csv"]}),
+        json!({"op":"dataset_open_if","expected_slot_id":null,"path":"/data/plant.duckdb"}),
+        json!({"op":"dataset_close_if","slot_id":"0123456789abcdef0123456789abcdef","sink_generation":1}),
+        json!({"op":"dataset_note_if","slot_id":"0123456789abcdef0123456789abcdef","text":"shift B start"}),
+        json!({"op":"dataset_query_if","slot_id":"0123456789abcdef0123456789abcdef","sql":"SELECT count(*) FROM captures","max_result_bytes":16384}),
+        json!({"op":"dataset_model_query_if","slot_id":"0123456789abcdef0123456789abcdef","sql":"SELECT count(*) FROM captures","max_result_bytes":16384}),
+        json!({"op":"dataset_export_if","slot_id":"0123456789abcdef0123456789abcdef","output":"/data/export-2","formats":["csv"],"max_bytes":1048576,"timeout_ms":30000}),
     ]
 }
 

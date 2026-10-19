@@ -21,6 +21,191 @@ fn view<'a>(state: &'a quick::State, p: &'static Palette, height: f32) -> Elemen
     })
 }
 
+#[test]
+fn exported_plan_copy_uses_this_workbench_and_exact_path_with_a_dry_run() {
+    use iced::futures::StreamExt;
+    let renderer = renderer();
+    for windows in [false, true] {
+        for custom_directory in [false, true] {
+            for physical in [Size::new(1100.0, 700.0), Size::new(480.0, 620.0)] {
+                let session = "bench's $(name);";
+                let mut app = Workbench::new(SessionHandle::new(), session.into(), true, None);
+                app.assistant.quick = scenes::fixture("quick-command", SessionSnapshot::default());
+                let (binary, directory, path, root) = if windows {
+                    (
+                        "C:\\Program Files\\Capturefab's\\capturefab.exe",
+                        "C:\\Session's $files;",
+                        "C:\\plan's $(file);.json",
+                        "D:\\Run's $root;",
+                    )
+                } else {
+                    (
+                        "/Applications/Capturefab's App/capturefab",
+                        "/tmp/session's $(directory);",
+                        "/tmp/plan's $(file);.json",
+                        "/Volumes/Run's $(root);",
+                    )
+                };
+                app.assistant.commands = agents::CommandContext::fixture(
+                    Some(binary),
+                    custom_directory.then_some(directory),
+                    windows,
+                );
+                app.assistant.quick.exported_plan = Some(PathBuf::from(path));
+                app.assistant.quick.context.as_mut().unwrap().capture_root = PathBuf::from(root);
+                let expected = app
+                    .assistant
+                    .commands
+                    .plan_preview(
+                        session,
+                        std::path::Path::new(path),
+                        std::path::Path::new(root),
+                    )
+                    .unwrap()
+                    .command;
+                let copied = {
+                    let mut view = app.assistant_sheet(Palette::of(false), physical.height);
+                    let mut tree = Tree::new(view.as_widget());
+                    let node = view.as_widget_mut().layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(Size::ZERO, physical),
+                    );
+                    apply(
+                        &mut view,
+                        &mut tree,
+                        &node,
+                        &renderer,
+                        iced::advanced::widget::operation::focusable::focus::<Message>(Id::new(
+                            "quick-command-export-preview",
+                        )),
+                    );
+                    apply(
+                        &mut view,
+                        &mut tree,
+                        &node,
+                        &renderer,
+                        accessibility::focus_reveal_operation(app.main_window),
+                    );
+                    let (snapshot, bridge, window) = accessibility::snapshot_widget(
+                        view.as_widget_mut(),
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                    );
+                    let (id, copy) = snapshot
+                        .nodes
+                        .iter()
+                        .find(|(_, node)| {
+                            node.label() == Some("Copy exported plan preview command")
+                        })
+                        .unwrap();
+                    let bounds = copy.bounds().unwrap();
+                    assert!(
+                        bounds.width() > 0.0
+                            && bounds.height() > 0.0
+                            && bounds.y0 >= 0.0
+                            && bounds.y1 <= f64::from(physical.height) + 0.5
+                    );
+                    assert!(
+                        snapshot
+                            .nodes
+                            .iter()
+                            .any(|(_, node)| node.label() == Some(expected.as_str()))
+                    );
+                    assert!(
+                        snapshot.nodes.iter().any(|(_, node)| node.label()
+                            == Some(format!("Output folder: {root}").as_str()))
+                    );
+                    assert!(
+                        snapshot.nodes.iter().any(|(_, node)| node
+                            .label()
+                            .is_some_and(|text| text
+                                .contains("checks the plan without changing the session")
+                                && text.contains("before removing --dry-run")))
+                    );
+                    let mut stream =
+                        iced_runtime::task::into_stream(bridge.dispatch(accessibility::Request {
+                            window,
+                            replay: None,
+                            action: accesskit::ActionRequest {
+                                action: accesskit::Action::Click,
+                                target: *id,
+                                data: None,
+                            },
+                        }))
+                        .unwrap();
+                    let iced_runtime::Action::Output(Message::Assistant(Input::Quick(
+                        quick::Input::Copy(command),
+                    ))) = iced::futures::executor::block_on(stream.next()).unwrap()
+                    else {
+                        panic!("actual copy control emits the preview command")
+                    };
+                    command
+                };
+                assert_eq!(copied, expected);
+                let task = app.update_assistant(Input::Quick(quick::Input::Copy(copied)));
+                let mut stream = iced_runtime::task::into_stream(task).unwrap();
+                let iced_runtime::Action::Clipboard(iced_runtime::clipboard::Action::Write {
+                    contents,
+                    ..
+                }) = iced::futures::executor::block_on(stream.next()).unwrap()
+                else {
+                    panic!("copy writes to the clipboard")
+                };
+                assert_eq!(
+                    contents, expected,
+                    "clipboard preserves quoted locators exactly"
+                );
+                assert!(app.pending.is_empty());
+                assert!(app.handle.snapshot().signals.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn exported_plan_does_not_offer_a_path_dependent_command_without_executable_or_reviewed_root() {
+    let renderer = renderer();
+    for missing_context in [false, true] {
+        let mut app = Workbench::new(SessionHandle::new(), "bench".into(), true, None);
+        app.assistant.commands = agents::CommandContext::fixture(
+            missing_context.then_some("/opt/capturefab"),
+            None,
+            false,
+        );
+        app.assistant.quick = scenes::fixture("quick-command", SessionSnapshot::default());
+        if missing_context {
+            app.assistant.quick.context = None;
+        }
+        app.assistant.quick.exported_plan = Some(PathBuf::from("/tmp/plan.json"));
+        let mut view = app.assistant_sheet(Palette::of(false), 700.0);
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(700.0, 700.0)),
+        );
+        let (snapshot, _, _) = accessibility::snapshot_widget(
+            view.as_widget_mut(),
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+        );
+        assert!(
+            !snapshot
+                .nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Copy exported plan preview command"))
+        );
+        assert!(snapshot.nodes.iter().any(|(_, node)| {
+            node.label().is_some_and(|text| {
+                text.contains("preview command is unavailable") && text.contains("/tmp/plan.json")
+            })
+        }));
+    }
+}
+
 fn artifact(
     name: &str,
     view: &mut Element<'_, Message>,
@@ -95,6 +280,7 @@ fn quick_command_scenes_keep_prompt_close_and_approval_controls_inside_the_sheet
                         "Quick command request",
                         "Assistant provider and model",
                         "See camera images",
+                        "Read sensor values and dataset rows",
                     ] {
                         let control = snapshot
                             .nodes
@@ -313,6 +499,7 @@ fn press_key(
 struct BodyPosition {
     offset: f32,
     maximum: f32,
+    bounds: Option<Rectangle>,
 }
 impl Operation for BodyPosition {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
@@ -329,6 +516,290 @@ impl Operation for BodyPosition {
         if id == Some(&Id::new(crate::gui::widgets::SHEET_BODY)) {
             self.offset = translation.y;
             self.maximum = (content.height - bounds.height).max(0.0).round();
+            self.bounds = Some(bounds);
+        }
+    }
+}
+
+#[test]
+fn empty_quick_command_starts_with_its_heading_and_suggestions_above_consent() {
+    let mut renderer = renderer();
+    for scene in ["quick-command", "quick-command-data-consent"] {
+        for dark in [false, true] {
+            for scale in UiScale::ALL {
+                let size = Size::new(480.0, 620.0) / scale.factor();
+                let state = scenes::fixture(scene, SessionSnapshot::default());
+                let mut view = view(&state, Palette::of(dark), size.height);
+                let mut tree = Tree::new(view.as_widget());
+                let node = view.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, size),
+                );
+                let mut position = BodyPosition::default();
+                view.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut position,
+                );
+                assert!(
+                    position.offset.abs() <= 1.0,
+                    "{scene} {scale} starts at the top"
+                );
+                let body = position.bounds.unwrap();
+                let (snapshot, _, _) = accessibility::snapshot_widget(
+                    view.as_widget_mut(),
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                );
+                for label in [
+                    "What would you like to capture?",
+                    "Suggested request: Take a photo",
+                ] {
+                    let control = &snapshot
+                        .nodes
+                        .iter()
+                        .find(|(_, node)| node.label() == Some(label))
+                        .unwrap()
+                        .1;
+                    let bounds = control.bounds().unwrap();
+                    assert!(
+                        bounds.width() > 0.0
+                            && bounds.height() > 0.0
+                            && bounds.y0 >= f64::from(body.y) - 0.5
+                            && bounds.y1 <= f64::from(body.y + body.height) + 0.5,
+                        "{scene} {scale}: {label} at {bounds:?} must be visible in {body:?}"
+                    );
+                }
+                if scale == UiScale::Standard {
+                    artifact(
+                        &format!(
+                            "{scene}-initial-{}-480x620",
+                            if dark { "dark" } else { "light" }
+                        ),
+                        &mut view,
+                        &mut tree,
+                        &node,
+                        &mut renderer,
+                        size,
+                        (dark, scale.factor()),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn quick_source_binding_controls_are_local_and_reachable_at_compact_scales() {
+    let mut renderer = renderer();
+    for dark in [false, true] {
+        for scale in UiScale::ALL {
+            let size = Size::new(480.0, 620.0) / scale.factor();
+            let state = scenes::fixture("quick-command-data-sources", SessionSnapshot::default());
+            let mut view = view(&state, Palette::of(dark), size.height);
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, size),
+            );
+            let (snapshot, _, _) = accessibility::snapshot_widget(
+                view.as_widget_mut(),
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+            );
+            for label in [
+                "Quick command data source endpoint",
+                "Add data source to Quick Command",
+            ] {
+                let input = &snapshot
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| node.label() == Some(label))
+                    .unwrap()
+                    .1;
+                assert!(
+                    !input.is_disabled(),
+                    "{label} supports deliberate local editing"
+                );
+            }
+            let source = &state.data_sources[0];
+            assert!(snapshot.nodes.iter().any(|(_, node)| node.label()
+                == Some(format!("Remove approved source {}", source.reference).as_str())));
+            assert!(
+                snapshot
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.role() == accessibility::Role::CheckBox
+                        && node.label() == Some("Read sensor values and dataset rows")
+                        && node.toggled() == Some(accesskit::Toggled::True))
+            );
+            assert_focus_traversal_reveals(&mut view, &mut tree, &node, &renderer);
+            if scale == UiScale::Standard {
+                apply(
+                    &mut view,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    iced::advanced::widget::operation::focusable::focus::<Message>(Id::new(
+                        "quick-command-data-source",
+                    )),
+                );
+                apply(
+                    &mut view,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    accessibility::focus_reveal_operation(iced::window::Id::unique()),
+                );
+                artifact(
+                    &format!(
+                        "quick-command-data-sources-{}-480x620",
+                        if dark { "dark" } else { "light" }
+                    ),
+                    &mut view,
+                    &mut tree,
+                    &node,
+                    &mut renderer,
+                    size,
+                    (dark, scale.factor()),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_quick_source_editor_masks_password_and_reveals_every_local_control() {
+    let mut renderer = renderer();
+    for dark in [false, true] {
+        for scale in UiScale::ALL {
+            for physical in [Size::new(480.0, 620.0), Size::new(1100.0, 700.0)] {
+                let size = physical / scale.factor();
+                let state = scenes::fixture("quick-command-data-auth", SessionSnapshot::default());
+                let mut view = view(&state, Palette::of(dark), size.height);
+                let mut tree = Tree::new(view.as_widget());
+                let node = view.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, size),
+                );
+                let (snapshot, _, _) = accessibility::snapshot_widget(
+                    view.as_widget_mut(),
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                );
+                for label in [
+                    "Source profile name",
+                    "Source endpoint",
+                    "Source user name",
+                    "Source authentication",
+                    "Source password",
+                    "Save protected source profile",
+                ] {
+                    let role = match label {
+                        "Source authentication" => accessibility::Role::ComboBox,
+                        "Source password" => accessibility::Role::PasswordInput,
+                        "Save protected source profile" => accessibility::Role::Button,
+                        _ => accessibility::Role::TextInput,
+                    };
+                    let control = &snapshot
+                        .nodes
+                        .iter()
+                        .find(|(_, node)| node.label() == Some(label) && node.role() == role)
+                        .unwrap_or_else(|| panic!("protected source editor exposes {label}"))
+                        .1;
+                    assert!(
+                        !control.is_disabled(),
+                        "{label} is editable before an assistant request"
+                    );
+                    if label == "Source password" {
+                        assert_eq!(control.role(), accessibility::Role::PasswordInput);
+                        assert!(
+                            control
+                                .value()
+                                .is_none_or(|value| !value.contains("fixture-only-password"))
+                        );
+                    }
+                }
+                assert!(
+                    snapshot
+                        .nodes
+                        .iter()
+                        .any(|(_, node)| node.label() == Some("Send quick command")
+                            && node.is_disabled())
+                );
+                assert_focus_traversal_reveals(&mut view, &mut tree, &node, &renderer);
+                apply(
+                    &mut view,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    iced::advanced::widget::operation::focusable::focus::<Message>(Id::new(
+                        "quick-source-profile-save",
+                    )),
+                );
+                apply(
+                    &mut view,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    accessibility::focus_reveal_operation(iced::window::Id::unique()),
+                );
+                apply(
+                    &mut view,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    iced::advanced::widget::operation::focusable::focus::<Message>(Id::new(
+                        "quick-source-profile-password",
+                    )),
+                );
+                let (snapshot, _, _) = accessibility::snapshot_widget(
+                    view.as_widget_mut(),
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                );
+                let password = &snapshot
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| {
+                        node.label() == Some("Source password")
+                            && node.role() == accessibility::Role::PasswordInput
+                    })
+                    .unwrap()
+                    .1;
+                let bounds = password.bounds().unwrap();
+                assert!(
+                    bounds.x0 >= -0.5
+                        && bounds.y0 >= -0.5
+                        && bounds.x1 <= f64::from(size.width) + 0.5
+                        && bounds.y1 <= f64::from(size.height) + 0.5,
+                    "protected password is visible after keyboard focus at {scale}: {bounds:?}"
+                );
+                if scale == UiScale::Standard {
+                    artifact(
+                        &format!(
+                            "quick-command-data-auth-{}-{}x{}",
+                            if dark { "dark" } else { "light" },
+                            physical.width,
+                            physical.height
+                        ),
+                        &mut view,
+                        &mut tree,
+                        &node,
+                        &mut renderer,
+                        size,
+                        (dark, scale.factor()),
+                    );
+                }
+            }
         }
     }
 }
@@ -392,6 +863,7 @@ fn return_in_every_generic_text_editor_and_on_remove_never_runs_a_plan() {
                 FieldKind::Url => json!("rtsp://camera.example/live"),
                 FieldKind::Path => json!("/tmp/capturefab-scene"),
                 FieldKind::Tags => json!({"line":"one"}),
+                FieldKind::StringList => json!(["temperature"]),
                 FieldKind::Features => json!([{"feature":"Gain","value":"0"}]),
                 FieldKind::Region => json!([0, 0, 1, 1]),
                 FieldKind::Secret => Value::Null,
@@ -465,6 +937,147 @@ fn return_in_every_generic_text_editor_and_on_remove_never_runs_a_plan() {
                     Message::Assistant(Input::Quick(quick::Input::Run(_)))
                 ))
         );
+    }
+}
+
+#[test]
+fn string_list_rows_have_single_name_editors_and_keyboard_add_remove_controls() {
+    let mut renderer = renderer();
+    for (tool, key, label) in [
+        ("start_signal_capture", "tags", "Tags"),
+        ("export_dataset", "tables", "Tables"),
+        ("get_camera_features", "names", "Features"),
+    ] {
+        let mut state = scenes::fixture("quick-command", SessionSnapshot::default());
+        let spec = crate::tools::spec(tool).unwrap();
+        let mut args: serde_json::Map<String, Value> = (spec.schema)()["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|key| (key.clone(), Value::Null))
+            .collect();
+        args.insert(key.into(), json!(["first", "second"]));
+        let id = state
+            .plan
+            .propose(
+                crate::tools::ToolCall {
+                    tool: tool.into(),
+                    args: Value::Object(args),
+                },
+                None,
+            )
+            .unwrap();
+        state.options_open.insert(id);
+        for dark in [false, true] {
+            for scale in UiScale::ALL {
+                let size = Size::new(480.0, 620.0) / scale.factor();
+                let mut view = view(&state, Palette::of(dark), size.height);
+                let mut tree = Tree::new(view.as_widget());
+                let node = view.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, size),
+                );
+                let (snapshot, _, _) = accessibility::snapshot_widget(
+                    view.as_widget_mut(),
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                );
+                for (index, value) in ["first", "second"].into_iter().enumerate() {
+                    let input = snapshot
+                        .nodes
+                        .iter()
+                        .find(|(_, node)| {
+                            node.role() == accessibility::Role::TextInput
+                                && node.label()
+                                    == Some(format!("Step {} {label} {}", id.0, index + 1).as_str())
+                        })
+                        .expect("each name has one native text input");
+                    assert_eq!(input.1.value(), Some(value));
+                }
+                assert!(!snapshot.nodes.iter().any(|(_, node)| {
+                    node.label()
+                        .is_some_and(|label| label.contains("Expected value"))
+                }));
+                assert_focus_traversal_reveals(&mut view, &mut tree, &node, &renderer);
+                if scale == UiScale::Standard {
+                    apply(
+                        &mut view,
+                        &mut tree,
+                        &node,
+                        &renderer,
+                        iced::advanced::widget::operation::focusable::focus::<Message>(Id::from(
+                            cards::field_id(id, &format!("{key}.0")),
+                        )),
+                    );
+                    apply(
+                        &mut view,
+                        &mut tree,
+                        &node,
+                        &renderer,
+                        accessibility::focus_reveal_operation(iced::window::Id::unique()),
+                    );
+                    artifact(
+                        &format!(
+                            "string-list-{key}-{}-480x620",
+                            if dark { "dark" } else { "light" }
+                        ),
+                        &mut view,
+                        &mut tree,
+                        &node,
+                        &mut renderer,
+                        size,
+                        (dark, scale.factor()),
+                    );
+                }
+            }
+        }
+        let press = |state: &quick::State, control: String| {
+            let mut view = view(state, Palette::of(false), 620.0);
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(480.0, 620.0)),
+            );
+            apply(
+                &mut view,
+                &mut tree,
+                &node,
+                &renderer,
+                iced::advanced::widget::operation::focusable::focus::<Message>(Id::from(control)),
+            );
+            enter(&mut view, &mut tree, &node, &renderer)
+        };
+        let messages = press(&state, cards::field_id(id, &format!("{key}-add")));
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            Message::Assistant(Input::Quick(quick::Input::StringList { remove: None, .. }))
+        )));
+        for message in messages {
+            if let Message::Assistant(Input::Quick(input)) = message {
+                let _ = state.input(input, Instant::now());
+            }
+        }
+        assert_eq!(
+            state.plan.steps[0].call.args[key],
+            json!(["first", "second", ""])
+        );
+        let messages = press(&state, cards::field_id(id, &format!("{key}.0-remove")));
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            Message::Assistant(Input::Quick(quick::Input::StringList {
+                remove: Some(0),
+                ..
+            }))
+        )));
+        for message in messages {
+            if let Message::Assistant(Input::Quick(input)) = message {
+                let _ = state.input(input, Instant::now());
+            }
+        }
+        assert_eq!(state.plan.steps[0].call.args[key], json!(["second", ""]));
     }
 }
 

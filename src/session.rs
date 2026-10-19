@@ -1,6 +1,7 @@
 //! Multi-camera coordinator: one isolated process per camera, shared-memory pixels.
 mod activity;
 mod log;
+pub mod task_data;
 pub use crate::shared_memory::FrameMeta;
 use crate::{
     genicam::FeatureInfo,
@@ -264,15 +265,83 @@ pub enum SessionCommand {
         #[serde(default)]
         storage: crate::storage::StoragePolicy,
     },
+    /// Open only while the coordinator still has the approved dataset slot.
+    DatasetOpenIf {
+        expected_slot_id: Option<String>,
+        path: String,
+        #[serde(default)]
+        mode: crate::dataset::OpenMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_bytes: Option<u64>,
+    },
+    /// Close only the exact open instance that was approved.
+    DatasetCloseIf {
+        slot_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sink_generation: Option<u64>,
+    },
+    DatasetNoteIf {
+        slot_id: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        context: crate::context::Context,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        camera: Option<String>,
+    },
+    /// Read an approved open instance, bounding the complete JSON response.
+    DatasetQueryIf {
+        slot_id: String,
+        sql: String,
+        #[serde(default = "crate::dataset::default_query_limit")]
+        limit: u32,
+        #[serde(default)]
+        timeout_ms: u64,
+        max_result_bytes: u32,
+    },
+    /// Run model SQL only after protected metadata has been projected into a
+    /// bounded private snapshot of the approved open instance.
+    DatasetModelQueryIf {
+        slot_id: String,
+        sql: String,
+        #[serde(default = "crate::dataset::default_query_limit")]
+        limit: u32,
+        #[serde(default)]
+        timeout_ms: u64,
+        max_result_bytes: u32,
+    },
+    /// Export an approved open instance within a finite byte/time allowance.
+    DatasetExportIf {
+        slot_id: String,
+        output: String,
+        /// Canonical capture root pinned by the checked tool at review time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approved_root: Option<String>,
+        #[serde(default)]
+        formats: Vec<crate::dataset::ExportFormat>,
+        #[serde(default)]
+        tables: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until_ms: Option<u64>,
+        #[serde(default)]
+        storage: crate::storage::StoragePolicy,
+        max_bytes: u64,
+        timeout_ms: u64,
+    },
     /// One-shot read of a signal source's current values.
     SignalRead {
         uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<crate::signals::auth::AuthBinding>,
         #[serde(default = "crate::signals::default_timeout_ms")]
         timeout_ms: u64,
     },
     /// List OPC UA nodes, MQTT topics or MTConnect data items for a bounded time.
     SignalBrowse {
         uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<crate::signals::auth::AuthBinding>,
         #[serde(default = "crate::signals::default_browse_ms")]
         duration_ms: u64,
         #[serde(default = "crate::signals::default_browse_limit")]
@@ -281,14 +350,42 @@ pub enum SessionCommand {
     /// Start logging a signal source in this session.
     SignalStart {
         uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<crate::signals::auth::AuthBinding>,
         #[serde(default = "crate::signals::default_interval_ms")]
         interval_ms: u64,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tags: Vec<String>,
     },
+    /// Acquire a finite signal capture into the exact open dataset slot.
+    SignalCapture {
+        uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<crate::signals::auth::AuthBinding>,
+        #[serde(default = "crate::signals::default_interval_ms")]
+        interval_ms: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+        duration_ms: u64,
+        max_samples: u64,
+        max_bytes: u64,
+        slot_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sink_generation: Option<u64>,
+    },
+    /// Explicit local action: bind a saved profile's current credentials to
+    /// this coordinator without making a network connection.
+    SignalBind {
+        profile: crate::signals::auth::ProfileRef,
+    },
     /// Stop a signal source by `signal:<16 hex>` ID, or `all`.
     SignalStop {
         id: String,
+    },
+    /// Stop only the specified source instance; never a replacement.
+    SignalStopIf {
+        id: String,
+        capture_id: String,
     },
     /// Signal source status.
     Signals,
@@ -633,11 +730,20 @@ impl SessionCommand {
             | Self::DatasetStatus
             | Self::DatasetNote { .. }
             | Self::DatasetQuery { .. }
-            | Self::DatasetExport { .. } => crate::dataset::validate_command(self)?,
+            | Self::DatasetExport { .. }
+            | Self::DatasetOpenIf { .. }
+            | Self::DatasetCloseIf { .. }
+            | Self::DatasetNoteIf { .. }
+            | Self::DatasetQueryIf { .. }
+            | Self::DatasetModelQueryIf { .. }
+            | Self::DatasetExportIf { .. } => crate::dataset::validate_command(self)?,
             Self::SignalRead { .. }
+            | Self::SignalBind { .. }
             | Self::SignalBrowse { .. }
             | Self::SignalStart { .. }
+            | Self::SignalCapture { .. }
             | Self::SignalStop { .. }
+            | Self::SignalStopIf { .. }
             | Self::Signals => crate::signals::validate_command(self)?,
             _ => {}
         }
@@ -653,15 +759,24 @@ impl SessionCommand {
                 | Self::DatasetNote { .. }
                 | Self::DatasetQuery { .. }
                 | Self::DatasetExport { .. }
+                | Self::DatasetOpenIf { .. }
+                | Self::DatasetCloseIf { .. }
+                | Self::DatasetNoteIf { .. }
+                | Self::DatasetQueryIf { .. }
+                | Self::DatasetModelQueryIf { .. }
+                | Self::DatasetExportIf { .. }
         )
     }
     pub fn is_signal(&self) -> bool {
         matches!(
             self,
             Self::SignalRead { .. }
+                | Self::SignalBind { .. }
                 | Self::SignalBrowse { .. }
                 | Self::SignalStart { .. }
+                | Self::SignalCapture { .. }
                 | Self::SignalStop { .. }
+                | Self::SignalStopIf { .. }
                 | Self::Signals
         )
     }
@@ -681,7 +796,10 @@ pub fn default_request_timeout(command: &SessionCommand) -> Duration {
         // settling its auto exposure, can outlast the frame wait itself.
         SessionCommand::Frame { timeout_ms, .. } => timeout_ms.saturating_add(15_000),
         SessionCommand::DatasetExport { .. } => 600_000,
-        SessionCommand::DatasetQuery { timeout_ms, .. } => (if *timeout_ms == 0 {
+        SessionCommand::DatasetExportIf { timeout_ms, .. } => timeout_ms.saturating_add(10_000),
+        SessionCommand::DatasetQuery { timeout_ms, .. }
+        | SessionCommand::DatasetQueryIf { timeout_ms, .. }
+        | SessionCommand::DatasetModelQueryIf { timeout_ms, .. } => (if *timeout_ms == 0 {
             30_000
         } else {
             *timeout_ms
@@ -1054,6 +1172,11 @@ pub struct SessionSnapshot {
     /// Signal sources logging in this session (at most 32 tags each).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signals: Vec<crate::signals::SourceStatus>,
+    /// Cached readiness and local identity of the common signal persistence sink.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_sink: Option<crate::signals::SignalSinkStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signal_bindings: Vec<crate::signals::auth::BindingReceipt>,
 }
 impl SessionSnapshot {
     /// Project one participant's local view without changing shared selection.
@@ -1706,9 +1829,13 @@ struct Coordinator {
     activity: Arc<activity::Activity>,
     dataset: Arc<crate::dataset::Slot>,
     signals: crate::signals::hub::SignalHub,
+    task_data: OnceLock<Arc<task_data::Registry>>,
 }
 impl Drop for Coordinator {
     fn drop(&mut self) {
+        if let Some(tasks) = self.task_data.get() {
+            tasks.begin_close_all();
+        }
         self.signals.stop_all_nowait();
         self.dataset.close_quiet();
         // The poller holds only a Weak; wake it so it exits now, not next tick.
@@ -1853,6 +1980,32 @@ impl Default for SessionHandle {
     }
 }
 impl SessionHandle {
+    /// Local sideband dispatch for task data. Attribution does not select the
+    /// route: the checked capability is held separately from command JSON.
+    pub(crate) fn task_data_activity(
+        &self,
+        handle: &task_data::TaskDataHandle,
+        origin: ActivityOrigin,
+        actor: SessionActor,
+        command: &SessionCommand,
+        apply: impl FnOnce() -> Result<Value>,
+    ) -> Result<Value> {
+        self.check_task_data(handle)?;
+        command.validate()?;
+        actor.validate()?;
+        ensure!(!self.is_shutting_down(), "session is shutting down");
+        let _slot = PendingSlot::acquire(&self.inner, false)?;
+        let mut activity = self.inner.activity.begin_as(origin, actor, None, command);
+        if let Some(activity) = &activity {
+            activity.running();
+        }
+        let result = apply();
+        if let Some(activity) = &mut activity {
+            activity.finish(&result);
+        }
+        result
+    }
+
     pub fn new() -> Self {
         let h = Self {
             allow_hub_connect: true,
@@ -1876,6 +2029,7 @@ impl SessionHandle {
                 activity: Arc::new(activity::Activity::default()),
                 dataset: Arc::new(crate::dataset::Slot::new()),
                 signals: crate::signals::hub::SignalHub::new(),
+                task_data: OnceLock::new(),
             }),
         };
         let weak = Arc::downgrade(&h.inner);
@@ -2145,6 +2299,8 @@ impl SessionHandle {
         state.activity_revision = activity.revision;
         state.dataset = self.inner.dataset.status_cached();
         state.signals = self.inner.signals.status_brief();
+        state.signal_sink = Some(self.inner.signals.sink_status());
+        state.signal_bindings = self.inner.signals.cached_bindings();
         project_selected(&mut state);
         let mut log = locked(&self.inner.log);
         log.take_signals(self.inner.signals.logs());
@@ -2474,9 +2630,11 @@ impl SessionHandle {
             return None;
         }
         let target = match command {
-            SessionCommand::SignalStart { .. } | SessionCommand::SignalStop { .. } => {
-                CommandTarget::Signals
-            }
+            SessionCommand::SignalStart { .. }
+            | SessionCommand::SignalBind { .. }
+            | SessionCommand::SignalCapture { .. }
+            | SessionCommand::SignalStop { .. }
+            | SessionCommand::SignalStopIf { .. } => CommandTarget::Signals,
             SessionCommand::Discover { .. } | SessionCommand::NetworkScan { .. } => {
                 CommandTarget::Discovery
             }
@@ -2860,6 +3018,37 @@ impl SessionHandle {
             }
             command if command.is_dataset() => {
                 crate::dataset::coordinator::run(&self.inner.dataset, &self.inner.signals, command)
+            }
+            SessionCommand::SignalCapture {
+                uri,
+                auth,
+                interval_ms,
+                tags,
+                duration_ms,
+                max_samples,
+                max_bytes,
+                slot_id,
+                sink_generation,
+            } => {
+                let _lifecycle = self.inner.dataset.lifecycle();
+                self.inner.dataset.ensure_slot(Some(&slot_id))?;
+                Ok(serde_json::to_value(
+                    self.inner.signals.capture_for_dataset_bound(
+                        &uri,
+                        interval_ms,
+                        tags,
+                        crate::signals::CaptureLimits {
+                            duration_ms,
+                            max_samples,
+                            max_bytes,
+                        },
+                        crate::signals::hub::DatasetCaptureTarget {
+                            slot_id: &slot_id,
+                            sink_generation,
+                            auth: auth.as_ref(),
+                        },
+                    )?,
+                )?)
             }
             command if command.is_signal() => {
                 crate::signals::hub::run(&self.inner.signals, command)
@@ -3316,6 +3505,9 @@ impl SessionHandle {
             .activity
             .cancel_jobs(None, None, "session stopped before schedule completed");
         self.wake();
+        if let Some(tasks) = self.inner.task_data.get() {
+            tasks.close_all(Duration::from_secs(10));
+        }
         // Signals first, so their final samples reach the dataset before it closes.
         let signals = &self.inner.signals;
         signals.stop_all(Duration::from_secs(3));
@@ -3621,6 +3813,12 @@ mod tests {
         );
         assert_eq!(
             timeout(r#"{"op":"dataset_query","sql":"SELECT 1","timeout_ms":5000}"#),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            timeout(
+                r#"{"op":"dataset_model_query_if","slot_id":"0123456789abcdef0123456789abcdef","sql":"SELECT 1","timeout_ms":5000,"max_result_bytes":16384}"#
+            ),
             Duration::from_secs(15)
         );
         assert_eq!(timeout(r#"{"op":"status"}"#), Duration::from_secs(60));

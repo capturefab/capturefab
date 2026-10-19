@@ -34,7 +34,7 @@ ftp = ["uploads", "dep:suppaftp", "dep:rustls", "dep:rustls-platform-verifier"]
 # SFTP over pure-Rust SSH (ring); a tokio current-thread runtime only inside upload threads.
 sftp = ["uploads", "dep:russh", "dep:russh-sftp", "dep:tokio"]
 # Parquet and JSON exports from the dataset catalog (DuckDB's statically linked extensions).
-parquet = ["duckdb/parquet", "duckdb/json"]
+parquet = ["duckdb/parquet", "duckdb/json", "dep:parquet"]
 # Industrial signal sources; each runs in an isolated `__signal` helper process.
 # Modbus TCP is hand-rolled over std::net.
 modbus = []
@@ -94,7 +94,14 @@ sha2 = "0.10"
 fs2 = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # In-memory session analytics and on-disk dataset catalogs; bundling keeps releases portable.
-duckdb = { version = "~1.10506.1", default-features = false, features = ["bundled"] }
+duckdb = { version = "~1.10506.1", default-features = false, features = ["bundled", "appender-arrow"] }
+# The isolated task filesystem bridge uses this exact engine's C++ headers.
+# Its metadata supplies DEP_DUCKDB_INCLUDE without rebuilding another engine.
+libduckdb-sys = { version = "=1.10506.1", default-features = false, features = ["bundled"] }
+# Streaming bounded exports use the same Arrow major as DuckDB. Keep the
+# writer uncompressed to avoid another native codec dependency; ordinary
+# DuckDB exports continue to use Zstd.
+parquet = { version = "~58.4.0", optional = true, default-features = false, features = ["arrow"] }
 plotters = { version = "0.3.7", default-features = false, features = ["svg_backend", "line_series", "area_series"] }
 turbojpeg = { version = "1.5", optional = true, default-features = false, features = ["cmake", "require-simd"] }
 libloading = { version = "0.8", optional = true }
@@ -157,6 +164,7 @@ libc = "0.2"
 sha2 = { version = "0.10", features = ["asm"] }
 
 [build-dependencies]
+cc = "1"
 # Digest of the embedded FFmpeg, which names its extracted copy.
 sha2 = "0.10"
 

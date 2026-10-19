@@ -96,7 +96,17 @@ pub(in crate::gui) fn content<'a>(
     height: f32,
     spin: usize,
 ) -> Element<'a, quick::Input> {
-    content_with_banner(state, p, height, spin, None)
+    let commands = agents::CommandContext::fixture(
+        Some("/Applications/Capturefab App/capturefab"),
+        None,
+        false,
+    );
+    let preview = state.exported_plan.as_ref().and_then(|path| {
+        state.context.as_ref().and_then(|context| {
+            commands.plan_preview("layout-workbench", path, &context.capture_root)
+        })
+    });
+    content_with_banner(state, p, height, spin, None, preview)
 }
 
 pub(in crate::gui) fn content_with_banner<'a>(
@@ -105,6 +115,7 @@ pub(in crate::gui) fn content_with_banner<'a>(
     height: f32,
     spin: usize,
     banner: Option<Element<'a, quick::Input>>,
+    exported_preview: Option<agents::PlanPreview>,
 ) -> Element<'a, quick::Input> {
     let provider = state.provider_label();
     let model = state.model_label();
@@ -117,6 +128,9 @@ pub(in crate::gui) fn content_with_banner<'a>(
     let mut body = column![].spacing(16).width(Fill);
     if let Some(banner) = banner {
         body = body.push(banner);
+    }
+    if state.data_sources_open {
+        body = body.push(data_sources(state, p));
     }
     if !state.has_provider() {
         body = body.push(setup(state, p));
@@ -161,15 +175,18 @@ pub(in crate::gui) fn content_with_banner<'a>(
         body = body.push(super::cards::content(state, p));
     }
     if let Some(path) = &state.exported_plan {
-        let command = format!(
-            "capturefab tools apply {} --session NAME",
-            shell_quote(&path.to_string_lossy())
-        );
-        body = body.push(
+        if let Some(preview) = exported_preview {
+            let command = preview.command;
+            let shell_name = preview.shell;
+            body = body.push(
             column![
-                text("Plan exported. Review it before applying it in a session.")
+                text(format!("Plan exported. Run this in {shell_name} while this workbench stays open. It checks the plan without changing the session. Review the checks before removing --dry-run to run approved actions."))
                     .size(style::SMALL)
-                    .color(p.secondary),
+                    .color(p.secondary)
+                    .wrapping(text::Wrapping::WordOrGlyph),
+                text(format!("Output folder: {}", preview.capture_root))
+                    .size(style::SMALL).color(p.secondary)
+                    .wrapping(text::Wrapping::WordOrGlyph),
                 container(
                     row![
                         text(command.clone())
@@ -178,7 +195,9 @@ pub(in crate::gui) fn content_with_banner<'a>(
                             .wrapping(text::Wrapping::WordOrGlyph)
                             .width(Fill),
                         button(icon(Icon::Copy, 13.0, p.secondary))
-                            .name("Copy exported plan command")
+                            .id("quick-command-export-preview")
+                            .name("Copy exported plan preview command")
+                            .description("Copy a checks-only command for this workbench and exported plan")
                             .padding(4)
                             .style(style::plain)
                             .on_press(quick::Input::Copy(command)),
@@ -192,10 +211,13 @@ pub(in crate::gui) fn content_with_banner<'a>(
             ]
             .spacing(6),
         );
+        } else {
+            body = body.push(field_error(format!("Plan exported to {}. A preview command is unavailable until this workbench's output folder, executable and absolute export path are known. Refresh the assistant context, then export again.", path.display()), p));
+        }
     }
     if state.has_provider() {
         body = body.push(
-            text(consent(&provider, state.allow_images))
+            text(consent(&provider, state.allow_images, state.allow_data))
                 .size(style::SMALL)
                 .color(p.secondary)
                 .wrapping(text::Wrapping::WordOrGlyph),
@@ -245,12 +267,43 @@ pub(in crate::gui) fn content_with_banner<'a>(
         ]
         .spacing(7)
         .align_y(Alignment::Center),
+        row![
+            container(checkbox_maybe(
+                "Read sensor values and dataset rows",
+                state.allow_data,
+                (!busy).then_some(quick::Input::SeeData),
+            ))
+            .width(Fill),
+            button(
+                text(if state.data_sources.is_empty() {
+                    "Sources…".into()
+                } else {
+                    format!("Sources ({})", state.data_sources.len())
+                })
+                .size(style::SMALL)
+            )
+            .name("Approved data sources")
+            .expanded(state.data_sources_open)
+            .description("Add a credential-free endpoint locally or review cached sources.")
+            .id("quick-command-data-sources")
+            .padding([4, 6])
+            .style(style::plain)
+            .on_press_maybe((!busy).then_some(quick::Input::DataSources(!state.data_sources_open))),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
     ]
     .spacing(8);
     sheet_frame("Quick Command", quick::Input::Open(false), body, p)
         .mark(Icon::Sparkle)
         .size(720.0, height)
-        .anchor(scrollable::Anchor::End)
+        .anchor(
+            if state.transcript.is_empty() && state.plan.steps.is_empty() {
+                scrollable::Anchor::Start
+            } else {
+                scrollable::Anchor::End
+            },
+        )
         .scrolled(state.scrolled)
         .on_scroll(quick::Input::Scrolled)
         .controls(controls)
@@ -302,8 +355,9 @@ fn footer<'a>(
 ) -> Element<'a, quick::Input> {
     let busy = state.thinking() || state.running();
     let editable = state.editable();
-    let send = editable && state.has_provider() && !state.prompt.trim().is_empty();
-    let prompt = text_input::text_input("Describe a capture or camera change…", &state.prompt)
+    let draft = state.source_setup.has_uncommitted_draft();
+    let send = editable && !draft && state.has_provider() && !state.prompt.trim().is_empty();
+    let prompt = text_input::text_input("Describe an image or data capture…", &state.prompt)
         .id("quick-command-prompt")
         .name("Quick command request")
         .description("Return sends your request. It never runs a proposed plan.")
@@ -324,7 +378,9 @@ fn footer<'a>(
     } else {
         button(icon(Icon::PaperPlaneRight, 15.0, p.accent))
             .name("Send quick command")
-            .description(if state.has_provider() {
+            .description(if draft {
+                crate::gui::source_setup::UNCOMMITTED_DRAFT
+            } else if state.has_provider() {
                 "Send your request to the selected AI provider."
             } else {
                 "Set up an AI provider before sending a request."
@@ -336,6 +392,14 @@ fn footer<'a>(
     let mut footer = column![row![prompt, action].spacing(8).align_y(Alignment::Center)]
         .spacing(8)
         .width(Fill);
+    if draft {
+        footer = footer.push(
+            text(crate::gui::source_setup::UNCOMMITTED_DRAFT)
+                .size(style::SMALL)
+                .color(p.secondary)
+                .wrapping(text::Wrapping::WordOrGlyph),
+        );
+    }
     if busy {
         let status = if state.status.is_empty() {
             if state.thinking() {
@@ -447,26 +511,44 @@ fn setup<'a>(state: &quick::State, p: &'static Palette) -> Element<'a, quick::In
 }
 
 fn empty<'a>(state: &quick::State, p: &'static Palette) -> Element<'a, quick::Input> {
-    let suggestions = if state
+    let has_camera = state
         .context
         .as_ref()
-        .is_some_and(|context| !context.snapshot.cameras.is_empty())
-    {
+        .is_some_and(|context| !context.snapshot.cameras.is_empty());
+    let suggestions = if state.allow_data && !state.data_sources.is_empty() {
+        [
+            "Plan a bounded sensor capture",
+            if has_camera {
+                "Plan an image and sensor capture"
+            } else {
+                "Read an approved data source once"
+            },
+            "Plan an analysis export",
+        ]
+    } else if has_camera {
         [
             "Take a photo",
             "Record for 30 seconds",
             "Check the camera exposure",
         ]
+    } else if state.context.as_ref().is_some_and(|context| {
+        !context.snapshot.signals.is_empty() || context.snapshot.dataset.is_some()
+    }) {
+        [
+            "Review the current dataset",
+            "Check the source capture health",
+            "Plan an analysis export",
+        ]
     } else {
         [
             "Find available cameras",
-            "Help me connect a camera",
+            "Help me capture sensor data",
             "Show the storage budget",
         ]
     };
     let mut body = column![
         heading("What would you like to capture?", p),
-        text("Describe a capture or a camera change. Review the proposed plan before it runs.")
+        text("Describe an image or data capture, then review its plan. Add new sensor endpoints in Sources.")
             .size(style::BODY)
             .color(p.secondary)
             .wrapping(text::Wrapping::WordOrGlyph),
@@ -482,6 +564,94 @@ fn empty<'a>(state: &quick::State, p: &'static Palette) -> Element<'a, quick::In
                 .on_press(quick::Input::Suggestion(suggestion.into())),
         );
     }
+    body.into()
+}
+
+fn data_sources<'a>(state: &'a quick::State, p: &'static Palette) -> Element<'a, quick::Input> {
+    let editable = state.editable();
+    let error = state.source_draft_error();
+    let mut body = column![
+        heading("Approved data sources",p),
+        text("Add a credential-free endpoint locally. Data permission shares opaque references with the provider; new connections wait for Run plan.")
+            .size(style::SMALL).color(p.secondary).wrapping(text::Wrapping::WordOrGlyph),
+        row![
+            text_input::text_input("sim-signal://line1",&state.data_source_draft)
+                .name("Quick command data source endpoint")
+                .description("Use a credential-free endpoint. Start authenticated sources in the workbench first, then allow cached observations.")
+                .id("quick-command-data-source")
+                .invalid(error.clone())
+                .padding([7,10]).width(Fill).size(style::BODY)
+                .style(if error.is_some() { style::input_invalid } else { style::input })
+                .on_input_maybe(editable.then_some(quick::Input::DataSourceDraft))
+                .on_submit_maybe((editable && !state.data_source_draft.trim().is_empty() && error.is_none()).then_some(quick::Input::AddDataSource)),
+            button(text("Add source").size(style::SMALL))
+                .name("Add data source to Quick Command")
+                .id("quick-command-add-source")
+                .padding([8,10]).style(style::secondary)
+                .on_press_maybe((editable && !state.data_source_draft.trim().is_empty() && error.is_none()).then_some(quick::Input::AddDataSource)),
+        ].spacing(8).align_y(Alignment::Center),
+    ].spacing(8).width(Fill);
+    if let Some(error) = error {
+        body = body.push(field_error(error, p));
+    }
+    for source in &state.data_sources {
+        body = body.push(
+            container(
+                column![
+                    row![
+                        text(crate::tools::redact::for_output_text(&source.uri))
+                            .size(style::BODY)
+                            .width(Fill)
+                            .wrapping(text::Wrapping::WordOrGlyph),
+                        button(text("Remove").size(style::SMALL))
+                            .name(format!("Remove approved source {}", source.reference))
+                            .padding([4, 8])
+                            .style(style::plain)
+                            .on_press_maybe(editable.then_some(quick::Input::RemoveDataSource(
+                                source.reference.clone()
+                            ))),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Start),
+                    text(source.reference.clone())
+                        .size(style::SMALL)
+                        .font(style::MONO)
+                        .color(p.secondary),
+                ]
+                .spacing(4),
+            )
+            .padding(10)
+            .width(Fill)
+            .style(style::code),
+        );
+    }
+    if let Some(context) = &state.context {
+        for source in &context.snapshot.signals {
+            body = body.push(
+                text(format!(
+                    "Cached source · {} · {:?}",
+                    source.id, source.state
+                ))
+                .size(style::SMALL)
+                .color(p.secondary)
+                .wrapping(text::Wrapping::WordOrGlyph),
+            );
+        }
+    }
+    if !state.allow_data {
+        body = body.push(text("Enable Read sensor values and dataset rows to make these sources available to the provider.")
+            .size(style::SMALL).color(p.secondary).wrapping(text::Wrapping::WordOrGlyph));
+    }
+    body = body.push(accessibility::mapped(
+        crate::gui::source_setup::view(
+            &state.source_setup,
+            p,
+            editable,
+            "quick-source-profile",
+            crate::gui::source_setup::Purpose::Approve,
+        ),
+        quick::Input::SourceProfile,
+    ));
     body.into()
 }
 
@@ -586,14 +756,19 @@ pub(in crate::gui) fn thumbnail<'a>(
     .into()
 }
 
-fn consent(provider: &str, images: bool) -> String {
+fn consent(provider: &str, images: bool, data: bool) -> String {
     let images = if images {
-        ", and camera images the assistant inspects when See camera images is on"
+        " Includes inspected camera images."
+    } else {
+        ""
+    };
+    let data = if data {
+        " Includes approved source values, tag metadata, dataset notes and query results."
     } else {
         ""
     };
     format!(
-        "Sends your request and details of this session to {provider}, under {provider}'s data terms: camera names, models and IDs, discovered devices, destination names and locations, storage use, job file names and recent activity{images}. Never sends keys."
+        "Sends your request and session details to {provider} under its data terms: camera/device names, models and IDs; destinations and locations; storage use, job files and recent activity.{images}{data} Never sends keys."
     )
 }
 
@@ -654,9 +829,24 @@ mod tests {
 
     #[test]
     fn consent_follows_explicit_plan_image_permission() {
-        let plain = consent("Anthropic", false);
+        let plain = consent("Anthropic", false, false);
         assert!(!plain.contains("camera images"));
         assert!(plain.ends_with("Never sends keys."));
-        assert!(consent("Anthropic", true).contains("camera images the assistant inspects"));
+        assert!(consent("Anthropic", true, false).contains("inspected camera images"));
+        assert!(consent("Anthropic", false, true).contains("dataset notes and query results"));
+        assert!(!plain.contains("dataset notes and query results"));
+        for detail in [
+            "request",
+            "session",
+            "names, models and IDs",
+            "destinations and locations",
+            "storage use",
+            "job files",
+            "recent activity",
+            "Anthropic under its data terms",
+        ] {
+            assert!(plain.contains(detail), "{detail} remains disclosed");
+        }
+        assert!(consent("Anthropic", true, true).len() < 360);
     }
 }

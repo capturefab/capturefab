@@ -39,6 +39,33 @@ pub(crate) const SCANNER: &str = "scanner:ica:office";
 pub(crate) const FACETIME: &str = "avfoundation:FaceTime HD Camera";
 pub(crate) const ONVIF: &str = "onvif:http://10.0.0.5/onvif/device_service";
 
+/// A local receipt fixture, without touching a profile file or secret store.
+pub(crate) fn fixture_bound_source(ctx: &mut Context, endpoint: &str) -> context::DataSourceRef {
+    use crate::signals::auth::{AuthBinding, BindingReceipt, ProfileInfo, ProfileRef, SecretKind};
+    let receipt = BindingReceipt {
+        endpoint: endpoint.into(),
+        reference: crate::signals::source_id(endpoint),
+        auth: AuthBinding {
+            profile: ProfileRef {
+                id: "a".repeat(32),
+                revision: "b".repeat(32),
+            },
+            epoch: "c".repeat(32),
+        },
+    };
+    ctx.data_profiles.push(ProfileInfo {
+        profile: receipt.auth.profile.clone(),
+        name: "line-one".into(),
+        endpoint: endpoint.into(),
+        reference: receipt.reference.clone(),
+        protocol: crate::signals::parse(endpoint).unwrap().protocol,
+        secret: SecretKind::Environment,
+        insecure: false,
+    });
+    ctx.snapshot.signal_bindings.push(receipt.clone());
+    context::DataSourceRef::from_binding(&receipt).unwrap()
+}
+
 /// A scripted session. `snapshot()` steps through the scripted snapshots
 /// and then repeats the last; `execute()` records each command and answers
 /// with a queued reply for its op, or a default: Status from the current
@@ -387,6 +414,12 @@ pub(crate) fn fixture_context(snapshot: SessionSnapshot) -> Context {
         zone: Zone::Fixed(7200),
         session: true,
         snapshot,
+        data_sources: Vec::new(),
+        data_profiles: Vec::new(),
+        allow_data: false,
+        data_dataset: None,
+        task_data_available: false,
+        task_data_reserved_bytes: 0,
         destinations: vec![
             DestinationInfo {
                 approval_identity: None,
@@ -487,7 +520,10 @@ fn catalog_lists_the_observe_tools_with_their_sessions() {
             "list_jobs",
             "get_camera_features",
             "inspect_frame",
-            "wait_for"
+            "wait_for",
+            "list_data_sources",
+            "get_dataset",
+            "query_dataset"
         ]
     );
     for spec in catalog().iter().filter(|spec| spec.kind == ToolKind::Read) {
@@ -513,6 +549,30 @@ fn catalog_lists_the_observe_tools_with_their_sessions() {
     assert_eq!(json[6]["risk"], "observe");
     assert_eq!(json[6]["kind"], "read");
     assert_eq!(json[0]["input_schema"]["required"], json!([]));
+}
+
+#[test]
+fn string_list_form_fields_match_their_array_of_strings_schemas() {
+    let mut fields = Vec::new();
+    for tool in catalog() {
+        let schema = (tool.schema)();
+        for field in tool.fields {
+            if field.kind == FieldKind::StringList {
+                fields.push((tool.name, field.key));
+                let schema = &schema["properties"][field.key];
+                assert_eq!(schema["items"]["type"], "string", "{fields:?}");
+                assert!(schema["type"].as_array().unwrap().contains(&json!("array")));
+            }
+        }
+    }
+    assert_eq!(
+        fields,
+        [
+            ("get_camera_features", "names"),
+            ("start_signal_capture", "tags"),
+            ("export_dataset", "tables"),
+        ]
+    );
 }
 
 #[test]
@@ -1735,7 +1795,7 @@ fn gathering_reads_destinations_storage_and_encoders_without_secrets() {
         ctx.storage.request.max_bytes,
         StoragePolicy::default().max_bytes
     );
-    assert_eq!(ctx.storage.free_budget(), (1 << 30) - 5_600);
+    assert_eq!(ctx.storage.free_budget(), (1 << 30) - 5_000);
     assert_eq!(ctx.media.encoders_by_codec["hevc"], ["libx265"]);
     assert_eq!(ctx.media.encoders_by_codec["av1"], ["libsvtav1"]);
     assert!(ctx.media.encoders_by_codec["h264"].is_empty() && ctx.media.available);

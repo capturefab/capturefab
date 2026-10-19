@@ -14,6 +14,14 @@ pub struct Limits {
     pub max_bytes: u64,
     pub max_recordings: u32,
     pub max_recording_ms: u64,
+    /// Cumulative source captures, including a restarted capture of one source.
+    pub max_sources: u32,
+    pub max_samples: u64,
+    /// Reserved signal payload plus twice each export bundle limit (staging
+    /// and published copy); also charged to max_bytes, including failed attempts.
+    pub max_data_bytes: u64,
+    /// Cumulative reserved acquisition time across signal captures.
+    pub max_signal_ms: u64,
     pub max_setting_changes: u32,
     pub max_consecutive_errors: u32,
     pub max_identical_calls: u32,
@@ -33,6 +41,10 @@ impl Default for Limits {
             max_bytes: 2 * 1024 * 1024 * 1024,
             max_recordings: 2,
             max_recording_ms: 1_800_000,
+            max_sources: 8,
+            max_samples: 1_000_000,
+            max_data_bytes: 512 * 1024 * 1024,
+            max_signal_ms: 1_800_000,
             max_setting_changes: 300,
             max_consecutive_errors: 5,
             max_identical_calls: 3,
@@ -91,6 +103,18 @@ impl Limits {
             (
                 self.max_setting_changes <= 10_000,
                 "Enter a settings-change limit from 0 to 10,000.",
+            ),
+            (
+                self.max_sources <= 256,
+                "Enter a source-capture limit from 0 to 256.",
+            ),
+            (
+                self.max_samples <= 100_000_000,
+                "Enter a sample limit from 0 to 100,000,000.",
+            ),
+            (
+                self.max_signal_ms <= 604_800_000,
+                "Enter a total signal-duration limit from 0 to 7 days.",
             ),
             (
                 (1..=5).contains(&self.max_consecutive_errors),

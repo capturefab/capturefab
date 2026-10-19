@@ -73,16 +73,37 @@ pub(crate) fn render_artifact_scaled(
     size: Size,
     scale_factor: f32,
 ) {
+    render_artifact_themed(
+        name,
+        view,
+        tree,
+        node,
+        renderer,
+        size,
+        (false, scale_factor),
+    );
+}
+
+pub(crate) fn render_artifact_themed(
+    name: &str,
+    view: &Element<'_, GuiMessage>,
+    tree: &Tree,
+    node: &layout::Node,
+    renderer: &mut iced::Renderer,
+    size: Size,
+    appearance: (bool, f32),
+) {
     use iced::advanced::renderer::Renderer;
     let Ok(directory) = std::env::var("CAPTUREFAB_LAYOUT_ARTIFACTS") else {
         return;
     };
+    let (dark, scale_factor) = appearance;
     let viewport = Rectangle::new(iced::Point::ORIGIN, size);
     renderer.reset(viewport);
     view.as_widget().draw(
         tree,
         renderer,
-        &Theme::Light,
+        if dark { &Theme::Dark } else { &Theme::Light },
         &iced::advanced::renderer::Style::default(),
         Layout::new(node),
         iced::mouse::Cursor::Unavailable,
@@ -92,7 +113,7 @@ pub(crate) fn render_artifact_scaled(
         (size.width * scale_factor).round() as u32,
         (size.height * scale_factor).round() as u32,
     );
-    let pixels = renderer.screenshot(physical, scale_factor, Palette::of(false).base);
+    let pixels = renderer.screenshot(physical, scale_factor, Palette::of(dark).base);
     std::fs::create_dir_all(&directory).unwrap();
     let file = std::fs::File::create(PathBuf::from(directory).join(format!("{name}.png"))).unwrap();
     let mut encoder = png::Encoder::new(file, physical.width, physical.height);

@@ -1,6 +1,7 @@
 //! AI provider setup. All environment, settings-file, credential-store and
 //! provider work belongs to the serial worker; constructing this state is pure.
 use crate::assistant::{self as ai, Effort, ProviderId, ProviderSettings, Settings, VisionMode};
+pub(in crate::gui) use crate::gui::secret::SecretDraft;
 use crate::gui::*;
 use ai::provider::SettingsError;
 use iced::futures::channel::oneshot;
@@ -10,7 +11,6 @@ use std::{
     future::Future,
     sync::atomic::AtomicU64,
 };
-use zeroize::Zeroizing;
 #[path = "settings_worker.rs"]
 mod worker;
 #[cfg(test)]
@@ -20,24 +20,6 @@ pub(in crate::gui) use worker::{ConnectionFailure, Services};
 const DEBOUNCE: Duration = Duration::from_millis(600);
 const SECRET_HELP: &str =
     "Stored securely in the OS credential store. Never saved in app preferences.";
-
-#[derive(Clone, Default)]
-pub(in crate::gui) struct SecretDraft(Zeroizing<String>);
-impl SecretDraft {
-    pub(in crate::gui) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-impl From<String> for SecretDraft {
-    fn from(value: String) -> Self {
-        Self(Zeroizing::new(value))
-    }
-}
-impl fmt::Debug for SecretDraft {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("SecretDraft([redacted])")
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::gui) enum Field {
@@ -119,6 +101,7 @@ pub(in crate::gui) enum Input {
     SaveKey,
     RemoveKey,
     Test,
+    ContinueToQuick,
     ConnectionDetails(bool),
 }
 impl fmt::Debug for Input {
@@ -138,6 +121,7 @@ impl fmt::Debug for Input {
             Self::SaveKey => f.write_str("SaveKey"),
             Self::RemoveKey => f.write_str("RemoveKey"),
             Self::Test => f.write_str("Test"),
+            Self::ContinueToQuick => f.write_str("ContinueToQuick"),
             Self::ConnectionDetails(value) => {
                 f.debug_tuple("ConnectionDetails").field(value).finish()
             }
@@ -148,16 +132,11 @@ impl fmt::Debug for Input {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::gui) struct ProviderRow {
     pub id: ProviderId,
-    pub ready: bool,
+    pub status: &'static str,
 }
 impl fmt::Display for ProviderRow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} · {}",
-            self.id,
-            if self.ready { "Ready" } else { "Needs setup" }
-        )
+        write!(f, "{} · {}", self.id, self.status)
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -204,6 +183,9 @@ pub(in crate::gui) struct State {
     environment_ready: BTreeSet<ProviderId>,
     environment_names: Vec<String>,
     environment: BTreeMap<String, String>,
+    profile_regions: BTreeMap<String, Option<String>>,
+    profile_pending: BTreeSet<String>,
+    test_after_profile: Option<String>,
     original: BTreeMap<ProviderId, ProviderSettings>,
     status: Option<ai::CredentialStatus>,
     notice: Option<String>,
@@ -238,6 +220,9 @@ impl State {
             environment_ready: BTreeSet::new(),
             environment_names: vec![],
             environment: BTreeMap::new(),
+            profile_regions: BTreeMap::new(),
+            profile_pending: BTreeSet::new(),
+            test_after_profile: None,
             original: BTreeMap::new(),
             status: None,
             notice: None,
@@ -280,8 +265,15 @@ impl State {
     pub(in crate::gui) fn busy(&self) -> bool {
         self.pending > 0 || self.loading || !self.dirty.is_empty()
     }
+    pub(in crate::gui) fn ready_to_continue(&self) -> bool {
+        matches!(self.connection, Some(Ok(())))
+            && self.can_edit()
+            && !self.busy()
+            && self.unsaved.is_empty()
+    }
     pub(in crate::gui) fn clear_secret(&mut self) {
         self.secret = SecretDraft::default();
+        self.test_after_profile = None;
     }
     /// Measurement keys share the same accounts; update their nonsecret hint
     /// without loading settings or touching credentials on the UI thread.
@@ -325,6 +317,7 @@ impl State {
         }
     }
     fn request_status(&mut self) {
+        self.request_profile_region(false);
         if !self.loaded
             || !self.visible
             || self.settings.provider.is_none()
@@ -341,18 +334,62 @@ impl State {
             self.generation.load(Ordering::SeqCst),
         ));
     }
+    fn profile_for_region(&self) -> Option<String> {
+        if self.id() != ProviderId::Bedrock {
+            return None;
+        }
+        let effective = self
+            .selected()
+            .effective(self.id(), |name| self.environment.get(name).cloned())
+            .ok()?;
+        effective
+            .region
+            .is_none()
+            .then(|| effective.profile.unwrap_or_else(|| "default".into()))
+    }
+    fn request_profile_region(&mut self, refresh: bool) {
+        if !self.loaded || !self.visible || !self.section_open() || self.synthetic {
+            return;
+        }
+        let Some(profile) = self.profile_for_region() else {
+            return;
+        };
+        if self.profile_pending.contains(&profile)
+            || (!refresh && self.profile_regions.contains_key(&profile))
+        {
+            return;
+        }
+        self.profile_pending.insert(profile.clone());
+        self.send(worker::Work::ProfileRegion(profile));
+    }
+    fn start_test(&mut self) {
+        if self.field_issues().is_empty() && self.secret_error().is_none() {
+            self.flush_dirty();
+            self.test_pending = true;
+            self.connection = None;
+            self.error = None;
+            let key = self
+                .valid_secret()
+                .then(|| std::mem::take(&mut self.secret));
+            self.credential_pending = key.is_some();
+            self.send(worker::Work::Test(self.id(), self.selected(), key));
+        }
+    }
     fn changed(&mut self, now: Instant) {
         let id = self.id();
         let settings = self.selected();
         self.connection = None;
+        self.status = None;
         self.notice = None;
         self.error = None;
+        self.test_after_profile = None;
         self.settings.provider = Some(id);
         if settings.validate(id).is_ok() {
             self.dirty.insert(id, (settings, now));
         } else {
             self.dirty.remove(&id);
         }
+        self.request_profile_region(false);
     }
     fn can_edit(&self) -> bool {
         self.loaded && !self.credential_pending && !self.test_pending
@@ -363,6 +400,7 @@ impl State {
             self.open = open;
             self.ensure_loaded();
             if open && !was {
+                self.profile_regions.clear();
                 self.request_status();
             }
             if !open {
@@ -412,11 +450,15 @@ impl State {
                 self.secret = value;
                 self.notice = None;
                 self.error = None;
+                self.connection = None;
+                self.test_after_profile = None;
             }
             Input::SaveKey if self.valid_secret() => {
+                self.test_after_profile = None;
                 self.flush_dirty();
                 self.notice = None;
                 self.error = None;
+                self.connection = None;
                 self.credential_pending = true;
                 let key = std::mem::take(&mut self.secret);
                 self.send(worker::Work::Store(self.id(), self.selected(), key));
@@ -426,16 +468,19 @@ impl State {
                 self.clear_secret();
                 self.notice = None;
                 self.error = None;
+                self.connection = None;
                 self.credential_pending = true;
                 self.send(worker::Work::Remove(self.id(), self.selected()));
             }
             Input::Test => {
                 self.show_required = true;
-                if self.field_issues().is_empty() {
-                    self.flush_dirty();
-                    self.test_pending = true;
-                    self.connection = None;
-                    self.send(worker::Work::Test(self.id(), self.selected()));
+                self.connection = None;
+                self.error = None;
+                if let Some(profile) = self.profile_for_region().filter(|_| !self.synthetic) {
+                    self.test_after_profile = Some(profile);
+                    self.request_profile_region(true);
+                } else {
+                    self.start_test();
                 }
             }
             _ => {}
@@ -445,6 +490,10 @@ impl State {
         !self.secret.0.is_empty()
             && self.secret.0.len() <= 4096
             && self.secret.0.bytes().all(|b| b.is_ascii_graphic())
+    }
+    fn secret_error(&self) -> Option<&'static str> {
+        (!self.secret.0.is_empty() && !self.valid_secret())
+            .then_some("Use an API key without spaces or line breaks, up to 4096 characters.")
     }
     fn flush_dirty(&mut self) {
         for (id, (settings, _)) in std::mem::take(&mut self.dirty) {
@@ -515,6 +564,8 @@ impl State {
                     self.pending = 0;
                     self.credential_pending = false;
                     self.test_pending = false;
+                    self.profile_pending.clear();
+                    self.test_after_profile = None;
                     self.worker = None;
                     break;
                 }
@@ -552,6 +603,20 @@ impl State {
                     self.status = status;
                 }
             }
+            worker::Reply::ProfileRegion(profile, region) => {
+                self.profile_pending.remove(&profile);
+                let found = region.is_some();
+                self.profile_regions.insert(profile.clone(), region);
+                if self.test_after_profile.as_deref() == Some(&profile) {
+                    self.test_after_profile = None;
+                    if found
+                        && self.profile_for_region().as_deref() == Some(&profile)
+                        && self.visible
+                    {
+                        self.start_test();
+                    }
+                }
+            }
             worker::Reply::Credential(id, present, result) => {
                 self.credential_pending = false;
                 if let Some(present) = present {
@@ -568,9 +633,22 @@ impl State {
                     }
                 }
             }
-            worker::Reply::Tested(id, result) => {
+            worker::Reply::Tested {
+                id,
+                key_saved,
+                status,
+                result,
+            } => {
                 self.test_pending = false;
+                self.credential_pending = false;
+                if key_saved {
+                    self.settings.providers.entry(id).or_default().saved_key = true;
+                    self.original.entry(id).or_default().saved_key = true;
+                }
                 if id == self.id() {
+                    if let Some(status) = status {
+                        self.status = Some(status);
+                    }
                     self.connection = Some(result);
                 }
             }
@@ -581,10 +659,36 @@ impl State {
             .into_iter()
             .map(|id| ProviderRow {
                 id,
-                ready: self.environment_ready.contains(&id)
-                    || self.settings.provider_settings(id).saved_key,
+                status: self.provider_status(id),
             })
             .collect()
+    }
+    fn provider_status(&self, id: ProviderId) -> &'static str {
+        if self.settings.provider == Some(id) {
+            if self.test_pending || self.test_after_profile.is_some() {
+                return "Testing connection";
+            }
+            if self.credential_pending {
+                return "Checking credentials";
+            }
+            if let Some(connection) = &self.connection {
+                return if connection.is_ok() {
+                    "Connection passed"
+                } else {
+                    "Connection failed"
+                };
+            }
+            if let Some(status) = &self.status {
+                return if status.ready { "Ready" } else { "Needs setup" };
+            }
+        }
+        if self.environment_ready.contains(&id) {
+            "Environment credentials"
+        } else if self.settings.provider_settings(id).saved_key {
+            "Saved key"
+        } else {
+            "Not checked"
+        }
     }
     pub(in crate::gui) fn summary(&self) -> String {
         if !self.loaded {
@@ -599,21 +703,124 @@ impl State {
             "{} · {} · {}",
             id,
             settings.model(id),
-            if self.environment_ready.contains(&id) || settings.saved_key {
-                "Ready"
-            } else {
-                "Needs setup"
-            }
+            self.provider_status(id)
         )
     }
     pub(in crate::gui) fn field_issues(&self) -> Vec<SettingsError> {
         let id = self.id();
-        let settings = self.selected();
-        match settings.effective(id, |name| self.environment.get(name).cloned()) {
+        match self.effective_fields() {
             Ok(effective) => ai::provider::endpoints(id, &effective, effective.model(id))
                 .err()
                 .unwrap_or_default(),
             Err(issues) => issues,
+        }
+    }
+    fn effective_fields(&self) -> Result<ProviderSettings, Vec<SettingsError>> {
+        let mut settings = self
+            .selected()
+            .effective(self.id(), |name| self.environment.get(name).cloned())?;
+        if let Some(profile) = self.profile_for_region() {
+            match self.profile_regions.get(&profile) {
+                Some(Some(region)) => settings.region = Some(region.clone()),
+                Some(None) => {
+                    return Err(vec![SettingsError::new(
+                        "region",
+                        "Enter a region, or add a region to the selected AWS profile. Test connection checks the profile again.",
+                    )]);
+                }
+                None => {
+                    return Err(vec![SettingsError::new(
+                        "region",
+                        "Checking the selected AWS profile for its region…",
+                    )]);
+                }
+            }
+        }
+        settings.validate(self.id())?;
+        Ok(settings)
+    }
+    fn field_help(&self, field: Field) -> String {
+        let id = self.id();
+        if field == Field::Region
+            && let Some(profile) = self.profile_for_region()
+        {
+            if self.profile_pending.contains(&profile) {
+                return "Checking the selected AWS profile for its region…".into();
+            }
+            if let Some(Some(region)) = self.profile_regions.get(&profile) {
+                return format!(
+                    "Using {region} from AWS profile {profile}. Enter a region to override it."
+                );
+            }
+        }
+        let environment: &[&str] = match (id, field) {
+            (ProviderId::Cloudflare, Field::AccountId) => &["CLOUDFLARE_ACCOUNT_ID"],
+            (ProviderId::Azure, Field::Endpoint) => &["AZURE_OPENAI_ENDPOINT"],
+            (ProviderId::Bedrock, Field::Region) => &["AWS_REGION", "AWS_DEFAULT_REGION"],
+            (ProviderId::Bedrock, Field::Profile) => &["AWS_PROFILE"],
+            (ProviderId::Vertex, Field::Project) => &["GOOGLE_CLOUD_PROJECT"],
+            (ProviderId::Vertex, Field::Location) => &["GOOGLE_CLOUD_LOCATION"],
+            (ProviderId::Ollama, Field::BaseUrl) => &["OLLAMA_HOST"],
+            _ => &[],
+        };
+        if field.get(&self.selected()).is_none()
+            && let Some(name) = environment
+                .iter()
+                .find(|name| self.environment.contains_key(**name))
+        {
+            return format!(
+                "Using {name} from this app’s environment. Enter a value to override it."
+            );
+        }
+        match field {
+            Field::Model if id == ProviderId::Azure => {
+                "Enter your Azure deployment name. It must support tool calls.".into()
+            }
+            Field::Model if id.info().default_model.is_empty() => {
+                "Enter the model ID reported by your server. It must support tool calls.".into()
+            }
+            Field::Model => format!("Leave blank to use {}.", id.info().default_model),
+            Field::BaseUrl => {
+                "Use the API root, including /v1 for an OpenAI-compatible server. Do not include /chat/completions.".into()
+            }
+            Field::Endpoint => {
+                "Your Azure resource URL, such as https://your-resource.openai.azure.com.".into()
+            }
+            Field::AccountId => "Cloudflare account ID used to route the request.".into(),
+            Field::GatewayId => "Optional Cloudflare AI Gateway ID.".into(),
+            Field::Region => "AWS region where the model is available, such as us-east-1.".into(),
+            Field::Profile => "Optional local AWS profile name. Leave blank for the default credential chain.".into(),
+            Field::Project => "Google Cloud project ID for ADC. Gemini API key access can leave this blank.".into(),
+            Field::Location => "Leave blank for global, or use a location such as us-central1.".into(),
+        }
+    }
+    fn credential_help(&self) -> (&'static str, String) {
+        let id = self.id();
+        match id {
+            ProviderId::Bedrock => (
+                "Bedrock bearer token (optional)",
+                "Use your local AWS profile or AWS credential chain, or save a Bedrock bearer token here. AWS access key IDs and secret access keys belong in your AWS configuration.".into(),
+            ),
+            ProviderId::Vertex => (
+                "Google Cloud API key (Gemini only)",
+                "Use Google Application Default Credentials (ADC), or save a Google Cloud API key for Gemini. Claude on Vertex AI requires ADC and a project ID.".into(),
+            ),
+            ProviderId::Ollama => (
+                "API key (optional for local Ollama)",
+                "Start Ollama and choose an installed model. Local servers need no API key; ollama.com requires OLLAMA_API_KEY or a saved key.".into(),
+            ),
+            ProviderId::LmStudio => (
+                "API token (optional)",
+                "Start the LM Studio server and enter a loaded model ID. Save a token only if the server requires authentication.".into(),
+            ),
+            ProviderId::Custom => (
+                "API key (if your server requires one)",
+                "Use a server with OpenAI-compatible chat completions and tool calls. A key is optional when your server allows unauthenticated requests.".into(),
+            ),
+            _ => (
+                "API key",
+                format!("Save a {id} API key here, or launch Capturefab with {}.", id.info().key_envs.join(" or ")),
+            ),
         }
     }
     fn field_view<'a>(
@@ -639,9 +846,10 @@ impl State {
             .find(|issue| issue.field == field.key())
             .filter(|_| !value.is_empty() || self.show_required)
             .map(|issue| issue.message.clone());
+        let help = self.field_help(field);
         let input = text_input(placeholder, value)
             .name(format!("Assistant {}", field.label().to_lowercase()))
-            .description(format!("{} for the selected AI provider", field.label()))
+            .description(help.clone())
             .invalid(error.clone())
             .on_input_maybe(
                 self.can_edit()
@@ -656,7 +864,11 @@ impl State {
             });
         let mut out = column![
             text(field.label()).size(style::SMALL).color(p.secondary),
-            input
+            input,
+            text(help)
+                .size(style::SMALL)
+                .color(p.secondary)
+                .wrapping(text::Wrapping::WordOrGlyph)
         ]
         .spacing(6);
         if let Some(error) = error {
@@ -717,7 +929,7 @@ impl State {
             .spacing(6),
         );
         if self.settings.provider.is_none() {
-            return content.push(text("Choose a provider to set up the optional AI assistant. No request is sent when you open Settings.").size(style::SMALL).color(p.secondary)).into();
+            return content.push(text("Choose a provider for natural language captures in Quick Command. External agents can use the CLI without an app provider. No request is sent when you open Settings.").size(style::SMALL).color(p.secondary)).into();
         }
         content = content.push(self.field_view(Field::Model, &issues, p));
         let mut suggestions = vec![];
@@ -779,19 +991,33 @@ impl State {
             status,
             accessibility::Role::Status,
         ));
+        let (credential_label, credential_help) = self.credential_help();
+        let secret_error = self.secret_error();
         content = content.push(
             column![
-                text("API key").size(style::SMALL).color(p.secondary),
-                text_input("API key", &self.secret.0)
+                text(credential_label).size(style::SMALL).color(p.secondary),
+                text(credential_help)
+                    .size(style::SMALL)
+                    .color(p.secondary)
+                    .wrapping(text::Wrapping::WordOrGlyph),
+                text_input(credential_label, &self.secret.0)
                     .name(format!("{id} assistant API key"))
                     .description(SECRET_HELP)
+                    .invalid(secret_error.map(str::to_owned))
                     .secure(true)
                     .on_input_maybe(ready.then_some(|value: String| Input::Secret(value.into())))
                     .on_submit_maybe((ready && self.valid_secret()).then_some(Input::SaveKey))
                     .padding([6, 10])
                     .size(style::BODY)
-                    .style(style::input),
+                    .style(if secret_error.is_some() {
+                        style::input_invalid
+                    } else {
+                        style::input
+                    }),
                 text(SECRET_HELP).size(style::SMALL).color(p.secondary),
+                text("Environment credentials take precedence over saved keys.")
+                    .size(style::SMALL)
+                    .color(p.secondary),
                 row![
                     button(text("Save key").size(style::BODY))
                         .name("Save assistant API key in OS credential store")
@@ -811,6 +1037,9 @@ impl State {
             ]
             .spacing(6),
         );
+        if let Some(error) = secret_error {
+            content = content.push(field_error(error, p));
+        }
         let vision = settings.vision.unwrap_or_default();
         let decision = ai::vision::resolve(id, settings.model(id), vision, None, false);
         let resolved = match decision.resolved {
@@ -848,16 +1077,28 @@ impl State {
                 .spacing(6),
             );
         }
-        let test: Element<'_, Input> = if self.test_pending {
+        let checking_profile = self.test_after_profile.is_some();
+        let test: Element<'_, Input> = if self.test_pending || checking_profile {
             row![
                 icon::spinner(style::BODY, p.secondary, spin),
-                text("Testing connection…").size(style::BODY)
+                text(if checking_profile {
+                    "Checking AWS profile region…"
+                } else {
+                    "Testing connection…"
+                })
+                .size(style::BODY)
             ]
             .spacing(8)
             .align_y(Alignment::Center)
             .into()
         } else {
-            text("Test connection").size(style::BODY).into()
+            text(if self.valid_secret() {
+                "Save key and test connection"
+            } else {
+                "Test connection"
+            })
+            .size(style::BODY)
+            .into()
         };
         content = content.push(
             button(test)
@@ -866,25 +1107,30 @@ impl State {
                 .style(move |theme, status| {
                     style::secondary(
                         theme,
-                        if self.test_pending {
+                        if self.test_pending || checking_profile {
                             button::Status::Active
                         } else {
                             status
                         },
                     )
                 })
-                .on_press_maybe((ready && issues.is_empty()).then_some(Input::Test)),
+                .on_press_maybe(
+                    (ready && !checking_profile && secret_error.is_none()).then_some(Input::Test),
+                ),
         );
         content=content.push(text(format!("Sends a small test request to {id}. API usage may incur charges. No camera information or images are sent.")).size(style::SMALL).color(p.secondary));
         if !issues.is_empty() {
             content = content.push(
-                text("Complete the provider fields above to test the connection.")
+                    text("Complete the provider fields above. Test connection will show any missing fields.")
                     .size(style::SMALL)
                     .color(p.secondary),
             );
         }
         let connection = match &self.connection {
-            Some(Ok(())) => Some(("Done · Connection test passed.".to_owned(), Level::Done)),
+            Some(Ok(())) => Some((
+                "Done · Connection passed. Ready for Quick Command.".to_owned(),
+                Level::Done,
+            )),
             Some(Err(error)) => Some((format!("Failed · {}", error.message), Level::Error)),
             None => None,
         };
@@ -909,6 +1155,15 @@ impl State {
             text(" ").size(style::SMALL).into()
         };
         content = content.push(status);
+        if matches!(self.connection, Some(Ok(()))) {
+            content = content.push(
+                button(text("Open Quick Command").size(style::BODY))
+                    .name("Assistant setup complete: open Quick Command")
+                    .padding([6, 12])
+                    .style(style::primary)
+                    .on_press_maybe(self.ready_to_continue().then_some(Input::ContinueToQuick)),
+            );
+        }
         if let Some(Err(error)) = &self.connection
             && let Some(excerpt) = &error.excerpt
         {
@@ -978,6 +1233,12 @@ impl State {
         }
         state
     }
+    pub(in crate::gui) fn show_connection_success(&mut self) {
+        if self.synthetic {
+            self.clear_secret();
+            self.connection = Some(Ok(()));
+        }
+    }
 }
 
 fn supports_effort(id: ProviderId) -> bool {
@@ -1008,6 +1269,10 @@ mod tests {
         selected: Mutex<Option<ProviderId>>,
         keys: Mutex<Vec<(ProviderId, bool)>>,
         tests: AtomicUsize,
+        fail_store: std::sync::atomic::AtomicBool,
+        test_success: std::sync::atomic::AtomicBool,
+        profile_config: Mutex<Option<std::path::PathBuf>>,
+        profile_reads: Mutex<Vec<(String, std::thread::ThreadId)>>,
     }
     #[test]
     fn a_missing_worker_cannot_report_unsaved_settings_as_flushed() {
@@ -1019,6 +1284,16 @@ mod tests {
         assert!(!state.unsaved.is_empty());
     }
     impl Services for Stub {
+        fn profile_region(&self, profile: &str) -> Option<String> {
+            self.profile_reads
+                .lock()
+                .unwrap()
+                .push((profile.into(), std::thread::current().id()));
+            let path = self.profile_config.lock().unwrap().clone()?;
+            crate::aws::profile_region_from_env(profile, |name| {
+                (name == "AWS_CONFIG_FILE").then(|| path.as_os_str().to_owned())
+            })
+        }
         fn load(&self) -> Loaded {
             self.loaded.fetch_add(1, Ordering::SeqCst);
             *self.selected.lock().unwrap() = Some(ProviderId::Anthropic);
@@ -1059,6 +1334,9 @@ mod tests {
             }
         }
         fn store(&self, id: ProviderId, _: &str) -> Result<(), String> {
+            if self.fail_store.load(Ordering::SeqCst) {
+                return Err("The OS credential store could not save this key.".into());
+            }
             self.keys.lock().unwrap().push((id, true));
             Ok(())
         }
@@ -1068,6 +1346,9 @@ mod tests {
         }
         fn test(&self, _: ProviderId, _: ProviderSettings) -> Result<(), ConnectionFailure> {
             self.tests.fetch_add(1, Ordering::SeqCst);
+            if self.test_success.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             Err(ConnectionFailure {
                 message: "The provider rejected the request.".into(),
                 excerpt: Some("Choose another model.".into()),
@@ -1088,6 +1369,146 @@ mod tests {
         state.set_visible(true);
         settle(&mut state);
         (state, services)
+    }
+
+    #[test]
+    fn bedrock_profile_region_is_validated_on_the_worker_without_persisting_it() {
+        let root = std::env::temp_dir().join(format!(
+            "capturefab-gui-bedrock-{}-{}",
+            std::process::id(),
+            getrandom::u64().unwrap()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config");
+        std::fs::write(&path,"[default]\nregion = us-west-2\n[profile lab]\nregion = eu-central-1\n[profile env]\nregion = us-east-2\n").unwrap();
+        let (mut state, services) = loaded();
+        *services.profile_config.lock().unwrap() = Some(path.clone());
+        services.test_success.store(true, Ordering::SeqCst);
+        let ui_thread = std::thread::current().id();
+        state.input(Input::Provider(ProviderId::Bedrock), Instant::now());
+        state.input(Input::Field(Field::Profile, "lab".into()), Instant::now());
+        assert!(services.profile_reads.lock().unwrap().is_empty());
+        assert!(services.status.lock().unwrap().is_empty());
+        state.input(Input::Open(true), Instant::now());
+        settle(&mut state);
+        assert!(state.field_issues().is_empty());
+        assert_eq!(
+            state.effective_fields().unwrap().region.as_deref(),
+            Some("eu-central-1")
+        );
+        assert_eq!(state.selected().region, None);
+        assert!(state.field_help(Field::Region).contains("AWS profile lab"));
+        assert!(
+            services
+                .profile_reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(profile, thread)| profile == "lab" && *thread != ui_thread)
+        );
+        let reads = services.profile_reads.lock().unwrap().len();
+        let statuses = services.status.lock().unwrap().len();
+        for _ in 0..20 {
+            assert!(state.field_issues().is_empty());
+        }
+        assert_eq!(services.profile_reads.lock().unwrap().len(), reads);
+        assert_eq!(services.status.lock().unwrap().len(), statuses);
+
+        state.input(Input::Test, Instant::now());
+        settle(&mut state);
+        assert_eq!(services.tests.load(Ordering::SeqCst), 1);
+        assert!(matches!(state.connection, Some(Ok(()))));
+        assert!(
+            services
+                .writes
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, settings)| settings.region.is_none())
+        );
+
+        // A profile edit outside the app is rechecked by Test, including a
+        // missing region; cached success cannot send a request or remain ready.
+        std::fs::write(&path, "[profile lab]\noutput = json\n").unwrap();
+        state.input(Input::Test, Instant::now());
+        settle(&mut state);
+        assert_eq!(services.tests.load(Ordering::SeqCst), 1);
+        assert!(state.connection.is_none());
+        assert!(
+            state
+                .field_issues()
+                .iter()
+                .any(|issue| issue.field == "region")
+        );
+        std::fs::write(&path, "[profile lab]\nregion = eu-west-2\n").unwrap();
+        state.input(Input::Test, Instant::now());
+        settle(&mut state);
+        assert_eq!(services.tests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            state.effective_fields().unwrap().region.as_deref(),
+            Some("eu-west-2")
+        );
+
+        state
+            .environment
+            .insert("AWS_REGION".into(), "eu-north-1".into());
+        state
+            .environment
+            .insert("AWS_DEFAULT_REGION".into(), "us-east-1".into());
+        assert_eq!(
+            state.effective_fields().unwrap().region.as_deref(),
+            Some("eu-north-1")
+        );
+        state.environment.remove("AWS_REGION");
+        assert_eq!(
+            state.effective_fields().unwrap().region.as_deref(),
+            Some("us-east-1")
+        );
+        state.input(
+            Input::Field(Field::Region, "ap-south-1".into()),
+            Instant::now(),
+        );
+        assert_eq!(
+            state.effective_fields().unwrap().region.as_deref(),
+            Some("ap-south-1")
+        );
+        state.environment.insert("AWS_PROFILE".into(), "env".into());
+        state.input(Input::Field(Field::Region, String::new()), Instant::now());
+        state.environment.remove("AWS_DEFAULT_REGION");
+        assert_eq!(state.profile_for_region().as_deref(), Some("lab"));
+        state.input(Input::Field(Field::Profile, String::new()), Instant::now());
+        assert_eq!(state.profile_for_region().as_deref(), Some("env"));
+        state.environment.remove("AWS_PROFILE");
+        assert_eq!(state.profile_for_region().as_deref(), Some("default"));
+        settle(&mut state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_late_profile_region_cannot_test_changed_settings_or_touch_credentials() {
+        let (mut state, services) = loaded();
+        state.settings.provider = Some(ProviderId::Bedrock);
+        state
+            .settings
+            .providers
+            .entry(ProviderId::Bedrock)
+            .or_default()
+            .profile = Some("old".into());
+        state.test_after_profile = Some("old".into());
+        state.input(
+            Input::Field(Field::Profile, "replacement".into()),
+            Instant::now(),
+        );
+        state.reply(worker::Reply::ProfileRegion(
+            "old".into(),
+            Some("us-east-1".into()),
+        ));
+        assert!(state.test_after_profile.is_none());
+        assert!(!state.test_pending);
+        assert_eq!(services.tests.load(Ordering::SeqCst), 0);
+        assert!(services.status.lock().unwrap().is_empty());
+        assert!(services.keys.lock().unwrap().is_empty());
+        assert!(services.profile_reads.lock().unwrap().is_empty());
     }
     #[test]
     fn construction_and_all_provider_readiness_do_not_read_the_credential_store() {
@@ -1111,19 +1532,26 @@ mod tests {
             .or_default()
             .saved_key = true;
         let rows = state.provider_rows();
-        assert!(
+        assert_eq!(
             rows.iter()
                 .find(|row| row.id == ProviderId::OpenAi)
                 .unwrap()
-                .ready
+                .status,
+            "Environment credentials"
         );
-        assert!(
+        assert_eq!(
             rows.iter()
                 .find(|row| row.id == ProviderId::Groq)
                 .unwrap()
-                .ready
+                .status,
+            "Saved key"
         );
-        assert_eq!(rows.iter().filter(|row| row.ready).count(), 2);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.status != "Not checked")
+                .count(),
+            2
+        );
         assert!(services.status.lock().unwrap().is_empty());
         state.input(Input::Open(true), Instant::now());
         settle(&mut state);
@@ -1131,6 +1559,105 @@ mod tests {
         state.provider_rows();
         state.provider_rows();
         assert_eq!(services.status.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn provider_readiness_uses_async_keyless_and_cloud_chain_receipts_without_more_io() {
+        let services = Arc::new(Stub::default());
+        let mut state = State::with_services(services.clone());
+        state.loaded = true;
+        for (id, source) in [
+            (ProviderId::Ollama, "No API key required"),
+            (ProviderId::LmStudio, "No API key required"),
+            (ProviderId::Custom, "No API key required"),
+            (ProviderId::Bedrock, "AWS profile"),
+            (ProviderId::Vertex, "Google Application Default Credentials"),
+        ] {
+            state.settings.provider = Some(id);
+            state.reply(worker::Reply::Status(
+                id,
+                Some(ai::CredentialStatus {
+                    ready: true,
+                    source: source.into(),
+                    missing: vec![],
+                }),
+            ));
+            assert_eq!(state.provider_status(id), "Ready", "{id}");
+            assert!(state.summary().ends_with(" · Ready"), "{id}");
+            let rows = state.provider_rows();
+            assert_eq!(
+                rows.iter().find(|row| row.id == id).unwrap().status,
+                "Ready"
+            );
+            assert!(
+                rows.iter()
+                    .filter(|row| row.id != id)
+                    .all(|row| row.status == "Not checked")
+            );
+        }
+        assert_eq!(services.loaded.load(Ordering::SeqCst), 0);
+        assert!(services.status.lock().unwrap().is_empty());
+        assert!(services.keys.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn provider_readiness_uses_connection_results_and_discards_old_configuration_status() {
+        let services = Arc::new(Stub::default());
+        let mut state = State::with_services(services.clone());
+        state.loaded = true;
+        state.synthetic = true;
+        state.settings.provider = Some(ProviderId::Ollama);
+        state.status = Some(ai::CredentialStatus {
+            ready: true,
+            source: "No API key required".into(),
+            missing: vec![],
+        });
+        state.reply(worker::Reply::Tested {
+            id: ProviderId::Ollama,
+            key_saved: false,
+            status: None,
+            result: Ok(()),
+        });
+        assert!(state.summary().ends_with(" · Connection passed"));
+        state.reply(worker::Reply::Tested {
+            id: ProviderId::Ollama,
+            key_saved: false,
+            status: None,
+            result: Err(ConnectionFailure {
+                message: "Server unavailable".into(),
+                excerpt: None,
+            }),
+        });
+        assert!(state.summary().ends_with(" · Connection failed"));
+        state.input(Input::Provider(ProviderId::Bedrock), Instant::now());
+        assert!(state.status.is_none() && state.connection.is_none());
+        assert!(state.summary().ends_with(" · Not checked"));
+        state.reply(worker::Reply::Status(
+            ProviderId::Ollama,
+            Some(ai::CredentialStatus {
+                ready: true,
+                source: "stale local status".into(),
+                missing: vec![],
+            }),
+        ));
+        assert!(
+            state.status.is_none(),
+            "another provider's receipt cannot label this one"
+        );
+        state.reply(worker::Reply::Status(
+            ProviderId::Bedrock,
+            Some(ai::CredentialStatus {
+                ready: true,
+                source: "AWS profile".into(),
+                missing: vec![],
+            }),
+        ));
+        assert!(state.summary().ends_with(" · Ready"));
+        state.input(
+            Input::Field(Field::Region, "us-west-2".into()),
+            Instant::now(),
+        );
+        assert!(state.status.is_none());
+        assert!(state.summary().ends_with(" · Not checked"));
+        assert!(services.status.lock().unwrap().is_empty());
     }
     #[test]
     fn only_the_visible_selected_provider_gets_a_status_read() {
@@ -1351,6 +1878,117 @@ mod tests {
         assert!(
             matches!(state.connection,Some(Err(ref error)) if error.excerpt.as_deref()==Some("Choose another model."))
         );
+    }
+    #[test]
+    fn testing_a_draft_saves_it_before_testing_and_reports_the_current_key_state() {
+        let (mut state, services) = loaded();
+        services.test_success.store(true, Ordering::SeqCst);
+        state.input(
+            Input::Secret("new-test-key".to_owned().into()),
+            Instant::now(),
+        );
+        state.input(Input::Test, Instant::now());
+        assert!(state.test_pending && state.credential_pending);
+        assert!(
+            state.secret.0.is_empty(),
+            "the draft leaves the UI immediately"
+        );
+        settle(&mut state);
+        assert_eq!(
+            &*services.keys.lock().unwrap(),
+            &[(ProviderId::Anthropic, true)]
+        );
+        assert_eq!(services.tests.load(Ordering::SeqCst), 1);
+        assert!(state.selected().saved_key);
+        assert!(matches!(state.connection, Some(Ok(()))));
+        state.input(Input::RemoveKey, Instant::now());
+        assert!(
+            state.connection.is_none(),
+            "removing the tested key invalidates success"
+        );
+        settle(&mut state);
+    }
+    #[test]
+    fn a_failed_key_save_aborts_the_test_instead_of_using_previous_credentials() {
+        let (mut state, services) = loaded();
+        services.fail_store.store(true, Ordering::SeqCst);
+        state.input(
+            Input::Secret("new-test-key".to_owned().into()),
+            Instant::now(),
+        );
+        state.input(Input::Test, Instant::now());
+        settle(&mut state);
+        assert_eq!(services.tests.load(Ordering::SeqCst), 0);
+        assert!(!state.selected().saved_key);
+        assert!(
+            matches!(state.connection, Some(Err(ref error)) if error.message.contains("could not save"))
+        );
+        assert!(!state.credential_pending && !state.test_pending);
+    }
+    #[test]
+    fn testing_missing_fields_reveals_errors_without_sending_a_request() {
+        let (mut state, services) = loaded();
+        state.input(Input::Provider(ProviderId::Custom), Instant::now());
+        settle(&mut state);
+        assert!(!state.show_required);
+        state.input(Input::Test, Instant::now());
+        assert!(state.show_required);
+        assert!(
+            state
+                .field_issues()
+                .iter()
+                .any(|issue| issue.field == "model")
+        );
+        state.input(
+            Input::Field(Field::Model, "local-model".into()),
+            Instant::now(),
+        );
+        assert!(state.show_required);
+        assert!(
+            state
+                .field_issues()
+                .iter()
+                .any(|issue| issue.field == "base_url")
+        );
+        assert_eq!(services.tests.load(Ordering::SeqCst), 0);
+        assert!(!state.test_pending);
+    }
+    #[test]
+    fn field_help_names_detected_configuration_without_persisting_it() {
+        let mut state = State::scene(false);
+        state.settings.provider = Some(ProviderId::Azure);
+        state.environment.insert(
+            "AZURE_OPENAI_ENDPOINT".into(),
+            "https://resource.openai.azure.com".into(),
+        );
+        assert!(
+            state
+                .field_help(Field::Endpoint)
+                .contains("Using AZURE_OPENAI_ENDPOINT")
+        );
+        assert!(state.selected().endpoint.is_none());
+        state.input(
+            Input::Field(Field::Endpoint, "https://override.openai.azure.com".into()),
+            Instant::now(),
+        );
+        assert!(
+            !state
+                .field_help(Field::Endpoint)
+                .contains("Using AZURE_OPENAI_ENDPOINT")
+        );
+    }
+    #[test]
+    fn invalid_key_drafts_are_explained_without_entering_the_worker() {
+        let (mut state, services) = loaded();
+        state.input(
+            Input::Secret("key with whitespace".to_owned().into()),
+            Instant::now(),
+        );
+        assert!(state.secret_error().is_some());
+        state.input(Input::Test, Instant::now());
+        assert!(!state.test_pending);
+        assert_eq!(services.tests.load(Ordering::SeqCst), 0);
+        assert!(services.keys.lock().unwrap().is_empty());
     }
     #[test]
     fn stale_status_requests_do_not_open_a_keychain_after_settings_closes() {

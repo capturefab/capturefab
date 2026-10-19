@@ -6,16 +6,16 @@
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#1e1e20" media="(prefers-color-scheme: dark)">
-  <meta name="description" content="Connect cameras, examine live images and save frames or video. Download the free Capturefab desktop app and CLI for macOS, Windows and Linux.">
-  <meta property="og:title" content="Capturefab — camera control and image capture">
-  <meta property="og:description" content="Control industrial cameras, webcams and network streams. Save images or video with the free desktop app and CLI.">
+  <meta name="description" content="Capture images and video with your coding agent or Capturefab's built-in assistant. Collect plant data through the CLI. Share one workspace and step in when needed.">
+  <meta property="og:title" content="Capturefab — camera capture for people and agents">
+  <meta property="og:description" content="Drive camera captures from your coding agent, the built-in assistant or direct controls. Keep images, data and human review together.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://capturefab.com/">
   <meta property="og:image" content="https://capturefab.com/images/docs/workspace.png">
   <meta property="og:image:width" content="2200">
   <meta property="og:image:height" content="1400">
   <meta name="twitter:card" content="summary_large_image">
-  <title>Capturefab — camera control and image capture</title>
+  <title>Capturefab — camera capture for people and agents</title>
   <link rel="stylesheet" href="style.css">
   <link rel="icon" href="favicon.ico" sizes="16x16 32x32 48x48">
   <link rel="icon" href="favicon-32.png" type="image/png" sizes="32x32">
@@ -38,12 +38,12 @@
     <main id="main">
       <div class="hero product-hero">
         <section class="hero-copy" aria-labelledby="hero-title">
-          <p class="eyebrow"><span class="brand-dot" aria-hidden="true"></span> Camera control for your desktop and terminal</p>
-          <h1 id="hero-title">Connect your camera.<br>Capture the image.</h1>
-          <p class="lead">Control industrial cameras, webcams and network streams. Adjust camera settings. Save images or video from one desktop app.</p>
-          <div class="actions"><a class="button primary" href="#download">Download Capturefab <span aria-hidden="true">↓</span></a><a class="button" href="#in-action">See the app in action <span aria-hidden="true">→</span></a></div>
+          <p class="eyebrow"><span class="brand-dot" aria-hidden="true"></span> Cameras, agents and people in one workspace</p>
+          <h1 id="hero-title">Let an agent capture.<br>Step in when needed.</h1>
+          <p class="lead">Let your coding agent or the built-in AI assistant examine cameras and capture images or video. Collect plant data through the CLI. Follow the work in the app.</p>
+          <div class="actions"><a class="button primary" href="#download">Download Capturefab <span aria-hidden="true">↓</span></a><a class="button" href="#start">Choose how to start <span aria-hidden="true">→</span></a></div>
           <p class="hero-note">Free and open source. MIT license.<br>Desktop app and CLI for macOS, Windows and Linux.</p>
-          <ul class="hero-facts"><li>Compare live images from multiple cameras.</li><li>Control the same session from a script.</li><li>Try the simulator without a camera.</li></ul>
+          <ul class="hero-facts"><li>Connect your existing agent through the CLI.</li><li>Give the built-in assistant a task and clear limits.</li><li>Try either route with a simulator camera.</li></ul>
         </section>
         <section id="download" class="download-card hero-download" aria-labelledby="download-title">
           <div class="download-heading"><p class="eyebrow">Get Capturefab</p><h2 id="download-title">Choose your download</h2><p>Latest release: <span id="release-version">see all downloads</span></p></div>
@@ -66,6 +66,14 @@
           <noscript><p class="notice">Open <a href="downloads.html">all downloads</a> to select a file. JavaScript is not necessary.</p></noscript>
         </section>
       </div>
+      <section id="start" class="start-section" aria-labelledby="start-title">
+        <div class="start-intro"><h2 id="start-title">Choose who drives.</h2><p>Use the same camera session for automation and manual controls. Keep the preview and Activity open for review.</p></div>
+        <div class="start-routes">
+          <article><h3>Your coding agent</h3><p>Use Claude Code, Codex, Antigravity or another harness that runs CLI commands. Capturefab supplies camera tools and JSON results.</p><p class="route-detail">No Capturefab AI provider setup. Your harness manages its own model access.</p><a href="docs.html#agent-setup">Set up an external agent</a><a href="agents.md" download="capturefab-agents.md">Download agent instructions</a></article>
+          <article><h3>The built-in assistant</h3><p>Configure your provider in Settings → AI assistant. Open Quick Command and describe the capture task.</p><p class="route-detail">Review a plan, or select cameras and limits for a bounded task. Enable camera images only when wanted.</p><a href="docs.html#assistant">Set up the AI assistant</a></article>
+          <article><h3>You, at the controls</h3><p>Connect a camera and capture directly. Use the preview, image scopes and settings to guide or take over the work.</p><p class="route-detail">Start with <code>sim:0</code> before connecting hardware. Provider credentials are unnecessary for direct capture.</p><a href="docs.html#getting-started">Try a manual capture</a></article>
+        </div>
+      </section>
       <section class="showcase" aria-labelledby="workspace-title">
         <div class="showcase-bar"><span id="workspace-title"><span class="brand-dot" aria-hidden="true"></span> Multiple cameras. One workspace.</span><a href="docs.html#workspace">Read the interface guide <span aria-hidden="true">→</span></a></div>
         <figure><a class="screenshot-link" href="images/docs/workspace.png" aria-label="Enlarge the Capturefab desktop screenshot"><img src="images/docs/workspace.png" alt="Capturefab desktop with four simulator camera previews, a camera list and the selected camera's Features inspector" width="2200" height="1400" fetchpriority="high" decoding="async"></a><figcaption>Actual desktop interface from a development build. All images use built-in simulator cameras. Select an image to see the controls in detail.</figcaption></figure>
@@ -101,13 +109,13 @@ capturefab --camera sim:0 capture -o first.png
 capturefab --camera sim:0 features</code></pre><button class="copy-button" type="button" aria-label="Copy the simulator quickstart">Copy</button></div><p><a href="docs.html#getting-started">Read the quickstart →</a></p></div></div>
       </section>
       <section id="automation" class="section" aria-labelledby="automation-title">
-        <div class="section-heading"><p class="eyebrow">Desktop and CLI in one session</p><h2 id="automation-title">See what your script does.</h2><p>Connect a script or coding agent to a named desktop session. The app shows camera activity, saved files and errors.</p></div>
+        <div class="section-heading"><p class="eyebrow">Desktop and CLI in one session</p><h2 id="automation-title">See what your agent does.</h2><p>Pin a named session and camera. Give the agent a recognizable name. Activity shows its actions, saved files and errors.</p></div>
         <div class="automation-grid"><div><div class="code-wrap"><pre><code># Open a named desktop session
 capturefab gui --name bench
 
 # Use another terminal for these commands
-capturefab --session bench connect sim:0
-capturefab --session bench --camera sim:0 capture -o shot.png
+capturefab --session bench --actor capture-agent --actor-kind agent connect sim:0 --json
+capturefab --session bench --actor capture-agent --actor-kind agent --camera sim:0 capture -o 'shot-{seq}.png' --json
 capturefab --session bench status --json</code></pre><button class="copy-button" type="button" aria-label="Copy the session commands">Copy</button></div><div class="text-links"><a href="docs.html#sessions">Sessions and automation →</a><a href="docs.html#cli-reference">CLI reference →</a></div></div><figure><a class="screenshot-link" href="images/cli.svg" aria-label="Enlarge the real terminal example"><img src="images/cli.svg" alt="Capturefab terminal commands for simulator discovery, feature changes and image capture with JSON results" width="1200" height="712" loading="lazy"></a><figcaption>Actual command output from the simulator. The CLI supplies JSON results and exit codes for scripts.</figcaption></figure></div>
       </section>
       <section id="how" class="section" aria-labelledby="how-title"><div class="reliability"><div><p class="eyebrow">Capture with clear limits</p><h2 id="how-title">Keep control of files and storage.</h2><p>Each camera runs in a separate process. Live previews use the newest frame. Capture and recording use storage limits.</p><a href="docs.html#architecture">Read about the architecture →</a></div><dl><div><dt>Protect existing files</dt><dd>Capturefab does not replace an existing file when its name matches the output name.</dd></div><div><dt>Set storage limits</dt><dd>The defaults are 10 GiB and 10,000 files. Capture stops at the limit. Automatic deletion is optional.</dd></div><div><dt>Run locally</dt><dd>Capturefab has no telemetry or automatic update requests. You can capture camera images without a cloud account.</dd></div></dl></div></section>

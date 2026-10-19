@@ -41,6 +41,7 @@ pub(super) enum Input {
 
 #[derive(Default)]
 pub(super) struct State {
+    pub(super) commands: agents::CommandContext,
     pub settings: settings::State,
     pub quick: quick::State,
     pub tasks: tasks::State,
@@ -48,12 +49,22 @@ pub(super) struct State {
     handoff: Option<bool>,
     pub(super) quit: Option<CloseTarget>,
     announced_approval: Option<(String, u64)>,
-    takeover: Option<String>,
+    takeover: Option<tasks::TakeoverTarget>,
 }
 
 impl Workbench {
     pub(super) fn update_assistant(&mut self, input: Input) -> Task<Message> {
         match input {
+            Input::Settings(settings::Input::ContinueToQuick) => {
+                if !self.assistant.settings.ready_to_continue() {
+                    return Task::none();
+                }
+                return self
+                    .handle_message(Message::Settings(false))
+                    .chain(Task::done(Message::Assistant(Input::Quick(
+                        quick::Input::Open(true),
+                    ))));
+            }
             Input::Settings(input) => self.assistant.settings.input(input, self.now),
             Input::Task(input) => return self.update_assistant_task(input),
             Input::Quick(input) => {
@@ -70,6 +81,9 @@ impl Workbench {
                     let _ = self.assistant.tasks.input(tasks::Input::NewTask, self.now);
                 }
                 if let quick::Input::Open(open) = &input {
+                    if *open && self.help_open && self.sheets.agents {
+                        self.help_open = false;
+                    }
                     if *open && !self.assistant.quick.open && self.sheet_open() {
                         return Task::none();
                     }
@@ -108,8 +122,11 @@ impl Workbench {
             );
         }
         self.assistant.tasks.tick(self.now);
-        if let Some(camera) = self.assistant.tasks.take_takeover() {
-            self.assistant.takeover = Some(camera);
+        if self.assistant.tasks.take_context_refresh() {
+            self.assistant.quick.refresh_context(self.now);
+        }
+        if let Some(target) = self.assistant.tasks.take_takeover() {
+            self.assistant.takeover = Some(target);
         }
         if let Some(actor) = self.assistant.tasks.actor_id() {
             self.assistant.local_actors.insert(actor);
@@ -165,6 +182,10 @@ impl Workbench {
             self.assistant.quick.settings.clone()
         };
         self.assistant.quick.configure(settings.clone(), services);
+        self.assistant
+            .quick
+            .source_setup
+            .configure(Arc::new(source_setup::Native(self.handle.clone())));
         let task_services = Arc::new(tasks_worker::NativeServices::new(
             self.handle.clone(),
             self.actor.clone(),
@@ -177,6 +198,10 @@ impl Workbench {
             },
         ));
         self.assistant.tasks.configure(settings, task_services);
+        self.assistant
+            .tasks
+            .source_setup
+            .configure(Arc::new(source_setup::Native(self.handle.clone())));
         if self.assistant.settings.loaded() {
             self.assistant
                 .quick
@@ -195,6 +220,7 @@ impl Workbench {
             quick::Effect::FocusStep(id) => {
                 operation::focus(cards::focus_id(&self.assistant.quick, id))
             }
+            quick::Effect::FocusField(id) => operation::focus(id),
             quick::Effect::Copy(value) => {
                 iced::clipboard::write(crate::tools::redact::for_output_text(&value))
             }
@@ -211,8 +237,19 @@ impl Workbench {
     }
 
     pub(super) fn take_assistant_handoff(&mut self) -> Task<Message> {
-        if let Some(camera) = self.assistant.takeover.take() {
-            return self.assistant_take_over(camera);
+        if let Some(target) = self.assistant.takeover.take() {
+            return match target {
+                tasks::TakeoverTarget::Camera(camera) => self.assistant_take_over(camera),
+                tasks::TakeoverTarget::Data => {
+                    let _ = self.update_assistant(Input::Quick(quick::Input::Open(false)));
+                    self.set_notice(
+                        "You have control of data sources. The assistant stopped.",
+                        None,
+                        Level::Done,
+                    );
+                    self.open_data_sources()
+                }
+            };
         }
         match self.assistant.handoff.take() {
             Some(true) => {
@@ -244,6 +281,19 @@ impl Workbench {
                 self.spin(),
                 task_view::plan_notice(&self.assistant.tasks, p)
                     .map(|notice| accessibility::mapped(notice, quick::Input::Task)),
+                self.assistant
+                    .quick
+                    .exported_plan
+                    .as_ref()
+                    .and_then(|path| {
+                        self.assistant.quick.context.as_ref().and_then(|context| {
+                            self.assistant.commands.plan_preview(
+                                &self.session,
+                                path,
+                                &context.capture_root,
+                            )
+                        })
+                    }),
             ),
             |input| Message::Assistant(Input::Quick(input)),
         )
@@ -442,7 +492,9 @@ impl Workbench {
                             .on_key_press(no_return)
                             .style(style::secondary)
                             .padding([4, 8])
-                            .on_press(message(tasks::Input::TakeOver(Some(camera.into())))),
+                            .on_press(message(tasks::Input::TakeOver(
+                                tasks::TakeoverTarget::Camera(camera.into())
+                            ))),
                     ]
                     .spacing(8),
                 ]

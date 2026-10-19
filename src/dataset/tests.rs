@@ -488,6 +488,68 @@ fn validate_command_bounds() {
         until_ms: Some(1),
         storage: Default::default()
     }));
+    for (id, accepted) in [
+        ("0123456789abcdef0123456789abcdef", true),
+        ("", false),
+        ("foreign/path", false),
+    ] {
+        assert_eq!(
+            ok(C::DatasetCloseIf {
+                slot_id: id.into(),
+                sink_generation: None
+            }),
+            accepted
+        );
+    }
+    for (max_result_bytes, accepted) in [
+        (0, false),
+        (255, false),
+        (256, true),
+        (8 * 1024 * 1024 + 1, false),
+    ] {
+        assert_eq!(
+            ok(C::DatasetQueryIf {
+                slot_id: "0123456789abcdef0123456789abcdef".into(),
+                sql: "SELECT 1".into(),
+                limit: 1,
+                timeout_ms: 1000,
+                max_result_bytes
+            }),
+            accepted
+        );
+        assert_eq!(
+            ok(C::DatasetModelQueryIf {
+                slot_id: "0123456789abcdef0123456789abcdef".into(),
+                sql: "SELECT 1".into(),
+                limit: 1,
+                timeout_ms: 1000,
+                max_result_bytes
+            }),
+            accepted
+        );
+    }
+    for (max_bytes, timeout_ms, accepted) in [
+        (0, 1000, false),
+        (1000, 0, false),
+        (1000, 600001, false),
+        (1000, 1000, true),
+    ] {
+        assert_eq!(
+            ok(C::DatasetExportIf {
+                slot_id: "0123456789abcdef0123456789abcdef".into(),
+                output: "/x".into(),
+                approved_root: None,
+                formats: vec![],
+                tables: vec![],
+                since_ms: None,
+                until_ms: None,
+                storage: Default::default(),
+                max_bytes,
+                timeout_ms
+            }),
+            accepted
+        );
+    }
 }
 
 fn export_request(output: PathBuf, formats: Vec<ExportFormat>) -> export::ExportRequest {
@@ -634,6 +696,514 @@ fn unsupported_formats_without_parquet() {
         .err()
         .unwrap();
     assert_eq!(crate::cli::error_code(&error).1, 5, "{error}");
+    slot.close().unwrap();
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn checked_dataset_identity_changes_on_reopen_and_preserves_replacement() {
+    use crate::session::SessionCommand as C;
+    let dir = temp_dir("checked-slot");
+    let path = dir.join("data.duckdb");
+    let slot = Arc::new(Slot::new());
+    let hub = crate::signals::hub::SignalHub::new();
+    let open = || C::DatasetOpenIf {
+        expected_slot_id: None,
+        path: path.to_string_lossy().into_owned(),
+        mode: OpenMode::Auto,
+        max_bytes: None,
+    };
+    let first = coordinator::run(&slot, &hub, open()).unwrap();
+    let first_id = first["slot_id"].as_str().unwrap().to_owned();
+    assert_eq!(first_id.len(), 32);
+    let unchanged = slot
+        .open_if(Some(&first_id), &path, OpenMode::Open, None)
+        .unwrap();
+    assert_eq!(unchanged.slot_id.as_deref(), Some(first_id.as_str()));
+    coordinator::run(
+        &slot,
+        &hub,
+        C::DatasetCloseIf {
+            slot_id: first_id.clone(),
+            sink_generation: None,
+        },
+    )
+    .unwrap();
+    let second = coordinator::run(&slot, &hub, open()).unwrap();
+    let second_id = second["slot_id"].as_str().unwrap().to_owned();
+    assert_ne!(first_id, second_id);
+    assert_eq!(
+        first["dataset_id"], second["dataset_id"],
+        "file identity persists"
+    );
+    assert!(hub.has_sink());
+    let auto = dir.join("automatic.duckdb");
+    slot.set_auto_path(Some(auto.clone()));
+    let events = slot.status_cached().unwrap().events;
+    for command in [
+        C::DatasetCloseIf {
+            slot_id: first_id.clone(),
+            sink_generation: None,
+        },
+        C::DatasetNoteIf {
+            slot_id: first_id.clone(),
+            text: "stale note".into(),
+            context: Context::new(),
+            camera: None,
+        },
+        C::DatasetQueryIf {
+            slot_id: first_id.clone(),
+            sql: "SELECT 1".into(),
+            limit: 1,
+            timeout_ms: 1000,
+            max_result_bytes: 1000,
+        },
+        C::DatasetModelQueryIf {
+            slot_id: first_id.clone(),
+            sql: "SELECT 1".into(),
+            limit: 1,
+            timeout_ms: 1000,
+            max_result_bytes: 1000,
+        },
+        C::DatasetExportIf {
+            slot_id: first_id.clone(),
+            output: dir.join("wrong-export").to_string_lossy().into_owned(),
+            approved_root: None,
+            formats: vec![ExportFormat::Csv],
+            tables: vec![],
+            since_ms: None,
+            until_ms: None,
+            storage: Default::default(),
+            max_bytes: 100000,
+            timeout_ms: 1000,
+        },
+        open(),
+    ] {
+        let error = coordinator::run(&slot, &hub, command).unwrap_err();
+        assert!(
+            error.to_string().contains("dataset slot changed"),
+            "{error:#}"
+        );
+        assert!(
+            hub.has_sink(),
+            "stale close must not detach the replacement sink"
+        );
+        assert_eq!(
+            slot.auto_path(),
+            Some(auto.clone()),
+            "stale open/close must not alter automatic setup"
+        );
+        let status = slot.status_cached().unwrap();
+        assert_eq!(status.slot_id.as_deref(), Some(second_id.as_str()));
+        assert_eq!(status.events, events);
+    }
+    assert!(!dir.join("wrong-export").exists());
+    let tags = [TagInfo {
+        tag: "t".into(),
+        unit: Some("°C".into()),
+        kind: Some("number".into()),
+    }];
+    assert!(
+        slot.register_for_dataset_slot(&first_id, &source(), &tags)
+            .is_err()
+    );
+    assert!(
+        slot.write_for_dataset_slot(
+            &first_id,
+            "signal:0001",
+            &[sample(1, "t", Signal::Number(1.0))]
+        )
+        .is_err()
+    );
+    assert_eq!(slot.status_cached().unwrap().signals, 0);
+    assert_eq!(slot.status_cached().unwrap().samples, 0);
+    slot.register_for_dataset_slot(&second_id, &source(), &tags)
+        .unwrap();
+    slot.write_for_dataset_slot(
+        &second_id,
+        "signal:0001",
+        &[sample(1, "t", Signal::Number(1.0))],
+    )
+    .unwrap();
+    assert_eq!(slot.status_cached().unwrap().samples, 1);
+    coordinator::run(
+        &slot,
+        &hub,
+        C::DatasetCloseIf {
+            slot_id: second_id,
+            sink_generation: None,
+        },
+    )
+    .unwrap();
+    assert!(!hub.has_sink());
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(feature = "parquet")]
+fn bounded_query_rejects_select_sequence_writes_without_advancing_them() {
+    let dir = temp_dir("query-sequence-read-only");
+    let slot = Slot::new();
+    let status = slot
+        .open(&dir.join("data.duckdb"), OpenMode::Create, None)
+        .unwrap();
+    let slot_id = status.slot_id.as_deref().unwrap();
+    let reader = slot.reader_if(slot_id).unwrap();
+    let sequence = "SELECT last_value FROM duckdb_sequences() WHERE sequence_name='event_ids'";
+    let before = reader.query_bounded(sequence, 1, 1000, 512).unwrap()["rows"][0][0].clone();
+    for sql in [
+        "SELECT nextval('event_ids')",
+        "SELECT nextval('event_ids') FROM range(10)",
+    ] {
+        let error = reader.query_bounded(sql, 10, 1000, 512).unwrap_err();
+        assert!(error.to_string().contains("read-only"), "{error:#}");
+        assert_eq!(
+            reader.query_bounded(sequence, 1, 1000, 512).unwrap()["rows"][0][0],
+            before
+        );
+    }
+    let note_id = slot
+        .note_if(slot_id, None, "writer remains writable", &Context::new())
+        .unwrap();
+    assert_eq!(note_id, before.as_u64().unwrap() + 1);
+    assert_eq!(
+        reader
+            .query_bounded("SELECT text FROM events WHERE kind='note'", 1, 1000, 512)
+            .unwrap()["rows"][0][0],
+        "writer remains writable"
+    );
+    drop(reader);
+    slot.close().unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn bounded_query_counts_metadata_and_escaping_and_stays_read_only() {
+    let dir = temp_dir("bounded-query");
+    let path = dir.join("data.duckdb");
+    let slot = Slot::new();
+    let status = slot.open(&path, OpenMode::Create, None).unwrap();
+    slot.record_event("note", None, None, "a note", &Context::new())
+        .unwrap();
+    let reader = if cfg!(feature = "parquet") {
+        slot.reader_if(status.slot_id.as_deref().unwrap()).unwrap()
+    } else {
+        slot.close().unwrap();
+        let dataset = Dataset::open_read_only(&path).unwrap();
+        // Keep its claim alive while using its connection.
+        let reader = dataset.reader().unwrap();
+        drop(dataset);
+        reader
+    };
+    for cap in [256, 300, 512, 1024, 2048] {
+        let result = reader.query_bounded("SELECT range AS n, concat('value,', chr(10), chr(34), 'é') AS value FROM range(10000)", 10000, 1000, cap).unwrap();
+        assert!(
+            serde_json::to_vec(&result).unwrap().len() <= cap,
+            "{result}"
+        );
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["truncation_reason"], "bytes");
+    }
+    let huge = reader
+        .query_bounded("SELECT repeat('x', 100000) AS text", 10, 1000, 256)
+        .unwrap();
+    assert_eq!(huge["row_count"], 0);
+    assert_eq!(huge["truncation_reason"], "bytes");
+    let sql = format!("SELECT 1 AS \"{}\"", "column".repeat(200));
+    assert!(
+        reader
+            .query_bounded(&sql, 10, 1000, 256)
+            .unwrap_err()
+            .to_string()
+            .contains("column metadata exceeds")
+    );
+    for bad in ["DELETE FROM events", "SELECT 1; DELETE FROM events"] {
+        assert!(reader.query_bounded(bad, 1, 1000, 512).is_err());
+    }
+    assert_eq!(
+        reader
+            .query_bounded(
+                "SELECT count(*) FROM events WHERE kind='note'",
+                1,
+                1000,
+                512
+            )
+            .unwrap()["rows"][0][0],
+        1
+    );
+    drop(reader);
+    slot.close().unwrap();
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn bounded_export_caps_all_files_checksums_and_refuses_overwrite() {
+    let dir = temp_dir("bounded-export");
+    let slot = Slot::new();
+    slot.open(&dir.join("data.duckdb"), OpenMode::Create, None)
+        .unwrap();
+    slot.record_event(
+        "note",
+        None,
+        None,
+        "comma, quote\" newline\nユニコード",
+        &Context::new(),
+    )
+    .unwrap();
+    let reader = slot.reader().unwrap();
+    let mut formats = vec![ExportFormat::Csv];
+    if cfg!(feature = "parquet") {
+        formats.extend([
+            ExportFormat::Parquet,
+            ExportFormat::Json,
+            ExportFormat::Jsonl,
+        ]);
+    }
+    let mut request = export_request(dir.join("bundle"), formats);
+    request.tables = vec!["events".into()];
+    let result = reader.export_bounded(&request, 1_000_000, 10000).unwrap();
+    let readme = fs::read_to_string(request.output.join("README.md")).unwrap();
+    assert!(readme.contains("events = pd.read_"));
+    assert!(!readme.contains("captures = pd.read_"));
+    assert!(!readme.contains("samples = pl.read_"));
+    let bytes = result["bytes"].as_u64().unwrap();
+    let files = result["files"].as_array().unwrap();
+    assert_eq!(
+        bytes,
+        files
+            .iter()
+            .map(|f| f["bytes"].as_u64().unwrap())
+            .sum::<u64>()
+    );
+    assert!(bytes <= 1_000_000);
+    for file in files {
+        use sha2::Digest;
+        let bytes = fs::read(request.output.join(file["path"].as_str().unwrap())).unwrap();
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&bytes)),
+            file["sha256"]
+        );
+    }
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let note: String = conn
+        .query_row(
+            &format!(
+                "SELECT text FROM read_csv('{}', header=true) WHERE kind='note'",
+                request.output.join("events.csv").display()
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(note, "comma, quote\" newline\nユニコード");
+    if cfg!(feature = "parquet") {
+        let parquet_note: String = conn
+            .query_row(
+                &format!(
+                    "SELECT text FROM read_parquet('{}') WHERE kind='note'",
+                    request.output.join("events.parquet").display()
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parquet_note, note);
+        let rows: Vec<Value> =
+            serde_json::from_slice(&fs::read(request.output.join("events.json")).unwrap()).unwrap();
+        assert_eq!(
+            rows.iter().find(|r| r["kind"] == "note").unwrap()["text"],
+            note
+        );
+        let lines: Vec<Value> = fs::read_to_string(request.output.join("events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows, lines);
+    }
+    let before = fs::read(request.output.join("manifest.json")).unwrap();
+    assert!(
+        reader
+            .export_bounded(&request, 1_000_000, 10000)
+            .unwrap_err()
+            .to_string()
+            .contains("already exists")
+    );
+    assert_eq!(
+        fs::read(request.output.join("manifest.json")).unwrap(),
+        before
+    );
+    let before: std::collections::BTreeSet<_> = fs::read_dir(&reader.staging.dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    request.output = dir.join("too-large");
+    let error = reader.export_bounded(&request, 200, 10000).unwrap_err();
+    assert!(error.to_string().contains("task allowance"), "{error:#}");
+    assert!(!request.output.exists());
+    let after: std::collections::BTreeSet<_> = fs::read_dir(&reader.staging.dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        before, after,
+        "partial staged files are removed after a cap failure"
+    );
+    request.formats = vec![ExportFormat::Parquet];
+    if cfg!(feature = "parquet") {
+        assert!(
+            reader
+                .export_bounded(&request, 1, 10000)
+                .unwrap_err()
+                .to_string()
+                .contains("task allowance")
+        );
+        assert!(!request.output.exists());
+    } else {
+        assert!(
+            reader
+                .export_bounded(&request, 100000, 10000)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported")
+        );
+    }
+    drop(reader);
+    slot.close().unwrap();
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn closing_a_slot_cancels_its_checked_reader_before_reuse() {
+    let dir = temp_dir("checked-cancel");
+    let slot = Arc::new(Slot::new());
+    let status = slot
+        .open(&dir.join("data.duckdb"), OpenMode::Create, None)
+        .unwrap();
+    let reader = slot.reader_if(status.slot_id.as_deref().unwrap()).unwrap();
+    let closing_slot = slot.clone();
+    let closing = std::thread::spawn(move || closing_slot.close().unwrap());
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while reader.check_cancelled().is_ok() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let error = reader.query_bounded("SELECT 1", 1, 1000, 512).unwrap_err();
+    assert!(error.to_string().contains("cancelled"), "{error:#}");
+    let request = export_request(dir.join("cancelled-export"), vec![ExportFormat::Csv]);
+    assert!(
+        reader
+            .export_bounded(&request, 100000, 1000)
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled")
+    );
+    assert!(!request.output.exists());
+    drop(reader);
+    closing.join().unwrap();
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn bounded_export_preserves_joined_samples_and_time_filters() {
+    let dir = temp_dir("bounded-joined");
+    let slot = Slot::new();
+    slot.open(&dir.join("mixed.duckdb"), OpenMode::Create, None)
+        .unwrap();
+    slot.register(&source(), &[]).unwrap();
+    slot.write(
+        "signal:0001",
+        &[
+            sample(100, "temp", Signal::Number(20.0)),
+            sample(200, "temp", Signal::Number(30.0)),
+        ],
+    )
+    .unwrap();
+    slot.record_saved(
+        batch(vec![capture("/x/one.png", 150), capture("/x/two.png", 250)]),
+        0,
+    );
+    let mut formats = vec![ExportFormat::Csv];
+    if cfg!(feature = "parquet") {
+        formats.push(ExportFormat::Parquet);
+    }
+    let mut request = export_request(dir.join("selected"), formats.clone());
+    request.tables = vec!["samples".into(), "captures_with_signals".into()];
+    request.since_ms = Some(150);
+    request.until_ms = Some(250);
+    let result = slot
+        .reader()
+        .unwrap()
+        .export_bounded(&request, 1_000_000, 10000)
+        .unwrap();
+    assert_eq!(result["tables"]["samples"], 1);
+    assert_eq!(result["tables"]["captures_with_signals"], 2);
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    for format in formats {
+        let ext = format.extension();
+        let rows: Vec<(u64, f64)> = conn
+            .prepare(&format!(
+                "SELECT sample_ms, value_double FROM '{}' ORDER BY capture_id",
+                request
+                    .output
+                    .join(format!("captures_with_signals.{ext}"))
+                    .display()
+            ))
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<duckdb::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, [(100, 20.0), (200, 30.0)]);
+        let rows: u64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM '{}' WHERE ts_ms = 200",
+                    request.output.join(format!("samples.{ext}")).display()
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert!(!request.output.join(format!("captures.{ext}")).exists());
+    }
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(request.output.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["filters"]["since_ms"], 150);
+    assert_eq!(manifest["filters"]["until_ms"], 250);
+    assert_eq!(manifest["slot_id"], result["slot_id"]);
+    slot.close().unwrap();
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn bounded_export_enforces_the_pinned_capture_root() {
+    let dir = temp_dir("export-root");
+    let allowed = dir.join("allowed");
+    let outside = dir.join("outside");
+    fs::create_dir_all(&allowed).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let slot = Slot::new();
+    slot.open(&dir.join("data.duckdb"), OpenMode::Create, None)
+        .unwrap();
+    let reader = slot.reader().unwrap();
+    let mut request = export_request(outside.join("bundle"), vec![ExportFormat::Csv]);
+    request.tables = vec!["events".into()];
+    let error = reader
+        .export_bounded_in(&request, 100000, 10000, Some(&allowed))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("approved capture root"),
+        "{error:#}"
+    );
+    assert!(!request.output.exists());
+    request.output = allowed.join("new-parent/bundle");
+    let result = reader
+        .export_bounded_in(&request, 100000, 10000, Some(&allowed))
+        .unwrap();
+    assert!(request.output.join("events.csv").is_file());
+    assert!(result["bytes"].as_u64().unwrap() <= 100000);
+    drop(reader);
     slot.close().unwrap();
     let _ = fs::remove_dir_all(dir);
 }

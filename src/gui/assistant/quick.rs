@@ -13,7 +13,11 @@ use crate::{
         conversation::Conversation,
     },
     gui::*,
-    tools::{self, Checked, StepId, ToolCall, context::Context, exec::ProgressState},
+    tools::{
+        self, Checked, StepId, ToolCall,
+        context::{Context, DataSourceRef},
+        exec::ProgressState,
+    },
 };
 use serde_json::{Value, json};
 use std::{
@@ -40,6 +44,12 @@ pub(in crate::gui) enum Input {
     Run(u64),
     ExportPlan,
     SeeImages(bool),
+    SeeData(bool),
+    DataSources(bool),
+    DataSourceDraft(String),
+    AddDataSource,
+    RemoveDataSource(String),
+    SourceProfile(crate::gui::source_setup::Input),
     Field {
         step: StepId,
         key: String,
@@ -48,6 +58,11 @@ pub(in crate::gui) enum Input {
     Commit {
         step: StepId,
         key: String,
+    },
+    StringList {
+        step: StepId,
+        key: String,
+        remove: Option<usize>,
     },
     Secret {
         step: StepId,
@@ -93,12 +108,20 @@ impl fmt::Debug for Input {
             Self::Run(revision) => f.debug_tuple("Run").field(revision).finish(),
             Self::ExportPlan => f.write_str("ExportPlan"),
             Self::SeeImages(value) => f.debug_tuple("SeeImages").field(value).finish(),
+            Self::SeeData(value) => f.debug_tuple("SeeData").field(value).finish(),
+            Self::DataSources(value) => f.debug_tuple("DataSources").field(value).finish(),
+            Self::DataSourceDraft(_) | Self::RemoveDataSource(_) => {
+                f.write_str("DataSource([redacted])")
+            }
+            Self::AddDataSource => f.write_str("AddDataSource"),
+            Self::SourceProfile(input) => f.debug_tuple("SourceProfile").field(input).finish(),
             Self::Field { step, .. } => f
                 .debug_tuple("Field")
                 .field(step)
                 .field(&"[redacted]")
                 .finish(),
             Self::Commit { step, .. } => f.debug_tuple("Commit").field(step).finish(),
+            Self::StringList { step, .. } => f.debug_tuple("StringList").field(step).finish(),
             Self::Secret { step, .. } => f
                 .debug_tuple("Secret")
                 .field(step)
@@ -131,6 +154,7 @@ pub(in crate::gui) enum Effect {
     None,
     FocusPrompt,
     FocusStep(StepId),
+    FocusField(String),
     Settings,
     NewDestination,
     Copy(String),
@@ -194,6 +218,11 @@ pub(in crate::gui) struct State {
     pub provider_excerpt: Option<String>,
     pub exported_plan: Option<PathBuf>,
     pub allow_images: bool,
+    pub allow_data: bool,
+    pub data_sources: Vec<DataSourceRef>,
+    pub data_source_draft: String,
+    pub data_sources_open: bool,
+    pub source_setup: crate::gui::source_setup::State,
     pub generation: u64,
     pub usage: Usage,
     pub step_outcomes: BTreeMap<StepId, StepStatus>,
@@ -236,6 +265,11 @@ impl State {
             provider_excerpt: None,
             exported_plan: None,
             allow_images: false,
+            allow_data: false,
+            data_sources: Vec::new(),
+            data_source_draft: String::new(),
+            data_sources_open: false,
+            source_setup: crate::gui::source_setup::State::default(),
             generation: 0,
             usage: Usage::default(),
             step_outcomes: BTreeMap::new(),
@@ -290,10 +324,19 @@ impl State {
             || self.testing_s3.is_some()
     }
     pub(in crate::gui) fn editable(&self) -> bool {
-        !self.thinking() && !self.running() && self.testing_s3.is_none()
+        !self.thinking()
+            && !self.running()
+            && self.testing_s3.is_none()
+            && !self.source_setup.pending
     }
     pub(in crate::gui) fn has_provider(&self) -> bool {
         self.settings.provider.is_some()
+    }
+    pub(in crate::gui) fn source_draft_error(&self) -> Option<String> {
+        (!self.data_source_draft.trim().is_empty())
+            .then(|| DataSourceRef::approved(&self.data_source_draft).err())
+            .flatten()
+            .map(|error| tools::redact::for_output_text(&error.to_string()))
     }
     pub(in crate::gui) fn provider_label(&self) -> String {
         self.settings
@@ -388,7 +431,9 @@ impl State {
         !self.thinking()
             && !self.running()
             && self.testing_s3.is_none()
+            && !self.source_setup.pending
             && self.context.is_some()
+            && !self.source_setup.has_uncommitted_draft()
             && !self.plan.steps.is_empty()
             && self
                 .plan
@@ -400,6 +445,7 @@ impl State {
         self.notice.take()
     }
     pub(in crate::gui) fn clear_secrets(&mut self) {
+        self.source_setup.clear_secret();
         let had_secret = self.plan.steps.iter().any(|step| {
             tools::spec(&step.call.tool).is_some_and(|spec| {
                 spec.fields.iter().any(|field| {
@@ -432,16 +478,73 @@ impl State {
             Err(error) => self.set_error(error),
         }
     }
+    pub(super) fn refresh_context(&mut self, now: Instant) {
+        // An earlier gather may predate an explicit credential binding.
+        self.gathering = None;
+        self.context = None;
+        self.refresh(now);
+    }
     fn recheck(&mut self) {
-        let Some(ctx) = &self.context else {
+        let Some(ctx) = &mut self.context else {
             return;
         };
+        if let Err(error) =
+            ai::agent::authorize_plan_data_with_sources(ctx, self.allow_data, &self.data_sources)
+        {
+            self.error = Some(tools::redact::for_output_text(&error.to_string()));
+            ai::agent::authorize_plan_data(ctx, false);
+        }
         let checked = self.plan.steps.iter().any(|step| step.checked.is_some());
         let before = approval_view(&self.plan);
         self.drafts
             .recheck(&mut self.plan, ctx, self.services.actor_id());
         if checked && before != approval_view(&self.plan) {
             self.plan.revision = self.plan.revision.saturating_add(1);
+        }
+    }
+    fn data_scope_changed(&mut self) {
+        self.generation = self.generation.saturating_add(1);
+        self.conversation = None;
+        let revision = self.plan.revision;
+        self.recheck();
+        if revision == self.plan.revision {
+            self.plan.revision = self.plan.revision.saturating_add(1);
+        }
+    }
+    fn source_effects(&mut self, effects: Vec<crate::gui::source_setup::Effect>) {
+        let mut changed = false;
+        let mut refresh = false;
+        for effect in effects {
+            match effect {
+                crate::gui::source_setup::Effect::Bound(binding) => {
+                    if !self.data_sources.contains(&binding) {
+                        refresh |= binding.auth.is_some();
+                        self.data_sources.retain(|source| {
+                            source.reference != binding.reference
+                                && (binding.profile_id().is_none()
+                                    || source.profile_id() != binding.profile_id())
+                        });
+                        self.data_sources.push(binding);
+                        changed = true;
+                    }
+                }
+                crate::gui::source_setup::Effect::Invalidate(profile) => {
+                    let count = self.data_sources.len();
+                    self.data_sources
+                        .retain(|source| source.profile_id() != Some(profile.as_str()));
+                    changed |= count != self.data_sources.len();
+                }
+            }
+        }
+        if changed {
+            if refresh {
+                self.context = None;
+                self.gathering = None;
+            }
+            self.data_scope_changed();
+            if refresh {
+                self.refresh(Instant::now());
+            }
         }
     }
     fn append(&mut self, entry: TranscriptEntry) {
@@ -512,6 +615,13 @@ impl State {
                 return Effect::NewDestination;
             }
             Input::FocusStep(id) => return Effect::FocusStep(id),
+            Input::SourceProfile(input) => {
+                self.source_setup.set_synthetic(self.synthetic);
+                let enabled = self.editable();
+                let effects = self.source_setup.input(input, enabled);
+                self.source_effects(effects);
+                return Effect::None;
+            }
             _ => {}
         }
         if !self.editable() {
@@ -521,6 +631,52 @@ impl State {
             Input::Prompt(value) => self.prompt = value,
             Input::Suggestion(value) => self.prompt = value,
             Input::SeeImages(value) => self.allow_images = value,
+            Input::SeeData(value) => {
+                if self.allow_data != value {
+                    self.allow_data = value;
+                    self.data_scope_changed();
+                }
+            }
+            Input::DataSources(open) => {
+                self.data_sources_open = open;
+                if !open {
+                    self.source_setup
+                        .input(crate::gui::source_setup::Input::Open(false), true);
+                }
+                if open {
+                    return Effect::FocusField("quick-command-data-source".into());
+                }
+            }
+            Input::DataSourceDraft(value) => self.data_source_draft = value,
+            Input::AddDataSource => {
+                if self.data_source_draft.trim().is_empty() {
+                    return Effect::None;
+                }
+                match DataSourceRef::approved(&self.data_source_draft) {
+                    Ok(source) => {
+                        if !self.data_sources.iter().any(|existing| existing == &source) {
+                            self.data_sources
+                                .retain(|existing| existing.reference != source.reference);
+                            self.data_sources.push(source);
+                            self.data_scope_changed();
+                        }
+                        self.data_source_draft.clear();
+                        self.error = None;
+                        return Effect::FocusField("quick-command-data-source".into());
+                    }
+                    Err(error) => {
+                        self.set_error(tools::redact::for_output_text(&error.to_string()))
+                    }
+                }
+            }
+            Input::RemoveDataSource(reference) => {
+                let count = self.data_sources.len();
+                self.data_sources
+                    .retain(|source| source.reference != reference);
+                if self.data_sources.len() != count {
+                    self.data_scope_changed();
+                }
+            }
             Input::Send => self.send(now),
             Input::Retry => {
                 if let Some(prompt) = self.last_prompt.clone() {
@@ -545,6 +701,13 @@ impl State {
                 self.remaining = false;
                 self.usage = Usage::default();
                 self.allow_images = false;
+                self.allow_data = false;
+                self.data_sources.clear();
+                self.data_source_draft.clear();
+                self.data_sources_open = false;
+                self.source_setup.reset();
+                self.generation = self.generation.saturating_add(1);
+                self.recheck();
                 return Effect::FocusPrompt;
             }
             Input::Field { step, key, value } => {
@@ -555,6 +718,9 @@ impl State {
             Input::Commit { step, key } => {
                 let _ = self.drafts.commit(&mut self.plan, step, &key);
                 self.recheck();
+            }
+            Input::StringList { step, key, remove } => {
+                return self.string_list(step, &key, remove);
             }
             Input::Secret { step, key, value } => {
                 let Some(item) = self.plan.steps.iter_mut().find(|item| item.id == step) else {
@@ -602,6 +768,46 @@ impl State {
         }
         Effect::None
     }
+    fn string_list(&mut self, id: StepId, key: &str, remove: Option<usize>) -> Effect {
+        let Some(step) = self.plan.steps.iter().find(|step| step.id == id) else {
+            return Effect::None;
+        };
+        if !tools::spec(&step.call.tool).is_some_and(|spec| {
+            spec.fields
+                .iter()
+                .any(|field| field.key == key && field.kind == tools::FieldKind::StringList)
+        }) {
+            return Effect::None;
+        }
+        let mut values = step.call.args[key].as_array().cloned().unwrap_or_default();
+        let focus = if let Some(index) = remove {
+            if index >= values.len() {
+                return Effect::None;
+            }
+            values.remove(index);
+            (!values.is_empty()).then(|| index.min(values.len() - 1))
+        } else {
+            values.push(json!(""));
+            Some(values.len() - 1)
+        };
+        if self
+            .drafts
+            .set_value(&mut self.plan, id, key, Value::Array(values))
+            .is_err()
+        {
+            return Effect::None;
+        }
+        self.step_outcomes.remove(&id);
+        self.recheck();
+        self.plan
+            .steps
+            .iter()
+            .find(|step| step.id == id)
+            .map_or(Effect::None, |step| {
+                Effect::FocusField(super::cards::string_list_focus_id(step, key, focus))
+            })
+    }
+
     fn schedule_end(&mut self, id: StepId, kind: &str) {
         if !["duration", "count", "until"].contains(&kind) {
             return;
@@ -643,6 +849,10 @@ impl State {
         if self.synthetic {
             return;
         }
+        if self.source_setup.has_uncommitted_draft() {
+            self.set_error(crate::gui::source_setup::UNCOMMITTED_DRAFT);
+            return;
+        }
         if let Err(error) = ai::prompt::validate_prompt(&self.prompt) {
             self.set_error(error.to_string());
             return;
@@ -664,6 +874,8 @@ impl State {
             plan: self.plan.clone(),
             conversation: self.conversation.clone(),
             allow_images: self.allow_images,
+            allow_data: self.allow_data,
+            data_sources: self.data_sources.clone(),
         };
         let cancel = Arc::new(AtomicBool::new(false));
         match runner::turn(
@@ -760,11 +972,14 @@ impl State {
         if self.synthetic || self.exporting.is_some() {
             return;
         }
-        let document = self.plan.document();
-        if let Err(error) = tools::plan::to_json(&document) {
-            self.set_error(error.to_string());
-            return;
-        }
+        let document =
+            match tools::plan::for_local_export(&self.plan.document(), &self.data_sources) {
+                Ok(document) => document,
+                Err(error) => {
+                    self.set_error(error.to_string());
+                    return;
+                }
+            };
         match runner::export(self.services.clone(), document) {
             Ok(receive) => self.exporting = Some(receive),
             Err(error) => self.set_error(error),
@@ -807,6 +1022,8 @@ impl State {
         if self.synthetic {
             return;
         }
+        let effects = self.source_setup.tick();
+        self.source_effects(effects);
         if let Some(result) = self
             .gathering
             .as_ref()

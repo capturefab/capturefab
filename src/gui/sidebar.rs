@@ -357,11 +357,27 @@ impl Workbench {
                 ]
             }
             // Data sources with values and sparklines, and Live signals open.
-            "signals" => {
-                self.signals.fixture = Some(signals::fixture());
+            "signals-empty" => {
+                let _ = self.open_data_sources();
+            }
+            "signals-persistence-error" => {
+                let (sources, sink) = signals::persistence_failure_fixture();
+                self.signals.fixture = Some(sources);
+                self.signals.fixture_sink = Some(sink);
                 self.tick_signals();
-                let _ =
-                    self.handle_message(Message::InspectorDisclosure(inspector::Section::Signals));
+                let _ = self.open_data_sources();
+            }
+            "signals" | "signals-auth" => {
+                self.signals.fixture = Some(signals::fixture());
+                if word == "signals-auth" {
+                    self.tab = Tab::Capture;
+                    self.inspector_open = true;
+                    self.inspector_summoned = true;
+                    self.inspector_peek = true;
+                    self.signals.source_setup.fixture();
+                }
+                self.tick_signals();
+                self.restore_open_sections(&["signals".into()]);
             }
             "side-address" => self.address = "192.168.1.20".into(),
             "side-unknown" => self.address = "line-7 camera".into(),
@@ -670,9 +686,7 @@ impl Workbench {
         for entry in recent {
             list = list.push(self.recent_row(entry, spin, p));
         }
-        if let Some(sources) = self.sidebar_signals(p) {
-            list = list.push(sources);
-        }
+        list = list.push(self.sidebar_signals(p));
         // The network check only once GigE is in play, under the list; the
         // quick guide's connection notes keep it reachable otherwise. Its
         // report only once there is one, so it is never shown disabled. The

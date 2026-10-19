@@ -158,7 +158,9 @@ pub(crate) fn resolve_outputs(command: &mut SessionCommand, base: &Path) -> Resu
     match command {
         SessionCommand::CaptureSessionOpen { path, .. }
         | SessionCommand::DatasetOpen { path, .. }
-        | SessionCommand::DatasetExport { output: path, .. } => resolve_path(path, base),
+        | SessionCommand::DatasetOpenIf { path, .. }
+        | SessionCommand::DatasetExport { output: path, .. }
+        | SessionCommand::DatasetExportIf { output: path, .. } => resolve_path(path, base),
         SessionCommand::Capture {
             output,
             destination: None,

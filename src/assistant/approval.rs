@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     sync::{
         Arc, Mutex,
@@ -252,6 +252,7 @@ struct GrantKey {
     camera: Option<String>,
     risk: Risk,
     egress: Option<[u8; 32]>,
+    data_resources: BTreeSet<String>,
 }
 fn grant_key(checked: &Checked) -> GrantKey {
     let egress = checked.leaves_computer.then(|| {
@@ -272,6 +273,7 @@ fn grant_key(checked: &Checked) -> GrantKey {
         camera: checked.call.args["camera"].as_str().map(str::to_owned),
         risk: checked.risk,
         egress,
+        data_resources: checked.data_resources.clone(),
     }
 }
 
@@ -345,6 +347,12 @@ impl ApprovalPolicy {
         self.grants
             .retain(|key, _| key.camera.as_deref() != Some(camera));
     }
+    /// Resource references alone are insufficient when a shared source or
+    /// dataset is replaced. All grants touching the changed identity expire.
+    pub fn invalidate_data_resource(&mut self, resource: &str) {
+        self.grants
+            .retain(|key, _| !key.data_resources.contains(resource));
+    }
     pub fn needs_user(&self) -> bool {
         self.denials >= 3
     }
@@ -385,6 +393,7 @@ pub fn recheck_approved(approved: &Checked, fresh: &Checked) -> Result<(), Appro
         || approved.reasons != fresh.reasons
         || approved.leaves_computer != fresh.leaves_computer
         || approved.output_root != fresh.output_root
+        || approved.data_resources != fresh.data_resources
         || destination(approved) != destination(fresh)
         || approved.issues != fresh.issues
         || !crate::tools::exec::same_approval_operations(approved, fresh)
@@ -505,6 +514,39 @@ mod tests {
             Some("new-login-or-credentials".into());
         assert!(policy.requires(&changed));
         assert!(recheck_approved(&upload, &changed).is_err());
+    }
+
+    #[test]
+    fn data_grants_bind_endpoint_dataset_and_capture_lifetimes() {
+        let mut original = checked(Risk::Bounded);
+        original.call = ToolCall {
+            tool: "start_signal_capture".into(),
+            args: json!({"source":"signal:1111111111111111"}),
+        };
+        original.data_resources = BTreeSet::from([
+            "source:signal:1111111111111111".into(),
+            "endpoint:exact-uri-one".into(),
+            "dataset:slot-one".into(),
+            "signal:capture-one".into(),
+            "sink:1".into(),
+        ]);
+        let mut policy = ApprovalPolicy::new(RunMode::Supervised);
+        policy.record(&original, &approved(ApprovalScope::ForRun));
+        assert!(!policy.requires(&original));
+        for (old, new) in [
+            ("endpoint:exact-uri-one", "endpoint:exact-uri-two"),
+            ("dataset:slot-one", "dataset:slot-two"),
+            ("signal:capture-one", "signal:capture-two"),
+            ("sink:1", "sink:2"),
+        ] {
+            let mut replacement = original.clone();
+            replacement.data_resources.remove(old);
+            replacement.data_resources.insert(new.into());
+            assert!(policy.requires(&replacement), "{new}");
+            assert!(recheck_approved(&original, &replacement).is_err());
+        }
+        policy.invalidate_data_resource("source:signal:1111111111111111");
+        assert!(policy.requires(&original));
     }
 
     #[test]

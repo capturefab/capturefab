@@ -7,8 +7,12 @@ use duckdb::{Connection, InterruptHandle, types::Value as Db};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
-    sync::{Arc, Condvar, Mutex, PoisonError, mpsc},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Condvar, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -18,19 +22,28 @@ pub const MAX_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// Query results stop growing past this many bytes of JSON.
 pub const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
+pub const MIN_RESULT_BYTES: usize = 256;
 
 /// Outstanding readers of the session's dataset, so closing can interrupt them.
 #[derive(Default)]
 pub(crate) struct Readers {
-    state: Mutex<(u64, BTreeMap<u64, Arc<InterruptHandle>>)>,
+    state: Mutex<(u64, BTreeMap<u64, ReaderInterrupt>)>,
     idle: Condvar,
 }
+struct ReaderInterrupt {
+    handle: Arc<InterruptHandle>,
+    cancelled: Arc<AtomicBool>,
+}
 impl Readers {
-    fn add(self: &Arc<Self>, handle: Arc<InterruptHandle>) -> ReaderGuard {
+    fn add(
+        self: &Arc<Self>,
+        handle: Arc<InterruptHandle>,
+        cancelled: Arc<AtomicBool>,
+    ) -> ReaderGuard {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.0 += 1;
         let id = state.0;
-        state.1.insert(id, handle);
+        state.1.insert(id, ReaderInterrupt { handle, cancelled });
         ReaderGuard {
             readers: self.clone(),
             id,
@@ -40,8 +53,9 @@ impl Readers {
     pub fn interrupt_and_wait(&self, wait: Duration) -> bool {
         let deadline = Instant::now() + wait;
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        for handle in state.1.values() {
-            handle.interrupt();
+        for reader in state.1.values() {
+            reader.cancelled.store(true, Ordering::Release);
+            reader.handle.interrupt();
         }
         while !state.1.is_empty() {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -53,8 +67,9 @@ impl Readers {
                 .wait_timeout(state, left)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
-            for handle in state.1.values() {
-                handle.interrupt();
+            for reader in state.1.values() {
+                reader.cancelled.store(true, Ordering::Release);
+                reader.handle.interrupt();
             }
         }
         true
@@ -85,6 +100,7 @@ pub struct Reader {
     pub(crate) status: super::DatasetStatus,
     /// Opened with DuckDB's read-only access mode.
     pub(crate) read_only: bool,
+    pub(crate) cancelled: Arc<AtomicBool>,
     _guard: Option<ReaderGuard>,
 }
 
@@ -94,13 +110,15 @@ impl super::Dataset {
             .conn
             .try_clone()
             .map_err(|e| explain(e, &self.path, "read"))?;
-        let guard = readers.map(|r| r.add(conn.interrupt_handle()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let guard = readers.map(|r| r.add(conn.interrupt_handle(), cancelled.clone()));
         Ok(Reader {
             conn,
             staging: self.staging.clone(),
             path: self.path.clone(),
             status: self.status.clone(),
             read_only: self.read_only,
+            cancelled,
             _guard: guard,
         })
     }
@@ -133,6 +151,71 @@ pub(crate) fn with_timeout<T>(
 }
 
 impl Reader {
+    pub(crate) fn check_cancelled(&self) -> Result<()> {
+        ensure!(
+            !self.cancelled.load(Ordering::Acquire),
+            "dataset operation cancelled because its open instance was closed"
+        );
+        Ok(())
+    }
+    pub fn query(&self, sql: &str, limit: u32, timeout_ms: u64) -> Result<Value> {
+        self.query_bounded(sql, limit, timeout_ms, MAX_RESULT_BYTES)
+    }
+    /// Bound the complete serialized JSON reply, including column metadata,
+    /// separators and truncation markers, rather than only its row payload.
+    pub fn query_bounded(
+        &self,
+        sql: &str,
+        limit: u32,
+        timeout_ms: u64,
+        max_bytes: usize,
+    ) -> Result<Value> {
+        ConnectionQuery {
+            conn: &self.conn,
+            path: &self.path,
+            read_only: self.read_only,
+            cancelled: &self.cancelled,
+        }
+        .query_bounded(sql, limit, timeout_ms, max_bytes)
+    }
+    /// Copy approved physical tables into a private, no-spill projected
+    /// snapshot before running arbitrary model SQL. No limit failure falls
+    /// back to querying the shared connection.
+    pub fn query_model_bounded(
+        &self,
+        sql: &str,
+        limit: u32,
+        timeout_ms: u64,
+        max_result_bytes: usize,
+    ) -> Result<Value> {
+        super::model_snapshot::query(
+            self,
+            sql,
+            super::model_snapshot::ModelQueryLimits::bounded(limit, timeout_ms, max_result_bytes)?,
+            &AtomicBool::new(false),
+        )
+    }
+    pub fn label(&self) -> String {
+        file_label(&self.path)
+    }
+}
+
+/// The same checked query semantics on either a shared reader or a private
+/// task engine. Connections never escape their owner's lifetime.
+pub(super) struct ConnectionQuery<'a> {
+    pub conn: &'a Connection,
+    pub path: &'a Path,
+    pub read_only: bool,
+    pub cancelled: &'a AtomicBool,
+}
+impl ConnectionQuery<'_> {
+    fn check_cancelled(&self) -> Result<()> {
+        ensure!(
+            !self.cancelled.load(Ordering::Acquire),
+            "dataset operation cancelled because its open instance was closed"
+        );
+        Ok(())
+    }
     /// Refuse anything but exactly one SELECT/WITH statement, before DuckDB
     /// prepares it: preparing runs every statement but the last.
     fn guard(&self, sql: &str) -> Result<()> {
@@ -152,7 +235,7 @@ impl Reader {
                 [sql],
                 |r| r.get(0),
             )
-            .map_err(|e| explain(e, &self.path, "query"))?;
+            .map_err(|e| explain(e, self.path, "query"))?;
         let parsed: Value = serde_json::from_str(&parsed)?;
         let one = parsed["error"] == false
             && parsed["statements"]
@@ -166,10 +249,40 @@ impl Reader {
         Ok(())
     }
 
-    pub fn query(&self, sql: &str, limit: u32, timeout_ms: u64) -> Result<Value> {
+    /// Bound the complete serialized JSON reply, including column metadata,
+    /// separators and truncation markers, rather than only its row payload.
+    pub fn query_bounded(
+        &self,
+        sql: &str,
+        limit: u32,
+        timeout_ms: u64,
+        max_bytes: usize,
+    ) -> Result<Value> {
+        self.query_bounded_with_watchdog(sql, limit, timeout_ms, max_bytes, |timeout, operation| {
+            let (result, fired) = with_timeout(self.conn, timeout, operation);
+            if fired {
+                bail!("dataset query timed out after {} ms", timeout.as_millis());
+            }
+            result
+        })
+    }
+
+    /// The watcher owns only execution, never transaction cleanup. It must
+    /// stop and join before returning, so a late interrupt cannot abort the
+    /// ROLLBACK on this borrowed connection. Callers with a combined copy/query
+    /// deadline can supply their existing watcher without nesting another one.
+    pub(super) fn query_bounded_with_watchdog(
+        &self,
+        sql: &str,
+        limit: u32,
+        timeout_ms: u64,
+        max_bytes: usize,
+        watch: impl FnOnce(Duration, &mut dyn FnMut() -> Result<Value>) -> Result<Value>,
+    ) -> Result<Value> {
+        self.check_cancelled()?;
         ensure!(
-            sql.len() <= MAX_SQL_BYTES,
-            "dataset query must be at most 64 KiB"
+            !sql.trim().is_empty() && sql.len() <= MAX_SQL_BYTES,
+            "dataset query must be 1 byte to 64 KiB of SQL"
         );
         ensure!(
             (1..=MAX_LIMIT).contains(&limit),
@@ -179,36 +292,50 @@ impl Reader {
             timeout_ms <= MAX_TIMEOUT_MS,
             "dataset query timeout must be at most 300000 milliseconds"
         );
+        ensure!(
+            (MIN_RESULT_BYTES..=MAX_RESULT_BYTES).contains(&max_bytes),
+            "dataset query result limit must be 256..8388608 bytes"
+        );
         let timeout_ms = if timeout_ms == 0 {
             DEFAULT_TIMEOUT_MS
         } else {
             timeout_ms
         };
-        self.guard(sql)?;
-        self.conn
-            .execute_batch("BEGIN TRANSACTION")
-            .map_err(|e| explain(e, &self.path, "query"))?;
-        let (result, fired) = with_timeout(&self.conn, Duration::from_millis(timeout_ms), || {
-            self.run(sql, limit)
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let result = watch(Duration::from_millis(timeout_ms), &mut || {
+            self.guard(sql)?;
+            self.conn
+                // SELECT functions such as nextval can mutate persistent
+                // state even when the transaction is rolled back. Let the
+                // engine reject every write within this reader operation.
+                .execute_batch("BEGIN TRANSACTION READ ONLY")
+                .map_err(|e| explain(e, self.path, "query"))?;
+            self.run(sql, limit, max_bytes)
         });
         let _ = self.conn.execute_batch("ROLLBACK");
+        self.check_cancelled()?;
+        // Cleanup is deliberately outside the interrupting watcher, but it
+        // still counts against the wall budget and cannot produce late success.
+        if Instant::now() >= deadline {
+            bail!("dataset query timed out after {timeout_ms} ms");
+        }
         match result {
             Ok(value) => Ok(value),
-            Err(e) if fired || e.to_string().contains("INTERRUPT") => {
+            Err(e) if e.to_string().contains("INTERRUPT") => {
                 bail!("dataset query timed out after {timeout_ms} ms")
             }
             Err(e) => Err(e),
         }
     }
 
-    fn run(&self, sql: &str, limit: u32) -> Result<Value> {
+    fn run(&self, sql: &str, limit: u32, max_bytes: usize) -> Result<Value> {
         let mut statement = self
             .conn
             .prepare(sql)
-            .map_err(|e| explain(e, &self.path, "query"))?;
+            .map_err(|e| explain(e, self.path, "query"))?;
         let mut rows = statement
             .query([])
-            .map_err(|e| explain(e, &self.path, "query"))?;
+            .map_err(|e| explain(e, self.path, "query"))?;
         let columns: Vec<Value> = rows
             .as_ref()
             .map(|stmt| {
@@ -223,22 +350,37 @@ impl Reader {
             })
             .unwrap_or_default();
         let mut out = Vec::new();
-        let mut bytes = 0usize;
+        // Reserve the longest possible metadata shape. Actual row_count is
+        // at most limit, and `false` is longer than `true`.
+        let mut bytes =
+            json!({"columns": columns, "row_count": limit, "rows": [], "truncated": false,
+            "truncation_reason": "bytes", "max_result_bytes": max_bytes})
+            .to_string()
+            .len();
+        ensure!(
+            bytes <= max_bytes,
+            "dataset query column metadata exceeds the {max_bytes}-byte result limit; select fewer or shorter columns"
+        );
         let mut truncated = false;
-        while let Some(row) = rows.next().map_err(|e| explain(e, &self.path, "query"))? {
+        let mut reason = Value::Null;
+        while let Some(row) = rows.next().map_err(|e| explain(e, self.path, "query"))? {
+            self.check_cancelled()?;
             if out.len() >= limit as usize {
                 truncated = true;
+                reason = json!("rows");
                 break;
             }
             let values: Vec<Value> = (0..columns.len())
                 .map(|i| row.get::<_, Db>(i).map(to_json))
                 .collect::<duckdb::Result<_>>()?;
             let value = Value::Array(values);
-            bytes += value.to_string().len();
-            if bytes > MAX_RESULT_BYTES {
+            let next_bytes = value.to_string().len() + usize::from(!out.is_empty());
+            if bytes.saturating_add(next_bytes) > max_bytes {
                 truncated = true;
+                reason = json!("bytes");
                 break;
             }
+            bytes += next_bytes;
             out.push(value);
         }
         Ok(json!({
@@ -246,11 +388,9 @@ impl Reader {
             "row_count": out.len(),
             "rows": out,
             "truncated": truncated,
+            "truncation_reason": reason,
+            "max_result_bytes": max_bytes,
         }))
-    }
-
-    pub fn label(&self) -> String {
-        file_label(&self.path)
     }
 }
 
@@ -336,5 +476,67 @@ pub fn to_json(value: Db) -> Value {
         ),
         Db::Union(inner) => to_json(*inner),
         other => json!(format!("{other:?}")),
+    }
+}
+
+#[cfg(all(test, feature = "parquet"))]
+mod watchdog_tests {
+    use super::*;
+
+    #[test]
+    fn a_late_watchdog_interrupt_finishes_before_borrowed_transaction_cleanup() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE readings(value INTEGER); INSERT INTO readings VALUES(17)")
+            .unwrap();
+        for deadline in [false, true].into_iter().cycle().take(8) {
+            let cancel = AtomicBool::new(false);
+            let query = ConnectionQuery {
+                conn: &conn,
+                path: Path::new(":memory:"),
+                read_only: false,
+                cancelled: &cancel,
+            };
+            let error = query
+                .query_bounded_with_watchdog(
+                    "SELECT value FROM readings",
+                    1,
+                    3000,
+                    1024,
+                    |_, operation| {
+                        // The query has entered READ ONLY and completed, but
+                        // its transaction still belongs to query_bounded.
+                        let value = operation()?;
+                        super::super::snapshot::with_watchdog(
+                            &cancel,
+                            None,
+                            &conn,
+                            Instant::now() + Duration::from_millis(20),
+                            || {
+                                if !deadline {
+                                    cancel.store(true, Ordering::Release);
+                                }
+                                // Force the interrupt after BEGIN, including
+                                // when the watcher is scheduled only at join.
+                                std::thread::sleep(Duration::from_millis(30));
+                                Ok(value)
+                            },
+                        )
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(if deadline { "deadline" } else { "cancelled" }),
+                "{error:#}"
+            );
+            conn.execute_batch("BEGIN TRANSACTION; UPDATE readings SET value=99; ROLLBACK")
+                .unwrap();
+            assert_eq!(
+                conn.query_row("SELECT value FROM readings", [], |row| row.get::<_, i32>(0))
+                    .unwrap(),
+                17
+            );
+        }
     }
 }

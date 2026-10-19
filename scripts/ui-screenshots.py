@@ -51,6 +51,7 @@ BASELINE = (
     Scene("folder-editor", "folder-editor,noscopes", "Folder destination editor"),
     Scene("bucket-editor", "bucket-editor,noscopes", "S3 destination editor with checked example credentials"),
     Scene("help", "help-more,noscopes", "Quick guide steps with connection notes expanded beneath them"),
+    Scene("agent-setup", "agent-setup,noscopes", "External-agent session briefing and connection command"),
     Scene("settings", "settings-credentials,noscopes", "Settings sheet fixture including API-key controls"),
     Scene("settings-assistant", "settings-assistant,noscopes", "AI assistant provider, model and credential setup with synthetic status"),
     Scene("quick-command", "quick-command,noscopes", "Quick command before a request, with local suggestions", 2),
@@ -58,6 +59,7 @@ BASELINE = (
     Scene("quick-command-invalid", "quick-command-invalid,noscopes", "Assistant plan with invalid fields and a blocking reason", 2),
     Scene("quick-command-running", "quick-command-running,noscopes", "Assistant plan execution with synthetic progress", 2),
     Scene("quick-command-done", "quick-command-done,noscopes", "Completed assistant plan and outcome rows", 2),
+    Scene("quick-command-exported", "quick-command-exported,noscopes", "Exported source plan with this workbench's checks-only command and reviewed capture folder", 1),
     Scene("quick-command-setup", "quick-command-setup,noscopes", "Quick command without a configured provider", 2),
     Scene("quick-command-task-setup", "quick-command-task-setup,noscopes", "Assistant camera scope, image permission and hard limits", 2),
     Scene("quick-command-task-running", "quick-command-task-running,noscopes", "Assistant latest view, budgets and task controls", 2),
@@ -65,6 +67,13 @@ BASELINE = (
     Scene("quick-command-task-paused-human", "quick-command-task-paused-human,noscopes", "Assistant paused after a person changes the camera", 2),
     Scene("quick-command-task-limit", "quick-command-task-limit,noscopes", "Assistant stopped at a hard task limit", 2),
     Scene("quick-command-task-done", "quick-command-task-done,noscopes", "Completed task, changes and remaining effects", 2),
+    Scene("quick-command-task-data-setup", "quick-command-task-data-setup,noscopes", "Data-only source scope, separate data permission and capture allowances", 1),
+    Scene("quick-command-task-data-running", "quick-command-task-data-running,noscopes", "Data-only values, quality, timestamps and persisted counts", 1),
+    Scene("quick-command-task-mixed-running", "quick-command-task-mixed-running,noscopes", "Mixed camera and sensor task with shared dataset status", 2),
+    Scene("quick-command-task-data-approval", "quick-command-task-data-approval,noscopes", "Source connection approval with exact local endpoint identity", 1),
+    Scene("quick-command-task-data-paused-human", "quick-command-task-data-paused-human,noscopes", "Data task paused after a person replaces its dataset", 1),
+    Scene("quick-command-task-data-error", "quick-command-task-data-error,noscopes", "Data task persistence failure and retained accounting", 1),
+    Scene("quick-command-task-data-done", "quick-command-task-data-done,noscopes", "Completed data task with final persistence evidence", 1),
     Scene("network", "network,noscopes", "Camera network report with synthetic adapter and unreachable camera"),
     Scene("analytics", "analytics,noscopes", "Session acquisition analytics with live simulator statistics"),
     Scene("measurements", "analytics-measurements,noscopes", "Default prompt measurements form before collection starts"),
@@ -85,18 +94,31 @@ COMPACT = (
     Scene("bucket-editor", "bucket-editor-advanced,noscopes", "Compact S3 editor with Advanced expanded"),
     Scene("bucket-bottom", "bucket-editor-advanced,noscopes,sheet-bottom", "S3 editor advanced controls and pinned Save/Cancel actions"),
     Scene("help", "help-more,noscopes,sheet-bottom", "Lower shortcut tables and the terminal or agent session commands"),
+    Scene("agent-setup", "agent-setup,noscopes", "Compact external-agent session setup and copy action"),
     Scene("settings", "settings-credential-error,noscopes,sheet-bottom", "API-key controls, credential error and pinned Settings footer"),
     Scene("settings-assistant", "settings-assistant-error,noscopes", "Compact AI assistant setup with field validation and a synthetic provider refusal"),
     Scene("settings-assistant-bottom", "settings-assistant,noscopes,sheet-bottom", "Lower assistant settings and pinned Settings footer after scrolling"),
     Scene("quick-command-plan", "quick-command-plan,noscopes", "Compact assistant plan with pinned actions", 2),
     Scene("quick-command-invalid", "quick-command-invalid,noscopes", "Compact assistant plan validation and focus target", 2),
+    Scene("quick-command-data-consent", "quick-command-data-consent,noscopes", "Compact Quick Command with image and data transmission disclosures", 2),
     Scene("quick-command-task-setup", "quick-command-task-setup,noscopes", "Compact assistant task setup", 2),
     Scene("quick-command-task-approval", "quick-command-task-approval,noscopes", "Compact assistant approval controls", 2),
     Scene("quick-command-task-running", "quick-command-task-running,noscopes", "Compact assistant running controls", 2),
+    Scene("quick-command-task-data-setup", "quick-command-task-data-setup,noscopes", "Compact data task source scope and capture allowances", 1),
+    Scene("quick-command-task-data-running", "quick-command-task-data-running,noscopes", "Compact data values and persistent task controls", 1),
+    Scene("quick-command-task-data-approval", "quick-command-task-data-approval,noscopes", "Compact source connection approval", 1),
+    Scene("quick-command-task-data-done", "quick-command-task-data-done,noscopes", "Compact final sample accounting and persistence evidence", 1),
     Scene("network", "network-error,noscopes,sheet-bottom", "Unreachable camera details and pinned Scan network action"),
     Scene("analytics", "analytics,noscopes,sheet-bottom", "Lower acquisition analytics and native camera statistics"),
     Scene("measurements", "analytics-invalid,noscopes", "Compact prompt measurement rows and invalid sample interval"),
     Scene("measurements-bottom", "analytics-measurements-populated,noscopes,sheet-bottom", "Populated measurement chart and wrapped result notes"),
+    Scene("quick-command-data-sources", "quick-command-data-sources,noscopes", "Compact Plan-first local source binding and data consent", 2),
+    Scene("quick-command-data-auth", "quick-command-data-auth,noscopes", "Compact protected source profile editor with a masked OS-store password", 1),
+    Scene("quick-command-task-data-auth", "quick-command-task-data-auth,noscopes", "Compact task source profile editor and independent data consent", 1),
+    Scene("signals-auth", "signals-auth,peek,noscopes", "Compact manual Sources profile editor with protected credentials", 1),
+    Scene("signals-empty", "signals-empty,noscopes", "Compact manual source entry with zero connected cameras or sources", 0),
+    Scene("signals-persistence-error", "signals-persistence-error,noscopes,inspector-bottom", "Compact running source with failed writes, zero saved samples and storage loss", 0),
+    Scene("quick-command-exported", "quick-command-exported,noscopes", "Compact exported-plan preview command with reviewed capture folder", 1),
 )
 
 VARIANTS = (
@@ -108,8 +130,15 @@ VARIANTS = (
     Scene("notice-long", "notice-long,noscopes", "Long command-error notice with disclosure action"),
     Scene("measurement-history", "analytics-measurements-populated,noscopes,sheet-bottom", "Measurement chart, unknown value and wrapped result notes"),
     Scene("settings-assistant-error", "settings-assistant-error,noscopes", "AI assistant field validation and synthetic provider error details"),
+    Scene("quick-command-data-consent", "quick-command-data-consent,noscopes", "Quick Command with independent image and data consent enabled", 2),
     Scene("quick-command-thinking", "quick-command-thinking,noscopes", "Pending assistant turn with Stop and read-only plan cards", 2),
     Scene("quick-command-error", "quick-command-error,noscopes", "Assistant provider failure and retry action", 2),
+    Scene("quick-command-data-sources", "quick-command-data-sources,noscopes", "Plan-first approved local endpoints and opaque source references", 2),
+    Scene("quick-command-data-auth", "quick-command-data-auth,noscopes", "Plan-first explicit local username and protected password setup", 1),
+    Scene("quick-command-task-data-auth", "quick-command-task-data-auth,noscopes", "Task source profile creation without provider or preference credential disclosure", 1),
+    Scene("signals-auth", "signals-auth,noscopes", "Manual Sources uses the same protected local source profile editor", 1),
+    Scene("signals-empty", "signals-empty,noscopes", "Manual source setup and sidebar entry before connecting any camera or source", 0),
+    Scene("signals-persistence-error", "signals-persistence-error,noscopes,inspector-bottom", "Manual source persistence failure while the connection remains running", 0),
 )
 
 EXTRA_STATES = (
@@ -160,6 +189,13 @@ def matrix(kinds=False):
     for index, scene in enumerate(VARIANTS):
         appearance = "light" if index % 2 == 0 else "dark"
         yield (f"{scene.name}-{appearance}", scene, appearance, "standard", (1100, 700), "states")
+    # Append new task-storage cases to preserve existing review artifact order.
+    for state in ("setup", "done"):
+        name = f"quick-command-task-separate-{state}"
+        scene = Scene(name, f"{name},noscopes,sheet-down", f"Separate sensor task dataset: {state}, scrolled storage disclosure and retained receipt", 0)
+        for appearance in ("light", "dark"):
+            yield (f"{scene.name}-{appearance}", scene, appearance, "standard", (1100, 700), "states")
+        yield (f"{scene.name}-compact-dark", scene, "dark", "larger", (900, 620), "compact")
 
 
 def sha256(path):
@@ -178,7 +214,7 @@ def isolated_environment():
     }
     prefixes = ("CAPTUREFAB_", "AWS_", "GOOGLE_", "AZURE_")
     return {key: value for key, value in os.environ.items()
-            if not key.startswith(prefixes) and key not in provider_keys}
+            if not key.upper().startswith(prefixes) and key.upper() not in provider_keys}
 
 
 def select_cases(kinds=False, only=None, all_screens=False):

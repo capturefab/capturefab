@@ -118,6 +118,9 @@ impl Approver for GuiApprover {
 }
 
 pub(in crate::gui) trait Services: Send + Sync {
+    fn retained_datasets(&self) -> anyhow::Result<Vec<RetainedDataset>> {
+        Ok(Vec::new())
+    }
     fn human_actor(&self) -> SessionActor {
         SessionActor::process(ActivityOrigin::Gui)
     }
@@ -194,6 +197,40 @@ impl NativeServices {
     }
 }
 impl Services for NativeServices {
+    fn retained_datasets(&self) -> anyhow::Result<Vec<RetainedDataset>> {
+        let live = self.handle.retained_task_data();
+        let mut rows = Vec::new();
+        for handle in live {
+            let status = handle.status();
+            let path = PathBuf::from(&status.catalog.dataset.path);
+            let error = retained_issue(&status);
+            rows.push(RetainedDataset {
+                key: retained_key(),
+                path: path.parent().unwrap_or(&path).to_owned(),
+                cap: status.catalog.extents.limit,
+                detail: format!(
+                    "{} · {} stored samples",
+                    status.catalog.dataset.name, status.catalog.dataset.samples
+                ),
+                owner: Some(RetainedOwner::Live(handle)),
+                error,
+            });
+        }
+        for row in crate::storage::recover_task_namespaces()? {
+            if rows.iter().any(|live| live.path == row.path) {
+                continue;
+            }
+            rows.push(RetainedDataset {
+                key: retained_key(),
+                path: row.path,
+                cap: row.cap,
+                detail: format!("Recovered workspace {}", row.id),
+                owner: row.handle.map(RetainedOwner::Recovered),
+                error: row.error,
+            });
+        }
+        Ok(rows)
+    }
     fn human_actor(&self) -> SessionActor {
         self.actor.clone()
     }
@@ -326,7 +363,7 @@ pub(super) fn start(
                 &mut |event| {
                     let event = match event {
                         RunEvent::State(s) => Event::State(Box::new(s)),
-                        RunEvent::Finished(o) => Event::Finished(Box::new(o)),
+                        RunEvent::Finished(o) => Event::Finished(o),
                         RunEvent::Approval(_) => return,
                         RunEvent::Changes(changes) => Event::Changes(changes),
                         RunEvent::Agent(agent::Event::Text(s)) => Event::Text(s),
@@ -355,7 +392,149 @@ pub(super) fn start(
     })
 }
 
+#[derive(Clone)]
+enum RetainedOwner {
+    Live(crate::session::task_data::TaskDataHandle),
+    Recovered(Arc<crate::storage::RecoveredNamespace>),
+}
+
+#[derive(Clone)]
+pub(in crate::gui) struct RetainedDataset {
+    pub key: u64,
+    pub path: PathBuf,
+    pub cap: u64,
+    pub detail: String,
+    pub error: Option<String>,
+    owner: Option<RetainedOwner>,
+}
+pub(super) fn retained_key() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+fn retained_issue(status: &crate::session::task_data::TaskDataStatus) -> Option<String> {
+    use crate::session::task_data::TaskDataPhase;
+    let mut issues = Vec::new();
+    for error in [
+        status.error.as_ref(),
+        status.catalog.dataset.last_error.as_ref(),
+        status.sink.error.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !issues.contains(error) {
+            issues.push(error.clone());
+        }
+    }
+    if status.sink.dropped_total > 0 {
+        issues.push(format!(
+            "Task writer reports {} dropped samples.",
+            crate::gui::format::grouped(status.sink.dropped_total)
+        ));
+    }
+    if issues.is_empty() {
+        match status.phase {
+            TaskDataPhase::Open | TaskDataPhase::Closing => {
+                issues.push("Workspace is still active or closing; saving a copy and removal are unavailable until it is retained.".into());
+            }
+            TaskDataPhase::RetainedError => {
+                issues.push("Dataset persistence or shutdown needs review. Reveal the workspace or retry removal; its reservation remains charged.".into());
+            }
+            _ if status.catalog.quarantined || !status.catalog.closed => {
+                issues.push("Dataset closure is unconfirmed; saving a copy is unavailable. Its reservation remains charged.".into());
+            }
+            _ => {}
+        }
+    }
+    (!issues.is_empty()).then(|| issues.join("\n"))
+}
+
+impl RetainedDataset {
+    fn save_copy(&self) -> anyhow::Result<Option<PathBuf>> {
+        let Some(output) = rfd::FileDialog::new()
+            .set_title("Save task dataset in a new folder")
+            .set_file_name("task-dataset-copy")
+            .save_file()
+        else {
+            return Ok(None);
+        };
+        self.copy_to(&output)?;
+        Ok(Some(output))
+    }
+    pub(super) fn copy_to(&self, output: &std::path::Path) -> anyhow::Result<()> {
+        let policy = crate::storage::configured_policy()?;
+        match &self.owner {
+            Some(RetainedOwner::Live(handle)) => handle.save_copy(output, &policy),
+            Some(RetainedOwner::Recovered(handle)) => handle.save_copy(output, &policy),
+            None => anyhow::bail!("Workspace is unavailable; refresh its inventory."),
+        }
+    }
+    pub(super) fn available(&self) -> bool {
+        self.owner.is_some()
+    }
+    pub(super) fn copyable(&self) -> bool {
+        match &self.owner {
+            Some(RetainedOwner::Recovered(_)) => true,
+            Some(RetainedOwner::Live(handle)) => {
+                let status = handle.status();
+                status.catalog.closed
+                    && !status.catalog.quarantined
+                    && status.phase != crate::session::task_data::TaskDataPhase::Removed
+            }
+            None => false,
+        }
+    }
+    pub(super) fn removable(&self) -> bool {
+        match &self.owner {
+            Some(RetainedOwner::Recovered(_)) => true,
+            Some(RetainedOwner::Live(handle)) => matches!(
+                handle.status().phase,
+                crate::session::task_data::TaskDataPhase::Retained
+                    | crate::session::task_data::TaskDataPhase::RetainedError
+            ),
+            None => false,
+        }
+    }
+    fn reveal(&self) -> anyhow::Result<()> {
+        match &self.owner {
+            Some(RetainedOwner::Live(handle)) => {
+                let status = handle.status();
+                anyhow::ensure!(
+                    status.phase != crate::session::task_data::TaskDataPhase::Removed,
+                    "Dataset was already removed."
+                );
+                anyhow::ensure!(
+                    std::path::Path::new(&status.catalog.dataset.path).parent()
+                        == Some(self.path.as_path()),
+                    "Workspace identity changed."
+                );
+                // Native capability checks the held original namespace.
+                handle.verify_workspace()?;
+            }
+            Some(RetainedOwner::Recovered(handle)) => handle.verify()?,
+            None => anyhow::bail!("This workspace is unavailable; refresh its inventory."),
+        }
+        crate::gui::reveal::reveal(&self.path)?;
+        Ok(())
+    }
+    fn remove(&self) -> anyhow::Result<Option<crate::session::task_data::TaskDataStatus>> {
+        anyhow::ensure!(
+            self.removable(),
+            "Workspace is still active or unavailable; removal refused."
+        );
+        match self.owner.as_ref().expect("removable owner") {
+            RetainedOwner::Live(handle) => handle.remove(Duration::from_secs(10)).map(Some),
+            RetainedOwner::Recovered(handle) => handle.remove().map(|_| None),
+        }
+    }
+}
+
 pub(super) enum Job {
+    Retained,
+    CopyRetained(RetainedDataset),
+    RevealRetained(RetainedDataset),
+    RemoveRetained(RetainedDataset),
     Crash,
     Read(String),
     Export(String),
@@ -364,6 +543,13 @@ pub(super) enum Job {
     Apply(Vec<(StepId, ToolCall)>, Vec<Checked>, RecoveryGuard),
 }
 pub(super) enum Reply {
+    Retained(Result<Vec<RetainedDataset>, String>),
+    Copied(Result<Option<PathBuf>, String>),
+    Revealed(Result<(), String>),
+    Removed(
+        u64,
+        Result<Option<Box<crate::session::task_data::TaskDataStatus>>, String>,
+    ),
     Crash(Result<Option<ai::log::RunSummary>, String>),
     Read(Result<String, String>),
     Export(Result<Option<PathBuf>, String>),
@@ -376,6 +562,22 @@ pub(super) fn job(services: Arc<dyn Services>, job: Job) -> Result<Receiver<Repl
         .name("capturefab-task-review".into())
         .spawn(move || {
             let reply = match job {
+                Job::CopyRetained(row) => {
+                    Reply::Copied(row.save_copy().map_err(|e| format!("{e:#}")))
+                }
+                Job::Retained => {
+                    Reply::Retained(services.retained_datasets().map_err(|e| format!("{e:#}")))
+                }
+                Job::RevealRetained(row) => {
+                    Reply::Revealed(row.reveal().map_err(|e| format!("{e:#}")))
+                }
+                Job::RemoveRetained(row) => {
+                    let result = row
+                        .remove()
+                        .map(|status| status.map(Box::new))
+                        .map_err(|e| format!("{e:#}"));
+                    Reply::Removed(row.key, result)
+                }
                 Job::Crash => Reply::Crash(
                     services
                         .runs()
@@ -445,6 +647,30 @@ pub(super) fn cleanup_plan(
     leftover: &run::Leftover,
     ctx: &Context,
 ) -> anyhow::Result<run::RestorePlan> {
+    if leftover.kind == "signal_capture" {
+        let token = record
+            .signal_captures
+            .get(&leftover.camera)
+            .ok_or_else(|| {
+                anyhow::anyhow!("This task has no acknowledged ownership of the signal capture.")
+            })?;
+        anyhow::ensure!(
+            ctx.snapshot
+                .signals
+                .iter()
+                .any(|source| source.id == leftover.camera
+                    && source.capture_id == *token
+                    && source.completed_ms.is_none()),
+            "The signal capture finished or was replaced after this task. Review the current source status."
+        );
+        return Ok(run::RestorePlan {
+            calls: vec![ToolCall {
+                tool: "stop_signal_capture".into(),
+                args: serde_json::json!({"source":leftover.camera}),
+            }],
+            skipped: Vec::new(),
+        });
+    }
     let camera = ctx
         .snapshot
         .cameras
@@ -544,8 +770,49 @@ impl RecoveryGuard {
         };
         anyhow::ensure!(
             fresh.calls == self.proposed,
-            "The camera changed while this action was being reviewed. Review it again before applying."
+            "The capture resource changed while this action was being reviewed. Review it again before applying."
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod retained_tests {
+    use super::*;
+    use crate::session::task_data::TaskDataPhase;
+
+    #[test]
+    fn retained_inventory_preserves_persistence_failures_and_uncertain_closure() {
+        let state = crate::gui::assistant::task_scenes::fixture(
+            "quick-command-task-separate-done",
+            crate::session::SessionSnapshot::default(),
+        );
+        let mut receipt = state.outcome.unwrap().task_data.unwrap();
+        assert!(retained_issue(&receipt).is_none());
+
+        receipt.phase = TaskDataPhase::RetainedError;
+        let issue = retained_issue(&receipt).unwrap();
+        assert!(issue.contains("persistence or shutdown needs review"));
+
+        receipt.error = Some("Checkpoint was interrupted.".into());
+        receipt.catalog.dataset.last_error = receipt.error.clone();
+        receipt.sink.error = Some("Storage allowance is full.".into());
+        receipt.sink.dropped_total = 2;
+        let issue = retained_issue(&receipt).unwrap();
+        assert_eq!(issue.matches("Checkpoint was interrupted.").count(), 1);
+        assert!(issue.contains("Storage allowance is full."));
+        assert!(issue.contains("2 dropped samples"));
+
+        receipt.error = None;
+        receipt.catalog.dataset.last_error = None;
+        receipt.sink.error = None;
+        receipt.sink.dropped_total = 0;
+        receipt.phase = TaskDataPhase::Closing;
+        receipt.catalog.closed = false;
+        assert!(
+            retained_issue(&receipt)
+                .unwrap()
+                .contains("still active or closing")
+        );
     }
 }

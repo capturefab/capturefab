@@ -1117,14 +1117,23 @@ fn process_plain(
         | SessionCommand::DatasetStatus
         | SessionCommand::DatasetNote { .. }
         | SessionCommand::DatasetQuery { .. }
-        | SessionCommand::DatasetExport { .. } => {
+        | SessionCommand::DatasetExport { .. }
+        | SessionCommand::DatasetOpenIf { .. }
+        | SessionCommand::DatasetCloseIf { .. }
+        | SessionCommand::DatasetNoteIf { .. }
+        | SessionCommand::DatasetQueryIf { .. }
+        | SessionCommand::DatasetModelQueryIf { .. }
+        | SessionCommand::DatasetExportIf { .. } => {
             anyhow::bail!("datasets belong to the coordinator")
         }
         SessionCommand::Signals
+        | SessionCommand::SignalBind { .. }
         | SessionCommand::SignalRead { .. }
         | SessionCommand::SignalBrowse { .. }
         | SessionCommand::SignalStart { .. }
-        | SessionCommand::SignalStop { .. } => anyhow::bail!("signals belong to the coordinator"),
+        | SessionCommand::SignalCapture { .. }
+        | SessionCommand::SignalStop { .. }
+        | SessionCommand::SignalStopIf { .. } => anyhow::bail!("signals belong to the coordinator"),
         SessionCommand::NetworkScan { .. } => {
             anyhow::bail!("network scan belongs to the coordinator")
         }

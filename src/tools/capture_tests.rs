@@ -523,7 +523,8 @@ fn delete_oldest_warns_for_remaining_budget_and_files_but_not_total_recording_li
 fn recording_reservations_include_existing_reservations_and_actionable_maximum() {
     let mut ctx = context();
     ctx.storage.effective.max_bytes = 100_000_000;
-    ctx.storage.allocated_bytes = 60_000_000;
+    // The ledger includes unwritten reservations in its allocated total.
+    ctx.storage.allocated_bytes = 90_000_000;
     ctx.storage.reserved_bytes = 30_000_000;
     let mut input = args("start_recording");
     input["duration"] = json!("10s");

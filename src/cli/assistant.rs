@@ -56,6 +56,9 @@ pub enum AssistantCommand {
         /// Export the version 1 plan to a new private file; never overwrite
         #[arg(long)]
         plan_out: Option<PathBuf>,
+        /// Allow current dataset rows and cached sensor values to be sent to the provider
+        #[arg(long)]
+        allow_data: bool,
     },
     /// Work within a camera scope, approval policy and hard limits in a running session
     Run {
@@ -63,8 +66,20 @@ pub enum AssistantCommand {
         #[command(flatten)]
         request: PromptArgs,
         /// Camera ID in this task; repeat for up to eight cameras
-        #[arg(long, required = true, value_delimiter = ',')]
+        #[arg(long, value_delimiter = ',')]
         camera: Vec<String>,
+        /// Approved signal reference or credential-free source URI; repeat for multiple sources
+        #[arg(long)]
+        source: Vec<String>,
+        /// Saved local source profile to bind explicitly to this workbench; repeat as needed
+        #[arg(long)]
+        source_profile: Vec<String>,
+        /// Exact open dataset slot ID from tools call get_dataset --json
+        #[arg(long)]
+        dataset: Option<String>,
+        /// Permit source metadata, values, notes and dataset rows to be sent to the provider
+        #[arg(long)]
+        allow_data: bool,
         /// Saved destination name in this task; repeat to allow more than one
         #[arg(long, value_delimiter = ',')]
         destination: Vec<String>,
@@ -79,8 +94,8 @@ pub enum AssistantCommand {
         approvals: Option<String>,
         /// Hard task limits; omitted values use saved defaults
         #[command(flatten)]
-        limits: LimitArgs,
-        /// Pause, inform the model, or stop after a person changes a scoped camera
+        limits: Box<LimitArgs>,
+        /// Pause, inform the model, or stop after a person changes a scoped camera, source or dataset
         #[arg(long, default_value = "pause", value_parser = ["pause", "inform", "stop"])]
         on_human_change: String,
         /// Stream the action log JSONL to a new private file, or - for stderr
@@ -183,7 +198,7 @@ pub struct LimitArgs {
     /// Maximum still captures, from 0 to 100,000; zero also disables schedules
     #[arg(long)]
     max_captures: Option<u32>,
-    /// Maximum saved capture and recording bytes, such as 2GiB, within the storage budget
+    /// Reserved images, recordings and sample payload plus twice each export bundle limit, such as 2GiB
     #[arg(long)]
     max_size: Option<String>,
     /// Maximum file recordings, from 0 to 32; streams require separate exact approval
@@ -195,6 +210,18 @@ pub struct LimitArgs {
     /// Approval deadline, from 1s to 24h; the task wall limit still applies
     #[arg(long)]
     approval_timeout: Option<String>,
+    /// Maximum sensor capture attempts, from 0 to 256
+    #[arg(long)]
+    max_sources: Option<u32>,
+    /// Maximum reserved sensor samples across this task
+    #[arg(long)]
+    max_samples: Option<u64>,
+    /// Reserved sensor payload plus twice each export bundle limit, such as 512MiB; 0 disables them
+    #[arg(long)]
+    max_data_size: Option<String>,
+    /// Maximum cumulative sensor logging duration, such as 10m; 0 disables logging
+    #[arg(long)]
+    max_signal_time: Option<String>,
 }
 
 // Raw prompts, credential-shaped URLs and keys never appear in argument Debug.
@@ -257,6 +284,7 @@ impl AssistantTaskFailure {
                 step["summary"].as_str().unwrap_or("Review this step.")
             )?;
         }
+        print_signal_reports(&mut out, &self.result)?;
         for leftover in self.result["leftovers"].as_array().into_iter().flatten() {
             writeln!(
                 out,
@@ -266,6 +294,30 @@ impl AssistantTaskFailure {
         }
         Ok(())
     }
+}
+fn print_signal_reports(out: &mut impl std::io::Write, value: &Value) -> Result<()> {
+    for source in value["signal_reports"].as_array().into_iter().flatten() {
+        writeln!(
+            out,
+            "{}: {} acquired, {} written; {} dropped; persistence {}",
+            source["source"].as_str().unwrap_or("source"),
+            source["samples"].as_u64().unwrap_or(0),
+            source["written"].as_u64().unwrap_or(0),
+            source["dropped"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_add(source["helper_dropped"].as_u64().unwrap_or(0)),
+            if source["persistence_complete"] == true {
+                "complete"
+            } else {
+                "incomplete"
+            }
+        )?;
+        if let Some(error) = source["error"].as_str() {
+            writeln!(out, "  {error}")?;
+        }
+    }
+    Ok(())
 }
 impl fmt::Debug for AssistantTaskFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -297,6 +349,8 @@ pub(super) struct PreparedAssistant {
     limits: Option<crate::assistant::Limits>,
     #[cfg(feature = "ai")]
     key: Option<zeroize::Zeroizing<String>>,
+    #[cfg(feature = "ai")]
+    source_profiles: Vec<crate::signals::auth::ProfileInfo>,
 }
 
 pub(super) fn prepare(cli: &Cli, command: &AssistantCommand) -> Result<PreparedAssistant> {
@@ -414,6 +468,7 @@ pub(super) fn print_human(command: &AssistantCommand, value: &Value) -> Result<(
                 value["summary"].as_str().unwrap_or("")
             )?;
             writeln!(out, "Action log: {}", value["log"].as_str().unwrap_or(""))?;
+            print_signal_reports(&mut out, value)?;
             for effect in value["leftovers"].as_array().into_iter().flatten() {
                 writeln!(
                     out,
@@ -661,6 +716,25 @@ mod enabled {
         if let Some(v) = &args.approval_timeout {
             value.approval_timeout_ms = duration("approval_timeout", v)?;
         }
+        if let Some(v) = args.max_sources {
+            value.max_sources = v;
+        }
+        if let Some(v) = args.max_samples {
+            value.max_samples = v;
+        }
+        if let Some(v) = &args.max_data_size {
+            value.max_data_bytes = match v.trim().to_ascii_lowercase().as_str() {
+                "0" | "0b" | "0 b" => 0,
+                _ => crate::storage::parse_bytes(v)
+                    .map_err(|error| field("max_data_size", error.to_string()))?,
+            };
+        }
+        if let Some(v) = &args.max_signal_time {
+            value.max_signal_ms = match v.trim().to_ascii_lowercase().as_str() {
+                "0" | "0s" | "0ms" => 0,
+                _ => duration("max_signal_time", v)?,
+            };
+        }
         if let Err(messages) = value.validate() {
             let names = [
                 "max_rounds",
@@ -674,6 +748,9 @@ mod enabled {
                 "max_recordings",
                 "max_recording",
                 "max_setting_changes",
+                "max_sources",
+                "max_samples",
+                "max_signal_time",
                 "max_consecutive_errors",
                 "max_identical_calls",
                 "approval_timeout",
@@ -695,6 +772,9 @@ mod enabled {
                 value.max_recordings <= 32,
                 (1000..=604_800_000).contains(&value.max_recording_ms),
                 value.max_setting_changes <= 10_000,
+                value.max_sources <= 256,
+                value.max_samples <= 100_000_000,
+                value.max_signal_ms <= 604_800_000,
                 (1..=5).contains(&value.max_consecutive_errors),
                 (1..=3).contains(&value.max_identical_calls),
                 (1000..=86_400_000).contains(&value.approval_timeout_ms),
@@ -747,6 +827,7 @@ mod enabled {
             prompt: None,
             limits: None,
             key: None,
+            source_profiles: Vec::new(),
         };
         match command {
             AssistantCommand::Use {
@@ -810,6 +891,10 @@ mod enabled {
             AssistantCommand::Run {
                 request,
                 camera,
+                source,
+                source_profile,
+                dataset,
+                allow_data,
                 destination,
                 approvals,
                 limits: args,
@@ -817,7 +902,40 @@ mod enabled {
                 ..
             } => {
                 result.prompt = Some(read_prompt(request)?);
+                if !source_profile.is_empty() && !allow_data {
+                    return Err(field(
+                        "allow_data",
+                        "Allow data to reach the provider before selecting a saved source.",
+                    ));
+                }
+                if source_profile.len() + source.len() > 32 {
+                    return Err(field("source_profile", "Choose up to 32 data sources."));
+                }
+                if !source_profile.is_empty() {
+                    let profiles = crate::signals::auth::Store::session()
+                        .list()
+                        .map_err(|error| field("source_profile", error.to_string()))?;
+                    for name in source_profile {
+                        let profile = profiles.iter().find(|profile|profile.name.eq_ignore_ascii_case(name))
+                            .ok_or_else(||field("source_profile", "No saved source has this name; run capturefab signals profiles list."))?;
+                        result.source_profiles.push(profile.clone());
+                    }
+                }
                 let scope = RunScope {
+                    data_sources: source
+                        .iter()
+                        .cloned()
+                        .chain(
+                            result
+                                .source_profiles
+                                .iter()
+                                .map(|profile| profile.reference.clone()),
+                        )
+                        .collect(),
+                    source_bindings: Vec::new(),
+                    cached_source_bindings: Vec::new(),
+                    dataset: dataset.clone(),
+                    allow_data: *allow_data,
                     cameras: camera.clone(),
                     destinations: destination.clone(),
                     allow_images: false,
@@ -825,6 +943,14 @@ mod enabled {
                     allow_schedules: false,
                     effects_may_outlive_run: false,
                 };
+                for uri in source {
+                    if crate::tools::plan::credential_value(&json!(uri)) {
+                        return Err(field(
+                            "source",
+                            "Do not put credentials in a source argument. Use a credential-free source reference or configure the source locally.",
+                        ));
+                    }
+                }
                 scope
                     .validate()
                     .map_err(|error| field("camera", error.to_string()))?;
@@ -978,6 +1104,7 @@ mod enabled {
     fn ask(cli: &Cli, command: &AssistantCommand, prepared: PreparedAssistant) -> Result<Value> {
         let AssistantCommand::Ask {
             model,
+            allow_data,
             apply,
             allow_tools,
             plan_out,
@@ -998,6 +1125,7 @@ mod enabled {
         let mut request = PlanRequest::new(prepared.prompt.as_deref().expect("prompt read once"));
         request.provider = Some(id);
         request.model = model.clone();
+        request.allow_data = *allow_data;
         let deps = deps(cli, prepared.settings)?;
         let cancel = Arc::new(AtomicBool::new(false));
         let signal = cancel.clone();
@@ -1205,7 +1333,10 @@ mod enabled {
                 "Type yes {} to approve once{}, or no {} to deny.",
                 req.id,
                 if req.allow_run_scope {
-                    format!(", run {} for this tool and camera during this task", req.id)
+                    format!(
+                        ", run {} for this tool and these reviewed resources during this task",
+                        req.id
+                    )
                 } else {
                     String::new()
                 },
@@ -1376,6 +1507,9 @@ mod enabled {
     ) -> Result<Value> {
         let AssistantCommand::Run {
             camera,
+            source,
+            dataset,
+            allow_data,
             destination,
             see_images,
             mode,
@@ -1394,6 +1528,20 @@ mod enabled {
             ));
         }
         let limits = prepared.limits.expect("limits checked offline");
+        // Consent, scope, limits and provider settings were checked offline.
+        // Bind exact saved revisions now, before the model resolves credentials.
+        let selected_host = host(cli)?;
+        let mut source_bindings = Vec::new();
+        for profile in &prepared.source_profiles {
+            let receipt: crate::signals::auth::BindingReceipt =
+                serde_json::from_value(selected_host.execute(
+                    None,
+                    crate::session::SessionCommand::SignalBind {
+                        profile: profile.profile.clone(),
+                    },
+                )?)?;
+            source_bindings.push(tools::context::DataSourceRef::from_binding(&receipt)?);
+        }
         let request = RunRequest {
             goal: prepared.prompt.expect("prompt read once"),
             mode: if mode == "autonomous" {
@@ -1402,6 +1550,19 @@ mod enabled {
                 RunMode::Supervised
             },
             scope: RunScope {
+                data_sources: source
+                    .iter()
+                    .cloned()
+                    .chain(
+                        source_bindings
+                            .iter()
+                            .map(|binding| binding.reference.clone()),
+                    )
+                    .collect(),
+                source_bindings,
+                cached_source_bindings: Vec::new(),
+                dataset: dataset.clone(),
+                allow_data: *allow_data,
                 cameras: camera.clone(),
                 destinations: destination.clone(),
                 allow_images: *see_images,
@@ -1418,6 +1579,7 @@ mod enabled {
             provider: prepared.provider,
             model: None,
             wait_for_answer: false,
+            task_data: None,
         };
         let ask = approvals.as_deref().map_or(
             io::stdin().is_terminal() && io::stderr().is_terminal(),
@@ -1556,7 +1718,7 @@ mod enabled {
     }
     fn run_value(outcome: &runtime::RunOutcome) -> Value {
         tools::redact::for_output(
-            json!({"run_id":outcome.run_id,"outcome":outcome.outcome,"summary":outcome.summary,"totals":outcome.totals,"leftovers":outcome.leftovers,"log":outcome.log}),
+            json!({"run_id":outcome.run_id,"outcome":outcome.outcome,"summary":outcome.summary,"totals":outcome.totals,"signal_reports":outcome.signal_reports,"leftovers":outcome.leftovers,"log":outcome.log}),
         )
     }
 
@@ -1727,11 +1889,11 @@ mod enabled {
             "overwrite a value a human set during this run",
             "create a destination (HumanOnly; approve once)"
         ]);
-        value["scope"] = json!({"cameras":{"min":1,"max":8,"pinned_ids":true},"destinations":"saved names; empty means the local capture root","images":"--see-images is explicit consent for this task","recordings":"max_recordings > 0 permits file recordings","schedules":"max_captures > 0 permits schedules","effects_may_outlive_run":false});
-        value["limits"] = json!({"defaults":Limits::default(),"ceilings":{"max_rounds":1000,"max_wall_ms":86_400_000,"max_input_tokens":50_000_000,"max_output_tokens":5_000_000,"max_cost_usd":500,"max_images":2000,"max_captures":100_000,"max_bytes":"live storage ceiling","max_recordings":32,"max_recording_ms":604_800_000,"max_setting_changes":10_000,"max_consecutive_errors":5,"max_identical_calls":3,"approval_timeout_ms":86_400_000},"minimums":{"max_wall_ms":60_000,"max_recording_ms":1000,"approval_timeout_ms":1000,"min_round_interval_ms":1000},"prices":"user-entered USD per million tokens; no built-in prices; max_cost needs known prices","unique_images":true,"projected_usage_before_request":true});
-        value["approvals"] = json!({"cli":["ask","deny"],"default":"ask with stdin/stderr TTY, deny otherwise","scopes":["once","run"],"run_scope_binding":["tool","camera","risk","exact egress"],"human_only":"once only","recheck_after_wait":true,"max_denials_or_timeouts":3,"no_auto_approve":true});
+        value["scope"] = json!({"cameras":{"min":0,"max":8,"pinned_ids":true},"data_sources":"--source URI or cached reference; pinned opaque references; credential URLs refused in CLI arguments","dataset":"--dataset pins an existing dataset slot; tasks can open their own local dataset","selection":"at least one camera, source or dataset","data":"--allow-data is explicit consent to send source values and dataset rows for this task","destinations":"saved names; empty means the local capture root","images":"--see-images is explicit consent for this task","recordings":"max_recordings > 0 permits file recordings","schedules":"max_captures > 0 permits schedules","effects_may_outlive_run":false});
+        value["limits"] = json!({"defaults":Limits::default(),"ceilings":{"max_rounds":1000,"max_wall_ms":86_400_000,"max_input_tokens":50_000_000,"max_output_tokens":5_000_000,"max_cost_usd":500,"max_images":2000,"max_captures":100_000,"max_bytes":"live storage ceiling","max_recordings":32,"max_recording_ms":604_800_000,"max_setting_changes":10_000,"max_sources":256,"max_samples":100_000_000,"max_data_bytes":"serialized sample payload plus twice each export bundle limit for staged and published copies; failed attempts stay charged; physical database growth and scratch are separate","max_signal_ms":604_800_000,"max_consecutive_errors":5,"max_identical_calls":3,"approval_timeout_ms":86_400_000},"minimums":{"max_wall_ms":60_000,"max_recording_ms":1000,"approval_timeout_ms":1000,"min_round_interval_ms":1000},"prices":"user-entered USD per million tokens; no built-in prices; max_cost needs known prices","unique_images":true,"projected_usage_before_request":true,"export_reservation":{"bundle_limit_unchanged":true,"copies":2,"cumulative_attempts":true,"remaining_bundle_limit":"floor(min(remaining.bytes, remaining.data_bytes) / 2)","excluded":"database/WAL growth, query scratch and filesystem overhead"}});
+        value["approvals"] = json!({"cli":["ask","deny"],"default":"ask with stdin/stderr TTY, deny otherwise","scopes":["once","run"],"run_scope_binding":["tool","camera","risk","exact egress","source endpoint identity","dataset slot","capture token","sample sink generation"],"human_only":"once only","recheck_after_wait":true,"max_denials_or_timeouts":3,"no_auto_approve":true});
         value["action_log"] = json!({"path":"<state_dir>/assistant/runs/<run_id>.jsonl","version":1,"mode":"0600","directory_mode":"0700","events":"--events FILE|- copies the exact flushed JSONL; - writes stderr","records":["start","request","text","tool","observation","approval","human_change","rollover","limit","stop","end"],"image_bytes":false,"credentials":false,"opaque_provider_reasoning":false});
-        value["data_sent"] = json!({"when":"only when the user sends an assistant request","text":["request and conversation","current plan","tool schemas and descriptions","camera names, models and IDs","discovered devices","destination names and redacted locations","storage use","job file names","recent activity","tool observations, settings and metrics"],"images":"only inspected or checkpoint images when explicitly allowed and supported; resized bytes and labels","never":["API keys","passwords","destination secrets","credential URLs","base64 images in logs"],"privacy":"Requests go to the selected provider under its data terms. Loopback and plain HTTP requests bypass proxies."});
+        value["data_sent"] = json!({"when":"only when the user sends an assistant request","text":["request and conversation","current plan","tool schemas and descriptions","camera names, models and IDs","discovered devices","destination names and redacted locations","storage use","job file names","recent activity","tool observations, settings and metrics"],"data":"source values, tags, annotations and dataset rows only with explicit --allow-data consent and fixed source/dataset scope","images":"only inspected or checkpoint images when explicitly allowed and supported; resized bytes and labels","never":["API keys","passwords","destination secrets","credential URLs","base64 images in logs"],"privacy":"Requests go to the selected provider under its data terms. Loopback and plain HTTP requests bypass proxies."});
         value["apply"] = json!({"default_allow_tools":DEFAULT_ALLOW,"all_steps_ready":true,"whole_plan_allowlist_check":true,"remote_output":false,"needs_session":true});
         value["exit_codes"] = json!({"finished_or_needs_user":0,"stopped_limit_or_failed":1,"refused_config":2,"unavailable":3,"timeout":4,"unsupported_build":5,"storage_full":6});
         value
@@ -1776,6 +1938,10 @@ mod enabled {
                 max_recordings: None,
                 max_recording: None,
                 approval_timeout: None,
+                max_sources: None,
+                max_samples: None,
+                max_data_size: None,
+                max_signal_time: None,
             }
         }
         fn error_field(error: &anyhow::Error) -> String {
@@ -1867,6 +2033,13 @@ mod enabled {
             assert_eq!(values.max_bytes, 10 * 1024 * 1024);
             assert_eq!(values.max_recordings, 0);
             assert_eq!(values.max_captures, 0);
+            for zero in ["0", "0B", "0 B"] {
+                args.max_data_size = Some(zero.into());
+                args.max_signal_time = Some("0s".into());
+                let values = limits(&defaults, &args).unwrap();
+                assert_eq!(values.max_data_bytes, 0);
+                assert_eq!(values.max_signal_ms, 0);
+            }
         }
 
         #[test]
@@ -2156,6 +2329,40 @@ mod enabled {
                 assert!(provider["env_vars"].is_array());
             }
             assert_eq!(schema["scope"]["effects_may_outlive_run"], false);
+            assert_eq!(schema["scope"]["cameras"]["min"], 0);
+            assert!(
+                schema["scope"]["data"]
+                    .as_str()
+                    .unwrap()
+                    .contains("--allow-data")
+            );
+            assert_eq!(schema["limits"]["defaults"]["max_sources"], 8);
+            assert_eq!(schema["limits"]["ceilings"]["max_samples"], 100_000_000);
+            assert_eq!(schema["limits"]["export_reservation"]["copies"], 2);
+            assert_eq!(
+                schema["limits"]["export_reservation"]["remaining_bundle_limit"],
+                "floor(min(remaining.bytes, remaining.data_bytes) / 2)"
+            );
+            assert_eq!(
+                schema["limits"]["export_reservation"]["cumulative_attempts"],
+                true
+            );
+            assert!(
+                schema["approvals"]["run_scope_binding"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("sample sink generation"))
+            );
+        }
+
+        #[test]
+        fn human_data_report_distinguishes_acquired_written_and_incomplete_persistence() {
+            let value = json!({"signal_reports":[{"source":"signal:0123456789abcdef","samples":12,"written":10,"dropped":1,"helper_dropped":1,"persistence_complete":false,"error":"Dataset is full."}]});
+            let mut output = Vec::new();
+            print_signal_reports(&mut output, &value).unwrap();
+            let text = String::from_utf8(output).unwrap();
+            assert!(text.contains("12 acquired, 10 written; 2 dropped; persistence incomplete"));
+            assert!(text.contains("Dataset is full."));
         }
 
         #[test]

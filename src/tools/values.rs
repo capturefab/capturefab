@@ -373,6 +373,11 @@ pub fn contain_path(root: &Path, candidate: &Path) -> Result<(), Issue> {
     Ok(())
 }
 
+/// Pin the physical capture root while retaining any not-yet-created tail.
+pub fn canonical_root(root: &Path) -> Result<PathBuf, Issue> {
+    existing_ancestor(root).map_err(path_problem)
+}
+
 /// Repeat destination refusals on the physical location just before creating
 /// the folder. This closes aliases into protected session and staging roots.
 pub fn folder_path_live(

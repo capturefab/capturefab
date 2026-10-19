@@ -139,7 +139,7 @@ impl Services for NativeServices {
         tools::apply(
             &self.host(),
             secrets,
-            || self.gather(),
+            || approved_data_context(self.gather()?, approved),
             calls,
             Some(approved),
             progress,
@@ -204,6 +204,35 @@ impl Services for NativeServices {
             Err("Use a build with S3 support to test this destination.".into())
         }
     }
+}
+
+/// Fresh application checks receive only the exact endpoints already present
+/// in the locally reviewed operations. Cached display locations never bind.
+fn approved_data_context(mut context: Context, approved: &[Checked]) -> anyhow::Result<Context> {
+    let allowed = approved
+        .iter()
+        .any(|step| tools::data::is_action(&step.call.tool));
+    let mut bindings = Vec::new();
+    for step in approved {
+        for op in &step.ops {
+            if let tools::Op::Session {
+                command:
+                    crate::session::SessionCommand::SignalCapture { uri, auth, .. }
+                    | crate::session::SessionCommand::SignalRead { uri, auth, .. }
+                    | crate::session::SessionCommand::SignalBrowse { uri, auth, .. },
+                ..
+            } = op
+            {
+                let mut binding = tools::context::DataSourceRef::approved(uri)?;
+                binding.auth = auth.clone();
+                binding.validate_local()?;
+                binding.validate_in(&context)?;
+                bindings.push(binding);
+            }
+        }
+    }
+    agent::authorize_plan_data_with_sources(&mut context, allowed, &bindings)?;
+    Ok(context)
 }
 
 pub(super) struct Unavailable;
@@ -359,4 +388,113 @@ pub(super) fn test_s3(
     spawn("capturefab-assistant-bucket-test", move |sender| {
         let _ = sender.send(services.test_s3(&checked, secrets.as_ref()));
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::tests::{FakeHost, fixture_context, fixture_snapshot};
+    use serde_json::json;
+
+    #[test]
+    fn native_apply_rebinds_only_reviewed_source_endpoints_before_the_first_effect() {
+        let snapshot = fixture_snapshot();
+        let binding = tools::context::DataSourceRef::approved("sim-signal://plan-first").unwrap();
+        let mut context = fixture_context(snapshot.clone());
+        agent::authorize_plan_data_with_sources(&mut context, true, std::slice::from_ref(&binding))
+            .unwrap();
+        let calls = vec![(
+            StepId(1),
+            ToolCall {
+                tool: "read_data_source".into(),
+                args: json!({"source":binding.reference,"timeout":"1s"}),
+            },
+        )];
+        let approved = tools::check_plan(&context, &calls, &|_, _| false);
+        assert!(approved[0].ready(), "{:?}", approved[0].issues);
+        assert_eq!(approved[0].call.args["source"], binding.reference);
+        let host = FakeHost::new(snapshot.clone());
+        assert!(host.calls().is_empty());
+        tools::apply(
+            &host,
+            &tools::EmptySecrets,
+            || approved_data_context(fixture_context(snapshot.clone()), &approved),
+            &calls,
+            Some(&approved),
+            |_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(host.calls().iter().any(|(_,command)|matches!(command,crate::session::SessionCommand::SignalRead {uri,..} if uri==&binding.uri)));
+
+        let substituted = FakeHost::new(snapshot.clone());
+        let result = tools::apply(
+            &substituted,
+            &tools::EmptySecrets,
+            || {
+                let mut context =
+                    approved_data_context(fixture_context(snapshot.clone()), &approved)?;
+                context.data_sources = vec![tools::context::DataSourceRef::approved(
+                    "sim-signal://unreviewed",
+                )?];
+                Ok(context)
+            },
+            &calls,
+            Some(&approved),
+            |_| {},
+            &AtomicBool::new(false),
+        );
+        assert!(result.is_err());
+        assert!(
+            substituted.calls().is_empty(),
+            "substituted bindings fail before any effect"
+        );
+    }
+
+    #[test]
+    fn native_apply_preserves_reviewed_credential_epoch_and_rejects_its_replacement() {
+        let mut context = fixture_context(fixture_snapshot());
+        let source = crate::gui::source_setup::tests::bound_context(&mut context);
+        let fresh = context.clone();
+        agent::authorize_plan_data_with_sources(&mut context, true, std::slice::from_ref(&source))
+            .unwrap();
+        let calls = vec![(
+            StepId(1),
+            ToolCall {
+                tool: "read_data_source".into(),
+                args: json!({"source":source.reference,"timeout":"1s"}),
+            },
+        )];
+        let approved = tools::check_plan(&context, &calls, &|_, _| false);
+        assert!(approved[0].ready(), "{:?}", approved[0].issues);
+        let host = FakeHost::new(context.snapshot.clone());
+        tools::apply(
+            &host,
+            &tools::EmptySecrets,
+            || approved_data_context(fresh.clone(), &approved),
+            &calls,
+            Some(&approved),
+            |_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(host.calls().iter().any(|(_,command)|matches!(command,crate::session::SessionCommand::SignalRead{uri,auth,..} if uri==&source.uri && auth==&source.auth)));
+        let mut changed = fresh;
+        changed.snapshot.signal_bindings[0].auth.epoch = "e".repeat(32);
+        let denied = FakeHost::new(changed.snapshot.clone());
+        let result = tools::apply(
+            &denied,
+            &tools::EmptySecrets,
+            || approved_data_context(changed.clone(), &approved),
+            &calls,
+            Some(&approved),
+            |_| {},
+            &AtomicBool::new(false),
+        );
+        assert!(result.is_err());
+        assert!(
+            denied.calls().is_empty(),
+            "epoch replacement fails before the first source effect"
+        );
+    }
 }

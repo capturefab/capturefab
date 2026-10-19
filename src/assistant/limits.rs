@@ -51,10 +51,15 @@ pub struct Totals {
     pub captures: u32,
     pub bytes: u64,
     pub recordings: u32,
+    pub sources: u32,
+    pub samples: u64,
+    pub data_bytes: u64,
+    pub signal_ms: u64,
     pub setting_changes: u32,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Remaining {
     pub rounds: u32,
     pub wall_ms: u64,
@@ -65,6 +70,12 @@ pub struct Remaining {
     pub captures: u32,
     pub bytes: u64,
     pub recordings: u32,
+    pub sources: u32,
+    pub samples: u64,
+    pub data_bytes: u64,
+    /// Maximum bundle limit after reserving both staged and published copies.
+    pub export_bundle_bytes: u64,
+    pub signal_ms: u64,
     pub setting_changes: u32,
 }
 
@@ -162,6 +173,12 @@ pub struct ToolImpact {
     pub bytes: u64,
     pub recordings: u32,
     pub recording_ms: Option<u64>,
+    pub sources: u32,
+    pub samples: u64,
+    pub data_bytes: u64,
+    pub signal_ms: u64,
+    /// Worst-case synchronous work; it may not overrun the task deadline.
+    pub blocking_ms: u64,
     pub setting_changes: u32,
     pub ends_at_ms: Option<u64>,
 }
@@ -219,19 +236,55 @@ impl ToolImpact {
                 | SessionCommand::Manual { .. } => {
                     impact.setting_changes = impact.setting_changes.saturating_add(1)
                 }
+                SessionCommand::SignalCapture {
+                    duration_ms,
+                    max_samples,
+                    max_bytes,
+                    ..
+                } => {
+                    impact.sources = impact.sources.saturating_add(1);
+                    impact.samples = impact.samples.saturating_add(*max_samples);
+                    impact.data_bytes = impact.data_bytes.saturating_add(*max_bytes);
+                    impact.signal_ms = impact.signal_ms.saturating_add(*duration_ms);
+                    impact.ends_at_ms = Some(
+                        impact
+                            .ends_at_ms
+                            .unwrap_or(0)
+                            .max(now_ms.saturating_add(*duration_ms)),
+                    );
+                }
+                SessionCommand::DatasetExportIf {
+                    max_bytes,
+                    timeout_ms,
+                    ..
+                } => {
+                    impact.data_bytes = impact
+                        .data_bytes
+                        .saturating_add(max_bytes.saturating_mul(2));
+                    impact.blocking_ms = impact.blocking_ms.saturating_add(*timeout_ms);
+                }
+                SessionCommand::SignalRead { timeout_ms, .. } => {
+                    impact.blocking_ms = impact.blocking_ms.saturating_add(*timeout_ms)
+                }
+                SessionCommand::SignalBrowse { duration_ms, .. } => {
+                    impact.blocking_ms = impact.blocking_ms.saturating_add(*duration_ms)
+                }
                 _ => {}
             }
         }
         let recording = checked.call.tool == "start_recording";
         for op in &checked.ops {
             match op {
-                Op::Command { command: cmd, .. } | Op::Stream { command: cmd, .. } => {
-                    command(&mut impact, cmd, now_ms, recording)
-                }
+                Op::Command { command: cmd, .. }
+                | Op::Stream { command: cmd, .. }
+                | Op::Session { command: cmd, .. } => command(&mut impact, cmd, now_ms, recording),
                 Op::Restartable { commands, .. } => {
                     for cmd in commands {
                         command(&mut impact, cmd, now_ms, recording);
                     }
+                }
+                Op::WaitData { timeout_ms, .. } => {
+                    impact.blocking_ms = impact.blocking_ms.saturating_add(*timeout_ms)
                 }
                 _ => {}
             }
@@ -284,6 +337,10 @@ fn label(name: &str) -> &str {
         "cost" => "estimated cost",
         "bytes" => "data",
         "recording_ms" => "recording-duration",
+        "sources" => "source-capture",
+        "samples" => "sample",
+        "data_bytes" => "signal and export bytes",
+        "signal_ms" => "signal-duration",
         "setting_changes" => "settings-change",
         "consecutive_errors" => "consecutive-error",
         "identical_calls" => "identical-action",
@@ -362,10 +419,22 @@ impl Limiter {
     pub fn deadline_ms(&self) -> u64 {
         self.start_ms.saturating_add(self.limits.max_wall_ms)
     }
+    /// The native workspace promise is separate from serialized payload limits,
+    /// but remains charged to the task's overall byte allowance after failure.
+    pub fn reserve_task_storage(&mut self, bytes: u64) -> Result<(), LimitReached> {
+        bound_sum("bytes", self.totals.bytes, bytes, self.limits.max_bytes)?;
+        self.totals.bytes += bytes;
+        Ok(())
+    }
     pub fn remaining_wall_ms(&self, now_ms: u64) -> u64 {
         self.deadline_ms().saturating_sub(now_ms)
     }
     pub fn remaining(&self, now_ms: u64) -> Remaining {
+        let bytes = self.limits.max_bytes.saturating_sub(self.totals.bytes);
+        let data_bytes = self
+            .limits
+            .max_data_bytes
+            .saturating_sub(self.totals.data_bytes);
         Remaining {
             rounds: self.limits.max_rounds.saturating_sub(self.totals.rounds),
             wall_ms: self.remaining_wall_ms(now_ms),
@@ -386,11 +455,19 @@ impl Limiter {
                 .limits
                 .max_captures
                 .saturating_sub(self.totals.captures),
-            bytes: self.limits.max_bytes.saturating_sub(self.totals.bytes),
+            bytes,
             recordings: self
                 .limits
                 .max_recordings
                 .saturating_sub(self.totals.recordings),
+            sources: self.limits.max_sources.saturating_sub(self.totals.sources),
+            samples: self.limits.max_samples.saturating_sub(self.totals.samples),
+            data_bytes,
+            export_bundle_bytes: bytes.min(data_bytes) / 2,
+            signal_ms: self
+                .limits
+                .max_signal_ms
+                .saturating_sub(self.totals.signal_ms),
             setting_changes: self
                 .limits
                 .max_setting_changes
@@ -503,6 +580,12 @@ impl Limiter {
     }
     pub fn check_tool(&self, now_ms: u64, impact: &ToolImpact) -> Result<(), LimitReached> {
         self.check_totals(now_ms)?;
+        bound_sum(
+            "wall",
+            now_ms.saturating_sub(self.start_ms),
+            impact.blocking_ms,
+            self.limits.max_wall_ms,
+        )?;
         for (name, used, added, max) in [
             (
                 "images",
@@ -523,6 +606,12 @@ impl Limiter {
                 self.limits.max_recordings,
             ),
             (
+                "sources",
+                self.totals.sources,
+                impact.sources,
+                self.limits.max_sources,
+            ),
+            (
                 "setting_changes",
                 self.totals.setting_changes,
                 impact.setting_changes,
@@ -541,6 +630,28 @@ impl Limiter {
             impact.bytes,
             self.limits.max_bytes,
         )?;
+        for (name, used, added, max) in [
+            (
+                "samples",
+                self.totals.samples,
+                impact.samples,
+                self.limits.max_samples,
+            ),
+            (
+                "data_bytes",
+                self.totals.data_bytes,
+                impact.data_bytes,
+                self.limits.max_data_bytes,
+            ),
+            (
+                "signal_ms",
+                self.totals.signal_ms,
+                impact.signal_ms,
+                self.limits.max_signal_ms,
+            ),
+        ] {
+            bound_sum(name, used, added, max)?;
+        }
         if let Some(duration) = impact.recording_ms {
             bound("recording_ms", duration, self.limits.max_recording_ms)?;
         }
@@ -551,6 +662,10 @@ impl Limiter {
         self.totals.captures = self.totals.captures.saturating_add(impact.captures);
         self.totals.bytes = self.totals.bytes.saturating_add(impact.bytes);
         self.totals.recordings = self.totals.recordings.saturating_add(impact.recordings);
+        self.totals.sources = self.totals.sources.saturating_add(impact.sources);
+        self.totals.samples = self.totals.samples.saturating_add(impact.samples);
+        self.totals.data_bytes = self.totals.data_bytes.saturating_add(impact.data_bytes);
+        self.totals.signal_ms = self.totals.signal_ms.saturating_add(impact.signal_ms);
         self.totals.setting_changes = self
             .totals
             .setting_changes
@@ -626,6 +741,26 @@ impl Limiter {
                 "recordings",
                 f64::from(self.totals.recordings),
                 f64::from(self.limits.max_recordings),
+            ),
+            (
+                "sources",
+                f64::from(self.totals.sources),
+                f64::from(self.limits.max_sources),
+            ),
+            (
+                "samples",
+                self.totals.samples as f64,
+                self.limits.max_samples as f64,
+            ),
+            (
+                "data_bytes",
+                self.totals.data_bytes as f64,
+                self.limits.max_data_bytes as f64,
+            ),
+            (
+                "signal_ms",
+                self.totals.signal_ms as f64,
+                self.limits.max_signal_ms as f64,
             ),
             (
                 "setting_changes",
@@ -935,6 +1070,7 @@ mod tests {
             recording_ms: Some(1000),
             setting_changes: 2,
             ends_at_ms: None,
+            ..Default::default()
         };
         state.check_tool(101, &impact).unwrap();
         state.record_tool(impact);
@@ -979,6 +1115,237 @@ mod tests {
             .unwrap_err()
             .name,
             "bytes"
+        );
+    }
+
+    #[test]
+    fn source_allowances_are_reserved_cumulatively_and_cannot_be_refunded_after_failure() {
+        let mut state = limiter(Limits {
+            max_sources: 1,
+            max_samples: 20,
+            max_data_bytes: 100,
+            max_signal_ms: 1000,
+            ..Limits::default()
+        });
+        let impact = ToolImpact {
+            sources: 1,
+            samples: 20,
+            data_bytes: 100,
+            signal_ms: 1000,
+            bytes: 100,
+            ..Default::default()
+        };
+        state.check_tool(101, &impact).unwrap();
+        state.record_tool(impact);
+        state.record_result(false).unwrap();
+        for (added, name) in [
+            (
+                ToolImpact {
+                    sources: 1,
+                    ..Default::default()
+                },
+                "sources",
+            ),
+            (
+                ToolImpact {
+                    samples: 1,
+                    ..Default::default()
+                },
+                "samples",
+            ),
+            (
+                ToolImpact {
+                    data_bytes: 1,
+                    ..Default::default()
+                },
+                "data_bytes",
+            ),
+            (
+                ToolImpact {
+                    signal_ms: 1,
+                    ..Default::default()
+                },
+                "signal_ms",
+            ),
+        ] {
+            assert_eq!(state.check_tool(102, &added).unwrap_err().name, name);
+        }
+        let remaining = state.remaining(102);
+        assert_eq!(remaining.sources, 0);
+        assert_eq!(remaining.samples, 0);
+        assert_eq!(remaining.data_bytes, 0);
+        assert_eq!(remaining.signal_ms, 0);
+        assert_eq!(state.totals.bytes, 100);
+    }
+
+    #[test]
+    fn data_impacts_use_checked_finite_commands_instead_of_model_descriptions() {
+        let mut checked = Checked::new(
+            StepId(1),
+            &ToolCall {
+                tool: "start_signal_capture".into(),
+                args: json!({"max_samples":1}),
+            },
+        );
+        checked.ops.push(Op::Session {
+            command: SessionCommand::SignalCapture {
+                auth: None,
+                slot_id: "1".repeat(32),
+                sink_generation: None,
+                uri: "sim-signal://line1".into(),
+                interval_ms: 100,
+                tags: Vec::new(),
+                duration_ms: 1000,
+                max_samples: 40,
+                max_bytes: 4096,
+            },
+            dataset_from_plan: false,
+        });
+        let impact = ToolImpact::from_checked(&checked, 4096, 100);
+        assert_eq!(impact.sources, 1);
+        assert_eq!(impact.samples, 40);
+        assert_eq!(impact.data_bytes, 4096);
+        assert_eq!(impact.bytes, 4096);
+        assert_eq!(impact.signal_ms, 1000);
+        assert_eq!(impact.ends_at_ms, Some(1100));
+    }
+
+    #[test]
+    fn export_reservations_count_both_copies_and_keep_failed_attempts_charged() {
+        let mut checked = Checked::new(
+            StepId(1),
+            &ToolCall {
+                tool: "export_dataset".into(),
+                args: json!({"max_bytes":1}),
+            },
+        );
+        checked.ops.push(Op::Session {
+            command: SessionCommand::DatasetExportIf {
+                slot_id: "1".repeat(32),
+                output: "/data/export".into(),
+                approved_root: Some("/data".into()),
+                formats: vec![crate::dataset::ExportFormat::Csv],
+                tables: Vec::new(),
+                since_ms: None,
+                until_ms: None,
+                storage: Default::default(),
+                max_bytes: 100,
+                timeout_ms: 1000,
+            },
+            dataset_from_plan: false,
+        });
+        // PlanState already includes both copies. Runtime adds no third copy.
+        let impact = ToolImpact::from_checked(&checked, 200, 100);
+        assert_eq!(impact.bytes, 200);
+        assert_eq!(impact.data_bytes, 200);
+        for (max_bytes, max_data_bytes, rejected) in
+            [(199, 1000, "bytes"), (1000, 199, "data_bytes")]
+        {
+            let state = limiter(Limits {
+                max_bytes,
+                max_data_bytes,
+                ..Limits::default()
+            });
+            assert_eq!(state.check_tool(101, &impact).unwrap_err().name, rejected);
+        }
+        let mut state = limiter(Limits {
+            max_bytes: 400,
+            max_data_bytes: 400,
+            ..Limits::default()
+        });
+        for expected in [200, 400] {
+            state.check_tool(101, &impact).unwrap();
+            // The runtime records reservations before execution. A failed
+            // export or failed staging cleanup never refunds this charge.
+            state.record_tool(impact);
+            assert_eq!(state.totals.bytes, expected);
+            assert_eq!(state.totals.data_bytes, expected);
+        }
+        assert_eq!(state.check_tool(101, &impact).unwrap_err().name, "bytes");
+        assert_eq!(state.remaining(101).export_bundle_bytes, 0);
+    }
+
+    #[test]
+    fn remaining_export_bundle_bytes_use_half_the_smaller_byte_allowance() {
+        let mut state = limiter(Limits {
+            max_bytes: 101,
+            max_data_bytes: 80,
+            ..Limits::default()
+        });
+        assert_eq!(state.remaining(101).export_bundle_bytes, 40);
+        state.record_tool(ToolImpact {
+            bytes: 50,
+            data_bytes: 10,
+            ..Default::default()
+        });
+        let remaining = state.remaining(101);
+        assert_eq!(remaining.bytes, 51);
+        assert_eq!(remaining.data_bytes, 70);
+        assert_eq!(remaining.export_bundle_bytes, 25);
+        assert_eq!(
+            serde_json::to_value(remaining).unwrap()["export_bundle_bytes"],
+            25
+        );
+    }
+
+    #[test]
+    fn native_workspace_reservation_leaves_transfer_allowances_separate_but_charges_total_bytes() {
+        let mut state = limiter(Limits {
+            max_bytes: 100,
+            max_data_bytes: 80,
+            ..Limits::default()
+        });
+        state.reserve_task_storage(40).unwrap();
+        assert_eq!(state.remaining(101).bytes, 60);
+        assert_eq!(state.remaining(101).data_bytes, 80);
+        assert_eq!(state.remaining(101).export_bundle_bytes, 30);
+        let payload = ToolImpact {
+            bytes: 60,
+            data_bytes: 60,
+            ..Default::default()
+        };
+        state.check_tool(101, &payload).unwrap();
+        state.record_tool(payload);
+        assert_eq!(state.reserve_task_storage(1).unwrap_err().name, "bytes");
+        assert_eq!(state.totals.bytes, 100);
+        assert_eq!(state.totals.data_bytes, 60);
+    }
+
+    #[test]
+    fn blocking_data_operations_cannot_outlive_the_remaining_task_wall_time() {
+        let state = limiter(Limits::default());
+        let mut checked = Checked::new(
+            StepId(1),
+            &ToolCall {
+                tool: "read_data_source".into(),
+                args: json!({}),
+            },
+        );
+        checked.ops.push(Op::Session {
+            command: SessionCommand::SignalRead {
+                auth: None,
+                uri: "sim-signal://line1".into(),
+                timeout_ms: 5000,
+            },
+            dataset_from_plan: false,
+        });
+        checked.ops.push(Op::WaitData {
+            source: "signal:0000000000000000".into(),
+            capture_id: Some("a".repeat(32)),
+            timeout_ms: 5000,
+            samples: None,
+        });
+        let impact = ToolImpact::from_checked(&checked, 0, 100);
+        assert_eq!(impact.blocking_ms, 10_000);
+        state
+            .check_tool(state.deadline_ms() - 10_000, &impact)
+            .unwrap();
+        assert_eq!(
+            state
+                .check_tool(state.deadline_ms() - 9999, &impact)
+                .unwrap_err()
+                .name,
+            "wall"
         );
     }
 

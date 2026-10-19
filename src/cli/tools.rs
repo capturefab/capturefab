@@ -31,9 +31,18 @@ static NEXT_IMAGE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Subcommand)]
 pub enum ToolsCommand {
-    /// List the shared camera tools, risks and portable argument schemas
-    List,
-    /// Read session facts or check and run one camera tool
+    /// List shared image and data tools, risks and portable argument schemas
+    List {
+        /// Return just names, titles, risks and capability flags; use describe for each schema
+        #[arg(long)]
+        compact: bool,
+    },
+    /// Read one tool's description and argument schema without a session
+    Describe {
+        /// Tool name from tools list
+        name: String,
+    },
+    /// Read session facts or check and run one image or data tool
     Call {
         /// Tool name from tools list
         name: String,
@@ -59,7 +68,7 @@ pub enum ToolsCommand {
         #[arg(long)]
         inline_image: bool,
     },
-    /// Check and run a version 1 camera-tool plan in order
+    /// Check and run a version 1 image and data tool plan in order
     Apply {
         /// Plan JSON file, or - for stdin
         file: PathBuf,
@@ -78,7 +87,14 @@ pub enum ToolsCommand {
 impl fmt::Debug for ToolsCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::List => f.write_str("Tools::List"),
+            Self::List { compact } => f
+                .debug_struct("Tools::List")
+                .field("compact", compact)
+                .finish(),
+            Self::Describe { name } => f
+                .debug_struct("Tools::Describe")
+                .field("name", &registry::redact::for_output_text(name))
+                .finish(),
             Self::Call {
                 name,
                 args,
@@ -117,7 +133,7 @@ impl fmt::Debug for ToolsCommand {
 
 /// Cached once during CLI preparation, before session auto-attachment.
 pub(super) enum PreparedTools {
-    List,
+    Catalog(Value),
     Calls(Vec<(StepId, ToolCall)>),
 }
 
@@ -182,7 +198,23 @@ pub(super) fn prepare(cli: &Cli, command: &ToolsCommand) -> Result<PreparedTools
     })())
     .map_err(|error| usage(format!("{error:#}")))?;
     let (steps, secret_stdin) = match command {
-        ToolsCommand::List => return Ok(PreparedTools::List),
+        ToolsCommand::List { compact } => {
+            return Ok(PreparedTools::Catalog(if *compact {
+                json!(
+                    registry::catalog()
+                        .iter()
+                        .map(registry::ToolSpec::index_json)
+                        .collect::<Vec<_>>()
+                )
+            } else {
+                registry::catalog_json()
+            }));
+        }
+        ToolsCommand::Describe { name } => {
+            let spec =
+                registry::spec(name).ok_or_else(|| usage("Choose a tool from tools list."))?;
+            return Ok(PreparedTools::Catalog(spec.description_json()));
+        }
         ToolsCommand::Call {
             name,
             args,
@@ -341,8 +373,9 @@ fn unwrap_apply(error: ApplyError) -> anyhow::Error {
 }
 
 pub(super) fn run(cli: &Cli, command: &ToolsCommand, prepared: PreparedTools) -> Result<Value> {
-    let PreparedTools::Calls(steps) = prepared else {
-        return Ok(registry::catalog_json());
+    let steps = match prepared {
+        PreparedTools::Calls(steps) => steps,
+        PreparedTools::Catalog(value) => return Ok(value),
     };
     let override_timeout = cli
         .request_timeout
@@ -371,7 +404,9 @@ pub(super) fn run(cli: &Cli, command: &ToolsCommand, prepared: PreparedTools) ->
             confirmed_by_user,
             ..
         } => (*dry_run, *secret_stdin, *confirmed_by_user),
-        ToolsCommand::List => unreachable!("list has no prepared calls"),
+        ToolsCommand::List { .. } | ToolsCommand::Describe { .. } => {
+            unreachable!("catalog commands have no prepared calls")
+        }
     };
     if !host.has_session() {
         for (_, call) in &steps {
@@ -447,7 +482,7 @@ pub(super) fn run(cli: &Cli, command: &ToolsCommand, prepared: PreparedTools) ->
     let cancel = Arc::new(AtomicBool::new(false));
     let signal_cancel = cancel.clone();
     ctrlc::set_handler(move || signal_cancel.store(true, Ordering::Relaxed))
-        .context("Install the camera-tool stop handler.")?;
+        .context("Install the capture-tool stop handler.")?;
     if steps.len() == 1
         && registry::spec(&steps[0].1.tool).is_some_and(|spec| spec.kind == ToolKind::Read)
     {
@@ -650,7 +685,7 @@ fn deliver_image(
 
 pub(super) fn print_human(command: &ToolsCommand, value: &Value) -> Result<()> {
     let mut out = io::stdout().lock();
-    if matches!(command, ToolsCommand::List) {
+    if matches!(command, ToolsCommand::List { .. }) {
         writeln!(out, "{:<28} {:<12} TITLE", "TOOL", "RISK")?;
         for spec in registry::catalog() {
             writeln!(
@@ -692,11 +727,13 @@ pub(super) fn print_human(command: &ToolsCommand, value: &Value) -> Result<()> {
 pub(super) fn schema_contract() -> Value {
     json!({
         "catalog":registry::catalog_json(),
+        "discovery":{"list":"tools list --json returns the full catalog; tools list --compact --json returns names, titles, kinds, risks and capability flags without descriptions or schemas","describe":"tools describe NAME --json returns one full catalog entry","session":"Neither command needs a running session or provider credentials"},
         "plan":{"version":registry::PLAN_VERSION,"shape":{"version":1,"calls":[{"tool":"tool name","args":"complete argument object"}]},"max_calls":registry::MAX_PLAN_CALLS,"max_bytes":MAX_INPUT,"kinds":["control","capture","configure"],"unknown_fields":"refused","export":"0600; credential URLs refused"},
         "issues":{"shape":{"step":"1-based integer","field":"argument path or null","message":"redacted sentence","severity":"error or warning","code":"typed category"},"exit_codes":{"usage":2,"unavailable":3,"timeout":4,"unsupported":5,"storage_full":6,"operation_failed":1}},
         "confirmation":{"risks":["disruptive","human_only"],"flag":"--confirmed-by-user","rule":"Pass only after the user approved this exact action.","missing":"usage (exit 2) with risk and checked steps, before checked validation or availability errors","dry_run":"confirmation is not necessary; checked issues determine the exit code"},
         "images":{"tool":"inspect_frame","default":"private ephemeral <runtime_dir>/inspect/ files outside the storage ledger","directory_mode":"0700","file_mode":"0600","max_files":MAX_IMAGES,"max_bytes":MAX_IMAGE_BYTES,"image_out":"storage-budgeted new file; existing files are never overwritten","inline_image":"image.base64 holds the encoded preview","metadata":["path","mime","width","height","bytes","sha256"]},
         "secrets":{"source":"--secret-stdin","count":"exactly one eligible step","fields":["create_s3_destination.secret","stream_to_url.password"],"schemas":"secret and password are UI/CLI-only and absent from schemas"},
+        "field_kinds":{"string_list":{"json":"array of strings; optional fields also accept null","editor":"one name per row; Add and Remove preserve string values"}},
         "redaction":"URL passwords, credential query values, RTMP stream keys and AWS access key IDs are removed from output; model output additionally removes serial, address, profile and full network URL paths."
     })
 }
@@ -706,6 +743,14 @@ mod tests {
     use super::super::Command;
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn schema_documents_string_list_form_values() {
+        assert_eq!(
+            schema_contract()["field_kinds"]["string_list"]["json"],
+            "array of strings; optional fields also accept null"
+        );
+    }
 
     #[test]
     fn bounded_json_reads_stop_at_the_contract_limit() {

@@ -12,7 +12,7 @@ const CALLOUT: f32 = 4.0 + style::line_height(style::SMALL) + 4.0;
 /// Height of the welcome screen's content with one card and nothing else,
 /// which sits centered; more grows downward from there, so nothing above
 /// the cards ever moves as discovery changes them.
-const ANCHORED: f32 = 280.0;
+const ANCHORED: f32 = 330.0;
 /// How far the welcome screen rises as it fades in.
 const RISE: f32 = 24.0;
 
@@ -148,7 +148,7 @@ impl Workbench {
             })
             // The sidebar retains every discovered and recent source. Avoid
             // duplicating a long source list above compact onboarding actions.
-            .take(if compact && self.sidebar_open { 2 } else { 4 })
+            .take(if compact && self.sidebar_open { 1 } else { 4 })
             .collect();
         let recent: Vec<&Recent> = self
             .recent
@@ -197,10 +197,39 @@ impl Workbench {
         let mut content = column![
             icon(Icon::Mark, if compact { 32.0 } else { 44.0 }, p.accent),
             space().height(if compact { 6 } else { 10 }),
-            text("Connect a camera")
+            text("Your capture workbench")
                 .size(style::DISPLAY)
                 .font(style::BOLD)
                 .color(p.text),
+            row![
+                button(
+                    row![
+                        icon(Icon::Sparkle, 15.0, Color::WHITE),
+                        text("Ask the assistant").size(style::BODY)
+                    ]
+                    .spacing(7)
+                    .align_y(Alignment::Center)
+                )
+                .name("Ask the assistant")
+                .description("Plan or run a capture task using your own provider or local model")
+                .style(style::primary)
+                .padding([7, 12])
+                .on_press(Message::Assistant(assistant::Input::Quick(
+                    assistant::quick::Input::Open(true)
+                ))),
+                button(text("Connect an agent").size(style::BODY))
+                    .name("Connect an agent")
+                    .description(
+                        "Let an external harness control this same workbench through the CLI"
+                    )
+                    .style(style::secondary)
+                    .padding([7, 12])
+                    .on_press(Message::AgentSetup(true)),
+            ]
+            .spacing(8)
+            .wrap()
+            .vertical_spacing(8),
+            space().height(if compact { 4 } else { 12 }),
             text(subtitle)
                 .size(style::BODY)
                 .color(p.secondary)
@@ -385,17 +414,6 @@ impl Workbench {
             .wrap()
             .vertical_spacing(8);
         let guide = row![
-            button(text("Quick command…").size(style::SMALL))
-                .name("Open quick command")
-                .style(style::link)
-                .padding([2, 6])
-                .on_press(Message::Assistant(assistant::Input::Quick(
-                    assistant::quick::Input::Open(true)
-                ))),
-            text(Action::QuickCommand.key_label(os))
-                .size(style::CAPTION)
-                .color(p.secondary),
-            space().width(8),
             button(text("Quick guide").size(style::SMALL))
                 .style(style::link)
                 .padding([2, 6])
@@ -626,6 +644,8 @@ mod tests {
                 Action::Discover.hint(DISCOVERS, Os::CURRENT),
                 Action::ConnectAddress.hint(ADDRESSES, Os::CURRENT),
                 "Quick guide".into(),
+                "Ask the assistant".into(),
+                "Connect an agent".into(),
             ] {
                 let action = snapshot
                     .nodes

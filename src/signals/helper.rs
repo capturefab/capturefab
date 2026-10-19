@@ -32,12 +32,13 @@ pub fn run_helper() -> Result<()> {
     // decides when sources stop and flush.
     let _ = ctrlc::set_handler(|| {});
     let mut input = std::io::stdin().lock();
-    let mut line = String::new();
+    let mut line = zeroize::Zeroizing::new(String::new());
     (&mut input).take(MAX_SPEC + 1).read_line(&mut line)?;
     if line.len() as u64 > MAX_SPEC {
         bail!("signal spec exceeds 64 KiB");
     }
     let spec: SignalSpec = serde_json::from_str(line.trim()).context("read signal spec")?;
+    drop(line);
     drop(input);
     let stop = Arc::new(AtomicBool::new(false));
     // Watch stdin: `stop` ends the protocol loop; EOF means the parent is
@@ -58,9 +59,12 @@ pub fn run_helper() -> Result<()> {
             }
         })?;
     let (sender, emitter) = Emitter::start(std::io::stdout());
-    let result = parse(&spec.uri).and_then(|uri| {
-        super::require_compiled(uri.protocol)?;
+    let result = parse(&spec.uri).and_then(|mut uri| {
+        if let Some(credentials) = &spec.credentials {
+            credentials.apply(&mut uri)?;
+        }
         let ctx = Ctx::new(spec.clone(), uri, stop, sender.clone());
+        super::require_compiled(ctx.uri.protocol)?;
         let truncated = dispatch(&ctx)?;
         ctx.flush_dropped();
         Ok(truncated)
@@ -68,9 +72,15 @@ pub fn run_helper() -> Result<()> {
     let password = parse(&spec.uri).ok().and_then(|u| u.password);
     let last = match result {
         Ok(truncated) => Line::Done { truncated },
-        Err(error) => Line::Error {
-            message: super::redact_text(&format!("{error:#}"), &spec.uri, password.as_deref()),
-        },
+        Err(error) => {
+            let text = super::redact_text(&format!("{error:#}"), &spec.uri, password.as_deref());
+            Line::Error {
+                message: spec
+                    .credentials
+                    .as_ref()
+                    .map_or_else(|| text.clone(), |credentials| credentials.redact(&text)),
+            }
+        }
     };
     let _ = sender.send(Out::Line(last));
     drop(sender);
@@ -109,6 +119,17 @@ pub struct Ctx {
     dropped: AtomicU64,
     allow: BTreeSet<String>,
 }
+impl Drop for Ctx {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(user) = &mut self.uri.user {
+            user.zeroize();
+        }
+        if let Some(password) = &mut self.uri.password {
+            password.zeroize();
+        }
+    }
+}
 impl Ctx {
     pub(crate) fn new(
         spec: SignalSpec,
@@ -143,9 +164,15 @@ impl Ctx {
         self.allow.is_empty() || self.allow.contains(tag)
     }
     /// Queue a sample without blocking; a full queue counts a drop.
-    pub fn sample(&self, sample: Sample) {
+    pub fn sample(&self, mut sample: Sample) {
         if !self.allowed(&sample.tag) {
             return;
+        }
+        if let Some(credentials) = &self.spec.credentials {
+            sample.tag = credentials.redact(&sample.tag);
+            if let super::Value::Text(text) = &mut sample.value {
+                *text = credentials.redact(text);
+            }
         }
         match self.out.try_send(Out::Sample(sample)) {
             Ok(()) => {}
@@ -159,7 +186,10 @@ impl Ctx {
     pub fn drop_sample(&self) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
     }
-    fn line(&self, line: Line) {
+    fn line(&self, mut line: Line) {
+        if let Some(credentials) = &self.spec.credentials {
+            credentials.scrub_line(&mut line);
+        }
         let _ = self.out.send(Out::Line(line));
     }
     pub fn ready(&self, tags: Vec<TagInfo>) {
@@ -194,7 +224,11 @@ impl Ctx {
         }
     }
     pub fn redact(&self, text: &str) -> String {
-        super::redact_text(text, &self.spec.uri, self.uri.password.as_deref())
+        let text = super::redact_text(text, &self.spec.uri, self.uri.password.as_deref());
+        self.spec
+            .credentials
+            .as_ref()
+            .map_or_else(|| text.clone(), |credentials| credentials.redact(&text))
     }
     /// Sleep until `until`, waking early when stopped. False when stopped.
     pub fn sleep_until(&self, until: Instant) -> bool {

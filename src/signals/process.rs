@@ -18,28 +18,66 @@ const MAX_LINE: u64 = 1024 * 1024;
 pub struct SignalProcess {
     child: Child,
     stdin: Option<ChildStdin>,
+    credentials: Option<super::auth::SignalCredentials>,
 }
 
 impl SignalProcess {
     /// Start a helper and send it the spec; returns the stdout reader too.
     pub fn spawn(spec: &SignalSpec) -> Result<(Self, BufReader<ChildStdout>)> {
+        Self::spawn_wire(spec, false)
+    }
+    pub(crate) fn spawn_bound(
+        spec: &SignalSpec,
+        session: &super::auth::Session,
+        binding: Option<&super::auth::AuthBinding>,
+        deadline: Option<Instant>,
+    ) -> Result<(Self, BufReader<ChildStdout>)> {
+        ensure!(
+            deadline.is_none_or(|deadline| Instant::now() < deadline),
+            "signal operation deadline expired; no connection was started"
+        );
+        match binding {
+            Some(binding) => session.with_credentials(binding, &spec.uri, |credentials| {
+                ensure!(deadline.is_none_or(|deadline|Instant::now()<deadline),"signal operation timed out while resolving credentials; no connection was started");
+                let mut wire = spec.clone();
+                wire.credentials = credentials;
+                Self::spawn_wire(&wire, true)
+            }),
+            None => Self::spawn(spec),
+        }
+    }
+    fn spawn_wire(spec: &SignalSpec, protected: bool) -> Result<(Self, BufReader<ChildStdout>)> {
         let executable = std::env::var_os("CAPTUREFAB_EXECUTABLE")
             .map(PathBuf::from)
             .unwrap_or(std::env::current_exe()?);
-        let mut child = crate::session::spawn_helper(
-            Command::new(executable)
-                .arg("__signal")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit()),
-        )
-        .context("launch signal helper process")?;
+        let mut command = Command::new(executable);
+        command
+            .arg("__signal")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(if protected || spec.credentials.is_some() {
+                Stdio::null()
+            } else {
+                Stdio::inherit()
+            });
+        for (name, _) in std::env::vars_os() {
+            if name
+                .to_str()
+                .and_then(|name| name.get(..super::auth::ENV_PREFIX.len()))
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(super::auth::ENV_PREFIX))
+            {
+                command.env_remove(name);
+            }
+        }
+        let mut child =
+            crate::session::spawn_helper(&mut command).context("launch signal helper process")?;
         let stdout = child.stdout.take().context("signal helper stdout")?;
         let mut process = Self {
             stdin: child.stdin.take(),
             child,
+            credentials: spec.credentials.clone(),
         };
-        let mut line = serde_json::to_vec(spec)?;
+        let mut line = zeroize::Zeroizing::new(serde_json::to_vec(spec)?);
         line.push(b'\n');
         if let Some(stdin) = process.stdin.as_mut() {
             stdin
@@ -48,6 +86,16 @@ impl SignalProcess {
                 .context("send signal spec")?;
         }
         Ok((process, BufReader::new(stdout)))
+    }
+    pub(crate) fn redact(&self, text: &str) -> String {
+        self.credentials
+            .as_ref()
+            .map_or_else(|| text.to_owned(), |credentials| credentials.redact(text))
+    }
+    pub(crate) fn scrub_line(&self, line: &mut Line) {
+        if let Some(credentials) = &self.credentials {
+            credentials.scrub_line(line);
+        }
     }
     pub fn pid(&self) -> u32 {
         self.child.id()
@@ -87,7 +135,7 @@ impl Drop for SignalProcess {
 
 /// Read one helper line; `None` at EOF.
 pub fn read_line(reader: &mut impl BufRead) -> Result<Option<Line>> {
-    let mut data = Vec::new();
+    let mut data = zeroize::Zeroizing::new(Vec::new());
     reader.take(MAX_LINE + 1).read_until(b'\n', &mut data)?;
     if data.is_empty() {
         return Ok(None);
@@ -113,8 +161,18 @@ pub fn pki_dir() -> Option<PathBuf> {
 }
 
 /// Run a one-shot helper until `done` or `error`, or kill it at `deadline_ms`.
-fn one_shot(spec: SignalSpec, deadline_ms: u64) -> Result<(Vec<Line>, u64)> {
-    let (process, mut reader) = SignalProcess::spawn(&spec)?;
+fn one_shot(
+    spec: SignalSpec,
+    deadline_ms: u64,
+    binding: Option<(&super::auth::Session, &super::auth::AuthBinding)>,
+) -> Result<(Vec<Line>, u64)> {
+    let deadline = Instant::now() + Duration::from_millis(deadline_ms);
+    let (process, mut reader) = match binding {
+        Some((session, binding)) => {
+            SignalProcess::spawn_bound(&spec, session, Some(binding), Some(deadline))?
+        }
+        None => SignalProcess::spawn(&spec)?,
+    };
     let (sender, receiver) = mpsc::channel();
     thread::Builder::new()
         .name("capturefab-signal-read".into())
@@ -128,19 +186,24 @@ fn one_shot(spec: SignalSpec, deadline_ms: u64) -> Result<(Vec<Line>, u64)> {
             }
         })?;
     let mut process = process;
-    let deadline = Instant::now() + Duration::from_millis(deadline_ms);
     let mut lines = Vec::new();
     let mut dropped = 0;
     let password = parse(&spec.uri).ok().and_then(|u| u.password);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let line = match receiver.recv_timeout(remaining) {
-            Ok(line) => line?,
+            Ok(line) => {
+                line.map_err(|error| anyhow::anyhow!("{}", process.redact(&format!("{error:#}"))))?
+            }
             Err(_) => {
                 process.wait_or_kill(Instant::now());
                 bail!("signal source timed out after {deadline_ms} ms");
             }
         };
+        let mut line = line;
+        if let Some(line) = &mut line {
+            process.scrub_line(line);
+        }
         match line {
             None => bail!("signal helper exited without a result"),
             Some(Line::Done { truncated }) => {
@@ -151,7 +214,11 @@ fn one_shot(spec: SignalSpec, deadline_ms: u64) -> Result<(Vec<Line>, u64)> {
                 // The helper redacts; redact again in case it did not.
                 bail!(
                     "{}",
-                    super::redact_text(&message, &spec.uri, password.as_deref())
+                    process.redact(&super::redact_text(
+                        &message,
+                        &spec.uri,
+                        password.as_deref()
+                    ))
                 )
             }
             Some(Line::Dropped { count }) => dropped += count,
@@ -165,6 +232,7 @@ fn one_shot(spec: SignalSpec, deadline_ms: u64) -> Result<(Vec<Line>, u64)> {
 fn spec(uri: &str, mode: Mode, timeout_ms: u64, protocol: Protocol) -> SignalSpec {
     SignalSpec {
         uri: uri.to_string(),
+        credentials: None,
         mode,
         interval_ms: super::default_interval_ms(),
         tags: Vec::new(),
@@ -175,11 +243,27 @@ fn spec(uri: &str, mode: Mode, timeout_ms: u64, protocol: Protocol) -> SignalSpe
 
 /// `signal_read`: one round of current values.
 pub fn read(uri: &str, timeout_ms: u64) -> Result<Json> {
+    read_inner(uri, timeout_ms, None)
+}
+pub fn read_bound(
+    uri: &str,
+    timeout_ms: u64,
+    session: &super::auth::Session,
+    binding: Option<&super::auth::AuthBinding>,
+) -> Result<Json> {
+    read_inner(uri, timeout_ms, binding.map(|binding| (session, binding)))
+}
+fn read_inner(
+    uri: &str,
+    timeout_ms: u64,
+    binding: Option<(&super::auth::Session, &super::auth::AuthBinding)>,
+) -> Result<Json> {
     let parsed = parse(uri)?;
     super::require_compiled(parsed.protocol)?;
     let (lines, dropped) = one_shot(
         spec(uri, Mode::Read, timeout_ms, parsed.protocol),
         timeout_ms + 5000,
+        binding,
     )?;
     let mut tags: Vec<TagInfo> = Vec::new();
     let mut samples: Vec<Sample> = Vec::new();
@@ -202,6 +286,28 @@ pub fn read(uri: &str, timeout_ms: u64) -> Result<Json> {
 
 /// `signal_browse`: nodes, topics or data items, at most `limit`.
 pub fn browse(uri: &str, duration_ms: u64, limit: u32) -> Result<Json> {
+    browse_inner(uri, duration_ms, limit, None)
+}
+pub fn browse_bound(
+    uri: &str,
+    duration_ms: u64,
+    limit: u32,
+    session: &super::auth::Session,
+    binding: Option<&super::auth::AuthBinding>,
+) -> Result<Json> {
+    browse_inner(
+        uri,
+        duration_ms,
+        limit,
+        binding.map(|binding| (session, binding)),
+    )
+}
+fn browse_inner(
+    uri: &str,
+    duration_ms: u64,
+    limit: u32,
+    binding: Option<(&super::auth::Session, &super::auth::AuthBinding)>,
+) -> Result<Json> {
     let parsed = parse(uri)?;
     super::require_compiled(parsed.protocol)?;
     if parsed.protocol == Protocol::ModbusTcp {
@@ -216,6 +322,7 @@ pub fn browse(uri: &str, duration_ms: u64, limit: u32) -> Result<Json> {
             parsed.protocol,
         ),
         duration_ms + timeout_ms + 5000,
+        binding,
     )?;
     let mut items: Vec<BrowseItem> = Vec::new();
     let mut truncated = false;

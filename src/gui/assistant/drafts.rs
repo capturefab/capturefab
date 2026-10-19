@@ -156,7 +156,7 @@ impl Drafts {
         if !key.contains('.')
             && matches!(
                 spec.kind,
-                FieldKind::Features | FieldKind::Tags | FieldKind::Region
+                FieldKind::Features | FieldKind::Tags | FieldKind::StringList | FieldKind::Region
             )
         {
             let prefix = format!("{key}.");
@@ -181,11 +181,11 @@ impl Drafts {
         match parsed {
             Ok(value) => {
                 self.errors.remove(&entry);
-                put(&mut call.args, key, value)?;
+                put(&mut call.args, key, value, spec.kind)?;
             }
             Err(error) => {
                 self.errors.insert(entry.clone(), error);
-                put(&mut call.args, key, Value::String(value.clone()))?;
+                put(&mut call.args, key, Value::String(value.clone()), spec.kind)?;
             }
         }
         rewrite_extension(&mut call.args, &previous.call.args, key);
@@ -353,7 +353,18 @@ pub(in crate::gui) fn at<'a>(args: &'a Value, key: &str) -> &'a Value {
         })
 }
 
-fn put(args: &mut Value, key: &str, value: Value) -> Result<(), String> {
+fn put(args: &mut Value, key: &str, value: Value, kind: FieldKind) -> Result<(), String> {
+    if kind == FieldKind::StringList
+        && let Some((root, index)) = key.split_once('.')
+    {
+        let entry = index
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| args[root].as_array_mut()?.get_mut(index))
+            .ok_or("Choose an existing list row.")?;
+        *entry = value;
+        return Ok(());
+    }
     let parts: Vec<_> = key.split('.').collect();
     let mut current = args;
     for (index, part) in parts.iter().enumerate() {
@@ -408,6 +419,13 @@ fn parse(spec: &FieldSpec, key: &str, raw: &str) -> Result<Value, String> {
                 Ok(Value::Null)
             }
             FieldKind::Features | FieldKind::Tags => Ok(Value::String(raw.into())),
+            FieldKind::StringList
+                if key
+                    .split_once('.')
+                    .is_some_and(|(_, index)| index.parse::<usize>().is_ok()) =>
+            {
+                Ok(Value::String(raw.into()))
+            }
             _ => Err("Choose an existing step field.".into()),
         };
     }
@@ -441,6 +459,14 @@ fn parse(spec: &FieldSpec, key: &str, raw: &str) -> Result<Value, String> {
             .ok()
             .filter(Value::is_array)
             .ok_or_else(|| "Enter a list of values.".into()),
+        FieldKind::StringList => tools::plan::parse_value(raw)
+            .ok()
+            .filter(|value| {
+                value
+                    .as_array()
+                    .is_some_and(|items| items.iter().all(Value::is_string))
+            })
+            .ok_or_else(|| "Enter a list of names.".into()),
         FieldKind::Region => tools::plan::parse_value(raw)
             .ok()
             .filter(Value::is_object)
@@ -484,6 +510,86 @@ mod tests {
         let mut plan = Plan::default();
         let id = plan.propose(tools::ToolCall { tool: "capture_photos".into(), args: json!({"camera":"sim:0","count":1,"format":"png","file_name":"photo.png","destination":null,"tags":null}) }, None).unwrap();
         (plan, id)
+    }
+
+    #[test]
+    fn string_list_edits_preserve_strings_and_discard_removed_row_drafts() {
+        for (tool, key) in [
+            ("start_signal_capture", "tags"),
+            ("export_dataset", "tables"),
+            ("get_camera_features", "names"),
+        ] {
+            let mut plan = Plan::default();
+            let id = plan
+                .propose(
+                    tools::ToolCall {
+                        tool: tool.into(),
+                        args: json!({key:null}),
+                    },
+                    None,
+                )
+                .unwrap();
+            let mut drafts = Drafts::default();
+            drafts
+                .set_value(&mut plan, id, key, json!(["first", "second"]))
+                .unwrap();
+            let row = format!("{key}.0");
+            drafts
+                .edit(&mut plan, id, &row, "line.temperature \"é\"".into())
+                .unwrap();
+            drafts.commit(&mut plan, id, &row).unwrap();
+            assert_eq!(
+                plan.steps[0].call.args[key],
+                json!(["line.temperature \"é\"", "second"])
+            );
+            drafts
+                .set_value(&mut plan, id, key, json!(["second"]))
+                .unwrap();
+            assert_eq!(drafts.text(id, &row, &plan.steps[0].call.args), "second");
+            assert!(drafts.issue(id, &row).is_none());
+            drafts.set_value(&mut plan, id, key, json!([])).unwrap();
+            assert_eq!(plan.steps[0].call.args[key], json!([]));
+            assert!(!drafts.has_draft(id, &row));
+        }
+    }
+
+    #[test]
+    fn string_lists_reject_object_rows_and_allow_existing_rows_past_the_setting_list_limit() {
+        let spec = tools::spec("start_signal_capture")
+            .unwrap()
+            .fields
+            .iter()
+            .find(|field| field.key == "tags")
+            .unwrap();
+        for invalid in [
+            r#"[{"feature":"temperature","value":""}]"#,
+            r#"["temperature",2]"#,
+        ] {
+            assert!(parse(spec, "tags", invalid).is_err());
+        }
+        assert!(parse(spec, "tags.0.feature", "temperature").is_err());
+        let mut plan = Plan::default();
+        let id = plan
+            .propose(
+                tools::ToolCall {
+                    tool: "start_signal_capture".into(),
+                    args: json!({"tags":vec!["tag";32]}),
+                },
+                None,
+            )
+            .unwrap();
+        let mut drafts = Drafts::default();
+        drafts
+            .edit(&mut plan, id, "tags.31", "temperature".into())
+            .unwrap();
+        assert_eq!(plan.steps[0].call.args["tags"][31], "temperature");
+        let before = plan.steps[0].call.args.clone();
+        assert!(
+            drafts
+                .edit(&mut plan, id, "tags.999999999", "no allocation".into())
+                .is_err()
+        );
+        assert_eq!(plan.steps[0].call.args, before);
     }
 
     #[test]

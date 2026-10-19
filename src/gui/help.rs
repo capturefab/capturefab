@@ -39,6 +39,8 @@ fn picker_page(picker: &mut Picker, was_open: bool) -> Task<Message> {
 /// State for the sheets: the quick guide and the destination sheets (whose
 /// pickers keep their own, see `Picker`).
 pub(super) struct SheetState {
+    /// The guide is showing the external-agent connection page.
+    pub(super) agents: bool,
     /// The scrim of a sheet: 1 shown, 0 gone. It rises with the sheet and
     /// fades out after the sheet closes, so the window never flashes back
     /// to full brightness.
@@ -56,6 +58,7 @@ pub(super) struct SheetState {
 impl Default for SheetState {
     fn default() -> Self {
         Self {
+            agents: false,
             shown: Motion::new(0.0, motion::SHEET, motion::SHEET_OUT, Kind::Fade),
             scrolled: false,
             more: false,
@@ -104,6 +107,10 @@ impl Workbench {
             return false;
         }
         match word {
+            "agent-setup" => {
+                self.show_agent_setup(true);
+                true
+            }
             "settings" => {
                 self.settings_open = true;
                 true
@@ -128,6 +135,7 @@ impl Workbench {
         }
         self.help_open = open;
         if open {
+            self.sheets.agents = false;
             self.sheets.scrolled = false;
             self.sheets.more = false;
             // Closed already: no turn while the sheet fades in.
@@ -333,6 +341,13 @@ impl Workbench {
                 Some(Message::Settings(false)),
                 t,
             )
+        } else if self.help_open && self.sheets.agents {
+            modal(
+                body,
+                self.agent_setup(p, height),
+                Some(Message::AgentSetup(false)),
+                t,
+            )
         } else if self.help_open {
             modal(body, self.help(p, height), Some(Message::Help(false)), t)
         } else if self.assistant.quick.open {
@@ -438,6 +453,11 @@ impl Workbench {
         let [editing, cameras, acquisition, view, panels, window] = Action::SECTIONS;
         let more = self.sheets.more;
         let mut body = column![
+            button(text("Connect an external agent…").size(style::BODY))
+                .name("Open agent setup")
+                .style(style::secondary)
+                .padding([7, 12])
+                .on_press(Message::AgentSetup(true)),
             self.guide_steps_view(p),
             disclosure(
                 "Connecting cameras",

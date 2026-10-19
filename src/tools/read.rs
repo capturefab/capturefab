@@ -1,7 +1,8 @@
 //! Observation tools. They read the session and this computer and never
 //! change either: no Connect, Select, Set, Execute, Start or Stop. The only
 //! commands they send are Status, Discover (at most once per user turn) and
-//! Frame, whose replies are measurements and a bounded preview.
+//! Frame, whose replies are measurements and a bounded preview. Scoped dataset
+//! queries send a bounded, read-only query against the exact approved slot.
 //!
 //! Every result is redacted for its reader and kept under
 //! `MAX_OUTPUT_BYTES`, with a marker where lists were cut.
@@ -426,7 +427,9 @@ pub fn run_read(
             .collect::<Vec<_>>()
     })?;
     let output = match spec.name {
-        "get_overview" => parse_args::<NoArgs>(spec, &call.args).map(|_| overview(ctx).into()),
+        "get_overview" => {
+            parse_args::<NoArgs>(spec, &call.args).map(|_| overview(ctx, opts.origin).into())
+        }
         "list_cameras" => parse_args(spec, &call.args)
             .and_then(|args| list_cameras(host, ctx, args, opts))
             .map(ToolOutput::from),
@@ -434,6 +437,9 @@ pub fn run_read(
             parse_args::<NoArgs>(spec, &call.args).map(|_| destinations(ctx).into())
         }
         "get_storage" => parse_args::<NoArgs>(spec, &call.args).map(|_| storage(ctx).into()),
+        "list_data_sources" | "get_dataset" | "query_dataset" => {
+            super::data::read(host, ctx, call, opts.origin, opts.max_wait).map(ToolOutput::from)
+        }
         "list_jobs" => parse_args(spec, &call.args)
             .and_then(|args| list_jobs(ctx, args, opts.origin))
             .map(ToolOutput::from),
@@ -469,8 +475,16 @@ pub fn run_read(
 /// Check an observation without contacting a host, discovering devices or
 /// waiting. Dry runs use the same typed argument and state validation as
 /// execution; caller-specific wait limits are applied again by `run_read`.
+#[cfg(test)]
 pub(crate) fn preflight(ctx: &Context, call: &ToolCall) -> Result<(), Vec<Issue>> {
     preflight_for(ctx, call, Origin::Cli, MAX_WAIT)
+}
+pub(crate) fn preflight_with_origin(
+    ctx: &Context,
+    call: &ToolCall,
+    origin: Origin,
+) -> Result<(), Vec<Issue>> {
+    preflight_for(ctx, call, origin, MAX_WAIT)
 }
 
 fn preflight_for(
@@ -489,6 +503,8 @@ fn preflight_for(
         return Err(vec![Issue::usage(None, needs_session(spec.name))]);
     }
     match spec.name {
+        "list_data_sources" | "get_dataset" => parse_args::<NoArgs>(spec, &call.args).map(|_| ()),
+        "query_dataset" => super::data::preflight(ctx, call, origin),
         "get_overview" | "list_destinations" | "get_storage" => {
             parse_args::<NoArgs>(spec, &call.args).map(|_| ())
         }
@@ -607,7 +623,7 @@ enum Until {
     Activity,
 }
 
-fn overview(ctx: &Context) -> Value {
+fn overview(ctx: &Context, origin: Origin) -> Value {
     let mut overview = json!({
         "now": {
             "local": ctx.zone.rfc3339(ctx.now_ms),
@@ -628,6 +644,7 @@ fn overview(ctx: &Context) -> Value {
             "encoders": ctx.media.encoders_by_codec,
             "problem": ctx.media.problem,
         },
+        "data": super::data::metadata(ctx, origin),
     });
     if !ctx.session {
         overview["note"] = json!(

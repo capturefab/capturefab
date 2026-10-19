@@ -12,6 +12,16 @@ This is an initial implementation, not complete Aravis or vendor-SDK feature par
 
 Download the matching desktop or headless binary from [GitHub Releases](https://github.com/capturefab/capturefab/releases). The [project site](https://capturefab.com/) selects from published artifacts, with explicit architecture choices and SHA-256 checksums. Until a release is actually published, the site displays that state instead of fabricated download links.
 
+Choose how to drive the capture. Each route can share a visible desktop session for review and manual intervention.
+
+| Driver | Setup | First task |
+| --- | --- | --- |
+| Your coding agent, such as Claude Code, Codex or Antigravity | Select **Connect an agent** on the welcome screen, or **Help → Connect an Agent…**. Copy its executable path and session briefing to your harness. | Reuse the harness's model access; Capturefab assistant credentials are unnecessary. See [agent instructions](web/agents.md#start-with-an-external-harness) and [setup](https://capturefab.com/docs.html#agent-setup). |
+| Capturefab's built-in assistant | Configure **Settings → AI assistant** with your provider and credentials. | Open **Quick Command…**. Describe the task, review its plan or choose a bounded run. See [assistant setup](docs/assistant.md). |
+| You, with direct controls | Open the desktop app. Connect a camera or use `sim:0`. | Examine the preview and capture directly. See [your first capture](https://capturefab.com/docs.html#getting-started). |
+
+For a first agent task, use only `sim:0`, request two numbered PNG files, and keep the session open for review. In **Activity**, follow the agent's named actions and saved paths. Stop the harness task before manual takeover, then examine session status and active jobs; accepted commands can still finish.
+
 ```sh
 capturefab                         # desktop; follows system light/dark mode
 capturefab discover                # network, USB3 Vision, host and saved hub cameras
@@ -105,12 +115,14 @@ Agents can look at a camera without saving files. RPC `{"op":"frame","fresh":1,"
 
 ## Camera tools for agents
 
-Claude Code, Codex and other external agents can use the same checked camera tools as Capturefab. The registry covers observation, camera controls, captures, recordings, schedules and destination creation. It is available in desktop and headless builds.
+Claude Code, Codex and other external agents can use the same checked image and data tools as Capturefab. The registry covers observation, camera controls, captures, recordings, schedules, sensor acquisition, datasets, exports and destination creation. It is available in desktop and headless builds.
 
 ```sh
 capturefab serve --name bench
 # In another terminal:
-capturefab --session bench --actor codex --actor-kind agent tools list --json
+capturefab tools list --compact --json
+capturefab tools describe inspect_frame --json
+capturefab tools describe set_camera_features --json
 capturefab --session bench --actor codex --actor-kind agent tools call get_overview --json
 capturefab --session bench --actor codex --actor-kind agent tools call connect_camera --args '{"camera":"sim:0","size":null,"fps":null}' --json
 capturefab --session bench --actor codex --actor-kind agent tools call start_live_view --args '{"camera":"sim:0"}' --json
@@ -120,13 +132,15 @@ capturefab --session bench --actor codex --actor-kind agent tools call set_camer
 
 Read `result.image.path` with your image viewer. Default inspection images are private, temporary diagnostics outside the capture budget; `--image-out PATH` saves a budgeted file without overwriting. `--inline-image` returns `image.base64` in JSON. A stopped camera acquires one frame and stays stopped. With images off, `inspect_frame` still returns exposure and focus measurements.
 
-Read each tool's schema in `tools list --json` or `schema --json` under `result.tools`. Every argument key is required; use `null` for defaults. Tool calls choose their camera in `args.camera`; omit global `--camera` and `CAPTUREFAB_CAMERA`. Calls and dry runs can attach to a running session. Offline observation tools and destination creation also work without one; camera tools do not create a temporary session.
+Use `tools list --compact --json` for a small index of tools, risks and session requirements. Read one schema with `tools describe NAME --json`; both work offline. The full catalog remains available in `tools list --json` or `schema --json` under `result.tools`. Every argument key is required; use `null` for defaults. Tool calls choose their camera in `args.camera`; omit global `--camera` and `CAPTUREFAB_CAMERA`. Calls and dry runs can attach to a running session. Offline observation tools and destination creation also work without one; camera tools do not create a temporary session.
 
 Action dry runs return `{checked,commands}` without executing. Review issues, risk and output locations first. Pass `--confirmed-by-user` for Disruptive or HumanOnly actions only after the user approved that exact action. `--secret-stdin` supplies one stream password or S3 secret separately from arguments. Never put secrets in prompts, command lines or plan files.
 
 `tools apply FILE --dry-run --json` checks a strict version-1 document: `{"version":1,"calls":[{"tool":"start_live_view","args":{"camera":"sim:0"}}]}`. Plans accept 1–64 calls and at most 256 KiB. Apply rechecks the plan, executes in order and stops at the first failure; earlier effects remain. See [the external-agent recipe](web/agents.md#let-an-agent-drive-cameras) for observation, optimistic setting writes, waiting, capture, undo and typed error recovery.
 
-## AI camera assistant
+For sensor capture, discover `list_data_sources`, `open_dataset`, `start_signal_capture`, `wait_for_data`, `query_dataset` and `export_dataset`. Set finite duration, sample and payload limits, then verify written counts, drops, final persistence and export checksums. A data-only workflow needs no camera. Follow the [data tool recipe](web/agents.md#capture-data-with-the-same-tools); sensor tag filters are arrays of names, while camera capture tags are arrays of `{key,value}` objects.
+
+## AI image and data assistant
 
 The optional `ai` feature adds `capturefab assistant`. Select one of 22 provider entries, including OpenAI, Anthropic, Gemini, Vertex AI, Bedrock, OpenRouter, Cloudflare, Groq and DeepSeek. Local Ollama, LM Studio and custom endpoints are also configurable. These are catalog entries, not provider compatibility claims.
 
@@ -136,8 +150,11 @@ Plan first mode, ask for a task, inspect its checked steps and edit their fields
 Select **Run plan** to execute the reviewed revision. Return sends a request or
 commits an edit; it never runs a plan. Closing the sheet keeps the conversation
 and work in progress. Use Stop to cancel a turn or stop after the current step.
-For a camera task, choose **Ask before each change** or **Run on its own**, then
-review its camera scope, allowed destinations, image permission and hard limits.
+For a sensor plan, open **Sources…** to approve an endpoint locally, then enable
+**Read sensor values and dataset rows**. New connections wait for **Run plan**;
+the provider uses an opaque reference while the endpoint stays local.
+For an image or data task, choose **Ask before each change** or **Run on its own**, then
+review its cameras, data sources, dataset, allowed destinations, separate image/data permission and capture allowances.
 The sheet shows approvals, the exact preview sent, budget meters and setting
 changes. Stop and Take over remain available while the task runs. Quitting
 requires a separate decision; new conversations start in Plan first mode.
@@ -152,9 +169,11 @@ capturefab --session bench assistant run 'Examine sim:0 and capture two verified
   --camera sim:0 --mode autonomous --approvals deny --max-time 10m --max-captures 2 --max-size 128MiB --json
 ```
 
-`ask` runs observations and returns a plan. `run` uses explicit camera and destination scope with hard limits. Supervised mode asks before each change; autonomous mode runs Reversible and Bounded actions within those limits. Disruptive actions always ask, and HumanOnly approval is once. `--approvals ask` must have a TTY; `deny` is the noninteractive default. Ctrl-C stops new work and discards late provider replies. Existing accepted commands finish, and the report lists leftovers instead of undoing them.
+`ask` runs observations and returns a plan. `run` uses explicit camera, source, dataset and destination scope with limits. A data-only task needs no camera; repeat `--source URI` and add `--allow-data` to permit selected values and query results to reach the model. Supervised mode asks before each change; autonomous mode runs Reversible and Bounded actions within those limits. Disruptive actions always ask, and HumanOnly approval is once. `--approvals ask` must have a TTY; `deny` is the noninteractive default. Ctrl-C stops new work and discards late provider replies. Existing accepted commands finish, and the report lists leftovers instead of undoing them.
 
-Requests include your prompt, conversation and redacted session details. Camera previews are sent only when permitted. Keys stay outside model content, in provider environment variables or the OS credential store. `assistant providers` does not read the keychain unless `--check-keychain` is supplied. Settings live in private `assistant.json`; private action logs support `assistant runs` and `assistant log RUN_ID`. See the [assistant guide](docs/assistant.md) for credentials, data sent, approvals, limits, cost estimates, restore rules and JSON results. External agents can use the [camera tool registry](#camera-tools-for-agents) without an in-process AI provider.
+Authenticated MQTT and OPC UA sources use the protected saved-source editor in **Sources…**, task setup or manual Data sources. Save the credential-free endpoint and local credentials, then select **Use source** for an assistant or **Start logging** in manual controls. The CLI offers `signals profiles list|save|remove|bind`; credentials enter through stdin or a `CAPTUREFAB_SIGNAL_` environment reference. Use `assistant run --source-profile NAME --allow-data` to select a saved source. Profile revisions and credential epochs prevent an existing task from switching accounts at the same endpoint.
+
+Requests include your prompt, conversation and redacted session details. Camera previews and data rows each require separate permission. Keys stay outside model content, in provider environment variables or the OS credential store. `assistant providers` does not read the keychain unless `--check-keychain` is supplied. Settings live in private `assistant.json`; private action logs support `assistant runs` and `assistant log RUN_ID`. See the [assistant guide](docs/assistant.md) for credentials, data sent, approvals, limits, cost estimates, restore rules and JSON results. External agents can use the [camera tool registry](#camera-tools-for-agents) without an in-process AI provider.
 
 ## Automatic capture and review
 
@@ -378,7 +397,7 @@ Modbus addresses are 0-based protocol addresses (Modicon `40001` is `holding/0`)
 
 `signals read` uses the global `--timeout-ms`; `browse` takes `--duration` (100 ms to 60 s) and `--limit` (1 to 5000) and is unsupported for Modbus (exit 5). `signals start` (interval 100 ms to 1 h, optional repeatable `--tag`) and `signals stop ID|all` need a running GUI or `serve` session. `log` takes 1 to 16 URIs, runs until `--duration` or Ctrl-C, and needs `--csv` (a new file) or `--dataset`. A session holds at most 16 sources and 4096 tags per source. `ts_ms` is the host clock (UTC milliseconds) when a value was read; `source_ts_ms` is the device clock. Without a dataset or CSV, samples are kept only as latest values and `signals` reports `persisting:false`. Dropped samples are always counted. Exit codes: 2 for a bad URI, 3 for a refused connection or unknown source ID, 4 for a timeout, 5 for a protocol not compiled into this build.
 
-In the desktop app, **Live signals** in the Capture panel has an **Add data source** field, recent URIs (only those without credentials are saved) and per-tag values with sparklines. The sidebar lists **Data sources** with a stop button. `GET /api/signals?history=1` returns the same status over HTTP. `doctor --json` reports the compiled protocols in `signals`.
+In the desktop app, select **Data sources** in the sidebar to open manual source controls, even with no camera connected. **Live signals** has an **Add data source** field, recent URIs (only those without credentials are saved) and per-tag values with sparklines. Each source in the sidebar has a stop button. Data-only task **Take over** waits for the task to finish its current command and owned-data flush, then opens these controls. `GET /api/signals?history=1` returns the same status over HTTP. `doctor --json` reports the compiled protocols in `signals`.
 
 ## Datasets and analysis exports
 

@@ -1,9 +1,12 @@
 //! The single read-write connection to one dataset file: schema, sandboxed
 //! settings, inserts and the incrementally maintained status.
-use super::{DatasetStatus, SCHEMA_VERSION, SavedCamera, SavedFile, SavedItem};
+use super::{
+    DatasetStatus, SCHEMA_VERSION, SavedCamera, SavedFile, SavedItem,
+    write::{self, context_json},
+};
 use crate::{
     context::Context,
-    signals::{Sample, SignalInfo, TagInfo, Value as SignalValue},
+    signals::{Sample, SignalInfo, TagInfo},
     storage::FREE_SPACE_FLOOR,
 };
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
@@ -22,7 +25,7 @@ pub const DEFAULT_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Rows accepted by one `append_samples` call.
 pub const MAX_SAMPLES_PER_CALL: usize = 10_000;
 
-const DDL: &str = "
+pub(super) const DDL: &str = "
 CREATE TABLE dataset_info (singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   schema_version UINTEGER NOT NULL, dataset_id VARCHAR NOT NULL, name VARCHAR NOT NULL,
   created_ms UBIGINT NOT NULL, generator VARCHAR NOT NULL,
@@ -289,6 +292,7 @@ pub struct Dataset {
 impl Dataset {
     pub fn open(path: &Path, mode: super::OpenMode, max_bytes: Option<u64>) -> Result<Self> {
         use super::OpenMode;
+        crate::storage::ensure_not_task_namespace(path)?;
         let path = canonical_target(path, mode != OpenMode::Open)?;
         let claim = PathClaim::new(&path)?;
         let exists = path
@@ -339,18 +343,13 @@ impl Dataset {
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                conn.execute_batch(&format!("BEGIN TRANSACTION; {DDL}"))?;
-                conn.execute(
-                    "INSERT INTO dataset_info (singleton, schema_version, dataset_id, name, created_ms, generator, max_bytes)
-                     VALUES (1, ?, ?, ?, ?, ?, ?)",
-                    params![
-                        SCHEMA_VERSION,
-                        id,
-                        name,
-                        now_ms(),
-                        format!("capturefab {}", env!("CARGO_PKG_VERSION")),
-                        max_bytes.unwrap_or(DEFAULT_MAX_BYTES)
-                    ],
+                conn.execute_batch("BEGIN TRANSACTION")?;
+                write::initialize(
+                    &conn,
+                    &id,
+                    &name,
+                    now_ms(),
+                    max_bytes.unwrap_or(DEFAULT_MAX_BYTES),
                 )?;
                 conn.execute_batch("COMMIT; CHECKPOINT;")?;
                 Ok(())
@@ -603,27 +602,14 @@ impl Dataset {
 
     /// Insert or update a source's tags.
     pub fn register(&mut self, source: &SignalInfo, tags: &[TagInfo]) -> Result<()> {
-        let protocol = serde_json::to_value(source.protocol)?
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
+        let protocol = write::protocol(source)?;
         self.sources
             .insert(source.id.clone(), (source.uri.clone(), protocol.clone()));
         let path = self.path.clone();
         let conn = &self.conn;
         conn.execute_batch("BEGIN TRANSACTION")
             .map_err(|e| explain(e, &path, "insert"))?;
-        let result = (|| -> Result<()> {
-            for tag in tags {
-                conn.execute(
-                    "INSERT INTO signals (source_id, protocol, uri, tag, unit, kind) VALUES (?, ?, ?, ?, ?, ?)
-                     ON CONFLICT (source_id, tag) DO UPDATE SET protocol = excluded.protocol, uri = excluded.uri,
-                       unit = coalesce(excluded.unit, signals.unit), kind = coalesce(excluded.kind, signals.kind)",
-                    params![source.id, protocol, source.uri, tag.tag, tag.unit, tag.kind],
-                )?;
-            }
-            Ok(())
-        })();
+        let result = write::register(conn, source, tags, &protocol);
         self.finish_txn(result)?;
         self.status.signals = self
             .conn
@@ -663,64 +649,12 @@ impl Dataset {
             .get(source_id)
             .cloned()
             .unwrap_or_else(|| (source_id.to_owned(), String::new()));
-        let mut range: BTreeMap<&str, (u64, u64, &'static str)> = BTreeMap::new();
-        for sample in batch {
-            let kind = match sample.value {
-                SignalValue::Bool(_) => "bool",
-                SignalValue::Number(_) => "number",
-                SignalValue::Text(_) => "text",
-            };
-            let entry =
-                range
-                    .entry(sample.tag.as_str())
-                    .or_insert((sample.ts_ms, sample.ts_ms, kind));
-            entry.0 = entry.0.min(sample.ts_ms);
-            entry.1 = entry.1.max(sample.ts_ms);
-        }
+        let range = write::sample_ranges(batch);
         let path = self.path.clone();
         let conn = &self.conn;
         conn.execute_batch("BEGIN TRANSACTION")
             .map_err(|e| explain(e, &path, "insert"))?;
-        let result = (|| -> Result<()> {
-            {
-                let mut appender = conn.appender("samples")?;
-                for sample in batch {
-                    let (double, text) = match &sample.value {
-                        SignalValue::Bool(b) => (
-                            Some(if *b { 1.0 } else { 0.0 }),
-                            Some(if *b { "true" } else { "false" }.to_owned()),
-                        ),
-                        SignalValue::Number(n) => (Some(*n), None),
-                        SignalValue::Text(t) => (None, Some(t.clone())),
-                    };
-                    let quality = serde_json::to_value(sample.quality)?
-                        .as_str()
-                        .map(str::to_owned);
-                    appender.append_row(params![
-                        sample.ts_ms,
-                        sample.source_ts_ms,
-                        source_id,
-                        sample.tag,
-                        double,
-                        text,
-                        quality
-                    ])?;
-                }
-                appender.flush()?;
-            }
-            for (tag, (first, last, kind)) in &range {
-                conn.execute(
-                    "INSERT INTO signals (source_id, protocol, uri, tag, kind, first_ms, last_ms)
-                     VALUES (?, nullif(?, ''), ?, ?, ?, ?, ?)
-                     ON CONFLICT (source_id, tag) DO UPDATE SET
-                       kind = coalesce(signals.kind, excluded.kind),
-                       first_ms = least(coalesce(signals.first_ms, excluded.first_ms), excluded.first_ms),
-                       last_ms = greatest(coalesce(signals.last_ms, excluded.last_ms), excluded.last_ms)",
-                    params![source_id, protocol, uri, tag, kind, first, last],
-                )?;
-            }
-            Ok(())
-        })();
+        let result = write::append_samples(conn, source_id, &uri, &protocol, batch, &range);
         self.finish_txn(result)?;
         self.status.samples += batch.len() as u64;
         if let (Some(first), Some(last)) = (
@@ -745,22 +679,10 @@ impl Dataset {
         context: &Context,
     ) -> Result<u64> {
         let wall_ms = now_ms();
-        let id: u64 = self
-            .conn
-            .query_row(
-                "INSERT INTO events (wall_ms, kind, camera_id, source_id, text, context)
-                 VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
-                params![
-                    wall_ms,
-                    kind,
-                    camera_id,
-                    source_id,
-                    text,
-                    context_json(context)
-                ],
-                |r| r.get(0),
-            )
-            .map_err(|e| explain(e, &self.path, "insert"))?;
+        let id = write::record_event(
+            &self.conn, wall_ms, kind, camera_id, source_id, text, context,
+        )
+        .map_err(|error| explain(error, &self.path, "insert"))?;
         self.status.events += 1;
         Ok(id)
     }
@@ -783,10 +705,6 @@ fn read_info(conn: &Connection) -> Result<(String, String, u64, u64)> {
         "dataset schema version {version} is newer than this Capturefab"
     );
     Ok((id, name, created, max))
-}
-
-fn context_json(context: &Context) -> Option<String> {
-    (!context.is_empty()).then(|| serde_json::to_string(context).unwrap_or_default())
 }
 
 pub(crate) fn wal_path(path: &Path) -> PathBuf {

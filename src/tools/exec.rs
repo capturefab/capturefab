@@ -21,6 +21,22 @@ use zeroize::Zeroizing;
 /// An operation whose camera identity was selected while checking the plan.
 #[derive(Clone, Debug)]
 pub enum Op {
+    /// A checked coordinator operation. An earlier approved open may supply
+    /// the dataset slot only when this flag is explicit.
+    Session {
+        command: SessionCommand,
+        dataset_from_plan: bool,
+    },
+    StopSignal {
+        source: String,
+        capture_id: Option<String>,
+    },
+    WaitData {
+        source: String,
+        capture_id: Option<String>,
+        timeout_ms: u64,
+        samples: Option<u64>,
+    },
     Connect {
         selector: String,
     },
@@ -60,6 +76,21 @@ pub enum Op {
 impl Serialize for Op {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         let value = match self {
+            Self::Session {
+                command,
+                dataset_from_plan,
+            } => json!({"command":command,"dataset_from_plan":dataset_from_plan}),
+            Self::StopSignal { source, capture_id } => {
+                json!({"op":"signal_stop_if","source":source,"capture_id":capture_id})
+            }
+            Self::WaitData {
+                source,
+                capture_id,
+                timeout_ms,
+                samples,
+            } => {
+                json!({"op":"wait_for_data","source":source,"capture_id":capture_id,"timeout_ms":timeout_ms,"samples":samples})
+            }
             Self::Connect { selector } => json!({"op":"connect","selector":selector}),
             Self::Command { camera, command } => {
                 json!({"camera":camera.selector(),"command":command})
@@ -94,6 +125,8 @@ impl Serialize for Op {
 /// Everything a person approves, plus the operations to perform.
 #[derive(Clone)]
 pub struct Checked {
+    /// Private resource identities used to bind scope and approvals.
+    pub data_resources: BTreeSet<String>,
     pub id: StepId,
     pub call: ToolCall,
     pub title: String,
@@ -116,6 +149,7 @@ impl Checked {
         let spec = super::spec(&call.tool);
         let title = spec.map_or_else(|| call.tool.clone(), |spec| spec.title.into());
         Self {
+            data_resources: BTreeSet::new(),
             id,
             call: call.clone(),
             summary: title.clone(),
@@ -177,6 +211,9 @@ impl Serialize for Checked {
 /// Sequential overlays let later steps refer to effects of earlier steps.
 #[derive(Clone, Debug)]
 pub struct PlanState {
+    pub dataset_slot: Option<String>,
+    pub dataset_planned: bool,
+    pub signal_captures: BTreeMap<String, Option<String>>,
     pub origin: Origin,
     pub actor_id: Option<String>,
     /// Optional ownership facts prevent conservative CLI classification
@@ -193,12 +230,27 @@ pub struct PlanState {
     pub canceled_jobs: BTreeSet<(String, u64)>,
     pub changed_features: BTreeMap<String, BTreeSet<String>>,
     pub planned_bytes: u64,
+    /// Private signal payload allowances do not reserve the already-paid native
+    /// dataset extents a second time. Exports still require global file space.
+    pub prepaid_signal_payload_bytes: u64,
     pub planned_files: u64,
 }
 
 impl PlanState {
     pub fn new(ctx: &Context) -> Self {
         Self {
+            dataset_slot: ctx
+                .snapshot
+                .dataset
+                .as_ref()
+                .and_then(|dataset| dataset.slot_id.clone()),
+            dataset_planned: false,
+            signal_captures: ctx
+                .snapshot
+                .signals
+                .iter()
+                .map(|source| (source.id.clone(), Some(source.capture_id.clone())))
+                .collect(),
             origin: Origin::Cli,
             actor_id: None,
             run: None,
@@ -245,6 +297,7 @@ impl PlanState {
             canceled_jobs: BTreeSet::new(),
             changed_features: BTreeMap::new(),
             planned_bytes: 0,
+            prepaid_signal_payload_bytes: 0,
             planned_files: 0,
         }
     }
@@ -312,6 +365,12 @@ pub struct RunFacts {
     /// when its worker lifetime ends.
     pub worker_pids: BTreeMap<String, u32>,
     pub human_values: BTreeMap<(String, String), String>,
+    /// Approved source references, selected by the caller rather than the model.
+    pub data_sources: BTreeSet<String>,
+    /// The exact open dataset slot lifetime authorized for this task.
+    pub dataset: Option<String>,
+    /// Acknowledged captures actually started by this run: source reference → token.
+    pub signal_captures: BTreeMap<String, String>,
 }
 
 fn raise(checked: &mut Checked, reason: &str) {
@@ -576,6 +635,9 @@ pub struct StepOutcome {
 type DestinationCreator<'a> = dyn Fn(&Destination, Option<Zeroizing<String>>) -> Result<Value> + 'a;
 
 pub struct Executor<'a> {
+    dataset_slot: Option<String>,
+    dataset_sink_generation: Option<u64>,
+    signal_captures: BTreeMap<String, String>,
     host: &'a dyn ToolHost,
     secrets: &'a dyn SecretSource,
     pub aliases: HashMap<String, String>,
@@ -589,6 +651,9 @@ pub struct Executor<'a> {
 impl<'a> Executor<'a> {
     pub fn new(host: &'a dyn ToolHost, secrets: &'a dyn SecretSource) -> Self {
         Self {
+            dataset_slot: None,
+            dataset_sink_generation: None,
+            signal_captures: BTreeMap::new(),
             host,
             secrets,
             aliases: HashMap::new(),
@@ -788,6 +853,62 @@ impl<'a> Executor<'a> {
                 }
             }
             let result = match op {
+                Op::Session {
+                    command,
+                    dataset_from_plan,
+                } => {
+                    let mut command = command.clone();
+                    if *dataset_from_plan {
+                        let slot = self.dataset_slot.as_deref().context("The earlier step did not acknowledge its dataset. Review the dataset before continuing.")?;
+                        super::data::bind_dataset(&mut command, slot)?;
+                        if let SessionCommand::SignalCapture {
+                            sink_generation, ..
+                        }
+                        | SessionCommand::DatasetCloseIf {
+                            sink_generation, ..
+                        } = &mut command
+                        {
+                            *sink_generation = Some(self.dataset_sink_generation.context("The earlier step did not acknowledge its sample sink. Review the dataset before starting capture.")?);
+                        }
+                    }
+                    super::data::contain_output(checked.output_root.as_deref(), &command)?;
+                    command.validate()?;
+                    let result = self.host.execute(None, command)?;
+                    if let Some(generation) = result["sink_generation"].as_u64() {
+                        self.dataset_sink_generation = Some(generation);
+                    }
+                    super::data::acknowledge(
+                        &result,
+                        &mut self.dataset_slot,
+                        &mut self.signal_captures,
+                    );
+                    self.acknowledged.push(redact::for_output(result.clone()));
+                    super::read::bound(result)
+                }
+                Op::StopSignal { source, capture_id } => {
+                    let capture_id = capture_id.as_ref().or_else(|| self.signal_captures.get(source))
+                        .context("The earlier step did not acknowledge its signal capture. Inspect it before stopping.")?;
+                    let command = SessionCommand::SignalStopIf {
+                        id: source.clone(),
+                        capture_id: capture_id.clone(),
+                    };
+                    command.validate()?;
+                    let result = self.host.execute(None, command)?;
+                    self.acknowledged.push(redact::for_output(result.clone()));
+                    result
+                }
+                Op::WaitData {
+                    source,
+                    capture_id,
+                    timeout_ms,
+                    samples,
+                } => {
+                    let capture_id = capture_id
+                        .as_ref()
+                        .or_else(|| self.signal_captures.get(source))
+                        .context("Identify a signal capture before waiting for it.")?;
+                    super::data::wait(self.host, source, capture_id, *timeout_ms, *samples, cancel)?
+                }
                 Op::Connect { selector } => {
                     let command = SessionCommand::Connect {
                         camera: selector.clone(),
@@ -1284,6 +1405,9 @@ pub(crate) fn approval_facts(checked: &Checked) -> Vec<(&str, &str)> {
 /// timestamp may move during approval; count, interval, output, destination and
 /// every other command field must still match the checked operations.
 pub(crate) fn same_approval_operations(approved: &Checked, fresh: &Checked) -> bool {
+    if approved.data_resources != fresh.data_resources {
+        return false;
+    }
     fn comparable(checked: &Checked) -> Result<Value, serde_json::Error> {
         let mut ops = checked.ops.clone();
         if immediate_schedule(checked) {

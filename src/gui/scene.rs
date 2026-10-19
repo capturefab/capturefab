@@ -5,6 +5,18 @@ use super::*;
 use notice::{Level, Saved, command_notice};
 use serde_json::json;
 
+/// An explicit zero renders a camera-free workbench; it never invents a
+/// simulator just to satisfy the screenshot's startup condition.
+pub(super) fn screenshot_camera_count(words: &[&str], existing: u32, requested: u32) -> u32 {
+    if words.contains(&"welcome") {
+        0
+    } else if existing > 0 {
+        existing
+    } else {
+        requested.min(16)
+    }
+}
+
 pub(super) struct ScreenshotRequest {
     pub(super) path: PathBuf,
     pub(super) cameras: u32,
@@ -123,6 +135,11 @@ pub(super) struct Scene {
     pub(super) auto: bool,
     /// Scroll a normal widget after its first staged layout, before capturing.
     scroll_end: Option<&'static str>,
+    /// Review the next portion of a sheet after focus has revealed its control.
+    scroll_down: bool,
+    /// Auth fixtures reveal the save row, then focus the real masked input.
+    reveal_control: Option<&'static str>,
+    focus_control: Option<&'static str>,
     /// Welcome discovery is display-only and never enumerates real devices.
     welcome: bool,
     searching: bool,
@@ -279,6 +296,7 @@ impl Workbench {
                 "light" => self.appearance = Appearance::Light,
                 "dark" => self.appearance = Appearance::Dark,
                 "sheet-bottom" => self.scene.scroll_end = Some(SHEET_BODY),
+                "sheet-down" => self.scene.scroll_down = true,
                 "inspector-bottom" => self.scene.scroll_end = Some(inspector::SCROLL),
                 "close-error" => {
                     // A display fixture only: no failed write, close request,
@@ -370,7 +388,34 @@ impl Workbench {
                 }
                 "saved" | "copied" | "pending" | "starting" | "write-error" | "kind-scanner"
                 | "kind-unknown" => self.scene.late.push((*word).into()),
-                word if self.area_scene(word, false) => {}
+                word if self.area_scene(word, false) => {
+                    let controls = match word {
+                        "quick-command-data-auth" => {
+                            Some(("quick-source-profile-save", "quick-source-profile-password"))
+                        }
+                        "quick-command-task-data-auth" => {
+                            Some(("task-source-profile-save", "task-source-profile-password"))
+                        }
+                        "quick-command-task-separate-setup" => Some((
+                            "assistant-task-separate-dataset",
+                            "assistant-task-separate-dataset",
+                        )),
+                        "signals-auth" => Some((
+                            "manual-source-profile-save",
+                            "manual-source-profile-password",
+                        )),
+                        "signals-empty" => Some((signals::ENDPOINT, signals::ENDPOINT)),
+                        "quick-command-exported" => Some((
+                            "quick-command-export-preview",
+                            "quick-command-export-preview",
+                        )),
+                        _ => None,
+                    };
+                    if let Some((reveal, focus)) = controls {
+                        self.scene.reveal_control = Some(reveal);
+                        self.scene.focus_control = Some(focus);
+                    }
+                }
                 word => self.scene.late.push(word.into()),
             }
         }
@@ -644,10 +689,25 @@ impl Workbench {
                 }
                 Err(TryRecvError::Empty) => {}
             }
+        } else if request.staged && self.scene.reveal_control == Some(signals::ENDPOINT) {
+            // Exercise the same ordered scroll-then-focus route as the sidebar.
+            self.scene.reveal_control = None;
+            self.scene.focus_control = None;
+            task = self.open_data_sources();
+        } else if request.staged && self.scene.reveal_control.is_some() {
+            task = accessibility::focus_in_window(
+                self.scene.reveal_control.take().unwrap(),
+                self.main_window,
+            );
+        } else if request.staged && self.scene.focus_control.is_some() {
+            task = operation::focus(self.scene.focus_control.take().unwrap());
         } else if request.staged && self.scene.scroll_end.is_some() {
             // The first staged frame establishes the scrollable's real
             // extent. Give the operation another paint before the screenshot.
             task = operation::snap_to_end(self.scene.scroll_end.take().unwrap());
+        } else if request.staged && self.scene.scroll_down {
+            self.scene.scroll_down = false;
+            task = operation::scroll_by(SHEET_BODY, operation::AbsoluteOffset { x: 0.0, y: 150.0 });
         } else if request.staged && !request.requested {
             // One tick after staging, so the staged state is what gets drawn.
             task = window::latest()
@@ -839,12 +899,252 @@ mod tests {
         assert!(bench.analytics.open);
         assert_eq!(bench.analytics.tab, analytics::Tab::Measurements);
         assert_eq!(bench.scene.scroll_end, Some(SHEET_BODY));
+        bench.apply_scene(&["sheet-down"]);
+        assert!(bench.scene.scroll_down);
         assert!(bench.scene.late.is_empty());
         assert!(bench.pending.is_empty());
         bench.apply_scene(&["close-error"]);
         assert!(bench.close_error.is_some());
         assert!(bench.closing.is_none());
         assert!(bench.pending.is_empty());
+    }
+
+    #[test]
+    fn exported_plan_scene_reveals_the_preview_without_saving_or_running_a_plan() {
+        let mut bench = Workbench::new(
+            SessionHandle::new(),
+            "ui-plan-review-test".into(),
+            true,
+            None,
+        );
+        bench.apply_scene(&["quick-command-exported"]);
+        assert_eq!(
+            bench.scene.focus_control,
+            Some("quick-command-export-preview")
+        );
+        assert_eq!(
+            bench.scene.reveal_control,
+            Some("quick-command-export-preview")
+        );
+        assert!(
+            bench
+                .assistant
+                .quick
+                .exported_plan
+                .as_ref()
+                .unwrap()
+                .is_absolute()
+        );
+        assert_eq!(bench.assistant.quick.plan.steps.len(), 1);
+        assert!(
+            bench.assistant.quick.plan.steps[0]
+                .checked
+                .as_ref()
+                .unwrap()
+                .ready()
+        );
+        assert!(bench.pending.is_empty());
+        assert!(bench.handle.snapshot().signals.is_empty());
+        assert!(bench.handle.snapshot().signal_bindings.is_empty());
+        assert!(bench.handle.dataset().status_cached().is_none());
+    }
+
+    #[test]
+    fn protected_source_scenes_only_focus_synthetic_masked_inputs() {
+        for (scene, prefix) in [
+            ("quick-command-data-auth", "quick-source-profile"),
+            ("quick-command-task-data-auth", "task-source-profile"),
+            ("signals-auth", "manual-source-profile"),
+        ] {
+            let mut bench = Workbench::new(
+                SessionHandle::new(),
+                "ui-auth-review-test".into(),
+                true,
+                None,
+            );
+            bench.apply_scene(&[scene]);
+            assert_eq!(
+                bench.scene.focus_control,
+                Some(format!("{prefix}-password").as_str())
+            );
+            assert_eq!(
+                bench.scene.reveal_control,
+                Some(format!("{prefix}-save").as_str())
+            );
+            assert!(bench.pending.is_empty());
+            assert!(bench.handle.snapshot().signals.is_empty());
+            assert!(bench.handle.snapshot().signal_bindings.is_empty());
+            if scene == "signals-auth" {
+                assert_eq!(bench.tab, Tab::Capture);
+                assert!(bench.inspector_open && bench.inspector_summoned);
+                assert!(bench.inspector_shown());
+            }
+        }
+    }
+
+    #[test]
+    fn zero_camera_manual_source_scene_opens_real_empty_controls_without_fixture_data() {
+        assert_eq!(screenshot_camera_count(&["signals-empty"], 0, 0), 0);
+        assert_eq!(screenshot_camera_count(&[], 0, 1), 1);
+        assert_eq!(screenshot_camera_count(&[], 0, 32), 16);
+        assert_eq!(screenshot_camera_count(&[], 2, 0), 2);
+        assert_eq!(screenshot_camera_count(&["welcome"], 0, 1), 0);
+        let mut app = Workbench::new(
+            SessionHandle::new(),
+            "zero-camera-sources-scene".into(),
+            true,
+            None,
+        );
+        app.apply_scene(&["signals-empty"]);
+        assert_eq!(app.tab, Tab::Capture);
+        assert!(app.inspector_shown());
+        assert!(app.snapshot.cameras.is_empty());
+        assert!(app.snapshot.connected.is_none());
+        assert!(app.signals.fixture.is_none());
+        assert!(app.signals.live.is_empty());
+        assert!(app.signals.source_setup.profiles.is_empty());
+        assert!(!app.signals.source_setup.pending);
+        assert_eq!(app.scene.focus_control, Some(signals::ENDPOINT));
+        assert!(app.pending.is_empty());
+        assert!(app.handle.snapshot().signal_bindings.is_empty());
+    }
+
+    #[test]
+    fn manual_auth_scene_renders_a_masked_password_in_the_full_capture_inspector() {
+        use destinations::layout_tests::{
+            apply, prepare_artifact_frame, render_artifact_scaled, renderer,
+        };
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Id, Tree},
+        };
+        let mut renderer = renderer();
+        for dark in [false, true] {
+            for scale in prefs::UiScale::ALL {
+                for physical_height in [620.0, 900.0] {
+                    let mut app = bench();
+                    app.snapshot.connected = Some(app.snapshot.cameras[0].info.clone());
+                    app.inspector_open = false;
+                    app.tab = Tab::Features;
+                    app.apply_scene(&["signals-auth"]);
+                    // An already restored disclosure must stay open when the
+                    // fixture is applied, rather than toggling closed.
+                    app.apply_scene(&["signals-auth"]);
+                    assert_eq!(app.tab, Tab::Capture);
+                    assert!(app.inspector_open && app.inspector_summoned);
+                    assert!(app.inspector_shown());
+                    app.sync_inspector();
+                    app.now += Duration::from_millis(500);
+                    let size =
+                        Size::new(INSPECTOR, physical_height / scale.factor() - BAR - TOOLBAR);
+                    let mut view = app.inspector(Palette::of(dark));
+                    let mut tree = Tree::new(view.as_widget());
+                    let node = view.as_widget_mut().layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(Size::ZERO, size),
+                    );
+                    prepare_artifact_frame(&mut view, &mut tree, &node, &renderer, size);
+                    let (snapshot, _, _) = accessibility::snapshot_widget(
+                        view.as_widget_mut(),
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                    );
+                    let password = &snapshot
+                        .nodes
+                        .iter()
+                        .find(|(_, node)| {
+                            node.role() == accessibility::Role::PasswordInput
+                                && node.label() == Some("Source password")
+                        })
+                        .expect(
+                            "the actual Capture inspector renders the protected source password",
+                        )
+                        .1;
+                    assert!(!password.is_disabled());
+                    assert!(
+                        password
+                            .value()
+                            .is_none_or(|value| !value.contains("fixture-only-password"))
+                    );
+                    assert!(
+                        snapshot
+                            .nodes
+                            .iter()
+                            .any(|(_, node)| node.role() == accessibility::Role::ComboBox
+                                && node.label() == Some("Source authentication"))
+                    );
+                    apply(
+                        &mut view,
+                        &mut tree,
+                        &node,
+                        &renderer,
+                        iced::advanced::widget::operation::focusable::focus::<Message>(Id::new(
+                            "manual-source-profile-save",
+                        )),
+                    );
+                    apply(
+                        &mut view,
+                        &mut tree,
+                        &node,
+                        &renderer,
+                        accessibility::focus_reveal_operation(iced::window::Id::unique()),
+                    );
+                    apply(
+                        &mut view,
+                        &mut tree,
+                        &node,
+                        &renderer,
+                        iced::advanced::widget::operation::focusable::focus::<Message>(Id::new(
+                            "manual-source-profile-password",
+                        )),
+                    );
+                    let (snapshot, _, _) = accessibility::snapshot_widget(
+                        view.as_widget_mut(),
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                    );
+                    for (role, label) in [
+                        (accessibility::Role::PasswordInput, "Source password"),
+                        (accessibility::Role::Button, "Save protected source profile"),
+                    ] {
+                        let bounds = snapshot
+                            .nodes
+                            .iter()
+                            .find(|(_, node)| node.role() == role && node.label() == Some(label))
+                            .unwrap()
+                            .1
+                            .bounds()
+                            .unwrap();
+                        assert!(
+                            bounds.width() > 0.0
+                                && bounds.height() > 0.0
+                                && bounds.x0 >= -0.5
+                                && bounds.y0 >= -0.5
+                                && bounds.x1 <= f64::from(size.width) + 0.5
+                                && bounds.y1 <= f64::from(size.height) + 0.5,
+                            "{label} is visible in full inspector after focus: {scale}, {physical_height}, {bounds:?}"
+                        );
+                    }
+                    if !dark {
+                        render_artifact_scaled(
+                            &format!("signals-auth-full-inspector-light-{physical_height}-{scale}"),
+                            &view,
+                            &tree,
+                            &node,
+                            &mut renderer,
+                            size,
+                            scale.factor(),
+                        );
+                    }
+                    assert!(app.pending.is_empty());
+                    assert!(app.handle.snapshot().signals.is_empty());
+                    assert!(app.handle.snapshot().signal_bindings.is_empty());
+                }
+            }
+        }
     }
 
     #[test]

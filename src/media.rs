@@ -876,8 +876,8 @@ pub(crate) fn command(exe: &Executable) -> Command {
         cmd.creation_flags(0x08000000);
     }
     cmd.stdin(Stdio::null());
-    // Camera hub secrets may live in the environment of the process that
-    // opens the camera; FFmpeg never needs them.
+    // Camera and signal secrets may live in this process's environment;
+    // FFmpeg never needs them.
     for (name, _) in std::env::vars_os() {
         if is_hub_secret_variable(&name) {
             cmd.env_remove(name);
@@ -890,9 +890,14 @@ pub(crate) const HUB_SECRET_PREFIX: &str = "CAPTUREFAB_HUB_";
 fn is_hub_secret_variable(name: &std::ffi::OsStr) -> bool {
     // Windows environment names are case-insensitive, including when the
     // inherited spelling differs from the saved uppercase variable name.
-    name.to_str()
-        .and_then(|name| name.get(..HUB_SECRET_PREFIX.len()))
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(HUB_SECRET_PREFIX))
+    name.to_str().is_some_and(|name| {
+        [HUB_SECRET_PREFIX, crate::signals::auth::ENV_PREFIX]
+            .iter()
+            .any(|expected| {
+                name.get(..expected.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(expected))
+            })
+    })
 }
 fn bounded_output(exe: &Executable, args: &[String], timeout: Duration) -> Result<(bool, String)> {
     let (success, output, _) = timed_output(exe, args, &[], timeout)?;
@@ -5586,6 +5591,8 @@ esac"#
             "CAPTUREFAB_HUB_TEST_SECRET",
             "capturefab_hub_test_secret",
             "Capturefab_Hub_Secret",
+            "CAPTUREFAB_SIGNAL_LINE_PASSWORD",
+            "capturefab_signal_line_password",
         ] {
             assert!(is_hub_secret_variable(std::ffi::OsStr::new(name)));
         }

@@ -2,6 +2,113 @@
 
 Capturefab opens its desktop app without a subcommand. Use explicit subcommands for automation. It acquires camera images and video, reads sensor and PLC signals (Modbus TCP, MQTT, OPC UA, MTConnect), catalogs saved files and samples in a DuckDB dataset, and exports analysis bundles. The installed binary's `schema` and `--help` output define its supported commands.
 
+## Start with an external harness
+
+Claude Code, Codex, Antigravity and other harnesses can use Capturefab by running CLI commands and reading JSON.
+Your harness supplies model access; Capturefab provider credentials are unnecessary for this route.
+The [built-in assistant](#use-the-ai-assistant) uses separate provider settings.
+Your harness controls whether its model receives camera images and tool results.
+
+1. Make the installed executable available to the harness through `PATH` or its full path.
+2. Examine the build and read the compact tool catalog.
+3. Read only the schemas for the tools your task uses.
+
+```sh
+capturefab --version
+capturefab doctor --json
+capturefab tools list --compact --json
+capturefab tools describe connect_camera --json
+capturefab tools describe inspect_frame --json
+capturefab tools describe capture_photos --json
+```
+
+`tools list --compact --json` returns a small index in `result`, including risk and session requirements.
+`tools describe NAME --json` returns one full catalog entry with its `input_schema`.
+Both commands work without a session or provider account.
+For an older build without these options, use `tools list --json`.
+Use `schema --json` when the task needs the full CLI or RPC contract.
+
+### First simulator capture
+
+In an open desktop app, choose **Help → Connect an Agent…** and select **Copy agent briefing**.
+The briefing contains the installed executable path and the visible session's name.
+Give it to the harness to reuse that workspace.
+
+For a new visible workspace, run this command in its own terminal.
+Keep that terminal open:
+
+```sh
+capturefab gui --name bench
+```
+
+For a headless workspace, use `capturefab serve --name bench`.
+If a workspace is already open, read `capturefab sessions --json` and reuse its name.
+Run the harness under the same operating-system account as the local session.
+Do not open a separate connection to a camera the app already controls.
+
+Run these calls from the harness or another terminal:
+
+```sh
+capturefab --session bench --actor capture-agent --actor-kind agent tools call connect_camera --args '{"camera":"sim:0","size":null,"fps":null}' --json
+capturefab --session bench --actor capture-agent --actor-kind agent tools call inspect_frame --args '{"camera":"sim:0","fresh":1,"max_dimension":1024,"region":null,"include_image":true}' --json
+capturefab --session bench --actor capture-agent --actor-kind agent tools call capture_photos --args '{"camera":"sim:0","count":2,"format":"png","file_name":"first-{seq}.png","destination":null,"tags":null}' --json
+capturefab --session bench activity --json
+```
+
+Use `result.image.path` from inspection with the harness's image viewer.
+Inspection images are temporary diagnostics; they are separate from saved capture files.
+The capture result reports saved paths in the harness's working directory.
+CLI tool captures use that directory; the built-in assistant uses the app's configured capture folder.
+The `{seq}` template permits another run without overwriting files.
+Report those paths and errors; do not claim image verification without examining the image or its measurements.
+Tool arguments select the camera; omit global `--camera` and unset `CAPTUREFAB_CAMERA`.
+For PowerShell or complex JSON, save the argument object in a file and use `--args-file FILE`.
+
+### Capture data with the same tools
+
+Read the installed schemas before starting a data task:
+
+```sh
+capturefab tools describe open_dataset --json
+capturefab tools describe start_signal_capture --json
+capturefab tools describe wait_for_data --json
+capturefab tools describe query_dataset --json
+capturefab tools describe export_dataset --json
+```
+
+Give the harness a bounded task: open a new `agent-data.duckdb` inside its working folder,
+log `sim-signal://line1` every `100ms` for `2s` with at most `20` individual tag samples
+and `65536` serialized payload bytes, wait for final persistence, then query and export the results.
+The harness can add camera captures and query `captures_with_signals` to align images with measurements.
+Use returned source references, dataset slot IDs and capture tokens. Confirm acquired and written counts,
+drops, persistence errors and export checksums before reporting success.
+
+A running session's finite signal capture stops at its first duration, sample or payload limit even if
+the client exits. Stopping a client alone does not stop legacy unbounded logging. Use conditional tools
+to stop only the intended capture. Payload limits and generated export limits do not cap physical
+DuckDB/WAL growth or per-task query scratch space; dataset-wide storage policy is separate.
+Checked exports reserve twice the bundle limit for staged files and published copies. Built-in
+tasks charge that reservation to both data and total allowances, including failed attempts;
+`remaining.export_bundle_bytes` gives the largest bundle allowed by the remaining reservations.
+
+The built-in assistant runs SQL on a private copy of the six standard tables, with stored camera
+serials removed, URLs reduced to scheme and host, and the home-directory prefix replaced before
+SQL can transform them. The complete copy must fit 100,000 rows and 16 MiB of Arrow transfers
+(8 MiB per batch), within the query's one setup/copy/SQL timeout. Oversized or changed-schema
+catalogs fail explicitly. Trusted external CLI queries retain the local catalog's original data.
+
+### Hand control back to a person
+
+Keep the session open so the person can review the preview and Activity.
+Retain `--actor NAME --actor-kind agent` on external-agent actions.
+Before manual intervention, stop the harness task and examine `status`, `jobs` and `activity`.
+A client timeout or stopped harness does not cancel accepted camera commands.
+Cancel only the intended job or recording; preserve work from other participants.
+Use current setting values in `expect` when the agent resumes.
+See [Let an agent drive cameras](#let-an-agent-drive-cameras) for conflict detection, undo and recovery.
+
+## Read the automation contract
+
 ```sh
 capturefab schema --json
 capturefab doctor --json
@@ -128,11 +235,27 @@ capturefab assistant runs --json
 capturefab assistant log RUN_ID --json
 ```
 
+For data-only tasks, camera selection is optional. Data permission is separate from images:
+
+```sh
+capturefab --session bench assistant run \
+  'Open agent-data.duckdb with a 64MiB dataset cap. Log the selected source every 100ms for 2s, at most 20 samples and 65536 payload bytes. Wait for persistence, query samples, then export Parquet to agent-export with a 16MiB cap.' \
+  --source sim-signal://line1 --allow-data --mode autonomous --approvals deny \
+  --max-time 5m --max-sources 1 --max-samples 20 --max-signal-time 2s \
+  --max-data-size 32MiB --max-size 128MiB --json
+```
+
+Add `--camera sim:0` for a mixed task. The camera must already be connected.
+`--allow-data` permits scoped values, tag metadata, annotations and dataset query results to reach
+the selected model. Source endpoints stay local; the model uses opaque source references.
+Credential-bearing source URLs are refused in CLI arguments. Inspect final persisted counts and
+leftovers in the result; reserved allowances are not measured file sizes.
+
 `ask` runs Observe tools and returns other calls as plan steps.
 Positional prompt text and `--prompt-file FILE|-` are exclusive; the maximum is 4,000 characters.
 Ask options `--provider ID` and `--model NAME` override selection for that request.
 Ask attaches to a session when available; without one, only local read-only context is available and `--apply` is refused.
-Run must have an active session and one to eight explicit `--camera ID` values.
+Run requires an active session and at least one explicit camera, data source or dataset. Use up to eight `--camera ID` values, repeated `--source URI` values, or `--dataset SLOT_ID` from current dataset status.
 Global `--camera` is for other command families; use the run subcommand's camera options.
 Use `--actor NAME --actor-kind agent` for external-agent calls; runs use their own `assistant:{pid}:{run8}` agent actor.
 Actor metadata is display attribution, not authentication.
@@ -197,19 +320,21 @@ The same registry is available in desktop and headless builds.
 Use the installed catalog to obtain names, schemas, ranges and risk classes.
 
 1. Start a shared session with `serve --name bench` or `gui --name bench`.
-2. List the tools and read `get_overview` before selecting a camera.
-3. Connect a listed camera and start live view.
-4. Examine the image file and numeric measurements from `inspect_frame`.
-5. Read feature values before proposing a settings change.
-6. Include `expect` values to detect conflicting writes.
-7. Use `wait_for` between changes and observations.
-8. Capture the requested files after verification.
-9. Restore a change only with its returned `camera_change.token`.
+2. Read the compact tool index and the relevant tool schemas.
+3. Read `get_overview` before selecting a camera.
+4. Connect a listed camera and start live view.
+5. Examine the image file and numeric measurements from `inspect_frame`.
+6. Read feature values before proposing a settings change.
+7. Include `expect` values to detect conflicting writes.
+8. Use `wait_for` between changes and observations.
+9. Capture the requested files after verification.
+10. Restore a change only with its returned `camera_change.token`.
 
 ```sh
 capturefab serve --name bench
 # In another terminal; retain this actor on every agent call:
-capturefab --session bench --actor codex --actor-kind agent tools list --json
+capturefab tools list --compact --json
+capturefab tools describe set_camera_features --json
 capturefab --session bench --actor codex --actor-kind agent tools call get_overview --json
 capturefab --session bench --actor codex --actor-kind agent tools call list_cameras --args '{"discover":true,"include_simulated":true}' --json
 capturefab --session bench --actor codex --actor-kind agent tools call connect_camera --args '{"camera":"sim:0","size":null,"fps":null}' --json
@@ -236,6 +361,14 @@ Webcams use their discovered friendly names.
 `--actor-kind agent` identifies an external agent; actor metadata does not authenticate it.
 
 `tools call` and `tools apply`, including dry runs, can automatically attach to the only active session.
+Authenticated MQTT/OPC UA sources use local saved profiles: `signals profiles list|save|remove|bind`.
+Keep endpoints credential-free. `save --credentials-stdin` accepts bounded username/password JSON
+on stdin for the OS store; with `--password-env CAPTUREFAB_SIGNAL_NAME`, send only the username.
+Updates/removals require the exact listed revision. `bind NAME` explicitly resolves local credentials
+in the selected workbench and returns an opaque source reference without contacting its endpoint.
+Use that reference with data tools, or select profiles for a bounded task with repeatable
+`assistant run --source-profile NAME --allow-data`. Profiles, credential epochs and endpoints cannot
+be supplied by the model. Profile edits, credential changes and workbench restarts expire bindings.
 With several sessions, specify `--session NAME`.
 With no session, `get_overview`, `list_destinations`, `get_storage` and `list_cameras` with `discover:false` remain available.
 Destination creation also works without a camera session.
@@ -244,11 +377,12 @@ Other camera tools must have a running session; they do not create temporary wor
 
 All schema argument keys are required.
 Use `null` for an optional value or default; unknown fields cause a usage error.
-Tags are `null` or an array of `{key,value}` objects.
+Camera capture tags are `null` or an array of `{key,value}` objects. Sensor tag filters are `null` or an array of tag-name strings; read each tool's schema for its exact shape.
 `--args JSON` and `--args-file FILE|-` are exclusive; argument input is limited to 256 KiB.
 
 No-argument tools accept an omitted argument object.
-`tools list --json` returns the catalog array in `result`.
+`tools list --json` returns the full catalog array in `result`.
+Prefer `tools list --compact --json` for discovery and `tools describe NAME --json` for one schema.
 Each entry includes `name`, `title`, `kind`, `risk`, `needs_session`, `needs_vision`, `description` and `input_schema`.
 
 Read tools return their redacted value in `result`.
@@ -607,6 +741,25 @@ Destination JSON: FTP `{name,kind:"ftp",host,port,user,dir,tls:"explicit"|"plain
 No-overwrite: S3 uses `If-None-Match`, or a HEAD check first in `check_first` mode (a short race window). SFTP writes an exclusive temporary file, then an SFTPv3 rename that refuses an existing target. FTP uploads `.NAME.HASH.part`, checks size, then renames; many servers let a rename replace a file, so keep one writer per FTP folder. FTP servers without SIZE and MLST are refused. Older Capturefab binaries reject upload queues holding FTP or SFTP items.
 
 ## Schedule captures and respect storage budgets
+
+Native sensor-only assistant tasks can use a separate dataset. Its full logical extent reservation
+stays charged until removal. In Quick Command, **Retained datasets…** offers reveal, save a copy
+and confirmed permanent removal, including after starting another task or restarting the app.
+For orphan workspaces, external agents can use:
+
+```sh
+capturefab storage task-data list --json
+capturefab storage task-data copy RESERVATION_ID recovered-data --json
+# Only after the user approves this exact permanent deletion:
+capturefab storage task-data remove RESERVATION_ID --confirmed-by-user --json
+```
+
+Use the inventory's reservation ID, never a path or action-log ID. A running owner blocks CLI
+recovery. Copies require a new folder, consume a separate storage allowance and preserve the
+database and WAL together; open the copied `task.duckdb` with its WAL alongside it. Originals stay
+unchanged. Changed directory identities, extra file links and uncertain closure keep charges
+reserved. Inspect partial copy output before retrying. Mixed image/data captures use the shared
+dataset tools described above.
 
 ```sh
 capturefab --session gui capture -n 60 -o timed-frames --delay 5s --interval 1m --json

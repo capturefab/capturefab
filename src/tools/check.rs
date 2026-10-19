@@ -29,22 +29,31 @@ pub fn check(
         return checked;
     }
     let mut overlay = plan.clone();
-    match spec.kind {
-        ToolKind::Read => match super::read::preflight(ctx, call) {
-            Ok(()) => {
-                checked.output_root = Some(ctx.capture_root.clone());
-                checked.ops.push(Op::Observe(call.clone()));
+    if super::data::is_action(spec.name) {
+        super::data::check(ctx, &mut overlay, &mut checked);
+    } else {
+        match spec.kind {
+            ToolKind::Read => match super::read::preflight_with_origin(ctx, call, plan.origin) {
+                Ok(()) => {
+                    if call.tool == "query_dataset"
+                        && let Some(slot) = &ctx.data_dataset
+                    {
+                        checked.data_resources.insert(format!("dataset:{slot}"));
+                    }
+                    checked.output_root = Some(ctx.capture_root.clone());
+                    checked.ops.push(Op::Observe(call.clone()));
+                }
+                Err(issues) => checked.issues.extend(issues),
+            },
+            ToolKind::Control => {
+                super::control::check(ctx, &mut overlay, &mut checked, secrets_present)
             }
-            Err(issues) => checked.issues.extend(issues),
-        },
-        ToolKind::Control => {
-            super::control::check(ctx, &mut overlay, &mut checked, secrets_present)
-        }
-        ToolKind::Capture => {
-            super::capture::check(ctx, &mut overlay, &mut checked, secrets_present)
-        }
-        ToolKind::Configure => {
-            super::destinations::check(ctx, &mut overlay, &mut checked, secrets_present)
+            ToolKind::Capture => {
+                super::capture::check(ctx, &mut overlay, &mut checked, secrets_present)
+            }
+            ToolKind::Configure => {
+                super::destinations::check(ctx, &mut overlay, &mut checked, secrets_present)
+            }
         }
     }
     if spec.kind != ToolKind::Read && spec.needs_session && !ctx.session {
@@ -55,7 +64,9 @@ pub fn check(
     }
     for op in &checked.ops {
         match op {
-            Op::Command { command, .. } | Op::Stream { command, .. } => {
+            Op::Command { command, .. }
+            | Op::Stream { command, .. }
+            | Op::Session { command, .. } => {
                 if let Err(error) = command.validate() {
                     checked.issues.push(command_issue(&error.to_string()));
                 }

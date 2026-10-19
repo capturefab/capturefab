@@ -148,7 +148,13 @@ fn compact_settings_reveal_complete_assistant_controls_in_both_presentations() {
     for sheet in [false, true] {
         for scale in UiScale::ALL {
             for dark in [false, true] {
-                for error in [false, true] {
+                for scene in [
+                    "settings-assistant",
+                    "settings-assistant-error",
+                    "settings-assistant-success",
+                ] {
+                    let error = scene.ends_with("-error");
+                    let success = scene.ends_with("-success");
                     let physical = if sheet {
                         Size::new(900.0, 620.0)
                     } else {
@@ -167,14 +173,7 @@ fn compact_settings_reveal_complete_assistant_controls_in_both_presentations() {
                     } else {
                         Appearance::Light
                     };
-                    assert!(app.scene_assistant_settings(
-                        if error {
-                            "settings-assistant-error"
-                        } else {
-                            "settings-assistant"
-                        },
-                        false,
-                    ));
+                    assert!(app.scene_assistant_settings(scene, false));
                     let mut view = if sheet {
                         app.settings_sheet(Palette::of(dark), (viewport.height - 80.0).max(320.0))
                     } else {
@@ -214,7 +213,7 @@ fn compact_settings_reveal_complete_assistant_controls_in_both_presentations() {
                         "the whole footer fits, sheet={sheet}, {scale}, {pinned:?}"
                     );
                     let prefix = format!(
-                        "assistant-settings-{}-{scale}-{}-error-{error}",
+                        "assistant-settings-{}-{scale}-{}-{scene}",
                         if sheet { "sheet" } else { "native" },
                         if dark { "dark" } else { "light" },
                     );
@@ -255,6 +254,14 @@ fn compact_settings_reveal_complete_assistant_controls_in_both_presentations() {
                         control.label.contains("assistant API key")
                             && control.role == accessibility::Role::PasswordInput
                     }));
+                    assert_eq!(
+                        geometry.controls.iter().any(|control| {
+                            control.label == "Assistant setup complete: open Quick Command"
+                                && control.role == accessibility::Role::Button
+                        }),
+                        success,
+                        "only a successful test offers the continuation action"
+                    );
                     for control in &geometry.controls {
                         // The operation sees unshifted layouts. Reveal each
                         // complete field or action without dispatching it.

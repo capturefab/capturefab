@@ -1,5 +1,6 @@
 //! The native workbench. Camera I/O lives on the session worker, never the UI thread.
 mod accessibility;
+mod agents;
 mod analytics;
 mod assistant;
 mod autocapture;
@@ -39,9 +40,11 @@ mod refresh;
 mod reveal;
 mod scene;
 mod scopes;
+mod secret;
 mod settings;
 mod sidebar;
 mod signals;
+mod source_setup;
 mod sparkline;
 mod stage;
 mod storage_policy;
@@ -249,15 +252,8 @@ pub fn run_capture(
         if let Some(path) = &screenshot {
             let scene = std::env::var("CAPTUREFAB_SCREENSHOT_SCENE").unwrap_or_default();
             let scene: Vec<&str> = scene.split(',').map(str::trim).collect();
-            let welcome = scene.contains(&"welcome");
             let existing = handle.snapshot().cameras.len() as u32;
-            let count = if welcome {
-                0
-            } else if existing > 0 {
-                existing
-            } else {
-                demo_cameras.clamp(1, 16)
-            };
+            let count = scene::screenshot_camera_count(&scene, existing, demo_cameras);
             app.apply_scene(&scene);
             app.screenshot = Some(ScreenshotRequest {
                 path: path.clone(),
@@ -678,6 +674,7 @@ enum Message {
     RetryClose,
     KeepOpen,
     Help(bool),
+    AgentSetup(bool),
     DragWindow,
     Discover,
     ScanNetwork,
@@ -3226,6 +3223,13 @@ impl Workbench {
                 self.show_help(open);
                 if open && self.help_open {
                     return operation::focus("sheet-close");
+                }
+            }
+            Message::AgentSetup(open) => {
+                self.show_agent_setup(open);
+                if open && self.help_open && self.sheets.agents {
+                    return operation::snap_to(SHEET_BODY, operation::RelativeOffset::START)
+                        .chain(operation::focus("sheet-close"));
                 }
             }
             Message::DragWindow => return window::drag(self.main_window),

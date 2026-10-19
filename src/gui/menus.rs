@@ -20,6 +20,7 @@ pub(super) enum Command {
     Record,
     Schedule,
     Quit,
+    AgentSetup,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -360,11 +361,14 @@ impl Workbench {
             },
             Menu {
                 title: "Help",
-                items: vec![action(
-                    "Capturefab Help",
-                    Action::Help,
-                    ready || self.help_open,
-                )],
+                items: vec![
+                    Some(Item::command(
+                        "Connect an Agent…",
+                        Command::AgentSetup,
+                        ready,
+                    )),
+                    action("Capturefab Help", Action::Help, ready || self.help_open),
+                ],
             },
         ];
         if !cfg!(target_os = "macos") {
@@ -403,6 +407,7 @@ impl Workbench {
         match command {
             Command::Quit => self.handle_message(Message::Quit),
             Command::Action(action) => self.dispatch_action(action),
+            Command::AgentSetup => self.handle_message(Message::AgentSetup(true)),
             Command::Edit(command) => {
                 let serial = self
                     .menu_edit

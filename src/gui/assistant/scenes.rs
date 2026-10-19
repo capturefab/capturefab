@@ -13,8 +13,11 @@ use crate::{
 use serde_json::json;
 use std::sync::Arc;
 
-pub(in crate::gui) const WORDS: [&str; 8] = [
+pub(in crate::gui) const WORDS: [&str; 12] = [
     "quick-command",
+    "quick-command-data-consent",
+    "quick-command-data-sources",
+    "quick-command-data-auth",
     "quick-command-plan",
     "quick-command-invalid",
     "quick-command-running",
@@ -22,6 +25,7 @@ pub(in crate::gui) const WORDS: [&str; 8] = [
     "quick-command-setup",
     "quick-command-thinking",
     "quick-command-error",
+    "quick-command-exported",
 ];
 
 impl Workbench {
@@ -49,6 +53,57 @@ pub(in crate::gui) fn fixture(word: &str, snapshot: SessionSnapshot) -> quick::S
     state.context = Some(context(snapshot));
     if word == "quick-command-setup" {
         state.settings.provider = None;
+        return state;
+    }
+    if word == "quick-command-data-consent" {
+        state.allow_data = true;
+        state.allow_images = true;
+        return state;
+    }
+    if word == "quick-command-data-sources" {
+        state.allow_data = true;
+        state.data_sources_open = true;
+        state.data_sources.push(
+            crate::tools::context::DataSourceRef::approved(
+                "mqtt://line1.example/line1/temperature",
+            )
+            .unwrap(),
+        );
+        state.data_source_draft = "modbus-tcp://plc.example/1/holding/0".into();
+        return state;
+    }
+    if word == "quick-command-data-auth" {
+        state.allow_data = true;
+        state.data_sources_open = true;
+        state.source_setup.fixture();
+        state.prompt = "Read the approved temperature source.".into();
+        return state;
+    }
+    if word == "quick-command-exported" {
+        let source = crate::tools::context::DataSourceRef::approved("sim-signal://line1").unwrap();
+        state.allow_data = true;
+        state.data_sources.push(source.clone());
+        let context = state.context.as_mut().unwrap();
+        #[cfg(windows)]
+        {
+            context.capture_root = PathBuf::from(r"C:\Capturefab Review\captures");
+        }
+        context.allow_data = true;
+        context.data_sources.push(source.clone());
+        state
+            .plan
+            .propose(
+                ToolCall {
+                    tool: "read_data_source".into(),
+                    args: json!({"source":source.reference,"timeout":"1s"}),
+                },
+                None,
+            )
+            .unwrap();
+        state
+            .plan
+            .recheck(context, None, &crate::tools::EmptySecrets);
+        state.exported_plan = Some(context.capture_root.join("reviewed-plan.json"));
         return state;
     }
     if word == "quick-command" {
@@ -150,10 +205,16 @@ pub(in crate::gui) fn context(mut snapshot: SessionSnapshot) -> Context {
     }
     let policy = StoragePolicy::default();
     Context {
+        data_profiles: Vec::new(),
         now_ms: 1_792_344_960_000,
         zone: Zone::Fixed(-14_400),
         session: true,
         snapshot,
+        data_sources: Vec::new(),
+        allow_data: false,
+        data_dataset: None,
+        task_data_available: cfg!(unix) && cfg!(feature = "parquet"),
+        task_data_reserved_bytes: 0,
         destinations: vec![DestinationInfo {
             approval_identity: None,
             name: "inspection-archive".into(),

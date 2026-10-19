@@ -1,6 +1,7 @@
 //! Analysis bundles: DuckDB writes each table into the private staging
 //! folder, then every file is copied into a new export folder through the
 //! storage ledger, with `manifest.json` and `README.md` beside them.
+pub(super) mod bounded;
 use super::{
     ExportFormat, Reader, TABLES,
     db::{file_label, now_ms, sql_text},
@@ -23,6 +24,7 @@ const METADATA_RESERVE: u64 = 64 * 1024;
 pub const SUMMARY_BYTES: usize = 8 * 1024;
 /// `captures_wide` is written only for 1..=256 distinct tags.
 pub const WIDE_TAGS: usize = 256;
+pub const MAX_TIMEOUT_MS: u64 = 600_000;
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(570);
 
 #[derive(Debug, Clone)]
@@ -257,65 +259,31 @@ impl Reader {
         }))
     }
 
-    fn filter(&self, table: &str, request: &ExportRequest) -> String {
-        let Some(column) = time_column(table) else {
-            return String::new();
-        };
-        let mut clauses = Vec::new();
-        if let Some(since) = request.since_ms {
-            clauses.push(format!("{column} >= {since}"));
-        }
-        if let Some(until) = request.until_ms {
-            clauses.push(format!("{column} <= {until}"));
-        }
-        if clauses.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", clauses.join(" AND "))
+    fn export_source(&self) -> ExportSource<'_> {
+        ExportSource {
+            conn: &self.conn,
+            path: &self.path,
+            status: &self.status,
+            cancelled: &self.cancelled,
         }
     }
-
-    /// The SELECT for `captures_wide`, or `None` without 1..=256 tags.
-    fn wide_select(&self, request: &ExportRequest) -> Result<Option<String>> {
-        let pairs: Vec<(String, String)> = {
-            let mut statement = self
-                .conn
-                .prepare("SELECT DISTINCT source_id, tag FROM samples ORDER BY tag, source_id")?;
-            statement
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<duckdb::Result<_>>()?
-        };
-        if pairs.is_empty() || pairs.len() > WIDE_TAGS {
-            return Ok(None);
-        }
-        let mut seen = BTreeMap::<&str, usize>::new();
-        for (_, tag) in &pairs {
-            *seen.entry(tag.as_str()).or_default() += 1;
-        }
-        let repeated = seen.values().any(|count| *count > 1);
-        let key = if repeated {
-            "source_id || ':' || tag"
-        } else {
-            "tag"
-        };
-        let keys: Vec<String> = pairs
-            .iter()
-            .map(|(source, tag)| {
-                let key = if repeated {
-                    format!("{source}:{tag}")
-                } else {
-                    tag.clone()
-                };
-                format!("'{}'", sql_text(&key))
-            })
-            .collect();
-        Ok(Some(format!(
-            "SELECT * FROM (PIVOT (SELECT capture_id, wall_ms, camera_id, path, value_double, {key} AS key
-               FROM captures_with_signals{}) ON key IN ({}) USING first(value_double)
-               GROUP BY capture_id, wall_ms, camera_id, path) ORDER BY capture_id",
-            self.filter("captures_with_signals", request),
-            keys.join(", ")
-        )))
+    fn export_select(&self, table: &str, request: &ExportRequest) -> Result<Option<String>> {
+        self.export_source().export_select(table, request)
+    }
+    fn metadata(&self, request: &ExportRequest) -> Result<Metadata> {
+        self.export_source().metadata(request)
+    }
+    fn manifest(
+        &self,
+        request: &ExportRequest,
+        formats: &[ExportFormat],
+        files: &[Value],
+        meta: &Metadata,
+    ) -> Value {
+        self.export_source().manifest(request, formats, files, meta)
+    }
+    fn readme(&self, manifest: &Value, meta: &Metadata) -> String {
+        self.export_source().readme(manifest, meta)
     }
 
     fn stage(&self, request: &ExportRequest, formats: &[ExportFormat]) -> Result<Vec<Staged>> {
@@ -350,22 +318,8 @@ impl Reader {
         // so each export's files carry their own prefix.
         let prefix = super::db::random_name()?;
         for table in tables {
-            let select = if table == "captures_wide" {
-                match self.wide_select(request)? {
-                    Some(select) => select,
-                    None => continue,
-                }
-            } else {
-                let order = match table {
-                    "signals" => " ORDER BY source_id, tag",
-                    "samples" => " ORDER BY ts_ms",
-                    "captures_with_signals" => " ORDER BY capture_id, source_id, tag",
-                    _ => " ORDER BY 1",
-                };
-                format!(
-                    "SELECT * FROM {table}{}{order}",
-                    self.filter(table, request)
-                )
+            let Some(select) = self.export_select(table, request)? else {
+                continue;
             };
             for format in formats {
                 let file = format!("{prefix}-{table}.{}", format.extension());
@@ -454,7 +408,117 @@ struct Metadata {
     last_ms: Option<u64>,
 }
 
-impl Reader {
+/// Borrowed only for the duration of a checked export. The connection is never
+/// cloned or exposed by this adapter, including for private task engines.
+pub(super) struct ExportSource<'a> {
+    pub conn: &'a duckdb::Connection,
+    pub path: &'a Path,
+    pub status: &'a super::DatasetStatus,
+    pub cancelled: &'a std::sync::atomic::AtomicBool,
+}
+impl ExportSource<'_> {
+    pub(super) fn check_cancelled(&self) -> Result<()> {
+        ensure!(
+            !self.cancelled.load(std::sync::atomic::Ordering::Acquire),
+            "dataset export cancelled"
+        );
+        Ok(())
+    }
+    pub(super) fn metadata_text(
+        &self,
+        request: &ExportRequest,
+        formats: &[ExportFormat],
+        files: &[Value],
+    ) -> Result<Vec<(&'static str, String)>> {
+        let metadata = self.metadata(request)?;
+        let manifest = self.manifest(request, formats, files, &metadata);
+        let readme = self.readme(&manifest, &metadata);
+        Ok(vec![
+            ("manifest.json", serde_json::to_string_pretty(&manifest)?),
+            ("README.md", readme),
+        ])
+    }
+    fn filter(&self, table: &str, request: &ExportRequest) -> String {
+        let Some(column) = time_column(table) else {
+            return String::new();
+        };
+        let mut clauses = Vec::new();
+        if let Some(since) = request.since_ms {
+            clauses.push(format!("{column} >= {since}"));
+        }
+        if let Some(until) = request.until_ms {
+            clauses.push(format!("{column} <= {until}"));
+        }
+        if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        }
+    }
+
+    /// The SELECT for `captures_wide`, or `None` without 1..=256 tags.
+    fn wide_select(&self, request: &ExportRequest) -> Result<Option<String>> {
+        let pairs: Vec<(String, String)> = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT DISTINCT source_id, tag FROM samples ORDER BY tag, source_id")?;
+            statement
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<duckdb::Result<_>>()?
+        };
+        if pairs.is_empty() || pairs.len() > WIDE_TAGS {
+            return Ok(None);
+        }
+        let mut seen = BTreeMap::<&str, usize>::new();
+        for (_, tag) in &pairs {
+            *seen.entry(tag.as_str()).or_default() += 1;
+        }
+        let repeated = seen.values().any(|count| *count > 1);
+        let key = if repeated {
+            "source_id || ':' || tag"
+        } else {
+            "tag"
+        };
+        let keys: Vec<String> = pairs
+            .iter()
+            .map(|(source, tag)| {
+                let key = if repeated {
+                    format!("{source}:{tag}")
+                } else {
+                    tag.clone()
+                };
+                format!("'{}'", sql_text(&key))
+            })
+            .collect();
+        Ok(Some(format!(
+            "SELECT * FROM (PIVOT (SELECT capture_id, wall_ms, camera_id, path, value_double, {key} AS key
+               FROM captures_with_signals{}) ON key IN ({}) USING first(value_double)
+               GROUP BY capture_id, wall_ms, camera_id, path) ORDER BY capture_id",
+            self.filter("captures_with_signals", request),
+            keys.join(", ")
+        )))
+    }
+
+    pub(super) fn export_select(
+        &self,
+        table: &str,
+        request: &ExportRequest,
+    ) -> Result<Option<String>> {
+        if table == "captures_wide" {
+            return self.wide_select(request);
+        }
+        let order = match table {
+            "signals" => " ORDER BY source_id, tag",
+            "samples" => " ORDER BY ts_ms",
+            "captures_with_signals" => " ORDER BY capture_id, source_id, tag",
+            _ => " ORDER BY 1",
+        };
+        Ok(Some(format!(
+            "SELECT * FROM {table}{}{order}",
+            self.filter(table, request)
+        )))
+    }
+
     fn metadata(&self, request: &ExportRequest) -> Result<Metadata> {
         let conn = &self.conn;
         let mut meta = Metadata::default();
@@ -648,8 +712,9 @@ impl Reader {
             "format_version": 1,
             "generator": format!("capturefab {}", env!("CARGO_PKG_VERSION")),
             "dataset_id": self.status.dataset_id,
+            "slot_id": self.status.slot_id,
             "name": self.status.name,
-            "source_file": file_label(&self.path),
+            "source_file": file_label(self.path),
             "exported_ms": now_ms(),
             "time_base": "UTC Unix milliseconds, host clock",
             "filters": {"since_ms": request.since_ms, "until_ms": request.until_ms, "tables": request.tables},
@@ -700,26 +765,44 @@ impl Reader {
                 table["description"].as_str().unwrap_or("")
             ));
         }
-        let parquet = manifest["formats"]
-            .as_array()
-            .is_some_and(|f| f.iter().any(|f| f == "parquet"));
-        let ext = if parquet { "parquet" } else { "csv" };
-        let has_wide = manifest["tables"]
-            .as_array()
-            .is_some_and(|t| t.iter().any(|t| t["name"] == "captures_wide"));
-        let wide = if has_wide {
-            format!(
-                "# one row per capture, one column per tag\nwide = pd.read_{ext}('captures_wide.{ext}')\n"
-            )
-        } else {
-            String::new()
-        };
-        out.push_str(&format!(
-            "\n## Loading\n\npandas:\n\n```python\nimport pandas as pd\ncaptures = pd.read_{ext}('captures.{ext}')\n\
-             # long format: one row per capture and tag\njoined = pd.read_{ext}('captures_with_signals.{ext}')\n{wide}```\n\n\
-             DuckDB:\n\n```sql\nSELECT * FROM 'captures.{ext}';\nSELECT tag, avg(value_double) FROM 'samples.{ext}' GROUP BY tag;\n```\n\n\
-             polars:\n\n```python\nimport polars as pl\nsamples = pl.read_{ext}('samples.{ext}')\n```\n\n",
-        ));
+        let mut pandas = String::from("import pandas as pd\n");
+        let mut polars = String::from("import polars as pl\n");
+        let mut sql = String::new();
+        for table in manifest["tables"].as_array().into_iter().flatten() {
+            // Examples must follow the actual selected tables and formats.
+            // A notes-only or JSON-only bundle has no captures.csv to load.
+            let file = ["parquet", "csv", "json", "jsonl"]
+                .iter()
+                .find_map(|format| {
+                    table["files"]
+                        .as_array()?
+                        .iter()
+                        .find(|f| f["format"] == *format)
+                });
+            let Some(file) = file else { continue };
+            let name = table["name"].as_str().unwrap_or("data");
+            let path = file["path"].as_str().unwrap_or("");
+            let format = file["format"].as_str().unwrap_or("csv");
+            let variable = match name {
+                "captures_with_signals" => "joined",
+                "captures_wide" => "wide",
+                name => name,
+            };
+            let (pandas_reader, polars_reader, duck_reader, args) = match format {
+                "parquet" => ("read_parquet", "read_parquet", "read_parquet", ""),
+                "json" => ("read_json", "read_json", "read_json_auto", ""),
+                "jsonl" => ("read_json", "read_ndjson", "read_json_auto", ", lines=True"),
+                _ => ("read_csv", "read_csv", "read_csv_auto", ""),
+            };
+            pandas.push_str(&format!(
+                "{variable} = pd.{pandas_reader}('{path}'{args})\n"
+            ));
+            polars.push_str(&format!("{variable} = pl.{polars_reader}('{path}')\n"));
+            sql.push_str(&format!(
+                "SELECT * FROM {duck_reader}('{path}') LIMIT 10;\n"
+            ));
+        }
+        out.push_str(&format!("\n## Loading\n\npandas:\n\n```python\n{pandas}```\n\nDuckDB:\n\n```sql\n{sql}```\n\npolars:\n\n```python\n{polars}```\n\n"));
         out.push_str(
             "## Notes on paths\n\nMedia paths are absolute paths on the capturing computer. A non-null `object_key` means the \
              file was queued for upload to that remote destination and may live only there.\n\n",

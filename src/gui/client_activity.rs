@@ -662,7 +662,7 @@ fn matches_job(entry: &SessionActivity, job: &Job) -> bool {
         Job::DatasetNote => entry.operation == "dataset_note",
         Job::DatasetExport => entry.operation == "dataset_export",
         Job::SignalStart => entry.operation == "signal_start",
-        Job::SignalStop => entry.operation == "signal_stop",
+        Job::SignalStop => matches!(entry.operation.as_str(), "signal_stop" | "signal_stop_if"),
         Job::Set(feature) => entry.operation == "set" && entry.feature.as_ref() == Some(feature),
         Job::SetMany => entry.operation == "set_many",
         Job::Execute(feature) => {

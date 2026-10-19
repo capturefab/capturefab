@@ -15,7 +15,7 @@ use crate::{
     storage::StoragePolicy,
     tools::{
         self, Checked, Origin, PlanState, SecretSource, StepId, ToolCall, ToolKind,
-        context::{Context, RecordingDefaults, ToolHost},
+        context::{Context, DataSourceRef, RecordingDefaults, ToolHost},
         read::{ReadOptions, TurnCache},
     },
 };
@@ -638,6 +638,10 @@ pub struct Plan {
     pub revision: u64,
     pub steps: Vec<PlanStep>,
     next_id: u64,
+    // Proposed arguments can carry values learned under data consent even
+    // when the proposed action only concerns a camera. Keep that lineage
+    // locally across edits, provider changes and conversation resets.
+    data_permission: bool,
 }
 impl Default for Plan {
     fn default() -> Self {
@@ -645,6 +649,7 @@ impl Default for Plan {
             revision: 0,
             steps: Vec::new(),
             next_id: 1,
+            data_permission: false,
         }
     }
 }
@@ -654,9 +659,11 @@ impl Plan {
     pub fn restore_from(&mut self, snapshot: &Self) {
         let revision = self.revision.max(snapshot.revision).saturating_add(1);
         let next_id = self.next_id.max(snapshot.next_id);
+        let data_permission = self.data_permission || snapshot.data_permission;
         *self = snapshot.clone();
         self.revision = revision;
         self.next_id = next_id;
+        self.data_permission = data_permission;
     }
     pub fn calls(&self) -> Vec<(StepId, ToolCall)> {
         self.steps
@@ -671,6 +678,17 @@ impl Plan {
         tools::redact::for_output(
             json!({"revision":self.revision,"steps":self.steps.iter().map(|step|json!({"step":step.id,"call":step.call,"checked":step.checked,"user_edited":step.user_edited,"changed_by_assistant":step.changed_by_assistant})).collect::<Vec<_>>()}),
         )
+    }
+    pub(crate) fn model_value(&self, allow_data: bool) -> Value {
+        if self.data_permission && !allow_data {
+            json!({
+                "revision": self.revision,
+                "steps": self.steps.iter().map(|step| json!({"step":step.id,"tool":step.call.tool})).collect::<Vec<_>>(),
+                "notice": "Plan arguments and checked details are withheld because data permission is off. The full plan is retained locally."
+            })
+        } else {
+            self.value()
+        }
     }
     pub fn recheck(&mut self, ctx: &Context, actor: Option<String>, secrets: &dyn SecretSource) {
         let mut state = PlanState::assistant(ctx);
@@ -772,6 +790,10 @@ pub struct PlanRequest {
     pub plan: Plan,
     pub conversation: Option<Conversation>,
     pub allow_images: bool,
+    pub allow_data: bool,
+    /// Human-entered endpoint bindings, retained locally and never serialized
+    /// into the provider request or journal.
+    pub data_sources: Vec<DataSourceRef>,
 }
 impl PlanRequest {
     pub fn new(prompt: impl Into<String>) -> Self {
@@ -782,8 +804,70 @@ impl PlanRequest {
             plan: Plan::default(),
             conversation: None,
             allow_images: false,
+            allow_data: false,
+            data_sources: Vec::new(),
         }
     }
+}
+
+/// Plan-mode consent grants cached values and the exact current dataset,
+/// without turning redacted status URIs into new connection endpoints.
+pub fn authorize_plan_data(ctx: &mut Context, allowed: bool) {
+    ctx.allow_data = allowed;
+    ctx.data_dataset = allowed
+        .then(|| {
+            ctx.snapshot
+                .dataset
+                .as_ref()
+                .and_then(|dataset| dataset.slot_id.clone())
+        })
+        .flatten();
+    ctx.data_sources = if allowed {
+        ctx.snapshot
+            .signals
+            .iter()
+            .map(tools::context::DataSourceRef::cached_source)
+            .collect()
+    } else {
+        Vec::new()
+    };
+}
+
+/// Reapply explicit local bindings after every gather. A cached source never
+/// supplies an executable URI, and a caller cannot forge an opaque reference.
+pub fn authorize_plan_data_with_sources(
+    ctx: &mut Context,
+    allowed: bool,
+    bindings: &[DataSourceRef],
+) -> Result<()> {
+    let explicit = validated_plan_data_sources(bindings)?;
+    authorize_plan_data(ctx, allowed);
+    if allowed {
+        for binding in explicit.values() {
+            binding.validate_in(ctx)?;
+        }
+        ctx.data_sources
+            .retain(|source| !explicit.contains_key(&source.reference));
+        ctx.data_sources.extend(explicit.into_values());
+    }
+    Ok(())
+}
+
+fn validated_plan_data_sources(
+    bindings: &[DataSourceRef],
+) -> Result<std::collections::BTreeMap<String, DataSourceRef>> {
+    let mut explicit = std::collections::BTreeMap::new();
+    for binding in bindings {
+        binding.validate_local()?;
+        let approved = binding.clone();
+        if let Some(previous) = explicit.insert(approved.reference.clone(), approved.clone()) {
+            ensure!(
+                previous == approved,
+                "Two approved endpoints share a source reference. Remove one and add it again."
+            );
+        }
+    }
+    Ok(explicit)
 }
 #[derive(Clone, Debug)]
 pub struct PlanOutcome {
@@ -804,6 +888,8 @@ pub fn plan_turn(
     cancel: &AtomicBool,
 ) -> Result<PlanOutcome> {
     prompt::validate_prompt(&req.prompt)?;
+    // Reject malformed local bindings before credentials or a provider request.
+    validated_plan_data_sources(&req.data_sources)?;
     ensure!(
         !cancel.load(Ordering::Relaxed),
         "The assistant task was stopped."
@@ -817,6 +903,10 @@ pub fn plan_turn(
     if let Some(model) = &req.model {
         settings.model = Some(model.clone());
     }
+    // Source authorization precedes provider credentials and requests. A stale
+    // profile selection must be repaired locally before the provider sees it.
+    let mut ctx = deps.gather(deps.host.as_ref())?;
+    authorize_plan_data_with_sources(&mut ctx, req.allow_data, &req.data_sources)?;
     let mut session =
         ModelSession::resolve(deps, provider, settings, Mode::Plan, req.allow_images)?;
     ensure!(
@@ -824,8 +914,8 @@ pub fn plan_turn(
         "The assistant task was stopped."
     );
     let mut plan = req.plan.clone();
+    plan.data_permission |= req.allow_data;
     let original_plan = plan.clone();
-    let ctx = deps.gather(deps.host.as_ref())?;
     plan.recheck(&ctx, deps.host.actor_id(), deps.secrets.as_ref());
     let expected_tools = protocol::assistant_tools(Mode::Plan);
     let mut conv = req
@@ -835,6 +925,7 @@ pub fn plan_turn(
                 && conv.model == session.model
                 && conv.tools == expected_tools
                 && (session.vision.enabled || conv.images().next().is_none())
+                && (req.allow_data || !conv.data_permission)
         })
         .unwrap_or_else(|| {
             Conversation::new(
@@ -854,6 +945,7 @@ pub fn plan_turn(
         );
         conv.append_user(&user, session.wire.as_ref())?;
     }
+    conv.data_permission |= req.allow_data;
     let mut log = super::log::ActionLog::create(&deps.log_directory, deps.clock.now_ms())?;
     log.record("start",json!({"goal":req.prompt,"mode":"plan","provider":provider,"model":session.model,"app_version":env!("CARGO_PKG_VERSION"),"actor":deps.host.actor_id()}),deps.clock.now_ms())?;
     let run_id = log.run_id().to_owned();
@@ -910,6 +1002,7 @@ pub fn plan_turn(
                         prompt::system(Mode::Plan),
                         protocol::assistant_tools(Mode::Plan),
                     );
+                    base.data_permission |= req.allow_data;
                     let observations = tools::redact::for_model(json!(
                         results
                             .iter()
@@ -1056,7 +1149,15 @@ pub fn plan_turn(
                 options.allow_images = session.vision.enabled;
                 options.turn = Some(&turn);
                 options.image_number = image_number;
-                let output = plan_call(call, &mut plan, deps, &options, events);
+                let output = plan_call(
+                    call,
+                    &mut plan,
+                    deps,
+                    &options,
+                    req.allow_data,
+                    &req.data_sources,
+                    events,
+                );
                 let result = match output {
                     Ok(result) => result,
                     Err(source) => ResultRecord::error(
@@ -1135,6 +1236,8 @@ fn plan_call(
     plan: &mut Plan,
     deps: &Deps,
     options: &ReadOptions<'_>,
+    allow_data: bool,
+    data_sources: &[DataSourceRef],
     events: &mut dyn FnMut(Event),
 ) -> Result<ResultRecord> {
     if call.name == "remove_step" {
@@ -1165,7 +1268,8 @@ fn plan_call(
     }
     let spec = tools::spec(&call.name)
         .ok_or_else(|| anyhow::anyhow!("Unknown tool. Use a tool from the provided list."))?;
-    let ctx = deps.gather(deps.host.as_ref())?;
+    let mut ctx = deps.gather(deps.host.as_ref())?;
+    authorize_plan_data_with_sources(&mut ctx, allow_data, data_sources)?;
     if spec.kind == ToolKind::Read {
         let tool = ToolCall {
             tool: call.name.clone(),
@@ -1461,6 +1565,154 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn plan_source_bindings_are_exact_and_never_adopt_cached_locations() {
+        let source = DataSourceRef::approved("sim-signal://line1").unwrap();
+        let mut ctx = fixture_context(fixture_snapshot());
+        authorize_plan_data_with_sources(&mut ctx, false, std::slice::from_ref(&source)).unwrap();
+        assert!(ctx.data_sources.is_empty());
+        authorize_plan_data_with_sources(&mut ctx, true, std::slice::from_ref(&source)).unwrap();
+        assert_eq!(ctx.data_sources, vec![source.clone()]);
+        let mut forged = source.clone();
+        forged.reference = "signal:0000000000000000".into();
+        assert!(authorize_plan_data_with_sources(&mut ctx, true, &[forged]).is_err());
+        for uri in [
+            "mqtt://user:private-test-password@host/topic",
+            "mqtt://host/topic?token=private-test-token",
+            "mqtt://user@host/topic",
+        ] {
+            let error = DataSourceRef::approved(uri).unwrap_err().to_string();
+            assert!(!error.contains("private-test"));
+            assert!(!error.contains("user@"));
+        }
+        let mut cached = serde_json::to_value(crate::signals::SourceStatus {
+            auth: None,
+            id: source.reference.clone(),
+            capture_id: "capture".into(),
+            dataset_slot_id: None,
+            protocol: crate::signals::Protocol::SimSignal,
+            uri: "sim-signal://redacted-not-executable".into(),
+            interval_ms: 1000,
+            state: crate::signals::SourceState::Running,
+            started_ms: 1,
+            capture_limits: None,
+            deadline_ms: None,
+            completed_ms: None,
+            completion: None,
+            payload_bytes: 0,
+            written_bytes: 0,
+            persistence_complete: false,
+            persistence_error: None,
+            last_sample_ms: None,
+            samples: 0,
+            written: 0,
+            dropped: 0,
+            helper_dropped: 0,
+            restarts: 0,
+            error: None,
+            helper_pid: None,
+            tags: vec![],
+            tags_total: 0,
+            tags_truncated: false,
+        })
+        .unwrap();
+        ctx.snapshot.signals = vec![serde_json::from_value(cached.clone()).unwrap()];
+        authorize_plan_data_with_sources(&mut ctx, true, std::slice::from_ref(&source)).unwrap();
+        assert_eq!(ctx.data_sources, vec![source]);
+        cached["id"] = json!("signal:1234567890abcdef");
+        ctx.snapshot
+            .signals
+            .push(serde_json::from_value(cached).unwrap());
+        authorize_plan_data_with_sources(&mut ctx, true, &[]).unwrap();
+        assert!(ctx.data_sources.iter().all(|source| source.uri.is_empty()));
+    }
+
+    #[test]
+    fn forged_plan_source_bindings_fail_before_credentials_or_provider_requests() {
+        let provider = ProviderId::Anthropic;
+        let mut context = fixture_context(fixture_snapshot());
+        let expired = crate::tools::tests::fixture_bound_source(&mut context, "mqtts://host/topic");
+        for binding in [
+            DataSourceRef {
+                reference: "signal:0000000000000000".into(),
+                uri: "sim-signal://line1".into(),
+                auth: None,
+            },
+            DataSourceRef::from_uri("mqtt://user:private-test-password@host/topic").unwrap(),
+            expired,
+        ] {
+            let (deps, script, credentials) = deps(provider, vec![end_reply(provider)]);
+            let mut request = PlanRequest::new("Plan a source reading.");
+            request.allow_data = true;
+            request.data_sources = vec![binding];
+            let error =
+                plan_turn(request, &deps, &mut |_| {}, &AtomicBool::new(false)).unwrap_err();
+            assert!(!error.to_string().contains("private-test-password"));
+            assert_eq!(credentials.0.load(Ordering::Relaxed), 0);
+            assert!(script.requests.lock().unwrap().is_empty());
+            if deps.log_directory.exists() {
+                fs::remove_dir_all(deps.log_directory).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn plan_fresh_source_binding_survives_gathers_but_never_contacts_or_serializes_endpoint() {
+        let provider = ProviderId::Anthropic;
+        let source =
+            DataSourceRef::approved("mqtt://line1.example/private-topic-for-binding-test").unwrap();
+        for allowed in [false, true] {
+            let (mut deps, script, _) = deps(
+                provider,
+                vec![
+                    tool_reply(provider, "sources", "list_data_sources", json!({})),
+                    tool_reply(
+                        provider,
+                        "read",
+                        "read_data_source",
+                        json!({"source":source.reference,"timeout":"1s","replace_step":null}),
+                    ),
+                    end_reply(provider),
+                ],
+            );
+            let host = Arc::new(FakeHost::new(fixture_snapshot()));
+            deps.host = host.clone();
+            let mut request =
+                PlanRequest::new("Plan a fresh reading of the approved sensor source.");
+            request.allow_data = allowed;
+            request.data_sources = vec![source.clone()];
+            let outcome = plan_turn(request, &deps, &mut |_| {}, &AtomicBool::new(false)).unwrap();
+            assert_eq!(outcome.plan.steps.len(), 1);
+            let checked = outcome.plan.steps[0].checked.as_ref().unwrap();
+            assert_eq!(checked.call.args["source"], source.reference);
+            assert_eq!(checked.ready(), allowed, "{:?}", checked.issues);
+            if allowed {
+                assert!(checked.ops.iter().any(|op|matches!(op,tools::Op::Session {command:crate::session::SessionCommand::SignalRead {uri,..},..} if uri==&source.uri)));
+            }
+            assert!(
+                host.calls().is_empty(),
+                "Plan first never contacts a fresh endpoint"
+            );
+            let requests = script
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| request.1.to_string())
+                .collect::<String>();
+            assert!(!requests.contains(&source.uri));
+            assert!(!requests.contains("private-topic-for-binding-test"));
+            let records =
+                super::super::log::read_log_in(&deps.log_directory, &outcome.run_id).unwrap();
+            assert!(
+                !serde_json::to_string(&records)
+                    .unwrap()
+                    .contains("private-topic-for-binding-test")
+            );
+            fs::remove_dir_all(deps.log_directory).unwrap();
+        }
+    }
+
+    #[test]
     fn follow_up_replaces_a_stable_user_edited_step_and_flags_it() {
         let provider = ProviderId::Anthropic;
         let (deps, script, _) = deps(
@@ -1510,6 +1762,62 @@ pub(crate) mod tests {
         assert_eq!(result.plan.steps[0].call.args["count"], 3);
         assert!(result.plan.steps[0].changed_by_assistant);
         result.conversation.check_invariant().unwrap();
+        fs::remove_dir_all(deps.log_directory).unwrap();
+    }
+
+    #[test]
+    fn revoked_data_consent_drops_prior_overview_and_dataset_history() {
+        let provider = ProviderId::Anthropic;
+        let (mut deps, script, _) = deps(
+            provider,
+            vec![
+                tool_reply(provider, "overview", "get_overview", json!({})),
+                tool_reply(provider, "dataset", "get_dataset", json!({})),
+                end_reply(provider),
+            ],
+        );
+        let mut snapshot = fixture_snapshot();
+        snapshot.dataset = Some(crate::dataset::DatasetStatus {
+            slot_id: Some("a".repeat(32)),
+            last_error: Some("private-data-history-marker".into()),
+            ..Default::default()
+        });
+        deps.host = Arc::new(FakeHost::new(snapshot));
+        let mut request = PlanRequest::new("Inspect the current dataset.");
+        request.allow_data = true;
+        let first = plan_turn(request, &deps, &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        assert!(first.conversation.data_permission);
+        assert!(
+            script
+                .requests
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .1
+                .to_string()
+                .contains("private-data-history-marker")
+        );
+        script.replies.lock().unwrap().push_back(HttpResponse {
+            status: 200,
+            headers: Headers::new(),
+            body: serde_json::to_vec(&end_reply(provider)).unwrap(),
+        });
+        let mut request = PlanRequest::new("Plan a camera photo.");
+        request.conversation = Some(first.conversation);
+        let second = plan_turn(request, &deps, &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        assert!(!second.conversation.data_permission);
+        assert!(
+            !script
+                .requests
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .1
+                .to_string()
+                .contains("private-data-history-marker")
+        );
         fs::remove_dir_all(deps.log_directory).unwrap();
     }
 
