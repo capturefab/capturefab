@@ -610,7 +610,7 @@ fn capture_guidance(kind: CameraKind) -> Option<&'static str> {
             "Use Raw pixels for depth samples; image formats are 8-bit. Keep the component's unit, scale and offset for measurements.",
         ),
         CameraKind::Thermal => Some(
-            "Use Raw pixels for temperature samples; image formats are 8-bit. Keep the camera's temperature unit and calibration for measurements.",
+            "Use Raw pixels for temperature samples; image formats are 8-bit. Keep the temperature unit and calibration for measurements.",
         ),
         _ => None,
     }
