@@ -1220,7 +1220,14 @@ fn frame_inspection_over_http_returns_measurements_and_an_image() {
         json!({"op":"frame","fresh":1,"max_dimension":128}),
     );
     assert_eq!(inspected["frame"]["source"], "grab");
-    assert_eq!(inspected["image"]["mime"], "image/jpeg");
+    assert_eq!(
+        inspected["image"]["mime"],
+        if cfg!(feature = "jpeg") {
+            "image/jpeg"
+        } else {
+            "image/png"
+        }
+    );
     assert_eq!(inspected["image"]["width"], 128);
     assert!(inspected["image"]["base64"].as_str().unwrap().len() > 100);
     assert!(inspected["exposure"]["mean"].as_f64().unwrap() > 0.0);
