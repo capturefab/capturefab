@@ -375,3 +375,31 @@ fn follow_up_image_rejection_restarts_sealed_history_and_keeps_the_plan() {
 fn turning_vision_off_drops_old_images_before_the_first_follow_up_request() {
     follow_up_with_accepted_image_history(false);
 }
+
+#[test]
+fn oversized_provider_responses_are_not_misreported_as_local_request_limits() {
+    let (deps, script, _) = deps(ProviderId::DeepSeek, Vec::new());
+    script.replies.lock().unwrap().push_back(HttpResponse {
+        status: 200,
+        headers: Default::default(),
+        body: vec![b' '; crate::assistant::http::MAX_BODY_BYTES + 1],
+    });
+    let error = plan_turn(
+        PlanRequest::new("Read the camera overview"),
+        &deps,
+        &mut |_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<ProviderError>().unwrap().kind,
+        crate::assistant::http::ProviderErrorKind::CutOff
+    );
+    assert_eq!(script.requests.lock().unwrap().len(), 1);
+    let runs = crate::assistant::log::runs_in(&deps.log_directory).unwrap();
+    assert_eq!(runs.len(), 1);
+    let records = crate::assistant::log::read_log_in(&deps.log_directory, &runs[0].run_id).unwrap();
+    assert_eq!(records.last().unwrap()["kind"], "end");
+    assert_eq!(records.last().unwrap()["outcome"], "failed");
+    std::fs::remove_dir_all(deps.log_directory).unwrap();
+}

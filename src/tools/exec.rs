@@ -1190,6 +1190,78 @@ pub struct Progress {
     pub summary: String,
 }
 
+fn capture_facts(checked: &Checked) -> bool {
+    matches!(
+        checked.call.tool.as_str(),
+        "capture_photos" | "start_recording" | "schedule_captures"
+    )
+}
+
+fn immediate_schedule(checked: &Checked) -> bool {
+    checked.call.tool == "schedule_captures" && checked.call.args["start_at"].is_null()
+}
+
+/// Compare approval-bearing facts while allowing display-only clocks and
+/// available-space meters to advance. Feature before-values and recipients
+/// remain exact, including when they happen to use one of these labels.
+pub(crate) fn approval_facts(checked: &Checked) -> Vec<(&str, &str)> {
+    let capture = capture_facts(checked);
+    let dynamic_file = capture
+        && checked.call.args["file_name"]
+            .as_str()
+            .is_some_and(|template| {
+                ["{time}", "{date}", "{datetime}"]
+                    .iter()
+                    .any(|part| template.contains(part))
+            });
+    checked
+        .facts
+        .iter()
+        .filter_map(|(name, value)| {
+            if (name == "File" && dynamic_file)
+                || (name == "Schedule" && immediate_schedule(checked))
+            {
+                None
+            } else if name == "Storage" && capture {
+                Some((
+                    name.as_str(),
+                    value
+                        .split_once(" · ")
+                        .map_or(value.as_str(), |(estimate, _)| estimate),
+                ))
+            } else {
+                Some((name.as_str(), value.as_str()))
+            }
+        })
+        .collect()
+}
+
+/// An immediate schedule means start when execution begins. Only that start
+/// timestamp may move during approval; count, interval, output, destination and
+/// every other command field must still match the checked operations.
+#[cfg(any(feature = "ai", test))]
+pub(crate) fn same_approval_operations(approved: &Checked, fresh: &Checked) -> bool {
+    fn comparable(checked: &Checked) -> Result<Value, serde_json::Error> {
+        let mut ops = checked.ops.clone();
+        if immediate_schedule(checked) {
+            for op in &mut ops {
+                if let Op::Command {
+                    command: SessionCommand::Schedule { first_at_ms, .. },
+                    ..
+                } = op
+                {
+                    *first_at_ms = 0;
+                }
+            }
+        }
+        serde_json::to_value(&ops)
+    }
+    match (comparable(approved), comparable(fresh)) {
+        (Ok(approved), Ok(fresh)) => approved == fresh,
+        _ => false,
+    }
+}
+
 pub(crate) fn changed(approved: &Checked, current: &Checked) -> Option<&'static str> {
     if approved.id != current.id || approved.call.tool != current.call.tool {
         return Some("the action");
@@ -1229,7 +1301,7 @@ pub(crate) fn changed(approved: &Checked, current: &Checked) -> Option<&'static 
     }
     if approved.title != current.title
         || approved.summary != current.summary
-        || approved.facts != current.facts
+        || approval_facts(approved) != approval_facts(current)
         || approved.reasons != current.reasons
     {
         return Some("the displayed camera facts");
@@ -1480,6 +1552,114 @@ mod tests {
             changed(&approved, &fresh),
             Some("the displayed camera facts")
         );
+    }
+
+    #[test]
+    fn approval_facts_allow_capture_clock_and_free_space_drift_but_keep_security_facts() {
+        for tool in ["capture_photos", "start_recording", "schedule_captures"] {
+            let mut approved = step(
+                tool,
+                json!({"camera":"sim:0","file_name":"shot-{datetime}.png","start_at":null}),
+            );
+            approved.facts = vec![
+                ("File".into(), "/captures/shot-20261018-120000.png".into()),
+                ("Storage".into(), "≈ 8 MiB · 2 GiB of 10 GiB free".into()),
+                ("Folder".into(), "/captures".into()),
+            ];
+            let mut fresh = approved.clone();
+            fresh.facts[0].1 = "/captures/shot-20261018-120100.png".into();
+            fresh.facts[1].1 = "≈ 8 MiB · 1 GiB of 10 GiB free".into();
+            assert_eq!(changed(&approved, &fresh), None, "{tool}");
+            fresh.facts[1].1 = "≈ 16 MiB · 1 GiB of 10 GiB free".into();
+            assert_eq!(
+                changed(&approved, &fresh),
+                Some("the displayed camera facts")
+            );
+            fresh = approved.clone();
+            fresh.facts[2].1 = "/another-recipient".into();
+            assert_eq!(
+                changed(&approved, &fresh),
+                Some("the displayed camera facts")
+            );
+            approved.call.args["file_name"] = json!("fixed.png");
+            fresh = approved.clone();
+            fresh.facts[0].1 = "/captures/different.png".into();
+            assert_eq!(
+                changed(&approved, &fresh),
+                Some("the displayed camera facts")
+            );
+        }
+        let mut approved = step(
+            "set_camera_features",
+            json!({"camera":"sim:0","file_name":"{time}"}),
+        );
+        approved.facts = vec![
+            ("File".into(), "1 → 3".into()),
+            ("Storage".into(), "1 → 3 · feature unit".into()),
+        ];
+        let mut fresh = approved.clone();
+        fresh.facts[0].1 = "2 → 3".into();
+        assert!(changed(&approved, &fresh).is_some());
+        fresh = approved.clone();
+        fresh.facts[1].1 = "1 → 3 · changed feature unit".into();
+        assert!(changed(&approved, &fresh).is_some());
+    }
+
+    fn checked_capture(ctx: &Context, tool: &str) -> Checked {
+        let schema = (super::super::spec(tool).unwrap().schema)();
+        let mut args = Value::Object(
+            schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|name| (name.clone(), Value::Null))
+                .collect(),
+        );
+        args["camera"] = json!("sim:0");
+        args["file_name"] = json!("shot-{datetime}.png");
+        if tool == "schedule_captures" {
+            args["every"] = json!("1m");
+            args["count"] = json!(3);
+        }
+        let call = ToolCall {
+            tool: tool.into(),
+            args,
+        };
+        super::super::check(ctx, &mut PlanState::new(ctx), StepId(12), &call, &|_, _| {
+            false
+        })
+    }
+
+    #[test]
+    fn an_immediate_schedule_approval_binds_every_operation_except_its_execution_start() {
+        let ctx = fixture_context(fixture_snapshot());
+        let approved = checked_capture(&ctx, "schedule_captures");
+        assert!(approved.ready(), "{approved:?}");
+        let mut later = ctx.clone();
+        later.now_ms += 61_000;
+        later.storage.allocated_bytes += 1024 * 1024;
+        let fresh = checked_capture(&later, "schedule_captures");
+        assert!(fresh.ready(), "{fresh:?}");
+        assert_ne!(approved.facts, fresh.facts);
+        assert_eq!(changed(&approved, &fresh), None);
+        assert!(same_approval_operations(&approved, &fresh));
+        let mut altered = fresh.clone();
+        for op in &mut altered.ops {
+            if let Op::Command {
+                command: SessionCommand::Schedule { count, .. },
+                ..
+            } = op
+            {
+                *count += 1;
+            }
+        }
+        assert!(!same_approval_operations(&approved, &altered));
+        let mut explicit = approved.clone();
+        explicit.call.args["start_at"] = json!("2026-10-18T12:00:00Z");
+        let mut explicit_later = fresh.clone();
+        explicit_later.call.args["start_at"] = explicit.call.args["start_at"].clone();
+        assert!(!same_approval_operations(&explicit, &explicit_later));
+        assert_ne!(approval_facts(&explicit), approval_facts(&explicit_later));
     }
 
     fn forward(output: &str) -> SessionCommand {

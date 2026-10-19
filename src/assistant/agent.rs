@@ -718,7 +718,10 @@ pub fn plan_turn(
                 Err(source)
                     if source
                         .downcast_ref::<ProviderError>()
-                        .is_some_and(|error| error.kind == ProviderErrorKind::CutOff) =>
+                        .is_some_and(|error| error.kind == ProviderErrorKind::CutOff)
+                        && session
+                            .build(&conv)
+                            .is_err_and(|error| error.kind == ProviderErrorKind::CutOff) =>
                 {
                     error=Some("This conversation has reached its request limit. Start a new conversation; your plan is kept.".into());
                     break;

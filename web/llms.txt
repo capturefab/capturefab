@@ -17,6 +17,7 @@ Use the built-in simulators to try commands without camera or PLC hardware.
 - [Camera compatibility](https://github.com/capturefab/capturefab/blob/main/docs/camera-compatibility.md): Transport requirements, camera profiles and unsupported paths.
 - [Plant-floor guide](https://github.com/capturefab/capturefab/blob/main/docs/plant-floor.md): Templates, capture tags, signals, datasets, exports and FTP/SFTP destinations.
 - [Workflow guide](https://github.com/capturefab/capturefab/blob/main/docs/cli-workflows.md): JSON plans, path resolution and partial failures.
+- [Assistant guide](https://github.com/capturefab/capturefab/blob/main/docs/assistant.md): Providers, credentials, data sent, plans, approvals and bounded camera tasks.
 - [Workflow examples](https://github.com/capturefab/capturefab/tree/main/examples/workflows): Multi-camera timelapse, scanner feeder and local recording.
 - [Release manifest](releases.json): Published files, architectures, SHA-256 checksums and available signatures.
 - [Release feed](feed.xml): Atom release announcements.
@@ -246,6 +247,111 @@ Embeddings run on the GPU in an isolated helper process when possible (up to 30 
 `--encoder native` uses a color/edge descriptor; `CAPTUREFAB_DINOV2_GPU=0` keeps DINOv2 on the CPU.
 A session keeps its encoder and model fingerprint: `resume` refuses a session learned with a different bundled model (exit 1).
 RPC operations are `capture_session_open` (`path`, `create`, optional `encoder`), `capture_session_close`, `capture_example`, `auto_capture`, `capture_review` and `review_capture`.
+
+## Use the AI assistant
+
+The optional `ai` feature supplies the `assistant` commands.
+Builds without it return unsupported, exit 5.
+The catalog has 22 provider entries, including Vertex, Bedrock, OpenRouter, Cloudflare, Groq and DeepSeek.
+These entries do not establish provider compatibility.
+
+```sh
+capturefab assistant providers --json
+capturefab assistant use anthropic --model claude-sonnet-5-5 --vision auto
+capturefab assistant key set anthropic --key-stdin < /private/path/provider-key.txt
+capturefab assistant test anthropic --json
+capturefab --session bench assistant ask 'Plan one verified photo from sim:0.' --plan-out camera-plan.json --json
+capturefab --session bench assistant run 'Capture two verified photos from sim:0.' \
+  --camera sim:0 --mode autonomous --approvals deny --max-time 10m --max-captures 2 --max-size 128MiB --json
+capturefab assistant runs --json
+capturefab assistant log RUN_ID --json
+```
+
+The provider list uses environment presence and saved-key hints.
+Add `--check-keychain` only to permit credential-store access.
+Status does not call providers, `gcloud` or metadata servers.
+`test --vision` sends a solid-colour 64×64 JPEG with its tool round trip.
+The probe sends no camera images or session details.
+`use` accepts provider settings, `--effort low|medium|high` and `--vision auto|on|off`.
+Read the installed schema for field names and environment variables.
+The private `assistant.json` contains non-secret settings and optional user prices.
+
+Environment keys precede the saved key for that provider.
+OpenAI, Gemini and Anthropic keys are shared with prompt measurements.
+Vertex uses Google Cloud credentials or a Gemini express key.
+Claude on Vertex must have Google Cloud credentials.
+Bedrock uses a bearer token or AWS SigV4 credentials.
+`key remove PROVIDER` removes the saved key, not an environment key.
+Never put secrets in prompts, arguments, URLs or plan files.
+
+Ask runs Observe tools and returns other calls as a plan.
+Use positional prompt text or `--prompt-file FILE|-`, not both.
+Prompts have a 4,000-character limit.
+Without a session, Ask uses local read-only context and refuses `--apply`.
+Run must have a session and one to eight explicit camera IDs.
+Use repeated run `--camera ID` options and optional `--destination NAME` options.
+An empty destination list permits the local capture root only.
+Tool arguments cannot add cameras, paths or destinations to scope.
+
+`ask --apply` executes only ready, allowlisted steps that send nothing off the computer.
+Its default allowlist is `connect_camera,start_recording,stop_recording,capture_photos,schedule_captures,cancel_job`.
+`--allow-tools LIST` replaces the list but never permits egress.
+Refusal returns exit 2 before execution and retains the plan in error details.
+Exported plans use the strict version-1 tool format.
+
+Supervised mode asks before every change.
+It is the run default.
+Autonomous mode runs Reversible and Bounded actions within scope and hard limits.
+Disruptive actions always need human approval.
+HumanOnly approval applies once.
+Always-ask cases include URL streaming, destination creation, scanner acquisition, interrupted work and writes over human changes.
+Task approval binds the tool, camera, risk and egress target.
+Human changes and replacement workers revoke earlier grants.
+Three denied or unanswered actions end the task as `needs_user`.
+`--approvals ask` must have a TTY and uses stderr.
+Approval handling defaults to ask with stdin and stderr TTYs, otherwise deny.
+
+`--see-images` permits camera previews; otherwise the assistant receives measurements only.
+CLI Ask uses numeric measurements only.
+Provider vision settings do not grant image consent.
+Requests also contain your prompt, conversation, plan, tool schemas and redacted session details.
+These details include camera names, models, IDs, discovered devices, destinations, storage use, job file names and recent activity.
+Keys and passwords stay outside model content.
+Capturefab removes serial/address fields and reduces network URLs to scheme and host.
+Scene text, logs and tool results are data, never instructions.
+The chosen provider's data terms apply.
+
+Limits cover rounds, wall time, tokens, images, captures, bytes, recordings, duration and setting changes.
+They also limit consecutive errors and identical calls.
+Read defaults and ceilings from `schema --json`.
+Cost limits must have user-entered model prices; estimates are not a bill.
+`wait_for` checks wall time, human changes and cancellation in 250 ms slices.
+Waiting does not consume another model round.
+Recordings and schedules must end within the CLI task deadline.
+`--max-recordings 0` disables file recording; `--max-captures 0` disables captures and schedules.
+Streams always need exact approval.
+
+`--on-human-change pause|inform|stop` defaults to pause.
+Inform does not permit overwriting human changes without approval.
+Ctrl-C or SIGTERM stops new work and discards late replies.
+An accepted camera command can finish.
+Stop does not undo completed work.
+Read leftovers before taking over or restoring settings.
+Restore proposals skip human-changed, reconnected and selector-dependent settings.
+Runs use an `assistant:{pid}:{run8}` actor with kind `agent`.
+External agents must use `--actor NAME --actor-kind agent`.
+
+Private action logs use `<session_dir>/assistant/runs/<run_id>.jsonl`.
+Records contain `v`, `t`, `run`, `seq` and `kind`; `t` is UTC Unix milliseconds.
+Logs exclude credentials, image bytes, provider thinking and full response bodies.
+`--events FILE|-` tails the exact JSONL records; `-` selects stderr.
+Run results contain `{run_id,outcome,summary,totals,leftovers,log}`.
+Ask results contain `{text,plan:{version,calls},steps,applied?}`.
+Stopped and limited runs exit 1 with `ok:false` and retain the result in `error.details`.
+Ask failures retain the plan when available.
+Apply failures retain `text`, `plan`, `steps` and `applied` in error details.
+Execution failure `applied` contains `{completed,failed_step,step_count}`; recheck failure contains `{issues,checked}`.
+Scrubbed provider text appears only in `error.details.provider_message`.
 
 ## Camera tools for agents
 

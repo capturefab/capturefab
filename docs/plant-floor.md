@@ -3,8 +3,13 @@
 This guide is for manufacturing and process engineers who must collect images,
 video, sensor values and PLC tags on a line, then give the data to an analysis
 tool later: a notebook, a BI tool, or an AI assistant such as Claude, ChatGPT or
-Gemini. Everything runs on one computer on the OT network. No cloud service is
-necessary.
+Gemini. Everything runs on the local computer. The optional AI assistant and
+prompt measurements send data to the AI provider you choose, only when you send
+a request. Camera acquisition and datasets do not depend on an AI provider.
+
+The [assistant guide](assistant.md) describes provider setup, the data sent,
+plan review and bounded camera tasks. External agents can use the same camera
+tools through a shared local session.
 
 The result of a session is one DuckDB dataset file and the image and video files
 it catalogs. Each capture row records the camera, the time, the file path, its

@@ -4163,3 +4163,1135 @@ fn tools_secret_stdin_requires_exactly_one_consumer_before_touching_session_stat
     }
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[cfg(feature = "ai")]
+mod assistant_cli_tests {
+    use super::*;
+    use capturefab::assistant::ProviderId;
+    use serde_json::json;
+    use std::{
+        collections::VecDeque,
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+
+    struct Directory(PathBuf);
+    impl Directory {
+        fn new(name: &str) -> Self {
+            let root = temp_root(name);
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The only HTTP peer these tests use. Replies are finite and scripted;
+    /// unexpected requests fail locally instead of falling through to a service.
+    struct ProviderServer {
+        base_url: String,
+        requests: Arc<Mutex<Vec<Value>>>,
+        stop: Arc<AtomicBool>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+    impl ProviderServer {
+        fn new(replies: Vec<Value>) -> Self {
+            Self::statuses(replies.into_iter().map(|body| (200, body)).collect())
+        }
+        fn statuses(replies: Vec<(u16, Value)>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let seen = requests.clone();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = stop.clone();
+            let worker = thread::spawn(move || {
+                let mut replies = VecDeque::from(replies);
+                while !stopped.load(Ordering::Relaxed) {
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => panic!("Scripted provider accept failed: {error}"),
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap();
+                    assert_eq!(first.trim_end(), "POST /v1/chat/completions HTTP/1.1");
+                    let mut length = None;
+                    let mut header_bytes = first.len();
+                    loop {
+                        let mut line = String::new();
+                        assert!(reader.read_line(&mut line).unwrap() > 0);
+                        header_bytes += line.len();
+                        assert!(header_bytes <= 16 * 1024);
+                        if line == "\r\n" || line == "\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            length = Some(value.trim().parse::<usize>().unwrap());
+                        }
+                    }
+                    let length = length.expect("Bounded JSON request has Content-Length");
+                    assert!(length <= 1024 * 1024);
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    drop(reader);
+                    seen.lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&body).unwrap());
+                    let (status, body) = replies.pop_front().unwrap_or_else(|| {
+                        (400, json!({"error":{"message":"Unexpected request to the offline scripted provider."}}))
+                    });
+                    let body = body.to_string();
+                    write!(stream,"HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                    stream.flush().unwrap();
+                }
+            });
+            Self {
+                base_url,
+                requests,
+                stop,
+                worker: Some(worker),
+            }
+        }
+    }
+    impl Drop for ProviderServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(worker) = self.worker.take() {
+                let result = worker.join();
+                if !thread::panicking() {
+                    result.expect("The scripted provider worker failed.");
+                }
+            }
+        }
+    }
+
+    fn command(dir: &PathBuf, cwd: &PathBuf, args: &[&str], env: &[(&str, &str)]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_capturefab"));
+        command
+            .env_remove("CAPTUREFAB_SESSION")
+            .env_remove("CAPTUREFAB_CAMERA")
+            .env_remove("CAPTUREFAB_ACTOR")
+            .env_remove("CAPTUREFAB_ACTOR_KIND");
+        for id in ProviderId::ALL {
+            for name in id.info().key_envs {
+                command.env_remove(name);
+            }
+        }
+        for name in [
+            "AWS_PROFILE",
+            "AWS_DEFAULT_PROFILE",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "GOOGLE_CLOUD_PROJECT",
+            "GCLOUD_PROJECT",
+            "GOOGLE_CLOUD_LOCATION",
+            "GOOGLE_CLOUD_QUOTA_PROJECT",
+            "OLLAMA_HOST",
+            "AZURE_OPENAI_ENDPOINT",
+            "CLOUDFLARE_ACCOUNT_ID",
+            "CLOUDFLARE_GATEWAY_ID",
+        ] {
+            command.env_remove(name);
+        }
+        // An explicit dummy Custom bearer skips the native keychain fallback.
+        command
+            .env("CAPTUREFAB_AI_API_KEY", "offline-test")
+            .env("CAPTUREFAB_SESSION_DIR", dir)
+            .env("CAPTUREFAB_STAGING_DIR", dir.join("uploads"))
+            .envs(env.iter().copied())
+            .current_dir(cwd)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+    fn output(
+        dir: &PathBuf,
+        cwd: &PathBuf,
+        args: &[&str],
+        input: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> std::process::Output {
+        let mut command = command(dir, cwd, args, env);
+        if input.is_some() {
+            command.stdin(Stdio::piped());
+        }
+        let mut child = command.spawn().unwrap();
+        if let Some(input) = input {
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+        }
+        child.wait_with_output().unwrap()
+    }
+    fn ok(dir: &PathBuf, cwd: &PathBuf, args: &[&str]) -> Value {
+        let out = output(dir, cwd, args, None, &[]);
+        assert!(
+            out.status.success(),
+            "{args:?}\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let value = tools_response(&out);
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["ok"], true);
+        value["result"].clone()
+    }
+    fn settings(dir: &PathBuf, server: &ProviderServer) {
+        std::fs::create_dir_all(dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(dir.join("assistant.json")).unwrap();
+        let value = json!({"version":1,"provider":"custom","providers":{"custom":{"model":"offline-camera-model","base_url":server.base_url,"vision":"off","saved_key":false}}});
+        write!(file, "{value}").unwrap();
+    }
+    fn fixture(name: &str) -> (Fixture, PathBuf, PathBuf) {
+        let (fixture, dir, cwd, _captures) = tools_fixture(name);
+        tools_ok(
+            &dir,
+            &cwd,
+            &["--json", "--session", "tools-ci", "connect", "sim:0"],
+        );
+        (fixture, dir, cwd)
+    }
+    fn call(id: &str, name: &str, args: Value) -> Value {
+        json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":50,"completion_tokens":15}})
+    }
+    fn end() -> Value {
+        json!({"choices":[{"message":{"role":"assistant","content":"The plan is ready."},"finish_reason":"stop"}],"usage":{"prompt_tokens":50,"completion_tokens":15}})
+    }
+    fn photo(name: &str) -> Value {
+        json!({"camera":"sim:0","count":1,"format":"png","file_name":name,"destination":null,"tags":null})
+    }
+    fn proposal(mut args: Value) -> Value {
+        args["replace_step"] = Value::Null;
+        args
+    }
+    fn finish() -> Value {
+        call(
+            "finished",
+            "finish_task",
+            json!({"outcome":"succeeded","summary":"Saved the requested photograph."}),
+        )
+    }
+    fn assert_png(path: &std::path::Path) {
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    }
+    fn assert_end_log(dir: &PathBuf, id: &str, outcome: &str) -> Vec<Value> {
+        let log = ok(dir, dir, &["--json", "assistant", "log", id]);
+        let records = log.as_array().unwrap();
+        assert_eq!(records.first().unwrap()["kind"], "start");
+        assert_eq!(records.last().unwrap()["kind"], "end");
+        assert_eq!(records.last().unwrap()["outcome"], outcome);
+        assert!(!log.to_string().contains("offline-test"));
+        records.clone()
+    }
+
+    #[test]
+    fn assistant_providers_report_environment_presence_without_keychain_or_session() {
+        let root = Directory::new("assistant-providers");
+        let dir = root.0.join("sessions");
+        let absent = ok(&dir, &root.0, &["--json", "assistant", "providers"]);
+        let providers = absent.as_array().unwrap();
+        assert_eq!(providers.len(), 22);
+        for id in ProviderId::ALL {
+            let provider = providers.iter().find(|item| item["id"] == id.id()).unwrap();
+            assert!(provider["name"].is_string());
+            assert!(provider["credential"]["ready"].is_boolean());
+            assert!(provider["vision"].get("mode").is_some());
+            assert!(provider["vision"].get("resolved").is_some());
+            assert!(provider["vision"]["source"].is_string());
+            assert!(provider["vision"]["placement"].is_string());
+        }
+        assert_eq!(
+            providers
+                .iter()
+                .find(|item| item["id"] == "openai")
+                .unwrap()["credential"]["ready"],
+            false
+        );
+        let present = output(
+            &dir,
+            &root.0,
+            &["--json", "assistant", "providers"],
+            None,
+            &[("OPENAI_API_KEY", "offline-openai-presence")],
+        );
+        assert!(present.status.success());
+        let present = tools_response(&present);
+        let provider = present["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "openai")
+            .unwrap();
+        assert_eq!(provider["credential"]["ready"], true);
+        assert!(!present.to_string().contains("offline-openai-presence"));
+        assert!(!present.to_string().contains("offline-test"));
+        assert!(
+            !dir.exists(),
+            "Listing providers must not create session state."
+        );
+    }
+
+    #[test]
+    fn assistant_configuration_and_prompt_errors_fail_before_session_or_keychain_access() {
+        let root = Directory::new("assistant-invalid");
+        let dir = root.0.join("sessions");
+        for (args, field) in [
+            (
+                vec!["--json", "assistant", "use", "unknown-provider"],
+                "provider",
+            ),
+            (
+                vec![
+                    "--json",
+                    "assistant",
+                    "use",
+                    "custom",
+                    "--model",
+                    "fixture",
+                    "--base-url",
+                    "http://public.example.test/v1",
+                ],
+                "base_url",
+            ),
+            (
+                vec![
+                    "--json",
+                    "assistant",
+                    "use",
+                    "azure",
+                    "--endpoint",
+                    "https://fixture.openai.azure.com/evil",
+                ],
+                "endpoint",
+            ),
+            (
+                vec![
+                    "--json",
+                    "assistant",
+                    "key",
+                    "set",
+                    "unknown-provider",
+                    "--key-stdin",
+                ],
+                "provider",
+            ),
+        ] {
+            let out = output(&dir, &root.0, &args, None, &[]);
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{args:?}\n{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            let error = tools_response(&out);
+            assert_eq!(error["ok"], false);
+            assert_eq!(error["error"]["code"], "usage");
+            assert!(
+                error["error"]["details"]["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|issue| issue["field"] == field),
+                "{error}"
+            );
+            assert!(!dir.exists());
+        }
+        for args in [
+            vec!["--json", "assistant", "key", "set", "custom"],
+            vec![
+                "--json",
+                "assistant",
+                "ask",
+                "rtsp://user:private-password@camera/live",
+            ],
+            vec![
+                "--json",
+                "assistant",
+                "ask",
+                "two sources",
+                "--prompt-file",
+                "-",
+            ],
+            vec![
+                "--json",
+                "assistant",
+                "run",
+                "inspect",
+                "--camera",
+                "sim:0",
+                "--max-time",
+                "30s",
+            ],
+            vec![
+                "--json",
+                "assistant",
+                "run",
+                "inspect",
+                "--camera",
+                "sim:0",
+                "--approvals",
+                "ask",
+            ],
+        ] {
+            let out = output(&dir, &root.0, &args, None, &[]);
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{args:?}\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(!dir.exists(), "{args:?}");
+            assert!(!String::from_utf8_lossy(&out.stdout).contains("private-password"));
+        }
+    }
+
+    #[test]
+    fn assistant_use_persists_only_non_secret_settings_in_a_private_file() {
+        let root = Directory::new("assistant-use");
+        let dir = root.0.join("sessions");
+        let server = ProviderServer::new(Vec::new());
+        ok(
+            &dir,
+            &root.0,
+            &[
+                "--json",
+                "assistant",
+                "use",
+                "custom",
+                "--model",
+                "offline-camera-model",
+                "--base-url",
+                &server.base_url,
+                "--vision",
+                "off",
+                "--effort",
+                "low",
+            ],
+        );
+        let path = dir.join("assistant.json");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let saved: Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved["version"], 1);
+        assert_eq!(saved["provider"], "custom");
+        assert_eq!(
+            saved["providers"]["custom"]["model"],
+            "offline-camera-model"
+        );
+        assert_eq!(saved["providers"]["custom"]["base_url"], server.base_url);
+        assert_eq!(saved["providers"]["custom"]["vision"], "off");
+        assert_eq!(saved["providers"]["custom"]["effort"], "low");
+        assert!(!saved.to_string().contains("offline-test"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        assert!(server.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn assistant_limit_flags_have_field_errors_before_any_provider_or_session_request() {
+        let root = Directory::new("assistant-limit-args");
+        let dir = root.0.join("sessions");
+        let server = ProviderServer::new(Vec::new());
+        settings(&dir, &server);
+        for (flag, value, field) in [
+            ("--max-time", "30s", "max_time"),
+            ("--max-rounds", "1001", "max_rounds"),
+            ("--max-images", "2001", "max_images"),
+            ("--max-cost", "501", "max_cost"),
+        ] {
+            let out = output(
+                &dir,
+                &root.0,
+                &[
+                    "--json",
+                    "assistant",
+                    "run",
+                    "Observe the workbench",
+                    "--camera",
+                    "sim:0",
+                    flag,
+                    value,
+                ],
+                None,
+                &[],
+            );
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{flag}\n{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            let failure = tools_response(&out);
+            assert!(
+                failure["error"]["details"]["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|issue| issue["field"] == field),
+                "{failure}"
+            );
+            assert_eq!(
+                std::fs::read_dir(&dir).unwrap().count(),
+                1,
+                "Only the prewritten assistant settings may exist."
+            );
+        }
+        assert!(server.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn assistant_ask_returns_a_ready_reviewable_plan_and_private_export() {
+        let (_fixture, dir, cwd) = fixture("assistant-ask");
+        let server = ProviderServer::new(vec![
+            call("overview", "get_overview", json!({})),
+            call(
+                "photo",
+                "capture_photos",
+                proposal(photo("assistant-plan.png")),
+            ),
+            end(),
+        ]);
+        settings(&dir, &server);
+        let plan_out = cwd.join("assistant-plan.json");
+        let out = output(
+            &dir,
+            &cwd,
+            &[
+                "--json",
+                "assistant",
+                "ask",
+                "--prompt-file",
+                "-",
+                "--plan-out",
+                plan_out.to_str().unwrap(),
+            ],
+            Some("Capture one photograph\n"),
+            &[],
+        );
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let result = tools_response(&out)["result"].clone();
+        assert!(result["text"].as_str().unwrap().contains("plan is ready"));
+        assert_eq!(result["plan"]["version"], 1);
+        let calls = result["plan"]["calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["tool"], "capture_photos");
+        assert_eq!(calls[0]["args"]["camera"], "sim:0");
+        let steps = result["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0]["risk"], "bounded");
+        assert_eq!(steps[0]["leaves_computer"], false);
+        assert!(
+            !steps[0]["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|issue| issue["severity"] == "error")
+        );
+        assert!(!cwd.join("assistant-plan.png").exists());
+        let exported: Value = serde_json::from_slice(&std::fs::read(&plan_out).unwrap()).unwrap();
+        assert_eq!(exported, result["plan"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&plan_out).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["model"], "offline-camera-model");
+        assert!(
+            !serde_json::to_string(&*requests)
+                .unwrap()
+                .contains("offline-test")
+        );
+        assert!(requests[1]["messages"].to_string().contains("sim:0"));
+    }
+
+    #[test]
+    fn assistant_ask_apply_saves_the_approved_local_capture() {
+        let (_fixture, dir, cwd) = fixture("assistant-apply");
+        let server = ProviderServer::new(vec![
+            call("overview", "get_overview", json!({})),
+            call(
+                "photo",
+                "capture_photos",
+                proposal(photo("assistant-applied.png")),
+            ),
+            end(),
+        ]);
+        settings(&dir, &server);
+        let result = ok(
+            &dir,
+            &cwd,
+            &[
+                "--json",
+                "--actor",
+                "assistant-test-client",
+                "--actor-kind",
+                "agent",
+                "assistant",
+                "ask",
+                "Capture a photograph",
+                "--apply",
+            ],
+        );
+        assert_eq!(result["plan"]["calls"][0]["tool"], "capture_photos");
+        assert!(!result["applied"].is_null());
+        assert_png(&cwd.join("assistant-applied.png"));
+        let status = tools_ok(&dir, &cwd, &["--json", "--session", "tools-ci", "status"]);
+        assert!(status["activity"].as_array().unwrap().iter().any(
+            |activity| activity["operation"] == "capture"
+                && activity["actor"]["name"] == "assistant-test-client"
+                && activity["actor"]["kind"] == "agent"
+        ));
+        assert_eq!(server.requests.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn assistant_ask_apply_refuses_a_tool_outside_the_default_allowlist() {
+        let (_fixture, dir, cwd) = fixture("assistant-apply-refused");
+        let server = ProviderServer::new(vec![
+            call(
+                "change",
+                "set_camera_features",
+                proposal(
+                    json!({"camera":"sim:0","values":[{"feature":"Gain","value":"3","expect":null}],"restart_stream":false}),
+                ),
+            ),
+            end(),
+        ]);
+        settings(&dir, &server);
+        let out = output(
+            &dir,
+            &cwd,
+            &["--json", "assistant", "ask", "Adjust gain", "--apply"],
+            None,
+            &[],
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let current = tools_ok(
+            &dir,
+            &cwd,
+            &[
+                "--json",
+                "--session",
+                "tools-ci",
+                "--camera",
+                "sim:0",
+                "get",
+                "Gain",
+            ],
+        );
+        assert_eq!(current["features"][0]["value"].as_f64(), Some(0.0));
+    }
+
+    #[test]
+    fn assistant_run_autonomously_captures_finishes_and_exposes_its_action_log() {
+        let (_fixture, dir, cwd) = fixture("assistant-run");
+        let server = ProviderServer::new(vec![
+            call("overview", "get_overview", json!({})),
+            call("photo", "capture_photos", photo("assistant-task.png")),
+            finish(),
+        ]);
+        settings(&dir, &server);
+        let events = cwd.join("task-events.jsonl");
+        let result = ok(
+            &dir,
+            &cwd,
+            &[
+                "--json",
+                "assistant",
+                "run",
+                "Capture one photograph",
+                "--camera",
+                "sim:0",
+                "--mode",
+                "autonomous",
+                "--approvals",
+                "deny",
+                "--events",
+                events.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(result["outcome"], "finished");
+        assert_eq!(result["totals"]["captures"], 1);
+        assert_eq!(result["totals"]["rounds"], 3);
+        assert!(result["leftovers"].is_array());
+        assert!(std::path::Path::new(result["log"].as_str().unwrap()).is_file());
+        assert_png(&cwd.join("assistant-task.png"));
+        let id = result["run_id"].as_str().unwrap();
+        let records = assert_end_log(&dir, id, "finished");
+        assert_eq!(records[0]["actor"]["kind"], "agent");
+        assert!(
+            records[0]["actor"]["id"]
+                .as_str()
+                .unwrap()
+                .starts_with("assistant:")
+        );
+        assert!(records.iter().any(|record| record["kind"] == "tool"
+            && record["name"] == "capture_photos"
+            && record["outcome"] == "ok"));
+        let runs = ok(&dir, &cwd, &["--json", "assistant", "runs"]);
+        assert!(
+            runs.as_array()
+                .unwrap()
+                .iter()
+                .any(|run| run["run_id"] == id && run["complete"] == true)
+        );
+        let streamed = std::fs::read_to_string(&events).unwrap();
+        let streamed: Vec<Value> = streamed
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(streamed, records);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&events).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(server.requests.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn assistant_run_denies_a_disruptive_overwrite_of_a_human_setting() {
+        let (_fixture, dir, cwd) = fixture("assistant-denied");
+        tools_ok(
+            &dir,
+            &cwd,
+            &[
+                "--json",
+                "--session",
+                "tools-ci",
+                "--camera",
+                "sim:0",
+                "set",
+                "ExposureTime=1000",
+            ],
+        );
+        let server = ProviderServer::new(vec![
+            call(
+                "change",
+                "set_camera_features",
+                json!({"camera":"sim:0","values":[{"feature":"ExposureTime","value":"2000","expect":"1000"}],"restart_stream":false}),
+            ),
+            finish(),
+        ]);
+        settings(&dir, &server);
+        let result = ok(
+            &dir,
+            &cwd,
+            &[
+                "--json",
+                "assistant",
+                "run",
+                "Adjust exposure if allowed",
+                "--camera",
+                "sim:0",
+                "--mode",
+                "autonomous",
+                "--approvals",
+                "deny",
+            ],
+        );
+        assert_eq!(result["outcome"], "finished");
+        let current = tools_ok(
+            &dir,
+            &cwd,
+            &[
+                "--json",
+                "--session",
+                "tools-ci",
+                "--camera",
+                "sim:0",
+                "get",
+                "ExposureTime",
+            ],
+        );
+        assert_eq!(current["features"][0]["value"].as_f64(), Some(1000.0));
+        let records = assert_end_log(&dir, result["run_id"].as_str().unwrap(), "finished");
+        assert!(records.iter().any(|record| record["kind"] == "approval"
+            && record["risk"] == "disruptive"
+            && record["decision"] == "denied"));
+        assert!(!records.iter().any(|record| record["kind"] == "tool"
+            && record["name"] == "set_camera_features"
+            && record["outcome"] == "ok"));
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1]["messages"]
+                .to_string()
+                .contains("Do not retry this action")
+        );
+    }
+
+    #[test]
+    fn assistant_run_round_limit_stops_a_loop_with_a_reviewable_failure() {
+        let (_fixture, dir, cwd) = fixture("assistant-round-limit");
+        let server = ProviderServer::new(
+            (1..=5)
+                .map(|round| call(&format!("overview-{round}"), "get_overview", json!({})))
+                .collect(),
+        );
+        settings(&dir, &server);
+        let out = output(
+            &dir,
+            &cwd,
+            &[
+                "--json",
+                "assistant",
+                "run",
+                "Keep observing",
+                "--camera",
+                "sim:0",
+                "--mode",
+                "autonomous",
+                "--approvals",
+                "deny",
+                "--max-rounds",
+                "2",
+            ],
+            None,
+            &[],
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let failure = tools_response(&out);
+        assert_eq!(failure["ok"], false);
+        assert_eq!(failure["error"]["code"], "operation_failed");
+        let result = &failure["error"]["details"];
+        assert_eq!(result["outcome"], "limit");
+        assert_eq!(result["totals"]["rounds"], 2);
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        assert_end_log(&dir, result["run_id"].as_str().unwrap(), "limit");
+    }
+
+    #[test]
+    fn assistant_provider_failures_put_scrubbed_details_in_the_json_error() {
+        let root = Directory::new("assistant-provider-error");
+        let dir = root.0.join("sessions");
+        let server = ProviderServer::statuses(vec![(
+            400,
+            json!({"error":{"message":"Model fixture rejected this request. Bearer planted-private-key rtsp://user:planted-password@camera/live"}}),
+        )]);
+        settings(&dir, &server);
+        let out = output(
+            &dir,
+            &root.0,
+            &["--json", "assistant", "ask", "Read the session overview"],
+            None,
+            &[],
+        );
+        assert_eq!(out.status.code(), Some(1));
+        let failure = tools_response(&out);
+        let message = failure["error"]["details"]["provider_message"]
+            .as_str()
+            .unwrap();
+        assert!(message.contains("Model fixture rejected"));
+        assert!(!failure.to_string().contains("planted-private-key"));
+        assert!(!failure.to_string().contains("planted-password"));
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn assistant_provider_failure_after_capture_keeps_effects_and_the_complete_event_log() {
+        let (_fixture, dir, cwd) = fixture("assistant-partial-provider-error");
+        let server = ProviderServer::statuses(vec![
+            (
+                200,
+                call(
+                    "photo",
+                    "capture_photos",
+                    photo("assistant-before-error.png"),
+                ),
+            ),
+            (
+                400,
+                json!({"error":{"message":"Model fixture rejected verification. Bearer planted-private-key rtsp://user:planted-password@camera/live"}}),
+            ),
+        ]);
+        settings(&dir, &server);
+        let events = cwd.join("failed-task-events.jsonl");
+        let out = output(
+            &dir,
+            &cwd,
+            &[
+                "--json",
+                "assistant",
+                "run",
+                "Capture one photograph and verify it",
+                "--camera",
+                "sim:0",
+                "--mode",
+                "autonomous",
+                "--approvals",
+                "deny",
+                "--events",
+                events.to_str().unwrap(),
+            ],
+            None,
+            &[],
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let failure = tools_response(&out);
+        assert_eq!(failure["ok"], false);
+        let details = &failure["error"]["details"];
+        assert_eq!(details["outcome"], "failed");
+        assert_eq!(details["totals"]["captures"], 1);
+        assert_eq!(details["totals"]["rounds"], 2);
+        assert!(details["leftovers"].is_array());
+        let id = details["run_id"].as_str().unwrap();
+        assert!(std::path::Path::new(details["log"].as_str().unwrap()).is_file());
+        assert!(
+            details["provider_message"]
+                .as_str()
+                .unwrap()
+                .contains("Model fixture rejected verification")
+        );
+        assert!(!failure.to_string().contains("planted-private-key"));
+        assert!(!failure.to_string().contains("planted-password"));
+        assert_png(&cwd.join("assistant-before-error.png"));
+        let records = assert_end_log(&dir, id, "failed");
+        assert!(records.iter().any(|record| record["kind"] == "tool"
+            && record["name"] == "capture_photos"
+            && record["outcome"] == "ok"));
+        let streamed = std::fs::read_to_string(events).unwrap();
+        let streamed: Vec<Value> = streamed
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            streamed, records,
+            "A failed provider request must still flush the end record."
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn assistant_ask_provider_failure_keeps_the_partial_plan_without_capturing() {
+        let (_fixture, dir, cwd) = fixture("assistant-partial-plan-error");
+        let mut proposed = call(
+            "photo",
+            "capture_photos",
+            proposal(photo("assistant-unrun-partial.png")),
+        );
+        proposed["choices"][0]["message"]["content"] = json!("I will prepare the photograph.");
+        let server = ProviderServer::statuses(vec![
+            (200, proposed),
+            (
+                400,
+                json!({"error":{"message":"Model fixture rejected the plan follow-up. Bearer planted-private-key rtsp://user:planted-password@camera/live"}}),
+            ),
+        ]);
+        settings(&dir, &server);
+        let out = output(
+            &dir,
+            &cwd,
+            &[
+                "--json",
+                "assistant",
+                "ask",
+                "Prepare a photograph without running it",
+            ],
+            None,
+            &[],
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let failure = tools_response(&out);
+        assert_eq!(failure["ok"], false);
+        let details = &failure["error"]["details"];
+        assert!(
+            details["provider_message"]
+                .as_str()
+                .unwrap()
+                .contains("Model fixture rejected the plan follow-up")
+        );
+        assert_eq!(details["text"], "I will prepare the photograph.");
+        assert_eq!(details["plan"]["version"], 1);
+        let calls = details["plan"]["calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["tool"], "capture_photos");
+        assert_eq!(calls[0]["args"]["camera"], "sim:0");
+        let steps = details["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0]["tool"], "capture_photos");
+        assert_eq!(steps[0]["risk"], "bounded");
+        assert!(!failure.to_string().contains("planted-private-key"));
+        assert!(!failure.to_string().contains("planted-password"));
+        assert!(!cwd.join("assistant-unrun-partial.png").exists());
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn assistant_sigterm_stops_the_task_and_finishes_its_action_log() {
+        struct Running(Option<Child>);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                if let Some(child) = &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        let (_fixture, dir, cwd) = fixture("assistant-sigterm");
+        let server = ProviderServer::new(
+            (1..=5)
+                .map(|round| call(&format!("overview-{round}"), "get_overview", json!({})))
+                .collect(),
+        );
+        settings(&dir, &server);
+        let mut running = Running(Some(
+            command(
+                &dir,
+                &cwd,
+                &[
+                    "--json",
+                    "assistant",
+                    "run",
+                    "Keep observing until stopped",
+                    "--camera",
+                    "sim:0",
+                    "--mode",
+                    "autonomous",
+                    "--approvals",
+                    "deny",
+                ],
+                &[],
+            )
+            .spawn()
+            .unwrap(),
+        ));
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while server.requests.lock().unwrap().is_empty() {
+            assert!(
+                running.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+                "The assistant exited before sending its first request."
+            );
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "The assistant did not reach the scripted provider."
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let pid = running.0.as_ref().unwrap().id().to_string();
+        assert!(
+            Command::new("kill")
+                .args(["-TERM", &pid])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let stop_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while running.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < stop_deadline,
+                "SIGTERM did not stop the assistant within 10 seconds."
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let out = running.0.take().unwrap().wait_with_output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let failure = tools_response(&out);
+        assert_eq!(failure["ok"], false);
+        assert_eq!(failure["error"]["code"], "operation_failed");
+        let details = &failure["error"]["details"];
+        assert_eq!(details["outcome"], "stopped");
+        assert_eq!(details["totals"]["captures"], 0);
+        assert!(details["totals"]["rounds"].as_u64().unwrap() >= 1);
+        assert!(std::path::Path::new(details["log"].as_str().unwrap()).is_file());
+        let records = assert_end_log(&dir, details["run_id"].as_str().unwrap(), "stopped");
+        assert!(records.iter().any(|record| record["kind"] == "stop"));
+    }
+}

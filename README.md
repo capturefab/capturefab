@@ -2,7 +2,7 @@
 
 Capture camera images, video, sensor values and PLC tags on the plant floor, and keep them ready for analysis. Capturefab is a native desktop app and a scriptable CLI for manufacturing and process engineers who work on OT networks. It connects GigE Vision, USB3 Vision, webcams, RTSP/ONVIF cameras and document scanners; reads Modbus TCP, MQTT, OPC UA and MTConnect sources; and catalogs every saved file and sample in one DuckDB dataset. An export gives Parquet or CSV files plus a `README.md` and `manifest.json` that a notebook, a BI tool or an AI assistant such as Claude, ChatGPT or Gemini can read without more explanation.
 
-Camera acquisition, storage and datasets run on the local computer. Optional AI features send requests and selected camera data to the provider you choose. Files are never overwritten: captures get new names from templates such as `{camera}-{datetime}-{seq}.png`. Open `capturefab` to discover cameras, select a device, inspect its settings, and capture. The same executable runs headless and lets scripts or coding agents control an already visible GUI session.
+Everything runs on the local computer. The optional AI assistant and prompt measurements send data to the AI provider you choose, only when you send a request. Files are never overwritten: captures get new names from templates such as `{camera}-{datetime}-{seq}.png`. Open `capturefab` to discover cameras, select a device, inspect its settings, and capture. The same executable runs headless and lets scripts or coding agents control an already visible GUI session.
 
 Capturefab is MIT-licensed. Its GigE Vision, USB3 Vision, GenICam, Modbus TCP, MQTT, OPC UA and MTConnect clients are Rust; each signal source runs in its own helper process. Media decoding, host-driver camera access and encoding use a bundled, source-built FFmpeg executable. Release binaries require no separately installed Aravis, FFmpeg, libusb, vendor SDK or Python. Operating-system graphics and camera drivers remain necessary.
 
@@ -123,6 +123,24 @@ Read each tool's schema in `tools list --json` or `schema --json` under `result.
 Action dry runs return `{checked,commands}` without executing. Review issues, risk and output locations first. Pass `--confirmed-by-user` for Disruptive or HumanOnly actions only after the user approved that exact action. `--secret-stdin` supplies one stream password or S3 secret separately from arguments. Never put secrets in prompts, command lines or plan files.
 
 `tools apply FILE --dry-run --json` checks a strict version-1 document: `{"version":1,"calls":[{"tool":"start_live_view","args":{"camera":"sim:0"}}]}`. Plans accept 1–64 calls and at most 256 KiB. Apply rechecks the plan, executes in order and stops at the first failure; earlier effects remain. See [the external-agent recipe](web/agents.md#let-an-agent-drive-cameras) for observation, optimistic setting writes, waiting, capture, undo and typed error recovery.
+
+## AI camera assistant
+
+The optional `ai` feature adds `capturefab assistant`. Select one of 22 provider entries, including OpenAI, Anthropic, Gemini, Vertex AI, Bedrock, OpenRouter, Cloudflare, Groq and DeepSeek. Local Ollama, LM Studio and custom endpoints are also configurable. These are catalog entries, not provider compatibility claims.
+
+```sh
+capturefab assistant providers --json
+capturefab assistant use anthropic --model claude-sonnet-5-5 --vision auto
+capturefab assistant key set anthropic --key-stdin < /private/path/provider-key.txt
+capturefab assistant test anthropic --json
+capturefab --session bench assistant ask 'Examine sim:0 and plan one verified photo.' --plan-out camera-plan.json --json
+capturefab --session bench assistant run 'Examine sim:0 and capture two verified photos.' \
+  --camera sim:0 --mode autonomous --approvals deny --max-time 10m --max-captures 2 --max-size 128MiB --json
+```
+
+`ask` runs observations and returns a plan. `run` uses explicit camera and destination scope with hard limits. Supervised mode asks before each change; autonomous mode runs Reversible and Bounded actions within those limits. Disruptive actions always ask, and HumanOnly approval is once. `--approvals ask` must have a TTY; `deny` is the noninteractive default. Ctrl-C stops new work and discards late provider replies. Existing accepted commands finish, and the report lists leftovers instead of undoing them.
+
+Requests include your prompt, conversation and redacted session details. Camera previews are sent only when permitted. Keys stay outside model content, in provider environment variables or the OS credential store. `assistant providers` does not read the keychain unless `--check-keychain` is supplied. Settings live in private `assistant.json`; private action logs support `assistant runs` and `assistant log RUN_ID`. See the [assistant guide](docs/assistant.md) for credentials, data sent, approvals, limits, cost estimates, restore rules and JSON results. External agents can use the [camera tool registry](#camera-tools-for-agents) without an in-process AI provider.
 
 ## Automatic capture and review
 

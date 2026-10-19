@@ -1,4 +1,6 @@
+pub(crate) mod assistant;
 mod tools;
+pub use assistant::{AssistantCommand, AssistantTaskFailure};
 pub use tools::{ToolsCommand, ToolsConfirmationRequired};
 
 use crate::{
@@ -680,6 +682,11 @@ pub enum CaptureSessionCommand {
 }
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Configure an AI provider, plan captures or run a bounded camera task
+    Assistant {
+        #[command(subcommand)]
+        command: AssistantCommand,
+    },
     /// List, check and run the shared camera tools for people and external agents
     Tools {
         #[command(subcommand)]
@@ -1233,6 +1240,7 @@ fn camera_command(command: Option<&Command>) -> bool {
 
 fn uses_session(command: Option<&Command>) -> bool {
     camera_command(command)
+        || matches!(command,Some(Command::Assistant {command}) if assistant::uses_session(command))
         || matches!(
             command,
             Some(
@@ -1337,13 +1345,18 @@ fn input<T>(result: Result<T>) -> Result<T> {
 
 /// Prepare all command arguments before connecting or applying --set/--auto.
 fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
-    prepare_with(cli, &mut None)
+    prepare_with(cli, &mut None, &mut None)
 }
 
 fn prepare_with(
     cli: &Cli,
     prepared_tools: &mut Option<tools::PreparedTools>,
+    prepared_assistant: &mut Option<assistant::PreparedAssistant>,
 ) -> Result<Option<SessionCommand>> {
+    if let Some(Command::Assistant { command }) = &cli.command {
+        *prepared_assistant = Some(assistant::prepare(cli, command)?);
+        return Ok(None);
+    }
     if let Some(Command::Tools { command }) = &cli.command {
         *prepared_tools = Some(tools::prepare(cli, command)?);
         return Ok(None);
@@ -1744,28 +1757,44 @@ impl Drop for Client<'_> {
 pub fn run(mut cli: Cli) -> Result<()> {
     let base = std::env::current_dir()?;
     let is_tools = matches!(&cli.command, Some(Command::Tools { .. }));
-    if !is_tools && let Some(camera) = &mut cli.camera {
+    let is_assistant = matches!(&cli.command, Some(Command::Assistant { .. }));
+    if !is_tools
+        && !is_assistant
+        && let Some(camera) = &mut cli.camera
+    {
         input(crate::workflow::resolve_selector(camera, &base))?;
     }
     if let Some(Command::Connect { camera } | Command::Select { camera }) = &mut cli.command {
         input(crate::workflow::resolve_selector(camera, &base))?;
     }
     let mut prepared_tools = None;
-    // Typed tool check failures retain their issue codes and details.
-    let mut prepared = if is_tools {
-        prepare_with(&cli, &mut prepared_tools)?
+    let mut prepared_assistant = None;
+    // Typed checks and provider failures retain their codes and details.
+    let mut prepared = if is_tools || is_assistant {
+        prepare_with(&cli, &mut prepared_tools, &mut prepared_assistant)?
     } else {
         input(prepare(&cli))?
     };
     resolve_session(&mut cli)?;
-    if cli.session.is_none()
+    if !is_assistant
+        && cli.session.is_none()
         && let Some(camera) = &cli.camera
     {
         crate::camera::validate_selector(camera)?;
     }
     prepare_outputs(&cli, &mut prepared)?;
-    input(crate::media::configure_hwaccel(&cli.hwaccel))?;
+    if !is_assistant {
+        input(crate::media::configure_hwaccel(&cli.hwaccel))?;
+    }
     match &cli.command {
+        Some(Command::Assistant { command }) => {
+            let result = assistant::run(
+                &cli,
+                command,
+                prepared_assistant.expect("assistant prepared once"),
+            )?;
+            return output(&cli, result);
+        }
         Some(Command::Tools { command }) => {
             let result = tools::run(&cli, command, prepared_tools.expect("tools prepared once"))?;
             return output(&cli, result);
@@ -2447,6 +2476,9 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
         }
         return write_json(&envelope);
     }
+    if let Some(Command::Assistant { command }) = &cli.command {
+        return assistant::print_human(command, &value);
+    }
     if let Some(Command::Tools { command }) = &cli.command {
         return tools::print_human(command, &value);
     }
@@ -2723,13 +2755,8 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
 }
 fn doctor() -> Value {
     let interfaces=if_addrs::get_if_addrs().map(|items|items.into_iter().filter_map(|i|match i.addr{if_addrs::IfAddr::V4(a)=>Some(json!({"name":i.name,"ip":a.ip,"netmask":a.netmask,"broadcast":a.broadcast})),_=>None}).collect::<Vec<_>>()).unwrap_or_default();
-    let value = json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"ai":cfg!(feature="ai"),"uploads":cfg!(feature="uploads"),"usb":cfg!(feature="usb"),"scanner":cfg!(feature="scanner"),"wgpu":cfg!(feature="gui"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox"),"s3":cfg!(feature="s3"),"ftp":cfg!(feature="ftp"),"sftp":cfg!(feature="sftp"),"parquet":cfg!(feature="parquet"),"modbus":cfg!(feature="modbus"),"mqtt":cfg!(feature="mqtt"),"opcua":cfg!(feature="opcua"),"mtconnect":cfg!(feature="mtconnect"),"dinov2":cfg!(feature="dinov2")},"auto_capture":crate::autocapture::doctor(),"signals":crate::signals::compiled_protocols(),"scanners":crate::scanner::doctor(),"jpeg":jpeg_backends(),"session_directory":ipc::session_dir(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox. Document scanning uses installed platform scanner drivers (SANE scanimage on Linux).","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}});
-    #[cfg(feature = "ai")]
-    let value = {
-        let mut value = value;
-        value["assistant"] = crate::assistant::doctor();
-        value
-    };
+    let mut value = json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"ai":cfg!(feature="ai"),"uploads":cfg!(feature="uploads"),"usb":cfg!(feature="usb"),"scanner":cfg!(feature="scanner"),"wgpu":cfg!(feature="gui"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox"),"s3":cfg!(feature="s3"),"ftp":cfg!(feature="ftp"),"sftp":cfg!(feature="sftp"),"parquet":cfg!(feature="parquet"),"modbus":cfg!(feature="modbus"),"mqtt":cfg!(feature="mqtt"),"opcua":cfg!(feature="opcua"),"mtconnect":cfg!(feature="mtconnect"),"dinov2":cfg!(feature="dinov2")},"auto_capture":crate::autocapture::doctor(),"signals":crate::signals::compiled_protocols(),"scanners":crate::scanner::doctor(),"jpeg":jpeg_backends(),"session_directory":ipc::session_dir(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox. Document scanning uses installed platform scanner drivers (SANE scanimage on Linux).","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}});
+    value["assistant"] = assistant::doctor();
     value
 }
 /// JPEG encoders available to this build and host, best first.
@@ -2780,10 +2807,7 @@ fn schema() -> Value {
     let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"gui","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"capture","output":"run-1","count":10,"timeout_ms":2000,"format":"png","destination":"archive"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","jpeg","raw","pgm","ppm"],"stdout":"--camera ... capture -n 1 -o - --format raw; no --json","destination":"--destination NAME (or \"destination\" in capture/schedule/forward RPC): -o is a relative name inside a saved folder, S3 bucket, FTP(S) or SFTP server; see destination list, volumes and uploads"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized with GUI operations."});
     contract["exit_codes"]["6"] = json!("storage quota or disk full");
     contract["tools"] = tools::schema_contract();
-    #[cfg(feature = "ai")]
-    {
-        contract["assistant"] = crate::assistant::schema_contract();
-    }
+    contract["assistant"] = assistant::schema_contract();
     let mut command = Cli::command();
     command.build();
     contract["cli"] = command_schema(&command);
@@ -3969,6 +3993,22 @@ pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
         .find_map(|cause| cause.downcast_ref::<crate::assistant::http::ProviderError>())
     {
         return failure.exit();
+    }
+    if let Some(failure) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<AssistantTaskFailure>())
+    {
+        return (
+            match failure.exit() {
+                2 => "usage",
+                3 => "unavailable",
+                4 => "timeout",
+                5 => "unsupported",
+                6 => "storage_full",
+                _ => "operation_failed",
+            },
+            failure.exit(),
+        );
     }
     if let Some(failure) = error
         .chain()

@@ -19,6 +19,18 @@ Gemini also accepts `GOOGLE_API_KEY`. When both Gemini variables are set, `GOOGL
 
 Credential status shows the source without revealing the key. Keys are excluded from ordinary preferences, measurement history and charts. Credential access and provider calls run on background workers.
 
+These keys are shared with the [camera assistant](assistant.md). Both use credential-store service `capturefab-ai`, with accounts `openai`, `gemini` and `claude` for OpenAI, Gemini and Anthropic. Saving or removing one of these keys affects both features. Other assistant providers have separate accounts. Assistant configuration lives in `assistant.json`; it does not change measurement prompts or start collection.
+
+The CLI can manage the same saved keys without putting them in arguments:
+
+```sh
+capturefab assistant key set anthropic --key-stdin < /private/path/provider-key.txt
+capturefab assistant key remove anthropic
+capturefab assistant providers --json
+```
+
+The provider list uses environment presence and saved-key hints by default. Add `--check-keychain` only when you want credential-store access. Keys and credential-bearing URLs must never appear in measurement prompts or assistant requests.
+
 The environment variable names and authentication follow the official [OpenAI quickstart](https://developers.openai.com/api/docs/quickstart), [Gemini API key guide](https://ai.google.dev/gemini-api/docs/api-key) and [Claude API key guide](https://platform.claude.com/docs/en/get-api-key).
 
 ## Configure measurements

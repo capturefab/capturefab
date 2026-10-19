@@ -85,6 +85,9 @@ fn main() {
         let confirmation = error
             .chain()
             .find_map(|cause| cause.downcast_ref::<cli::ToolsConfirmationRequired>());
+        let assistant_failure = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<cli::AssistantTaskFailure>());
         #[cfg(feature = "ai")]
         let provider_failure = error
             .chain()
@@ -93,6 +96,7 @@ fn main() {
             .map(ToString::to_string)
             .or_else(|| plan_failure.map(ToString::to_string))
             .or_else(|| confirmation.map(ToString::to_string))
+            .or_else(|| assistant_failure.map(ToString::to_string))
             .or_else(|| workflow_failure.map(ToString::to_string))
             .unwrap_or_else(|| format!("{error:#}"));
         #[cfg(feature = "ai")]
@@ -100,7 +104,9 @@ fn main() {
         if json_mode {
             let mut envelope =
                 json!({"version":1,"ok":false,"error":{"code":code,"message":message}});
-            if let Some(failure) = check_failure {
+            if let Some(failure) = assistant_failure {
+                envelope["error"]["details"] = failure.details();
+            } else if let Some(failure) = check_failure {
                 envelope["error"]["details"] = failure.details();
             } else if let Some(failure) = plan_failure {
                 envelope["error"]["details"] = failure.details();
@@ -112,9 +118,24 @@ fn main() {
             #[cfg(feature = "ai")]
             if let Some(failure) = provider_failure {
                 envelope["error"]["message"] = json!(failure.to_string());
-                envelope["error"]["details"] = failure.details();
+                let mut details = assistant_failure
+                    .map(cli::AssistantTaskFailure::details)
+                    .unwrap_or_else(|| json!({}));
+                if let (Some(report), Some(provider)) =
+                    (details.as_object_mut(), failure.details().as_object())
+                {
+                    report.extend(
+                        provider
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone())),
+                    );
+                }
+                envelope["error"]["details"] = details;
             }
             let _ = cli::write_json(&envelope);
+        } else if let Some(failure) = assistant_failure {
+            let _ = failure.print_human();
+            eprintln!("capturefab: {message}");
         } else if let Some(failure) = check_failure {
             for (step, issues) in &failure.issues_by_step {
                 for issue in issues {

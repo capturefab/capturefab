@@ -378,13 +378,13 @@ pub fn recheck_approved(approved: &Checked, fresh: &Checked) -> Result<(), Appro
         || approved.risk != fresh.risk
         || approved.title != fresh.title
         || approved.summary != fresh.summary
-        || approved.facts != fresh.facts
+        || crate::tools::exec::approval_facts(approved) != crate::tools::exec::approval_facts(fresh)
         || approved.reasons != fresh.reasons
         || approved.leaves_computer != fresh.leaves_computer
         || approved.output_root != fresh.output_root
         || destination(approved) != destination(fresh)
         || approved.issues != fresh.issues
-        || serde_json::to_value(&approved.ops).ok() != serde_json::to_value(&fresh.ops).ok()
+        || !crate::tools::exec::same_approval_operations(approved, fresh)
     {
         Err(ApprovalChanged)
     } else {
@@ -667,5 +667,80 @@ mod tests {
         let mut fresh = original.clone();
         fresh.facts[0].1 = "3 → 2".into();
         assert!(recheck_approved(&original, &fresh).is_err());
+    }
+
+    #[test]
+    fn elapsed_time_does_not_revoke_a_capture_or_immediate_schedule_approval() {
+        use crate::tools::{
+            PlanState,
+            tests::{fixture_context, fixture_snapshot},
+        };
+        let before = fixture_context(fixture_snapshot());
+        let mut after = before.clone();
+        after.now_ms += 61_000;
+        after.storage.allocated_bytes += 1024 * 1024;
+        for tool in ["capture_photos", "schedule_captures"] {
+            let schema = (crate::tools::spec(tool).unwrap().schema)();
+            let mut args = Value::Object(
+                schema["properties"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(|name| (name.clone(), Value::Null))
+                    .collect(),
+            );
+            args["camera"] = json!("sim:0");
+            args["file_name"] = json!("capture-{datetime}.png");
+            if tool == "schedule_captures" {
+                args["every"] = json!("1m");
+                args["count"] = json!(3);
+            }
+            let call = ToolCall {
+                tool: tool.into(),
+                args,
+            };
+            let approved = crate::tools::check(
+                &before,
+                &mut PlanState::new(&before),
+                StepId(1),
+                &call,
+                &|_, _| false,
+            );
+            let fresh = crate::tools::check(
+                &after,
+                &mut PlanState::new(&after),
+                StepId(1),
+                &approved.call,
+                &|_, _| false,
+            );
+            assert!(approved.ready(), "{approved:?}");
+            assert!(fresh.ready(), "{fresh:?}");
+            assert_ne!(approved.facts, fresh.facts);
+            assert!(recheck_approved(&approved, &fresh).is_ok(), "{tool}");
+            let mut redirected = fresh.clone();
+            redirected.output_root = Some("/different".into());
+            assert!(recheck_approved(&approved, &redirected).is_err());
+            let mut changed_size = fresh.clone();
+            changed_size
+                .facts
+                .iter_mut()
+                .find(|(name, _)| name == "Storage")
+                .unwrap()
+                .1 = "≈ 999 GiB · enough free".into();
+            assert!(recheck_approved(&approved, &changed_size).is_err());
+            if tool == "schedule_captures" {
+                let mut changed = fresh.clone();
+                for op in &mut changed.ops {
+                    if let Op::Command {
+                        command: SessionCommand::Schedule { interval_ms, .. },
+                        ..
+                    } = op
+                    {
+                        *interval_ms += 1000;
+                    }
+                }
+                assert!(recheck_approved(&approved, &changed).is_err());
+            }
+        }
     }
 }
