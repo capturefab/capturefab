@@ -578,7 +578,9 @@ fn camera_guidance(kind: CameraKind) -> &'static str {
         CameraKind::Microscope => {
             "Choose the objective and magnification, then adjust focus and illumination for the specimen."
         }
-        CameraKind::Thermal => "Set temperature output, range and emissivity before measuring.",
+        CameraKind::Thermal => {
+            "Configure temperature output, measurement range and emissivity before taking measurements."
+        }
         CameraKind::DocumentScanner => {
             "Each capture scans one page. Choose a source and resolution supported by your scanner."
         }
@@ -608,7 +610,7 @@ fn capture_guidance(kind: CameraKind) -> Option<&'static str> {
             "Use Raw pixels for depth samples; image formats are 8-bit. Keep the component's unit, scale and offset for measurements.",
         ),
         CameraKind::Thermal => Some(
-            "Use Raw pixels for temperature samples; image formats are 8-bit. Keep the temperature unit and calibration for measurements.",
+            "Raw pixels hold temperature samples; image formats are 8-bit. Keep temperature unit and calibration for measurements.",
         ),
         _ => None,
     }

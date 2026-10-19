@@ -309,7 +309,7 @@ fn a_suggestion_whose_frame_is_not_saved_leaves_the_published_count() {
         1
     );
     drop(release);
-    let status = f.published(|status| status.pending_count == 0);
+    let status = f.published(|status| status.pending_count == 0 && status.note.is_some());
     assert!(status.note.unwrap().contains("is missing"));
 }
 
