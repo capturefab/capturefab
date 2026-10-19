@@ -30,7 +30,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -303,10 +303,13 @@ impl RunControl {
     /// Called synchronously before the desktop starts dropping worker
     /// messages during shutdown. It never waits for a provider thread.
     pub fn finish_app_quit(&self) {
-        self.stop();
+        // Claim the terminal outcome before publishing cancellation: the
+        // worker may finish immediately after it observes that flag.
         if self.shared.ended.swap(true, Ordering::SeqCst) {
             return;
         }
+        let already = self.shared.cancel.swap(true, Ordering::SeqCst);
+        self.shared.generation.fetch_add(1, Ordering::SeqCst);
         if let Some(log) = self
             .shared
             .log
@@ -328,10 +331,11 @@ impl RunControl {
                 .as_millis()
                 .try_into()
                 .unwrap_or(u64::MAX);
-            let _ = log
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .finish(fields, now);
+            let mut log = log.lock().unwrap_or_else(|error| error.into_inner());
+            if !already {
+                let _ = log.record("stop", json!({"by":"caller","reason":"requested"}), now);
+            }
+            let _ = log.finish(fields, now);
         }
     }
 }
@@ -699,6 +703,7 @@ struct Runtime<'a> {
     context: Context,
     humans: HumanTracker,
     owned_forwarders: BTreeMap<String, String>,
+    uncertain_forwarders: BTreeSet<String>,
     owned_auto: BTreeSet<String>,
     notes: Vec<String>,
     experiments: Vec<String>,
@@ -786,6 +791,169 @@ fn pin_scope(scope: &RunScope, ctx: &Context) -> Result<RunScope> {
     pinned.destinations = names;
     pinned.validate()?;
     Ok(pinned)
+}
+
+const MAX_INITIALIZATIONS: usize = 16;
+static INITIALIZATIONS: AtomicUsize = AtomicUsize::new(0);
+struct InitializationSlot;
+impl InitializationSlot {
+    fn acquire() -> Result<Self> {
+        loop {
+            let count = INITIALIZATIONS.load(Ordering::SeqCst);
+            ensure!(
+                count < MAX_INITIALIZATIONS,
+                "Earlier credential lookups are still finishing. Wait before starting another task."
+            );
+            if INITIALIZATIONS
+                .compare_exchange(count, count + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        Ok(Self)
+    }
+}
+impl Drop for InitializationSlot {
+    fn drop(&mut self) {
+        INITIALIZATIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// OS credential calls can finish late. The parent waits only within the run
+/// budget; cancellation stops later auth/probe stages and no camera commands
+/// are available to this helper. A process-wide cap bounds uncancellable OS
+/// calls without retaining their credentials in the UI.
+fn initialize_model(
+    deps: &Deps,
+    provider: ProviderId,
+    settings: super::provider::ProviderSettings,
+    allow_images: bool,
+    deadline_ms: u64,
+    control: &RunControl,
+) -> Result<Option<ModelSession>> {
+    credential_work(deps, deadline_ms, control, move |deps, worker| {
+        ModelSession::resolve_until(
+            deps,
+            provider,
+            settings,
+            Mode::Run,
+            allow_images,
+            deadline_ms,
+            worker.cancel(),
+        )
+    })
+}
+
+fn credential_work<T: Send + 'static>(
+    deps: &Deps,
+    deadline_ms: u64,
+    control: &RunControl,
+    resolve: impl FnOnce(&Deps, &RunControl) -> Result<T> + Send + 'static,
+) -> Result<Option<T>> {
+    let slot = InitializationSlot::acquire()?;
+    let deps = deps.clone();
+    let clock = deps.clock.clone();
+    let worker = control.clone();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("capturefab-assistant-auth".into())
+        .spawn(move || {
+            let _slot = slot;
+            let result = resolve(&deps, &worker);
+            let _ = sender.send(result);
+        })?;
+    loop {
+        if control.cancel().load(Ordering::SeqCst) || clock.now_ms() >= deadline_ms {
+            control.shared.cancel.store(true, Ordering::SeqCst);
+            return Ok(None);
+        }
+        let remaining = deadline_ms.saturating_sub(clock.now_ms());
+        match receiver.recv_timeout(Duration::from_millis(remaining.min(250))) {
+            Ok(result) => return result.map(Some),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("The assistant credential worker disconnected.")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InitializationLog<'a> {
+    run_id: &'a str,
+    actor: &'a SessionActor,
+    log: &'a Arc<Mutex<ActionLog>>,
+    deps: &'a Deps,
+    control: &'a RunControl,
+    start_ms: u64,
+}
+impl InitializationLog<'_> {
+    fn finish(
+        self,
+        outcome: Outcome,
+        summary: String,
+        events: &mut dyn FnMut(RunEvent),
+    ) -> Result<RunOutcome> {
+        let Self {
+            run_id,
+            actor,
+            log,
+            deps,
+            control,
+            start_ms,
+        } = self;
+        let outcome = if control.shared.ended.load(Ordering::SeqCst) {
+            Outcome::AppQuit
+        } else {
+            outcome
+        };
+        let summary = if outcome == Outcome::AppQuit {
+            "The assistant stopped because Capturefab quit.".into()
+        } else {
+            summary
+        };
+        let report = RunOutcome {
+            run_id: run_id.into(),
+            outcome,
+            summary: summary.clone(),
+            totals: Totals::default(),
+            leftovers: Vec::new(),
+            log: log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .path()
+                .to_owned(),
+            restore: RunRecord {
+                run_id: run_id.into(),
+                actor_id: actor.id.clone(),
+                ..RunRecord::default()
+            },
+        };
+        if !control.shared.ended.swap(true, Ordering::SeqCst) {
+            log.lock().map_err(|_|anyhow!("The assistant action log is unavailable."))?.finish(json!({"outcome":outcome,"summary":summary,"totals":report.totals,"leftovers":report.leftovers}),deps.clock.now_ms())?;
+        }
+        let snapshot = RunSnapshot {
+            run_id: run_id.into(),
+            actor_id: actor.id.clone(),
+            state: match outcome {
+                Outcome::Stopped | Outcome::AppQuit => RunState::Stopped,
+                Outcome::Limit => RunState::LimitReached,
+                _ => RunState::Failed,
+            },
+            elapsed_ms: deps.clock.now_ms().saturating_sub(start_ms),
+            summary,
+            ..RunSnapshot::default()
+        };
+        *control
+            .shared
+            .status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = snapshot.clone();
+        events(RunEvent::State(snapshot));
+        events(RunEvent::Finished(report.clone()));
+        Ok(report)
+    }
 }
 
 pub fn run_blocking(
@@ -882,23 +1050,67 @@ pub fn run_blocking(
         log: log.clone(),
         deps,
     };
-    ensure!(
-        !control.cancel().load(Ordering::SeqCst),
-        "The assistant task was stopped."
-    );
+    let initialization = InitializationLog {
+        run_id: &run_id,
+        actor: &actor,
+        log: &log,
+        deps,
+        control,
+        start_ms,
+    };
+    if control.cancel().load(Ordering::SeqCst) {
+        return initialization.finish(
+            Outcome::Stopped,
+            "The assistant task was stopped.".into(),
+            events,
+        );
+    }
     events(RunEvent::State(control.status()));
-    let model = ModelSession::resolve(
+    let initialized = initialize_model(
         deps,
         provider,
         settings,
-        Mode::Run,
         request.scope.allow_images,
-    )?;
-    limiter.check_wall(deps.clock.now_ms())?;
-    ensure!(
-        !control.cancel().load(Ordering::SeqCst),
-        "The assistant task was stopped."
+        limiter.deadline_ms(),
+        control,
     );
+    let terminal = if control.shared.ended.load(Ordering::SeqCst) {
+        Some((
+            Outcome::AppQuit,
+            "The assistant stopped because Capturefab quit.".into(),
+        ))
+    } else if deps.clock.now_ms() >= limiter.deadline_ms() {
+        control.shared.cancel.store(true, Ordering::SeqCst);
+        Some((
+            Outcome::Limit,
+            "The assistant task reached its time limit.".into(),
+        ))
+    } else if control.cancel().load(Ordering::SeqCst) {
+        Some((Outcome::Stopped, "The assistant task was stopped.".into()))
+    } else {
+        None
+    };
+    if let Some((outcome, summary)) = terminal {
+        return initialization.finish(outcome, summary, events);
+    }
+    let model = match initialized {
+        Ok(Some(model)) => model,
+        Ok(None) => {
+            return initialization.finish(
+                Outcome::Stopped,
+                "The assistant task was stopped.".into(),
+                events,
+            );
+        }
+        Err(error) => {
+            initialization.finish(
+                Outcome::Failed,
+                redact::for_output_text(&error.to_string()),
+                events,
+            )?;
+            return Err(error);
+        }
+    };
     let host = match deps.host.with_actor(actor.clone()) {
         Ok(host) => host,
         Err(error) => {
@@ -961,6 +1173,7 @@ pub fn run_blocking(
         context: ctx,
         humans,
         owned_forwarders: BTreeMap::new(),
+        uncertain_forwarders: BTreeSet::new(),
         owned_auto: BTreeSet::new(),
         notes: Vec::new(),
         experiments: Vec::new(),
@@ -1320,6 +1533,34 @@ impl Runtime<'_> {
                 self.rollover(reason, executor)?;
                 continue;
             }
+            self.limiter.check_request(self.now(), &projection)?;
+            if self.model.needs_credentials_refresh() {
+                let settings = self.model.settings.clone();
+                let deadline_ms = self.limiter.deadline_ms();
+                self.state(RunState::Running, "Refreshing the provider sign-in…");
+                let refreshed =
+                    credential_work(self.deps, deadline_ms, self.control, move |deps, worker| {
+                        ModelSession::refresh_credentials_until(
+                            deps,
+                            &settings,
+                            worker.cancel(),
+                            deadline_ms,
+                        )
+                    });
+                self.limiter.check_wall(self.now())?;
+                if self.control.cancel().load(Ordering::SeqCst) {
+                    return Ok((Outcome::Stopped, "The assistant task was stopped.".into()));
+                }
+                if let Some(auth) = refreshed? {
+                    self.model.auth = auth;
+                }
+            }
+            if self.control.shared.pause.load(Ordering::SeqCst) {
+                if !self.boundary(false)? {
+                    return Ok((Outcome::Stopped, "The assistant task was stopped.".into()));
+                }
+                continue;
+            }
             for notice in self.limiter.begin_request(self.now(), &projection)? {
                 self.emit(Event::Notice(notice.message));
             }
@@ -1328,9 +1569,12 @@ impl Runtime<'_> {
             let vision_rejected = self.conversation.vision_rejected;
             let started = self.now();
             self.last_request_ms = Some(started);
-            let reply =
-                self.model
-                    .request(&mut self.conversation, self.deps, self.control.cancel());
+            let reply = self.model.request_until(
+                &mut self.conversation,
+                self.deps,
+                self.control.cancel(),
+                self.limiter.deadline_ms(),
+            );
             if generation != self.control.shared.generation.load(Ordering::SeqCst)
                 || self.control.cancel().load(Ordering::SeqCst)
             {
@@ -1339,6 +1583,7 @@ impl Runtime<'_> {
             let reply = match reply {
                 Ok(reply) => reply,
                 Err(error) => {
+                    self.limiter.check_wall(self.now())?;
                     if !vision_rejected && self.conversation.vision_rejected {
                         self.emit(Event::Notice(
                             "This model can't see images; continuing with measurements only."
@@ -1885,10 +2130,18 @@ impl Runtime<'_> {
             }
             Err(error) => {
                 let acknowledged = executor.acknowledged().to_vec();
+                let changed_settings = acknowledged.iter().any(|reply| {
+                    reply
+                        .get("camera_change")
+                        .is_some_and(|value| !value.is_null())
+                });
                 if acknowledged.iter().any(|reply| {
                     reply
                         .get("camera_change")
                         .is_some_and(|change| !change.is_null())
+                        || reply["forwarding_id"]
+                            .as_str()
+                            .is_some_and(crate::session::valid_forwarding_id)
                 }) {
                     self.track(
                         &checked,
@@ -1900,7 +2153,7 @@ impl Runtime<'_> {
                         },
                         executor,
                     )?;
-                    self.emit(Event::Notice("Some camera settings changed before the action failed. They are included in this task's restore proposal.".into()));
+                    self.emit(Event::Notice(if changed_settings {"Some camera settings changed before the action failed. They are included in this task's restore proposal."}else{"The worker accepted the recording or stream before verification failed. Review this task's remaining effects."}.into()));
                 } else {
                     self.refresh()?;
                 }
@@ -1936,6 +2189,13 @@ impl Runtime<'_> {
         self.state(RunState::WaitingApproval, checked.summary.clone());
         (self.events)(RunEvent::Approval(request.clone()));
         let local_cancel = Arc::new(AtomicBool::new(false));
+        struct CancelOnExit(Arc<AtomicBool>);
+        impl Drop for CancelOnExit {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _cancel_on_exit = CancelOnExit(local_cancel.clone());
         let worker_cancel = local_cancel.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::Builder::new()
@@ -2096,7 +2356,6 @@ impl Runtime<'_> {
         outcome: &tools::StepOutcome,
         executor: &mut Executor<'_>,
     ) -> Result<()> {
-        let fresh = self.deps.gather(self.host.as_ref())?;
         fn acknowledgements(
             value: &Value,
             forwarding_id: &mut Option<String>,
@@ -2139,6 +2398,35 @@ impl Runtime<'_> {
                 .cloned()
                 .unwrap_or_else(|| camera.into())
         });
+        if matches!(
+            checked.call.tool.as_str(),
+            "start_recording" | "stream_to_url"
+        ) && let (Some(camera), Some(id)) = (
+            &camera,
+            acknowledged_forwarding_id
+                .as_ref()
+                .filter(|id| crate::session::valid_forwarding_id(id)),
+        ) {
+            self.record.forwarders.insert(camera.clone(), id.clone());
+            self.uncertain_forwarders.insert(camera.clone());
+            if let Some(state) = before
+                .snapshot
+                .cameras
+                .iter()
+                .find(|state| state.info.id == *camera)
+            {
+                self.record
+                    .worker_pids
+                    .entry(camera.clone())
+                    .or_insert(state.worker_pid);
+            }
+        }
+        let fresh = self.deps.gather(self.host.as_ref()).or_else(|error| {
+            let mut fallback = before.clone();
+            fallback.snapshot = self.host.snapshot().map_err(|_| error)?;
+            Ok::<Context, anyhow::Error>(fallback)
+        })?;
+        self.settle_forwarders(&fresh);
         if let Some(camera) = &camera {
             if let Some(state) = fresh
                 .snapshot
@@ -2178,7 +2466,7 @@ impl Runtime<'_> {
                     "start_recording" | "stream_to_url"
                 ) && let Some(id) = acknowledged_forwarding_id
                     .as_ref()
-                    .filter(|id| Some(*id) == state.forwarding_id.as_ref())
+                    .filter(|id| !state.stale && Some(*id) == state.forwarding_id.as_ref())
                 {
                     self.facts.forwarders.insert(camera.clone());
                     self.owned_forwarders.insert(camera.clone(), id.clone());
@@ -2404,6 +2692,35 @@ impl Runtime<'_> {
         Ok(())
     }
 
+    fn settle_forwarders(&mut self, ctx: &Context) {
+        for camera in self.uncertain_forwarders.clone() {
+            if let Some(state) = ctx
+                .snapshot
+                .cameras
+                .iter()
+                .find(|state| state.info.id == camera && !state.stale)
+            {
+                if self.record.worker_pids.get(&camera) != Some(&state.worker_pid) {
+                    self.uncertain_forwarders.remove(&camera);
+                    continue;
+                }
+                if let Some(id) = self.record.forwarders.get(&camera).filter(|id| {
+                    Some(*id) == state.forwarding_id.as_ref() && state.forwarding.is_some()
+                }) {
+                    self.owned_forwarders.insert(camera.clone(), id.clone());
+                    self.facts.forwarders.insert(camera.clone());
+                    self.facts
+                        .worker_pids
+                        .insert(camera.clone(), state.worker_pid);
+                    self.record
+                        .worker_pids
+                        .insert(camera.clone(), state.worker_pid);
+                }
+                self.uncertain_forwarders.remove(&camera);
+            }
+        }
+    }
+
     fn leftovers(&self) -> Vec<Leftover> {
         let mut leftovers = Vec::new();
         for camera in self.context.snapshot.cameras.iter().filter(|camera| {
@@ -2479,11 +2796,15 @@ impl Runtime<'_> {
                 });
             }
         }
+        for camera in &self.uncertain_forwarders {
+            leftovers.push(Leftover {kind:"recording".into(),camera:camera.clone(),summary:format!("A recording or stream was accepted on {}. Its current state is unavailable; review the camera before starting more work.",redact::for_output_text(camera)),job_id:None,until_ms:None});
+        }
         leftovers
     }
 
     fn finish(&mut self, outcome: Outcome, summary: String) -> Result<RunOutcome> {
         if let Ok(ctx) = self.deps.gather(self.host.as_ref()) {
+            self.settle_forwarders(&ctx);
             self.context = ctx;
         }
         let summary = redact::for_output_text(&summary);
@@ -3419,12 +3740,671 @@ mod tests {
         let records = super::super::log::read_log_in(&directory, &run_id).unwrap();
         assert_eq!(records.last().unwrap()["outcome"], "app_quit");
         release_tx.send(()).unwrap();
-        assert!(thread.join().unwrap().is_err());
+        assert_eq!(thread.join().unwrap().unwrap().outcome, Outcome::AppQuit);
         let records = super::super::log::read_log_in(&directory, &run_id).unwrap();
         assert_eq!(records.iter().filter(|r| r["kind"] == "end").count(), 1);
         assert_eq!(records.last().unwrap()["outcome"], "app_quit");
         assert!(script.requests.lock().unwrap().is_empty());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn quitting_claims_the_terminal_outcome_before_cancellation_reaches_the_worker() {
+        let (deps, _, _) = fixture(vec![finished()]);
+        let mut log = ActionLog::create(&deps.log_directory, NOW).unwrap();
+        log.record("start", json!({"goal":"Test application quit."}), NOW)
+            .unwrap();
+        let run_id = log.id().to_owned();
+        let log = Arc::new(Mutex::new(log));
+        let control = RunControl::default();
+        *control.shared.log.lock().unwrap() = Some(log.clone());
+
+        // Hold the journal where the old stop-then-finish ordering could
+        // pause after publishing cancellation but before claiming the end.
+        let journal = log.lock().unwrap();
+        let quitter = control.clone();
+        let thread = thread::spawn(move || quitter.finish_app_quit());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !control.cancel().load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let cancelled = control.cancel().load(Ordering::SeqCst);
+        let quit_already_claimed_end = control.shared.ended.swap(true, Ordering::SeqCst);
+        drop(journal);
+        thread.join().unwrap();
+
+        assert!(cancelled);
+        assert!(quit_already_claimed_end);
+        let records = super::super::log::read_log_in(&deps.log_directory, &run_id).unwrap();
+        assert_eq!(records.iter().filter(|r| r["kind"] == "end").count(), 1);
+        assert_eq!(records.last().unwrap()["outcome"], "app_quit");
+        cleanup(deps);
+    }
+
+    #[test]
+    fn startup_stop_and_wall_limit_finish_before_a_noncooperative_resolver() {
+        struct Blocked {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl super::super::agent::CredentialResolver for Blocked {
+            fn resolve(
+                &self,
+                id: ProviderId,
+                settings: &super::super::ProviderSettings,
+            ) -> Result<super::super::credentials::ResolvedCredentials> {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                super::super::agent::CredentialResolver::resolve(
+                    &super::super::agent::tests::Credentials(AtomicUsize::new(0)),
+                    id,
+                    settings,
+                )
+            }
+        }
+        for limit in [false, true] {
+            let (mut deps, script, host) = fixture(vec![finished()]);
+            let directory = deps.log_directory.clone();
+            let clock = Arc::new(ClockStub(AtomicU64::new(NOW)));
+            deps.clock = clock.clone();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            deps.credentials = Arc::new(Blocked {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            });
+            let control = RunControl::default();
+            let worker = control.clone();
+            let (done_tx, done_rx) = mpsc::channel();
+            let thread = thread::spawn(move || {
+                let mut req = request();
+                req.limits.max_wall_ms = 60_000;
+                let result = run_blocking(
+                    req,
+                    &deps,
+                    Arc::new(DenyApprover::default()),
+                    &worker,
+                    &mut |_| {},
+                );
+                let _ = done_tx.send(result);
+            });
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if limit {
+                clock.0.store(NOW + 60_001, Ordering::SeqCst);
+            } else {
+                control.stop();
+            }
+            let report = done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("startup must not wait for the resolver")
+                .unwrap();
+            assert_eq!(
+                report.outcome,
+                if limit {
+                    Outcome::Limit
+                } else {
+                    Outcome::Stopped
+                }
+            );
+            assert!(control.is_finished());
+            let records = super::super::log::read_log_in(&directory, &report.run_id).unwrap();
+            assert_eq!(
+                records.last().unwrap()["outcome"],
+                if limit { "limit" } else { "stopped" }
+            );
+            assert!(script.requests.lock().unwrap().is_empty());
+            assert!(host.sent.lock().unwrap().is_empty());
+            release_tx.send(()).unwrap();
+            thread.join().unwrap();
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn vertex_rounds_reuse_cached_tokens_and_refresh_only_the_pinned_auth() {
+        use super::super::credentials::{Auth, ResolvedCredentials, Source};
+        use super::super::http::Headers;
+
+        struct GoogleCredentials {
+            clock: Arc<ClockStub>,
+            identity: String,
+            exchanges: AtomicUsize,
+        }
+        impl Source for GoogleCredentials {
+            fn environment(&self, name: &str) -> Result<Option<String>> {
+                Ok((name == "GOOGLE_APPLICATION_CREDENTIALS").then(|| self.identity.clone()))
+            }
+            fn keychain(&self, _: &str) -> Result<Option<String>> {
+                panic!("the offline ADC test must never read a keychain")
+            }
+            fn file(&self, _: &std::path::Path) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
+                Ok(Some(zeroize::Zeroizing::new(serde_json::to_vec(&json!({
+                    "type":"authorized_user", "client_id":"offline-client",
+                    "client_secret":"offline-client-secret", "refresh_token":self.identity,
+                    "quota_project_id":"offline-refresh-project"
+                }))?)))
+            }
+            fn gcloud(&self) -> Result<Option<PathBuf>> {
+                Ok(None)
+            }
+            fn run_gcloud(&self, _: &std::path::Path) -> Result<zeroize::Zeroizing<String>> {
+                panic!("the offline ADC test must never launch gcloud")
+            }
+            fn metadata_allowed(&self) -> bool {
+                false
+            }
+            fn send_json(&self, request: HttpRequest<'_>) -> Result<(Value, Headers)> {
+                assert_eq!(request.url, "https://oauth2.googleapis.com/token");
+                let exchange = self.exchanges.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok((
+                    json!({"access_token":format!("offline-google-token-{exchange}"),"token_type":"Bearer","expires_in":3600}),
+                    Headers::new(),
+                ))
+            }
+            fn aws_chain(&self, _: Option<&str>) -> Result<(crate::aws::Keys, String)> {
+                panic!("the offline ADC test must never read AWS credentials")
+            }
+            fn aws_region(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn now(&self) -> u64 {
+                self.clock.now_ms() / 1000
+            }
+            fn cache_tokens(&self) -> bool {
+                true
+            }
+        }
+        impl super::super::agent::CredentialResolver for GoogleCredentials {
+            fn resolve(
+                &self,
+                id: ProviderId,
+                settings: &super::super::ProviderSettings,
+            ) -> Result<ResolvedCredentials> {
+                assert_eq!(id, ProviderId::Vertex);
+                let token = super::super::google::resolve(self)?.unwrap();
+                Ok(ResolvedCredentials {
+                    auth: Auth::Header {
+                        name: "authorization",
+                        value: zeroize::Zeroizing::new(format!("Bearer {}", token.value.as_str())),
+                        quota_project: token.quota_project,
+                    },
+                    settings: settings.effective(id, |_| None).unwrap(),
+                })
+            }
+        }
+        struct TokenScript {
+            script: Arc<Script>,
+            clock: Arc<ClockStub>,
+            auth: Mutex<Vec<String>>,
+        }
+        impl Transport for TokenScript {
+            fn send(&self, request: &HttpRequest<'_>) -> Result<HttpResponse, ProviderError> {
+                let Auth::Header { name, value, .. } = request.auth else {
+                    panic!("expected the pinned Google authorization kind")
+                };
+                assert_eq!(*name, "authorization");
+                let round = {
+                    let mut auth = self.auth.lock().unwrap();
+                    auth.push(value.to_string());
+                    auth.len()
+                };
+                let response = self.script.send(request)?;
+                let elapsed = match round {
+                    1 => 3_299_000,
+                    2 => 1000,
+                    _ => 0,
+                };
+                self.clock.0.fetch_add(elapsed, Ordering::SeqCst);
+                Ok(response)
+            }
+        }
+        let generate = |id: &str, name: &str, args: Value| json!({"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":id,"name":name,"args":args}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":10}});
+        let replies = vec![
+            generate("first", "remember", json!({"notes":"First measurement."})),
+            generate("second", "remember", json!({"notes":"Second measurement."})),
+            generate(
+                "finish",
+                "finish_task",
+                json!({"outcome":"succeeded","summary":"Verified the camera."}),
+            ),
+        ];
+        let (mut deps, script, host) = fixture(replies);
+        let clock = Arc::new(ClockStub(AtomicU64::new(NOW)));
+        let credentials = Arc::new(GoogleCredentials {
+            clock: clock.clone(),
+            identity: deps
+                .log_directory
+                .join("offline-adc")
+                .to_string_lossy()
+                .into_owned(),
+            exchanges: AtomicUsize::new(0),
+        });
+        let transport = Arc::new(TokenScript {
+            script: script.clone(),
+            clock: clock.clone(),
+            auth: Mutex::new(Vec::new()),
+        });
+        deps.clock = clock;
+        deps.credentials = credentials.clone();
+        deps.http = Arc::new(Http::with_transport(transport.clone()));
+        deps.settings.provider = Some(ProviderId::Vertex);
+        deps.settings.providers.insert(
+            ProviderId::Vertex,
+            super::super::ProviderSettings {
+                project: Some("offline-refresh-project".into()),
+                location: Some("global".into()),
+                ..super::super::ProviderSettings::default()
+            },
+        );
+        let mut req = request();
+        req.limits.max_wall_ms = 14_400_000;
+        let report = run(&deps, req, Arc::new(DenyApprover::default()));
+        assert_eq!(report.outcome, Outcome::Finished);
+        assert_eq!(report.totals.rounds, 3);
+        assert_eq!(credentials.exchanges.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            transport.auth.lock().unwrap().as_slice(),
+            [
+                "Bearer offline-google-token-1",
+                "Bearer offline-google-token-1",
+                "Bearer offline-google-token-2",
+            ]
+        );
+        let requests = script.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.windows(2).all(|pair| pair[0].0 == pair[1].0));
+        assert!(
+            requests[2].1["contents"].as_array().unwrap().len()
+                > requests[0].1["contents"].as_array().unwrap().len()
+        );
+        assert!(host.sent.lock().unwrap().is_empty());
+        drop(requests);
+        cleanup(deps);
+    }
+
+    #[test]
+    fn a_vertex_refresh_cannot_outlive_the_run_or_send_a_late_model_request() {
+        use super::super::credentials::{Auth, ResolvedCredentials};
+        struct Credentials {
+            refreshes: AtomicUsize,
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+            finished: mpsc::Sender<()>,
+        }
+        impl Credentials {
+            fn auth() -> Auth {
+                Auth::Header {
+                    name: "authorization",
+                    value: zeroize::Zeroizing::new("Bearer offline-refresh-token".into()),
+                    quota_project: None,
+                }
+            }
+        }
+        impl super::super::agent::CredentialResolver for Credentials {
+            fn resolve(
+                &self,
+                id: ProviderId,
+                settings: &super::super::ProviderSettings,
+            ) -> Result<ResolvedCredentials> {
+                Ok(ResolvedCredentials {
+                    auth: Self::auth(),
+                    settings: settings.effective(id, |_| None).unwrap(),
+                })
+            }
+            fn refresh_vertex(
+                &self,
+                _: &super::super::ProviderSettings,
+                _: Duration,
+                _: &AtomicBool,
+            ) -> Result<Auth> {
+                if self.refreshes.fetch_add(1, Ordering::SeqCst) == 1 {
+                    self.entered.send(()).unwrap();
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                    self.finished.send(()).unwrap();
+                }
+                Ok(Self::auth())
+            }
+        }
+        let first = json!({"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"remember","name":"remember","args":{"notes":"A measurement."}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":10}});
+        let (mut deps, script, host) = fixture(vec![first]);
+        let clock = Arc::new(ClockStub(AtomicU64::new(NOW)));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        deps.clock = clock.clone();
+        deps.credentials = Arc::new(Credentials {
+            refreshes: AtomicUsize::new(0),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            finished: finished_tx,
+        });
+        deps.settings.provider = Some(ProviderId::Vertex);
+        deps.settings.providers.insert(
+            ProviderId::Vertex,
+            super::super::ProviderSettings {
+                project: Some("offline-refresh-project".into()),
+                location: Some("global".into()),
+                ..super::super::ProviderSettings::default()
+            },
+        );
+        let directory = deps.log_directory.clone();
+        let deps = Arc::new(deps);
+        let worker_deps = deps.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut req = request();
+            req.limits.max_wall_ms = 60_000;
+            done_tx
+                .send(run(&worker_deps, req, Arc::new(DenyApprover::default())))
+                .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        clock.0.store(NOW + 60_001, Ordering::SeqCst);
+        let report = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(report.outcome, Outcome::Limit);
+        assert_eq!(report.totals.rounds, 1);
+        assert_eq!(script.requests.lock().unwrap().len(), 1);
+        assert!(host.sent.lock().unwrap().is_empty());
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(script.requests.lock().unwrap().len(), 1);
+        drop(deps);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pausing_during_a_vertex_refresh_waits_before_starting_a_model_round() {
+        use super::super::credentials::{Auth, ResolvedCredentials};
+        struct Credentials {
+            refreshes: AtomicUsize,
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Credentials {
+            fn auth() -> Auth {
+                Auth::Header {
+                    name: "authorization",
+                    value: zeroize::Zeroizing::new("Bearer offline-pause-token".into()),
+                    quota_project: None,
+                }
+            }
+        }
+        impl super::super::agent::CredentialResolver for Credentials {
+            fn resolve(
+                &self,
+                id: ProviderId,
+                settings: &super::super::ProviderSettings,
+            ) -> Result<ResolvedCredentials> {
+                Ok(ResolvedCredentials {
+                    auth: Self::auth(),
+                    settings: settings.effective(id, |_| None).unwrap(),
+                })
+            }
+            fn refresh_vertex(
+                &self,
+                _: &super::super::ProviderSettings,
+                _: Duration,
+                _: &AtomicBool,
+            ) -> Result<Auth> {
+                if self.refreshes.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.entered.send(()).unwrap();
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                Ok(Self::auth())
+            }
+        }
+        let finish = json!({"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"finish","name":"finish_task","args":{"outcome":"succeeded","summary":"Verified the camera."}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":10}});
+        let (mut deps, script, host) = fixture(vec![finish]);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let credentials = Arc::new(Credentials {
+            refreshes: AtomicUsize::new(0),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        deps.credentials = credentials.clone();
+        deps.settings.provider = Some(ProviderId::Vertex);
+        deps.settings.providers.insert(
+            ProviderId::Vertex,
+            super::super::ProviderSettings {
+                project: Some("offline-refresh-project".into()),
+                location: Some("global".into()),
+                ..super::super::ProviderSettings::default()
+            },
+        );
+        let deps = Arc::new(deps);
+        let control = RunControl::default();
+        let worker_control = control.clone();
+        let worker_deps = deps.clone();
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut req = request();
+            req.limits.max_wall_ms = 86_400_000;
+            run_blocking(
+                req,
+                &worker_deps,
+                Arc::new(DenyApprover::default()),
+                &worker_control,
+                &mut |event| {
+                    if matches!(event, RunEvent::State(state) if state.state == RunState::Paused) {
+                        let _ = paused_tx.send(());
+                    }
+                },
+            )
+            .unwrap()
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        control.pause();
+        release_tx.send(()).unwrap();
+        paused_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(script.requests.lock().unwrap().is_empty());
+        assert_eq!(control.status().totals.rounds, 0);
+        control.resume();
+        let report = worker.join().unwrap();
+        assert_eq!(report.outcome, Outcome::Finished);
+        assert_eq!(report.totals.rounds, 1);
+        assert_eq!(script.requests.lock().unwrap().len(), 1);
+        assert_eq!(credentials.refreshes.load(Ordering::SeqCst), 2);
+        assert!(host.sent.lock().unwrap().is_empty());
+        let directory = deps.log_directory.clone();
+        drop(deps);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_model_reply_after_the_wall_deadline_cannot_run_a_camera_action() {
+        let (mut deps, script, host) =
+            fixture(vec![reply("set", "set_camera_features", set_args(2))]);
+        let clock = Arc::new(ClockStub(AtomicU64::new(NOW)));
+        deps.clock = clock.clone();
+        deps.http = Arc::new(Http::with_transport(Arc::new(Hook {
+            script,
+            once: Mutex::new(Some(Box::new(move || {
+                clock.0.store(NOW + 60_001, Ordering::SeqCst);
+            }))),
+        })));
+        let mut req = request();
+        req.limits.max_wall_ms = 60_000;
+        let report = run(&deps, req, Arc::new(DenyApprover::default()));
+        assert_eq!(report.outcome, Outcome::Limit);
+        assert_eq!(host.count("set_many"), 0);
+        cleanup(deps);
+    }
+
+    #[test]
+    fn a_context_failure_cancels_the_pending_approval_worker() {
+        struct ContextsFail {
+            root: PathBuf,
+            fail: Arc<AtomicBool>,
+        }
+        impl ContextSource for ContextsFail {
+            fn gather(&self, host: &dyn ToolHost) -> Result<Context> {
+                ensure!(
+                    !self.fail.load(Ordering::SeqCst),
+                    "Injected context failure."
+                );
+                let mut ctx = fixture_context(host.snapshot()?);
+                ctx.capture_root = self.root.clone();
+                Ok(ctx)
+            }
+        }
+        struct WaitingApproval {
+            fail: Arc<AtomicBool>,
+            done: mpsc::Sender<bool>,
+        }
+        impl Approver for WaitingApproval {
+            fn request(
+                &self,
+                _: ApprovalRequest,
+                cancel: &AtomicBool,
+                _: Duration,
+            ) -> ApprovalDecision {
+                self.fail.store(true, Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                while !cancel.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                let cancelled = cancel.load(Ordering::SeqCst);
+                let _ = self.done.send(cancelled);
+                ApprovalDecision::Cancelled
+            }
+        }
+        let (mut deps, _, host) = fixture(vec![reply("set", "set_camera_features", set_args(2))]);
+        let fail = Arc::new(AtomicBool::new(false));
+        deps.context = Arc::new(ContextsFail {
+            root: deps.log_directory.join("captures"),
+            fail: fail.clone(),
+        });
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut req = request();
+        req.mode = RunMode::Supervised;
+        let result = run_blocking(
+            req,
+            &deps,
+            Arc::new(WaitingApproval {
+                fail,
+                done: done_tx,
+            }),
+            &RunControl::default(),
+            &mut |_| {},
+        );
+        assert!(result.is_err());
+        assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert_eq!(host.count("set_many"), 0);
+        cleanup(deps);
+    }
+
+    #[test]
+    fn accepted_recordings_remain_reported_when_verification_or_context_refresh_fails() {
+        #[derive(Clone)]
+        struct ForwardHost {
+            base: Host,
+            failed: Arc<AtomicBool>,
+            started: Arc<AtomicBool>,
+            persistent: bool,
+        }
+        impl ToolHost for ForwardHost {
+            fn snapshot(&self) -> Result<SessionSnapshot> {
+                if self.failed.swap(false, Ordering::SeqCst)
+                    || self.persistent && self.started.load(Ordering::SeqCst)
+                {
+                    bail!("Injected forwarding status failure.");
+                }
+                self.base.snapshot()
+            }
+            fn has_session(&self) -> bool {
+                true
+            }
+            fn actor_id(&self) -> Option<String> {
+                self.base.actor_id()
+            }
+            fn with_actor(&self, actor: SessionActor) -> Result<Arc<dyn ToolHost>> {
+                let mut host = self.clone();
+                host.base.actor = Some(actor);
+                Ok(Arc::new(host))
+            }
+            fn execute(&self, camera: Option<&str>, command: SessionCommand) -> Result<Value> {
+                if let SessionCommand::Forward {
+                    output,
+                    duration_ms,
+                    ..
+                } = &command
+                {
+                    self.base.sent.lock().unwrap().push((
+                        self.base.actor.clone(),
+                        camera.map(str::to_owned),
+                        command.clone(),
+                    ));
+                    let mut snapshot = self.base.snapshot.lock().unwrap();
+                    let state = snapshot
+                        .cameras
+                        .iter_mut()
+                        .find(|state| Some(state.info.id.as_str()) == camera)
+                        .unwrap();
+                    state.forwarding = Some(output.clone());
+                    state.forwarding_id = Some("22222222222222222222222222222222".into());
+                    state.forwarding_since_ms = Some(NOW);
+                    state.forwarding_until_ms = duration_ms.map(|d| NOW + d);
+                    self.started.store(true, Ordering::SeqCst);
+                    self.failed.store(true, Ordering::SeqCst);
+                    return Ok(
+                        json!({"forwarding":output,"forwarding_id":"22222222222222222222222222222222","since_ms":NOW,"until_ms":state.forwarding_until_ms}),
+                    );
+                }
+                self.base.execute(camera, command)
+            }
+        }
+        for persistent in [false, true] {
+            let args = json!({"camera":"sim:0","duration":"30s","file_name":null,"destination":null,"codec":null,"fps":null,"bitrate":null,"tags":null});
+            let (mut deps, _, host) =
+                fixture(vec![reply("record", "start_recording", args), finished()]);
+            deps.host = Arc::new(ForwardHost {
+                base: host,
+                failed: Arc::new(AtomicBool::new(false)),
+                started: Arc::new(AtomicBool::new(false)),
+                persistent,
+            });
+            let mut req = request();
+            req.scope.allow_recordings = true;
+            let mut report = None;
+            let result = run_blocking(
+                req,
+                &deps,
+                Arc::new(DenyApprover::default()),
+                &RunControl::default(),
+                &mut |event| {
+                    if let RunEvent::Finished(outcome) = event {
+                        report = Some(outcome);
+                    }
+                },
+            );
+            assert_eq!(result.is_err(), persistent);
+            let report = report.expect("accepted effects must remain reviewable");
+            assert!(
+                report
+                    .leftovers
+                    .iter()
+                    .any(|left| left.kind == "recording" && left.camera == "sim:0")
+            );
+            assert_eq!(
+                report.restore.forwarders.get("sim:0").map(String::as_str),
+                Some("22222222222222222222222222222222")
+            );
+            cleanup(deps);
+        }
     }
 
     #[test]

@@ -949,6 +949,22 @@ fn stream_urls_are_normalized_and_credentials_never_enter_operations_or_debug() 
         ),
         ("rtmp://host/live/STREAM-SECRET-KEY", "STREAM-SECRET-KEY"),
         (
+            "rtsp://host/video?api_key=private-api-key",
+            "private-api-key",
+        ),
+        (
+            "rtsp://host/video?%61pi%2Dkey=encoded-api-key",
+            "encoded-api-key",
+        ),
+        (
+            "rtsp://host/video?client_secret=private-client-secret",
+            "private-client-secret",
+        ),
+        (
+            "rtsp://host/video?X-Amz-Signature=private-signature",
+            "private-signature",
+        ),
+        (
             "rtsp://host/video?access_token=secret-token",
             "secret-token",
         ),

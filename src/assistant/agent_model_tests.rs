@@ -12,7 +12,11 @@ use crate::{
     },
     tools::tests::{FakeHost, fixture_snapshot},
 };
-use std::{collections::VecDeque, fs, sync::Mutex};
+use std::{
+    collections::VecDeque,
+    fs,
+    sync::{Mutex, atomic::AtomicU64},
+};
 
 #[derive(Clone, Debug)]
 struct Recorded {
@@ -74,6 +78,352 @@ fn conversation(session: &ModelSession) -> Conversation {
     conv.append_user("Inspect sim:0.", session.wire.as_ref())
         .unwrap();
     conv
+}
+
+struct DeadlineScript {
+    clock: Arc<tests::TestClock>,
+    responses: Mutex<VecDeque<(u64, u16, Value)>>,
+    timeouts: Mutex<Vec<Duration>>,
+}
+impl DeadlineScript {
+    fn install(deps: &mut Deps, responses: Vec<(u64, u16, Value)>) -> Arc<Self> {
+        let clock = Arc::new(tests::TestClock(AtomicU64::new(1_000)));
+        let script = Arc::new(Self {
+            clock: clock.clone(),
+            responses: Mutex::new(responses.into()),
+            timeouts: Mutex::new(Vec::new()),
+        });
+        deps.clock = clock.clone();
+        deps.http = Arc::new(Http::with_transport_and_timer(
+            script.clone(),
+            Arc::new(move || Duration::from_millis(clock.now_ms())),
+        ));
+        script
+    }
+}
+impl Transport for DeadlineScript {
+    fn send(&self, request: &HttpRequest<'_>) -> Result<HttpResponse, ProviderError> {
+        self.timeouts.lock().unwrap().push(request.timeout.unwrap());
+        let (elapsed, status, body) = self.responses.lock().unwrap().pop_front().unwrap();
+        self.clock.0.fetch_add(elapsed, Ordering::Relaxed);
+        Ok(HttpResponse {
+            status,
+            headers: Headers::new(),
+            body: serde_json::to_vec(&body).unwrap(),
+        })
+    }
+}
+
+#[test]
+fn effort_fallback_reuses_the_remaining_absolute_deadline() {
+    let provider = ProviderId::DeepSeek;
+    let (mut deps, _, _) = deps(provider, Vec::new());
+    let script = DeadlineScript::install(
+        &mut deps,
+        vec![
+            (
+                3_000,
+                400,
+                json!({"error":{"message":"effort is unsupported"}}),
+            ),
+            (1_000, 200, end_reply(provider)),
+        ],
+    );
+    let mut session = ModelSession::resolve(
+        &deps,
+        provider,
+        ProviderSettings::default(),
+        Mode::Run,
+        false,
+    )
+    .unwrap();
+    let mut conv = conversation(&session);
+    let reply = session
+        .request_until(&mut conv, &deps, &AtomicBool::new(false), 6_000)
+        .unwrap();
+    assert_eq!(reply.stop, Stop::EndTurn);
+    assert!(conv.effort_suppressed);
+    assert_eq!(
+        *script.timeouts.lock().unwrap(),
+        [Duration::from_secs(5), Duration::from_secs(2)]
+    );
+    fs::remove_dir_all(deps.log_directory).unwrap();
+}
+
+#[test]
+fn expired_effort_errors_and_late_replies_never_start_another_attempt() {
+    let provider = ProviderId::DeepSeek;
+    for (status, body) in [
+        (400, json!({"error":{"message":"effort is unsupported"}})),
+        (200, end_reply(provider)),
+    ] {
+        let (mut deps, _, _) = deps(provider, Vec::new());
+        let script = DeadlineScript::install(&mut deps, vec![(5_000, status, body)]);
+        let mut session = ModelSession::resolve(
+            &deps,
+            provider,
+            ProviderSettings::default(),
+            Mode::Run,
+            false,
+        )
+        .unwrap();
+        let mut conv = conversation(&session);
+        let error = session
+            .request_until(&mut conv, &deps, &AtomicBool::new(false), 6_000)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ProviderError>().unwrap().kind,
+            ProviderErrorKind::Timeout
+        );
+        assert_eq!(script.timeouts.lock().unwrap().len(), 1);
+        assert_eq!(conv.turns.len(), 1, "late data is never retained");
+        conv.check_invariant().unwrap();
+        fs::remove_dir_all(deps.log_directory).unwrap();
+    }
+}
+
+struct TimedCredentials {
+    clock: Arc<tests::TestClock>,
+    elapsed: u64,
+    timeouts: Mutex<Vec<Duration>>,
+}
+impl CredentialResolver for TimedCredentials {
+    fn resolve(
+        &self,
+        _id: ProviderId,
+        _settings: &ProviderSettings,
+    ) -> Result<ResolvedCredentials> {
+        panic!("bounded initialization must use the bounded credential hook")
+    }
+    fn resolve_bounded(
+        &self,
+        id: ProviderId,
+        settings: &ProviderSettings,
+        timeout: Duration,
+        _cancel: &AtomicBool,
+    ) -> Result<ResolvedCredentials> {
+        self.timeouts.lock().unwrap().push(timeout);
+        self.clock.0.fetch_add(self.elapsed, Ordering::Relaxed);
+        tests::Credentials(Default::default()).resolve(id, settings)
+    }
+}
+
+#[test]
+fn initialization_shares_one_deadline_across_credentials_and_vision_metadata() {
+    for auth_elapsed in [2_000, 5_000] {
+        let provider = ProviderId::Anthropic;
+        let (mut deps, _, _) = deps(provider, Vec::new());
+        let script = DeadlineScript::install(
+            &mut deps,
+            vec![(1_000, 200, json!({"capabilities":{"vision":true}}))],
+        );
+        let credentials = Arc::new(TimedCredentials {
+            clock: script.clock.clone(),
+            elapsed: auth_elapsed,
+            timeouts: Mutex::new(Vec::new()),
+        });
+        deps.credentials = credentials.clone();
+        let result = ModelSession::resolve_until(
+            &deps,
+            provider,
+            ProviderSettings {
+                model: Some(format!("claude-deadline-fixture-{auth_elapsed}")),
+                ..Default::default()
+            },
+            Mode::Run,
+            true,
+            6_000,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(
+            *credentials.timeouts.lock().unwrap(),
+            [Duration::from_secs(5)]
+        );
+        if auth_elapsed == 2_000 {
+            assert!(result.is_ok());
+            assert_eq!(*script.timeouts.lock().unwrap(), [Duration::from_secs(3)]);
+        } else {
+            let error = result.err().unwrap();
+            assert_eq!(
+                error.downcast_ref::<ProviderError>().unwrap().kind,
+                ProviderErrorKind::Timeout
+            );
+            assert!(script.timeouts.lock().unwrap().is_empty());
+        }
+        fs::remove_dir_all(deps.log_directory).unwrap();
+    }
+}
+
+struct VertexCredentials {
+    epoch: AtomicU64,
+    refreshed: Mutex<Vec<ProviderSettings>>,
+    express: bool,
+    unavailable: bool,
+}
+impl VertexCredentials {
+    fn new(express: bool, unavailable: bool) -> Arc<Self> {
+        Arc::new(Self {
+            epoch: AtomicU64::new(0),
+            refreshed: Mutex::new(Vec::new()),
+            express,
+            unavailable,
+        })
+    }
+    fn auth(&self, epoch: u64) -> Auth {
+        Auth::Header {
+            name: if self.express {
+                "x-goog-api-key"
+            } else {
+                "authorization"
+            },
+            value: zeroize::Zeroizing::new(format!("Bearer adc-refresh-{epoch}")),
+            quota_project: Some("pinned-quota".into()),
+        }
+    }
+}
+impl CredentialResolver for VertexCredentials {
+    fn resolve(&self, id: ProviderId, settings: &ProviderSettings) -> Result<ResolvedCredentials> {
+        let mut resolved = tests::Credentials(Default::default()).resolve(id, settings)?;
+        resolved.auth = self.auth(0);
+        Ok(resolved)
+    }
+    fn refresh_vertex(
+        &self,
+        settings: &ProviderSettings,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<Auth> {
+        assert!(timeout <= Duration::from_secs(120));
+        assert!(!cancel.load(Ordering::Relaxed));
+        self.refreshed.lock().unwrap().push(settings.clone());
+        ensure!(
+            !self.unavailable,
+            "Google Cloud access token could not be refreshed"
+        );
+        Ok(self.auth(self.epoch.fetch_add(1, Ordering::Relaxed) + 1))
+    }
+}
+struct VertexTransport {
+    script: Script,
+    epochs: Mutex<Vec<u64>>,
+}
+impl Transport for VertexTransport {
+    fn send(&self, request: &HttpRequest<'_>) -> Result<HttpResponse, ProviderError> {
+        let Auth::Header { value, .. } = request.auth else {
+            panic!("expected ADC header")
+        };
+        let epoch = value
+            .strip_prefix("Bearer adc-refresh-")
+            .unwrap()
+            .parse()
+            .unwrap();
+        self.epochs.lock().unwrap().push(epoch);
+        self.script.send(request)
+    }
+}
+
+fn vertex_settings() -> ProviderSettings {
+    ProviderSettings {
+        model: Some("claude-sonnet-5-5".into()),
+        project: Some("factory-project".into()),
+        location: Some("global".into()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn plan_requests_refresh_vertex_adc_without_changing_routing_or_opaque_history() {
+    let provider = ProviderId::Vertex;
+    let (mut deps, _, _) = deps(provider, Vec::new());
+    let credentials = VertexCredentials::new(false, false);
+    deps.credentials = credentials.clone();
+    let first = json!({"content":[{"type":"thinking","thinking":"Inspecting the frame.","signature":"unchanged-opaque-signature+/="},{"type":"text","text":"Ready."}],"stop_reason":"end_turn"});
+    let script = VertexTransport {
+        script: Script {
+            responses: Mutex::new(
+                [first.clone(), end_reply(ProviderId::Anthropic)]
+                    .into_iter()
+                    .map(|body| HttpResponse {
+                        status: 200,
+                        headers: Headers::new(),
+                        body: serde_json::to_vec(&body).unwrap(),
+                    })
+                    .collect(),
+            ),
+            requests: Mutex::new(Vec::new()),
+        },
+        epochs: Mutex::new(Vec::new()),
+    };
+    let transport = Arc::new(script);
+    deps.http = Arc::new(Http::with_transport(transport.clone()));
+    let mut session =
+        ModelSession::resolve(&deps, provider, vertex_settings(), Mode::Plan, false).unwrap();
+    let endpoint = session.endpoint.url.clone();
+    let settings = serde_json::to_value(&session.settings).unwrap();
+    let mut conv = conversation(&session);
+    let reply = session
+        .request(&mut conv, &deps, &AtomicBool::new(false))
+        .unwrap();
+    conv.push_reply(reply).unwrap();
+    conv.append_user("Inspect again.", session.wire.as_ref())
+        .unwrap();
+    deps.settings.provider = Some(ProviderId::DeepSeek);
+    session
+        .request(&mut conv, &deps, &AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(*transport.epochs.lock().unwrap(), [1, 2]);
+    let requests = transport.script.requests.lock().unwrap();
+    assert_eq!(requests[1].body["messages"][1]["content"], first["content"]);
+    assert!(requests.iter().all(|request| request.url == endpoint));
+    assert_eq!(session.provider, provider);
+    assert_eq!(session.model, "claude-sonnet-5-5");
+    assert_eq!(serde_json::to_value(&session.settings).unwrap(), settings);
+    assert_eq!(credentials.refreshed.lock().unwrap().len(), 2);
+    assert!(
+        credentials
+            .refreshed
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|value| serde_json::to_value(value).unwrap() == settings)
+    );
+    drop(requests);
+    fs::remove_dir_all(deps.log_directory).unwrap();
+}
+
+#[test]
+fn vertex_refresh_errors_do_not_send_and_express_keys_do_not_refresh() {
+    for express in [false, true] {
+        let provider = ProviderId::Vertex;
+        let (mut deps, _, _) = deps(provider, Vec::new());
+        let credentials = VertexCredentials::new(express, true);
+        deps.credentials = credentials.clone();
+        let script = Script::install(
+            &mut deps,
+            vec![(
+                200,
+                json!({"candidates":[{"content":{"role":"model","parts":[{"text":"Ready."}]},"finishReason":"STOP"}]}),
+            )],
+        );
+        let mut settings = vertex_settings();
+        if express {
+            settings.model = Some("gemini-3.5-flash".into());
+        }
+        let mut session =
+            ModelSession::resolve(&deps, provider, settings, Mode::Plan, false).unwrap();
+        assert_eq!(session.needs_credentials_refresh(), !express);
+        let mut conv = conversation(&session);
+        let result = session.request(&mut conv, &deps, &AtomicBool::new(false));
+        assert_eq!(result.is_ok(), express);
+        assert_eq!(script.requests.lock().unwrap().len(), usize::from(express));
+        assert_eq!(
+            credentials.refreshed.lock().unwrap().len(),
+            usize::from(!express)
+        );
+        assert_eq!(conv.turns.len(), 1);
+        conv.check_invariant().unwrap();
+        fs::remove_dir_all(deps.log_directory).unwrap();
+    }
 }
 
 #[test]

@@ -2855,7 +2855,7 @@ fn schema() -> Value {
     });
     contract["capture"]["result"] = json!({
         "capture":"{files:[path],frames:[{id,width,height,pixel_format,timestamp_ns,bytes,wall_ms,file?}],count,context?,destination?,queued_uploads?,queued?:[{file,upload_id,key,url}]}",
-        "record":"{forwarding,forwarding_id,since_ms,until_ms?,path?,stopped?}; path is the local recording file; until_ms is when the session stops a timed recording; with --duration, stopped is {forwarding:null,by:\"duration\"} when the session ended it on time, else the conditional-stop result",
+        "record":"{forwarding,forwarding_id,since_ms,until_ms?,path?,stopped?}; path is the local recording file; until_ms is the nominal UTC deadline for a timed recording; elapsed time and computer sleep count, and backward clock changes do not extend it; with --duration, stopped is {forwarding:null,by:\"duration\"} when the session ended it on time, else the conditional-stop result",
         "status":"forwarding_id and forwarding_since_ms per camera and at the top level while forwarding, and forwarding_until_ms while a timed recording or forward runs",
         "conditional_stop":{"rpc":{"op":"stop_forward_if","forwarding_id":"32 lowercase hexadecimal characters"},"behavior":"Stops only the acknowledged forwarding instance. A different current identity is refused without stopping it. Timed CLI fallback and assistant cleanup use this form; explicit human stop-forward stops the current instance."}
     });
@@ -3508,9 +3508,9 @@ impl TimedRecording {
             };
         if !ours {
             let grace = RECORDING_GRACE.as_millis() as u64;
-            let on_time = self
-                .until_ms
-                .is_some_and(|until| now_ms.saturating_add(grace) >= until);
+            let on_time = self.until_ms.is_some_and(|until| {
+                now_ms.saturating_add(grace) >= until || elapsed >= self.duration
+            });
             return if on_time && !self.errors.newer_in(&status) {
                 RecordingWait::Finished
             } else {
@@ -4498,6 +4498,9 @@ mod tests {
             assert_eq!(timed.next(stopped, now, s(30), false), Finished);
         }
         assert_eq!(timed.next(stopped, since + 30_000, s(30), true), Finished);
+        // The worker's monotonic timer can finish while UTC is still behind
+        // its nominal deadline after a system-clock rollback.
+        assert_eq!(timed.next(stopped, since - 60_000, s(30), false), Finished);
         // Another participant's newer recording is not this one to stop.
         let newer = status(true, Some(since + 30_500), earlier, logged);
         assert_eq!(timed.next(newer, since + 31_000, s(33), false), Finished);

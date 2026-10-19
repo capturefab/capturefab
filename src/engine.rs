@@ -48,6 +48,44 @@ impl Counters {
         self.fps_bits.store(fps.to_bits(), Ordering::Relaxed);
     }
 }
+
+/// A timed forward keeps elapsed time already credited by the wall clock.
+/// Forward jumps (including sleep) count; a later rollback cannot take that
+/// time back or prolong the recording beyond its remaining duration.
+#[derive(Clone, Debug)]
+struct ForwardClock {
+    forwarding_id: String,
+    anchor_ms: u64,
+    anchor: Instant,
+}
+impl ForwardClock {
+    fn now_ms(&mut self, wall_ms: u64, now: Instant) -> u64 {
+        let elapsed_ms = u64::try_from(now.saturating_duration_since(self.anchor).as_millis())
+            .unwrap_or(u64::MAX);
+        let floor = self.anchor_ms.saturating_add(elapsed_ms);
+        if wall_ms > floor {
+            self.anchor_ms = wall_ms;
+            self.anchor = now;
+            wall_ms
+        } else {
+            floor
+        }
+    }
+}
+
+/// A stale caller's rejected stop did not fail the camera or its current
+/// recording. Keep the refusal distinct from encoder stop/commit failures.
+#[derive(Debug)]
+struct ForwardChanged;
+impl std::fmt::Display for ForwardChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the recording changed before it could be stopped; the current recording was preserved",
+        )
+    }
+}
+impl std::error::Error for ForwardChanged {}
+
 #[derive(Clone)]
 pub struct WorkerHandle {
     sender: SyncSender<Envelope>,
@@ -63,6 +101,8 @@ pub struct WorkerHandle {
     saved: Arc<Mutex<crate::dataset::SavedLog>>,
     /// The local recording in progress, reported when it stops.
     recording: Arc<Mutex<Option<crate::scheduling::RecordingMeta>>>,
+    /// Private timing state, bound to the exact worker-issued forward ID.
+    forward_clock: Arc<Mutex<Option<ForwardClock>>>,
     /// Output numbers handed out, so concurrent captures never share a name.
     names: Arc<Mutex<crate::naming::Namer>>,
 }
@@ -92,6 +132,7 @@ impl WorkerHandle {
             capture_session: Arc::default(),
             saved: Arc::default(),
             recording: Arc::default(),
+            forward_clock: Arc::default(),
             names: Arc::default(),
         };
         let worker_handle = handle.clone();
@@ -508,6 +549,7 @@ fn end_forward(
         }
         None => Ok(()),
     };
+    *h.forward_clock.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // Last: whoever sees the forward gone (a client waiting out a timed
     // recording, say) finds its file finished and reported.
     let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
@@ -535,7 +577,24 @@ fn finish_timed_forward(
     auto: &mut Option<AutoController>,
     now_ms: u64,
 ) {
-    let due = forward_due(&h.state.read().unwrap_or_else(|e| e.into_inner()), now_ms);
+    finish_timed_forward_at(h, forwarder, auto, now_ms, Instant::now());
+}
+fn finish_timed_forward_at(
+    h: &WorkerHandle,
+    forwarder: &mut Option<(Forwarder, f64)>,
+    auto: &mut Option<AutoController>,
+    wall_ms: u64,
+    now: Instant,
+) {
+    let due = {
+        let state = h.state.read().unwrap_or_else(|e| e.into_inner());
+        let mut clock = h.forward_clock.lock().unwrap_or_else(|e| e.into_inner());
+        let now_ms = clock
+            .as_mut()
+            .filter(|clock| state.forwarding_id.as_deref() == Some(clock.forwarding_id.as_str()))
+            .map_or(wall_ms, |clock| clock.now_ms(wall_ms, now));
+        forward_due(&state, now_ms)
+    };
     let (Some(duration_ms), Some((f, _))) = (due, forwarder.as_ref()) else {
         return;
     };
@@ -951,6 +1010,12 @@ fn process_plain(
             let since_ms = crate::scheduling::now_ms();
             // The worker loop stops a timed forward at this wall-clock time.
             let until_ms = duration_ms.map(|duration| since_ms.saturating_add(duration));
+            *h.forward_clock.lock().unwrap_or_else(|e| e.into_inner()) =
+                duration_ms.map(|_| ForwardClock {
+                    forwarding_id: forwarding_id.clone(),
+                    anchor_ms: since_ms,
+                    anchor: Instant::now(),
+                });
             let shown = crate::media::redact_url(&output);
             {
                 let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
@@ -983,7 +1048,7 @@ fn process_plain(
         SessionCommand::StopForwardIf { forwarding_id } => {
             ensure!(
                 h.snapshot().forwarding_id.as_deref() == Some(forwarding_id.as_str()),
-                "the recording changed before it could be stopped; the current recording was preserved"
+                ForwardChanged
             );
             stop_forward(h, forwarder, auto)?;
             Ok(json!({"forwarding":null}))
@@ -1859,6 +1924,7 @@ fn worker(h: WorkerHandle, rx: Receiver<Envelope>) {
             );
             if let Err(err) = &result
                 && !inspection
+                && !err.is::<ForwardChanged>()
             {
                 h.log("error", format!("{err:#}"));
             }
@@ -2084,6 +2150,152 @@ mod tests {
         }
     }
     #[test]
+    fn recording_clock_keeps_elapsed_time_across_wall_clock_rollbacks() {
+        let epoch = Instant::now();
+        let mut clock = ForwardClock {
+            forwarding_id: "11111111111111111111111111111111".into(),
+            anchor_ms: 1_000,
+            anchor: epoch,
+        };
+        assert_eq!(clock.now_ms(500, epoch + Duration::from_secs(1)), 2_000);
+        // A forward wall jump counts time spent asleep even on a platform
+        // whose Instant does not advance during system sleep.
+        assert_eq!(clock.now_ms(20_000, epoch + Duration::from_secs(1)), 20_000);
+        assert_eq!(clock.now_ms(0, epoch + Duration::from_secs(2)), 21_000);
+        assert_eq!(clock.now_ms(0, epoch + Duration::from_secs(3)), 22_000);
+        assert_eq!(
+            clock.now_ms(u64::MAX, epoch + Duration::from_secs(4)),
+            u64::MAX
+        );
+        assert_eq!(clock.now_ms(0, epoch + Duration::from_secs(5)), u64::MAX);
+    }
+
+    #[test]
+    fn timed_forward_ends_after_credited_sleep_even_if_wall_time_rolls_back() {
+        // Commands run without an acquisition loop: no frame reaches the
+        // encoder, so neither FFmpeg nor a network connection is involved.
+        let h = WorkerHandle::new();
+        let mut camera = None;
+        let mut forwarder = None;
+        let mut auto = None;
+        let mut run =
+            |camera: &mut Option<Camera>, forwarder: &mut Option<(Forwarder, f64)>, command| {
+                process(
+                    &h,
+                    camera,
+                    forwarder,
+                    &mut auto,
+                    &mut Vec::new(),
+                    &mut 1,
+                    &mut false,
+                    command,
+                )
+            };
+        run(
+            &mut camera,
+            &mut forwarder,
+            SessionCommand::Connect {
+                camera: "sim:0".into(),
+                timeout_ms: 100,
+            },
+        )
+        .unwrap();
+        let target = Path::new("udp://127.0.0.1:9");
+        let reply = run(
+            &mut camera,
+            &mut forwarder,
+            timed_forward(target, Some(2_000)),
+        )
+        .unwrap();
+        let since = reply["since_ms"].as_u64().unwrap();
+        let clock = h.forward_clock.lock().unwrap().clone().unwrap();
+        assert_eq!(reply["forwarding_id"], clock.forwarding_id);
+        finish_timed_forward_at(&h, &mut forwarder, &mut None, since + 1_000, clock.anchor);
+        assert!(forwarder.is_some());
+        finish_timed_forward_at(
+            &h,
+            &mut forwarder,
+            &mut None,
+            since - 1_000,
+            clock.anchor + Duration::from_millis(999),
+        );
+        assert!(
+            forwarder.is_some(),
+            "not before its remaining elapsed duration"
+        );
+        finish_timed_forward_at(
+            &h,
+            &mut forwarder,
+            &mut None,
+            since - 1_000,
+            clock.anchor + Duration::from_secs(1),
+        );
+        assert!(
+            forwarder.is_none(),
+            "a wall rollback cannot extend the credited duration"
+        );
+        assert!(h.forward_clock.lock().unwrap().is_none());
+        assert!(h.snapshot().forwarding_until_ms.is_none());
+        assert_eq!(
+            h.snapshot().logs.last().unwrap().message,
+            "Forwarding finished after 2 s"
+        );
+        run(&mut camera, &mut forwarder, timed_forward(target, None)).unwrap();
+        assert!(
+            h.forward_clock.lock().unwrap().is_none(),
+            "untimed forwarding has no deadline clock"
+        );
+        finish_timed_forward_at(
+            &h,
+            &mut forwarder,
+            &mut None,
+            u64::MAX,
+            clock.anchor + Duration::from_secs(10),
+        );
+        assert!(forwarder.is_some());
+        run(&mut camera, &mut forwarder, SessionCommand::StopForward).unwrap();
+        h.shutdown();
+    }
+
+    #[test]
+    fn stale_conditional_stop_does_not_report_a_camera_or_recording_failure() {
+        let h = WorkerHandle::new();
+        let current = "11111111111111111111111111111111";
+        // A cached active report is enough to exercise the worker's actual
+        // reply/error path; no camera or encoder is opened by this fixture.
+        {
+            let mut state = h.state.write().unwrap();
+            state.forwarding = Some("clip.mkv".into());
+            state.forwarding_id = Some(current.into());
+            state.last_error = Some("an earlier unrelated error".into());
+        }
+        let before = h.snapshot();
+        let error = h
+            .request(SessionCommand::StopForwardIf {
+                forwarding_id: "22222222222222222222222222222222".into(),
+            })
+            .unwrap_err();
+        assert!(error.is::<ForwardChanged>());
+        let after = h.snapshot();
+        assert_eq!(after.forwarding_id.as_deref(), Some(current));
+        assert_eq!(after.last_error, before.last_error);
+        assert_eq!(after.logs.len(), before.logs.len());
+        // Ordinary camera errors still reach last_error; the exemption is
+        // specific to a stale identity, not every conditional stop failure.
+        let error = h
+            .request(SessionCommand::Set {
+                feature: "Gain".into(),
+                value: "1".into(),
+            })
+            .unwrap_err();
+        assert!(!error.is::<ForwardChanged>());
+        let after = h.snapshot();
+        assert_eq!(after.logs.last().unwrap().level, "error");
+        assert_ne!(after.last_error, before.last_error);
+        h.shutdown();
+    }
+
+    #[test]
     fn conditional_stop_preserves_a_replacement_with_the_same_start_time_and_output() {
         // No acquisition loop runs here, so the encoder never starts and
         // no FFmpeg, socket connection or saved recording is needed.
@@ -2122,6 +2334,15 @@ mod tests {
         .unwrap();
         let first_id = first["forwarding_id"].as_str().unwrap().to_owned();
         assert!(crate::session::valid_forwarding_id(&first_id));
+        assert_eq!(
+            h.forward_clock
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .forwarding_id,
+            first_id
+        );
         run(
             &mut camera,
             &mut forwarder,
@@ -2131,6 +2352,7 @@ mod tests {
         )
         .unwrap();
         assert!(h.snapshot().forwarding_id.is_none());
+        assert!(h.forward_clock.lock().unwrap().is_none());
         let next = run(
             &mut camera,
             &mut forwarder,
@@ -2139,6 +2361,12 @@ mod tests {
         .unwrap();
         let next_id = next["forwarding_id"].as_str().unwrap().to_owned();
         assert_ne!(first_id, next_id);
+        let replacement_clock = h.forward_clock.lock().unwrap().clone().unwrap();
+        assert_eq!(replacement_clock.forwarding_id, next_id);
+        assert_eq!(
+            replacement_clock.anchor_ms,
+            next["since_ms"].as_u64().unwrap()
+        );
         {
             let mut state = h.state.write().unwrap();
             state.forwarding_since_ms = first["since_ms"].as_u64();
@@ -2162,6 +2390,10 @@ mod tests {
         assert_eq!(after.forwarding, before.forwarding);
         assert_eq!(after.forwarding_id, before.forwarding_id);
         assert_eq!(after.forwarding_until_ms, before.forwarding_until_ms);
+        let after_clock = h.forward_clock.lock().unwrap().clone().unwrap();
+        assert_eq!(after_clock.forwarding_id, replacement_clock.forwarding_id);
+        assert_eq!(after_clock.anchor, replacement_clock.anchor);
+        assert_eq!(after_clock.anchor_ms, replacement_clock.anchor_ms);
         run(
             &mut camera,
             &mut forwarder,
@@ -2174,6 +2406,7 @@ mod tests {
         assert!(forwarder.is_none());
         assert!(stopped.forwarding_id.is_none());
         assert!(stopped.forwarding_until_ms.is_none());
+        assert!(h.forward_clock.lock().unwrap().is_none());
         h.shutdown();
     }
     #[test]

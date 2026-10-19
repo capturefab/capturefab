@@ -601,8 +601,8 @@ impl<'a> Executor<'a> {
     }
 
     /// Acknowledged camera commands from the latest step remain available
-    /// when a later restart fails. They contain no stream command results,
-    /// whose temporary credentials require additional caller-side scrubbing.
+    /// when a later restart or verification fails. Forward acknowledgements
+    /// retain only their opaque identity, never stream command results.
     pub fn acknowledged(&self) -> &[Value] {
         &self.acknowledged
     }
@@ -667,17 +667,19 @@ impl<'a> Executor<'a> {
         {
             self.tokens.push((camera.clone(), token.into()));
         }
-        if !forward {
-            self.acknowledged.push(redact::for_output(result.clone()));
-        }
-        if let Some(before) = before.filter(|_| forward) {
-            self.verify_forward(&camera, &before, duration_ms, started, &result)?;
+        if forward {
             if let Some(id) = result["forwarding_id"]
                 .as_str()
                 .filter(|id| crate::session::valid_forwarding_id(id))
             {
+                self.acknowledged.push(json!({"forwarding_id":id}));
                 self.forwarders.insert(camera.clone(), id.into());
             }
+        } else {
+            self.acknowledged.push(redact::for_output(result.clone()));
+        }
+        if let Some(before) = before.filter(|_| forward) {
+            self.verify_forward(&camera, &before, duration_ms, started, &result)?;
         }
         if stops_forward {
             self.forwarders.remove(&camera);
@@ -717,18 +719,13 @@ impl<'a> Executor<'a> {
                     "The recording or stream changed while it was starting."
                 );
             }
-            let reached_deadline = until_ms.map_or_else(
-                || {
-                    duration_ms.is_some_and(|duration| {
-                        started.elapsed().as_millis() >= u128::from(duration)
-                    })
-                },
-                |until| {
+            let reached_deadline = duration_ms
+                .is_some_and(|duration| started.elapsed().as_millis() >= u128::from(duration))
+                || until_ms.is_some_and(|until| {
                     SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .is_ok_and(|now| now.as_millis() >= u128::from(until))
-                },
-            );
+                });
             if seen && !forwarding && reached_deadline {
                 return Ok(());
             }
@@ -2015,6 +2012,21 @@ mod tests {
     }
 
     #[test]
+    fn forward_verification_accepts_elapsed_duration_after_wall_clock_rollback() {
+        let before = fixture_snapshot();
+        let host = FakeHost::new(before.clone());
+        Executor::new(&host, &EmptySecrets)
+            .verify_forward(
+                "sim:0",
+                &before,
+                Some(1_000),
+                Instant::now() - Duration::from_secs(2),
+                &json!({"forwarding":"short.mp4","until_ms":u64::MAX}),
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn forward_verification_observes_a_late_startup_error() {
         let mut before = fixture_snapshot();
         let camera = before
@@ -2052,6 +2064,61 @@ mod tests {
                 .to_string()
                 .contains("encoder failed")
         );
+    }
+
+    #[test]
+    fn accepted_forward_identity_survives_a_failed_verification_without_stream_secrets() {
+        struct LostStatus(FakeHost, std::sync::atomic::AtomicUsize);
+        impl ToolHost for LostStatus {
+            fn snapshot(&self) -> Result<crate::session::SessionSnapshot> {
+                ensure!(
+                    self.1.fetch_add(1, Ordering::Relaxed) != 1,
+                    "status temporarily unavailable"
+                );
+                self.0.snapshot()
+            }
+            fn execute(&self, camera: Option<&str>, command: SessionCommand) -> Result<Value> {
+                self.0.execute(camera, command)
+            }
+            fn has_session(&self) -> bool {
+                true
+            }
+        }
+        let id = "0123456789abcdef0123456789abcdef";
+        let host = LostStatus(
+            FakeHost::new(fixture_snapshot()).reply(
+                "forward",
+                Ok(
+                    json!({"forwarding_id":id,"forwarding":"rtmps://h/live/private-key",
+                          "diagnostic":"private-key"}),
+                ),
+            ),
+            std::sync::atomic::AtomicUsize::new(0),
+        );
+        let mut executor = Executor::new(&host, &EmptySecrets);
+        let mut checked = step("stream_to_url", json!({"camera":"sim:0"}));
+        checked.ops.push(Op::Command {
+            camera: CameraRef::Connected("sim:0".into()),
+            command: forward("rtmps://h/live/private-key"),
+        });
+        assert!(
+            executor
+                .run_step(&checked, &AtomicBool::new(false))
+                .is_err()
+        );
+        assert_eq!(executor.acknowledged(), &[json!({"forwarding_id":id})]);
+        assert_eq!(
+            executor.forwarders.get("sim:0").map(String::as_str),
+            Some(id)
+        );
+        checked.ops = vec![Op::StopForward {
+            camera: CameraRef::Connected("sim:0".into()),
+            forwarding_id: None,
+        }];
+        executor
+            .run_step(&checked, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(host.0.sent()[1].1["forwarding_id"], id);
     }
 
     #[test]

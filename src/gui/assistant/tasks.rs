@@ -980,10 +980,22 @@ impl State {
                     self.in_flight = false;
                     self.clear_approval();
                     if let Err(failure) = result {
-                        self.error = Some(failure.message);
-                        self.provider_excerpt = failure.excerpt;
-                        if self.outcome.is_none() {
-                            self.snapshot.state = RunState::Failed;
+                        if self.outcome.is_none()
+                            && self
+                                .running
+                                .as_ref()
+                                .is_some_and(|r| r.control.cancel().load(Ordering::SeqCst))
+                        {
+                            self.snapshot.state = RunState::Stopped;
+                            self.snapshot.summary = "The assistant task was stopped.".into();
+                            self.error = None;
+                            self.provider_excerpt = None;
+                        } else {
+                            self.error = Some(failure.message);
+                            self.provider_excerpt = failure.excerpt;
+                            if self.outcome.is_none() {
+                                self.snapshot.state = RunState::Failed;
+                            }
                         }
                     }
                     self.running = None;

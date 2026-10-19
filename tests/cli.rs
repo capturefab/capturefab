@@ -4008,12 +4008,47 @@ fn tools_setting_exposure_changes_the_frame_and_undo_restores_it() {
         brighter["exposure"]["mean"].as_f64().unwrap() > mean + 0.15,
         "before {baseline}; after {brighter}"
     );
+    // A separate CLI process cannot prove the token belongs to its run.
+    // The shared policy therefore requires approval before undoing it.
+    let undo_args = serde_json::json!({"camera":"sim:0","token":token});
+    let denied = tools_output(
+        &dir,
+        &cwd,
+        &[
+            "--json",
+            "--session",
+            "tools-ci",
+            "--actor",
+            "tools-integration",
+            "--actor-kind",
+            "agent",
+            "tools",
+            "call",
+            "undo_camera_change",
+            "--args",
+            &undo_args.to_string(),
+        ],
+        None,
+    );
+    assert_eq!(denied.status.code(), Some(2));
+    assert_eq!(
+        tools_response(&denied)["error"]["details"]["risk"],
+        "disruptive"
+    );
+    let unchanged = tools_call(&dir, &cwd, "inspect_frame", inspect.clone(), &[]);
+    assert!(
+        (unchanged["exposure"]["mean"].as_f64().unwrap()
+            - brighter["exposure"]["mean"].as_f64().unwrap())
+        .abs()
+            < 0.1,
+        "an unapproved undo changed the frame: before {brighter}; after {unchanged}"
+    );
     tools_call(
         &dir,
         &cwd,
         "undo_camera_change",
-        serde_json::json!({"camera":"sim:0","token":token}),
-        &[],
+        undo_args,
+        &["--confirmed-by-user"],
     );
     let restored = tools_call(&dir, &cwd, "inspect_frame", inspect, &[]);
     assert!(

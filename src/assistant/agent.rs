@@ -108,11 +108,53 @@ impl Clock for SystemClock {
 }
 pub trait CredentialResolver: Send + Sync {
     fn resolve(&self, id: ProviderId, settings: &ProviderSettings) -> Result<ResolvedCredentials>;
+    fn resolve_bounded(
+        &self,
+        id: ProviderId,
+        settings: &ProviderSettings,
+        _timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<ResolvedCredentials> {
+        ensure!(
+            !cancel.load(Ordering::Relaxed),
+            "The assistant task was stopped."
+        );
+        self.resolve(id, settings)
+    }
+    /// Refresh only the Google Cloud identity of an existing Vertex ADC
+    /// session. Native resolution never falls back to an express API key.
+    fn refresh_vertex(
+        &self,
+        settings: &ProviderSettings,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<Auth> {
+        Ok(self
+            .resolve_bounded(ProviderId::Vertex, settings, timeout, cancel)?
+            .auth)
+    }
 }
 pub struct NativeCredentials;
 impl CredentialResolver for NativeCredentials {
     fn resolve(&self, id: ProviderId, settings: &ProviderSettings) -> Result<ResolvedCredentials> {
         credentials::resolve_with_settings(id, settings)
+    }
+    fn resolve_bounded(
+        &self,
+        id: ProviderId,
+        settings: &ProviderSettings,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<ResolvedCredentials> {
+        credentials::resolve_with_settings_bounded(id, settings, timeout, cancel)
+    }
+    fn refresh_vertex(
+        &self,
+        _settings: &ProviderSettings,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<Auth> {
+        credentials::refresh_google_bounded(timeout, cancel)
     }
 }
 pub trait ContextSource: Send + Sync {
@@ -134,6 +176,7 @@ impl ContextSource for NativeContext {
     }
 }
 
+#[derive(Clone)]
 pub struct Deps {
     pub host: Arc<dyn ToolHost>,
     pub settings: Settings,
@@ -175,8 +218,8 @@ impl Deps {
     }
 }
 
-/// Authentication and endpoint routing are fixed once per turn/run. The
-/// model never supplies either one, and requests reuse this Auth across rounds.
+/// Endpoint routing is fixed once per turn/run. Google Cloud access tokens
+/// refresh through the same credential chain without changing that routing.
 pub struct ModelSession {
     pub provider: ProviderId,
     pub model: String,
@@ -199,7 +242,51 @@ impl ModelSession {
         mode: Mode,
         allow_images: bool,
     ) -> Result<Self> {
-        let resolved = deps.credentials.resolve(id, &settings)?;
+        Self::resolve_inner(
+            deps,
+            id,
+            settings,
+            mode,
+            allow_images,
+            None,
+            &AtomicBool::new(false),
+        )
+    }
+    pub fn resolve_until(
+        deps: &Deps,
+        id: ProviderId,
+        settings: ProviderSettings,
+        mode: Mode,
+        allow_images: bool,
+        wall_deadline_ms: u64,
+        cancel: &AtomicBool,
+    ) -> Result<Self> {
+        Self::resolve_inner(
+            deps,
+            id,
+            settings,
+            mode,
+            allow_images,
+            Some(wall_deadline_ms),
+            cancel,
+        )
+    }
+    fn resolve_inner(
+        deps: &Deps,
+        id: ProviderId,
+        settings: ProviderSettings,
+        mode: Mode,
+        allow_images: bool,
+        deadline_ms: Option<u64>,
+        cancel: &AtomicBool,
+    ) -> Result<Self> {
+        let resolved = match deadline_budget(deps, deadline_ms, cancel)? {
+            Some(timeout) => deps
+                .credentials
+                .resolve_bounded(id, &settings, timeout, cancel)?,
+            None => deps.credentials.resolve(id, &settings)?,
+        };
+        deadline_budget(deps, deadline_ms, cancel)?;
         let settings = resolved.settings;
         let model = settings.model(id).to_owned();
         let endpoints = provider::endpoints(id, &settings, &model).map_err(|issues| {
@@ -224,10 +311,19 @@ impl ModelSession {
             && mode_setting == VisionMode::Auto
             && vision_cache().get(&key, deps.clock.now_ms()).is_none()
         {
-            metadata(deps, id, &model, &settings, &resolved.auth)
+            metadata(
+                deps,
+                id,
+                &model,
+                &settings,
+                &resolved.auth,
+                deadline_ms,
+                cancel,
+            )
         } else {
             None
         };
+        deadline_budget(deps, deadline_ms, cancel)?;
         let vision = vision_cache().resolve(
             &key,
             mode_setting,
@@ -265,13 +361,78 @@ impl ModelSession {
         deps: &Deps,
         cancel: &AtomicBool,
     ) -> Result<ModelReply> {
+        conv.check_invariant()?;
+        if self.needs_credentials_refresh() {
+            self.auth = Self::refresh_credentials(deps, &self.settings, cancel, None)?;
+        }
+        self.request_inner(conv, deps, cancel, None)
+    }
+    pub fn needs_credentials_refresh(&self) -> bool {
+        self.provider == ProviderId::Vertex
+            && matches!(
+                self.auth,
+                Auth::Header {
+                    name: "authorization",
+                    ..
+                }
+            )
+    }
+    /// The runtime runs this operation in its bounded credential worker and
+    /// installs only Auth after checking cancellation and the run deadline.
+    pub fn refresh_credentials_until(
+        deps: &Deps,
+        settings: &ProviderSettings,
+        cancel: &AtomicBool,
+        wall_deadline_ms: u64,
+    ) -> Result<Auth> {
+        Self::refresh_credentials(deps, settings, cancel, Some(wall_deadline_ms))
+    }
+    fn refresh_credentials(
+        deps: &Deps,
+        settings: &ProviderSettings,
+        cancel: &AtomicBool,
+        deadline_ms: Option<u64>,
+    ) -> Result<Auth> {
+        let timeout =
+            deadline_budget(deps, deadline_ms, cancel)?.unwrap_or(Duration::from_secs(120));
+        let auth = deps.credentials.refresh_vertex(settings, timeout, cancel)?;
+        deadline_budget(deps, deadline_ms, cancel)?;
+        ensure!(
+            matches!(
+                &auth,
+                Auth::Header {
+                    name: "authorization",
+                    ..
+                }
+            ),
+            "Google Cloud credentials are no longer available. Sign in again before continuing."
+        );
+        Ok(auth)
+    }
+    pub fn request_until(
+        &mut self,
+        conv: &mut Conversation,
+        deps: &Deps,
+        cancel: &AtomicBool,
+        wall_deadline_ms: u64,
+    ) -> Result<ModelReply> {
+        self.request_inner(conv, deps, cancel, Some(wall_deadline_ms))
+    }
+    fn request_inner(
+        &mut self,
+        conv: &mut Conversation,
+        deps: &Deps,
+        cancel: &AtomicBool,
+        deadline_ms: Option<u64>,
+    ) -> Result<ModelReply> {
         ensure!(
             !cancel.load(Ordering::Relaxed),
             "The assistant task was stopped."
         );
         conv.check_invariant()?;
         for attempt in 0..=1 {
-            let request = self.build(conv)?;
+            deadline_budget(deps, deadline_ms, cancel)?;
+            let mut request = self.build(conv)?;
             // Missing-usage estimates include every image, including fresh
             // checkpoint images represented only in the raw wire history.
             let request_value: Value = serde_json::from_slice(&request.body)?;
@@ -297,6 +458,13 @@ impl ModelSession {
             let input_bytes = text_bytes(&request_value).saturating_add(
                 usize::try_from(image_tokens.saturating_mul(3)).unwrap_or(usize::MAX),
             );
+            if let Some(remaining) = deadline_budget(deps, deadline_ms, cancel)? {
+                request.timeout = Some(
+                    request
+                        .timeout
+                        .map_or(remaining, |timeout| timeout.min(remaining)),
+                );
+            }
             conv.mark_sent()?;
             match deps.http.post_json(request, cancel) {
                 Ok((body, headers)) => {
@@ -304,6 +472,7 @@ impl ModelSession {
                         !cancel.load(Ordering::Relaxed),
                         "The assistant task was stopped."
                     );
+                    deadline_budget(deps, deadline_ms, cancel)?;
                     super::http::reject_credential_reflection(&body, &self.auth)?;
                     let mut reply = self.wire.parse(&body, &headers)?;
                     if reply.usage.estimated {
@@ -314,9 +483,11 @@ impl ModelSession {
                             text_bytes(&body),
                         );
                     }
+                    deadline_budget(deps, deadline_ms, cancel)?;
                     return Ok(reply);
                 }
                 Err(error) => {
+                    deadline_budget(deps, deadline_ms, cancel)?;
                     if vision::is_image_rejection(
                         error.status,
                         error.excerpt.as_deref().unwrap_or_default(),
@@ -360,6 +531,8 @@ fn metadata(
     model: &str,
     settings: &ProviderSettings,
     auth: &Auth,
+    deadline_ms: Option<u64>,
+    cancel: &AtomicBool,
 ) -> Option<Value> {
     let base = settings
         .base_url
@@ -382,16 +555,39 @@ fn metadata(
     } else {
         HttpRequest::get(url, auth)
     };
-    request.timeout = Some(Duration::from_secs(10));
+    let remaining = deadline_budget(deps, deadline_ms, cancel).ok()?;
+    request.timeout = Some(remaining.map_or(Duration::from_secs(10), |left| {
+        left.min(Duration::from_secs(10))
+    }));
     if id == ProviderId::Anthropic {
         request
             .headers
             .push(("anthropic-version".into(), "2023-06-01".into()));
     }
     deps.http
-        .send_json(request, &AtomicBool::new(false))
+        .send_json(request, cancel)
         .ok()
         .map(|(value, _)| value)
+}
+
+fn deadline_budget(
+    deps: &Deps,
+    deadline_ms: Option<u64>,
+    cancel: &AtomicBool,
+) -> Result<Option<Duration>> {
+    ensure!(
+        !cancel.load(Ordering::Relaxed),
+        "The assistant task was stopped."
+    );
+    deadline_ms
+        .map(|deadline| {
+            let remaining = deadline.saturating_sub(deps.clock.now_ms());
+            if remaining == 0 {
+                return Err(ProviderError::new(ProviderErrorKind::Timeout).into());
+            }
+            Ok(Duration::from_millis(remaining))
+        })
+        .transpose()
 }
 
 /// Text bytes only. Encoded pixel data is accounted as image tokens, rather

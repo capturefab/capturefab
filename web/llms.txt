@@ -134,6 +134,7 @@ Keep the GUI, headless session or direct command active for the schedule lifetim
 
 `record` is an alias for `forward`.
 `record --duration 30s` keeps the CLI active until the camera worker stops the encoder at the deadline.
+Elapsed time and computer sleep count. A backward clock change does not extend the recording.
 Ctrl-C stops the encoder early.
 This works with temporary workers and persistent sessions.
 RPC and workflow `forward` commands use `duration_ms` for the same limit.
@@ -180,7 +181,7 @@ A recording result gives the resolved file in `path` and the start time in `sinc
 Forward replies and active status include an opaque 32-character lowercase hexadecimal `forwarding_id`.
 RPC `{"op":"stop_forward_if","forwarding_id":"ID"}` stops only that instance and refuses a replacement.
 Timed CLI fallback and assistant recording cleanup use that identity. Explicit human stop-forward stops the current recording.
-A timed recording result also gives the stop time in `until_ms`; `status` shows it in `forwarding_until_ms`.
+A timed recording result also gives the nominal UTC deadline in `until_ms`; `status` shows it in `forwarding_until_ms`.
 When the session stops a timed recording on time, `record --duration` returns `"stopped":{"forwarding":null,"by":"duration"}`.
 The desktop saves to `~/Capturefab/{date}/{camera}-{datetime}-{seq}.png` by default.
 
@@ -297,6 +298,8 @@ Environment keys precede the saved key for that provider.
 OpenAI, Gemini and Anthropic keys are shared with prompt measurements.
 Vertex uses Google Cloud credentials or a Gemini express key.
 Claude on Vertex must have Google Cloud credentials.
+ADC model requests renew cached access tokens when due. The endpoint and conversation stay fixed.
+An existing ADC session never switches to an express key.
 Bedrock uses a bearer token or AWS SigV4 credentials.
 `key remove PROVIDER` removes the saved key, not an environment key.
 Never put secrets in prompts, arguments, URLs or plan files.
@@ -340,6 +343,7 @@ The chosen provider's data terms apply.
 
 Limits cover rounds, wall time, tokens, images, captures, bytes, recordings, duration and setting changes.
 They also limit consecutive errors and identical calls.
+Wall time includes credential lookup, provider retries and approval waits.
 Read defaults and ceilings from `schema --json`.
 Cost limits must have user-entered model prices; estimates are not a bill.
 `wait_for` checks wall time, human changes and cancellation in 250 ms slices.

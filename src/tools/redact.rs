@@ -182,6 +182,18 @@ fn drop_keys(value: &mut Value) {
     match value {
         Value::Array(values) => values.iter_mut().for_each(drop_keys),
         Value::Object(fields) => {
+            // GenICam metadata and history store identifiers as named values,
+            // rather than as `serial`/`address` object keys. Keep the feature
+            // name useful for reasoning without sending its identifying data.
+            if fields
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(identifying_feature)
+            {
+                for key in ["value", "before", "after", "choices", "error"] {
+                    fields.remove(key);
+                }
+            }
             fields.retain(|key, _| {
                 !MODEL_DROPPED.contains(&key.as_str()) && !SECRET_FIELDS.contains(&key.as_str())
             });
@@ -189,6 +201,19 @@ fn drop_keys(value: &mut Value) {
         }
         _ => {}
     }
+}
+
+fn identifying_feature(name: &str) -> bool {
+    let name: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    name.contains("serial")
+        || name.ends_with("address")
+        || name.contains("subnetmask")
+        || name.ends_with("gateway")
+        || matches!(name.as_str(), "deviceid" | "gevscda" | "gevmcda")
 }
 
 fn hide_secret_fields(value: &mut Value) {
@@ -450,6 +475,36 @@ mod tests {
         for text in [output.to_string(), model.to_string()] {
             assert!(!text.contains("stream-password") && !text.contains("aws-secret"));
         }
+    }
+
+    #[test]
+    fn model_redaction_omits_identifiers_in_named_camera_values() {
+        let features = json!([
+            {"name":"DeviceSerialNumber","value":"SN-private","kind":"String"},
+            {"name":"DeviceID","value":"factory-private"},
+            {"name":"GevCurrentIPAddress","value":3232235785_u64},
+            {"name":"GevDeviceMACAddress","value":123456789_u64},
+            {"name":"GevSCDA","value":3232235786_u64},
+            {"name":"GevPersistentDefaultGateway","value":3232235777_u64},
+            {"name":"DeviceSerialNumber","before":"old-private","after":"new-private",
+             "choices":["choice-private"],"error":"error-private"},
+            {"name":"ExposureTime","value":1200},
+            {"name":"DeviceUserID","value":"Line 1"}
+        ]);
+        assert_eq!(for_output(features.clone()), features);
+        let model = for_model(json!({"snapshot":{"features":features}}));
+        let text = model.to_string();
+        for identifier in [
+            "private",
+            "3232235785",
+            "123456789",
+            "3232235786",
+            "3232235777",
+        ] {
+            assert!(!text.contains(identifier), "{identifier} leaked: {text}");
+        }
+        assert_eq!(model["snapshot"]["features"][7]["value"], 1200);
+        assert_eq!(model["snapshot"]["features"][8]["value"], "Line 1");
     }
 
     #[test]

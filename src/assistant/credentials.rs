@@ -11,8 +11,8 @@ use std::{
     fs::File,
     io::Read as _,
     path::{Path, PathBuf},
-    sync::atomic::AtomicBool,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use zeroize::Zeroizing;
 
@@ -79,8 +79,27 @@ pub(super) trait Source {
     fn file(&self, path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>>;
     fn gcloud(&self) -> Result<Option<PathBuf>>;
     fn run_gcloud(&self, path: &Path) -> Result<Zeroizing<String>>;
+    fn run_gcloud_bounded(
+        &self,
+        path: &Path,
+        _timeout: Duration,
+        _cancel: &AtomicBool,
+    ) -> Result<Zeroizing<String>> {
+        self.run_gcloud(path)
+    }
+
     fn metadata_allowed(&self) -> bool;
     fn send_json(&self, req: http::HttpRequest<'_>) -> Result<(Value, http::Headers)>;
+    fn send_json_bounded(
+        &self,
+        mut req: http::HttpRequest<'_>,
+        timeout: Duration,
+        _cancel: &AtomicBool,
+    ) -> Result<(Value, http::Headers)> {
+        req.timeout = Some(req.timeout.unwrap_or(timeout).min(timeout));
+        self.send_json(req)
+    }
+
     fn aws_chain(&self, profile: Option<&str>) -> Result<(crate::aws::Keys, String)>;
     fn aws_region(&self, profile: &str) -> Option<String>;
     fn now(&self) -> u64 {
@@ -141,6 +160,14 @@ impl Source for NativeSource {
     fn run_gcloud(&self, path: &Path) -> Result<Zeroizing<String>> {
         google::run_gcloud(path)
     }
+    fn run_gcloud_bounded(
+        &self,
+        path: &Path,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<Zeroizing<String>> {
+        google::run_gcloud_bounded(path, timeout, cancel)
+    }
 
     fn metadata_allowed(&self) -> bool {
         google::native_metadata_allowed(self)
@@ -152,6 +179,15 @@ impl Source for NativeSource {
             .map_err(Into::into)
     }
 
+    fn send_json_bounded(
+        &self,
+        mut req: http::HttpRequest<'_>,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<(Value, http::Headers)> {
+        req.timeout = Some(req.timeout.unwrap_or(timeout).min(timeout));
+        http::Http::new().send_json(req, cancel).map_err(Into::into)
+    }
     fn aws_chain(&self, profile: Option<&str>) -> Result<(crate::aws::Keys, String)> {
         crate::aws::bedrock_chain(profile)
     }
@@ -162,6 +198,74 @@ impl Source for NativeSource {
 
     fn cache_tokens(&self) -> bool {
         true
+    }
+}
+
+/// One startup budget spans every credential lookup and token refresh. OS
+/// keychain/file calls may finish late; the runtime discards their result and
+/// this wrapper prevents subsequent network or subprocess work after expiry.
+struct BoundedSource<'a> {
+    inner: &'a dyn Source,
+    deadline: Instant,
+    cancel: &'a AtomicBool,
+}
+impl BoundedSource<'_> {
+    fn remaining(&self) -> Result<Duration> {
+        ensure!(
+            !self.cancel.load(Ordering::SeqCst),
+            "The assistant task was stopped."
+        );
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(http::ProviderError::new(http::ProviderErrorKind::Timeout).into());
+        }
+        Ok(remaining)
+    }
+    fn checked<T>(&self, run: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.remaining()?;
+        let result = run();
+        self.remaining()?;
+        result
+    }
+}
+impl Source for BoundedSource<'_> {
+    fn environment(&self, name: &str) -> Result<Option<String>> {
+        self.checked(|| self.inner.environment(name))
+    }
+    fn keychain(&self, account: &str) -> Result<Option<String>> {
+        self.checked(|| self.inner.keychain(account))
+    }
+    fn file(&self, path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        self.checked(|| self.inner.file(path))
+    }
+    fn gcloud(&self) -> Result<Option<PathBuf>> {
+        self.checked(|| self.inner.gcloud())
+    }
+    fn run_gcloud(&self, path: &Path) -> Result<Zeroizing<String>> {
+        let remaining = self.remaining()?;
+        self.checked(|| self.inner.run_gcloud_bounded(path, remaining, self.cancel))
+    }
+    fn metadata_allowed(&self) -> bool {
+        self.remaining().is_ok() && self.inner.metadata_allowed()
+    }
+    fn send_json(&self, req: http::HttpRequest<'_>) -> Result<(Value, http::Headers)> {
+        let remaining = self.remaining()?;
+        self.checked(|| self.inner.send_json_bounded(req, remaining, self.cancel))
+    }
+    fn aws_chain(&self, profile: Option<&str>) -> Result<(crate::aws::Keys, String)> {
+        self.checked(|| self.inner.aws_chain(profile))
+    }
+    fn aws_region(&self, profile: &str) -> Option<String> {
+        self.remaining().ok()?;
+        let region = self.inner.aws_region(profile);
+        self.remaining().ok()?;
+        region
+    }
+    fn now(&self) -> u64 {
+        self.inner.now()
+    }
+    fn cache_tokens(&self) -> bool {
+        self.inner.cache_tokens()
     }
 }
 
@@ -481,6 +585,44 @@ pub fn resolve_with_settings(
     resolve_in(&NativeSource, id, settings)
 }
 
+pub fn resolve_with_settings_bounded(
+    id: ProviderId,
+    settings: &ProviderSettings,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<ResolvedCredentials> {
+    let source = BoundedSource {
+        inner: &NativeSource,
+        deadline: Instant::now() + timeout,
+        cancel,
+    };
+    source.checked(|| resolve_in(&source, id, settings))
+}
+
+/// An established ADC session must keep using Google Cloud credentials. A
+/// later missing ADC file must never change it to an express or saved API key.
+pub(super) fn refresh_google_bounded(timeout: Duration, cancel: &AtomicBool) -> Result<Auth> {
+    let source = BoundedSource {
+        inner: &NativeSource,
+        deadline: Instant::now() + timeout,
+        cancel,
+    };
+    source.checked(|| refresh_google_in(&source))
+}
+
+fn refresh_google_in(source: &dyn Source) -> Result<Auth> {
+    let token = google::resolve(source)?.ok_or_else(|| {
+        anyhow!(
+            "Google Cloud credentials are no longer available. Sign in again before continuing."
+        )
+    })?;
+    Ok(Auth::Header {
+        name: "authorization",
+        value: Zeroizing::new(format!("Bearer {}", token.value.as_str())),
+        quota_project: token.quota_project,
+    })
+}
+
 fn resolve_in(
     source: &dyn Source,
     id: ProviderId,
@@ -745,6 +887,92 @@ mod tests {
             Auth::Header { name, value, .. } => (name, value),
             _ => panic!("expected a header"),
         }
+    }
+
+    #[test]
+    fn adc_refresh_uses_the_google_cache_and_never_falls_back_to_an_express_key() {
+        let mut source = Stub::default().vars(&[
+            ("GOOGLE_APPLICATION_CREDENTIALS", "/refresh-fixture.json"),
+            ("GOOGLE_CLOUD_API_KEY", "express-key-must-not-be-used"),
+        ]);
+        source.cache = true;
+        source.key = Some("saved-key-must-not-be-used".into());
+        source.clock.set(50_000);
+        source.files.insert(
+            "/refresh-fixture.json".into(),
+            serde_json::to_vec(&serde_json::json!({
+                "type":"authorized_user", "client_id":"refresh-fixture-client",
+                "client_secret":"refresh-fixture-secret", "refresh_token":"refresh-fixture-token",
+                "quota_project_id":"refresh-quota"
+            }))
+            .unwrap(),
+        );
+        for token in ["first-access-token", "second-access-token"] {
+            source.responses.borrow_mut().push_back((
+                serde_json::json!({"access_token":token,"token_type":"Bearer","expires_in":3600}),
+                Default::default(),
+            ));
+        }
+        assert_eq!(
+            header_value(&refresh_google_in(&source).unwrap()).1,
+            "Bearer first-access-token"
+        );
+        source.clock.set(53_299);
+        assert_eq!(
+            header_value(&refresh_google_in(&source).unwrap()).1,
+            "Bearer first-access-token"
+        );
+        assert_eq!(source.requests.borrow().len(), 1);
+        source.clock.set(53_300);
+        let auth = refresh_google_in(&source).unwrap();
+        assert_eq!(header_value(&auth).1, "Bearer second-access-token");
+        assert!(
+            matches!(auth, Auth::Header { quota_project:Some(ref project), .. } if project=="refresh-quota")
+        );
+        assert_eq!(source.requests.borrow().len(), 2);
+        source.files.clear();
+        assert!(
+            refresh_google_in(&source).is_err(),
+            "missing ADC must not use express credentials"
+        );
+        assert_eq!(source.called("keychain:"), 0);
+        assert_eq!(source.called("env:GOOGLE_CLOUD_API_KEY"), 0);
+    }
+
+    #[test]
+    fn bounded_sources_stop_before_any_side_effect_and_cap_each_auth_request() {
+        let source = Stub::default();
+        let cancel = AtomicBool::new(true);
+        let bounded = BoundedSource {
+            inner: &source,
+            deadline: Instant::now() + Duration::from_secs(1),
+            cancel: &cancel,
+        };
+        assert!(resolve_in(&bounded, ProviderId::OpenAi, &ProviderSettings::default()).is_err());
+        assert!(source.calls.borrow().is_empty());
+        cancel.store(false, Ordering::SeqCst);
+        let expired = BoundedSource {
+            inner: &source,
+            deadline: Instant::now(),
+            cancel: &cancel,
+        };
+        assert!(expired.environment("OPENAI_API_KEY").is_err());
+        assert!(source.calls.borrow().is_empty());
+        source
+            .responses
+            .borrow_mut()
+            .push_back((serde_json::json!({"ok":true}), http::Headers::new()));
+        let bounded = BoundedSource {
+            inner: &source,
+            deadline: Instant::now() + Duration::from_secs(2),
+            cancel: &cancel,
+        };
+        let mut request = http::HttpRequest::get("https://example.test/token", &Auth::None);
+        request.timeout = Some(Duration::from_secs(90));
+        bounded.send_json(request).unwrap();
+        let requests = source.requests.borrow();
+        assert!(requests[0].timeout.unwrap() <= Duration::from_secs(2));
+        assert!(!requests[0].timeout.unwrap().is_zero());
     }
 
     #[test]

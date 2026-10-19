@@ -68,6 +68,48 @@ pub fn hwaccel() -> String {
         .unwrap_or_else(|| "auto".into())
 }
 
+/// Credential-bearing query names use several case and separator conventions.
+/// Decode the name once, as URL query parsers do, while preserving the original
+/// spelling when the URL is redacted.
+pub(crate) fn credential_query_key(key: &str) -> bool {
+    let mut normalized = String::with_capacity(key.len());
+    let mut bytes = key.bytes();
+    while let Some(mut byte) = bytes.next() {
+        if byte == b'%' {
+            let high = bytes.next().and_then(|byte| (byte as char).to_digit(16));
+            let low = bytes.next().and_then(|byte| (byte as char).to_digit(16));
+            let (Some(high), Some(low)) = (high, low) else {
+                return false;
+            };
+            byte = (high * 16 + low) as u8;
+        }
+        if !matches!(byte, b'-' | b'_') {
+            normalized.push(char::from(byte.to_ascii_lowercase()));
+        }
+    }
+    matches!(
+        normalized.as_str(),
+        "password"
+            | "passphrase"
+            | "passwd"
+            | "token"
+            | "key"
+            | "auth"
+            | "secret"
+            | "accesstoken"
+            | "streamid"
+            | "apikey"
+            | "clientsecret"
+            | "xamzcredential"
+            | "xamzsignature"
+            | "xamzsecuritytoken"
+            | "xgoogcredential"
+            | "xgoogsignature"
+            | "xgoogsecuritytoken"
+            | "sig"
+    )
+}
+
 pub fn redact_url(url: &str) -> String {
     let mut result = url.to_string();
     if let Some(scheme_end) = result.find("://") {
@@ -86,18 +128,7 @@ pub fn redact_url(url: &str) -> String {
             .split('&')
             .map(|item| {
                 let (key, value) = item.split_once('=').unwrap_or((item, ""));
-                if matches!(
-                    key.to_ascii_lowercase().as_str(),
-                    "password"
-                        | "passphrase"
-                        | "passwd"
-                        | "token"
-                        | "key"
-                        | "auth"
-                        | "secret"
-                        | "access_token"
-                        | "streamid"
-                ) {
+                if credential_query_key(key) {
                     format!("{key}=<redacted>")
                 } else if value.is_empty() {
                     key.to_string()
@@ -3349,6 +3380,62 @@ mod tests {
         assert!(info("rtsp://camera/live").is_ok());
         assert!(info("concat:secret|other").is_err());
         assert!(info("rtsp://camera/live\n-x").is_err());
+    }
+    #[test]
+    fn query_credentials_are_redacted_across_case_separators_and_percent_encoding() {
+        for key in [
+            "api_key",
+            "API-Key",
+            "client_secret",
+            "ClIeNt-SeCrEt",
+            "X-Amz-Credential",
+            "x-AmZ-SiGnAtUrE",
+            "X-Amz-Security-Token",
+            "X-Goog-Credential",
+            "x-GoOg-SiGnAtUrE",
+            "X-Goog-Security-Token",
+            "sig",
+            "SiG",
+            "%61pI%5fkEy",
+            "%41PI%2dKeY",
+            "cLiEnT%5FsEcReT",
+            "%58-AmZ-%43reDential",
+            "X%2daMz%2dSiGnAtUrE",
+            "x-AmZ-sEcUrItY%2dtOkEn",
+            "%78-gOoG-CrEdEnTiAl",
+            "X%2DgOoG%2DsIgNaTuRe",
+            "x-GoOg-SeCuRiTy%2DtOkEn",
+            "%73%49%67",
+            "aCcEsS%5FtOkEn",
+            "%50aSsWoRd",
+        ] {
+            let url = format!("https://camera/stream?{key}=PRIVATE%2fvalue&fps=30");
+            assert!(credential_query_key(key), "{key}");
+            assert_eq!(
+                redact_url(&url),
+                format!("https://camera/stream?{key}=<redacted>&fps=30"),
+                "{key}"
+            );
+        }
+    }
+    #[test]
+    fn query_redaction_preserves_noncredential_parameters() {
+        let url = "https://camera/stream?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20261018T120000Z&X-Amz-Expires=60&X-Goog-SignedHeaders=host&sv=2026-02-06&se=2026-10-19&sp=r&fps=30&format=h264&request_id=value%2fkept";
+        assert_eq!(redact_url(url), url);
+        for key in [
+            "X-Amz-Date",
+            "X-Goog-Algorithm",
+            "expires",
+            "client_id",
+            "keyframe_interval",
+            "apikey_hint",
+            "api%252dkey",
+            "api%key",
+            "api%2",
+            "api%zzkey",
+        ] {
+            assert!(!credential_query_key(key), "{key}");
+        }
     }
     #[test]
     fn backend_urls_lowercase_only_the_scheme_and_keep_credentials_redacted() {

@@ -76,7 +76,7 @@ The OS credential-store service is `capturefab-ai`. Accounts use provider IDs ex
 
 For Vertex AI, Capturefab first resolves Google Cloud credentials: the explicit `GOOGLE_APPLICATION_CREDENTIALS` ADC file, the well-known gcloud ADC file, `gcloud` access-token fallback, then eligible Google Compute Engine metadata. An invalid explicit ADC file is an error. Supported ADC types are `service_account` and `authorized_user`; executable, URL and other external-account credential sources are refused. OAuth token exchange uses Google's fixed token endpoint. Metadata access uses the literal link-local address, only on an eligible machine, with no proxy.
 
-When no Google Cloud credential is available, Gemini on Vertex can use `GOOGLE_CLOUD_API_KEY`, then the saved `vertex` express key. Claude on Vertex must have Google Cloud credentials, a project and a location; an express API key cannot authorize it. Access tokens are cached until shortly before expiry. Credential status never performs these token-resolution operations.
+When no Google Cloud credential is available, Gemini on Vertex can use `GOOGLE_CLOUD_API_KEY`, then the saved `vertex` express key. Claude on Vertex must have Google Cloud credentials, a project and a location; an express API key cannot authorize it. Access tokens are cached until shortly before expiry. Vertex ADC model requests recheck that cache, including during long tasks. Renewal keeps the endpoint and conversation pinned and never switches an existing ADC session to an express key. Credential status never performs these token-resolution operations.
 
 For Bedrock, the bearer environment token wins. An explicit saved `profile`, `AWS_PROFILE`, or exported AWS credential fields selects SigV4 ahead of a saved Bedrock bearer token. Without such an AWS selection, the saved bearer token precedes the default AWS chain. Within the SigV4 chain, an explicit `--profile` ignores exported access keys; otherwise exported keys precede `AWS_PROFILE`, then the default profile. Partial or invalid exported keys are errors. SSO and `credential_process` profiles are refused with guidance. Region order is settings, `AWS_REGION`, `AWS_DEFAULT_REGION`, then the profile configuration.
 
@@ -220,7 +220,7 @@ Previews are JPEG or PNG, at most 1.5 MiB each and at most 1,568 pixels per dime
 | Approval timeout | 10 minutes | 1 second to 24 hours; also bounded by remaining wall time | `--approval-timeout` |
 | Interval between model requests | 1 second | At least 1 second | Settings file |
 
-Capturefab checks projected usage before each request and reserves tool resources before effects. It accounts for reported usage after the response. At 80 percent, it emits a notice. A reached limit stops new actions and produces a Capturefab-written `limit` report without another model call. Failed operations do not refund their reservations. Storage rules and no-overwrite checks still apply.
+Wall time includes credential lookup, provider retries and approval waits. Capturefab checks projected usage before each request and reserves tool resources before effects. It accounts for reported usage after the response. At 80 percent, it emits a notice. A reached limit stops new actions and produces a Capturefab-written `limit` report without another model call. Failed operations do not refund their reservations. Storage rules and no-overwrite checks still apply.
 
 Token usage is normalized across protocols, including cache and reasoning fields. When a provider omits usage, estimates use request text and image sizes. Cost estimates use user-entered USD prices per million tokens in `assistant.json`; no prices are supplied by default. Reported OpenRouter cost is used when present. Estimates are not a bill, and `--max-cost` must have known prices for the selected model.
 
@@ -228,7 +228,7 @@ Long conversations roll into new segments at round boundaries. A bounded checkpo
 
 ## Stop, take over and restore
 
-Ctrl-C or SIGTERM stops a CLI task. No new requests or actions start; a late provider reply is discarded. A blocking HTTP request can finish later, and an accepted camera command can finish. An internal live-view restart still attempts its final Start so cancellation does not leave the camera stopped by that internal sequence.
+Ctrl-C or SIGTERM stops a CLI task. No new requests or actions start; a late provider reply is discarded. A blocking HTTP request or OS credential lookup can finish later; late results are discarded. An accepted camera command can finish. An internal live-view restart still attempts its final Start so cancellation does not leave the camera stopped by that internal sequence.
 
 Stop does not undo work. The final report lists remaining recordings, schedules, auto mode and changed settings owned by the task. Examine these before stopping or changing other participants' work. To take over from the CLI, stop the task and explicitly address the camera with normal camera commands.
 

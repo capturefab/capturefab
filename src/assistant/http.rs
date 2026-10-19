@@ -166,13 +166,13 @@ impl<'a> HttpRequest<'a> {
             secrets: Vec::new(),
         }
     }
+}
 
-    fn known_secrets(&self) -> Vec<&str> {
-        let mut values: Vec<_> = self.secrets.iter().map(|value| value.as_str()).collect();
-        values.extend(auth_secrets(self.auth));
-        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-        values
-    }
+fn known_secrets<'a>(auth: &'a Auth, secrets: &'a [Zeroizing<String>]) -> Vec<&'a str> {
+    let mut values: Vec<_> = secrets.iter().map(|value| value.as_str()).collect();
+    values.extend(auth_secrets(auth));
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values
 }
 
 fn auth_secrets(auth: &Auth) -> Vec<&str> {
@@ -195,86 +195,144 @@ fn auth_secrets(auth: &Auth) -> Vec<&str> {
     }
 }
 
-/// A model response is retained verbatim for protocol replay. Refuse an
-/// authentication reflection before parsing it into text, calls or opaque
-/// history, rather than rewriting signed provider artifacts. OAuth exchanges
-/// deliberately do not call this: their successful response is a credential.
-pub(super) fn reject_credential_reflection(body: &Value, auth: &Auth) -> Result<(), ProviderError> {
-    fn contains(text: &str, known: &[&str]) -> bool {
-        let present = |bytes: &[u8]| {
-            let check = |text: &str| {
-                known
-                    .iter()
-                    .any(|secret| !secret.is_empty() && text.contains(secret))
-            };
-            match std::str::from_utf8(bytes) {
-                Ok(text) => check(text),
-                Err(_) => {
-                    let text = Zeroizing::new(String::from_utf8_lossy(bytes).into_owned());
-                    check(&text)
-                }
-            }
-        };
-        if present(text.as_bytes()) {
-            return true;
-        }
-        if !text.as_bytes().contains(&b'%') && !text.as_bytes().contains(&b'+') {
+fn reflected_text(text: &str, known: &[&str]) -> bool {
+    if known.iter().all(|secret| secret.is_empty()) {
+        return false;
+    }
+    let present = |text: &str| {
+        known
+            .iter()
+            .any(|secret| !secret.is_empty() && text.contains(secret))
+    };
+    if present(text) {
+        return true;
+    }
+    if !text.contains(['\\', '%', '+']) || text.len() > MAX_BODY_BYTES {
+        return false;
+    }
+    let mut current = Zeroizing::new(text.to_owned());
+    // Inspect decoded copies only. Bounded passes handle JSON strings inside
+    // function arguments and percent-encoded credentials without changing a
+    // provider's signed or opaque replay content.
+    for _ in 0..8 {
+        let next = decode_json_escapes(&current).or_else(|| decode_percent(&current));
+        let Some(next) = next else {
             return false;
-        }
-        // Decode percent escapes regardless of hex case, including escaped
-        // unreserved bytes. Invalid escapes stay literal. This temporary can
-        // contain the actual credential and is cleared when dropped.
-        let mut decoded = Zeroizing::new(Vec::with_capacity(text.len()));
-        let bytes = text.as_bytes();
-        let mut index = 0;
-        while index < bytes.len() {
-            if bytes[index] == b'%'
-                && let (Some(a), Some(b)) = (bytes.get(index + 1), bytes.get(index + 2))
-                && let (Some(a), Some(b)) = ((*a as char).to_digit(16), (*b as char).to_digit(16))
-            {
-                decoded.push((a * 16 + b) as u8);
-                index += 3;
-            } else {
-                decoded.push(bytes[index]);
-                index += 1;
-            }
-        }
-        if present(&decoded) {
+        };
+        current = next;
+        if present(&current) {
             return true;
         }
-        // Form encoding also uses + for a space. Check it separately so a
-        // real + in a bearer token is preserved by the ordinary URI check.
+    }
+    false
+}
+
+fn decode_json_escapes(text: &str) -> Option<Zeroizing<String>> {
+    fn hex4(chars: &mut std::str::Chars<'_>) -> Option<u32> {
+        (0..4).try_fold(0, |value, _| Some(value * 16 + chars.next()?.to_digit(16)?))
+    }
+    fn unicode(chars: &mut std::str::Chars<'_>) -> Option<char> {
+        let mut candidate = chars.clone();
+        let high = hex4(&mut candidate)?;
+        let code = if (0xd800..=0xdbff).contains(&high) {
+            if candidate.next()? != '\\' || candidate.next()? != 'u' {
+                return None;
+            }
+            let low = hex4(&mut candidate)?;
+            if !(0xdc00..=0xdfff).contains(&low) {
+                return None;
+            }
+            0x10000 + ((high - 0xd800) << 10) + low - 0xdc00
+        } else {
+            high
+        };
+        let decoded = char::from_u32(code)?;
+        *chars = candidate;
+        Some(decoded)
+    }
+    let mut out = Zeroizing::new(String::with_capacity(text.len()));
+    let mut chars = text.chars();
+    let mut changed = false;
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(escaped) = chars.next() else {
+            out.push(c);
+            break;
+        };
+        let decoded = match escaped {
+            '"' | '\\' | '/' => Some(escaped),
+            'b' => Some('\u{8}'),
+            'f' => Some('\u{c}'),
+            'n' => Some('\n'),
+            'r' => Some('\r'),
+            't' => Some('\t'),
+            'u' => unicode(&mut chars),
+            _ => None,
+        };
+        if let Some(decoded) = decoded {
+            out.push(decoded);
+            changed = true;
+        } else {
+            out.push(c);
+            out.push(escaped);
+        }
+    }
+    changed.then_some(out)
+}
+
+fn decode_percent(text: &str) -> Option<Zeroizing<String>> {
+    let mut decoded = Zeroizing::new(Vec::with_capacity(text.len()));
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    let mut changed = false;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let (Some(a), Some(b)) = (bytes.get(index + 1), bytes.get(index + 2))
+            && let (Some(a), Some(b)) = ((*a as char).to_digit(16), (*b as char).to_digit(16))
+        {
+            decoded.push((a * 16 + b) as u8);
+            index += 3;
+            changed = true;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    if !changed && decoded.contains(&b'+') {
+        // Keep literal + during URI decoding; only a later form-decoding
+        // pass changes it to a space, after checking the ordinary URI value.
         for byte in decoded.iter_mut().filter(|byte| **byte == b'+') {
             *byte = b' ';
         }
-        present(&decoded)
+        changed = true;
     }
-    fn reflected(value: &Value, known: &[&str], nested_json: u8) -> bool {
-        match value {
-            Value::String(text) => {
-                contains(text, known)
-                    // Chat and Responses carry function arguments as JSON
-                    // strings. Their own escapes are decoded by the wire
-                    // parser, after the outer HTTP JSON has been parsed.
-                    // Inspect bounded decoded copies without rewriting the
-                    // original signed or opaque provider content.
-                    || (nested_json < 8
-                        && text.len() <= MAX_BODY_BYTES
-                        && text.contains('\\')
-                        && serde_json::from_str::<Value>(text)
-                            .is_ok_and(|decoded| reflected(&decoded, known, nested_json + 1)))
-            }
-            Value::Array(values) => values
-                .iter()
-                .any(|value| reflected(value, known, nested_json)),
-            Value::Object(values) => values
-                .iter()
-                .any(|(key, value)| contains(key, known) || reflected(value, known, nested_json)),
-            _ => false,
-        }
+    changed.then(|| Zeroizing::new(String::from_utf8_lossy(&decoded).into_owned()))
+}
+
+fn has_credential_reflection(body: &Value, known: &[&str]) -> bool {
+    if known.is_empty() {
+        return false;
     }
-    let known = auth_secrets(auth);
-    if !known.is_empty() && reflected(body, &known, 0) {
+    match body {
+        Value::String(text) => reflected_text(text, known),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| has_credential_reflection(value, known)),
+        Value::Object(values) => values.iter().any(|(key, value)| {
+            reflected_text(key, known) || has_credential_reflection(value, known)
+        }),
+        _ => false,
+    }
+}
+
+/// A model response is retained verbatim for protocol replay. Refuse an
+/// authentication reflection before parsing it into text, calls or opaque
+/// history. Successful OAuth exchanges deliberately do not call this.
+pub(super) fn reject_credential_reflection(body: &Value, auth: &Auth) -> Result<(), ProviderError> {
+    if has_credential_reflection(body, &auth_secrets(auth)) {
         return Err(ProviderError::new(ProviderErrorKind::Malformed));
     }
     Ok(())
@@ -291,9 +349,11 @@ pub trait Transport: Send + Sync {
 }
 
 type Waiter = dyn Fn(Duration, &AtomicBool) -> bool + Send + Sync;
+type Timer = dyn Fn() -> Duration + Send + Sync;
 pub struct Http {
     transport: Arc<dyn Transport>,
     wait: Arc<Waiter>,
+    timer: Arc<Timer>,
 }
 impl Default for Http {
     fn default() -> Self {
@@ -305,9 +365,22 @@ impl Http {
         Self::with_transport(Arc::new(NativeTransport::new()))
     }
     pub fn with_transport(transport: Arc<dyn Transport>) -> Self {
+        let started = Instant::now();
         Self {
             transport,
             wait: Arc::new(wait_cancel),
+            timer: Arc::new(move || started.elapsed()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_transport_and_timer(
+        transport: Arc<dyn Transport>,
+        timer: Arc<Timer>,
+    ) -> Self {
+        Self {
+            timer,
+            ..Self::with_transport(transport)
         }
     }
 
@@ -323,25 +396,38 @@ impl Http {
 
     pub fn send_json(
         &self,
-        request: HttpRequest<'_>,
+        mut request: HttpRequest<'_>,
         cancel: &AtomicBool,
     ) -> Result<(Value, Headers), ProviderError> {
-        Address::parse(&request)?;
-        let known = request.known_secrets();
+        let address = Address::parse(&request)?;
+        let maximum = Duration::from_secs(if address.direct { 600 } else { 120 });
+        let budget = request.timeout.unwrap_or(maximum).min(maximum);
+        let started = (self.timer)();
+        let remaining = || budget.saturating_sub((self.timer)().saturating_sub(started));
+        let known = known_secrets(request.auth, &request.secrets);
         for attempt in 0..=2 {
             if cancel.load(Ordering::Relaxed) {
                 return Err(ProviderError::new(ProviderErrorKind::Rejected));
             }
+            let left = remaining();
+            if left.is_zero() {
+                return Err(ProviderError::new(ProviderErrorKind::Timeout));
+            }
+            request.timeout = Some(left);
             let response = self.transport.send(&request).map_err(|mut error| {
                 error.excerpt = error
                     .excerpt
                     .as_deref()
                     .map(|text| scrub_text(text, &known));
                 error
-            })?;
+            });
             if cancel.load(Ordering::Relaxed) {
                 return Err(ProviderError::new(ProviderErrorKind::Rejected));
             }
+            if remaining().is_zero() {
+                return Err(ProviderError::new(ProviderErrorKind::Timeout));
+            }
+            let response = response?;
             if response.body.len() > MAX_BODY_BYTES {
                 return Err(ProviderError {
                     status: Some(response.status),
@@ -368,8 +454,12 @@ impl Http {
                         .retry_after_s
                         .map(Duration::from_secs)
                         .unwrap_or(Duration::from_millis(500 * (attempt + 1)));
-                    if !(self.wait)(delay, cancel) {
+                    let left = remaining();
+                    if !(self.wait)(delay.min(left), cancel) {
                         return Err(ProviderError::new(ProviderErrorKind::Rejected));
+                    }
+                    if delay >= left {
+                        return Err(ProviderError::new(ProviderErrorKind::Timeout));
                     }
                     continue;
                 }
@@ -420,20 +510,7 @@ impl Address {
         // even when a caller percent-encodes their spelling.
         if decode_query(uri.query().unwrap_or_default())?
             .iter()
-            .any(|(name, _)| {
-                matches!(
-                    name.to_ascii_lowercase().as_str(),
-                    "password"
-                        | "passphrase"
-                        | "passwd"
-                        | "token"
-                        | "key"
-                        | "auth"
-                        | "secret"
-                        | "access_token"
-                        | "streamid"
-                )
-            })
+            .any(|(name, _)| crate::media::credential_query_key(name))
         {
             return Err(reject());
         }
@@ -757,6 +834,11 @@ fn scrub_text(text: &str, known: &[&str]) -> String {
             text = text.replace(&clean, "<redacted>");
         }
     }
+    if reflected_text(&text, known) {
+        // Raw values were replaced above. Omit the entire excerpt if a
+        // reversible encoding still carries a known authentication value.
+        return "<redacted>".into();
+    }
     text = crate::tools::redact::for_output_text(&text);
     let mut out = String::new();
     let mut rest = text.as_str();
@@ -904,6 +986,169 @@ mod tests {
     }
     fn no_wait(http: &mut Http) {
         http.wait = Arc::new(|_, cancel| !cancel.load(Ordering::Relaxed));
+    }
+
+    struct TimedScript {
+        now: Arc<std::sync::atomic::AtomicU64>,
+        responses: Mutex<VecDeque<(u64, HttpResponse)>>,
+        timeouts: Mutex<Vec<Duration>>,
+    }
+    impl Transport for TimedScript {
+        fn send(&self, request: &HttpRequest<'_>) -> Result<HttpResponse, ProviderError> {
+            self.timeouts.lock().unwrap().push(request.timeout.unwrap());
+            let (elapsed, response) = self.responses.lock().unwrap().pop_front().unwrap();
+            self.now.fetch_add(elapsed, Ordering::Relaxed);
+            Ok(response)
+        }
+    }
+    fn timed_http(responses: Vec<(u64, HttpResponse)>) -> (Http, Arc<TimedScript>) {
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let script = Arc::new(TimedScript {
+            now: now.clone(),
+            responses: Mutex::new(responses.into()),
+            timeouts: Mutex::new(Vec::new()),
+        });
+        let timer = now.clone();
+        let mut http = Http::with_transport_and_timer(
+            script.clone(),
+            Arc::new(move || Duration::from_millis(timer.load(Ordering::Relaxed))),
+        );
+        http.wait = Arc::new(move |delay, cancel| {
+            now.fetch_add(delay.as_millis().try_into().unwrap(), Ordering::Relaxed);
+            !cancel.load(Ordering::Relaxed)
+        });
+        (http, script)
+    }
+
+    #[test]
+    fn attempts_and_backoff_share_one_http_budget() {
+        let (http, script) = timed_http(vec![
+            (1_200, response(503, json!({"message":"busy"}))),
+            (800, response(200, json!({"ok":true}))),
+        ]);
+        let auth = Auth::None;
+        let mut request = HttpRequest::json("https://example.test/v1", &json!({}), &auth).unwrap();
+        request.timeout = Some(Duration::from_secs(3));
+        assert_eq!(
+            http.post_json(request, &AtomicBool::new(false)).unwrap().0["ok"],
+            true
+        );
+        assert_eq!(
+            *script.timeouts.lock().unwrap(),
+            [Duration::from_millis(3_000), Duration::from_millis(1_300)]
+        );
+        assert_eq!(script.now.load(Ordering::Relaxed), 2_500);
+    }
+
+    #[test]
+    fn retry_after_never_waits_past_the_remaining_http_budget() {
+        let mut limited = response(429, json!({"error":{"message":"quota"}}));
+        limited.headers.insert("retry-after".into(), "20".into());
+        let (http, script) = timed_http(vec![(1_000, limited)]);
+        let auth = Auth::None;
+        let mut request = HttpRequest::get("https://example.test/v1", &auth);
+        request.timeout = Some(Duration::from_secs(3));
+        assert_eq!(
+            http.send_json(request, &AtomicBool::new(false))
+                .unwrap_err()
+                .kind,
+            ProviderErrorKind::Timeout
+        );
+        assert_eq!(script.now.load(Ordering::Relaxed), 3_000);
+        assert_eq!(script.timeouts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn late_success_and_an_empty_http_budget_are_refused() {
+        for (budget, elapsed, calls) in [(2_000, 5_000, 1), (0, 0, 0)] {
+            let (http, script) = timed_http(vec![(elapsed, response(200, json!({"ok":true})))]);
+            let auth = Auth::None;
+            let mut request = HttpRequest::get("https://example.test/v1", &auth);
+            request.timeout = Some(Duration::from_millis(budget));
+            assert_eq!(
+                http.send_json(request, &AtomicBool::new(false))
+                    .unwrap_err()
+                    .kind,
+                ProviderErrorKind::Timeout
+            );
+            assert_eq!(script.timeouts.lock().unwrap().len(), calls);
+        }
+    }
+
+    #[test]
+    fn default_and_explicit_http_budgets_keep_the_native_transport_ceiling() {
+        for (url, requested, expected) in [
+            ("https://example.test/v1", None, 120),
+            ("http://127.0.0.1:1234/v1", None, 600),
+            (
+                "https://example.test/v1",
+                Some(Duration::from_secs(500)),
+                120,
+            ),
+        ] {
+            let (http, script) = timed_http(vec![(0, response(200, json!({"ok":true})))]);
+            let auth = Auth::None;
+            let mut request = HttpRequest::get(url, &auth);
+            request.timeout = requested;
+            http.send_json(request, &AtomicBool::new(false)).unwrap();
+            assert_eq!(
+                *script.timeouts.lock().unwrap(),
+                [Duration::from_secs(expected)]
+            );
+        }
+    }
+
+    #[test]
+    fn failed_http_scrubs_reversibly_encoded_auth_and_oauth_secrets() {
+        let token = "fixture/private+credential";
+        let percent: String = token.bytes().map(|byte| format!("%{byte:02x}")).collect();
+        let unicode: String = token.bytes().map(|byte| format!("\\u{byte:04x}")).collect();
+        for encoded in [
+            percent,
+            unicode.clone(),
+            crate::aws::uri_encode(&unicode, true),
+        ] {
+            for oauth in [false, true] {
+                let script = Arc::new(Script::new(vec![response(
+                    400,
+                    json!({"error":{"message":format!("Provider echoed {encoded}")}}),
+                )]));
+                let auth = if oauth {
+                    Auth::None
+                } else {
+                    Auth::Header {
+                        name: "authorization",
+                        value: Zeroizing::new(format!("Bearer {token}")),
+                        quota_project: None,
+                    }
+                };
+                let request = if oauth {
+                    HttpRequest::form(
+                        "https://example.test/token",
+                        &[("refresh_token", token)],
+                        &auth,
+                    )
+                } else {
+                    HttpRequest::get("https://example.test/v1", &auth)
+                };
+                let error = Http::with_transport(script)
+                    .send_json(request, &AtomicBool::new(false))
+                    .unwrap_err();
+                assert_eq!(error.kind, ProviderErrorKind::Rejected);
+                assert_eq!(error.status, Some(400));
+                assert_eq!(error.excerpt.as_deref(), Some("<redacted>"));
+                for forbidden in [token, encoded.as_str()] {
+                    assert!(!format!("{error:?} {}", error.details()).contains(forbidden));
+                }
+            }
+        }
+        assert_eq!(
+            scrub_text(
+                r"A literal \\u0041 is harmless without a known credential.",
+                &[]
+            ),
+            r"A literal \\u0041 is harmless without a known credential."
+        );
     }
 
     #[test]
@@ -1250,6 +1495,10 @@ mod tests {
             "https://alice:password@example.test",
             "https://example.test?key=private-key",
             "https://example.test?%6b%65%79=private-key",
+            "https://example.test?%61%70%69%5f%6b%65%79=private-key",
+            "https://example.test?CLIENT-SECRET=private-key",
+            "https://example.test?X-Amz-%53ignature=private-key",
+            "https://example.test?%73%69%67=private-key",
         ] {
             assert!(Address::parse(&HttpRequest::get(url, &auth)).is_err());
         }

@@ -172,6 +172,13 @@ immediately and continues until stopped; a direct command remains in the
 foreground. Acquisition keeps running after a recording ends; stop it separately
 when done.
 
+Timed recordings count elapsed time and computer sleep. Moving the system clock
+backward does not extend them. Forward replies and active status include
+`forwarding_id`, an opaque 32-character lowercase hexadecimal identity. RPC
+`stop_forward_if` with that identity refuses a replacement recording. Timed CLI
+fallback and assistant cleanup use it; explicit human `stop-forward` still stops
+the current recording.
+
 The per-file cap remains enforced regardless of elapsed time. Hitting it stops
 recording, removes the partial file and reports a storage error, so size
 `--max-file-size` (`max_file_bytes`) for the whole duration: at `4M`, about
@@ -252,8 +259,3 @@ Get-Content -Raw .\workflow.json | capturefab workflow validate - --json
 
 The stdin form resolves outputs in the current terminal directory. Shell users
 can similarly redirect stdin with `capturefab workflow validate - --json < workflow.json`.
-
-Forward replies and active status include `forwarding_id`, an opaque 32-character
-lowercase hexadecimal identity. RPC `stop_forward_if` with that identity refuses
-a replacement recording. Timed CLI fallback and assistant cleanup use it;
-explicit human `stop-forward` still stops the current recording.

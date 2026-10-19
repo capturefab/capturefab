@@ -248,6 +248,9 @@ mod tests {
             "rtsp://u@h/s",
             "srt://h?passphrase=x",
             "rtmp://h/live2/ABCDEFGH",
+            "rtsp://h/s?api_key=private",
+            "https://h/s?%58-Amz-Signature=private",
+            "https://h/s?sig=private",
         ] {
             let mut doc = document();
             doc.calls[0].args["camera"] = json!(value);

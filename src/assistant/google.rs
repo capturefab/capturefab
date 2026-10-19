@@ -21,7 +21,11 @@ use std::{
     io::Read as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Mutex, OnceLock, mpsc},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -556,6 +560,19 @@ fn find_on_path(path: &str, windows: bool, exists: impl Fn(&Path) -> bool) -> Op
 }
 
 pub(super) fn run_gcloud(path: &Path) -> Result<Zeroizing<String>> {
+    run_gcloud_bounded(path, Duration::from_secs(10), &AtomicBool::new(false))
+}
+
+pub(super) fn run_gcloud_bounded(
+    path: &Path,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<Zeroizing<String>> {
+    ensure!(
+        !cancel.load(Ordering::SeqCst) && !timeout.is_zero(),
+        GCLOUD_ERROR
+    );
+    let deadline = Instant::now() + timeout.min(Duration::from_secs(10));
     let mut command = gcloud_command(path);
     let mut child = command.spawn().map_err(|_| anyhow!(GCLOUD_ERROR))?;
     let stdout = child.stdout.take().ok_or_else(|| anyhow!(GCLOUD_ERROR))?;
@@ -565,12 +582,15 @@ pub(super) fn run_gcloud(path: &Path) -> Result<Zeroizing<String>> {
         let result = stdout.take(16386).read_to_end(&mut bytes).map(|_| bytes);
         let _ = sender.send(result);
     });
-    let started = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < Duration::from_secs(10) => {
-                thread::sleep(Duration::from_millis(25))
+            Ok(None) if !cancel.load(Ordering::SeqCst) && Instant::now() < deadline => {
+                thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(25)),
+                );
             }
             _ => {
                 let _ = child.kill();
@@ -581,13 +601,21 @@ pub(super) fn run_gcloud(path: &Path) -> Result<Zeroizing<String>> {
     };
     ensure!(status.success(), GCLOUD_ERROR);
     let bytes = receiver
-        .recv_timeout(Duration::from_millis(100))
+        .recv_timeout(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100)),
+        )
         .map_err(|_| anyhow!(GCLOUD_ERROR))?
         .map_err(|_| anyhow!(GCLOUD_ERROR))?;
     let value = std::str::from_utf8(&bytes)
         .map_err(|_| anyhow!(GCLOUD_ERROR))?
         .trim();
     validate_token(value).map_err(|_| anyhow!(GCLOUD_ERROR))?;
+    ensure!(
+        !cancel.load(Ordering::SeqCst) && Instant::now() < deadline,
+        GCLOUD_ERROR
+    );
     Ok(Zeroizing::new(value.to_owned()))
 }
 
@@ -600,6 +628,17 @@ fn gcloud_command(path: &Path) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     command
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn expired_or_cancelled_gcloud_budget_never_spawns_a_process() {
+        let path = Path::new("/this-test-must-never-run-gcloud");
+        assert!(run_gcloud_bounded(path, Duration::ZERO, &AtomicBool::new(false)).is_err());
+        assert!(run_gcloud_bounded(path, Duration::from_secs(1), &AtomicBool::new(true)).is_err());
+    }
 }
 
 #[cfg(test)]

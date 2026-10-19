@@ -529,3 +529,32 @@ fn failed_started_tasks_keep_their_log_and_require_new_task_before_editing() {
     assert!(state.editable());
     assert!(state.log_id().is_none());
 }
+
+#[test]
+fn cancellation_before_a_journal_starts_is_stopped_without_an_error() {
+    let mut state = State::with_services(Arc::new(worker::Unavailable));
+    let (sender, events) = std::sync::mpsc::sync_channel(1);
+    let (approver, approvals) = worker::GuiApprover::new();
+    let control = run::RunControl::default();
+    control.stop();
+    state.running = Some(worker::Running {
+        control,
+        events,
+        approver,
+        approvals,
+        done: Arc::new(AtomicBool::new(true)),
+    });
+    assert!(
+        sender
+            .send(worker::Event::Complete(Err(worker::Failure {
+                message: "The assistant task was stopped.".into(),
+                excerpt: None
+            })))
+            .is_ok()
+    );
+    state.tick(Instant::now());
+    assert_eq!(state.snapshot.state, RunState::Stopped);
+    assert!(state.error.is_none());
+    assert!(!state.active());
+    assert!(state.editable());
+}

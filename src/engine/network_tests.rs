@@ -142,6 +142,7 @@ impl Harness {
             history: Arc::default(),
             saved: Arc::default(),
             recording: Arc::default(),
+            forward_clock: Arc::default(),
             names: Arc::default(),
         };
         let mut harness = Self {
