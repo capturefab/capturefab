@@ -227,8 +227,22 @@ fn compact_purpose_guidance_and_primary_actions_fit_before_external_drive_shortc
                     && bounds.x1 <= f64::from(size.width) + 0.5
                     && bounds.y1 <= f64::from(size.height) + 0.5)
                 {
+                    let layout_dump: Vec<_> = snapshot
+                        .nodes
+                        .iter()
+                        .filter_map(|(_, node)| {
+                            Some(format!(
+                                "{:?} {:?} {:?}",
+                                node.role(),
+                                node.label()
+                                    .map(|label| label.chars().take(40).collect::<String>()),
+                                node.bounds()?
+                            ))
+                        })
+                        .collect();
                     failures.push(format!(
-                        "primary action clipped at {kind:?}/{tab:?}/{scale}: {bounds:?}, viewport {size:?}"
+                        "primary action clipped at {kind:?}/{tab:?}/{scale}: {bounds:?}, viewport {size:?}\n{}",
+                        layout_dump.join("\n")
                     ));
                     continue;
                 }
