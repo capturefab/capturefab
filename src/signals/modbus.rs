@@ -529,7 +529,7 @@ mod tests {
         assert!(
             format!("{error:#}")
                 .to_ascii_lowercase()
-                .contains("connection refused")
+                .contains("refused")
         );
     }
 }

@@ -106,7 +106,8 @@ impl CommandContext {
                         && matches!(bytes[2], b'\\' | b'/')
                 }
             } else {
-                path.is_absolute()
+                // A POSIX shell's idea of absolute, whichever host builds it.
+                value.starts_with('/')
             };
             rooted.then_some(value.to_owned())
         };

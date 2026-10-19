@@ -192,9 +192,18 @@ impl ToolHost for FakeHost {
 }
 
 pub(crate) fn home() -> PathBuf {
-    std::env::var_os("HOME")
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .filter(|home| !home.is_empty())
-        .map_or_else(|| PathBuf::from("/home/test"), PathBuf::from)
+        .map_or_else(
+            || {
+                PathBuf::from(if cfg!(windows) {
+                    r"C:\home\test"
+                } else {
+                    "/home/test"
+                })
+            },
+            PathBuf::from,
+        )
 }
 
 pub(crate) fn feature(name: &str, kind: &str, value: Value) -> FeatureInfo {

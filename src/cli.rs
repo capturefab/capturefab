@@ -4373,6 +4373,8 @@ pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
     if s.contains("storage full") || s.contains("no space left") {
         ("storage_full", 6)
     } else if s.contains("connection refused")
+        // Windows words a refused port this way.
+        || s.contains("actively refused")
         // A host name that does not resolve is as unreachable as a refused
         // port (getaddrinfo wording on macOS, Linux and Windows).
         || s.contains("failed to lookup address")

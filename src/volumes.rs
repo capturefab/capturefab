@@ -234,7 +234,7 @@ fn from_fstab(table: &str) -> Vec<PathBuf> {
                 .is_some_and(|options| options.split(',').any(|o| o == "bind" || o == "rbind"));
             let path = PathBuf::from(unescape(mount));
             (!device.starts_with('#')
-                && path.is_absolute()
+                && mount.starts_with('/')
                 && path != Path::new("/")
                 && fs != "swap"
                 && !bind)

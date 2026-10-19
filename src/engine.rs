@@ -3318,7 +3318,12 @@ mod tests {
             let v = h.request(capture_to(&frames, 2, OnExists::Fail)).unwrap();
             assert_eq!(
                 files(v),
-                [1, 2].map(|i| format!("frames/frame-{:06}.raw", run * 2 + i))
+                [1, 2].map(|i| {
+                    Path::new("frames")
+                        .join(format!("frame-{:06}.raw", run * 2 + i))
+                        .to_string_lossy()
+                        .into_owned()
+                })
             );
         }
         h.shutdown();

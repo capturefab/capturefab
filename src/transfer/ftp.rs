@@ -565,11 +565,7 @@ mod tests {
         let mut refused = FtpUploader::new(server(1), None).unwrap();
         let error = refused.check().unwrap_err();
         assert!(retryable(&error));
-        assert!(
-            format!("{error:#}")
-                .to_lowercase()
-                .contains("connection refused")
-        );
+        assert!(format!("{error:#}").to_lowercase().contains("refused"));
         let fake = FakeFtp::start(|s| s.greeting = 421);
         let error = uploader(&fake).check().unwrap_err();
         assert!(retryable(&error), "{error:#}");

@@ -2,7 +2,6 @@
 //! provider wire bodies, opaque artifacts and camera pixels are never records.
 use anyhow::{Context, Result, ensure};
 use chrono::{TimeZone, Utc};
-use fs2::FileExt;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -50,7 +49,7 @@ fn adopt_logs(old: &Path, new: &Path) -> Result<()> {
     crate::ipc::ensure_private_dir(new)?;
     for (id, path, _) in files {
         let mut source = open_checked(&path)?;
-        if FileExt::try_lock_exclusive(&source).is_err() {
+        if claim::try_exclusive(&source).is_err() {
             continue;
         }
         let target = new.join(format!("{id}.jsonl"));
@@ -157,7 +156,7 @@ impl ActionLog {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(_) => anyhow::bail!("Could not create the assistant action log."),
             };
-            FileExt::try_lock_exclusive(&file).context("The assistant action log is busy.")?;
+            claim::try_exclusive(&file).context("The assistant action log is busy.")?;
             let log = Self {
                 file,
                 path,
@@ -252,9 +251,76 @@ impl ActionLog {
     }
 }
 
+/// The claim that marks a log as active. Unix locks the whole file, which
+/// still lets readers open it. Windows enforces locks against every other
+/// handle, so there the claim is one byte far beyond the end of the file:
+/// held against other claimants, invisible to readers and appenders.
+mod claim {
+    use std::{fs::File, io};
+
+    #[cfg(not(windows))]
+    pub fn try_exclusive(file: &File) -> io::Result<()> {
+        fs2::FileExt::try_lock_exclusive(file)
+    }
+
+    #[cfg(not(windows))]
+    pub fn release(file: &File) -> io::Result<()> {
+        fs2::FileExt::unlock(file)
+    }
+
+    #[cfg(windows)]
+    pub fn try_exclusive(file: &File) -> io::Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+        };
+        let mut overlapped = beyond_the_end();
+        // SAFETY: the handle belongs to `file` and `overlapped` outlives the call.
+        let locked = unsafe {
+            LockFileEx(
+                handle(file),
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            )
+        };
+        if locked == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    pub fn release(file: &File) -> io::Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+        let mut overlapped = beyond_the_end();
+        // SAFETY: as in `try_exclusive`.
+        if unsafe { UnlockFileEx(handle(file), 0, 1, 0, &mut overlapped) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn handle(file: &File) -> windows_sys::Win32::Foundation::HANDLE {
+        use std::os::windows::io::AsRawHandle;
+        file.as_raw_handle() as _
+    }
+
+    #[cfg(windows)]
+    fn beyond_the_end() -> windows_sys::Win32::System::IO::OVERLAPPED {
+        // SAFETY: an all-zero OVERLAPPED is its documented initial state.
+        let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED =
+            unsafe { std::mem::zeroed() };
+        overlapped.Anonymous.Anonymous.OffsetHigh = 0x4000_0000;
+        overlapped
+    }
+}
+
 impl Drop for ActionLog {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        let _ = claim::release(&self.file);
     }
 }
 
@@ -553,7 +619,7 @@ fn prune(directory: &Path, max_runs: usize, max_bytes: u64, current: Option<&str
         let Ok(file) = open_checked(&path) else {
             continue;
         };
-        if FileExt::try_lock_exclusive(&file).is_err() {
+        if claim::try_exclusive(&file).is_err() {
             continue;
         }
         // Recheck the directory entry after locking, before deleting only this
@@ -574,7 +640,7 @@ fn prune(directory: &Path, max_runs: usize, max_bytes: u64, current: Option<&str
             count -= 1;
             total = total.saturating_sub(bytes);
         }
-        let _ = FileExt::unlock(&file);
+        let _ = claim::release(&file);
     }
     Ok(())
 }
@@ -689,9 +755,9 @@ pub fn runs_in(directory: &Path) -> Result<Vec<RunSummary>> {
         let start = log.records.iter().find(|record| record["kind"] == "start");
         let end = log.records.last().filter(|record| record["kind"] == "end");
         let active = open_checked(&path).is_ok_and(|file| {
-            let active = FileExt::try_lock_exclusive(&file).is_err();
+            let active = claim::try_exclusive(&file).is_err();
             if !active {
-                let _ = FileExt::unlock(&file);
+                let _ = claim::release(&file);
             }
             active
         });
@@ -971,7 +1037,12 @@ mod tests {
         // Sparse test file exercises the real append offset without filling
         // the disk with millions of repetitive test records.
         log.bytes = MAX_RUN_BYTES - 3 * MAX_RECORD_BYTES as u64;
-        log.file.set_len(log.bytes).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(log.path())
+            .unwrap()
+            .set_len(log.bytes)
+            .unwrap();
         let error = log.record("request", json!({"round":1}), 1001).unwrap_err();
         assert!(error.downcast_ref::<LogFull>().is_some());
         log.record("approval", json!({"decision":"denied"}), 1002)

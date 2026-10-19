@@ -3099,6 +3099,8 @@ mod tests {
             .sum();
         (FREE_SPACE_FLOOR + 100).saturating_sub(used)
     }
+    // Needs a device identity to tell disks apart, which Windows lacks.
+    #[cfg(unix)]
     #[test]
     fn saves_leave_the_free_space_floor_on_their_disk() {
         let temp = Temp::new();
@@ -3146,6 +3148,8 @@ mod tests {
     fn roomy_disk(_: &Path) -> u64 {
         1 << 40
     }
+    // Needs a device identity to tell disks apart, which Windows lacks.
+    #[cfg(unix)]
     #[test]
     fn removals_that_free_no_space_stop_until_a_save_fits_again() {
         let temp = Temp::new();
@@ -3186,6 +3190,8 @@ mod tests {
         assert!(!temp.path("kept-1").exists() && temp.path("kept-2").exists());
         AVAILABLE.set(None);
     }
+    // Needs a device identity to tell disks apart, which Windows lacks.
+    #[cfg(unix)]
     #[test]
     fn files_are_not_removed_for_space_where_disks_cannot_be_told_apart() {
         let temp = Temp::new();

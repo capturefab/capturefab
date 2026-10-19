@@ -677,10 +677,6 @@ mod tests {
         .check()
         .unwrap_err();
         assert!(retryable(&refused));
-        assert!(
-            format!("{refused:#}")
-                .to_lowercase()
-                .contains("connection refused")
-        );
+        assert!(format!("{refused:#}").to_lowercase().contains("refused"));
     }
 }
