@@ -463,18 +463,16 @@ pub(super) fn native_metadata_allowed(source: &dyn Source) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        return source
+        source
             .file(Path::new("/sys/class/dmi/id/product_name"))
             .ok()
             .flatten()
-            .is_some_and(|bytes| {
-                String::from_utf8_lossy(&bytes).trim() == "Google Compute Engine"
-            });
+            .is_some_and(|bytes| String::from_utf8_lossy(&bytes).trim() == "Google Compute Engine")
     }
     #[cfg(windows)]
     {
         // The hardware registry is local and does not start a helper process.
-        return windows_google_bios();
+        windows_google_bios()
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     false
