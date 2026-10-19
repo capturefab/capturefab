@@ -64,13 +64,14 @@ fn exact_manual_sensor_frame_survives_close_and_resume() {
         .request(SessionCommand::CaptureSessionClose)
         .unwrap();
     let db = duckdb::Connection::open(f.root.join("session.duckdb")).unwrap();
-    let (pixels, width, stamp): (Vec<u8>, u32, u64) = db
+    let (name, width, stamp): (String, u32, u64) = db
         .query_row(
-            "SELECT data,width,timestamp_ns FROM captures WHERE source = 'manual'",
+            "SELECT frame_path,width,timestamp_ns FROM captures WHERE source = 'manual'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .unwrap();
+    let pixels = std::fs::read(f.root.join("session.frames").join(name)).unwrap();
     assert_eq!(
         (pixels, width, stamp),
         (frame.data, frame.width, frame.timestamp_ns)
@@ -83,6 +84,52 @@ fn exact_manual_sensor_frame_survives_close_and_resume() {
             .unwrap()["capture"]
             .is_null()
     );
+}
+
+#[test]
+fn an_open_session_with_no_embedding_on_its_way_lets_the_worker_sleep() {
+    let f = Fixture::new();
+    f.open(true);
+    assert!(f.worker.capture_session.lock().unwrap().is_some());
+    assert!(
+        !f.worker.embedding(),
+        "a native session embeds nothing later"
+    );
+    assert_eq!(idle_wait(&f.worker, &[]), IDLE);
+}
+
+#[test]
+fn close_and_disconnect_succeed_after_the_database_fails() {
+    let f = Fixture::new();
+    let blocked = |f: &Fixture| {
+        f.worker
+            .capture_session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .block_checkpoints()
+    };
+    f.open(true);
+    let blocker = blocked(&f);
+    f.worker
+        .request(SessionCommand::CaptureSessionClose)
+        .unwrap();
+    assert!(f.worker.snapshot().capture_session.is_none());
+    assert!(
+        f.worker
+            .snapshot()
+            .logs
+            .iter()
+            .any(|entry| entry.message.contains("without a final checkpoint"))
+    );
+    drop(blocker);
+    f.open(false);
+    let blocker = blocked(&f);
+    f.worker.request(SessionCommand::Disconnect).unwrap();
+    assert!(f.worker.snapshot().capture_session.is_none());
+    assert!(f.worker.snapshot().connected.is_none());
+    drop(blocker);
 }
 
 #[test]
@@ -175,4 +222,131 @@ fn invalid_auto_capture_inputs_are_rejected_before_mutation() {
     assert!(
         SessionCommand::from_json_slice(br#"{"op":"capture_session_close","extra":true}"#).is_err()
     );
+}
+
+impl Fixture {
+    /// Work on the open session as the camera thread does, holding it.
+    fn session<T>(&self, step: impl FnOnce(&mut crate::autocapture::CaptureSession) -> T) -> T {
+        step(
+            self.worker
+                .capture_session
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap(),
+        )
+    }
+    fn watch(&self) {
+        self.worker
+            .request(SessionCommand::AutoCapture {
+                enabled: true,
+                sensitivity: 0.5,
+                cooldown_ms: 250,
+            })
+            .unwrap();
+    }
+    /// The published auto capture status once it passes `check`, which it
+    /// must within ten seconds.
+    fn published(
+        &self,
+        check: impl Fn(&crate::autocapture::SessionStatus) -> bool,
+    ) -> crate::autocapture::SessionStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = self.worker.snapshot().capture_session.unwrap();
+            if check(&status) {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "published status stayed {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+fn gray(value: u8) -> Frame {
+    Frame {
+        id: 1,
+        width: 32,
+        height: 32,
+        pixel_format: crate::types::MONO8,
+        timestamp_ns: 0,
+        data: vec![value; 32 * 32],
+    }
+}
+
+#[test]
+fn a_frame_that_storage_refuses_shows_in_the_published_status() {
+    let f = Fixture::new();
+    f.open(true);
+    f.watch();
+    // The writer refuses its next write; the camera thread learns of it
+    // only from a later sample, which suggests nothing.
+    f.session(|session| session.fail_next_write("Storage full: test budget"));
+    let status = f.published(|status| status.state == "storage_full");
+    assert!(status.blocked_storage);
+    assert_eq!(status.note.as_deref(), Some("Storage full: test budget"));
+}
+
+#[test]
+fn a_suggestion_whose_frame_is_not_saved_leaves_the_published_count() {
+    let f = Fixture::new();
+    f.open(true);
+    f.watch();
+    std::fs::rename(f.root.join("session.frames"), f.root.join("session.moved")).unwrap();
+    // Published as the camera thread does a suggestion, while the writer
+    // has yet to save its frame.
+    let release = f.session(|session| {
+        let release = session.stall_writer();
+        session.suggest(&gray(140));
+        f.worker.publish_capture(session).unwrap();
+        release
+    });
+    assert_eq!(
+        f.worker.snapshot().capture_session.unwrap().pending_count,
+        1
+    );
+    drop(release);
+    let status = f.published(|status| status.pending_count == 0);
+    assert!(status.note.unwrap().contains("is missing"));
+}
+
+#[test]
+fn a_review_that_drops_a_capture_whose_frame_is_gone_publishes_it() {
+    let f = Fixture::new();
+    f.open(true);
+    let id = f.session(|session| {
+        session.flush();
+        let id = session.suggest(&gray(140));
+        session.flush();
+        f.worker.publish_capture(session).unwrap();
+        id
+    });
+    std::fs::remove_file(f.root.join("session.frames").join(format!("{id:08}.raw"))).unwrap();
+    let review = f
+        .worker
+        .request(SessionCommand::CaptureReview { id: None })
+        .unwrap();
+    assert!(review["capture"].is_null());
+    let status = f.worker.snapshot().capture_session.unwrap();
+    assert_eq!(status.pending_count, 0);
+    assert!(status.note.unwrap().contains(&format!("capture {id}")));
+}
+
+#[test]
+fn notes_reach_status_polls_between_frames_and_fade_from_them() {
+    let f = Fixture::new();
+    f.open(true);
+    // Paused: no frames, so the camera thread mostly sleeps.
+    let note = "Skipped a suggestion while the previous capture was still being saved";
+    f.session(|session| session.note_fading(note, Duration::from_secs(2)));
+    // As a camera worker does before it answers a status poll.
+    f.worker.refresh_capture();
+    assert_eq!(
+        f.worker.snapshot().capture_session.unwrap().note.as_deref(),
+        Some(note)
+    );
+    f.published(|status| status.note.is_none());
 }

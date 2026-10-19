@@ -22,6 +22,7 @@ fn app() -> Workbench {
         encoder: "native".into(),
         accelerator: None,
         samples_per_second: None,
+        note: None,
     });
     app.sync_capture_session();
     app.auto_capture.open = true;
@@ -159,6 +160,18 @@ fn inactive_automatic_capture_reveals_setup_through_a_native_disclosure() {
         app.pending.is_empty(),
         "disclosure has no camera side effects"
     );
+}
+
+#[test]
+fn a_session_note_says_why_a_suggestion_was_skipped() {
+    let renderer = crate::gui::destinations::layout_tests::renderer();
+    let mut app = app();
+    app.auto_capture.setup_open = false;
+    let note = "Skipped a suggestion while the previous capture was still being saved";
+    app.snapshot.capture_session.as_mut().unwrap().note = Some(note.into());
+    let (snapshot, _, _) = settings_snapshot(&app, &renderer);
+    named(&snapshot, note);
+    named(&snapshot, state_guidance("watching"));
 }
 
 #[test]

@@ -618,6 +618,10 @@ pub fn staging_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("CAPTUREFAB_SESSION_DIR") {
         return PathBuf::from(dir).join("staging");
     }
+    // Unit tests stage in their own session directory, never the user's.
+    if cfg!(test) {
+        return crate::ipc::state_dir().join("staging");
+    }
     let home = || std::env::var_os("HOME").map(PathBuf::from);
     let base = if cfg!(target_os = "macos") {
         home().map(|h| h.join("Library/Application Support/Capturefab"))
@@ -640,8 +644,22 @@ struct File {
     preferred: Option<String>,
 }
 
-fn path() -> PathBuf {
-    crate::ipc::session_dir().join("destinations.json")
+pub(crate) static STATE: crate::ipc::StateSet = crate::ipc::StateSet {
+    what: "saved destinations",
+    names: &["destinations.json"],
+    lock: Some("destinations.lock"),
+};
+
+/// The directory holding the saved list and its lock.
+fn dir() -> PathBuf {
+    static ADOPTED: std::sync::Once = std::sync::Once::new();
+    ADOPTED.call_once(|| crate::ipc::adopt_state(&STATE));
+    crate::ipc::state_dir()
+}
+
+/// The file holding the saved list.
+pub(crate) fn path() -> PathBuf {
+    dir().join("destinations.json")
 }
 
 /// All saved destinations.
@@ -712,7 +730,7 @@ pub fn get(name: &str) -> Result<Destination> {
 }
 
 fn write(file: &File) -> Result<()> {
-    let dir = crate::ipc::session_dir();
+    let dir = dir();
     crate::ipc::ensure_private_dir(&dir)?;
     // Write a sibling and rename it into place, so readers never see a
     // partial list.
@@ -741,7 +759,7 @@ fn locked_with_rollback<T>(
     rollback: impl FnOnce(&T) -> Result<()>,
 ) -> Result<T> {
     use fs2::FileExt;
-    let dir = crate::ipc::session_dir();
+    let dir = dir();
     crate::ipc::ensure_private_dir(&dir)?;
     let lock = fs::OpenOptions::new()
         .create(true)
@@ -1032,8 +1050,9 @@ pub struct Queued {
 impl Resolved {
     /// Queue a file this resolution produced for upload, if it has a network
     /// target. Called after the file is complete and recorded in the storage
-    /// ledger. Returns what was queued, or `None` for a local destination.
-    pub fn finished(&self, path: &Path) -> Result<Option<Queued>> {
+    /// ledger, with the SHA-256 its writer computed when the caller has it.
+    /// Returns what was queued, or `None` for a local destination.
+    pub fn finished(&self, path: &Path, sha256: Option<&str>) -> Result<Option<Queued>> {
         let (Some(remote), Some(root), Some(name)) = (&self.upload, &self.root, &self.destination)
         else {
             return Ok(None);
@@ -1042,13 +1061,13 @@ impl Resolved {
         ensure_compiled(remote)?;
         #[cfg(feature = "uploads")]
         {
-            let id = crate::upload::enqueue(name, remote, path, &key)?;
+            let id = crate::upload::enqueue(name, remote, path, &key, sha256)?;
             let url = remote.object_url(&key);
             Ok(Some(Queued { id, key, url }))
         }
         #[cfg(not(feature = "uploads"))]
         {
-            let _ = (name, key);
+            let _ = (name, key, sha256);
             anyhow::bail!("uploads are unsupported in this build")
         }
     }
@@ -1277,7 +1296,7 @@ mod tests {
         assert_eq!(preferred().as_deref(), Some("before"));
         let secret = std::cell::Cell::new("old");
         let temp =
-            crate::ipc::session_dir().join(format!("destinations.json.{}.tmp", std::process::id()));
+            crate::ipc::state_dir().join(format!("destinations.json.{}.tmp", std::process::id()));
         let result = replace_with(
             Some(&before),
             Some(&after),
@@ -1355,7 +1374,7 @@ mod tests {
             );
             return;
         }
-        let root = crate::ipc::session_dir().join("folders");
+        let root = crate::ipc::state_dir().join("folders");
         let folder = |name: &str, path: &str| Destination {
             name: name.into(),
             target: Target::Folder {
@@ -1571,12 +1590,12 @@ mod tests {
             target: Target::S3(bucket()),
         };
         if cfg!(feature = "s3") {
+            // Under the staging root, wherever the environment puts it.
             let resolved = resolve_with(&staged, "frames").unwrap();
-            assert!(resolved.output.ends_with(&format!(
-                "uploads{}archive{}frames",
-                std::path::MAIN_SEPARATOR,
-                std::path::MAIN_SEPARATOR
-            )));
+            assert_eq!(
+                PathBuf::from(&resolved.output),
+                staging_root().join("archive").join("frames")
+            );
             assert!(
                 matches!(&resolved.upload, Some(Remote::S3(b)) if b.bucket == "camera-archive")
             );

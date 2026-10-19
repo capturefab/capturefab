@@ -4,9 +4,11 @@ Capturefab's WebAssembly client runs in a laptop's browser and controls a native
 
 The HTTP listener is opt-in. Ordinary `capturefab serve --name bench` keeps its private local IPC interface. With a remote listener, the local CLI and the browser control the same session and cameras.
 
-## Build the server and browser client
+## Get the server and browser client
 
-Install the browser build tools once, using the same Rust toolchain as the client build:
+Release executables from 0.2.2 on, desktop and headless, have the browser client built in, so a downloaded archive needs nothing else: `capturefab serve --listen ...` serves it. `capturefab doctor --json` reports `features.embedded_web: true` for such an executable; with an older one, build the client as below and pass `--web-dir`. To run Capturefab as a service on a Raspberry Pi, Jetson or industrial PC, follow the [line computer guide](line-computer.md).
+
+From source, install the browser build tools once, using the same Rust toolchain as the client build:
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -16,11 +18,11 @@ cargo install wasm-bindgen-cli --version 0.2.129 --locked
 Then build from the repository root:
 
 ```sh
-cargo build --release --no-default-features --features usb,scanner,jpeg
 ./web-client/build.sh
+cargo build --release --no-default-features --features usb,scanner,jpeg,s3,ftp,sftp,embedded-web
 ```
 
-The native build needs the usual [Capturefab build dependencies](../README.md#build-test-and-release) and produces `target/release/capturefab`. Add `s3` to its features if the server will upload to bucket destinations. The browser build produces `web-client/dist`, which must be copied alongside the native executable on the capture server, or supplied with an absolute `--web-dir` path. The server does not compile the client at startup. The pinned `wasm-bindgen-cli` version must match the client's Rust dependency; no Node.js or npm is required.
+The native build needs the usual [Capturefab build dependencies](../README.md#build-test-and-release) and produces `target/release/capturefab`. The browser build produces `web-client/dist`; the `embedded-web` feature builds it into the executable (`CAPTUREFAB_WEB_DIST` names another built folder). Without that feature, copy `dist` next to the executable as a folder named `web`, or pass `--web-dir`. Without `--web-dir`, `serve` uses the built-in client, then a `web` folder beside the executable, then `web-client/dist` in the working directory. The server does not compile the client at startup. The pinned `wasm-bindgen-cli` version must match the client's Rust dependency; no Node.js or npm is required.
 
 ## Start a server reachable through Tailscale
 
@@ -33,9 +35,7 @@ tailscale ip -4
 Start Capturefab with the address printed by `tailscale ip -4`, replacing the example below:
 
 ```sh
-capturefab serve --name remote \
-  --listen 100.101.102.103:8787 \
-  --web-dir /path/to/web-client/dist
+capturefab serve --name remote --listen 100.101.102.103:8787
 ```
 
 The server reports the browser URL when ready. Keep the process running; camera connections and schedules belong to this process. Use your normal service manager for unattended operation.
@@ -65,9 +65,7 @@ Several browser users and AI agents can drive the same cameras at once. Each tab
 For a Tailscale HTTPS URL, bind Capturefab to loopback instead:
 
 ```sh
-capturefab serve --name remote \
-  --listen 127.0.0.1:8787 \
-  --web-dir /path/to/web-client/dist
+capturefab serve --name remote --listen 127.0.0.1:8787
 tailscale serve --bg http://127.0.0.1:8787
 tailscale serve status
 ```
@@ -84,7 +82,7 @@ The client uses same-origin HTTP endpoints without authentication headers. Reque
 | `GET /api/activity` | Shared `{revision, activity}` history, including actor and scheduled job progress |
 | `GET /api/activity?after=REV&timeout_ms=20000` | Wait for an activity change; all watchers wake when commands or jobs change |
 | `POST /api/command` | A native session command result |
-| `GET /api/preview?camera=ID` | Latest camera preview as PNG, or HTTP 204 while no frame is available |
+| `GET /api/preview?camera=ID&format=png\|jpeg` | Latest camera preview, scaled to fit 1280×720: PNG by default, JPEG with `format=jpeg`; HTTP 204 while no frame is available, 304 for the frame named in `If-None-Match` |
 | `GET /api/destinations` | Saved server destinations without credentials; each row has `kind` (`folder`, `s3`, `ftp` or `sftp`) |
 | `GET /api/storage` | Server storage usage and policy |
 | `GET`, `HEAD /health` | JSON readiness, uptime, camera counts and analytics health; HTTP 503 when stopping or analytics is unavailable |
@@ -104,6 +102,8 @@ Command requests wrap an existing `SessionCommand`:
 }
 ```
 
+Previews are display images. A gray image is a Gray PNG and anything else an RGB PNG; `format=jpeg` asks for a much smaller JPEG, which the bundled client uses, where the server build has the `jpeg` feature (release builds do); otherwise the reply stays PNG, so check `Content-Type`. Each preview has an `ETag` naming the frame and format, new for every frame even where a camera repeats frame ids, and `X-Frame-Id`, `X-Frame-Timestamp-Ns`, `X-Frame-Width` and `X-Frame-Height` describe the frame the camera delivered. Send the last `ETag` back in `If-None-Match`: while the newest frame is still that one, the server answers 304 with the same headers and no image, so polling a stopped or slow camera costs almost nothing. The server encodes each new frame once per format however many clients ask, and while a camera streams, clients asking within 100 ms of an encode get that preview rather than a newer frame, so several tabs cost about as much as one. Responses carry `Cache-Control: no-store`, so clients keep the tag themselves rather than relying on a browser cache.
+
 Omit `camera` for session-wide operations such as `{"op":"connect","camera":"sim:0","timeout_ms":2000}`. JSON responses use `{ "version": 1, "ok": true, "result": ... }`, or `ok: false` with an error message. Run `capturefab schema` for the session command contract. Captures write files on the server; the preview endpoint supplies a bounded display image rather than the original measurement data.
 
 `actor` is optional display attribution, not authentication. Supply a stable `id` (1–128 ASCII letters, digits, `-`, `_`, `.`, `:`), a nonempty `name` of up to 128 UTF-8 bytes without control characters, and `kind` (`human` or `agent`). Legacy HTTP calls without it appear as **HTTP client**. The activity history retains 200 completed entries plus active commands and schedules across camera selection and disconnect. Read-only observations do not create entries. A schedule's command state becomes `succeeded` when accepted; its `job` object carries `id`, `worker_pid`, `status`, `count`, `captured`, `last_file` and `error` as acquisition continues.
@@ -114,6 +114,8 @@ Local agents can observe the same immediate changes without enabling HTTP: `capt
 
 ## Analytics and monitoring
 
+Session snapshots hold the newest 200 `logs` lines from every camera (tagged
+`[camera-id]`), the session and signal sources, oldest first.
 Raw `logs` in session snapshots retain `time`, `level` and `message` and may add
 `timestamp:{unix_ms,utc_offset_seconds}`. Signed Unix milliseconds identify the
 absolute event, while the offset describes the producer clock's seconds east of
@@ -123,7 +125,7 @@ Desktop/browser displays use the viewer's local zone; browser log labels also
 include ISO UTC, and copied desktop logs include a dated numeric offset. This
 additive metadata preserves the version-1 envelope and original fields.
 
-Analytics collection runs with the session, including when no browser is open and no metrics scraper is connected. DuckDB stores the time series in memory, sampling once per second and retaining at most 24 hours or 250,000 rows. Its engine memory limit is 128 MB, with disk spilling and external access disabled. Camera metadata is capped at 256 entries, and inactive entries expire within 24 hours. Session counters accumulate across stop/start and camera disconnects as constant-size lifetime totals; time-series history expires independently. A new server process starts with fresh analytics. Frame and received-byte totals describe acquisition, while missed-frame metrics expose transport or shared-ring losses; they do not count files written by capture jobs.
+Analytics collection runs with the session, including when no browser is open and no metrics scraper is connected. DuckDB stores the time series in memory, one sample per second of all cameras together, so it retains 24 hours whatever the camera count, within a limit of 250,000 rows; `samples` in the report counts those one-second samples. The database starts with the first connected camera, and `/health` reports ready before that. Seconds without a connected camera store nothing and chart as idle; expired samples are deleted once a minute and left out of reports at once. Its engine memory limit is 128 MB, with disk spilling and external access disabled. Camera metadata is capped at 256 entries, and inactive entries expire within 24 hours. Session counters accumulate across stop/start and camera disconnects as constant-size lifetime totals; time-series history expires independently. A new server process starts with fresh analytics. Frame and received-byte totals describe acquisition. Missed-frame charts and percentages count `lost`: frames lost on the camera link or in the worker. Totals and camera summaries add `lost` and `preview_skipped` (preview frames a viewer missed because a newer one was ready; with no viewer there are none), camera summaries and points add `lost` and `lost_percent`, and `dropped` and `drop_percent` keep the `status --json` meaning, worker receive errors plus `preview_skipped`. None of them count files written by capture jobs.
 
 Open `/api/analytics.svg` to view or save the dashboard for the current session. The native desktop window's **Analytics** button shows the same measurements with charts that follow the app's appearance, readable camera names and browsable history data. **Show history data** opens a fixed snapshot; **Update history** loads the latest charted report while preserving the page when possible. The dark exported SVG includes an empty state before the first frame and scales its plots to the collected history. The JSON report includes `retention_seconds`, `sample_interval_seconds`, sample counts, session totals, camera summaries and time-series points. Its API and SVG routes enforce the same browser-origin checks as other `/api/` routes.
 
@@ -132,7 +134,7 @@ Widths are clamped to 180–2048 logical pixels; below 840 pixels the four panel
 stack vertically with readable labels. Omit `width` for the original 1200×700
 export. Invalid or duplicate query parameters return HTTP 400.
 
-Monitoring tools can fetch `/health` and `/metrics` directly without a browser origin. `/health` returns a plain JSON object with `status`, `ready`, `version`, `uptime_seconds`, `cameras` and `analytics`. An idle session with no connected cameras is ready. A previous camera command error stays in diagnostics without making readiness fail. `/metrics` uses Prometheus text format with session counters such as `capturefab_session_frames_total` and per-camera counters labeled by `camera_id` and `name`. `HEAD` returns the same status and headers as `GET` with no body; unsupported methods on these four routes return HTTP 405 with `Allow: GET, HEAD`.
+Monitoring tools can fetch `/health` and `/metrics` directly without a browser origin. `/health` returns a plain JSON object with `status`, `ready`, `version`, `uptime_seconds`, `cameras` and `analytics`. An idle session with no connected cameras is ready. A previous camera command error stays in diagnostics without making readiness fail. `/metrics` uses Prometheus text format with session counters such as `capturefab_session_frames_total` and per-camera counters labeled by `camera_id` and `name`. `capturefab_session_lost_frames_total` and `capturefab_camera_lost_frames_total` count lost frames, `capturefab_session_preview_skipped_frames_total` and `capturefab_camera_preview_skipped_frames_total` skipped previews, and the `dropped_frames_total` counters keep the status `dropped` meaning. `capturefab_analytics_samples` counts retained one-second samples. `HEAD` returns the same status and headers as `GET` with no body; unsupported methods on these four routes return HTTP 405 with `Allow: GET, HEAD`.
 
 ```sh
 curl http://100.101.102.103:8787/health
@@ -141,4 +143,6 @@ curl http://100.101.102.103:8787/api/analytics
 curl -o session-analytics.svg http://100.101.102.103:8787/api/analytics.svg
 ```
 
-If the laptop cannot load the page, check the listener address, host firewall and tailnet policy. If WASM fails to load, rebuild the client and copy the whole `dist` directory, including its `.wasm` and JavaScript files.
+If the laptop cannot load the page, check the listener address, host firewall and tailnet policy. If WASM fails to load from a source build, rebuild the client and copy the whole `dist` directory, including its `.wasm` and JavaScript files.
+
+The browser client pauses its preview, session and activity requests while its tab is hidden, and resumes when it is shown again.

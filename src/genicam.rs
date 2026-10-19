@@ -32,7 +32,7 @@ pub fn stream_locked(name: &str) -> bool {
     )
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FeatureInfo {
     pub name: String,
     pub display_name: String,

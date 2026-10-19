@@ -13,6 +13,8 @@ fn report(count: usize) -> Arc<AnalyticsSnapshot> {
             fps: (index + 1) as f64 * 2.0,
             bytes_per_second: (index + 1) as f64 * 1_048_576.0,
             drop_percent: (index % 3) as f64 * 5.0,
+            lost: index as u64 % 3,
+            lost_percent: (index % 3) as f64 * 5.0,
         })
         .collect();
     Arc::new(AnalyticsSnapshot {
@@ -34,6 +36,9 @@ fn report(count: usize) -> Arc<AnalyticsSnapshot> {
             drop_percent: 2.0,
             streaming: true,
             stale: false,
+            lost: 2,
+            preview_skipped: 0,
+            lost_percent: 2.0,
         }],
         points,
     })
@@ -500,8 +505,8 @@ fn compact_history_wraps_full_measurements_and_keeps_the_pager_inside_its_width(
     let renderer = super::super::super::destinations::layout_tests::renderer();
     let mut data = (*report(9)).clone();
     data.points[0].frames = 100_000;
-    data.points[0].dropped = 20_000;
-    data.points[0].drop_percent = 0.25;
+    data.points[0].lost = 20_000;
+    data.points[0].lost_percent = 0.25;
     data.cameras[0].name = "long-camera-name-".repeat(16);
     let data = Arc::new(data);
     let mut state = State::default();

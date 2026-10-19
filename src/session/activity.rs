@@ -873,6 +873,8 @@ mod tests {
             output: "frames".into(),
             count: 3,
             captured: 0,
+            skipped: 0,
+            retries: 0,
             first_at_ms: 1,
             interval_ms: 10,
             next_at_ms: 1,

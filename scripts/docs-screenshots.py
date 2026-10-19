@@ -69,6 +69,7 @@ def main():
                 for key in ("CAPTUREFAB_SESSION", "CAPTUREFAB_EXECUTABLE"):
                     env.pop(key, None)
                 env.update(CAPTUREFAB_SESSION_DIR=str(Path(temp) / "sessions"),
+                           CAPTUREFAB_CACHE_DIR=str(Path(temp) / "cache"),
                            CAPTUREFAB_SCREENSHOT_SCENE=scene,
                            CAPTUREFAB_SCREENSHOT_SIZE="1100x700")
                 subprocess.run([str(binary), "gui", "--name", "docs", "--screenshot",

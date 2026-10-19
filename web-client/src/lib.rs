@@ -44,6 +44,7 @@ struct App {
     preview_busy: bool,
     preview_url: Option<String>,
     preview_frame: String,
+    preview_etag: String,
     analytics_busy: bool,
     analytics_layout_dirty: bool,
     analytics_layout_width: Option<i32>,
@@ -220,7 +221,13 @@ fn update_disabled(app: &App) {
     }
 }
 
-async fn fetch(path: &str, body: Option<&Value>) -> Result<Response, String> {
+/// `if_none_match` names the preview this tab shows, so the server answers
+/// 304 instead of sending the same frame again.
+async fn fetch(
+    path: &str,
+    body: Option<&Value>,
+    if_none_match: Option<&str>,
+) -> Result<Response, String> {
     let options = RequestInit::new();
     options.set_method(if body.is_some() { "POST" } else { "GET" });
     options.set_mode(RequestMode::SameOrigin);
@@ -236,6 +243,12 @@ async fn fetch(path: &str, body: Option<&Value>) -> Result<Response, String> {
             .set("Content-Type", "application/json")
             .map_err(js_error)?;
     }
+    if let Some(tag) = if_none_match {
+        request
+            .headers()
+            .set("If-None-Match", tag)
+            .map_err(js_error)?;
+    }
     JsFuture::from(window().fetch_with_request(&request))
         .await
         .map_err(js_error)?
@@ -243,7 +256,7 @@ async fn fetch(path: &str, body: Option<&Value>) -> Result<Response, String> {
         .map_err(js_error)
 }
 async fn request(path: &str, body: Option<&Value>) -> Result<Value, String> {
-    let response = fetch(path, body).await?;
+    let response = fetch(path, body, None).await?;
     let status = response.status();
     let body = JsFuture::from(response.text().map_err(js_error)?)
         .await
@@ -715,9 +728,9 @@ fn render(app: &mut App) {
         set_text(
             "frame-stats",
             &format!(
-                "{} frames · {} dropped",
+                "{} frames · {} lost",
                 number(camera, "frames"),
-                number(camera, "dropped")
+                number(camera, "lost")
             ),
         );
         if let Some(error) = camera.get("last_error").and_then(Value::as_str) {
@@ -747,7 +760,7 @@ fn render(app: &mut App) {
             "preview-empty-description",
             "Choose a camera in the camera list, or discover one to get started.",
         );
-        set_text("frame-stats", "0 frames · 0 dropped");
+        set_text("frame-stats", "0 frames · 0 lost");
         clear_preview(app);
     }
     render_jobs(app);
@@ -779,6 +792,7 @@ fn clear_preview(app: &mut App) {
         let _ = Url::revoke_object_url(&url);
     }
     app.preview_frame.clear();
+    app.preview_etag.clear();
     let _ = element("preview").remove_attribute("src");
     visible("preview", false);
     visible("preview-empty", true);
@@ -836,15 +850,15 @@ fn render_analytics(app: &App) {
     let snapshot = &app.analytics;
     let totals = &snapshot["totals"];
     let frames = number(totals, "frames");
-    let dropped = number(totals, "dropped");
+    let lost = number(totals, "lost");
     set_text("analytics-frames", &grouped_number(frames));
     set_text(
         "analytics-dropped",
-        &format!("{:.2}%", drop_percent(frames, dropped)),
+        &format!("{:.2}%", drop_percent(frames, lost)),
     );
     set_text(
         "analytics-drop-detail",
-        &format!("{} missed frames", grouped_number(dropped)),
+        &format!("{} missed frames", grouped_number(lost)),
     );
     set_text("analytics-bytes", &data_size(number(totals, "bytes")));
     set_text(
@@ -861,7 +875,7 @@ fn render_analytics(app: &App) {
     set_text("analytics-status", "Live · refreshes every 5 s");
     element("analytics-status").set_class_name("analytics-status live");
 
-    let has_activity = frames > 0 || dropped > 0;
+    let has_activity = frames > 0 || lost > 0;
     visible(
         "analytics-empty",
         !has_activity || app.analytics_url.is_none(),
@@ -882,7 +896,7 @@ fn render_analytics(app: &App) {
     set_text(
         "analytics-chart-caption",
         &format!(
-            "Totals cover all cameras since this server started. Timeline history stays in memory for at most {hours} hours and clears on restart. Missed frames include transport losses and overwritten preview frames.{}",
+            "Totals cover all cameras since this server started. Timeline history stays in memory for at most {hours} hours and clears on restart. Missed frames were lost on the camera link or in the camera's worker; preview frames a viewer skipped are not counted.{}",
             if flag(snapshot, "truncated") {
                 " The oldest samples have been removed to keep history bounded."
             } else {
@@ -892,7 +906,7 @@ fn render_analytics(app: &App) {
     );
     let _ = element("analytics-chart").set_attribute("alt", &format!(
         "Capture timeline for all cameras: frame rate, acquired data rate, missed frame rate and acquired data volume by camera. This session has {} acquired frames, {} missed frames and {} of camera data.",
-        grouped_number(frames), grouped_number(dropped), data_size(number(totals, "bytes")),
+        grouped_number(frames), grouped_number(lost), data_size(number(totals, "bytes")),
     ));
 
     let cameras = list(snapshot, "cameras");
@@ -915,17 +929,17 @@ fn render_analytics(app: &App) {
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
         let frames = number(camera, "frames");
-        let dropped = number(camera, "dropped");
+        let lost = number(camera, "lost");
         rows.push_str(&format!(
             "<tr><th scope=\"row\" title=\"{}\">{}<span class=\"muted\">{state}</span></th><td>{}</td><td>{}</td><td>{}</td><td>{:.2}%</td></tr>",
             escape(id), escape(if name.is_empty() { id } else { name }), grouped_number(frames),
             if streaming && !stale { format!("{fps:.1} fps") } else { "—".into() },
             if streaming && !stale { format!("{}/s", data_size(rate.max(0.0) as u64)) } else { "—".into() },
-            drop_percent(frames, dropped),
+            drop_percent(frames, lost),
         ));
     }
     element("analytics-cameras").set_inner_html(&format!(
-        "<table><caption class=\"sr-only\">Session totals and current acquisition rates by camera. Missed frame percentages include transport losses and overwritten preview frames.</caption><thead><tr><th scope=\"col\">Camera</th><th scope=\"col\">Frames</th><th scope=\"col\">Now</th><th scope=\"col\">Data rate</th><th scope=\"col\">Missed</th></tr></thead><tbody>{rows}</tbody></table>"
+        "<table><caption class=\"sr-only\">Session totals and current acquisition rates by camera. Missed frame percentages count frames lost on the camera link or in the camera's worker.</caption><thead><tr><th scope=\"col\">Camera</th><th scope=\"col\">Frames</th><th scope=\"col\">Now</th><th scope=\"col\">Data rate</th><th scope=\"col\">Missed</th></tr></thead><tbody>{rows}</tbody></table>"
     ));
     visible("analytics-cameras", !cameras.is_empty());
 }
@@ -966,7 +980,7 @@ fn analytics_chart_width() -> i32 {
 async fn analytics_chart_url() -> Result<String, String> {
     let width = analytics_chart_width();
     APP.with(|state| state.borrow_mut().analytics_layout_width = Some(width));
-    let response = fetch(&format!("/api/analytics.svg?width={width}"), None).await?;
+    let response = fetch(&format!("/api/analytics.svg?width={width}"), None, None).await?;
     if !response.ok() {
         return Err(
             "The capture timeline could not be loaded. It will retry automatically.".into(),
@@ -1025,7 +1039,7 @@ fn refresh_analytics() {
     spawn_local(async move {
         let snapshot = request("/api/analytics", None).await;
         let chart = if snapshot.as_ref().is_ok_and(|snapshot| {
-            number(&snapshot["totals"], "frames") > 0 || number(&snapshot["totals"], "dropped") > 0
+            number(&snapshot["totals"], "frames") > 0 || number(&snapshot["totals"], "lost") > 0
         }) {
             Some(analytics_chart_url().await)
         } else {
@@ -1150,7 +1164,8 @@ fn destination_description(app: &App) {
 fn refresh() {
     let ticket = APP.with(|state| {
         let mut app = state.borrow_mut();
-        if app.snapshot_busy {
+        // A hidden tab waits; showing it again refreshes at once.
+        if app.snapshot_busy || document().hidden() {
             return None;
         }
         app.snapshot_busy = true;
@@ -1206,7 +1221,11 @@ fn sync_snapshot_activity(app: &mut App, snapshot: &Value) {
 fn refresh_activity() {
     let ticket = APP.with(|state| {
         let mut app = state.borrow_mut();
-        if !app.connected || app.activity_busy || js_sys::Date::now() < app.activity_next_at {
+        if !app.connected
+            || app.activity_busy
+            || document().hidden()
+            || js_sys::Date::now() < app.activity_next_at
+        {
             return None;
         }
         app.activity_busy = true;
@@ -1276,17 +1295,38 @@ fn preview() {
         }
         app.preview_busy = true;
         let worker = camera(&app).map(|c| number(c, "worker_pid")).unwrap_or(0);
-        Some((app.generation, app.selected.clone(), worker))
+        Some((
+            app.generation,
+            app.selected.clone(),
+            worker,
+            app.preview_etag.clone(),
+        ))
     });
-    let Some((generation, selected, worker)) = ticket else {
+    let Some((generation, selected, worker, shown)) = ticket else {
         return;
     };
     spawn_local(async move {
         let encoded = js_sys::encode_uri_component(&selected)
             .as_string()
             .unwrap_or_default();
-        let response = fetch(&format!("/api/preview?camera={encoded}"), None).await;
+        // JPEG is a fraction of PNG's size, and the tag of the image shown
+        // turns an unchanged frame into a bodiless 304.
+        let response = fetch(
+            &format!("/api/preview?camera={encoded}&format=jpeg"),
+            None,
+            Some(shown.as_str()).filter(|tag| !tag.is_empty()),
+        )
+        .await;
         let response = match response {
+            Ok(response) if response.status() == 304 => {
+                APP.with(|state| {
+                    let mut app = state.borrow_mut();
+                    if app.generation == generation {
+                        app.preview_busy = false;
+                    }
+                });
+                return;
+            }
             Ok(response) if response.status() == 204 => {
                 APP.with(|state| {
                     let mut app = state.borrow_mut();
@@ -1329,7 +1369,19 @@ fn preview() {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let identity = format!("{worker}:{frame_id}:{timestamp}");
+        let etag = response
+            .headers()
+            .get("ETag")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        // The tag names the frame even where camera frame ids repeat, as
+        // scanned pages' do; older servers send none.
+        let identity = if etag.is_empty() {
+            format!("{worker}:{frame_id}:{timestamp}")
+        } else {
+            etag.clone()
+        };
         let result = match response.blob() {
             Ok(promise) => JsFuture::from(promise)
                 .await
@@ -1361,6 +1413,7 @@ fn preview() {
                 let _ = Url::revoke_object_url(&old);
             }
             app.preview_frame = identity;
+            app.preview_etag = etag;
             element("preview")
                 .unchecked_into::<HtmlImageElement>()
                 .set_src(&url);

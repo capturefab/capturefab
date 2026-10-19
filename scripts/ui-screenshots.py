@@ -267,6 +267,7 @@ def main():
         with tempfile.TemporaryDirectory(prefix="capturefab-ui-review-") as temporary:
             env = isolated_environment()
             env.update(CAPTUREFAB_SESSION_DIR=str(Path(temporary) / "sessions"),
+                       CAPTUREFAB_CACHE_DIR=str(Path(temporary) / "cache"),
                        CAPTUREFAB_SCREENSHOT_SCENE=f"{appearance},{scene.words}",
                        CAPTUREFAB_SCREENSHOT_SIZE=f"{size[0]}x{size[1]}",
                        CAPTUREFAB_UI_SCALE=scale)

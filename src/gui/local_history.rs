@@ -40,7 +40,7 @@ fields! {
     quota_gib: f64, quota_files: u32, retention_enabled: bool, retention_days: u64,
     quota_action: &'static str, schedule_enabled: bool, schedule_delay_seconds: u64,
     schedule_interval_seconds: f64, storage_open: bool, auto_changes_open: bool,
-    appearance: Appearance, ui_scale: UiScale, logs_open: bool, fit: bool, zoom: f32, exposure_open: bool,
+    appearance: Appearance, ui_scale: UiScale, performance: crate::efficiency::Mode, logs_open: bool, fit: bool, zoom: f32, exposure_open: bool,
     focus_camera: bool, sidebar_open: bool, inspector_open: bool, inspector_peek: bool,
     image_mode: bool, recent: Vec<Recent>, auto_start: bool, tags: CaptureTags,
 }
@@ -251,6 +251,7 @@ pub(super) fn gesture(message: &Message) -> Option<(String, Option<String>)> {
         Message::Fit | Message::Actual => ("Change preview scale".into(), None),
         Message::Appearance(_) => ("Change appearance".into(), None),
         Message::UiScale(_) => ("Change interface size".into(), None),
+        Message::Performance(_) => ("Change performance".into(), None),
         Message::BalanceCommit(_) => ("Change auto exposure balance".into(), None),
         Message::Menu(menus::Command::Schedule) => ("Change scheduling".into(), None),
         Message::IncludeSimulator(_) | Message::TrySimulator => ("Show simulator".into(), None),

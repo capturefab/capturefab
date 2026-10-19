@@ -75,7 +75,37 @@ pub fn encode_with_backend(frame: &Frame) -> Result<(Vec<u8>, Backend)> {
     if let Some(bytes) = crate::vajpeg::encode(frame) {
         return Ok((bytes, Backend::VaApi));
     }
-    Ok((software(&Raster::new(frame)?)?, Backend::TurboJpeg))
+    Ok((software_frame(frame)?, Backend::TurboJpeg))
+}
+
+/// libjpeg-turbo reads RGB8, BGR8 and Mono8 frames in place; other formats
+/// are converted into a [`Raster`] first.
+#[cfg(feature = "jpeg")]
+fn software_frame(frame: &Frame) -> Result<Vec<u8>> {
+    use turbojpeg::PixelFormat;
+    let (format, channels) = match frame.pixel_format {
+        crate::types::RGB8 => (PixelFormat::RGB, 3),
+        0x0218_0015 => (PixelFormat::BGR, 3),
+        MONO8 => (PixelFormat::GRAY, 1),
+        _ => return software(&Raster::new(frame)?),
+    };
+    let size = crate::frame::checked_pixels(frame)? * channels;
+    anyhow::ensure!(
+        frame.data.len() >= size,
+        "truncated {} frame",
+        crate::frame::pixel_format_name(frame.pixel_format)
+    );
+    compress(
+        &frame.data[..size],
+        frame.width,
+        frame.height,
+        format,
+        QUALITY,
+    )
+}
+#[cfg(not(feature = "jpeg"))]
+fn software_frame(frame: &Frame) -> Result<Vec<u8>> {
+    software(&Raster::new(frame)?)
 }
 
 pub fn software(raster: &Raster) -> Result<Vec<u8>> {
@@ -86,21 +116,37 @@ pub fn software(raster: &Raster) -> Result<Vec<u8>> {
 /// detail for size; stills use `software` and the fixed `QUALITY`.
 #[cfg(feature = "jpeg")]
 pub fn software_quality(raster: &Raster, quality: i32) -> Result<Vec<u8>> {
+    use turbojpeg::PixelFormat;
+    let format = if raster.channels == 1 {
+        PixelFormat::GRAY
+    } else {
+        PixelFormat::RGB
+    };
+    compress(&raster.data, raster.width, raster.height, format, quality)
+}
+
+#[cfg(feature = "jpeg")]
+fn compress(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    format: turbojpeg::PixelFormat,
+    quality: i32,
+) -> Result<Vec<u8>> {
     use turbojpeg::{Compressor, Image, PixelFormat, Subsamp};
     anyhow::ensure!((1..=100).contains(&quality), "JPEG quality must be 1..100");
     let mut compressor = Compressor::new()?;
     compressor.set_quality(quality)?;
-    let (format, subsamp) = if raster.channels == 1 {
-        (PixelFormat::GRAY, Subsamp::Gray)
+    compressor.set_subsamp(if format == PixelFormat::GRAY {
+        Subsamp::Gray
     } else {
-        (PixelFormat::RGB, Subsamp::Sub2x2)
-    };
-    compressor.set_subsamp(subsamp)?;
+        Subsamp::Sub2x2
+    })?;
     Ok(compressor.compress_to_vec(Image {
-        pixels: raster.data.as_slice(),
-        width: raster.width as usize,
-        pitch: raster.width as usize * raster.channels,
-        height: raster.height as usize,
+        pixels,
+        width: width as usize,
+        pitch: width as usize * format.size(),
+        height: height as usize,
         format,
     })?)
 }
@@ -326,6 +372,22 @@ mod tests {
     fn marker_validation_requires_matching_frame_header() {
         assert!(!well_formed(&[0xFF, 0xD8, 0xFF, 0xD9], 1, 1));
         assert!(!well_formed(&[], 1, 1));
+    }
+    #[cfg(feature = "jpeg")]
+    #[test]
+    fn borrowed_frames_encode_byte_identical_to_rasters() {
+        for (format, bytes) in [(RGB8, 3), (0x0218_0015, 3), (MONO8, 1)] {
+            let frame = frame(format, 97, 61, bytes);
+            let borrowed = software_frame(&frame).unwrap();
+            assert_eq!(
+                borrowed,
+                software(&Raster::new(&frame).unwrap()).unwrap(),
+                "{format:x}"
+            );
+            let mut short = frame.clone();
+            short.data.pop();
+            assert!(software_frame(&short).is_err(), "{format:x}");
+        }
     }
     #[cfg(feature = "jpeg")]
     #[test]

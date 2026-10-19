@@ -95,28 +95,482 @@ pub struct Server {
     _observers: Arc<AtomicUsize>,
 }
 
-pub fn session_dir() -> PathBuf {
-    if let Some(p) = std::env::var_os("CAPTUREFAB_SESSION_DIR") {
-        return p.into();
+/// Session descriptors and their locks, and files that matter only while
+/// the processes using them run, such as scanner and GPU JPEG staging.
+/// CAPTUREFAB_SESSION_DIR overrides it together with the state directory.
+pub fn runtime_dir() -> PathBuf {
+    if let Some(dir) = var("CAPTUREFAB_SESSION_DIR") {
+        return dir;
     }
-    if let Some(p) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(p).join("capturefab");
+    if cfg!(test) {
+        return test_dir();
     }
-    #[cfg(windows)]
-    if let Some(p) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(p).join("capturefab").join("sessions");
+    let login = login_runtime_dir().filter(|(_, login)| *login == LoginDir::Usable);
+    runtime_dir_in(&var, login.map(|(dir, _)| dir))
+}
+/// What must outlive a reboot: GUI settings, saved destinations, the upload
+/// queue and the storage ledger. The Linux runtime directory is a RAM disk
+/// that logout clears, so there they live under XDG_STATE_HOME; elsewhere
+/// the two are one directory.
+pub fn state_dir() -> PathBuf {
+    if let Some(dir) = var("CAPTUREFAB_SESSION_DIR") {
+        return dir;
     }
-    let home = std::env::var_os("HOME")
+    if cfg!(test) {
+        return test_dir();
+    }
+    state_dir_in(&var, cfg!(target_os = "linux"))
+}
+/// The per-user cache, for what can be made again: the extracted FFmpeg, its
+/// encoder probes and, on Linux, dataset staging. CAPTUREFAB_CACHE_DIR
+/// overrides it.
+pub fn cache_dir() -> Option<PathBuf> {
+    if let Some(dir) = var("CAPTUREFAB_CACHE_DIR") {
+        return Some(dir);
+    }
+    // Tests never touch the user's cache.
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join("capturefab-test-cache"));
+    }
+    cache_dir_in(&var)
+}
+/// Unit tests never touch the user's sessions, storage ledger or upload
+/// queue: without CAPTUREFAB_SESSION_DIR each test process gets its own
+/// private directory, which its tests share as they would the real one.
+fn test_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        std::env::temp_dir().join(format!(
+            "capturefab-test-sessions-{}-{nanos}",
+            std::process::id()
+        ))
+    })
+    .clone()
+}
+/// An environment variable that is set to something.
+fn var(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    home.join(".cache").join("capturefab").join("sessions")
+}
+/// An XDG base directory; the specification ignores relative ones.
+fn xdg(var: &impl Fn(&str) -> Option<PathBuf>, name: &str) -> Option<PathBuf> {
+    var(name).filter(|dir| dir.is_absolute())
+}
+fn home(var: &impl Fn(&str) -> Option<PathBuf>) -> PathBuf {
+    var("HOME").unwrap_or_else(std::env::temp_dir)
+}
+/// The one directory versions before the split kept everything in, as macOS
+/// and Windows still do: the login's runtime directory, or a folder on disk.
+fn session_dir_in(var: &impl Fn(&str) -> Option<PathBuf>) -> PathBuf {
+    xdg(var, "XDG_RUNTIME_DIR").map_or_else(|| disk_session_dir(var), |dir| dir.join("capturefab"))
+}
+/// The folder on disk sessions fall back to without a runtime directory.
+fn disk_session_dir(var: &impl Fn(&str) -> Option<PathBuf>) -> PathBuf {
+    if cfg!(windows)
+        && let Some(dir) = var("LOCALAPPDATA")
+    {
+        return dir.join("capturefab").join("sessions");
+    }
+    home(var).join(".cache").join("capturefab").join("sessions")
+}
+/// Without XDG_RUNTIME_DIR, the login's own runtime directory when it is
+/// usable, so a service and an SSH shell find the same sessions.
+fn runtime_dir_in(
+    var: &impl Fn(&str) -> Option<PathBuf>,
+    user_runtime: Option<PathBuf>,
+) -> PathBuf {
+    match user_runtime {
+        Some(dir) if xdg(var, "XDG_RUNTIME_DIR").is_none() => dir.join("capturefab"),
+        _ => session_dir_in(var),
+    }
+}
+fn state_dir_in(var: &impl Fn(&str) -> Option<PathBuf>, linux: bool) -> PathBuf {
+    if !linux {
+        return session_dir_in(var);
+    }
+    xdg(var, "XDG_STATE_HOME")
+        .unwrap_or_else(|| home(var).join(".local").join("state"))
+        .join("capturefab")
+}
+/// ~/Library/Caches on macOS, %LOCALAPPDATA% on Windows, and $XDG_CACHE_HOME
+/// or ~/.cache elsewhere.
+fn cache_dir_in(var: &impl Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        return var("HOME").map(|home| home.join("Library/Caches/capturefab"));
+    }
+    if cfg!(windows) {
+        return var("LOCALAPPDATA").map(|dir| dir.join("capturefab").join("cache"));
+    }
+    xdg(var, "XDG_CACHE_HOME")
+        .or_else(|| var("HOME").map(|home| home.join(".cache")))
+        .map(|dir| dir.join("capturefab"))
+}
+/// Whether a process without XDG_RUNTIME_DIR can keep its sessions in the
+/// login's runtime directory, /run/user/<uid>, where logins look for them.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginDir {
+    /// This user's alone, and kept from boot to shutdown for a lingering user.
+    Usable,
+    /// logind keeps it only while the user is logged in, so a service's
+    /// session would vanish at logout.
+    NotLingering,
+    /// The user lingers, but logind has not made it yet.
+    Missing,
+    /// Another user's, or open to others.
+    NotPrivate,
+}
+#[cfg(any(target_os = "linux", all(unix, test)))]
+impl LoginDir {
+    fn of(dir: &Path, uid: u32, lingers: bool) -> Self {
+        match fs::symlink_metadata(dir) {
+            Ok(_) if !owned_private(dir, uid) => Self::NotPrivate,
+            Ok(_) if lingers => Self::Usable,
+            Err(_) if lingers => Self::Missing,
+            _ => Self::NotLingering,
+        }
+    }
+}
+/// The login's runtime directory and whether it is usable, decided once, so
+/// a process keeps its descriptor, locks and buffers in one place however
+/// logins come and go.
+#[cfg(target_os = "linux")]
+fn login_runtime_dir() -> Option<(PathBuf, LoginDir)> {
+    static LOGIN: std::sync::OnceLock<(PathBuf, LoginDir)> = std::sync::OnceLock::new();
+    let login = LOGIN.get_or_init(|| {
+        let uid = effective_uid();
+        // Integration tests stand in for the user's real one.
+        let dir = var("CAPTUREFAB_LOGIN_RUNTIME_DIR_TEST")
+            .unwrap_or_else(|| PathBuf::from(format!("/run/user/{uid}")));
+        let login = LoginDir::of(&dir, uid, lingers(uid));
+        (dir, login)
+    });
+    Some(login.clone())
+}
+#[cfg(not(target_os = "linux"))]
+fn login_runtime_dir() -> Option<(PathBuf, LoginDir)> {
+    None
+}
+/// Whether logind keeps `uid`'s runtime directory from boot to shutdown
+/// (`loginctl enable-linger`), not only while the user is logged in.
+#[cfg(target_os = "linux")]
+fn lingers(uid: u32) -> bool {
+    user_name(uid).is_some_and(|name| {
+        !name.is_empty() && Path::new("/var/lib/systemd/linger").join(name).exists()
+    })
+}
+/// The name passwd gives `uid`.
+#[cfg(target_os = "linux")]
+fn user_name(uid: u32) -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut found = std::ptr::null_mut();
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: getpwuid_r fills `entry`, with strings stored in `buffer`, and
+    // points `found` at it only when it found the user.
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            entry.as_mut_ptr(),
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if status != 0 || found.is_null() {
+        return None;
+    }
+    // SAFETY: pw_name is a NUL-terminated string in `buffer`, still alive.
+    let name = unsafe { std::ffi::CStr::from_ptr((*found).pw_name) };
+    Some(std::ffi::OsStr::from_bytes(name.to_bytes()).to_owned())
+}
+/// The login runtime directory that runtime_dir() passed over for a folder
+/// on disk, where logins look for sessions instead, and why.
+pub(crate) fn missed_runtime_dir() -> Option<(PathBuf, LoginDir)> {
+    if cfg!(test)
+        || var("CAPTUREFAB_SESSION_DIR").is_some()
+        || xdg(&var, "XDG_RUNTIME_DIR").is_some()
+    {
+        return None;
+    }
+    let logind = Path::new("/run/systemd/seats").is_dir() || Path::new("/run/user").is_dir();
+    missed(login_runtime_dir(), logind)
+}
+/// In a login with XDG_RUNTIME_DIR, where a service started without it
+/// keeps its sessions instead, with the login runtime directory it passes
+/// over and why. An SSH login on a line computer would otherwise see no sign
+/// of a service whose sessions it cannot find.
+pub(crate) fn service_runtime_dir() -> Option<(PathBuf, PathBuf, LoginDir)> {
+    if cfg!(test)
+        || var("CAPTUREFAB_SESSION_DIR").is_some()
+        || xdg(&var, "XDG_RUNTIME_DIR").is_none()
+    {
+        return None;
+    }
+    let logind = Path::new("/run/systemd/seats").is_dir() || Path::new("/run/user").is_dir();
+    let (login, why) = missed(login_runtime_dir(), logind)?;
+    Some((disk_session_dir(&var), login, why))
+}
+/// The responsive sessions in `service_runtime_dir`, which this login's
+/// commands do not find, and that folder.
+pub(crate) fn sessions_elsewhere() -> Option<(PathBuf, Vec<String>)> {
+    let (dir, ..) = service_runtime_dir()?;
+    let names: Vec<String> = descriptors_in(&dir)
+        .ok()?
+        .into_iter()
+        .filter(descriptor_active)
+        .map(|descriptor| descriptor.name)
+        .collect();
+    (!names.is_empty()).then_some((dir, names))
+}
+/// A host without logind, such as a container, has no logins to miss.
+fn missed(login: Option<(PathBuf, LoginDir)>, logind: bool) -> Option<(PathBuf, LoginDir)> {
+    login.filter(|(_, login)| logind && *login != LoginDir::Usable)
+}
+/// A real directory owned by `uid` with mode 0700.
+#[cfg(any(target_os = "linux", all(unix, test)))]
+fn owned_private(dir: &Path, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(dir)
+        .is_ok_and(|meta| meta.is_dir() && meta.uid() == uid && meta.mode() & 0o777 == 0o700)
+}
+#[cfg(unix)]
+pub(crate) fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and always succeeds.
+    unsafe { libc::geteuid() }
+}
+/// Files that move into the state directory together, and the lock that
+/// guards them in both places.
+pub(crate) struct StateSet {
+    /// What the files hold, for messages.
+    pub what: &'static str,
+    pub names: &'static [&'static str],
+    pub lock: Option<&'static str>,
+}
+/// What became of a set that versions before the split kept in a session
+/// directory.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Adoption {
+    /// No old directory holds any of it.
+    Nothing,
+    /// One does, and moves on the set's first use.
+    Pending(PathBuf),
+    /// It stays in these directories: the state directory has its own, or
+    /// more than one holds a copy, and only the user can tell which to keep.
+    LeftBehind(Vec<PathBuf>),
+}
+pub(crate) fn adoption(set: &StateSet) -> Adoption {
+    plan_adoption(&legacy_dirs(), &state_dir(), set.names)
+}
+fn plan_adoption(olds: &[PathBuf], new: &Path, names: &[&str]) -> Adoption {
+    let mut holding: Vec<PathBuf> = olds
+        .iter()
+        .filter(|dir| !held(dir, names).is_empty())
+        .cloned()
+        .collect();
+    match holding.len() {
+        0 => Adoption::Nothing,
+        1 if held(new, names).is_empty() => Adoption::Pending(holding.remove(0)),
+        _ => Adoption::LeftBehind(holding),
+    }
+}
+/// The `names` present in `dir`.
+pub(crate) fn held<'a>(dir: &Path, names: &[&'a str]) -> Vec<&'a str> {
+    names
+        .iter()
+        .copied()
+        .filter(|name| fs::symlink_metadata(dir.join(name)).is_ok())
+        .collect()
+}
+/// Every session directory a version before the split may have kept state
+/// in. A service and a login resolved different ones, so all of them count,
+/// whatever this process's environment. Only Linux moved its state.
+pub(crate) fn legacy_dirs() -> Vec<PathBuf> {
+    if !cfg!(target_os = "linux") || cfg!(test) || var("CAPTUREFAB_SESSION_DIR").is_some() {
+        return Vec::new();
+    }
+    let login = login_runtime_dir().map(|(dir, _)| dir);
+    let mut dirs = legacy_dirs_in(&var, login, &state_dir());
+    // Older versions refused any other directory too.
+    dirs.retain(|dir| check_private_dir(dir).is_ok());
+    dirs
+}
+/// $XDG_RUNTIME_DIR/capturefab, the login runtime directory's and the folder
+/// on disk, each once.
+fn legacy_dirs_in(
+    var: &impl Fn(&str) -> Option<PathBuf>,
+    login: Option<PathBuf>,
+    state: &Path,
+) -> Vec<PathBuf> {
+    let runtime = xdg(var, "XDG_RUNTIME_DIR").into_iter().chain(login);
+    let mut dirs = Vec::new();
+    for dir in runtime
+        .map(|dir| dir.join("capturefab"))
+        .chain([disk_session_dir(var)])
+    {
+        if dir != state && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+/// Move a set of state files a version before the split kept in a session
+/// directory into the state directory, on the set's first use in a process.
+/// A set it cannot move is named on stderr, and `doctor` says what to do.
+pub(crate) fn adopt_state(set: &StateSet) {
+    let new = state_dir();
+    let left = match plan_adoption(&legacy_dirs(), &new, set.names) {
+        Adoption::Nothing => return,
+        Adoption::Pending(old) => match move_state(&old, &new, set.names, set.lock) {
+            Ok(moved) if !moved.is_empty() => {
+                eprintln!(
+                    "capturefab: moved {} from {} to {}",
+                    moved.join(", "),
+                    old.display(),
+                    new.display()
+                );
+                return;
+            }
+            // Another process moved it, or made the set first, meanwhile.
+            Ok(_) if held(&old, set.names).is_empty() => return,
+            Ok(_) => vec![old],
+            Err(error) => {
+                eprintln!(
+                    "capturefab: left {} in {}, as it cannot move to {}: {error:#}",
+                    set.names.join(", "),
+                    old.display(),
+                    new.display()
+                );
+                return;
+            }
+        },
+        Adoption::LeftBehind(olds) => olds,
+    };
+    let left: Vec<String> = left.iter().map(|dir| dir.display().to_string()).collect();
+    eprintln!(
+        "capturefab: not using {} an older version left in {}; run `capturefab doctor`",
+        set.what,
+        left.join(" and ")
+    );
+}
+/// Move the `names` found in `old` to `new` while `new` has none of them,
+/// holding `lock` in both, so no other process changes either copy
+/// meanwhile. Everything is copied before anything is put in place, and a
+/// failure takes back what was placed, so the old set stays whole; nothing
+/// in `new` is ever replaced. Returns the names moved.
+fn move_state(old: &Path, new: &Path, names: &[&str], lock: Option<&str>) -> Result<Vec<String>> {
+    let found = |dir: &Path| held(dir, names);
+    if found(old).is_empty() || !found(new).is_empty() {
+        return Ok(Vec::new());
+    }
+    check_private_dir(old)?;
+    ensure_private_dir(new)?;
+    let _locks = lock
+        .map(|lock| -> Result<_> {
+            let locks = (lock_file(&new.join(lock))?, lock_file(&old.join(lock))?);
+            locks.0.lock_exclusive()?;
+            locks.1.lock_exclusive()?;
+            Ok(locks)
+        })
+        .transpose()?;
+    // Another process may have moved them while this one waited.
+    let moving = found(old);
+    if moving.is_empty() || !found(new).is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut copies = Vec::new();
+    let mut placed = Vec::new();
+    let result = (|| -> Result<()> {
+        for name in &moving {
+            // Named per process: a set without a lock can race another.
+            let copy = new.join(format!(".{name}.{}.moving", std::process::id()));
+            copies.push(copy.clone());
+            copy_private(&old.join(name), &copy)?;
+        }
+        for (name, copy) in moving.iter().zip(&copies) {
+            place(copy, &new.join(name))?;
+            placed.push(new.join(name));
+        }
+        sync_dir(new)
+    })();
+    if let Err(error) = result {
+        for path in placed.iter().chain(&copies) {
+            let _ = fs::remove_file(path);
+        }
+        return Err(error);
+    }
+    for name in &moving {
+        let _ = fs::remove_file(old.join(name));
+    }
+    Ok(moving.into_iter().map(str::to_owned).collect())
+}
+/// A private copy of the regular file `from`, made durable.
+fn copy_private(from: &Path, to: &Path) -> Result<()> {
+    ensure!(
+        fs::symlink_metadata(from)?.is_file(),
+        "{} is not a regular file",
+        from.display()
+    );
+    // Left by an interrupted move of a process with the same id.
+    let _ = fs::remove_file(to);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(to)?;
+    std::io::copy(&mut fs::File::open(from)?, &mut output)?;
+    output.sync_all()?;
+    Ok(())
+}
+/// Put `copy` at `path` unless something is already there.
+fn place(copy: &Path, path: &Path) -> Result<()> {
+    match fs::hard_link(copy, path) {
+        Ok(()) => fs::remove_file(copy)?,
+        // A file system without hard links; the set's lock keeps other
+        // processes from adding the file meanwhile.
+        Err(error)
+            if error.kind() != std::io::ErrorKind::AlreadyExists
+                && fs::symlink_metadata(path).is_err() =>
+        {
+            fs::rename(copy, path)?
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot create {}", path.display()));
+        }
+    }
+    Ok(())
+}
+fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+/// A lock file only this user can open.
+fn lock_file(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 pub fn validate_name(name: &str) -> Result<()> {
     let lower = name.to_ascii_lowercase();
     ensure!(
         !matches!(
             lower.as_str(),
-            "storage" | "storage-policy" | "destinations" | "uploads"
+            "storage" | "storage-policy" | "storage-summary" | "destinations" | "uploads" | "hubs"
         ),
         "session name is reserved for application bookkeeping; choose a different name"
     );
@@ -144,13 +598,7 @@ fn descriptor_path_in(dir: &Path, name: &str) -> Result<PathBuf> {
     Ok(dir.join(format!("{name}.json")))
 }
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
-    if path.exists() {
-        let m = fs::symlink_metadata(path)?;
-        ensure!(
-            m.is_dir() && !m.file_type().is_symlink(),
-            "session directory must be a real directory"
-        );
-    } else {
+    if !path.exists() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
@@ -161,11 +609,26 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
         #[cfg(not(unix))]
         fs::create_dir_all(path)?;
     }
+    check_private_dir(path)
+}
+/// A real directory that only this user can enter. One another user owns,
+/// such as a squatted /tmp or /dev/shm name, is refused even if private.
+fn check_private_dir(path: &Path) -> Result<()> {
+    let m = fs::symlink_metadata(path)?;
+    ensure!(
+        m.is_dir() && !m.file_type().is_symlink(),
+        "session directory must be a real directory"
+    );
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::MetadataExt;
         ensure!(
-            fs::metadata(path)?.permissions().mode() & 0o077 == 0,
+            m.uid() == effective_uid(),
+            "session directory {} belongs to another user",
+            path.display()
+        );
+        ensure!(
+            m.mode() & 0o077 == 0,
             "session directory must be private (chmod 700 {})",
             path.display()
         );
@@ -173,7 +636,21 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 pub fn read_descriptor(name: &str) -> Result<Descriptor> {
-    read_descriptor_in(&session_dir(), name)
+    let dir = runtime_dir();
+    read_descriptor_in(&dir, name).map_err(|error| {
+        let absent = |dir: &Path| {
+            descriptor_path_in(dir, name).is_ok_and(|path| fs::symlink_metadata(path).is_err())
+        };
+        match service_runtime_dir() {
+            Some((service, ..)) if service != dir && absent(&dir) && !absent(&service) => {
+                anyhow::anyhow!(
+                    "{error:#}; a session named {name} is in {}, where a service started without XDG_RUNTIME_DIR keeps it and this login does not look: `capturefab doctor` shows the fix under runtime_dir",
+                    service.display()
+                )
+            }
+            _ => error,
+        }
+    })
 }
 fn read_descriptor_in(dir: &Path, name: &str) -> Result<Descriptor> {
     let path = descriptor_path_in(dir, name)?;
@@ -330,9 +807,10 @@ fn serve_client(
         Err(e) => {
             let mut error = json!({"message":format!("{e:#}")});
             // A request the caller must change keeps exit code 2 across the
-            // connection; its text alone may not say so.
-            if e.chain().any(|cause| cause.is::<crate::dataset::Usage>()) {
-                error["code"] = json!("usage");
+            // connection, and a categorized failure its category; the text
+            // alone may not say so.
+            if let Some(code) = crate::types::error_transport_code(&e) {
+                error["code"] = json!(code);
             }
             json!({"version":VERSION,"ok":false,"error":error})
         }
@@ -346,24 +824,13 @@ impl Server {
         Self::start_with_kind(h, name, SessionKind::Serve)
     }
     pub fn start_with_kind(h: SessionHandle, name: &str, kind: SessionKind) -> Result<Self> {
-        Self::start_in(h, name, kind, &session_dir())
+        Self::start_in(h, name, kind, &runtime_dir())
     }
     fn start_in(h: SessionHandle, name: &str, kind: SessionKind, dir: &Path) -> Result<Self> {
         validate_name(name)?;
         ensure_private_dir(dir)?;
         let path = descriptor_path_in(dir, name)?;
-        let mut lock_options = fs::OpenOptions::new();
-        lock_options
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            lock_options.mode(0o600);
-        }
-        let name_lock = lock_options.open(dir.join(format!("{name}.session.lock")))?;
+        let name_lock = lock_file(&dir.join(format!("{name}.session.lock")))?;
         name_lock.try_lock_exclusive().with_context(|| {
             format!(
                 "session '{name}' already exists; choose another --name or use --session {name}"
@@ -617,10 +1084,10 @@ fn send_request_as(
             .as_str()
             .unwrap_or("session request failed")
             .to_owned();
-        if response["error"]["code"] == "usage" {
-            return Err(crate::dataset::Usage(message).into());
-        }
-        anyhow::bail!("{message}");
+        return Err(crate::types::error_from_transport(
+            response["error"]["code"].as_str(),
+            message,
+        ));
     }
     response
         .get("result")
@@ -657,13 +1124,13 @@ fn descriptors_in(dir: &Path) -> Result<Vec<Descriptor>> {
 /// Discover authenticated, responsive sessions without touching camera state
 /// or adding entries to their activity logs.
 pub fn active_sessions() -> Result<Vec<Descriptor>> {
-    Ok(descriptors_in(&session_dir())?
+    Ok(descriptors_in(&runtime_dir())?
         .into_iter()
         .filter(descriptor_active)
         .collect())
 }
 pub fn list() -> Result<Value> {
-    let sessions: Vec<_> = descriptors_in(&session_dir())?
+    let sessions: Vec<_> = descriptors_in(&runtime_dir())?
         .into_iter()
         .map(|descriptor| {
             let active = descriptor_active(&descriptor);
@@ -720,6 +1187,365 @@ mod tests {
             address,
             token: "a".repeat(64),
         }
+    }
+    #[test]
+    fn tests_never_default_to_the_users_session_directory() {
+        let dir = test_dir();
+        assert!(dir.starts_with(std::env::temp_dir()), "{}", dir.display());
+        assert_eq!(dir, test_dir(), "one directory per process");
+        if std::env::var_os("CAPTUREFAB_SESSION_DIR").is_none() {
+            assert_eq!(runtime_dir(), dir);
+            assert_eq!(state_dir(), dir);
+            assert_eq!(
+                crate::destination::staging_root(),
+                dir.join("staging"),
+                "staged uploads stay in it too"
+            );
+        }
+        if std::env::var_os("CAPTUREFAB_CACHE_DIR").is_none() {
+            assert!(cache_dir().unwrap().starts_with(std::env::temp_dir()));
+        }
+        assert!(legacy_dirs().is_empty(), "nothing to move in tests");
+        assert_eq!(missed_runtime_dir(), None);
+    }
+
+    fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<PathBuf> {
+        let vars: Vec<(String, PathBuf)> = vars
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.into()))
+            .collect();
+        move |name| {
+            vars.iter()
+                .find(|(set, _)| set == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    // XDG paths are absolute only on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn the_runtime_directory_is_the_same_with_or_without_xdg_runtime_dir() {
+        let login = Some(PathBuf::from("/run/user/1000"));
+        let shell = env(&[("XDG_RUNTIME_DIR", "/run/user/1000"), ("HOME", "/home/pi")]);
+        let service = env(&[("HOME", "/home/pi")]);
+        let expected = PathBuf::from("/run/user/1000/capturefab");
+        assert_eq!(runtime_dir_in(&shell, login.clone()), expected);
+        assert_eq!(runtime_dir_in(&shell, None), expected);
+        assert_eq!(runtime_dir_in(&service, login.clone()), expected);
+        // XDG_RUNTIME_DIR, such as a unit's RuntimeDirectory, comes first.
+        let unit = env(&[("XDG_RUNTIME_DIR", "/run/capturefab"), ("HOME", "/home/pi")]);
+        assert_eq!(
+            runtime_dir_in(&unit, login.clone()),
+            PathBuf::from("/run/capturefab/capturefab")
+        );
+        // Without a usable login directory, the folder on disk older
+        // versions used; a relative XDG_RUNTIME_DIR counts as unset.
+        let fallback = PathBuf::from("/home/pi/.cache/capturefab/sessions");
+        assert_eq!(runtime_dir_in(&service, None), fallback);
+        let relative = env(&[("XDG_RUNTIME_DIR", "run"), ("HOME", "/home/pi")]);
+        assert_eq!(runtime_dir_in(&relative, None), fallback);
+        assert_eq!(runtime_dir_in(&relative, login), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_keeps_state_out_of_the_runtime_directory() {
+        let shell = env(&[("XDG_RUNTIME_DIR", "/run/user/1000"), ("HOME", "/home/pi")]);
+        let service = env(&[("HOME", "/home/pi")]);
+        let state = PathBuf::from("/home/pi/.local/state/capturefab");
+        assert_eq!(state_dir_in(&shell, true), state);
+        assert_eq!(state_dir_in(&service, true), state);
+        let custom = env(&[("XDG_STATE_HOME", "/data/state"), ("HOME", "/home/pi")]);
+        assert_eq!(
+            state_dir_in(&custom, true),
+            PathBuf::from("/data/state/capturefab")
+        );
+        let relative = env(&[("XDG_STATE_HOME", "state"), ("HOME", "/home/pi")]);
+        assert_eq!(state_dir_in(&relative, true), state);
+        // Elsewhere nothing moves: state stays in the session directory.
+        assert_eq!(
+            state_dir_in(&shell, false),
+            PathBuf::from("/run/user/1000/capturefab")
+        );
+        assert_eq!(
+            state_dir_in(&service, false),
+            PathBuf::from("/home/pi/.cache/capturefab/sessions")
+        );
+    }
+
+    #[test]
+    fn the_cache_follows_each_platform() {
+        let home = env(&[("HOME", "/home/pi"), ("XDG_CACHE_HOME", "/data/cache")]);
+        let expected = if cfg!(target_os = "macos") {
+            Some("/home/pi/Library/Caches/capturefab")
+        } else if cfg!(windows) {
+            None
+        } else {
+            Some("/data/cache/capturefab")
+        };
+        assert_eq!(cache_dir_in(&home), expected.map(PathBuf::from));
+        if !cfg!(any(target_os = "macos", windows)) {
+            let plain = env(&[("HOME", "/home/pi"), ("XDG_CACHE_HOME", "cache")]);
+            assert_eq!(
+                cache_dir_in(&plain),
+                Some(PathBuf::from("/home/pi/.cache/capturefab"))
+            );
+            assert_eq!(cache_dir_in(&env(&[])), None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_private_runtime_directory_of_this_user_is_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new();
+        let uid = effective_uid();
+        let login = dir.0.join("1000");
+        fs::create_dir(&login).unwrap();
+        fs::set_permissions(&login, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(owned_private(&login, uid));
+        assert!(!owned_private(&login, uid + 1), "another user's");
+        fs::set_permissions(&login, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!owned_private(&login, uid), "readable by others");
+        fs::set_permissions(&login, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&login, &link).unwrap();
+        assert!(!owned_private(&link, uid), "a symbolic link");
+        assert!(!owned_private(&dir.0.join("missing"), uid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_login_directory_is_used_only_for_a_lingering_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new();
+        let uid = effective_uid();
+        let login = dir.0.join("1000");
+        assert_eq!(LoginDir::of(&login, uid, false), LoginDir::NotLingering);
+        assert_eq!(LoginDir::of(&login, uid, true), LoginDir::Missing);
+        fs::create_dir(&login).unwrap();
+        fs::set_permissions(&login, fs::Permissions::from_mode(0o700)).unwrap();
+        // Without lingering, logind removes it at logout, and a service's
+        // session with it, however private it is now.
+        assert_eq!(LoginDir::of(&login, uid, false), LoginDir::NotLingering);
+        assert_eq!(LoginDir::of(&login, uid, true), LoginDir::Usable);
+        assert_eq!(LoginDir::of(&login, uid + 1, true), LoginDir::NotPrivate);
+        fs::set_permissions(&login, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(LoginDir::of(&login, uid, true), LoginDir::NotPrivate);
+        assert_eq!(LoginDir::of(&login, uid, false), LoginDir::NotPrivate);
+    }
+
+    #[test]
+    fn a_host_without_logind_misses_no_login_directory() {
+        let dir = PathBuf::from("/run/user/1000");
+        for login in [
+            LoginDir::NotLingering,
+            LoginDir::Missing,
+            LoginDir::NotPrivate,
+        ] {
+            assert_eq!(
+                missed(Some((dir.clone(), login)), true),
+                Some((dir.clone(), login))
+            );
+            // A container has no logins that would look there.
+            assert_eq!(missed(Some((dir.clone(), login)), false), None);
+        }
+        assert_eq!(missed(Some((dir, LoginDir::Usable)), true), None);
+        assert_eq!(missed(None, true), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linger_is_looked_up_by_user_name() {
+        assert_eq!(user_name(0).as_deref(), Some(std::ffi::OsStr::new("root")));
+        assert_eq!(user_name(u32::MAX - 1), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_may_be_in_any_directory_an_older_version_used() {
+        let login = Some(PathBuf::from("/run/user/1000"));
+        let state = PathBuf::from("/home/pi/.local/state/capturefab");
+        let disk = PathBuf::from("/home/pi/.cache/capturefab/sessions");
+        let user = PathBuf::from("/run/user/1000/capturefab");
+        // An SSH shell also looks where a service without XDG_RUNTIME_DIR
+        // kept its state.
+        let shell = env(&[("XDG_RUNTIME_DIR", "/run/user/1000"), ("HOME", "/home/pi")]);
+        assert_eq!(
+            legacy_dirs_in(&shell, login.clone(), &state),
+            [user.clone(), disk.clone()]
+        );
+        let service = env(&[("HOME", "/home/pi")]);
+        assert_eq!(
+            legacy_dirs_in(&service, login.clone(), &state),
+            [user.clone(), disk.clone()]
+        );
+        assert_eq!(
+            legacy_dirs_in(&service, None, &state),
+            std::slice::from_ref(&disk)
+        );
+        // A unit that gained RuntimeDirectory= still finds what its login
+        // and its older self kept.
+        let unit = env(&[("XDG_RUNTIME_DIR", "/run/capturefab"), ("HOME", "/home/pi")]);
+        assert_eq!(
+            legacy_dirs_in(&unit, login, &state),
+            [
+                PathBuf::from("/run/capturefab/capturefab"),
+                user,
+                disk.clone()
+            ]
+        );
+        assert!(legacy_dirs_in(&service, None, &disk).is_empty());
+    }
+
+    #[test]
+    fn state_moves_only_when_one_copy_is_left() {
+        let root = TestDir::new();
+        let (runtime, disk, new) = (root.0.join("run"), root.0.join("disk"), root.0.join("new"));
+        for dir in [&runtime, &disk, &new] {
+            ensure_private_dir(dir).unwrap();
+        }
+        let olds = [runtime.clone(), disk.clone()];
+        let names = ["a.json", "b.json"];
+        assert_eq!(plan_adoption(&olds, &new, &names), Adoption::Nothing);
+        // A service's set on disk moves for a shell whose own runtime
+        // directory holds nothing: the regression where it stayed behind.
+        fs::write(disk.join("b.json"), "service").unwrap();
+        fs::write(runtime.join("other"), "").unwrap();
+        assert_eq!(
+            plan_adoption(&olds, &new, &names),
+            Adoption::Pending(disk.clone())
+        );
+        // Two copies, or one beside the state directory's own, wait for the
+        // user to choose.
+        fs::write(runtime.join("a.json"), "shell").unwrap();
+        assert_eq!(
+            plan_adoption(&olds, &new, &names),
+            Adoption::LeftBehind(olds.to_vec())
+        );
+        fs::remove_file(runtime.join("a.json")).unwrap();
+        fs::write(new.join("a.json"), "new").unwrap();
+        assert_eq!(
+            plan_adoption(&olds, &new, &names),
+            Adoption::LeftBehind(vec![disk])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_of_another_user_is_refused() {
+        // The root directory belongs to root; its mode alone would not
+        // refuse a private one that another user created first.
+        if effective_uid() != 0 {
+            let error = ensure_private_dir(Path::new("/")).unwrap_err().to_string();
+            assert!(error.contains("belongs to another user"), "{error}");
+        }
+        let dir = TestDir::new();
+        ensure_private_dir(&dir.0.join("a/b")).unwrap();
+    }
+
+    /// A legacy session directory holding `files`, and an empty state one.
+    fn legacy(files: &[(&str, &str)]) -> (TestDir, PathBuf, PathBuf) {
+        let root = TestDir::new();
+        let old = root.0.join("old");
+        let new = root.0.join("new");
+        ensure_private_dir(&old).unwrap();
+        for (name, text) in files {
+            fs::write(old.join(name), text).unwrap();
+        }
+        (root, old, new)
+    }
+
+    #[test]
+    fn state_moves_once_and_whole() {
+        let (_root, old, new) = legacy(&[("a.json", "A"), ("b.json", "B"), ("other", "O")]);
+        let names = ["a.json", "b.json", "c.json"];
+        let moved = move_state(&old, &new, &names, Some("set.lock")).unwrap();
+        assert_eq!(moved, ["a.json", "b.json"]);
+        assert_eq!(fs::read_to_string(new.join("a.json")).unwrap(), "A");
+        assert_eq!(fs::read_to_string(new.join("b.json")).unwrap(), "B");
+        assert!(!old.join("a.json").exists() && !old.join("b.json").exists());
+        assert!(old.join("other").exists(), "files of other sets stay");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(new.join("a.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let leftovers: Vec<_> = fs::read_dir(&new)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".moving"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        // Once the state directory has the set, an old file that turns up
+        // again stays where it is.
+        fs::write(old.join("a.json"), "stale").unwrap();
+        assert!(
+            move_state(&old, &new, &names, Some("set.lock"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read_to_string(new.join("a.json")).unwrap(), "A");
+        assert_eq!(fs::read_to_string(old.join("a.json")).unwrap(), "stale");
+    }
+
+    #[test]
+    fn state_never_replaces_a_file() {
+        let (_root, old, new) = legacy(&[("a.json", "old A"), ("b.json", "old B")]);
+        ensure_private_dir(&new).unwrap();
+        fs::write(new.join("b.json"), "new B").unwrap();
+        let names = ["a.json", "b.json"];
+        assert!(move_state(&old, &new, &names, None).unwrap().is_empty());
+        assert!(!new.join("a.json").exists(), "a set never moves in part");
+        assert_eq!(fs::read_to_string(new.join("b.json")).unwrap(), "new B");
+        assert_eq!(fs::read_to_string(old.join("a.json")).unwrap(), "old A");
+        // Placing refuses a file that appeared after the check.
+        let copy = new.join(".a.json.moving");
+        fs::write(&copy, "copy").unwrap();
+        assert!(place(&copy, &new.join("b.json")).is_err());
+        assert_eq!(fs::read_to_string(new.join("b.json")).unwrap(), "new B");
+    }
+
+    #[test]
+    fn a_failed_move_leaves_the_old_set_whole() {
+        let (_root, old, new) = legacy(&[("a.json", "A")]);
+        fs::create_dir(old.join("b.json")).unwrap();
+        let error = move_state(&old, &new, &["a.json", "b.json"], None).unwrap_err();
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        assert_eq!(fs::read_to_string(old.join("a.json")).unwrap(), "A");
+        assert_eq!(fs::read_dir(&new).unwrap().count(), 0, "no copies left");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_moves_only_from_a_private_directory_of_this_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_root, old, new) = legacy(&[("a.json", "A")]);
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(move_state(&old, &new, &["a.json"], None).is_err());
+        assert!(old.join("a.json").exists() && !new.join("a.json").exists());
+    }
+
+    #[test]
+    fn state_moves_while_no_process_holds_its_lock() {
+        let (_root, old, new) = legacy(&[("a.json", "A")]);
+        // An older version updating the set holds its lock there.
+        let held = lock_file(&old.join("set.lock")).unwrap();
+        held.lock_exclusive().unwrap();
+        let mover = {
+            let (old, new) = (old.clone(), new.clone());
+            std::thread::spawn(move || move_state(&old, &new, &["a.json"], Some("set.lock")))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!new.join("a.json").exists(), "waits for the lock");
+        fs::write(old.join("a.json"), "A2").unwrap();
+        FileExt::unlock(&held).unwrap();
+        assert_eq!(mover.join().unwrap().unwrap(), ["a.json"]);
+        assert_eq!(fs::read_to_string(new.join("a.json")).unwrap(), "A2");
     }
     #[test]
     fn authenticated_probes_do_not_change_camera_state_or_activity() {
@@ -1201,9 +2027,11 @@ mod tests {
         assert!(validate_name("bench-01").is_ok());
         assert!(validate_name("storage").is_err());
         assert!(validate_name("storage-policy").is_err());
+        assert!(validate_name("storage-summary").is_err());
         assert!(validate_name("Storage").is_err());
         assert!(validate_name("destinations").is_err());
         assert!(validate_name("uploads").is_err());
+        assert!(validate_name("Hubs").is_err());
         assert!(validate_name("com10").is_ok());
         assert!(validate_name("lpt0").is_ok());
     }

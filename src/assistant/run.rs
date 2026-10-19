@@ -2880,7 +2880,7 @@ mod tests {
                 camera.forwarding_since_ms = None;
                 camera.forwarding_until_ms = None;
                 camera.streaming = false;
-                for feature in &mut camera.features {
+                for feature in Arc::make_mut(&mut camera.features) {
                     if feature.name == "Gain" {
                         feature.value = Some(json!(0));
                     }
@@ -2898,12 +2898,12 @@ mod tests {
         }
         fn gain(&self, value: u32) {
             let mut snapshot = self.snapshot.lock().unwrap();
-            let feature = snapshot
+            let camera = snapshot
                 .cameras
                 .iter_mut()
                 .find(|camera| camera.info.id == "sim:0")
-                .unwrap()
-                .features
+                .unwrap();
+            let feature = Arc::make_mut(&mut camera.features)
                 .iter_mut()
                 .find(|feature| feature.name == "Gain")
                 .unwrap();
@@ -2951,8 +2951,7 @@ mod tests {
                     for value in values {
                         let parsed = serde_json::from_str::<Value>(&value.value)
                             .unwrap_or_else(|_| json!(value.value));
-                        state
-                            .features
+                        Arc::make_mut(&mut state.features)
                             .iter_mut()
                             .find(|feature| feature.name == value.feature)
                             .unwrap()
@@ -2984,8 +2983,7 @@ mod tests {
                         .iter_mut()
                         .find(|state| Some(state.info.id.as_str()) == camera)
                         .unwrap();
-                    state
-                        .features
+                    Arc::make_mut(&mut state.features)
                         .iter_mut()
                         .find(|feature| feature.name == "Gain")
                         .unwrap()
@@ -3575,19 +3573,21 @@ mod tests {
             ),
             finished(),
         ]);
-        host.snapshot
-            .lock()
-            .unwrap()
-            .cameras
-            .iter_mut()
-            .find(|camera| camera.info.id == "sim:0")
-            .unwrap()
-            .features
-            .push(crate::tools::tests::feature(
+        {
+            let mut snapshot = host.snapshot.lock().unwrap();
+            let camera = snapshot
+                .cameras
+                .iter_mut()
+                .find(|camera| camera.info.id == "sim:0")
+                .unwrap();
+            let mut features = camera.features.to_vec();
+            features.push(crate::tools::tests::feature(
                 "GainAutoOnce",
                 "Command",
                 Value::Null,
             ));
+            camera.features = features.into();
+        }
         let mut req = request();
         req.on_human_change = OnHumanChange::Pause;
         let report = run_blocking(

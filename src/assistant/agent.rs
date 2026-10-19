@@ -208,7 +208,7 @@ impl Deps {
             }),
             clock: Arc::new(SystemClock),
             secrets: Arc::new(tools::EmptySecrets),
-            log_directory: crate::ipc::session_dir().join("assistant/runs"),
+            log_directory: super::log::directory(),
         }
     }
     pub fn gather(&self, host: &dyn ToolHost) -> Result<Context> {

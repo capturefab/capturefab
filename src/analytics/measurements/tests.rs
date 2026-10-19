@@ -346,10 +346,9 @@ fn malformed_outputs_reject_the_entire_batch_without_inserting_earlier_rows() {
 fn database_insert_failure_rolls_back_the_entire_batch() {
     let analytics = Analytics::new();
     {
-        let store = analytics.store.lock().unwrap();
+        let mut store = analytics.store.lock().unwrap();
         store
-            .db
-            .as_ref()
+            .connection()
             .unwrap()
             .execute_batch(
                 "DROP TABLE measurement_samples;
@@ -380,7 +379,7 @@ fn measurement_retention_and_row_cap_are_independent_of_capture_counters() {
         let store = analytics.store.lock().unwrap();
         let db = store.db.as_ref().unwrap();
         db.execute(
-            "INSERT INTO samples VALUES (0, ?, 0, 1, 0, 100, 1.0, 100.0, 1, 0)",
+            "INSERT INTO samples VALUES (0, ?, 0, 1, 0, 100, 1.0, 100.0, 1, 0, 0, 0)",
             params![now],
         )
         .unwrap();

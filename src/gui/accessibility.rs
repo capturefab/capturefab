@@ -16,8 +16,9 @@ use std::{
     hash::{Hash, Hasher},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 mod decorate;
@@ -36,6 +37,9 @@ pub(super) use scroll::VerticalAnchorMarker;
 
 const ROOT: NodeId = NodeId(0);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// While an assistive technology listens, draws that only show new camera
+/// frames collect the tree at most this often; any other change, at once.
+const FRAME_COLLECTION: Duration = Duration::from_millis(250);
 
 pub(super) fn new_node_id() -> NodeId {
     NodeId(NEXT_ID.fetch_add(1, Ordering::Relaxed))
@@ -124,6 +128,12 @@ struct Shared {
     snapshots: Mutex<HashMap<window::Id, Snapshot>>,
     sender: Mutex<mpsc::Sender<Request>>,
     receiver: Mutex<Option<mpsc::Receiver<Request>>>,
+    /// An assistive technology asked for a tree and has not let go.
+    listening: AtomicBool,
+    /// Counts changes of state and input; see `changed`.
+    revision: AtomicU64,
+    /// The revision and time each window's tree was last collected at.
+    collected: Mutex<HashMap<window::Id, (u64, Instant)>>,
 }
 
 #[derive(Clone)]
@@ -137,6 +147,9 @@ impl Default for Bridge {
             snapshots: Mutex::new(HashMap::new()),
             sender: Mutex::new(sender),
             receiver: Mutex::new(Some(receiver)),
+            listening: AtomicBool::new(false),
+            revision: AtomicU64::new(0),
+            collected: Mutex::new(HashMap::new()),
         }))
     }
 }
@@ -317,6 +330,53 @@ impl Bridge {
             }
             snapshot.routes.clear();
         }
+    }
+
+    /// The app's state changed in a way an assistive technology may need to
+    /// hear about, beyond new camera frames: collect on the next draws.
+    pub fn changed(&self) {
+        self.0.revision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An assistive technology asked for window `id`'s tree: collect trees
+    /// from now on. Ones kept while nothing listened are stale, so they are
+    /// dropped, and the adapter waits for the next draw's tree, which then
+    /// reaches it as a change through `sync`.
+    fn listen(&self, id: window::Id) -> Option<TreeUpdate> {
+        if self.0.listening.swap(true, Ordering::Relaxed) {
+            return self.tree(id);
+        }
+        self.0.snapshots.lock().unwrap().clear();
+        self.0.collected.lock().unwrap().clear();
+        None
+    }
+
+    /// Nothing listens any more: stop collecting until something asks.
+    #[cfg(any(target_os = "linux", test))]
+    fn quiet(&self) {
+        self.0.listening.store(false, Ordering::Relaxed);
+    }
+
+    fn listening(&self) -> bool {
+        self.0.listening.load(Ordering::Relaxed)
+    }
+
+    /// Whether to collect window `id`'s tree on its draw at `at`: never
+    /// while nothing listens, at once after a change, and otherwise every
+    /// `FRAME_COLLECTION`, which keeps bounds near moving content.
+    fn due(&self, id: window::Id, at: Instant) -> bool {
+        if !self.listening() {
+            return false;
+        }
+        let revision = self.0.revision.load(Ordering::Relaxed);
+        let mut collected = self.0.collected.lock().unwrap();
+        let due = collected.get(&id).is_none_or(|(seen, when)| {
+            *seen != revision || at.saturating_duration_since(*when) >= FRAME_COLLECTION
+        });
+        if due {
+            collected.insert(id, (revision, at));
+        }
+        due
     }
 
     fn tree(&self, id: window::Id) -> Option<TreeUpdate> {
@@ -670,6 +730,9 @@ pub(super) fn focus_reveal_operation(id: window::Id) -> impl Operation<Message> 
     scroll::Locate::focused(id)
 }
 
+/// Expose `content` to assistive technologies as window `id`. While one
+/// listens, draws collect its semantic tree (see `Bridge::due`), and
+/// `on_changed` reports a tree that changed, for `Bridge::sync` to send.
 pub(super) fn wrap<'a>(
     content: Element<'a, Message>,
     bridge: Bridge,
@@ -779,7 +842,18 @@ impl Widget<Message, Theme, iced::Renderer> for Semantics<'_> {
         self.content.as_widget_mut().update(
             tree, event, layout, cursor, renderer, clipboard, shell, viewport,
         );
-        if matches!(event, Event::Window(window::Event::RedrawRequested(_))) {
+        let Event::Window(window::Event::RedrawRequested(at)) = event else {
+            // Input moves focus, scrolls and opens popups without telling
+            // the app, so the next draw collects.
+            self.bridge.changed();
+            if matches!(event, Event::Window(window::Event::Moved(_))) && self.bridge.listening() {
+                // The semantic client-relative tree may be identical after a
+                // move, but the AT-SPI screen origin must follow the window.
+                shell.publish((self.on_changed)(self.id));
+            }
+            return;
+        };
+        if self.bridge.due(self.id, *at) {
             let mut collector = Collector::new(self.scale);
             collector.viewport.root(layout.bounds());
             self.content
@@ -789,10 +863,6 @@ impl Widget<Message, Theme, iced::Renderer> for Semantics<'_> {
             if self.bridge.store(self.id, tree, routes) {
                 shell.publish((self.on_changed)(self.id));
             }
-        } else if matches!(event, Event::Window(window::Event::Moved(_))) {
-            // The semantic client-relative tree may be identical after a move,
-            // but the AT-SPI screen origin must follow the native window.
-            shell.publish((self.on_changed)(self.id));
         }
     }
     fn mouse_interaction(
@@ -1200,6 +1270,86 @@ mod tests {
             routes[&button.id].activate,
             Some(Message::Discover)
         ));
+    }
+
+    #[test]
+    fn draws_collect_the_tree_only_while_an_assistive_technology_listens() {
+        let renderer = crate::gui::destinations::layout_tests::renderer();
+        let bridge = Bridge::default();
+        let id = window::Id::unique();
+        let mut tree = Tree::empty();
+        // Draw a window holding one button labelled `label`, or give it
+        // `event`, and return what it published.
+        let mut send = |label: &str, event: Event| {
+            let mut view = wrap(
+                crate::gui::button::button(iced::widget::text(label.to_owned()))
+                    .on_press(Message::Discover)
+                    .into(),
+                bridge.clone(),
+                id,
+                "Capturefab".into(),
+                1.0,
+                Message::AccessibilityChanged,
+            );
+            tree.diff(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+            );
+            let mut messages = Vec::new();
+            view.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &Rectangle::with_size(node.size()),
+            );
+            messages.len()
+        };
+        let shown = || {
+            let tree = bridge.tree(id)?;
+            let (_, button) = tree
+                .nodes
+                .into_iter()
+                .find(|(_, node)| node.role() == Role::Button)?;
+            button.label().map(str::to_owned)
+        };
+        let start = Instant::now();
+        let ms = |value| start + Duration::from_millis(value);
+        let draw = |at| Event::Window(window::Event::RedrawRequested(at));
+        // Nothing listens: draws walk nothing, whatever changed.
+        bridge.changed();
+        assert_eq!(send("Start", draw(ms(0))), 0);
+        assert_eq!(shown(), None);
+        assert!(bridge.listen(id).is_none());
+        assert_eq!(send("Start", draw(ms(0))), 1, "the first tree is a change");
+        assert_eq!(shown().as_deref(), Some("Start"));
+        // Draws of new frames alone collect at most every FRAME_COLLECTION.
+        assert_eq!(send("Stop", draw(ms(100))), 0);
+        assert_eq!(shown().as_deref(), Some("Start"));
+        assert_eq!(send("Stop", draw(ms(250))), 1);
+        assert_eq!(shown().as_deref(), Some("Stop"));
+        // A change of state, or input the app never hears of, collects on
+        // the next draw.
+        bridge.changed();
+        assert_eq!(send("Record", draw(ms(260))), 1);
+        let moved = Event::Mouse(mouse::Event::CursorMoved {
+            position: iced::Point::ORIGIN,
+        });
+        assert_eq!(send("Pause", moved), 0);
+        assert_eq!(send("Pause", draw(ms(270))), 1);
+        assert_eq!(shown().as_deref(), Some("Pause"));
+        // Once it lets go, nothing is collected; asking again starts afresh
+        // and reaches the adapter even with an unchanged tree.
+        bridge.quiet();
+        bridge.changed();
+        assert_eq!(send("Pause", draw(ms(1000))), 0);
+        assert!(bridge.listen(id).is_none(), "the kept tree is stale");
+        assert_eq!(send("Pause", draw(ms(1001))), 1);
     }
 
     #[test]

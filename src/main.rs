@@ -1,4 +1,6 @@
 use capturefab::cli::{self, Cli};
+// Diagnostics that a hung-up terminal cannot turn into a panic.
+use capturefab::eprintln;
 use clap::Parser;
 use serde_json::json;
 
@@ -13,10 +15,21 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("__worker") {
         let result = std::env::args_os()
             .nth(2)
-            .ok_or_else(|| anyhow::anyhow!("missing shared ring path"))
-            .and_then(|p| capturefab::session::run_worker(std::path::Path::new(&p)));
+            .ok_or_else(|| anyhow::anyhow!("missing shared ring"))
+            .and_then(|ring| capturefab::session::run_worker(&ring));
         if let Err(e) = result {
-            eprintln!("capturefab worker: {e:#}");
+            eprintln!(
+                "capturefab worker: {}",
+                capturefab::hubs::scrub::scrub(&format!("{e:#}"))
+            );
+            std::process::exit(1)
+        }
+        return;
+    }
+    #[cfg(feature = "gui")]
+    if std::env::args().nth(1).as_deref() == Some("__gpu-probe") {
+        if let Err(e) = capturefab::doctor::run_gpu_probe() {
+            eprintln!("capturefab GPU probe: {e:#}");
             std::process::exit(1)
         }
         return;
@@ -92,6 +105,7 @@ fn main() {
         let provider_failure = error
             .chain()
             .find_map(|cause| cause.downcast_ref::<capturefab::assistant::http::ProviderError>());
+        // Classify typed failures before removing any registered hub secret.
         let message = check_failure
             .map(ToString::to_string)
             .or_else(|| plan_failure.map(ToString::to_string))
@@ -101,6 +115,7 @@ fn main() {
             .unwrap_or_else(|| format!("{error:#}"));
         #[cfg(feature = "ai")]
         let message = provider_failure.map(ToString::to_string).unwrap_or(message);
+        let message = capturefab::hubs::scrub::scrub(&message).into_owned();
         if json_mode {
             let mut envelope =
                 json!({"version":1,"ok":false,"error":{"code":code,"message":message}});

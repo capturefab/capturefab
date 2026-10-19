@@ -95,3 +95,123 @@ pub trait Backend: RegisterIo {
 
 pub const MONO8: u32 = 0x0108_0001;
 pub const RGB8: u32 = 0x0218_0014;
+
+/// How a failure is reported to scripts. Carried as a type, so a name inside a
+/// message (a camera called `porch_disabled`) cannot change the exit code that
+/// `cli::error_code` would otherwise infer from the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    OperationFailed,
+    Unavailable,
+    Timeout,
+    Unsupported,
+}
+impl ErrorKind {
+    /// The JSON error code and process exit code.
+    pub fn code(self) -> (&'static str, i32) {
+        match self {
+            Self::OperationFailed => ("operation_failed", 1),
+            Self::Unavailable => ("unavailable", 3),
+            Self::Timeout => ("timeout", 4),
+            Self::Unsupported => ("unsupported", 5),
+        }
+    }
+    fn from_code(code: &str) -> Option<Self> {
+        [
+            Self::OperationFailed,
+            Self::Unavailable,
+            Self::Timeout,
+            Self::Unsupported,
+        ]
+        .into_iter()
+        .find(|kind| kind.code().0 == code)
+    }
+}
+
+/// An error whose category was decided where it happened.
+#[derive(Debug)]
+pub struct Categorized {
+    pub kind: ErrorKind,
+    pub message: String,
+}
+impl Categorized {
+    pub fn error(kind: ErrorKind, message: impl Into<String>) -> anyhow::Error {
+        Self {
+            kind,
+            message: message.into(),
+        }
+        .into()
+    }
+}
+impl std::fmt::Display for Categorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for Categorized {}
+
+/// No frame arrived within the requested wait, but the source is still
+/// running: the engine keeps polling instead of counting a transport error.
+#[derive(Debug)]
+pub struct FrameWait;
+impl std::fmt::Display for FrameWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("frame timeout")
+    }
+}
+impl std::error::Error for FrameWait {}
+
+/// The category to send with an error that crosses a process or socket, so
+/// the receiving side reports it the same way: `usage` or an [`ErrorKind`]
+/// code.
+pub fn error_transport_code(error: &anyhow::Error) -> Option<&'static str> {
+    error.chain().find_map(|cause| {
+        if cause.is::<crate::dataset::Usage>() {
+            Some("usage")
+        } else {
+            cause
+                .downcast_ref::<Categorized>()
+                .map(|categorized| categorized.kind.code().0)
+        }
+    })
+}
+
+/// Rebuild an error received with [`error_transport_code`].
+pub fn error_from_transport(code: Option<&str>, message: String) -> anyhow::Error {
+    match code {
+        Some("usage") => crate::dataset::Usage(message).into(),
+        Some(code) => match ErrorKind::from_code(code) {
+            Some(kind) => Categorized::error(kind, message),
+            None => anyhow::Error::msg(message),
+        },
+        None => anyhow::Error::msg(message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn error_categories_survive_transport() {
+        let usage: anyhow::Error = crate::dataset::Usage("bad option".into()).into();
+        let timeout = Categorized::error(ErrorKind::Timeout, "camera timed out");
+        let wrapped = anyhow::Error::from(Categorized {
+            kind: ErrorKind::Unavailable,
+            message: "camera porch_disabled is offline".into(),
+        })
+        .context("connect");
+        for (error, code) in [
+            (usage, Some("usage")),
+            (timeout, Some("timeout")),
+            (wrapped, Some("unavailable")),
+            (anyhow::anyhow!("plain"), None),
+        ] {
+            assert_eq!(error_transport_code(&error), code);
+            let rebuilt = error_from_transport(code, format!("{error:#}"));
+            assert_eq!(error_transport_code(&rebuilt), code);
+            assert_eq!(format!("{rebuilt:#}"), format!("{error:#}"));
+        }
+        assert!(error_transport_code(&error_from_transport(Some("bogus"), "x".into())).is_none());
+    }
+}

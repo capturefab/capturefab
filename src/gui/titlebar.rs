@@ -130,6 +130,8 @@ impl Workbench {
                 output: "captures".into(),
                 count: 120,
                 captured: 18,
+                skipped: 0,
+                retries: 0,
                 first_at_ms: now.saturating_sub(18 * 60_000),
                 interval_ms: 60_000,
                 next_at_ms: now + 42_000,
@@ -291,6 +293,20 @@ enum Phase {
     Streaming,
     /// Streaming, but no new frame for this long; see `Workbench::stalled`.
     Waiting(Duration),
+    /// Streaming, while the camera's network stream is being reopened, as
+    /// its badge says; see `Workbench::reconnecting`.
+    Reconnecting,
+}
+
+/// The overview pill's count: cameras waiting or reconnecting of those
+/// streaming, or streaming of all. Reconnects are counted attempts too, so
+/// that count names its unit.
+fn overview_figure(phase: Phase, waiting: usize, streaming: usize, total: usize) -> String {
+    match phase {
+        Phase::Waiting(_) => format!("{waiting} of {streaming}"),
+        Phase::Reconnecting => format!("{waiting} of {streaming} cameras"),
+        _ => format!("{streaming} of {total}"),
+    }
 }
 
 impl Phase {
@@ -301,6 +317,7 @@ impl Phase {
             Phase::Stopping => "Stopping…",
             Phase::Streaming => "Streaming",
             Phase::Waiting(_) => "Waiting for frames",
+            Phase::Reconnecting => "Reconnecting…",
         }
     }
 
@@ -309,14 +326,17 @@ impl Phase {
     /// phases show none of it, and a stop fades from it rather than cutting.
     fn state(self) -> CameraState {
         match self {
-            Phase::Waiting(_) => CameraState::Stalled,
+            Phase::Waiting(_) | Phase::Reconnecting => CameraState::Stalled,
             _ => CameraState::Live,
         }
     }
 
     /// Whether the pill shows its live section, tinted as live.
     fn live(self) -> bool {
-        matches!(self, Phase::Streaming | Phase::Waiting(_))
+        matches!(
+            self,
+            Phase::Streaming | Phase::Waiting(_) | Phase::Reconnecting
+        )
     }
 
     /// While a start or stop is on its way, whether it is a stop.
@@ -648,16 +668,20 @@ impl Workbench {
         Some(match id.and_then(|id| self.stream_pending(id)) {
             Some(false) => Phase::Starting,
             Some(true) => Phase::Stopping,
-            None if snapshot.streaming => id
-                .and_then(|id| self.stalled(id))
-                .map_or(Phase::Streaming, Phase::Waiting),
+            None if snapshot.streaming => match id {
+                Some(id) if self.reconnecting(id).is_some() => Phase::Reconnecting,
+                _ => id
+                    .and_then(|id| self.stalled(id))
+                    .map_or(Phase::Streaming, Phase::Waiting),
+            },
             None => Phase::Ready,
         })
     }
 
     /// What the overview's status pill says, with each streaming camera
-    /// that waits for frames and how long it has waited.
-    fn overview_phase(&self) -> (Phase, Vec<(&CameraInfo, Duration)>) {
+    /// that waits for frames and how long it has waited, or `None` while its
+    /// network stream is being reopened.
+    fn overview_phase(&self) -> (Phase, Vec<(&CameraInfo, Option<Duration>)>) {
         let streaming: Vec<_> = self
             .snapshot
             .cameras
@@ -666,7 +690,13 @@ impl Workbench {
             .collect();
         let waiting: Vec<_> = streaming
             .iter()
-            .filter_map(|camera| Some((&camera.info, self.stalled(&camera.info.id)?)))
+            .filter_map(|camera| {
+                let id = &camera.info.id;
+                if self.reconnecting(id).is_some() {
+                    return Some((&camera.info, None));
+                }
+                Some((&camera.info, Some(self.stalled(id)?)))
+            })
             .collect();
         // Start all and Stop all; a single camera's tile shows its own.
         let batch = |job: Job| self.pending.iter().any(|p| p.batch && p.job == job);
@@ -674,8 +704,10 @@ impl Workbench {
             Phase::Starting
         } else if batch(Job::Stop) {
             Phase::Stopping
-        } else if let Some(longest) = waiting.iter().map(|(_, silent)| *silent).max() {
+        } else if let Some(longest) = waiting.iter().filter_map(|(_, silent)| *silent).max() {
             Phase::Waiting(longest)
+        } else if !waiting.is_empty() {
+            Phase::Reconnecting
         } else if streaming.is_empty() {
             Phase::Ready
         } else {
@@ -740,8 +772,15 @@ impl Workbench {
                 style::mix(p.accent_text, on, tint),
                 reveal,
             );
-            status = status.push(match phase {
-                Phase::Waiting(silent) => tip(pill, silence(silent)),
+            status = status.push(match (phase, self.preview_figure(id)) {
+                (Phase::Waiting(silent), _) => tip(pill, silence(silent)),
+                (Phase::Reconnecting, _) => match self.reconnecting(id) {
+                    Some(report) => tip(pill, stage::reconnect_about(report)),
+                    None => pill,
+                },
+                (Phase::Streaming, Some(figure)) => {
+                    tip(pill, format!("{figure}. {}", self.preview_about()))
+                }
                 _ => pill,
             });
         }
@@ -1007,10 +1046,8 @@ impl Workbench {
         let fit = self.overview_fit(phase.label(), record_label, (auto_on, auto_total));
         let pill = status_pill(
             phase.label(),
-            (reveal > 0.001 && fit.figure).then(|| match phase {
-                Phase::Waiting(_) => format!("{} of {streaming}", waiting.len()),
-                _ => format!("{streaming} of {total}"),
-            }),
+            (reveal > 0.001 && fit.figure)
+                .then(|| overview_figure(phase, waiting.len(), streaming, total)),
             None,
             None,
             style::mix(p.accent_text, on, tint),
@@ -1024,12 +1061,10 @@ impl Workbench {
                 waiting
                     .iter()
                     .map(|(camera, silent)| {
-                        format!(
-                            "{} · {}: {}",
-                            camera.model,
-                            identity(camera),
-                            silence(*silent).to_lowercase()
-                        )
+                        let why = silent.map_or("reconnecting…".into(), |silent| {
+                            silence(silent).to_lowercase()
+                        });
+                        format!("{} · {}: {why}", camera.model, identity(camera))
                     })
                     .collect::<Vec<_>>()
                     .join("\n"),
@@ -1208,7 +1243,15 @@ impl Workbench {
             auto_label: auto_width(true) - auto_width(false),
             record_label: if recording { 0.0 } else { worded(record) },
             capture_label: worded("Capture all"),
-            figure: live_width(false, Some(&format!("{total} of {total}")), None),
+            figure: live_width(
+                false,
+                Some(&if word == Phase::Reconnecting.label() {
+                    format!("{total} of {total} cameras")
+                } else {
+                    format!("{total} of {total}")
+                }),
+                None,
+            ),
         }
     }
 
@@ -1436,6 +1479,60 @@ mod tests {
         assert_eq!(bench.single_phase(), None);
         assert_eq!(silence(Duration::from_millis(6400)), "No new frame for 6 s");
         assert_eq!(Phase::Waiting(Duration::ZERO).label(), "Waiting for frames");
+    }
+
+    #[test]
+    fn the_pill_says_reconnecting_while_the_badge_does() {
+        let mut bench = bench();
+        let mut other = streaming_camera(10, 0, 30.0);
+        other.info.id = "sim:1".into();
+        bench.snapshot.cameras.push(other);
+        bench.snapshot.streaming = true;
+        let start = bench.now;
+        bench.observe_liveness();
+        let report = "Stream lost; reconnecting to rtsp://cam/line-1 (attempt 2): timed out";
+        bench.snapshot.cameras[0].last_error = Some(report.into());
+        bench.tick_stage();
+        assert_eq!(bench.reconnecting("sim:0"), None, "settling, as the badge");
+        bench.now = start + Duration::from_millis(300);
+        bench.tick_stage();
+        assert_eq!(bench.reconnecting("sim:0"), Some(report));
+        assert_eq!(bench.single_phase(), Some(Phase::Reconnecting));
+        assert_eq!(Phase::Reconnecting.label(), "Reconnecting…");
+        // "1 of 3" alone would read as the first of three attempts.
+        assert_eq!(
+            overview_figure(Phase::Reconnecting, 1, 3, 4),
+            "1 of 3 cameras"
+        );
+        assert_eq!(
+            overview_figure(Phase::Waiting(Duration::ZERO), 1, 3, 4),
+            "1 of 3"
+        );
+        assert_eq!(overview_figure(Phase::Streaming, 0, 3, 4), "3 of 4");
+        // Its tint is the camera's dot elsewhere, which also says no frames
+        // come.
+        assert_eq!(Phase::Reconnecting.state(), CameraState::Stalled);
+        assert!(Phase::Reconnecting.live());
+        let (phase, waiting) = bench.overview_phase();
+        assert_eq!(phase, Phase::Reconnecting);
+        assert_eq!(waiting.len(), 1);
+        // Another camera's frames stop for no reason it knows: the overview
+        // waits for frames, and the selected camera still reconnects.
+        bench.now = start + Duration::from_secs(8);
+        bench.tick_stage();
+        assert!(bench.stalled("sim:1").is_some());
+        let (phase, waiting) = bench.overview_phase();
+        assert!(matches!(phase, Phase::Waiting(_)), "{phase:?}");
+        assert_eq!(waiting.len(), 2);
+        assert_eq!(bench.single_phase(), Some(Phase::Reconnecting));
+        // Frames flow again: the badge goes, and the pill says so too.
+        bench.frame_seen("sim:0");
+        bench.frame_seen("sim:1");
+        bench.now += Duration::from_millis(100);
+        bench.tick_stage();
+        assert_eq!(bench.reconnecting("sim:0"), None);
+        assert_eq!(bench.single_phase(), Some(Phase::Streaming));
+        assert_eq!(bench.overview_phase().0, Phase::Streaming);
     }
 
     #[test]

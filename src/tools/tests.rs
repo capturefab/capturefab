@@ -190,7 +190,7 @@ pub(crate) fn feature(name: &str, kind: &str, value: Value) -> FeatureInfo {
 pub(crate) fn camera(info: CameraInfo) -> CameraSnapshot {
     CameraSnapshot {
         info,
-        features: Vec::new(),
+        features: Arc::default(),
         streaming: false,
         frames: 0,
         received_bytes: 0,
@@ -207,7 +207,8 @@ pub(crate) fn camera(info: CameraInfo) -> CameraSnapshot {
         capture_session: None,
         transport: None,
         history: CameraHistoryStatus::default(),
-        ring_dropped: 0,
+        lost: 0,
+        preview_skipped: 0,
         stale: false,
         error_logged: None,
     }
@@ -237,6 +238,8 @@ pub(crate) fn job(id: u64, status: &str) -> CaptureJob {
         output: "{camera}-{datetime}-{seq}.png".into(),
         count: 288,
         captured: 12,
+        skipped: 0,
+        retries: 0,
         first_at_ms: NOW - 3_600_000,
         interval_ms: 300_000,
         next_at_ms: NOW + 300_000,
@@ -292,7 +295,8 @@ pub(crate) fn fixture_snapshot() -> SessionSnapshot {
             ..feature("DeviceTemperature", "Float", json!(41.5))
         },
         feature("LutValueReg", "IntReg", json!(0)),
-    ];
+    ]
+    .into();
     sim0.auto = Some(AutoStatus {
         balance: 0.5,
         strategy: "software".into(),
@@ -315,7 +319,8 @@ pub(crate) fn fixture_snapshot() -> SessionSnapshot {
         feature("Width", "Integer", json!(1280)),
         feature("Height", "Integer", json!(720)),
         feature("VideoMode", "Enumeration", json!("1280x720@30")),
-    ];
+    ]
+    .into();
 
     let scanner = camera(CameraInfo {
         vendor: "ICA".into(),
@@ -749,7 +754,11 @@ fn overview_and_offline_tools_work_without_a_session() {
 
 #[test]
 fn list_cameras_discovers_once_per_turn_and_filters_simulators() {
-    let ctx = fixture_context(fixture_snapshot());
+    let mut snapshot = fixture_snapshot();
+    snapshot.cameras[0].dropped = 9;
+    snapshot.cameras[0].lost = 2;
+    snapshot.cameras[0].preview_skipped = 7;
+    let ctx = fixture_context(snapshot);
     let host = FakeHost::new(fixture_snapshot());
     let cancel = AtomicBool::new(false);
     let turn = TurnCache::new();
@@ -780,6 +789,9 @@ fn list_cameras_discovers_once_per_turn_and_filters_simulators() {
     assert_eq!(ids(&listed, "cameras").len(), 5);
     assert_eq!(listed["cameras"][0]["size"], "640x480");
     assert_eq!(listed["cameras"][0]["pixel_format"], "Mono8");
+    assert_eq!(listed["cameras"][0]["dropped"], 9);
+    assert_eq!(listed["cameras"][0]["lost"], 2);
+    assert_eq!(listed["cameras"][0]["preview_skipped"], 7);
     assert_eq!(listed["discovery"]["ran"], false);
     let args = json!({"discover": true, "include_simulated": true});
     let first = run(&host, &ctx, "list_cameras", args.clone(), &opts)
@@ -923,7 +935,11 @@ fn destinations_and_storage_report_budget_and_locations() {
 
 #[test]
 fn list_jobs_shows_schedules_and_recordings_per_camera() {
-    let ctx = fixture_context(fixture_snapshot());
+    let mut snapshot = fixture_snapshot();
+    snapshot.cameras[0].jobs[0].skipped = 2;
+    snapshot.cameras[0].jobs[0].retries = 1;
+    snapshot.cameras[0].jobs[0].next_at_ms += 900_000;
+    let ctx = fixture_context(snapshot);
     let host = FakeHost::new(fixture_snapshot());
     let cancel = AtomicBool::new(false);
     let opts = ReadOptions::new(Origin::Assistant, &cancel);
@@ -935,7 +951,10 @@ fn list_jobs_shows_schedules_and_recordings_per_camera() {
     assert_eq!(schedules.len(), 2);
     assert_eq!(schedules[0]["id"], 7, "active jobs come first");
     assert_eq!(schedules[0]["every"], "5 min");
-    assert_eq!(schedules[0]["next_at"], "2026-10-18T14:05:00+02:00");
+    assert_eq!(schedules[0]["next_at"], "2026-10-18T14:20:00+02:00");
+    assert_eq!(schedules[0]["last_at"], "2026-10-19T13:10:00+02:00");
+    assert_eq!(schedules[0]["skipped"], 2);
+    assert_eq!(schedules[0]["retries"], 1);
     assert_eq!(schedules[0]["last_file"], "~/Capturefab/sim-0012.png");
     assert!(schedules[1].get("next_at").is_none());
     let recordings = all["recordings"].as_array().unwrap();

@@ -6,6 +6,6 @@
 <key>CFBundleExecutable</key><string>capturefab</string>
 <key>CFBundleIconFile</key><string>capturefab.icns</string>
 <key>NSCameraUsageDescription</key><string>Capturefab discovers and captures frames from the cameras you select.</string>
-<key>NSLocalNetworkUsageDescription</key><string>Capturefab finds and captures from scanners and GigE Vision, ONVIF and RTSP cameras on your local network.</string>
+<key>NSLocalNetworkUsageDescription</key><string>Capturefab finds and captures from scanners, GigE Vision, ONVIF and RTSP cameras, and cameras on Home Assistant, Frigate, go2rtc and UniFi Protect servers on your local network.</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>

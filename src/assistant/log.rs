@@ -18,6 +18,87 @@ pub const MAX_RECORD_BYTES: usize = 64 * 1024;
 pub const MAX_RUNS: usize = 100;
 pub const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Persistent action logs, independent of the session runtime directory.
+pub fn directory() -> PathBuf {
+    let directory = crate::ipc::state_dir().join("assistant/runs");
+    for old in legacy_directories() {
+        if let Err(error) = adopt_logs(&old, &directory) {
+            crate::eprintln!(
+                "capturefab: left assistant logs in {}: {error:#}",
+                old.display()
+            );
+        }
+    }
+    directory
+}
+
+fn legacy_directories() -> impl Iterator<Item = PathBuf> {
+    crate::ipc::legacy_dirs()
+        .into_iter()
+        .map(|directory| directory.join("assistant/runs"))
+}
+
+/// Move only inactive, validated run files. A source lock protects against an
+/// older process still appending, and a hard link publishes the durable copy
+/// without replacing a run already in the state directory.
+fn adopt_logs(old: &Path, new: &Path) -> Result<()> {
+    let files = paths(old)?;
+    if files.is_empty() {
+        return Ok(());
+    }
+    ensure_parent(new)?;
+    crate::ipc::ensure_private_dir(new)?;
+    for (id, path, _) in files {
+        let mut source = open_checked(&path)?;
+        if FileExt::try_lock_exclusive(&source).is_err() {
+            continue;
+        }
+        let target = new.join(format!("{id}.jsonl"));
+        if fs::symlink_metadata(&target).is_ok() {
+            continue;
+        }
+        let temp = new.join(format!(".{id}.{}.moving", std::process::id()));
+        let mut output = match private_options().write(true).create_new(true).open(&temp) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let result = (|| -> Result<()> {
+            std::io::copy(&mut source, &mut output)?;
+            output.sync_all()?;
+            fs::hard_link(&temp, &target)?;
+            #[cfg(unix)]
+            File::open(new)?.sync_all()?;
+            if same_file(&source, &path) {
+                fs::remove_file(&path)?;
+                #[cfg(unix)]
+                File::open(old)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        drop(output);
+        let _ = fs::remove_file(&temp);
+        result?;
+    }
+    Ok(())
+}
+
+fn same_file(file: &File, path: &Path) -> bool {
+    private_file(path).is_ok_and(|meta| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            file.metadata()
+                .is_ok_and(|opened| opened.dev() == meta.dev() && opened.ino() == meta.ino())
+        }
+        #[cfg(not(unix))]
+        {
+            file.metadata()
+                .is_ok_and(|opened| opened.len() == meta.len())
+        }
+    })
+}
+
 #[derive(Debug)]
 pub struct LogFull;
 impl fmt::Display for LogFull {
@@ -577,7 +658,19 @@ pub fn read_log_in(directory: &Path, id: &str) -> Result<Vec<Value>> {
     Ok(read_in(directory, id)?.records)
 }
 pub fn read_log(id: &str) -> Result<Vec<Value>> {
-    read_log_in(&crate::ipc::session_dir().join("assistant/runs"), id)
+    ensure!(
+        valid_run_id(id),
+        "Choose an assistant run ID from the recent tasks list."
+    );
+    let directory = directory();
+    if !directory.join(format!("{id}.jsonl")).try_exists()? {
+        for old in legacy_directories() {
+            if old.join(format!("{id}.jsonl")).try_exists()? {
+                return read_log_in(&old, id);
+            }
+        }
+    }
+    read_log_in(&directory, id)
 }
 pub fn runs_in(directory: &Path) -> Result<Vec<RunSummary>> {
     let mut runs = Vec::new();
@@ -617,7 +710,17 @@ pub fn runs_in(directory: &Path) -> Result<Vec<RunSummary>> {
     Ok(runs)
 }
 pub fn runs() -> Result<Vec<RunSummary>> {
-    runs_in(&crate::ipc::session_dir().join("assistant/runs"))
+    let mut runs = runs_in(&directory())?;
+    let mut ids: HashSet<_> = runs.iter().map(|run| run.run_id.clone()).collect();
+    for old in legacy_directories() {
+        for run in runs_in(&old)? {
+            if ids.insert(run.run_id.clone()) {
+                runs.push(run);
+            }
+        }
+    }
+    runs.sort_by(|a, b| b.run_id.cmp(&a.run_id));
+    Ok(runs)
 }
 
 #[derive(Default)]
@@ -654,6 +757,63 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn state_migration_preserves_active_logs_and_existing_runs() {
+        let old = Directory::new();
+        let new = Directory::new();
+        let mut completed = ActionLog::create(&old.0, 1000).unwrap();
+        completed
+            .record("start", json!({"goal":"Finished task"}), 1000)
+            .unwrap();
+        completed
+            .finish(json!({"outcome":"finished","summary":"Done"}), 1001)
+            .unwrap();
+        let completed_path = completed.path().to_owned();
+        let completed_name = completed_path.file_name().unwrap().to_owned();
+        let completed_bytes = fs::read(&completed_path).unwrap();
+        drop(completed);
+
+        let mut active = ActionLog::create(&old.0, 2000).unwrap();
+        active
+            .record("start", json!({"goal":"Still running"}), 2000)
+            .unwrap();
+        let active_path = active.path().to_owned();
+        let mut conflicting = ActionLog::create(&old.0, 3000).unwrap();
+        conflicting
+            .record("start", json!({"goal":"Old copy"}), 3000)
+            .unwrap();
+        let conflicting_path = conflicting.path().to_owned();
+        drop(conflicting);
+        let existing = new.0.join(conflicting_path.file_name().unwrap());
+        private_options()
+            .write(true)
+            .create_new(true)
+            .open(&existing)
+            .unwrap()
+            .write_all(b"preserve the state copy")
+            .unwrap();
+
+        adopt_logs(&old.0, &new.0).unwrap();
+        assert!(!completed_path.exists());
+        assert_eq!(
+            fs::read(new.0.join(completed_name)).unwrap(),
+            completed_bytes
+        );
+        assert!(active_path.exists(), "a running task keeps its open log");
+        assert!(!new.0.join(active_path.file_name().unwrap()).exists());
+        assert!(
+            conflicting_path.exists(),
+            "a conflicting source is retained"
+        );
+        assert_eq!(fs::read(existing).unwrap(), b"preserve the state copy");
+
+        // Once its writer exits, another read can move the previously active log.
+        drop(active);
+        adopt_logs(&old.0, &new.0).unwrap();
+        assert!(!active_path.exists());
+        assert!(new.0.join(active_path.file_name().unwrap()).exists());
     }
 
     #[test]

@@ -207,10 +207,9 @@ fn populate(state: &mut tasks::State, word: &str, snapshot: SessionSnapshot) {
 pub(in crate::gui) fn context(snapshot: SessionSnapshot) -> Context {
     let mut context = scenes::context(snapshot);
     for camera in &mut context.snapshot.cameras {
-        camera
-            .features
-            .retain(|feature| feature.name != "ExposureTime");
-        camera.features.push(FeatureInfo {
+        let mut features = camera.features.to_vec();
+        features.retain(|feature| feature.name != "ExposureTime");
+        features.push(FeatureInfo {
             name: "ExposureTime".into(),
             display_name: "Exposure time".into(),
             kind: "Float".into(),
@@ -224,6 +223,7 @@ pub(in crate::gui) fn context(snapshot: SessionSnapshot) -> Context {
             choices: Vec::new(),
             error: None,
         });
+        camera.features = features.into();
     }
     context
 }

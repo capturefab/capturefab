@@ -142,10 +142,32 @@ jobs:
       contents: read
     uses: ./.github/workflows/ci.yml
 
+  web-client:
+    name: Build the browser client
+    needs: version
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.version.outputs.build == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal -t wasm32-unknown-unknown --no-self-update && rustup default stable
+      - run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+      - run: sh web-client/build.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: web-client
+          path: web-client/dist
+          if-no-files-found: error
+          retention-days: 7
+
   build:
     name: Build ${{ matrix.os }} ${{ matrix.arch }}
-    needs: [version, candidate]
-    if: ${{ !cancelled() && needs.version.result == 'success' && needs.version.outputs.build == 'true' && (needs.candidate.result == 'success' || needs.version.outputs.release != 'true') }}
+    needs: [version, candidate, web-client]
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.version.outputs.build == 'true' && needs.web-client.result == 'success' && (needs.candidate.result == 'success' || needs.version.outputs.release != 'true') }}
     permissions:
       contents: read
     strategy:
@@ -202,6 +224,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # With web-client/dist in place, release.py builds both variants with
+      # the embedded-web feature and CAPTUREFAB_WEB_DIST, so serve --listen
+      # needs no --web-dir.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: web-client
+          path: web-client/dist
+      - name: Check the browser client to embed
+        run: test -f web-client/dist/index.html && test -f web-client/dist/capturefab_web_bg.wasm
       # The Windows ARM64 image does not ship rustup.
       - name: Install rustup
         if: runner.os == 'Windows' && matrix.arch == 'aarch64'

@@ -45,6 +45,10 @@ const ACCEPTED: Duration = Duration::from_millis(450);
 const CONTEXT: Duration = Duration::from_millis(280);
 /// The panel's scrollable, for jumping back to its top.
 pub(super) const SCROLL: &str = "inspector";
+/// Rows an open feature group lays out until asked for the rest. The panel
+/// is rebuilt with every camera frame, and hundreds of rows cost a small
+/// computer more than its preview.
+const GROUP_ROWS: usize = 80;
 /// The feature groups retain every advertised control, including vendor
 /// extensions. Specialized controls come first for their camera type.
 fn feature_groups(kind: CameraKind) -> &'static [&'static str] {
@@ -631,6 +635,8 @@ pub(super) struct InspectorState {
     /// Disclosures are view preferences; searching temporarily reveals matches
     /// without changing them or discarding camera drafts.
     feature_groups_open: HashSet<&'static str>,
+    /// Long open groups shown whole; folding one shortens it again.
+    feature_groups_whole: HashSet<&'static str>,
     camera_details_open: bool,
     capture_options_open: bool,
     automation_open: bool,
@@ -687,6 +693,7 @@ impl Default for InspectorState {
     fn default() -> Self {
         Self {
             feature_groups_open: HashSet::new(),
+            feature_groups_whole: HashSet::new(),
             camera_details_open: false,
             capture_options_open: false,
             automation_open: false,
@@ -864,7 +871,9 @@ impl Workbench {
     pub(super) fn toggle_inspector_section(&mut self, section: Section) {
         match section {
             Section::Features(group) => {
-                if !self.inspect.feature_groups_open.remove(group) {
+                if self.inspect.feature_groups_open.remove(group) {
+                    self.inspect.feature_groups_whole.remove(group);
+                } else {
                     self.inspect.feature_groups_open.insert(group);
                 }
             }
@@ -955,8 +964,125 @@ impl Workbench {
                 self.inspect.feature_groups_open.insert(group);
             } else {
                 self.inspect.feature_groups_open.remove(group);
+                self.inspect.feature_groups_whole.remove(group);
             }
         }
+    }
+
+    /// Show every row of `group`. Its "Show more" link leaves with the rows
+    /// it stood for, so the keyboard moves on to the first of them it can
+    /// reach rather than to nowhere.
+    pub(super) fn show_whole_group(&mut self, group: &'static str) -> Task<Message> {
+        self.reveal_group(group)
+            .map_or_else(Task::none, operation::focus)
+    }
+
+    /// Make feature `name` show in the Features tab without a search: a
+    /// quick control always shows; any other needs its group open, and whole
+    /// if it sits past the rows a long group shows first.
+    pub(super) fn reveal_feature(&mut self, name: &str) {
+        let index = &self.inspect.index;
+        let Some(i) = self.snapshot.features.iter().position(|f| f.name == name) else {
+            return;
+        };
+        if index.is_quick.get(i).copied().unwrap_or(true) {
+            return;
+        }
+        let Some((group, members)) = index
+            .groups
+            .iter()
+            .find(|(_, members)| members.contains(&i))
+        else {
+            return;
+        };
+        let group = *group;
+        let late = self
+            .listed(members, "")
+            .iter()
+            .position(|&member| member == i)
+            .is_some_and(|row| row >= GROUP_ROWS);
+        self.inspect.feature_groups_open.insert(group);
+        if late {
+            self.inspect.feature_groups_whole.insert(group);
+        }
+    }
+
+    /// `show_whole_group`, with the id of the control to focus.
+    fn reveal_group(&mut self, group: &'static str) -> Option<String> {
+        let query = self.search.trim().to_lowercase();
+        let hidden: Vec<usize> = self
+            .inspect
+            .index
+            .groups
+            .iter()
+            .find(|(name, _)| *name == group)
+            .map(|(_, members)| {
+                let listed = self.listed(members, &query);
+                let shown: HashSet<usize> = self.shown_rows(group, &listed).0.into_iter().collect();
+                listed.into_iter().filter(|i| !shown.contains(i)).collect()
+            })
+            .unwrap_or_default();
+        self.inspect.feature_groups_whole.insert(group);
+        hidden
+            .into_iter()
+            .map(|i| &self.snapshot.features[i])
+            .find(|feature| self.focusable_by_name(feature))
+            .map(|feature| format!("feature:{}", feature.name))
+    }
+
+    /// The features of a group's `members` that the Features tab lists:
+    /// those matching the lowercased `query`, or without one, those not
+    /// among the quick controls.
+    fn listed(&self, members: &[usize], query: &str) -> Vec<usize> {
+        let index = &self.inspect.index;
+        members
+            .iter()
+            .copied()
+            .filter(|&i| {
+                self.snapshot.features.get(i).is_some()
+                    && if query.is_empty() {
+                        !index.is_quick[i]
+                    } else {
+                        query
+                            .split_whitespace()
+                            .all(|term| index.words[i].contains(term))
+                    }
+            })
+            .collect()
+    }
+
+    /// Whether `feature`'s row holds a control with its `feature:` id: a
+    /// field, choice or checkbox it can write. See `feature`.
+    pub(super) fn focusable_by_name(&self, feature: &FeatureInfo) -> bool {
+        let managed = self
+            .snapshot
+            .auto
+            .as_ref()
+            .is_some_and(|auto| auto.managed.contains(&feature.name));
+        let writable = (feature.writable || managed) && !self.stream_locks(feature);
+        writable && feature.error.is_none() && !feature.kind.eq_ignore_ascii_case("command")
+    }
+
+    /// The rows of open group `group` that show: the first `GROUP_ROWS`,
+    /// and any later one being edited or refused, unless it shows whole;
+    /// and how many more it holds.
+    fn shown_rows(&self, group: &'static str, members: &[usize]) -> (Vec<usize>, usize) {
+        if members.len() <= GROUP_ROWS || self.inspect.feature_groups_whole.contains(group) {
+            return (members.to_vec(), 0);
+        }
+        let features = &self.snapshot.features;
+        let rows: Vec<usize> = members
+            .iter()
+            .enumerate()
+            .filter(|&(n, &i)| {
+                n < GROUP_ROWS
+                    || self.edits.contains_key(&features[i].name)
+                    || self.inspect.write_errors.contains_key(&features[i].name)
+            })
+            .map(|(_, &i)| i)
+            .collect();
+        let more = members.len() - rows.len();
+        (rows, more)
     }
 
     /// Point the settings panel's motions at what they show; from
@@ -1170,6 +1296,12 @@ impl Workbench {
         self.inspect.accepted.hit(feature.clone(), self.now);
     }
 
+    /// Light up feature `name`'s control as when the camera takes a value,
+    /// to show where something sent the user.
+    pub(super) fn flash_feature(&mut self, name: &str) {
+        self.inspect.accepted.hit(name.to_owned(), self.now);
+    }
+
     /// Take a screenshot scene word for the settings panel: `late` is false
     /// while the scene is set up and true once its cameras stream. Returns
     /// whether the word was taken; see `apply_scene`. Words:
@@ -1199,6 +1331,18 @@ impl Workbench {
             // demonstrate its default policy, without touching the ledger.
             ("inspector-storage-default", _) => self.storage_status.update(
                 storage_policy::Policy::try_from(StoragePolicy::default()),
+                self.now,
+            ),
+            // The default policy 85% full, again without the ledger.
+            ("inspector-storage-usage", _) => self.storage_status.update(
+                storage_policy::Reply {
+                    policy: storage_policy::Policy::try_from(StoragePolicy::default()),
+                    usage: Some(storage_policy::Usage {
+                        bytes: (8.5 * (1u64 << 30) as f64) as u64,
+                        files: 3_210,
+                        free: Some(120 << 30),
+                    }),
+                },
                 self.now,
             ),
             ("inspector-noforward", _) => self.forward_output.clear(),
@@ -1428,6 +1572,15 @@ fn schedule_text_for(kind: CameraKind, count: u32, interval: f64) -> String {
     )
 }
 
+/// The text color for a storage line of this tone.
+fn tone_color(tone: storage_policy::Tone, p: &Palette) -> iced::Color {
+    match tone {
+        storage_policy::Tone::Normal => p.secondary,
+        storage_policy::Tone::Warning => p.ink(p.warn),
+        storage_policy::Tone::Error => p.ink(p.danger),
+    }
+}
+
 /// A quiet line saying why the action above it cannot run.
 fn reason<'a>(why: &'a str, p: &'static Palette) -> Element<'a, Message> {
     text(why).size(style::SMALL).color(p.secondary).into()
@@ -1464,7 +1617,7 @@ fn error_caption<'a>(message: String, quiet: bool, p: &'static Palette) -> Eleme
 /// An accent text action.
 /// A text action, set in the medium weight so it reads apart from the
 /// counts and notes beside it.
-fn link<'a>(label: &'a str, on: Option<Message>) -> Element<'a, Message> {
+fn link<'a>(label: impl text::IntoFragment<'a>, on: Option<Message>) -> Element<'a, Message> {
     button(text(label).size(style::SMALL).font(style::MEDIUM))
         .padding([3, 8])
         .style(style::link)
@@ -1693,20 +1846,7 @@ impl Workbench {
         }
         let mut matched = 0;
         for (group, members) in &index.groups {
-            let members: Vec<_> = members
-                .iter()
-                .copied()
-                .filter(|&i| {
-                    snapshot.features.get(i).is_some()
-                        && if searching {
-                            query
-                                .split_whitespace()
-                                .all(|term| index.words[i].contains(term))
-                        } else {
-                            !index.is_quick[i]
-                        }
-                })
-                .collect();
+            let members = self.listed(members, &query);
             matched += members.len();
             if !members.is_empty() {
                 let failed = members.iter().any(|&i| {
@@ -1739,7 +1879,26 @@ impl Workbench {
                     if let Some(guidance) = group_guidance(group, kind) {
                         content = content.push(reason(guidance, p));
                     }
-                    content = content.push(self.feature_rows(&members, p));
+                    let (rows, more) = self.shown_rows(group, &members);
+                    content = content.push(self.feature_rows(&rows, p));
+                    if more > 0 {
+                        content = content.push(
+                            button(
+                                text(format!("Show {} more", grouped(more as u64)))
+                                    .size(style::SMALL)
+                                    .font(style::MEDIUM),
+                            )
+                            // Clear on its own, as in a list of links.
+                            .name(format!(
+                                "Show {} more {group} {}",
+                                grouped(more as u64),
+                                if more == 1 { "feature" } else { "features" }
+                            ))
+                            .padding([3, 8])
+                            .style(style::link)
+                            .on_press(Message::ShowFeatures(group)),
+                        );
+                    }
                 }
                 groups = groups.push(*group, content);
             }
@@ -2279,9 +2438,13 @@ impl Workbench {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(current == "true" || current == "1"),
             };
-            widgets::checkbox_named("", label, checked, move |value| {
-                Message::Set(feature.name.clone(), value.to_string())
-            })
+            widgets::checkbox_named_id(
+                "",
+                label,
+                checked,
+                move |value| Message::Set(feature.name.clone(), value.to_string()),
+                format!("feature:{name}"),
+            )
         } else if !feature.choices.is_empty() {
             let glow = self.inspect.accepted.level(name, self.now);
             // What a write on its way asked for, else what the camera has.
@@ -2294,6 +2457,7 @@ impl Workbench {
                 move |value| Message::Set(feature.name.clone(), value),
             )
             .name(label)
+            .id(format!("feature:{name}"))
             .placeholder(current.clone())
             .width(CONTROL)
             .text_size(style::SMALL)
@@ -3108,11 +3272,11 @@ impl Workbench {
             options = options.push(
                 settings
                     .push(
-                        text("Auto chooses an available encoder. Check this computer's encoders with:")
+                        text("Auto chooses an available encoder. List FFmpeg's encoders with:")
                             .size(style::SMALL)
                             .color(p.secondary),
                     )
-                    .push(self.copyable("capturefab doctor".into(), p)),
+                    .push(self.copyable("capturefab ffmpeg --json".into(), p)),
             );
         }
         let modes = segmented(
@@ -3417,6 +3581,35 @@ impl Workbench {
             p
         )]
         .spacing(ROW_GAP);
+        // How full storage is; folded, only once it is nearly full.
+        if let Some(meter) = self
+            .storage_status
+            .state()
+            .meter(&self.storage_policy(), self.storage_status.usage())
+            && (open || meter.tone != storage_policy::Tone::Normal)
+        {
+            let color = tone_color(meter.tone, p);
+            let bar = match meter.tone {
+                storage_policy::Tone::Normal => p.accent,
+                storage_policy::Tone::Warning => p.warn,
+                storage_policy::Tone::Error => p.danger,
+            };
+            content = content.push(accessibility::group(
+                column![
+                    text(meter.text).size(style::SMALL).color(color),
+                    progress_bar(0.0..=1.0, meter.fraction)
+                        .girth(4)
+                        .style(move |theme| progress_bar::Style {
+                            bar: bar.into(),
+                            ..style::progress(theme)
+                        }),
+                ]
+                .spacing(4)
+                .into(),
+                meter.label,
+                accessibility::Role::Group,
+            ));
+        }
         if open {
             content = content
                 .push(reason(
@@ -3470,11 +3663,7 @@ impl Workbench {
             .into_iter()
             .filter(|caption| open || caption.tone != storage_policy::Tone::Normal)
         {
-            let color = match caption.tone {
-                storage_policy::Tone::Normal => p.secondary,
-                storage_policy::Tone::Warning => p.ink(p.warn),
-                storage_policy::Tone::Error => p.ink(p.danger),
-            };
+            let color = tone_color(caption.tone, p);
             content = content.push(text(caption.text).size(style::SMALL).color(color));
         }
         content.into()
@@ -3508,6 +3697,13 @@ impl Workbench {
             let status = job["status"].as_str().unwrap_or("unknown");
             let captured = job["captured"].as_u64().unwrap_or_default();
             let count = job["count"].as_u64().unwrap_or(1);
+            let mut progress = format!("{captured} / {count} frames");
+            for (field, label) in [("skipped", "skipped"), ("retries", "retried")] {
+                let n = job[field].as_u64().unwrap_or_default();
+                if n > 0 {
+                    progress.push_str(&format!(" · {n} {label}"));
+                }
+            }
             let mut card = column![
                 row![
                     text(format!("Job {id}"))
@@ -3527,9 +3723,7 @@ impl Workbench {
                 progress_bar(0.0..=1.0, captured as f32 / count.max(1) as f32)
                     .girth(4)
                     .style(style::progress),
-                text(format!("{captured} / {count} frames"))
-                    .size(style::CAPTION)
-                    .color(p.secondary),
+                text(progress).size(style::CAPTION).color(p.secondary),
                 text(job["output"].as_str().unwrap_or("").to_owned())
                     .size(style::CAPTION)
                     .font(style::MONO)
@@ -3572,6 +3766,177 @@ impl Workbench {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn long_feature_groups_show_their_first_rows_until_asked_for_the_rest() {
+        let mut bench = bench();
+        bench.snapshot.features = (0..200)
+            .map(|n| FeatureInfo {
+                name: format!("Feature{n}"),
+                display_name: format!("Feature {n}"),
+                kind: "Integer".into(),
+                value: Some(json!(n)),
+                writable: true,
+                description: String::new(),
+                unit: None,
+                min: None,
+                max: None,
+                inc: None,
+                choices: Vec::new(),
+                error: None,
+            })
+            .collect();
+        let group = "Image Format Control";
+        let members: Vec<usize> = (0..200).collect();
+        let (rows, more) = bench.shown_rows(group, &members[..GROUP_ROWS]);
+        assert_eq!(
+            (rows.len(), more),
+            (GROUP_ROWS, 0),
+            "short groups show whole"
+        );
+        // A row being edited or refused shows wherever it is.
+        bench.edits.insert("Feature150".into(), "7".into());
+        bench
+            .inspect
+            .write_errors
+            .insert("Feature199".into(), "refused".into());
+        let (rows, more) = bench.shown_rows(group, &members);
+        assert_eq!(rows.len(), GROUP_ROWS + 2);
+        assert_eq!(&rows[GROUP_ROWS..], [150, 199]);
+        assert_eq!(more, 118);
+        let _ = bench.update(Message::ShowFeatures(group));
+        assert_eq!(bench.shown_rows(group, &members), (members.clone(), 0));
+        // Folding the group shortens it for the next time it opens.
+        bench.inspect.feature_groups_open.insert(group);
+        bench.toggle_inspector_section(Section::Features(group));
+        assert_eq!(bench.shown_rows(group, &members).1, 118);
+    }
+
+    /// The Features tab rendered as the window does, with `acts` applied to
+    /// its controls in turn; its accessible labels, and the id `acts` left
+    /// focused.
+    fn features_view(
+        bench: &Workbench,
+        acts: &mut [&mut dyn iced::advanced::widget::Operation],
+    ) -> (Vec<String>, Option<iced::advanced::widget::Id>) {
+        use iced::advanced::{
+            Layout,
+            widget::{Operation, Tree, operation},
+        };
+        let renderer = destinations::layout_tests::renderer();
+        let mut view = bench.features(Palette::of(false));
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &iced::advanced::layout::Limits::new(Size::ZERO, Size::new(420.0, 20_000.0)),
+        );
+        for act in acts {
+            view.as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, *act);
+        }
+        let mut found = operation::focusable::find_focused();
+        view.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::black_box(&mut found),
+        );
+        let focused = match found.finish() {
+            operation::Outcome::Some(id) => Some(id),
+            _ => None,
+        };
+        let (native, _, _) = accessibility::snapshot_widget(
+            view.as_widget_mut(),
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+        );
+        let labels = native
+            .nodes
+            .into_iter()
+            .filter_map(|(_, node)| node.label().map(str::to_owned))
+            .collect();
+        (labels, focused)
+    }
+
+    fn focus(id: &str) -> impl iced::advanced::widget::Operation {
+        iced::advanced::widget::operation::focusable::focus::<()>(id.to_owned().into())
+    }
+
+    #[test]
+    fn showing_the_rest_of_a_group_moves_the_keyboard_to_its_first_new_control() {
+        let mut bench = bench();
+        bench.snapshot.features = (0..120)
+            .map(|n| FeatureInfo {
+                name: format!("Feature{n}"),
+                display_name: format!("Feature {n}"),
+                kind: if n == GROUP_ROWS + 1 {
+                    "Boolean"
+                } else {
+                    "Integer"
+                }
+                .into(),
+                value: Some(json!(n)),
+                // The first hidden row shows a value only.
+                writable: n != GROUP_ROWS,
+                description: String::new(),
+                unit: None,
+                min: None,
+                max: None,
+                inc: None,
+                choices: Vec::new(),
+                error: None,
+            })
+            .collect();
+        bench.tick_inspector();
+        let (group, _) = bench.inspect.index.groups[0];
+        bench.inspect.feature_groups_open.insert(group);
+        let (labels, _) = features_view(&bench, &mut []);
+        assert!(
+            labels.contains(&format!("Show 40 more {group} features")),
+            "the link says what it shows on its own: {labels:?}"
+        );
+        // The link leaves; the keyboard skips the read-only row and lands
+        // on the checkbox after it.
+        let target = bench.reveal_group(group).unwrap();
+        assert_eq!(target, "feature:Feature81");
+        let (_, focused) = features_view(&bench, &mut [&mut focus(&target)]);
+        assert_eq!(
+            focused,
+            Some(target.into()),
+            "the control takes the keyboard"
+        );
+    }
+
+    #[test]
+    fn adjusting_exposure_shows_and_focuses_the_control_for_any_camera_kind() {
+        let mut bench = bench();
+        let mut camera = liveness::streaming_camera(0, 0, 0.0).info;
+        camera.profile.kind = CameraKind::Microscope;
+        bench.snapshot.connected = Some(camera);
+        let mut auto = sample_feature("ExposureAuto", "Enumeration", json!("Continuous"));
+        auto.choices = vec!["Off".into(), "Continuous".into()];
+        bench.snapshot.features = vec![
+            auto,
+            sample_feature("ExposureTime", "Float", json!(5000.0)),
+            sample_feature("Gain", "Float", json!(0.0)),
+        ];
+        bench.tick_inspector();
+        // A microscope's quick controls leave auto exposure in its group.
+        assert!(!bench.inspect.index.is_quick[0]);
+        assert_eq!(bench.exposure_control(), Some("ExposureAuto"));
+        let _ = bench.update(Message::AdjustExposure);
+        assert_eq!(bench.tab, Tab::Features);
+        let (labels, focused) = features_view(&bench, &mut [&mut focus("feature:ExposureAuto")]);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label == &bench.inspect.index.labels[0]),
+            "its group opens: {labels:?}"
+        );
+        assert_eq!(focused, Some("feature:ExposureAuto".to_owned().into()));
+    }
 
     #[test]
     fn actual_capture_and_recording_fields_expose_precise_invalid_drafts_and_recovery() {

@@ -236,7 +236,9 @@ The runtime's Restore proposal contains baseline assignments only where the same
 
 ## Settings and logs
 
-`<session_dir>/assistant.json` is version 1, at most 64 KiB, written atomically under a lock. On Unix it has mode 0600. It is a regular private file, not a symlink. Invalid entries are ignored with a warning on load. It contains provider selection, non-secret fields, a saved-key hint, autonomy defaults and optional prices:
+Assistant settings and action logs live in the persistent state directory reported by `doctor --json`; `CAPTUREFAB_SESSION_DIR` overrides it together with the runtime directory. Existing Linux settings migrate from the old session directory on first use; inactive action logs move without overwriting an existing run, while active logs stay readable in their original directory until their writer closes.
+
+`<state_dir>/assistant.json` is version 1, at most 64 KiB, written atomically under a lock. On Unix it has mode 0600. It is a regular private file, not a symlink. Invalid entries are ignored with a warning on load. It contains provider selection, non-secret fields, a saved-key hint, autonomy defaults and optional prices:
 
 ```json
 {
@@ -257,7 +259,7 @@ capturefab assistant runs --json
 capturefab assistant log RUN_ID --json
 ```
 
-Action logs are private JSONL files under `<session_dir>/assistant/runs/<run_id>.jsonl`. Each record has `v`, `run`, `seq`, `t` (UTC Unix milliseconds) and `kind`. Kinds are `start`, `request`, `text`, `tool`, `observation`, `approval`, `human_change`, `rollover`, `limit`, `stop` and `end`. Logs exclude keys, passwords, raw provider thinking, image bytes and full provider response bodies. Observation records can include image dimensions, byte counts and SHA-256 values. If a dataset is open, state-changing tools also add a dataset note.
+Action logs are private JSONL files under `<state_dir>/assistant/runs/<run_id>.jsonl`. Each record has `v`, `run`, `seq`, `t` (UTC Unix milliseconds) and `kind`. Kinds are `start`, `request`, `text`, `tool`, `observation`, `approval`, `human_change`, `rollover`, `limit`, `stop` and `end`. Logs exclude keys, passwords, raw provider thinking, image bytes and full provider response bodies. Observation records can include image dimensions, byte counts and SHA-256 values. If a dataset is open, state-changing tools also add a dataset note.
 
 `--events FILE` tails the exact action-log records to a new file. `--events -` writes them to stderr, leaving stdout for the result envelope. Logs have a 16 MiB per-run cap; retention keeps at most 100 runs and 256 MiB. A run without an end record can be reported as interrupted on the next open; a currently locked live log is not a crash.
 

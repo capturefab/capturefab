@@ -652,7 +652,7 @@ impl<'a> Executor<'a> {
             .as_ref()
             .into_iter()
             .flat_map(|snapshot| snapshot.cameras.iter().find(|c| c.info.id == camera))
-            .flat_map(|c| &c.features)
+            .flat_map(|c| c.features.iter())
             .filter(|feature| changes.contains(feature.name.as_str()))
             .map(|feature| json!({"name":feature.name,"value":feature.value}))
             .collect();
@@ -1061,13 +1061,15 @@ fn create_destination(
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .context("Choose a folder for captures after configuring your home directory.")?;
-        super::values::folder_path_live(
-            path,
-            &home,
-            &crate::ipc::session_dir(),
-            &crate::destination::staging_root(),
-        )
-        .map_err(|issue| anyhow!(issue.message))?;
+        for protected in [crate::ipc::runtime_dir(), crate::ipc::state_dir()] {
+            super::values::folder_path_live(
+                path,
+                &home,
+                &protected,
+                &crate::destination::staging_root(),
+            )
+            .map_err(|issue| anyhow!(issue.message))?;
+        }
         crate::destination::create(destination, secret)?;
         return Ok(json!({"destination":destination}));
     }

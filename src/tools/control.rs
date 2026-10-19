@@ -1334,6 +1334,7 @@ mod tests {
         let camera = &mut snapshot.cameras[0];
         camera.streaming = false;
         camera.jobs.clear();
+        let mut features = camera.features.to_vec();
         for (name, value, max, inc) in [
             ("OffsetX", 0, 1280.0, 2.0),
             ("OffsetY", 0, 600.0, 2.0),
@@ -1344,8 +1345,9 @@ mod tests {
             f.min = Some(0.0);
             f.max = Some(max);
             f.inc = Some(inc);
-            camera.features.push(f);
+            features.push(f);
         }
+        camera.features = features.into();
         let ctx = fixture_context(snapshot);
         let mut plan = PlanState::new(&ctx);
         let mut result = Checked::new(

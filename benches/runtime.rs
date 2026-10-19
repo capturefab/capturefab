@@ -5,7 +5,9 @@
 ))]
 use capturefab::jpeg;
 use capturefab::{
+    efficiency::{self, Mode},
     frame,
+    session::{SessionCommand, SessionHandle},
     shared_memory::SharedRing,
     storage::{self, StoragePolicy},
     types::{Frame, MONO8, RGB8},
@@ -186,6 +188,14 @@ fn temp(name: &str) -> PathBuf {
     path
 }
 
+/// `f` run in efficiency mode, as on a small computer.
+fn efficient<T>(f: impl FnOnce() -> T) -> T {
+    efficiency::set(Mode::Efficient);
+    let result = f();
+    efficiency::set(Mode::Smooth);
+    result
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.iter().any(|a| a == "--bench") {
@@ -194,6 +204,7 @@ fn main() {
     let b = Bench {
         filter: args.into_iter().filter(|a| !a.starts_with("--")).collect(),
     };
+    efficiency::set(Mode::Smooth);
     for (width, height) in [(1920, 1200), (640, 480)] {
         for (name, format) in FORMATS {
             let f = frame(width, height, format);
@@ -227,6 +238,13 @@ fn main() {
             f.data.len(),
             || frame::preview_rgba(&f, 640, 480).unwrap(),
         );
+        efficient(|| {
+            b.run(
+                &format!("gui-efficient/tile/{name}/1920x1200"),
+                f.data.len(),
+                || frame::preview_rgba(&f, 640, 480).unwrap(),
+            )
+        });
         for encoding in ["png", "ppm", "raw"] {
             b.run(
                 &format!("encode/{encoding}/{name}/1920x1200"),
@@ -234,6 +252,55 @@ fn main() {
                 || frame::encode(&f, encoding).unwrap(),
             );
         }
+    }
+    // A large sensor in the main view: converted whole, as at 1:1, against
+    // fitted to a 1600x1000 stage (1500x1000 shown, converted as the main
+    // view does), and as an overview tile.
+    for (name, format) in [("Mono8", MONO8), ("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
+        let label = format!("/{name}/5472x3648");
+        if ![
+            "gui-new/main",
+            "gui-new/fit",
+            "gui-new/tile",
+            "gui-efficient/tile",
+        ]
+        .iter()
+        .any(|prefix| b.selected(&format!("{prefix}{label}")))
+        {
+            continue;
+        }
+        let f = frame(5472, 3648, format);
+        b.run(&format!("gui-new/main{label}"), f.data.len(), || {
+            frame::preview_rgba(&f, f.width, f.height).unwrap()
+        });
+        let (width, height) = frame::covering(&f, (1500, 1000));
+        b.run(&format!("gui-new/fit{label}"), f.data.len(), || {
+            frame::preview_rgba(&f, width, height).unwrap()
+        });
+        b.run(&format!("gui-new/tile{label}"), f.data.len(), || {
+            frame::preview_rgba(&f, 640, 480).unwrap()
+        });
+        efficient(|| {
+            b.run(&format!("gui-efficient/tile{label}"), f.data.len(), || {
+                frame::preview_rgba(&f, 640, 480).unwrap()
+            })
+        });
+    }
+    // The stage's scopes on a common 5 MP industrial sensor: the histogram,
+    // and focus in the default quarter region and over the whole frame.
+    let f = frame(2448, 2048, 0x0108_0009);
+    b.run("scopes/exposure/BayerRG8/2448x2048", f.data.len(), || {
+        frame::exposure(&f).unwrap()
+    });
+    for (label, region) in [
+        ("quarter", [918, 768, 612, 512]),
+        ("full", [0, 0, 2448, 2048]),
+    ] {
+        b.run(
+            &format!("scopes/sharpness/{label}/BayerRG8/2448x2048"),
+            f.data.len(),
+            || frame::sharpness(&f, region).unwrap(),
+        );
     }
     let mono = frame(1920, 1200, MONO8);
     b.run("encode/pgm/Mono8/1920x1200", mono.data.len(), || {
@@ -341,14 +408,13 @@ fn main() {
     let dir = temp("ring");
     for (name, format) in [("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
         let f = frame(1920, 1200, format);
-        let path = dir.join(format!("{name}.shm"));
-        let mut writer = SharedRing::create(&path, 16 << 20).unwrap();
-        let mut reader = SharedRing::open(&path).unwrap();
+        let mut writer = SharedRing::create(&dir, 16 << 20).unwrap();
+        let mut reader = writer.reader().unwrap();
         b.run(
             &format!("ring/write+take/{name}/1920x1200"),
             f.data.len(),
             || {
-                writer.write(&f).unwrap();
+                writer.write(&f, false).unwrap();
                 reader.take_latest().unwrap().unwrap()
             },
         );
@@ -358,14 +424,13 @@ fn main() {
     // new = ring copy into the reused cache, one direct RGBA decode.
     for (name, format) in [("Mono8", MONO8), ("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
         let f = frame(1920, 1200, format);
-        let path = dir.join(format!("display-{name}.shm"));
-        let mut writer = SharedRing::create(&path, 16 << 20).unwrap();
-        let mut reader = SharedRing::open(&path).unwrap();
+        let mut writer = SharedRing::create(&dir, 16 << 20).unwrap();
+        let mut reader = writer.reader().unwrap();
         b.run(
             &format!("display-old/{name}/1920x1200"),
             f.data.len(),
             || {
-                writer.write(&f).unwrap();
+                writer.write(&f, false).unwrap();
                 let cached = reader.take_latest().unwrap().unwrap();
                 let rgb = frame::rgb(&cached.clone()).unwrap();
                 rgb.as_chunks::<3>()
@@ -380,7 +445,7 @@ fn main() {
             &format!("display-new/{name}/1920x1200"),
             f.data.len(),
             || {
-                writer.write(&f).unwrap();
+                writer.write(&f, false).unwrap();
                 reader.take_latest_into(&mut cached).unwrap();
                 frame::convert(&cached, |[r, g, b]| [r, g, b, 255]).unwrap()
             },
@@ -415,23 +480,77 @@ fn main() {
         timestamp_ns: 0,
         data: vec![0],
     };
-    for entries in [100, 1000] {
+    // Room for the largest ledger below; the default keeps 10,000 files.
+    let policy = StoragePolicy {
+        max_files: 100_000,
+        ..StoragePolicy::default()
+    };
+    storage::configure_policy(&policy).unwrap();
+    let five = vec![7u8; 5_000_000];
+    for entries in [100, 1000, 10_000] {
         let name = format!("storage/save/raw/1x1/ledger{entries}");
+        let large = format!("storage/save_bytes/5MB/ledger{entries}");
         let mut save = || {
             index += 1;
-            storage::save(
-                &tiny,
-                &output.join(format!("{index}.raw")),
-                "raw",
-                &StoragePolicy::default(),
-            )
-            .unwrap();
+            storage::save(&tiny, &output.join(format!("{index}.raw")), "raw", &policy).unwrap();
             index
         };
-        if b.selected(&name) {
+        if b.selected(&name) || b.selected(&large) {
             while save() < entries {}
         }
         b.run(&name, 1, save);
+        // What a save adds to the ledger: journal growth, or the snapshot
+        // and new journal when it compacts. Constant however many are kept.
+        let ledger = |name| std::fs::metadata(session.join(name)).ok();
+        let (mut written, mut saves) = (0, 0);
+        b.run(&large, five.len(), || {
+            index += 1;
+            let snapshot = ledger("storage.json").and_then(|meta| meta.modified().ok());
+            let journal = ledger("storage.journal").map_or(0, |meta| meta.len());
+            storage::save_bytes(&five, &output.join(format!("{index}.raw")), &policy).unwrap();
+            let after = ledger("storage.journal").map_or(0, |meta| meta.len());
+            written += match ledger("storage.json") {
+                Some(meta) if meta.modified().ok() != snapshot => meta.len() + after,
+                _ => after.saturating_sub(journal),
+            };
+            saves += 1;
+        });
+        if let Some(per_save) = written.checked_div(saves) {
+            println!("{large:<40} ledger {per_save:>7} bytes per save");
+        }
+    }
+    // Session snapshots, as views take them, with eight idle simulated
+    // cameras on real workers and a full session log.
+    if b.selected("session/snapshot") {
+        unsafe { std::env::set_var("CAPTUREFAB_EXECUTABLE", env!("CARGO_BIN_EXE_capturefab")) };
+        let h = SessionHandle::new();
+        for camera in 0..8 {
+            h.request(SessionCommand::Connect {
+                camera: format!("sim:{camera}"),
+                timeout_ms: 5000,
+            })
+            .unwrap();
+        }
+        for _ in 0..200 {
+            let missing = SessionCommand::Get {
+                feature: "NoSuchFeature".into(),
+            };
+            let _ = h.request_to("sim:0", missing);
+        }
+        let snapshot = h.snapshot();
+        println!(
+            "session/snapshot: {} cameras, {} features, {} log lines, {} activity entries",
+            snapshot.cameras.len(),
+            snapshot
+                .cameras
+                .iter()
+                .map(|c| c.features.len())
+                .sum::<usize>(),
+            snapshot.logs.len(),
+            snapshot.activity.len()
+        );
+        b.run("session/snapshot/8-sim-cameras", 0, || h.snapshot());
+        h.shutdown();
     }
     for path in [dir, session, output] {
         let _ = std::fs::remove_dir_all(path);

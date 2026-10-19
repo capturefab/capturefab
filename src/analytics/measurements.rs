@@ -76,11 +76,7 @@ impl Analytics {
             .collect::<Result<Vec<_>>>()?;
         let mut store = self.store.lock().unwrap_or_else(|error| error.into_inner());
         let now = store.now();
-        let db = store
-            .db
-            .as_mut()
-            .context("analytics database is unavailable")?;
-        let transaction = db.transaction()?;
+        let transaction = store.connection()?.transaction()?;
         let last: Option<u64> =
             transaction.query_row("SELECT max(sequence) FROM measurement_samples", [], |row| {
                 row.get(0)
@@ -119,10 +115,9 @@ impl Analytics {
     pub fn measurement_history(&self) -> Result<Vec<MeasurementSample>> {
         let encoded = {
             let store = self.store.lock().unwrap_or_else(|error| error.into_inner());
-            let db = store
-                .db
-                .as_ref()
-                .context("analytics database is unavailable")?;
+            let Some(db) = store.opened()? else {
+                return Ok(Vec::new());
+            };
             prune_measurements(db, store.now())?;
             let mut statement = db.prepare(
                 "SELECT sample_json FROM measurement_samples

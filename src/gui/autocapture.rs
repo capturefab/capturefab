@@ -117,7 +117,9 @@ fn state_guidance(state: &str) -> &'static str {
     match state {
         "learning" => "Capture an example to start learning.",
         "watching" => "Watching for frames like your examples.",
-        "storage_full" => "Session storage is full. Discard suggestions or start a new session.",
+        "storage_full" => {
+            "Storage is full. Discard suggestions, free space or raise the storage budget; a session holds up to 2 GiB."
+        }
         "review_queue_full" => {
             "The review queue is full. Keep or discard suggestions to continue auto capture."
         }
@@ -175,6 +177,7 @@ impl Workbench {
             encoder: "dinov2".into(),
             accelerator: Some("GPU: Apple M4 Max (Metal)".into()),
             samples_per_second: Some(30.0),
+            note: None,
         };
         if let Some(selected) = self
             .snapshot
@@ -649,10 +652,15 @@ impl Workbench {
                     }),
                 )
                 .push(
-                    text("Saves the frame in this database. Capture & save also teaches it.")
+                    text("Saves the frame with this session. Capture & save also teaches it.")
                         .size(style::SMALL)
                         .color(p.secondary),
                 );
+            // Notes come and go with suggestions, so they sit below the
+            // actions instead of moving them.
+            if let Some(note) = &status.note {
+                content = content.push(text(note.clone()).size(style::SMALL).color(p.ink(p.warn)));
+            }
             let sensitivity = if status.sensitivity < 0.4 {
                 SENSITIVITY[0]
             } else if status.sensitivity > 0.65 {
@@ -983,23 +991,78 @@ impl Workbench {
 mod accessibility_tests;
 
 /// The model, then where and how fast it is embedding frames, for example
-/// "DINOv2 ViT-S/14 ... · GPU: Apple M4 Max (Metal) · 30 frames/s".
+/// "DINOv2 ViT-S/14 ... · GPU: Apple M4 Max (Metal) · 30 frames/s", or
+/// "... · CPU · 1 frame every 8 s" when sampling rests for the CPU.
 fn model_caption(status: &crate::autocapture::SessionStatus) -> String {
     let mut caption = status.model.clone();
     if let Some(accelerator) = &status.accelerator {
         caption.push_str(" · ");
         caption.push_str(accelerator);
     }
-    if let Some(rate) = status.samples_per_second {
-        caption.push_str(&format!(" · {rate:.0} frames/s"));
+    match status.samples_per_second {
+        Some(rate) if rate > 0.0 && rate < 1.0 => {
+            caption.push_str(&format!(" · 1 frame every {} s", figure(1.0 / rate)));
+        }
+        Some(rate) => {
+            let figure = figure(rate);
+            let noun = if figure == "1" { "frame" } else { "frames" };
+            caption.push_str(&format!(" · {figure} {noun}/s"));
+        }
+        None => {}
     }
     caption
+}
+
+/// A whole number, with one decimal below 2, where rounding would read 1
+/// for anything from 0.5 to 1.5.
+fn figure(value: f64) -> String {
+    if value < 2.0 {
+        super::format::number((value * 10.0).round() / 10.0)
+    } else {
+        format!("{value:.0}")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_model_caption_says_how_often_a_paced_cpu_samples() {
+        let mut status = crate::autocapture::SessionStatus {
+            path: "/captures/line-1.duckdb".into(),
+            camera: "sim:0".into(),
+            enabled: true,
+            sensitivity: 0.5,
+            cooldown_ms: 2000,
+            manual_count: 1,
+            kept_count: 0,
+            discarded_count: 0,
+            pending_count: 0,
+            blocked_storage: false,
+            state: "watching".into(),
+            model: "DINOv2".into(),
+            encoder: "dinov2".into(),
+            accelerator: Some("CPU".into()),
+            samples_per_second: Some(0.13),
+            note: None,
+        };
+        assert_eq!(model_caption(&status), "DINOv2 · CPU · 1 frame every 8 s");
+        status.samples_per_second = Some(29.6);
+        assert_eq!(model_caption(&status), "DINOv2 · CPU · 30 frames/s");
+        // Near one per second, whole numbers would hide the difference.
+        for (rate, caption) in [
+            (1.1, "1.1 frames/s"),
+            (1.0, "1 frame/s"),
+            (1.96, "2 frames/s"),
+            (0.7, "1 frame every 1.4 s"),
+            (0.5, "1 frame every 2 s"),
+        ] {
+            status.samples_per_second = Some(rate);
+            assert_eq!(model_caption(&status), format!("DINOv2 · CPU · {caption}"));
+        }
+    }
 
     #[test]
     fn preview_validates_pixels_before_creating_image() {
@@ -1082,6 +1145,7 @@ mod tests {
             encoder: "native".into(),
             accelerator: None,
             samples_per_second: None,
+            note: None,
         });
         app.sync_capture_session();
         app.auto_capture.open = true;

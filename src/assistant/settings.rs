@@ -23,6 +23,18 @@ pub const VERSION: u32 = 1;
 pub const MAX_BYTES: u64 = 64 * 1024;
 static NEXT_WRITE: AtomicU64 = AtomicU64::new(1);
 
+pub(crate) static STATE: crate::ipc::StateSet = crate::ipc::StateSet {
+    what: "assistant settings",
+    names: &["assistant.json"],
+    lock: Some("assistant.lock"),
+};
+
+fn dir() -> PathBuf {
+    static ADOPTED: std::sync::Once = std::sync::Once::new();
+    ADOPTED.call_once(|| crate::ipc::adopt_state(&STATE));
+    crate::ipc::state_dir()
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DefaultMode {
@@ -92,7 +104,7 @@ impl Settings {
         Ok(())
     }
     pub fn save(&self) -> Result<()> {
-        save_in(&crate::ipc::session_dir(), self)
+        save_in(&dir(), self)
     }
 }
 fn validate_provider(id: ProviderId, settings: &ProviderSettings) -> Result<()> {
@@ -129,13 +141,13 @@ pub struct Loaded {
 }
 
 pub fn load() -> Loaded {
-    load_in(&crate::ipc::session_dir())
+    load_in(&dir())
 }
 pub fn selected() -> Option<(ProviderId, ProviderSettings)> {
     load().settings.selected()
 }
 
-/// Read-only; a missing settings file does not create the session directory.
+/// Read-only; a missing settings file does not create the state directory.
 pub fn load_in(directory: &Path) -> Loaded {
     let path = directory.join("assistant.json");
     match read_private(&path) {
@@ -375,10 +387,10 @@ fn update_in(directory: &Path, update: impl FnOnce(&mut Settings) -> Result<()>)
 }
 /// Update just one entry under the lock, retaining other providers and prices.
 pub fn set_provider_settings(id: ProviderId, settings: ProviderSettings) -> Result<()> {
-    update_provider_in(&crate::ipc::session_dir(), id, settings, false)
+    update_provider_in(&dir(), id, settings, false)
 }
 pub fn select(id: ProviderId, settings: ProviderSettings) -> Result<()> {
-    select_in(&crate::ipc::session_dir(), id, settings)
+    select_in(&dir(), id, settings)
 }
 fn select_in(directory: &Path, id: ProviderId, settings: ProviderSettings) -> Result<()> {
     update_provider_in(directory, id, settings, true)
@@ -405,7 +417,7 @@ fn update_provider_in(
     })
 }
 pub fn set_saved_key(id: ProviderId, present: bool) -> Result<()> {
-    update_in(&crate::ipc::session_dir(), |store| {
+    update_in(&dir(), |store| {
         store.providers.entry(id).or_default().saved_key = present;
         Ok(())
     })
@@ -413,7 +425,7 @@ pub fn set_saved_key(id: ProviderId, present: bool) -> Result<()> {
 
 /// A nonsecret schema of the persisted file. No auth value is a settings field.
 pub fn schema_contract() -> Value {
-    json!({"path":"<session_dir>/assistant.json","version":VERSION,"max_bytes":MAX_BYTES,"mode":"0600","atomic":true,"prices_unit":"USD per million tokens","shape":{"version":1,"provider":"provider id or null","providers":{"<id>":{"model":null,"base_url":null,"account_id":null,"gateway_id":null,"region":null,"profile":null,"project":null,"location":null,"endpoint":null,"effort":null,"vision":null,"saved_key":false}},"autonomy":{"limits":Limits::default(),"see_images":false,"mode":"plan"},"prices":{}}})
+    json!({"path":"<state_dir>/assistant.json","version":VERSION,"max_bytes":MAX_BYTES,"mode":"0600","atomic":true,"prices_unit":"USD per million tokens","shape":{"version":1,"provider":"provider id or null","providers":{"<id>":{"model":null,"base_url":null,"account_id":null,"gateway_id":null,"region":null,"profile":null,"project":null,"location":null,"endpoint":null,"effort":null,"vision":null,"saved_key":false}},"autonomy":{"limits":Limits::default(),"see_images":false,"mode":"plan"},"prices":{}}})
 }
 
 #[cfg(test)]

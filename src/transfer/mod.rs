@@ -6,7 +6,7 @@
 //! (`destination add-*`, `destination test`, the GUI's Test action), never in
 //! camera workers or the session coordinator.
 use crate::destination::{Remote, SecretSource};
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
 use std::{io::Read, path::Path};
 
@@ -111,45 +111,7 @@ fn unsupported(remote: &Remote) -> anyhow::Error {
 // ---------------------------------------------------------------------------
 // Credentials.
 
-pub fn validate_secret(secret: &str) -> Result<()> {
-    ensure!(
-        !secret.is_empty() && secret.len() <= 4096,
-        "secret must contain 1..4096 bytes"
-    );
-    Ok(())
-}
-
-/// Store a secret in the OS credential store.
-pub(crate) fn store_secret(service: &str, account: &str, secret: &str) -> Result<()> {
-    validate_secret(secret)?;
-    keyring::Entry::new(service, account)
-        .and_then(|entry| entry.set_password(secret))
-        .map_err(|e| anyhow!("cannot save the secret in the OS credential store: {e}"))
-}
-
-/// Read a secret. A missing entry is `None`; a locked or unavailable store is
-/// an error, so a caller never mistakes it for an empty slot.
-pub(crate) fn read_secret(service: &str, account: &str) -> Result<Option<String>> {
-    match keyring::Entry::new(service, account).and_then(|entry| entry.get_password()) {
-        Ok(secret) => Ok(Some(secret)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => bail!("cannot read the secret from the OS credential store: {e}"),
-    }
-}
-
-pub(crate) fn delete_secret(service: &str, account: &str) -> Result<()> {
-    match keyring::Entry::new(service, account).and_then(|entry| entry.inner.delete_credential()) {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => bail!("cannot remove the secret from the OS credential store: {e}"),
-    }
-}
-
-/// Whether the OS credential store holds this secret.
-pub fn has_secret(service: &str, account: &str) -> bool {
-    keyring::Entry::new(service, account)
-        .and_then(|entry| entry.get_password())
-        .is_ok()
-}
+pub use crate::keychain::{delete_secret, has_secret, read_secret, store_secret, validate_secret};
 
 /// The FTP or SFTP password (or key passphrase) for an upload. `None` means
 /// sign in without one.
@@ -164,7 +126,10 @@ pub(crate) fn secret_for(remote: &Remote) -> Result<Option<String>> {
         SecretSource::NoSecret => Ok(None),
         SecretSource::Environment => match std::env::var(variable) {
             Ok(secret) if !secret.is_empty() => Ok(Some(secret)),
-            _ => Err(Permanent(format!("{variable} is not set in the uploading process")).into()),
+            _ => Err(Permanent(format!(
+                "{variable} is not set in this process; the process that uploads, such as a serve service, needs it"
+            ))
+            .into()),
         },
         SecretSource::Keychain => {
             let (service, account) = remote.secret_ref().expect("keychain secret reference");
@@ -284,6 +249,7 @@ pub(crate) fn token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     #[test]
     fn hashing_reader_counts_and_hashes() {

@@ -20,6 +20,11 @@ use std::{
 
 const RECENT_LIMIT: usize = 6;
 const FILE: &str = "gui.prefs.json";
+pub(crate) static STATE: crate::ipc::StateSet = crate::ipc::StateSet {
+    what: "GUI settings",
+    names: &[FILE],
+    lock: None,
+};
 
 const MIN_WINDOW: Size = Size::new(900.0, 620.0);
 
@@ -472,6 +477,9 @@ fn fit_size(wanted: Size, available: Size) -> (Size, Size) {
 pub struct Prefs {
     pub appearance: Appearance,
     pub ui_scale: UiScale,
+    /// Settings › Performance; a choice from a newer version reads as
+    /// Automatic.
+    pub performance: crate::efficiency::Mode,
     pub include_simulator: bool,
     pub tab: Tab,
     pub exposure_open: bool,
@@ -542,6 +550,7 @@ impl Default for Prefs {
         Self {
             appearance: Appearance::System,
             ui_scale: UiScale::Standard,
+            performance: crate::efficiency::Mode::Auto,
             include_simulator: false,
             tab: Tab::Features,
             exposure_open: true,
@@ -572,7 +581,7 @@ impl Default for Prefs {
             window: None,
             logs_open: false,
             video_analytics: Default::default(),
-            prefs_version: 2,
+            prefs_version: 3,
             auto_start: true,
             tags: CaptureTags::default(),
             dataset_path: None,
@@ -584,15 +593,7 @@ impl Default for Prefs {
 }
 /// Where the GUI saves by default: `Capturefab` in the user's home folder.
 pub fn capture_root() -> PathBuf {
-    let home = if cfg!(windows) {
-        std::env::var_os("USERPROFILE")
-    } else {
-        std::env::var_os("HOME")
-    };
-    home.filter(|home| !home.is_empty()).map_or_else(
-        || PathBuf::from("Capturefab"),
-        |home| PathBuf::from(home).join("Capturefab"),
-    )
+    crate::storage::capture_root()
 }
 /// A dated folder of uniquely named stills under `capture_root`.
 pub fn default_capture_output() -> String {
@@ -634,11 +635,14 @@ impl Prefs {
 }
 
 fn path() -> PathBuf {
-    crate::ipc::session_dir().join(FILE)
+    crate::ipc::state_dir().join(FILE)
 }
 
+/// Rename settings saved under the old name, which a session called `gui`
+/// needs for its descriptor, then move them into the state directory.
 pub fn migrate() {
-    migrate_in(&crate::ipc::session_dir());
+    migrate_in(&crate::ipc::runtime_dir());
+    crate::ipc::adopt_state(&STATE);
 }
 
 fn migrate_in(dir: &Path) {
@@ -657,6 +661,15 @@ fn migrate_in(dir: &Path) {
 
 pub fn load() -> Prefs {
     load_from(&path())
+}
+
+/// Settings › Performance as last saved, unless Automatic or never saved,
+/// for `doctor`: only the desktop window applies it.
+pub(crate) fn saved_performance() -> Option<crate::efficiency::Mode> {
+    let path = path();
+    path.is_file()
+        .then(|| load_from(&path).performance)
+        .filter(|mode| *mode != crate::efficiency::Mode::Auto)
 }
 
 /// One application's preference destination. All instances share a serialized
@@ -811,6 +824,7 @@ fn upgrade(prefs: &mut Prefs) {
             prefs.forward_output = default_record_output();
         }
     }
+    // Version 3 adds `performance`, which files without it read as Automatic.
     prefs.prefs_version = prefs.prefs_version.max(Prefs::default().prefs_version);
 }
 
@@ -992,6 +1006,37 @@ mod tests {
             UiScale::ALL,
             [UiScale::Standard, UiScale::Large, UiScale::Larger]
         );
+    }
+
+    #[test]
+    fn the_performance_setting_round_trips_and_unknown_choices_read_as_automatic() {
+        use crate::efficiency::Mode;
+        assert_eq!(Prefs::default().performance, Mode::Auto);
+        for mode in Mode::ALL {
+            let prefs = Prefs {
+                performance: mode,
+                count: 17,
+                ..Prefs::default()
+            };
+            let json = serde_json::to_vec(&prefs).unwrap();
+            assert_eq!(serde_json::from_slice::<Prefs>(&json).unwrap(), prefs);
+        }
+        let dir = test_dir("performance");
+        let file = dir.join(FILE);
+        fs::write(
+            &file,
+            br#"{"performance":"turbo","count":17,"prefs_version":2}"#,
+        )
+        .unwrap();
+        let future = load_from(&file);
+        assert_eq!(
+            (future.performance, future.count, future.prefs_version),
+            (Mode::Auto, 17, 3),
+            "a newer choice keeps the other preferences"
+        );
+        fs::write(&file, br#"{"count":17}"#).unwrap();
+        assert_eq!(load_from(&file).performance, Mode::Auto);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn snapshot(
@@ -1237,7 +1282,7 @@ mod tests {
         let prefs = load_from(&file);
         assert_eq!(prefs.output, default_capture_output());
         assert_eq!(prefs.forward_output, default_record_output());
-        assert_eq!(prefs.prefs_version, 2);
+        assert_eq!(prefs.prefs_version, 3);
         assert!(prefs.output.ends_with("{camera}-{datetime}-{seq}.png"));
         fs::write(
             &file,

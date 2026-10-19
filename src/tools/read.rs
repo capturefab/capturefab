@@ -788,7 +788,7 @@ fn camera_features(
     let status = host
         .execute(Some(id), SessionCommand::Status)
         .map_err(|error| vec![Issue::failed(&error, &json!([args.camera]), origin)])?;
-    let features: Vec<FeatureInfo> = serde_json::from_value(status["features"].clone())
+    let features: Arc<[FeatureInfo]> = serde_json::from_value(status["features"].clone())
         .unwrap_or_else(|_| camera.features.clone());
     let auto: Option<AutoStatus> =
         serde_json::from_value(status["auto"].clone()).unwrap_or_else(|_| camera.auto.clone());
@@ -1486,6 +1486,8 @@ fn camera_summary(ctx: &Context, camera: &CameraSnapshot, detail: bool) -> Value
         summary["address"] = json!(info.address);
         summary["frames"] = json!(camera.frames);
         summary["dropped"] = json!(camera.dropped);
+        summary["lost"] = json!(camera.lost);
+        summary["preview_skipped"] = json!(camera.preview_skipped);
         summary["undo"] = json!(camera.history.undo);
     }
     summary
@@ -1541,15 +1543,19 @@ fn forwarding_summary(ctx: &Context, camera: &CameraSnapshot) -> Option<Value> {
 }
 
 fn job_summary(ctx: &Context, camera: &str, job: &CaptureJob) -> Value {
+    let last_interval =
+        u64::from(job.count.saturating_sub(1)) + u64::from(job.skipped) + u64::from(job.retries);
     let last_at = job
         .interval_ms
-        .checked_mul(u64::from(job.count.saturating_sub(1)))
+        .checked_mul(last_interval)
         .and_then(|span| job.first_at_ms.checked_add(span));
     let mut summary = json!({
         "camera": camera,
         "id": job.id,
         "status": job.status,
         "captured": job.captured,
+        "skipped": job.skipped,
+        "retries": job.retries,
         "count": job.count,
         "every": format_duration(job.interval_ms),
         "first_at": ctx.zone.rfc3339(job.first_at_ms),

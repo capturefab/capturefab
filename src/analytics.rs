@@ -24,6 +24,8 @@ pub use measurements::{
 pub const RETENTION_SECONDS: u64 = 24 * 60 * 60;
 pub const SAMPLE_INTERVAL_SECONDS: u64 = 1;
 pub const MAX_SAMPLES: usize = 250_000;
+/// Expired samples are deleted at most this often; reports skip them sooner.
+const PRUNE_INTERVAL_MS: u64 = 60_000;
 const MAX_CAMERAS: usize = 256;
 const MAX_POINTS: u64 = 1_440;
 const MAX_LABEL_BYTES: usize = 512;
@@ -31,21 +33,33 @@ const MAX_LABEL_BYTES: usize = 512;
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct AnalyticsTotals {
     pub frames: u64,
+    /// The status `dropped` count: worker receive errors plus `preview_skipped`.
     pub dropped: u64,
     pub bytes: u64,
+    /// Frames lost on the camera link or in the worker.
+    pub lost: u64,
+    /// Preview frames a viewer skipped because a newer one was ready.
+    pub preview_skipped: u64,
 }
 impl AnalyticsTotals {
     fn add(&mut self, other: &Self) {
         self.frames = self.frames.saturating_add(other.frames);
         self.dropped = self.dropped.saturating_add(other.dropped);
         self.bytes = self.bytes.saturating_add(other.bytes);
+        self.lost = self.lost.saturating_add(other.lost);
+        self.preview_skipped = self.preview_skipped.saturating_add(other.preview_skipped);
     }
     fn difference(&self, previous: &Self) -> Self {
         Self {
             frames: counter_delta(self.frames, previous.frames),
             dropped: counter_delta(self.dropped, previous.dropped),
             bytes: counter_delta(self.bytes, previous.bytes),
+            lost: counter_delta(self.lost, previous.lost),
+            preview_skipped: counter_delta(self.preview_skipped, previous.preview_skipped),
         }
+    }
+    fn is_zero(&self) -> bool {
+        *self == Self::default()
     }
 }
 fn counter_delta(now: u64, previous: u64) -> u64 {
@@ -64,6 +78,10 @@ pub struct CameraAnalytics {
     pub drop_percent: f64,
     pub streaming: bool,
     pub stale: bool,
+    pub lost: u64,
+    pub preview_skipped: u64,
+    /// Lost frames as a share of the frames the camera sent.
+    pub lost_percent: f64,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct AnalyticsPoint {
@@ -75,6 +93,24 @@ pub struct AnalyticsPoint {
     pub fps: f64,
     pub bytes_per_second: f64,
     pub drop_percent: f64,
+    pub lost: u64,
+    pub lost_percent: f64,
+}
+impl AnalyticsPoint {
+    /// A bucket in which no camera was connected.
+    fn idle(timestamp_ms: u64) -> Self {
+        Self {
+            timestamp_ms,
+            frames: 0,
+            dropped: 0,
+            bytes: 0,
+            fps: 0.0,
+            bytes_per_second: 0.0,
+            drop_percent: 0.0,
+            lost: 0,
+            lost_percent: 0.0,
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct AnalyticsSnapshot {
@@ -101,7 +137,6 @@ pub struct AnalyticsHealth {
 
 struct CameraState {
     report: CameraAnalytics,
-    db_key: u64,
     worker_pid: u32,
     previous: AnalyticsTotals,
     last_seen_ms: u64,
@@ -111,6 +146,8 @@ struct CameraState {
     rate_pending: AnalyticsTotals,
 }
 struct Store {
+    /// Opened for the first sample worth keeping, so a session that never
+    /// sees a camera never starts DuckDB.
     db: Option<Connection>,
     error: Option<String>,
     started_at_ms: u64,
@@ -119,7 +156,9 @@ struct Store {
     last_sample: Option<Instant>,
     last_sample_ms: Option<u64>,
     next_sequence: u64,
-    next_camera_key: u64,
+    /// Rows in `samples`, counted as they are inserted and deleted.
+    rows: u64,
+    pruned_at: Option<u64>,
     truncated: bool,
     totals: AnalyticsTotals,
     pending: AnalyticsTotals,
@@ -127,8 +166,9 @@ struct Store {
     cameras: BTreeMap<String, CameraState>,
 }
 
-/// Observation never waits for chart rendering or a database query. The next
-/// snapshot catches up counters after a busy analytics lock is released.
+/// Observation never waits for chart rendering or a database query while a
+/// camera is connected. The next snapshot catches up counters after a busy
+/// analytics lock is released.
 pub struct Analytics {
     store: Mutex<Store>,
 }
@@ -140,22 +180,18 @@ impl Default for Analytics {
 impl Analytics {
     pub fn new() -> Self {
         let now = now_ms();
-        let opened = open_database();
-        let (db, error) = match opened {
-            Ok(db) => (Some(db), None),
-            Err(error) => (None, Some(format!("{error:#}"))),
-        };
         Self {
             store: Mutex::new(Store {
-                db,
-                error,
+                db: None,
+                error: None,
                 started_at_ms: now,
                 started_at: Instant::now(),
                 collected_at_ms: now,
                 last_sample: None,
                 last_sample_ms: None,
                 next_sequence: 0,
-                next_camera_key: 1,
+                rows: 0,
+                pruned_at: None,
                 truncated: false,
                 totals: AnalyticsTotals::default(),
                 pending: AnalyticsTotals::default(),
@@ -166,14 +202,18 @@ impl Analytics {
     }
 
     pub fn observe(&self, snapshot: &SessionSnapshot) {
-        let Ok(mut store) = self.store.try_lock() else {
-            return;
-        };
-        Self::observe_locked(&mut store, snapshot);
+        if snapshot.cameras.is_empty() {
+            // No frames wait on this, and the last camera's final counts
+            // must not be skipped.
+            self.observe_final(snapshot);
+        } else if let Ok(mut store) = self.store.try_lock() {
+            Self::observe_locked(&mut store, snapshot);
+        }
     }
 
-    /// Preserve the last counter deltas before a worker is removed. Used only
-    /// during command completion, away from frame acquisition and UI polling.
+    /// Preserve the last counter deltas, waiting for a busy lock, before a
+    /// worker is removed or after the last one was. Used away from frame
+    /// acquisition and UI polling.
     pub fn observe_final(&self, snapshot: &SessionSnapshot) {
         let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
         Self::observe_locked(&mut store, snapshot);
@@ -183,9 +223,13 @@ impl Analytics {
         let now = store.now();
         store.observe_counters(snapshot, now);
         let instant = Instant::now();
-        if store
-            .last_sample
-            .is_some_and(|last| instant.duration_since(last).as_secs() < SAMPLE_INTERVAL_SECONDS)
+        // The last camera's final counts are sampled at once: with no camera
+        // the status poller rests, and they would wait for the next one.
+        let last = !store.present() && !store.pending.is_zero();
+        if !last
+            && store.last_sample.is_some_and(|last| {
+                instant.duration_since(last).as_secs() < SAMPLE_INTERVAL_SECONDS
+            })
         {
             return;
         }
@@ -214,16 +258,12 @@ impl Analytics {
         result
     }
 
+    /// Ready until something fails, including before the database is
+    /// needed and opened.
     pub fn health(&self) -> AnalyticsHealth {
-        let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-        let now = store.now();
-        if let Err(error) = store.prune(now)
-            && (store.db.is_some() || store.error.is_none())
-        {
-            store.error = Some(format!("{error:#}"));
-        }
+        let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
         AnalyticsHealth {
-            ready: store.db.is_some() && store.error.is_none(),
+            ready: store.error.is_none(),
             error: store.error.clone(),
             retention_seconds: RETENTION_SECONDS,
             sample_interval_seconds: SAMPLE_INTERVAL_SECONDS,
@@ -248,7 +288,7 @@ impl Analytics {
         metric(
             &mut output,
             "capturefab_analytics_samples",
-            "Retained analytics rows, limited by time and row count.",
+            "Retained one-second samples of all cameras together, limited by time and row count.",
             "gauge",
             &report.samples.to_string(),
         );
@@ -276,9 +316,23 @@ impl Analytics {
         metric(
             &mut output,
             "capturefab_session_dropped_frames_total",
-            "Missed frames including transport losses and preview ring overwrites.",
+            "Worker receive errors plus preview frames a viewer skipped, as status dropped counts them.",
             "counter",
             &report.totals.dropped.to_string(),
+        );
+        metric(
+            &mut output,
+            "capturefab_session_lost_frames_total",
+            "Frames lost on the camera link or in the worker.",
+            "counter",
+            &report.totals.lost.to_string(),
+        );
+        metric(
+            &mut output,
+            "capturefab_session_preview_skipped_frames_total",
+            "Preview frames a viewer skipped because a newer one was ready; captures and recordings still received them.",
+            "counter",
+            &report.totals.preview_skipped.to_string(),
         );
         metric(
             &mut output,
@@ -313,7 +367,17 @@ impl Analytics {
             ),
             (
                 "capturefab_camera_dropped_frames_total",
-                "Missed frames including transport losses and preview ring overwrites.",
+                "Worker receive errors plus preview frames a viewer skipped, as status dropped counts them.",
+                "counter",
+            ),
+            (
+                "capturefab_camera_lost_frames_total",
+                "Frames lost on the camera link or in the worker.",
+                "counter",
+            ),
+            (
+                "capturefab_camera_preview_skipped_frames_total",
+                "Preview frames a viewer skipped because a newer one was ready; captures and recordings still received them.",
                 "counter",
             ),
             (
@@ -347,6 +411,10 @@ impl Analytics {
                 let value = match name {
                     "capturefab_camera_frames_total" => camera.frames.to_string(),
                     "capturefab_camera_dropped_frames_total" => camera.dropped.to_string(),
+                    "capturefab_camera_lost_frames_total" => camera.lost.to_string(),
+                    "capturefab_camera_preview_skipped_frames_total" => {
+                        camera.preview_skipped.to_string()
+                    }
                     "capturefab_camera_received_bytes_total" => camera.bytes.to_string(),
                     "capturefab_camera_fps" => finite(camera.fps).to_string(),
                     "capturefab_camera_received_bytes_per_second" => {
@@ -380,7 +448,8 @@ fn open_database() -> Result<Connection> {
         camera_id UBIGINT NOT NULL, frames UBIGINT NOT NULL,
         dropped UBIGINT NOT NULL, bytes UBIGINT NOT NULL,
         fps DOUBLE NOT NULL, bytes_per_second DOUBLE NOT NULL,
-        rate_frames UBIGINT NOT NULL, rate_dropped UBIGINT NOT NULL
+        rate_frames UBIGINT NOT NULL, rate_dropped UBIGINT NOT NULL,
+        lost UBIGINT NOT NULL, rate_lost UBIGINT NOT NULL
     )",
     )?;
     #[cfg(feature = "ai")]
@@ -425,11 +494,9 @@ impl Store {
                 frames: camera.frames,
                 dropped: camera.dropped,
                 bytes: camera.received_bytes,
+                lost: camera.lost,
+                preview_skipped: camera.preview_skipped,
             };
-            let db_key = self.next_camera_key;
-            if !self.cameras.contains_key(&id) {
-                self.next_camera_key = self.next_camera_key.saturating_add(1);
-            }
             let state = self
                 .cameras
                 .entry(id.clone())
@@ -447,8 +514,10 @@ impl Store {
                         drop_percent: 0.0,
                         streaming: false,
                         stale: false,
+                        lost: 0,
+                        preview_skipped: 0,
+                        lost_percent: 0.0,
                     },
-                    db_key,
                     worker_pid: camera.worker_pid,
                     previous: AnalyticsTotals::default(),
                     last_seen_ms: now,
@@ -469,7 +538,9 @@ impl Store {
             let reset = !same_generation
                 || counters.frames < state.previous.frames
                 || counters.dropped < state.previous.dropped
-                || counters.bytes < state.previous.bytes;
+                || counters.bytes < state.previous.bytes
+                || counters.lost < state.previous.lost
+                || counters.preview_skipped < state.previous.preview_skipped;
             let delta = if same_generation {
                 counters.difference(&state.previous)
             } else {
@@ -485,7 +556,13 @@ impl Store {
             state.report.frames = state.report.frames.saturating_add(delta.frames);
             state.report.dropped = state.report.dropped.saturating_add(delta.dropped);
             state.report.bytes = state.report.bytes.saturating_add(delta.bytes);
+            state.report.lost = state.report.lost.saturating_add(delta.lost);
+            state.report.preview_skipped = state
+                .report
+                .preview_skipped
+                .saturating_add(delta.preview_skipped);
             state.report.drop_percent = drop_percent(state.report.frames, state.report.dropped);
+            state.report.lost_percent = drop_percent(state.report.frames, state.report.lost);
             state.report.fps = if camera.streaming {
                 finite(camera.fps)
             } else {
@@ -506,55 +583,61 @@ impl Store {
         }
     }
 
+    /// Whether the last snapshot observed had a camera.
+    fn present(&self) -> bool {
+        self.cameras.values().any(|c| c.present)
+    }
+
+    /// The database, opened when first needed. A failed open is not retried.
+    fn connection(&mut self) -> Result<&mut Connection> {
+        if self.opened()?.is_none() {
+            self.db = Some(open_database()?);
+        }
+        Ok(self.db.as_mut().expect("opened above"))
+    }
+    /// The database if it is open; nothing was stored yet if not.
+    fn opened(&self) -> Result<Option<&Connection>> {
+        match (&self.db, &self.error) {
+            (None, Some(error)) => Err(anyhow!("analytics database is unavailable: {error}")),
+            (db, _) => Ok(db.as_ref()),
+        }
+    }
+    /// Record one sample of all cameras together. With no camera and
+    /// nothing counted there is nothing to chart; reports show such time as
+    /// idle.
     fn sample(&mut self, now: u64) -> Result<()> {
         self.prune(now)?;
         let interval = self
             .last_sample_ms
             .map(|last| now.saturating_sub(last).max(1) as f64 / 1000.0)
             .unwrap_or(1.0);
-        let db = self
-            .db
-            .as_mut()
-            .context("analytics database is unavailable")?;
-        let transaction = db.transaction()?;
-        {
-            let mut insert = transaction
-                .prepare_cached("INSERT INTO samples VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")?;
-            insert.execute(params![
-                self.next_sequence,
+        self.last_sample_ms = Some(now);
+        if !self.present() && self.pending.is_zero() {
+            return Ok(());
+        }
+        let (sequence, counts, rates) = (
+            self.next_sequence,
+            self.pending.clone(),
+            self.rate_pending.clone(),
+        );
+        self.connection()?
+            .prepare_cached("INSERT INTO samples VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")?
+            .execute(params![
+                sequence,
                 now,
                 0_u64,
-                self.pending.frames,
-                self.pending.dropped,
-                self.pending.bytes,
-                self.rate_pending.frames as f64 / interval,
-                self.rate_pending.bytes as f64 / interval,
-                self.rate_pending.frames,
-                self.rate_pending.dropped
+                counts.frames,
+                counts.dropped,
+                counts.bytes,
+                rates.frames as f64 / interval,
+                rates.bytes as f64 / interval,
+                rates.frames,
+                rates.dropped,
+                counts.lost,
+                rates.lost
             ])?;
-            self.next_sequence = self.next_sequence.saturating_add(1);
-            for camera in self
-                .cameras
-                .values()
-                .filter(|c| c.present || c.pending != AnalyticsTotals::default())
-            {
-                insert.execute(params![
-                    self.next_sequence,
-                    now,
-                    camera.db_key,
-                    camera.pending.frames,
-                    camera.pending.dropped,
-                    camera.pending.bytes,
-                    camera.rate_pending.frames as f64 / interval,
-                    camera.rate_pending.bytes as f64 / interval,
-                    camera.rate_pending.frames,
-                    camera.rate_pending.dropped
-                ])?;
-                self.next_sequence = self.next_sequence.saturating_add(1);
-            }
-        }
-        transaction.commit()?;
-        self.last_sample_ms = Some(now);
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.rows += 1;
         self.pending = AnalyticsTotals::default();
         self.rate_pending = AnalyticsTotals::default();
         for camera in self.cameras.values_mut() {
@@ -564,79 +647,110 @@ impl Store {
             camera.pending = AnalyticsTotals::default();
             camera.rate_pending = AnalyticsTotals::default();
         }
-        self.prune(now)
+        Ok(())
     }
 
+    /// Delete expired samples once a minute, and the oldest whenever there
+    /// are more than `MAX_SAMPLES`.
     fn prune(&mut self, now: u64) -> Result<()> {
         let cutoff = now.saturating_sub(RETENTION_SECONDS * 1000);
         self.cameras
             .retain(|_, c| c.present || c.last_seen_ms >= cutoff);
-        let db = self
-            .db
-            .as_ref()
-            .context("analytics database is unavailable")?;
-        db.execute(
-            "DELETE FROM samples WHERE timestamp_ms < ?",
-            params![cutoff],
-        )?;
-        let rows: u64 = db.query_row("SELECT count(*) FROM samples", [], |row| row.get(0))?;
-        if rows > MAX_SAMPLES as u64 {
-            let removed = db.execute("DELETE FROM samples WHERE sequence IN (SELECT sequence FROM samples ORDER BY sequence LIMIT ?)", params![rows - MAX_SAMPLES as u64])?;
+        let Some(db) = self.db.as_ref() else {
+            return Ok(());
+        };
+        if self
+            .pruned_at
+            .is_none_or(|at| now.saturating_sub(at) >= PRUNE_INTERVAL_MS)
+        {
+            let removed = db.execute(
+                "DELETE FROM samples WHERE timestamp_ms < ?",
+                params![cutoff],
+            )?;
+            self.rows = self.rows.saturating_sub(removed as u64);
+            self.pruned_at = Some(now);
+        }
+        if self.rows > MAX_SAMPLES as u64 {
+            let removed = db.execute("DELETE FROM samples WHERE sequence IN (SELECT sequence FROM samples ORDER BY sequence LIMIT ?)", params![self.rows - MAX_SAMPLES as u64])?;
+            self.rows = self.rows.saturating_sub(removed as u64);
             self.truncated |= removed > 0;
         }
-        #[cfg(feature = "ai")]
-        measurements::prune_measurements(db, now)?;
         Ok(())
     }
 
     fn report(&mut self, now: u64) -> Result<AnalyticsSnapshot> {
         self.prune(now)?;
-        let db = self
-            .db
-            .as_ref()
-            .context("analytics database is unavailable")?;
-        let samples: u64 = db.query_row("SELECT count(*) FROM samples", [], |row| row.get(0))?;
-        let bounds: (Option<u64>, Option<u64>) = db.query_row(
-            "SELECT min(timestamp_ms), max(timestamp_ms) FROM samples WHERE camera_id = 0",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        let first = bounds.0.unwrap_or(now);
-        let bucket_ms = match bounds {
-            (Some(first), Some(last)) => (last.saturating_sub(first) / MAX_POINTS + 1).max(1000),
-            _ => 1000,
+        if !self.present() {
+            // With no camera nothing is left to collect, so the counts are
+            // current and the session clock runs on while nothing observes.
+            self.collected_at_ms = now;
+        }
+        let cutoff = now.saturating_sub(RETENTION_SECONDS * 1000);
+        let points = match self.opened()? {
+            Some(db) => points(db, cutoff)?,
+            None => Vec::new(),
         };
-        let mut statement = db.prepare("SELECT CAST(max(timestamp_ms) AS UBIGINT), CAST(sum(frames) AS UBIGINT),
-            CAST(sum(dropped) AS UBIGINT), CAST(sum(bytes) AS UBIGINT), avg(fps), avg(bytes_per_second),
-            CAST(sum(rate_frames) AS UBIGINT), CAST(sum(rate_dropped) AS UBIGINT)
-            FROM samples WHERE camera_id = 0 GROUP BY (timestamp_ms - ?) // ? ORDER BY 1")?;
-        let points = statement
-            .query_map(params![first, bucket_ms], |row| {
-                let frames: u64 = row.get(6)?;
-                let dropped: u64 = row.get(7)?;
-                Ok(AnalyticsPoint {
-                    timestamp_ms: row.get(0)?,
-                    frames: row.get(1)?,
-                    dropped: row.get(2)?,
-                    bytes: row.get(3)?,
-                    fps: finite(row.get(4)?),
-                    bytes_per_second: finite(row.get(5)?),
-                    drop_percent: drop_percent(frames, dropped),
-                })
-            })?
-            .collect::<duckdb::Result<Vec<_>>>()?;
         Ok(AnalyticsSnapshot {
             retention_seconds: RETENTION_SECONDS,
             sample_interval_seconds: SAMPLE_INTERVAL_SECONDS,
             started_at_ms: self.started_at_ms,
             collected_at_ms: self.collected_at_ms,
-            samples: samples as usize,
+            samples: self.rows as usize,
             truncated: self.truncated,
             totals: self.totals.clone(),
             cameras: self.cameras.values().map(|c| c.report.clone()).collect(),
             points,
         })
     }
+}
+
+/// Up to about `MAX_POINTS` buckets of the samples since `cutoff`. Time
+/// without samples had no camera connected, so it shows as idle rather than
+/// a line drawn across it.
+fn points(db: &Connection, cutoff: u64) -> Result<Vec<AnalyticsPoint>> {
+    let bounds: (Option<u64>, Option<u64>) = db.query_row(
+        "SELECT min(timestamp_ms), max(timestamp_ms) FROM samples WHERE camera_id = 0 AND timestamp_ms >= ?",
+        params![cutoff],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let (Some(first), Some(last)) = bounds else {
+        return Ok(Vec::new());
+    };
+    let bucket_ms = (last.saturating_sub(first) / MAX_POINTS + 1).max(1000);
+    let mut statement = db.prepare("SELECT CAST(max(timestamp_ms) AS UBIGINT), CAST(sum(frames) AS UBIGINT),
+        CAST(sum(dropped) AS UBIGINT), CAST(sum(bytes) AS UBIGINT), avg(fps), avg(bytes_per_second),
+        CAST(sum(rate_frames) AS UBIGINT), CAST(sum(rate_dropped) AS UBIGINT),
+        CAST(sum(lost) AS UBIGINT), CAST(sum(rate_lost) AS UBIGINT)
+        FROM samples WHERE camera_id = 0 AND timestamp_ms >= ? GROUP BY (timestamp_ms - ?) // ? ORDER BY 1")?;
+    let buckets = statement
+        .query_map(params![first, first, bucket_ms], |row| {
+            let frames: u64 = row.get(6)?;
+            let dropped: u64 = row.get(7)?;
+            let lost: u64 = row.get(9)?;
+            Ok(AnalyticsPoint {
+                timestamp_ms: row.get(0)?,
+                frames: row.get(1)?,
+                dropped: row.get(2)?,
+                bytes: row.get(3)?,
+                fps: finite(row.get(4)?),
+                bytes_per_second: finite(row.get(5)?),
+                drop_percent: drop_percent(frames, dropped),
+                lost: row.get(8)?,
+                lost_percent: drop_percent(frames, lost),
+            })
+        })?
+        .collect::<duckdb::Result<Vec<_>>>()?;
+    let mut points = Vec::with_capacity(buckets.len());
+    for point in buckets {
+        if let Some(previous) = points.last().map(|p: &AnalyticsPoint| p.timestamp_ms)
+            && point.timestamp_ms - previous > 3 * bucket_ms
+        {
+            points.push(AnalyticsPoint::idle(previous + bucket_ms));
+            points.push(AnalyticsPoint::idle(point.timestamp_ms - bucket_ms));
+        }
+        points.push(point);
+    }
+    Ok(points)
 }
 
 fn finite(value: f64) -> f64 {
@@ -820,7 +934,7 @@ pub fn render_svg_with_options(report: &AnalyticsSnapshot, options: SvgOptions) 
             let summary = format!(
                 "{} frames   ·   {} missed   ·   {} captured   ·   session totals",
                 compact(report.totals.frames),
-                compact(report.totals.dropped),
+                compact(report.totals.lost),
                 human_bytes(report.totals.bytes)
             );
             root.draw(&Text::new(
@@ -856,7 +970,7 @@ pub fn render_svg_with_options(report: &AnalyticsSnapshot, options: SvgOptions) 
                 let panels = root.margin(99, 33, 22, 22).split_evenly((2, 2));
                 draw_panels(&panels, report, options)?;
             }
-            root.draw(&Text::new(if report.truncated { "History shortened by the memory row limit. Missed frames include transport losses and preview overwrites." } else { "Missed frames include transport losses and preview overwrites. Rates are sampled every second." }, (32, 679), ("sans-serif", 12).into_font().color(&MUTED))).map_err(plot_error)?;
+            root.draw(&Text::new(if report.truncated { "History shortened by the memory row limit. Missed frames were lost on the camera link or in the worker." } else { "Missed frames were lost on the camera link or in the worker. Rates are sampled every second." }, (32, 679), ("sans-serif", 12).into_font().color(&MUTED))).map_err(plot_error)?;
         }
         root.present().map_err(plot_error)?;
     }
@@ -906,7 +1020,7 @@ fn draw_panels(
             "% of observed frames"
         },
         rgb(options.colors.missed_frames),
-        |p| p.drop_percent,
+        |p| p.lost_percent,
         options,
     )?;
     draw_camera_chart(&panels[3], report, options)
@@ -939,7 +1053,7 @@ pub(crate) fn render_interface_time_plots(
             |point| match index {
                 0 => point.fps,
                 1 => point.bytes_per_second / 1_048_576.0,
-                _ => point.drop_percent,
+                _ => point.lost_percent,
             },
             options,
         )?;

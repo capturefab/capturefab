@@ -142,8 +142,10 @@ impl VideoAnalytics {
                             camera.streaming,
                             "The analytics camera's stream has stopped."
                         );
+                        // Samples are stamped when taken, so they need the
+                        // current frame, not an idle ring's keep-alive.
                         Ok(handle
-                            .latest_frame_for(&config.camera_id)
+                            .fresh_frame_for(&config.camera_id, Duration::from_secs(1))
                             .map(|frame| (camera.worker_pid, frame)))
                     },
                     crate::ai::analyze_frame,

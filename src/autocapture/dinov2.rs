@@ -419,7 +419,7 @@ fn validate(c: &Config) -> Result<()> {
 pub fn prepare(frame: &Frame, size: usize) -> Result<Vec<u8>> {
     // Decimate large sensors to a few times the input first; the triangle
     // filter then averages that preview rather than single sensor samples.
-    let (w, h, rgba) = frame::preview_rgba(frame, 4 * size as u32, 4 * size as u32)?;
+    let (w, h, rgba) = frame::sampled_rgba(frame, 4 * size as u32, 4 * size as u32)?;
     let (w, h) = (w as usize, h as usize);
     ensure!(
         w > 0 && h > 0 && rgba.len() == w * h * 4,

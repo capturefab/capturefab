@@ -11,6 +11,7 @@ use crate::{
     },
 };
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 fn context() -> Context {
     fixture_context(fixture_snapshot())
@@ -584,6 +585,59 @@ fn disk_checks_use_the_selected_destination_and_remote_steps_warn() {
 }
 
 #[test]
+fn disk_checks_leave_the_floor_after_reservations_and_earlier_plan_steps() {
+    let mut ctx = context();
+    ctx.storage.reserved_bytes = 4_000_000;
+    let photo_bytes = 640 * 480 * 4 + 65_536;
+    let enough = crate::storage::FREE_SPACE_FLOOR + ctx.storage.reserved_bytes + photo_bytes;
+    ctx.storage.free_disk = Some(enough - 1);
+    let short = run(&ctx, "capture_photos", args("capture_photos"));
+    assert!(issue(
+        &short,
+        "count",
+        Severity::Error,
+        "leave 512 MiB free"
+    ));
+    ctx.storage.free_disk = Some(enough);
+    let mut plan = PlanState::new(&ctx);
+    ready(&run_in(
+        &ctx,
+        &mut plan,
+        "capture_photos",
+        args("capture_photos"),
+    ));
+    let next = run_in(&ctx, &mut plan, "capture_photos", args("capture_photos"));
+    assert!(issue(
+        &next,
+        "count",
+        Severity::Error,
+        "earlier planned captures"
+    ));
+    assert_eq!(plan.planned_bytes, photo_bytes);
+    ctx.storage.free_disk = Some(enough + photo_bytes);
+    ready(&run_in(
+        &ctx,
+        &mut plan,
+        "capture_photos",
+        args("capture_photos"),
+    ));
+    assert_eq!(plan.planned_bytes, photo_bytes * 2);
+
+    // Retention can free space on this disk; review the deletion instead
+    // of refusing a plan before the ledger can choose its old captures.
+    ctx.storage.effective.on_full = "delete-oldest".into();
+    ctx.storage.free_disk = Some(enough - 1);
+    let retained = run(&ctx, "capture_photos", args("capture_photos"));
+    ready(&retained);
+    assert!(issue(
+        &retained,
+        "count",
+        Severity::Warning,
+        "Makes room by permanently deleting the oldest captures."
+    ));
+}
+
+#[test]
 fn capture_and_recording_fields_report_their_documented_issues() {
     let ctx = context();
     for bad in [0, 1001] {
@@ -827,10 +881,12 @@ fn prior_feature_changes_make_photo_estimates_use_available_sensor_maxima() {
     let mut ctx = context();
     ctx.snapshot.cameras[0].streaming = false;
     ctx.snapshot.cameras[0].jobs.clear();
-    ctx.snapshot.cameras[0].features.extend([
+    let mut features = ctx.snapshot.cameras[0].features.to_vec();
+    features.extend([
         feature("WidthMax", "Integer", json!(3840)),
         feature("HeightMax", "Integer", json!(2160)),
     ]);
+    ctx.snapshot.cameras[0].features = features.into();
     let mut plan = PlanState::new(&ctx);
     let before = run_in(&ctx, &mut plan, "capture_photos", args("capture_photos"));
     ready(&before);
@@ -858,7 +914,7 @@ fn prior_feature_changes_make_photo_estimates_use_available_sensor_maxima() {
 fn changed_dimension_estimates_use_feature_bounds_or_conservative_fallbacks() {
     for sensor_max in [Some((2048.0, 1024.0)), None] {
         let mut ctx = context();
-        let features = &mut ctx.snapshot.cameras[0].features;
+        let features = Arc::make_mut(&mut ctx.snapshot.cameras[0].features);
         features.iter_mut().find(|f| f.name == "Width").unwrap().max = sensor_max.map(|(w, _)| w);
         features
             .iter_mut()
@@ -879,8 +935,7 @@ fn changed_dimension_estimates_use_feature_bounds_or_conservative_fallbacks() {
         );
     }
     let mut ctx = context();
-    let width = ctx.snapshot.cameras[0]
-        .features
+    let width = Arc::make_mut(&mut ctx.snapshot.cameras[0].features)
         .iter_mut()
         .find(|f| f.name == "Width")
         .unwrap();

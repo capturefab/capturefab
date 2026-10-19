@@ -157,6 +157,9 @@ pub struct FocusMeter {
     sharp: bool,
     /// How many times the region came back into focus after leaving it.
     locks: u64,
+    /// The scores on show are of the region before it moved; the next score
+    /// starts afresh.
+    moved: bool,
 }
 
 impl FocusMeter {
@@ -165,6 +168,7 @@ impl FocusMeter {
         self.peak = previous.peak;
         self.sharp = previous.sharp;
         self.locks = previous.locks;
+        self.moved = previous.moved;
     }
     pub fn new(open: bool, region: [f32; 4], metric: Metric) -> Self {
         Self {
@@ -175,7 +179,15 @@ impl FocusMeter {
             peak: Sharpness::default(),
             sharp: false,
             locks: 0,
+            moved: false,
         }
+    }
+
+    /// Move the region. Its scores stay on show until the next one replaces
+    /// them, so a drag scored a few times a second never reads blank.
+    pub fn move_to(&mut self, region: Rectangle) {
+        self.region = region;
+        self.moved = !self.history.is_empty();
     }
 
     pub fn saved_region(&self) -> [f32; 4] {
@@ -196,6 +208,9 @@ impl FocusMeter {
     }
 
     pub fn record(&mut self, score: Sharpness) {
+        if self.moved {
+            self.reset();
+        }
         let settled = self.history.len() >= SETTLE;
         if self.history.len() == HISTORY {
             self.history.pop_front();
@@ -220,6 +235,7 @@ impl FocusMeter {
         self.history.clear();
         self.peak = Sharpness::default();
         self.sharp = false;
+        self.moved = false;
     }
 
     pub fn latest(&self) -> Option<f32> {
@@ -300,6 +316,15 @@ fn percent(share: f32) -> String {
     }
 }
 
+/// An exposure control's name in a sentence.
+fn control_words(name: &str) -> &'static str {
+    match name {
+        "ExposureAuto" => "auto exposure",
+        "Gain" => "gain",
+        _ => "exposure",
+    }
+}
+
 /// Whether a `stage` this size gets compact scope cards.
 fn compact(stage: Size) -> bool {
     stage.width < COMPACT_STAGE.width || stage.height < COMPACT_STAGE.height
@@ -358,26 +383,64 @@ impl Workbench {
         )
     }
 
+    /// The writable control that changes how bright frames come out: the
+    /// camera's own auto exposure while it runs, else the exposure time,
+    /// else the gain. FFmpeg sources and webcams usually have none.
+    pub(super) fn exposure_control(&self) -> Option<&'static str> {
+        let writable = |name: &str| {
+            self.snapshot
+                .features
+                .iter()
+                .find(|feature| feature.name == name && feature.writable)
+        };
+        let auto = writable("ExposureAuto").and_then(|feature| feature.value.as_ref());
+        if auto.and_then(|value| value.as_str()) == Some("Continuous") {
+            return Some("ExposureAuto");
+        }
+        ["ExposureTime", "ExposureTimeAbs", "Gain"]
+            .into_iter()
+            .find(|name| writable(name).is_some())
+    }
+
     fn exposure_card(&self, shown: f32, compact: bool) -> Option<Element<'_, Message>> {
         let exposure = self.exposure.as_ref()?;
         let ink = |color: Color| fade(color, shown);
         let stage = style::STAGE;
-        let clip = |label: &'static str, share: f32| {
+        let control = self.exposure_control();
+        let clip = |label: &'static str, share: f32, about: &'static str| {
             let over = share > CLIP_WARN;
             let color = ink(if over {
                 stage.ink(stage.warn)
             } else {
                 stage.secondary
             });
-            row![
+            let name = format!("{label} {}", percent(share));
+            let chip = row![
                 dot(color, 5.0),
-                text(format!("{label} {}", percent(share)))
+                text(name.clone())
                     .size(style::CAPTION)
                     .font(if over { style::MEDIUM } else { style::SANS })
                     .color(color),
             ]
             .spacing(5)
-            .align_y(Alignment::Center)
+            .align_y(Alignment::Center);
+            // A button whether or not it warns, so keyboard focus and screen
+            // readers stay put as clipping comes and goes.
+            match control {
+                Some(control) => {
+                    let about = format!("{about} · Adjust {}", control_words(control));
+                    tip(
+                        button(chip)
+                            .name(name)
+                            .description(about.clone())
+                            .padding([1, 4])
+                            .style(style::on_glass(false, shown))
+                            .on_press(Message::AdjustExposure),
+                        about,
+                    )
+                }
+                None => tip(chip, about),
+            }
         };
         // Not "Exposure": that is the control in the inspector.
         let header = row![
@@ -392,13 +455,11 @@ impl Workbench {
         ]
         .align_y(Alignment::Center);
         let footer = row![
-            tip(
-                clip("Shadows", exposure.shadows),
-                "Samples crushed to black"
-            ),
+            clip("Shadows", exposure.shadows, "Samples crushed to black"),
             space::horizontal(),
-            tip(
-                clip("Highlights", exposure.highlights),
+            clip(
+                "Highlights",
+                exposure.highlights,
                 "Samples with a channel blown out"
             ),
         ]
@@ -965,7 +1026,12 @@ impl canvas::Program<Message> for RegionEditor {
                             .and_capture(),
                     );
                 }
-                Some(canvas::Action::capture())
+                // Moves score the region at most once a frame; this scores
+                // where it was let go.
+                Some(match drag.moved {
+                    true => canvas::Action::publish(Message::FocusRegionEnd).and_capture(),
+                    false => canvas::Action::capture(),
+                })
             }
             _ => None,
         }
@@ -1166,6 +1232,42 @@ mod tests {
     }
 
     #[test]
+    fn letting_go_of_a_drag_scores_the_region_where_it_landed() {
+        use canvas::Program;
+        let editor = editor();
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(600.0, 400.0));
+        let mut drag = Drag::default();
+        let mut send = |event, x, y| {
+            let cursor = mouse::Cursor::Available(Point::new(x, y));
+            editor
+                .update(&mut drag, &canvas::Event::Mouse(event), bounds, cursor)
+                .and_then(|action| action.into_inner().0)
+        };
+        let (press, release) = (
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        );
+        let moved = mouse::Event::CursorMoved {
+            position: Point::new(350.0, 220.0),
+        };
+        assert!(matches!(
+            send(press, 300.0, 200.0),
+            Some(Message::FocusRegionStart)
+        ));
+        assert!(matches!(
+            send(moved, 350.0, 220.0),
+            Some(Message::FocusRegion(_))
+        ));
+        assert!(matches!(
+            send(release, 350.0, 220.0),
+            Some(Message::FocusRegionEnd)
+        ));
+        // Pressed and let go in place: nothing moved, nothing to score again.
+        assert!(send(press, 300.0, 200.0).is_some());
+        assert!(send(release, 300.0, 200.0).is_none());
+    }
+
+    #[test]
     fn drags_stay_inside_the_frame_and_above_the_minimum() {
         let editor = editor();
         let start = editor.region;
@@ -1240,6 +1342,35 @@ mod tests {
         assert_eq!(score(1203.4), "1203");
         assert_eq!(score(12_345.0), "12.3k");
         assert_eq!(percent(0.0004), "<0.1%");
+    }
+
+    #[test]
+    fn a_moved_region_keeps_its_score_on_show_until_the_next_one() {
+        let mut meter = FocusMeter::new(true, DEFAULT_REGION, Metric::Tenengrad);
+        let record = |meter: &mut FocusMeter, tenengrad| {
+            meter.record(Sharpness {
+                tenengrad,
+                ..Sharpness::default()
+            })
+        };
+        let region = |x| Rectangle::new(Point::new(x, 0.25), Size::new(0.2, 0.2));
+        meter.move_to(region(0.1));
+        assert!(!meter.moved, "nothing on show to replace");
+        record(&mut meter, 40.0);
+        record(&mut meter, 30.0);
+        meter.move_to(region(0.3));
+        meter.move_to(region(0.5));
+        assert_eq!(meter.region, region(0.5));
+        assert_eq!((meter.latest(), meter.share()), (Some(30.0), Some(0.75)));
+        // The next score is the new region's first, and its own peak.
+        record(&mut meter, 10.0);
+        assert_eq!((meter.latest(), meter.share()), (Some(10.0), Some(1.0)));
+        assert_eq!(meter.trace(), [10.0]);
+        record(&mut meter, 5.0);
+        assert_eq!(meter.share(), Some(0.5));
+        meter.move_to(region(0.1));
+        meter.reset();
+        assert!(!meter.moved && meter.latest().is_none());
     }
 
     #[test]
@@ -1384,6 +1515,87 @@ mod tests {
             assert_ne!(metric.to_string(), metric.label());
             assert!(metric.about().contains(metric.label()), "{metric:?}");
         }
+    }
+
+    #[test]
+    fn clipping_chips_jump_to_the_exposure_control() {
+        use crate::gui::format::sample_feature;
+        use iced::advanced::{Layout, layout::Limits, widget::Tree};
+        use serde_json::json;
+        let renderer = crate::gui::destinations::layout_tests::renderer();
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        bench.exposure = Some(Exposure {
+            luma: [10; 64],
+            channels: None,
+            mean: 0.5,
+            shadows: 0.0,
+            highlights: 0.02,
+        });
+        // The card's buttons by name and description.
+        let buttons = |bench: &Workbench| {
+            let mut view = bench.exposure_card(1.0, false).unwrap();
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &Limits::new(Size::ZERO, Size::new(WIDTH, 400.0)),
+            );
+            let (native, _, _) = accessibility::snapshot_widget(
+                view.as_widget_mut(),
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+            );
+            native
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.role() == accessibility::Role::Button)
+                .filter_map(|(_, node)| {
+                    Some((node.label()?.to_owned(), node.description()?.to_owned()))
+                })
+                .collect::<Vec<(String, String)>>()
+        };
+        // A webcam with nothing to adjust: the chips only explain.
+        assert!(buttons(&bench).is_empty());
+        // A writable exposure time: both chips are buttons, warning or not.
+        bench.snapshot.features = vec![
+            sample_feature("ExposureAuto", "Enumeration", json!("Off")),
+            sample_feature("ExposureTime", "Float", json!(5000.0)),
+        ];
+        assert_eq!(bench.exposure_control(), Some("ExposureTime"));
+        let described = |name: &str, about: &str| (name.to_owned(), about.to_owned());
+        assert_eq!(
+            buttons(&bench),
+            [
+                described("Shadows 0%", "Samples crushed to black · Adjust exposure"),
+                described(
+                    "Highlights 2.0%",
+                    "Samples with a channel blown out · Adjust exposure"
+                ),
+            ]
+        );
+        bench.exposure.as_mut().unwrap().highlights = 0.0;
+        assert_eq!(
+            buttons(&bench).len(),
+            2,
+            "the same buttons without a warning"
+        );
+        // Pressing one opens the exposure time in the Features tab.
+        bench.tab = Tab::Capture;
+        bench.image_mode = true;
+        bench.search = "gamma".into();
+        let _ = bench.update(Message::AdjustExposure);
+        assert_eq!(bench.tab, Tab::Features);
+        assert!(!bench.image_mode && bench.search.is_empty());
+        // The camera's own auto exposure running holds the exposure time.
+        bench.snapshot.features[0].value = Some(json!("Continuous"));
+        assert_eq!(bench.exposure_control(), Some("ExposureAuto"));
+        assert!(buttons(&bench)[0].1.ends_with("Adjust auto exposure"));
+        // Gain alone, and nothing writable.
+        bench.snapshot.features = vec![sample_feature("Gain", "Float", json!(0.0))];
+        assert_eq!(bench.exposure_control(), Some("Gain"));
+        bench.snapshot.features[0].writable = false;
+        assert_eq!(bench.exposure_control(), None);
     }
 
     #[test]

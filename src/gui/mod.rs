@@ -11,6 +11,8 @@ mod client_activity;
 mod close_error;
 mod dataset;
 mod destinations;
+#[cfg(test)]
+mod display_tests;
 mod format;
 mod gpu;
 mod grid;
@@ -27,8 +29,11 @@ mod motion;
 mod network;
 mod notice;
 mod oneline;
+mod pacing;
+mod performance;
 mod pick_list;
 mod prefs;
+pub(crate) use prefs::saved_performance;
 mod preview;
 mod refresh;
 mod reveal;
@@ -81,8 +86,8 @@ use liveness::{CameraState, Liveness};
 use motion::{Kind, Motion};
 use notice::{Batch, Level, Notice, Saved, command_notice};
 use pick_list::pick_list;
-pub(crate) use prefs::migrate as migrate_prefs;
 use prefs::{CaptureTags, Prefs, Recent, UiScale};
+pub(crate) use prefs::{STATE as PREFS_STATE, migrate as migrate_prefs};
 use preview::Shown;
 use scene::{Scene, ScreenshotRequest};
 use std::{
@@ -92,7 +97,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, TryRecvError},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -115,13 +120,40 @@ const SIDEBAR: f32 = 240.0;
 const TOOLBAR: f32 = 45.0;
 const INSPECTOR: f32 = 316.0;
 const GUTTER: f32 = 18.0;
-/// Longest wait between checks for a new camera frame.
-const FRAME_POLL: Duration = Duration::from_millis(2);
 /// Small overview tiles gain nothing from more than 30 redraws a second.
 const OVERVIEW_INTERVAL: Duration = Duration::from_micros(33_333);
+/// Efficiency mode draws at most 15 frames a second in a camera's view, and
+/// 5 in the overview.
+const EFFICIENT_INTERVAL: Duration = Duration::from_micros(66_667);
+const EFFICIENT_OVERVIEW_INTERVAL: Duration = Duration::from_millis(200);
+/// Least time between histograms of a stream's frames, and between focus
+/// scores: a histogram reads as well at 5 Hz, and focusing by hand wants more.
+const EXPOSURE_EVERY: Duration = Duration::from_millis(200);
+const FOCUS_EVERY: Duration = Duration::from_millis(66);
+/// Most pixels a side of a shrunk overview tile keeps, and of any view short
+/// of 1:1 in efficiency mode, on the GPU too.
+const TILE_SIDE: u32 = 1920;
+const EFFICIENT_SIDE: u32 = 1280;
 
 pub fn run(handle: SessionHandle, session_label: String, simulated: bool) -> Result<()> {
     run_capture(handle, session_label, simulated, None, 0)
+}
+
+/// Quit on SIGINT, SIGTERM or SIGHUP as the Quit command does, so the
+/// session finishes its recordings, folds the upload queue and removes its
+/// descriptor: `requested` tells the next tick. A second signal exits at
+/// once, in case the window cannot quit.
+fn quit_on_signal(requested: Arc<AtomicBool>) {
+    let again = AtomicBool::new(false);
+    let installed = crate::cli::on_quit_signal(move || {
+        if again.swap(true, Ordering::AcqRel) {
+            std::process::exit(130);
+        }
+        requested.store(true, Ordering::Release);
+    });
+    if let Err(error) = installed {
+        eprintln!("capturefab: a quit signal will end the window at once: {error:#}");
+    }
 }
 
 pub fn run_capture(
@@ -136,6 +168,8 @@ pub fn run_capture(
             "Window closed before the renderer screenshot was saved".into()
         })));
     let app_outcome = outcome.clone();
+    let quit_signal = Arc::new(AtomicBool::new(false));
+    quit_on_signal(quit_signal.clone());
     let screenshot_sequence = screenshot
         .as_ref()
         .map(|_| scene::ScreenshotSequence::from_env())
@@ -208,6 +242,7 @@ pub fn run_capture(
         );
         app.main_window = main_window;
         app.focused_window = main_window;
+        app.quit_signal = quit_signal.clone();
         app.key_window = Some(main_window);
         app.width = window_size.width / app.ui_scale.factor();
         app.height = window_size.height / app.ui_scale.factor();
@@ -293,44 +328,6 @@ pub fn run_capture(
     Ok(())
 }
 
-/// The session whose shared frame rings the frame watcher polls, and the
-/// shortest gap between its signals. A window has one session, and the gap is
-/// read live rather than hashed, so following the display never restarts the
-/// watcher.
-struct FrameWatch {
-    handle: SessionHandle,
-    /// Nanoseconds; see `Workbench::frame_gap`.
-    gap: Arc<AtomicU64>,
-}
-
-impl std::hash::Hash for FrameWatch {
-    fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {}
-}
-
-/// Sends `FrameArrived` when any camera publishes a frame: at most once per
-/// gap, and not again until the workbench has taken the last one.
-fn watch_frames(watch: &FrameWatch) -> impl iced::futures::Stream<Item = Message> + use<> {
-    let handle = watch.handle.clone();
-    let gap = watch.gap.clone();
-    iced::stream::channel(0, async move |mut output| {
-        std::thread::spawn(move || {
-            let mut seen = handle.frame_sequence();
-            while !output.is_closed() {
-                let gap = Duration::from_nanos(gap.load(Ordering::Relaxed));
-                // Finer checks at high refresh rates keep frames on their vsync.
-                let poll = (gap / 8).clamp(Duration::from_millis(1), FRAME_POLL);
-                std::thread::sleep(poll);
-                let sequence = handle.frame_sequence();
-                if sequence != seen && output.try_send(Message::FrameArrived).is_ok() {
-                    seen = sequence;
-                    std::thread::sleep(gap.saturating_sub(poll));
-                }
-            }
-        });
-        std::future::pending::<()>().await;
-    })
-}
-
 /// Session activity has its own condition variable, so even an idle window
 /// sees another participant's action as soon as it is queued or completed.
 struct ActivityWatch(SessionHandle);
@@ -345,7 +342,9 @@ fn watch_activity(watch: &ActivityWatch) -> impl iced::futures::Stream<Item = Me
         std::thread::spawn(move || {
             let mut seen = 0;
             while !output.is_closed() {
-                let revision = handle.wait_for_activity(seen, Duration::from_secs(1));
+                // Waiting here is not looking: the window's ticks say when
+                // it shows.
+                let revision = handle.wait_for_activity_unwatched(seen, Duration::from_secs(1));
                 if revision > seen {
                     if output.try_send(Message::Tick).is_ok() {
                         seen = revision;
@@ -525,9 +524,26 @@ const MAIN_VIEW: &str = "\0main";
 #[derive(Default)]
 struct CameraPreview {
     frame_id: Option<u64>,
+    /// What `shown` was converted for; the tile's size can change under it.
+    limits: Option<preview::Limits>,
     shown: Option<Shown>,
     meta: Option<(u64, u32, u32, u32)>,
     error: Option<String>,
+}
+
+/// When a scope last measured a frame of the stream, and which.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Measured {
+    at: Option<Instant>,
+    frame: Option<u64>,
+}
+
+impl Measured {
+    /// Whether `frame` is due a measurement: one not yet measured, no sooner
+    /// than `every` after the last.
+    fn due(self, frame: u64, now: Instant, every: Duration) -> bool {
+        self.frame != Some(frame) && self.at.is_none_or(|at| now >= at + every)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -615,6 +631,11 @@ enum Message {
     /// A redraw paced by the display, at the given time.
     Frame(Instant),
     FrameArrived,
+    /// The main window drew after frame work paused for want of draws.
+    Redrawn,
+    /// Whether the main window is out of sight, where the platform says;
+    /// see `pacing::out_of_sight`.
+    Hidden(Option<bool>),
     /// The window opened, moved or changed scale, perhaps onto another display.
     Displaced,
     /// The refresh interval the window's screen reports, if any.
@@ -635,6 +656,7 @@ enum Message {
     Assistant(assistant::Input),
     Appearance(Appearance),
     UiScale(UiScale),
+    Performance(crate::efficiency::Mode),
     ScaledViewport(Size),
     CloseRequested(window::Id),
     WindowOpened(window::Id),
@@ -689,6 +711,12 @@ enum Message {
     /// The focus region, normalized to the frame.
     FocusRegion(iced::Rectangle),
     FocusRegionStart,
+    /// A drag of the focus region let go.
+    FocusRegionEnd,
+    /// The overview scrolled this far down.
+    OverviewScrolled(f32),
+    /// Show the control that changes the histogram's exposure.
+    AdjustExposure,
     FocusMetric(scopes::Metric),
     ResetFocusPeak,
     ToggleActivity,
@@ -707,6 +735,8 @@ enum Message {
     InspectorDisclosure(inspector::Section),
     /// Open every feature group, or close them all.
     ExpandFeatureGroups(bool),
+    /// Show every row of a long feature group.
+    ShowFeatures(&'static str),
     RefreshFeatures,
     Auto(bool),
     Balance(f64),
@@ -851,6 +881,9 @@ struct Workbench {
     system_dark: bool,
     appearance: Appearance,
     ui_scale: UiScale,
+    /// Settings › Performance, as chosen here.
+    performance: crate::efficiency::Mode,
+    performance_state: performance::PerformanceState,
     screenshot: Option<ScreenshotRequest>,
     logs_open: bool,
     help_open: bool,
@@ -869,18 +902,36 @@ struct Workbench {
     /// Size of the preview stage at the last layout, so zooming from Fit
     /// starts where the image already is.
     stage: Cell<Size>,
+    /// The overview's tiles at the last layout, and how far it is scrolled.
+    grid: Cell<Option<grid::Grid>>,
+    grid_scroll: f32,
     exposure_open: bool,
     focus_camera: bool,
     exposure: Option<frame::Exposure>,
+    /// What the histogram and the focus score last measured.
+    measured: (Measured, Measured),
     /// The focus region and its scores.
     focus: scopes::FocusMeter,
     shown: Option<Shown>,
     gpu: GpuFrames,
     refresh: refresh::Refresh,
-    /// Nanoseconds between new-frame announcements, read by the frame watcher.
-    frame_gap: Arc<AtomicU64>,
+    /// What the frame watcher follows.
+    cadence: Arc<pacing::Cadence>,
+    draws: Arc<pacing::Draws>,
+    /// The first change of the view since the main window last drew; see
+    /// `frames_paused`.
+    undrawn: Option<Instant>,
+    /// The main window is out of sight, as far as the platform tells.
+    hidden: bool,
+    /// When frame work last took the newest frames; see `tick_frames`.
+    frames_taken: Option<Instant>,
     frame_meta: Option<(u64, u32, u32, u32, u64)>,
+    /// When the frame shown is a downscaled preview of one larger than the
+    /// camera's ring, that frame's width, height and pixel format.
+    frame_source: Option<(u32, u32, u32)>,
     frame_id: Option<u64>,
+    /// What the main view's frame was converted for.
+    frame_limits: Option<preview::Limits>,
     display_error: Option<String>,
     previews: HashMap<String, CameraPreview>,
     camera_views: HashMap<String, camera_view::CameraView>,
@@ -910,6 +961,9 @@ struct Workbench {
     saved: Option<Prefs>,
     prefs_saver: prefs::Saver,
     closing: Option<CloseTarget>,
+    /// SIGINT, SIGTERM or SIGHUP asked the window to quit; see
+    /// `quit_on_signal`.
+    quit_signal: Arc<AtomicBool>,
     close_error: Option<CloseError>,
     prefs_changed: Option<Instant>,
     now: Instant,
@@ -995,6 +1049,7 @@ impl Workbench {
         let client_activity = client_activity::State::from_snapshot(&handle.snapshot());
         let video_analytics =
             video_analytics::State::new(handle.clone(), prefs.video_analytics.clone());
+        let capture_to = Picker::new(true, false);
         let mut bench = Self {
             main_window,
             focused_window: main_window,
@@ -1024,8 +1079,8 @@ impl Workbench {
             tab: prefs.tab,
             edits: HashMap::new(),
             edit_sources: HashMap::new(),
-            capture_to: Picker::new(true, false),
-            record_to: Picker::new(false, true),
+            record_to: Picker::new(false, true).sharing(&capture_to),
+            capture_to,
             count: prefs.count,
             format: pick(&FORMATS, &prefs.format, &defaults.format),
             timeout_ms: prefs.timeout_ms,
@@ -1063,6 +1118,8 @@ impl Workbench {
                 Ok("larger") => UiScale::Larger,
                 _ => prefs.ui_scale,
             },
+            performance: prefs.performance,
+            performance_state: Default::default(),
             screenshot: None,
             logs_open: prefs.logs_open,
             help_open: false,
@@ -1079,9 +1136,12 @@ impl Workbench {
             fit: true,
             zoom: 1.0,
             stage: Cell::new(Size::new(800.0, 600.0)),
+            grid: Cell::new(None),
+            grid_scroll: 0.0,
             exposure_open: prefs.exposure_open,
             focus_camera: false,
             exposure: None,
+            measured: (Measured::default(), Measured::default()),
             focus: scopes::FocusMeter::new(
                 prefs.focus_open,
                 prefs.focus_region,
@@ -1090,9 +1150,15 @@ impl Workbench {
             shown: None,
             gpu: GpuFrames::new(),
             refresh: refresh::Refresh::default(),
-            frame_gap: Arc::default(),
+            cadence: Arc::default(),
+            draws: Arc::default(),
+            undrawn: None,
+            hidden: false,
+            frames_taken: None,
             frame_meta: None,
+            frame_source: None,
             frame_id: None,
+            frame_limits: None,
             display_error: None,
             previews: HashMap::new(),
             camera_views: HashMap::new(),
@@ -1113,6 +1179,7 @@ impl Workbench {
             saved,
             prefs_saver: prefs::Saver::new(),
             closing: None,
+            quit_signal: Arc::default(),
             close_error: None,
             prefs_changed: None,
             now,
@@ -1181,6 +1248,8 @@ impl Workbench {
             sheets: Default::default(),
         };
         bench.restore_open_sections(&open_sections);
+        performance::start(bench.performance);
+        bench.sync_performance();
         bench
     }
 
@@ -1188,6 +1257,7 @@ impl Workbench {
         Prefs {
             appearance: self.appearance,
             ui_scale: self.ui_scale,
+            performance: self.performance,
             include_simulator: self.include_simulator,
             tab: self.tab,
             exposure_open: self.exposure_open,
@@ -1371,6 +1441,10 @@ impl Workbench {
             || self.assistant_ui_busy();
         let interval = if busy {
             Duration::from_millis(60)
+        } else if self.frames_paused() || self.key_window.is_none() && !streaming {
+            // Nothing on screen, or nothing changing in the background:
+            // status, notices and saving still keep up.
+            Duration::from_secs(1)
         } else if streaming {
             Duration::from_millis(250)
         } else {
@@ -1382,13 +1456,13 @@ impl Workbench {
         } else {
             Subscription::none()
         };
-        let arrivals = if streaming {
+        let arrivals = if self.shown_streaming() {
             Subscription::run_with(
-                FrameWatch {
+                pacing::FrameWatch {
                     handle: self.handle.clone(),
-                    gap: self.frame_gap.clone(),
+                    cadence: self.cadence.clone(),
                 },
-                watch_frames,
+                pacing::watch_frames,
             )
         } else {
             Subscription::none()
@@ -1684,18 +1758,24 @@ impl Workbench {
         if self.fullscreen { 0.0 } else { LIGHTS }
     }
 
-    /// How long the frame watcher waits between announcing new frames: one
-    /// refresh, or the overview's slower interval, less a quarter refresh.
-    /// Sleep overshoot and polling would otherwise often land just after a
-    /// vsync and hold the frame for a whole extra refresh.
-    fn frame_gap(&self) -> Duration {
-        let period = self.refresh.period();
-        let interval = if self.overview() {
-            period.max(OVERVIEW_INTERVAL)
-        } else {
-            period
+    /// How often new frames are shown at most: once a refresh, or the
+    /// overview's slower interval; efficiency mode slows both.
+    fn frame_interval(&self) -> Duration {
+        let floor = match (self.overview(), performance::efficient()) {
+            (false, false) => Duration::ZERO,
+            (true, false) => OVERVIEW_INTERVAL,
+            (false, true) => EFFICIENT_INTERVAL,
+            (true, true) => EFFICIENT_OVERVIEW_INTERVAL,
         };
-        interval - period / 4
+        self.refresh.period().max(floor)
+    }
+
+    /// How long the frame watcher waits between announcing new frames: the
+    /// frame interval less a quarter refresh. Sleep overshoot and polling
+    /// would otherwise often land just after a vsync and hold the frame for
+    /// a whole extra refresh.
+    fn frame_gap(&self) -> Duration {
+        self.frame_interval() - self.refresh.period() / 4
     }
 
     fn overview(&self) -> bool {
@@ -1843,8 +1923,21 @@ impl Workbench {
     }
 
     fn tick(&mut self) -> Task<Message> {
+        if self.quit_signal.swap(false, Ordering::AcqRel) {
+            return self.close(CloseTarget::Quit);
+        }
         if self.shot_staged() {
-            return self.screenshot_tick();
+            let task = self.screenshot_tick();
+            // The shot is saved: take the frames held back meanwhile now,
+            // which frees the frame watcher, rather than a tick later.
+            if self
+                .screenshot
+                .as_ref()
+                .is_some_and(|request| !request.staged)
+            {
+                self.tick_frames();
+            }
+            return task;
         }
         self.poll();
         self.age_notice();
@@ -1852,7 +1945,13 @@ impl Workbench {
         self.prune_flashes();
         self.poll_accessibility();
         let selected = self.snapshot.active_camera.clone();
-        self.snapshot = self.handle.snapshot();
+        // Out of sight, with no command of its own on the way, nobody is
+        // looking: stopped cameras' workers are then polled at the idle rate.
+        self.snapshot = if self.frames_paused() && self.pending.is_empty() {
+            self.handle.snapshot_unwatched()
+        } else {
+            self.handle.snapshot()
+        };
         self.project_local_camera();
         self.scene.patch(&mut self.snapshot);
         self.sync_camera_history();
@@ -1873,7 +1972,9 @@ impl Workbench {
         self.sync_client_activity();
         self.sample_throughput();
         self.observe_liveness();
-        self.update_frames();
+        self.tick_frames();
+        self.refresh.settle(self.now);
+        self.tick_performance();
         let destination_before = local_history::LocalState::capture(self);
         self.capture_to.tick(&mut self.output);
         self.record_to.tick(&mut self.forward_output);
@@ -1896,9 +1997,21 @@ impl Workbench {
         Task::batch([
             pages,
             self.screenshot_tick(),
+            // An unseen window may still draw.
+            if self.sight_unknown() {
+                pacing::out_of_sight(self.main_window)
+            } else {
+                Task::none()
+            },
             if self.screenshot.is_none() {
+                // A destination's own picker shows its free space.
+                let folder = self
+                    .capture_to
+                    .selected
+                    .is_none()
+                    .then(|| storage_policy::folder(&self.output));
                 self.storage_status
-                    .refresh(self.now)
+                    .refresh(self.now, folder)
                     .map(Message::StoragePolicy)
             } else {
                 Task::none()
@@ -1931,6 +2044,16 @@ impl Workbench {
     }
 
     fn update_frames(&mut self) {
+        if self.frames_paused() {
+            // Frames, and the watcher with them, wait until the window
+            // draws again; a hidden one may draw without showing.
+            if !self.hidden {
+                self.draws.pause();
+            }
+            return;
+        }
+        self.cadence.taken();
+        self.frames_taken = Some(self.now);
         self.camera_views.retain(|id, _| {
             self.snapshot
                 .cameras
@@ -1960,31 +2083,55 @@ impl Workbench {
             }
             kept
         });
-        for camera in &snapshot.cameras {
-            let Some(frame) = self.handle.latest_frame_for(&camera.info.id) else {
-                continue;
-            };
-            let preview = self.previews.entry(camera.info.id.clone()).or_default();
-            if preview.frame_id == Some(frame.id) {
+        let grid = self.grid.get();
+        let (count, scale) = (snapshot.cameras.len(), self.main_scale());
+        let (most, shrink_for_gpu) = if performance::efficient() {
+            (EFFICIENT_SIDE, preview::Shrink::Larger)
+        } else {
+            (TILE_SIDE, preview::Shrink::UnderHalf)
+        };
+        for (index, camera) in snapshot.cameras.iter().enumerate() {
+            let id = &camera.info.id;
+            if grid.is_some_and(|grid| !grid.shows(index, count, self.grid_scroll)) {
+                // Scrolled out: nothing pulled from the ring or converted, and
+                // no frame held for a GPU view that is not drawn. Shown again
+                // when it scrolls back in, without counting as a new frame.
+                if let Some(preview) = self.previews.get_mut(id)
+                    && matches!(preview.shown, Some(Shown::Gpu { .. }))
+                    && preview.limits.take().is_some()
+                {
+                    gpu.retire(id);
+                }
                 continue;
             }
-            preview.frame_id = Some(frame.id);
-            liveness::seen(
-                &mut self.liveness,
-                self.scene.frozen.as_ref(),
-                &camera.info.id,
-                self.now,
-            );
+            let Some(frame) = self.handle.latest_frame_for(id) else {
+                continue;
+            };
+            let tile = grid.map_or(Size::new(640.0, 480.0), |grid| grid.tile);
+            let native = Size::new(frame.width as f32, frame.height as f32);
+            let limits = preview::Limits {
+                shrink_for_gpu,
+                ..preview::Limits::shown(&frame, preview::fit_scale(tile, native) * scale, most)
+            };
+            let preview = self.previews.entry(id.clone()).or_default();
+            let fresh = preview.frame_id != Some(frame.id);
+            if !fresh && preview.limits == Some(limits) {
+                continue;
+            }
+            (preview.frame_id, preview.limits) = (Some(frame.id), Some(limits));
+            if fresh {
+                liveness::seen(&mut self.liveness, self.scene.frozen.as_ref(), id, self.now);
+            }
             let meta = (frame.id, frame.width, frame.height, frame.pixel_format);
-            let state = self.camera_views.entry(camera.info.id.clone()).or_default();
+            let state = self.camera_views.entry(id.clone()).or_default();
             let shown = camera_view::present(
                 gpu,
                 &mut preview.shown,
                 state,
                 (camera.info.profile.kind, &camera.features),
-                &camera.info.id,
+                id,
                 frame,
-                (640, 480),
+                limits,
             );
             match shown {
                 Ok(()) => {
@@ -1996,15 +2143,28 @@ impl Workbench {
         }
     }
 
+    /// Show the selected camera's newest frame, and its current frame again
+    /// when the main view now shows more or less of it: after a zoom, a
+    /// resize or a change of scale.
     fn update_frame(&mut self, arrival: bool) {
         let Some(frame) = self.selected_frame() else {
             return;
         };
-        if Some(frame.id) == self.frame_id {
+        let limits = self.main_limits(&frame);
+        let fresh = Some(frame.id) != self.frame_id;
+        if !fresh && Some(limits) == self.frame_limits {
+            // A frame the scopes passed over while paced, such as the last
+            // before a stream stopped, once each is due.
+            self.measure(&frame, true);
             return;
         }
-        self.frame_id = Some(frame.id);
-        if arrival && let Some(id) = &self.observed_camera {
+        // The first frame of a camera, or of a new view of it, measures at once.
+        let paced = self.frame_id.is_some();
+        (self.frame_id, self.frame_limits) = (Some(frame.id), Some(limits));
+        if fresh
+            && arrival
+            && let Some(id) = &self.observed_camera
+        {
             liveness::seen(&mut self.liveness, self.scene.frozen.as_ref(), id, self.now);
         }
         let meta = (
@@ -2023,9 +2183,12 @@ impl Workbench {
         {
             self.focus.reset();
         }
-        self.measure(&frame);
+        if fresh {
+            self.measure(&frame, paced);
+        }
         let kind = self.camera_kind();
         let id = self.snapshot.active_camera.clone().unwrap_or_default();
+        let source = self.handle.preview_of(&id);
         let state = self.camera_views.entry(id).or_default();
         let shown = camera_view::present(
             &self.gpu,
@@ -2034,31 +2197,82 @@ impl Workbench {
             (kind, &self.snapshot.features),
             MAIN_VIEW,
             frame,
-            (u32::MAX, u32::MAX),
+            limits,
         );
         match shown {
             Ok(()) => {
                 self.frame_meta = Some(meta);
+                self.frame_source = source;
                 self.display_error = None;
             }
             Err(err) => self.display_error = Some(err.to_string()),
         }
     }
 
-    /// Update the open scopes from `frame`. A frame they cannot measure
-    /// still shows; presenting it reports any real decoding problem.
-    fn measure(&mut self, frame: &crate::types::Frame) {
+    /// Physical pixels per layout unit in the main window.
+    fn main_scale(&self) -> f32 {
+        self.window_scales
+            .get(&self.main_window)
+            .copied()
+            .unwrap_or(1.0)
+            * self.ui_scale.factor()
+    }
+
+    /// How much of `frame` the main view converts: what the picture covers
+    /// on screen at the zoom it settles at, every pixel from 1:1 up.
+    fn main_limits(&self, frame: &crate::types::Frame) -> preview::Limits {
+        let native = Size::new(frame.width as f32, frame.height as f32);
+        let zoom = if self.fit {
+            preview::fit_scale(self.stage.get(), native)
+        } else {
+            self.zoom
+        };
+        let (most, shrink_for_gpu) = if performance::efficient() {
+            (EFFICIENT_SIDE, preview::Shrink::Larger)
+        } else {
+            (u32::MAX, preview::Shrink::Never)
+        };
+        preview::Limits {
+            shrink_for_gpu,
+            ..preview::Limits::shown(frame, zoom * self.main_scale(), most)
+        }
+    }
+
+    /// Update the open scopes from `frame`; `paced` while frames stream, so
+    /// each scope measures no more often than it needs, and each frame once.
+    /// A frame they cannot measure still shows; presenting it reports any
+    /// real decoding problem.
+    fn measure(&mut self, frame: &crate::types::Frame, paced: bool) {
         if !self.intensity_image() || self.camera_kind() == CameraKind::LineScan {
             self.exposure = None;
             self.focus.reset();
             return;
         }
-        if self.exposure_open {
+        let now = self.now;
+        let due = |measured: Measured, every| !paced || measured.due(frame.id, now, every);
+        if self.exposure_open && due(self.measured.0, EXPOSURE_EVERY) {
+            self.measured.0 = Measured {
+                at: Some(now),
+                frame: Some(frame.id),
+            };
             self.exposure = frame::exposure(frame).ok();
         }
-        if self.focus.open
-            && let Ok(score) = frame::sharpness(frame, self.focus.pixels(frame.width, frame.height))
-        {
+        if due(self.measured.1, FOCUS_EVERY) {
+            self.measure_focus(frame);
+        }
+    }
+
+    /// Score the focus region of `frame`, when it is open.
+    fn measure_focus(&mut self, frame: &crate::types::Frame) {
+        if !self.focus.open {
+            return;
+        }
+        // A frame that cannot be scored is not tried again.
+        self.measured.1 = Measured {
+            at: Some(self.now),
+            frame: Some(frame.id),
+        };
+        if let Ok(score) = frame::sharpness(frame, self.focus.pixels(frame.width, frame.height)) {
             self.focus.record(score);
         }
     }
@@ -2067,7 +2281,20 @@ impl Workbench {
     /// stream still shows current values.
     fn remeasure(&mut self) {
         if let Some(frame) = self.selected_frame() {
-            self.measure(&frame);
+            self.measure(&frame, false);
+        }
+    }
+
+    /// Score the latest frame's focus region after it moved, unless scored
+    /// since or within `every` of the last score; the histogram does not
+    /// depend on it.
+    fn remeasure_focus(&mut self, every: Duration) {
+        if self.intensity_image()
+            && self.camera_kind() != CameraKind::LineScan
+            && let Some(frame) = self.selected_frame()
+            && self.measured.1.due(frame.id, self.now, every)
+        {
+            self.measure_focus(&frame);
         }
     }
 
@@ -2410,6 +2637,31 @@ impl Workbench {
         }
     }
 
+    /// Open the Features tab on the exposure control, lit as when the
+    /// camera takes a value, and focus it. Quick controls show only while no
+    /// search narrows the features; any other opens its group.
+    fn adjust_exposure(&mut self) -> Task<Message> {
+        let Some(name) = self.exposure_control() else {
+            return Task::none();
+        };
+        self.search.clear();
+        let tab = self.handle_message(Message::ShowTab(Tab::Features));
+        self.reveal_feature(name);
+        self.flash_feature(name);
+        // A control the stream holds read-only leaves the keyboard on the tab.
+        let reachable = self
+            .snapshot
+            .features
+            .iter()
+            .find(|feature| feature.name == name)
+            .is_some_and(|feature| self.focusable_by_name(feature));
+        if reachable {
+            operation::focus(format!("feature:{name}"))
+        } else {
+            tab
+        }
+    }
+
     fn zoom_by(&mut self, factor: f32) {
         let from = if self.fit {
             self.shown.as_ref().map_or(1.0, |shown| {
@@ -2418,8 +2670,23 @@ impl Workbench {
         } else {
             self.zoom
         };
-        self.fit = false;
-        self.zoom = (from * factor).clamp(stage::ZOOM_MIN, stage::ZOOM_MAX);
+        self.zoom_to(Some(
+            (from * factor).clamp(stage::ZOOM_MIN, stage::ZOOM_MAX),
+        ));
+    }
+
+    /// Show the picture at `zoom`, or fitted for None. The frame shown is
+    /// converted again at once if the new zoom needs more or fewer of its
+    /// pixels, so even a stopped stream is sharp at 1:1, and the zoom eases
+    /// in on that picture.
+    fn zoom_to(&mut self, zoom: Option<f32>) {
+        self.fit = zoom.is_none();
+        if let Some(zoom) = zoom {
+            self.zoom = zoom;
+        }
+        if !self.overview() {
+            self.update_frame(false);
+        }
     }
 
     fn storage_policy(&self) -> StoragePolicy {
@@ -2588,16 +2855,23 @@ impl Workbench {
             message => message,
         };
         self.now = Instant::now();
+        self.note_undrawn();
         let scale_before = self.ui_scale;
         let sheet_before = self.sheet_open();
-        let menus_changed = !matches!(
+        let frame_only = matches!(
             message,
             Message::Frame(_)
                 | Message::FrameArrived
+                | Message::Redrawn
                 | Message::Pointer
                 | Message::OverControls(_)
                 | Message::HoverTile(_)
         );
+        // An assistive technology hears of new state on the next draw. New
+        // frames alone wait for its throttle; pointer input tells it itself.
+        if !frame_only && !matches!(message, Message::AccessibilityChanged(_)) {
+            self.accessibility.changed();
+        }
         // Apply ready completions before capturing this gesture. A destination
         // replay must never overwrite input before its history entry exists.
         self.poll_destination_history();
@@ -2630,10 +2904,10 @@ impl Workbench {
                 auxiliary,
             ]);
         }
+        self.sync_performance();
         self.sync_animations();
-        self.frame_gap
-            .store(self.frame_gap().as_nanos() as u64, Ordering::Relaxed);
-        if menus_changed {
+        self.follow_frames();
+        if !frame_only {
             menus::sync(self);
         }
         task
@@ -2707,18 +2981,33 @@ impl Workbench {
                 {
                     return window::gain_focus(error.window);
                 }
+                let sight = if id == self.main_window && std::mem::take(&mut self.hidden) {
+                    self.update_frames();
+                    Task::none()
+                } else if self.hidden {
+                    // Another window brought the app forward, and the main
+                    // window perhaps with it.
+                    pacing::out_of_sight(self.main_window)
+                } else {
+                    Task::none()
+                };
                 self.focused_window = id;
                 self.key_window = Some(id);
                 self.menu_editor = self.window_editor_focus.get(&id).copied().unwrap_or(false);
                 self.popup_open = false;
-                return self.accessibility.focused(id, true).discard();
+                return Task::batch([self.accessibility.focused(id, true).discard(), sight]);
             }
             Message::WindowUnfocused(id) => {
                 if self.key_window == Some(id) {
                     self.key_window = None;
                 }
                 self.desktop_menu = Default::default();
-                return self.accessibility.focused(id, false).discard();
+                let hidden = if id == self.main_window {
+                    pacing::out_of_sight(id)
+                } else {
+                    Task::none()
+                };
+                return Task::batch([self.accessibility.focused(id, false).discard(), hidden]);
             }
             Message::CloseRequested(_) if self.close_error.is_some() => {
                 self.dismiss_close_error();
@@ -2843,6 +3132,7 @@ impl Workbench {
             }
             Message::Appearance(value) => self.appearance = value,
             Message::UiScale(value) => self.ui_scale = value,
+            Message::Performance(mode) => self.performance = mode,
             Message::ScaledViewport(size) => {
                 self.width = size.width;
                 self.height = size.height;
@@ -2871,7 +3161,7 @@ impl Workbench {
             Message::Tick => return self.tick(),
             Message::Frame(at) => self.refresh.redraw(at),
             Message::Displaced => {
-                self.refresh.recalibrate();
+                self.refresh.moved(self.now);
                 let id = self.main_window;
                 return Task::batch([
                     screen_refresh(id),
@@ -2879,8 +3169,14 @@ impl Workbench {
                 ]);
             }
             Message::ScreenRefresh(period) => self.refresh.report(period),
-            Message::FrameArrived if !self.shot_staged() => self.update_frames(),
-            Message::FrameArrived => {}
+            Message::FrameArrived | Message::Redrawn if !self.shot_staged() => self.update_frames(),
+            Message::FrameArrived | Message::Redrawn => {}
+            Message::Hidden(Some(hidden)) => {
+                if std::mem::replace(&mut self.hidden, hidden) && !hidden {
+                    self.update_frames();
+                }
+            }
+            Message::Hidden(None) => {}
             Message::SystemTheme(mode) => self.system_dark = mode == theme::Mode::Dark,
             Message::Key { chord, captured } => {
                 self.desktop_menu.cancel_alt();
@@ -2936,7 +3232,8 @@ impl Workbench {
             Message::ZoomWindow => {
                 return Task::done(self.main_window).then(|id| {
                     match prefs::double_click_action() {
-                        prefs::DoubleClickAction::Minimize => window::minimize(id, true),
+                        prefs::DoubleClickAction::Minimize => window::minimize(id, true)
+                            .chain(Task::done(Message::Hidden(Some(true)))),
                         prefs::DoubleClickAction::None => Task::none(),
                         prefs::DoubleClickAction::Fill => {
                             window::run(id, prefs::fill_window).discard()
@@ -3041,11 +3338,8 @@ impl Workbench {
                 let _ = self.handle_message(Message::Balance(value));
                 return self.handle_message(Message::BalanceReleased);
             }
-            Message::Fit => self.fit = true,
-            Message::Actual => {
-                self.fit = false;
-                self.zoom = 1.0;
-            }
+            Message::Fit => self.zoom_to(None),
+            Message::Actual => self.zoom_to(Some(1.0)),
             Message::Zoom(factor) => self.zoom_by(factor),
             Message::ToggleCameraView => {
                 if let Some(id) = &self.snapshot.active_camera {
@@ -3057,11 +3351,28 @@ impl Workbench {
             Message::ToggleExposure => self.toggle_exposure(),
             Message::ToggleFocusRegion => self.toggle_focus_region(),
             Message::FocusRegion(region) => {
-                self.focus.region = region;
-                self.focus.reset();
-                self.remeasure();
+                self.focus.move_to(region);
+                // The frame shown is unscored for the new region: scored at
+                // most once a frame's time while dragging, here or on the next
+                // tick, and where it lands on release.
+                self.measured.1.frame = None;
+                self.remeasure_focus(FOCUS_EVERY);
             }
-            Message::FocusRegionStart => self.break_history_group(),
+            Message::FocusRegionStart => {
+                self.break_history_group();
+                // A new press scores its first region at once, such as a click
+                // that moves the region without a drag.
+                self.measured.1 = Measured::default();
+            }
+            Message::FocusRegionEnd => self.remeasure_focus(Duration::ZERO),
+            Message::AdjustExposure => return self.adjust_exposure(),
+            Message::OverviewScrolled(offset) => {
+                self.grid_scroll = offset;
+                // Tiles scrolled into view show their newest frame at once.
+                if self.overview() {
+                    self.update_previews();
+                }
+            }
             Message::FocusMetric(metric) => self.focus.set_metric(metric),
             Message::ResetFocusPeak => {
                 self.focus.reset();
@@ -3104,6 +3415,7 @@ impl Workbench {
             Message::Search(value) => self.search = value,
             Message::InspectorDisclosure(section) => self.toggle_inspector_section(section),
             Message::ExpandFeatureGroups(open) => self.expand_feature_groups(open),
+            Message::ShowFeatures(group) => return self.show_whole_group(group),
             Message::RefreshFeatures => {
                 self.edits.clear();
                 self.edit_sources.clear();
@@ -3518,11 +3830,8 @@ impl Workbench {
             Action::ForwardTab => return self.handle_message(Message::ShowTab(Tab::Forward)),
             Action::ZoomIn => self.zoom_by(1.25),
             Action::ZoomOut => self.zoom_by(1.0 / 1.25),
-            Action::ZoomFit => self.fit = true,
-            Action::ZoomActual => {
-                self.fit = false;
-                self.zoom = 1.0;
-            }
+            Action::ZoomFit => self.zoom_to(None),
+            Action::ZoomActual => self.zoom_to(Some(1.0)),
             Action::ToggleActivity => self.logs_open = !self.logs_open,
             // Pressed where it does not apply, e.g. Space with no camera connected.
             _ => {}
@@ -3550,7 +3859,7 @@ impl Workbench {
         } else {
             container(self.view()).id("workbench-root").into()
         };
-        accessibility::wrap(
+        let view = accessibility::wrap(
             self.assistant_quit_view(
                 self.close_error_view(
                     keyboard_history::background(content, self.closing.is_some()),
@@ -3568,7 +3877,12 @@ impl Workbench {
             self.window_scales.get(&id).copied().unwrap_or(1.0) * self.ui_scale.factor(),
             Message::AccessibilityChanged,
         )
-        .map(move |message| Message::InWindow(id, Box::new(message)))
+        .map(move |message| Message::InWindow(id, Box::new(message)));
+        if id == self.main_window {
+            pacing::observe(view, self.draws.clone(), self.frames_shown())
+        } else {
+            view
+        }
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -3747,7 +4061,6 @@ fn num_requirement(key: Num) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iced::futures::{FutureExt, StreamExt};
 
     #[test]
     fn opening_panels_build_their_editors_before_animation_frames() {
@@ -4006,18 +4319,6 @@ mod tests {
         }
         bench.forward_output = "rtsp://127.0.0.1:8554/live".into();
         assert_eq!(bench.prefs().forward_output, "rtsp://127.0.0.1:8554/live");
-    }
-
-    #[test]
-    fn frame_watcher_stays_quiet_without_new_frames() {
-        let watch = FrameWatch {
-            handle: SessionHandle::new(),
-            gap: Arc::new(AtomicU64::new(16_000_000)),
-        };
-        let mut frames = Box::pin(watch_frames(&watch));
-        assert!(frames.next().now_or_never().is_none());
-        std::thread::sleep(FRAME_POLL * 10);
-        assert!(frames.next().now_or_never().is_none());
     }
 
     #[test]

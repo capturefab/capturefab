@@ -288,9 +288,18 @@ fn folder(_ctx: &Context, plan: &mut PlanState, checked: &mut Checked, args: Fol
     let path = match values::folder_path(
         &args.path,
         &home(),
-        &crate::ipc::session_dir(),
+        &crate::ipc::runtime_dir(),
         &crate::destination::staging_root(),
-    ) {
+    )
+    .and_then(|path| {
+        values::folder_path(
+            &args.path,
+            &home(),
+            &crate::ipc::state_dir(),
+            &crate::destination::staging_root(),
+        )?;
+        Ok(path)
+    }) {
         Ok(path) => Some(path),
         Err(issue) => {
             checked.issue(issue);

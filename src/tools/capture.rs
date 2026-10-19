@@ -726,6 +726,13 @@ fn budget(ctx: &Context, plan: &mut PlanState, checked: &mut Checked, estimate: 
     let free_files = u64::from(policy.max_files)
         .saturating_sub(ctx.storage.files)
         .saturating_sub(plan.planned_files);
+    let disk_full = free_disk.is_some_and(|free| {
+        bytes
+            .checked_add(plan.planned_bytes)
+            .and_then(|needed| needed.checked_add(ctx.storage.reserved_bytes))
+            .and_then(|needed| needed.checked_add(crate::storage::FREE_SPACE_FLOOR))
+            .is_none_or(|needed| free < needed)
+    });
     if exact && bytes > policy.max_bytes {
         let maximum = checked.call.args["bitrate"]
             .as_str()
@@ -750,7 +757,7 @@ fn budget(ctx: &Context, plan: &mut PlanState, checked: &mut Checked, estimate: 
             IssueCode::StorageFull,
         ));
     }
-    if bytes > free || files > free_files {
+    if bytes > free || files > free_files || disk_full {
         if policy.on_full == "delete-oldest" {
             checked.warning(
                 field,
@@ -789,11 +796,11 @@ fn budget(ctx: &Context, plan: &mut PlanState, checked: &mut Checked, estimate: 
             }
         }
     }
-    if free_disk.is_some_and(|free| free < bytes) {
+    if disk_full && policy.on_full != "delete-oldest" {
         checked.issue(Issue::error(
             Some(field),
             format!(
-                "Free space at the destination is less than the {} this may need.",
+                "Free space at the destination cannot cover the {} this may need and leave 512 MiB free after existing reservations and earlier planned captures.",
                 format_bytes(bytes)
             ),
             IssueCode::StorageFull,

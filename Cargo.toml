@@ -8,8 +8,8 @@ license = "MIT"
 repository = "https://github.com/capturefab/capturefab"
 
 [features]
-default = ["gui", "usb", "scanner", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "s3", "ftp", "sftp", "parquet", "modbus", "mqtt", "opcua", "mtconnect", "dinov2"]
-gui = ["ai", "dep:iced", "dep:bytemuck", "dep:rfd", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:mundy", "dep:accesskit", "dep:accesskit_macos", "dep:accesskit_windows", "dep:accesskit_unix", "dep:raw-window-handle", "dep:windows", "dep:x11-dl", "dep:libloading", "dep:libc"]
+default = ["gui", "usb", "scanner", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "s3", "ftp", "sftp", "parquet", "modbus", "mqtt", "opcua", "mtconnect", "dinov2", "hubs"]
+gui = ["ai", "dep:iced", "dep:bytemuck", "dep:rfd", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:mundy", "dep:accesskit", "dep:accesskit_macos", "dep:accesskit_windows", "dep:accesskit_unix", "dep:raw-window-handle", "dep:windows", "dep:x11-dl", "dep:libloading"]
 usb = ["dep:nusb"]
 # Document scanners: SANE scanimage, Windows WIA and macOS ImageCaptureCore.
 # Drivers run in disposable helper processes, never in the UI.
@@ -21,8 +21,11 @@ nvjpeg = ["dep:libloading"]
 # VA-API hardware JPEG (Intel iHD and other drivers), libva loaded at runtime in
 # an isolated helper process; libjpeg-turbo verifies its output at start-up.
 vaapi = ["dep:libloading", "jpeg"]
-# Upload queue and OS credential store shared by every network destination.
-uploads = ["dep:keyring"]
+# OS credential store (Keychain / Credential Manager / Secret Service) shared by
+# network destinations, AI provider keys and camera hubs.
+keychain = ["dep:keyring"]
+# Upload queue shared by every network destination.
+uploads = ["keychain"]
 # S3-compatible upload destinations (AWS, MinIO, RustFS, ...): a pure-Rust HTTPS
 # client (rustls, trusting the OS certificate store) and the OS credential store for keys.
 s3 = ["uploads", "dep:ureq"]
@@ -42,13 +45,22 @@ opcua = ["dep:async-opcua", "dep:tokio"]
 mtconnect = ["dep:ureq"]
 # Prompt measurements use HTTPS with the OS certificate store and native
 # Keychain / Credential Manager / Secret Service credentials.
-ai = ["dep:ureq", "dep:keyring", "dep:ring"]
+ai = ["dep:ureq", "keychain", "dep:ring"]
 # Bundled DINOv2 ViT-S/14 embeddings for auto capture (Apache-2.0 weights from
 # scripts/fetch-dinov2.py): wgpu compute shaders in an isolated helper process
 # (Metal, Vulkan, DX12), with a native CPU fallback.
 dinov2 = ["dep:matrixmultiply", "dep:half", "dep:libm", "dep:wgpu"]
+# Camera hubs (Home Assistant, Frigate, go2rtc, UniFi Protect): a hand-rolled
+# HTTP/1.1 client with rustls (ring; the OS trust store or a pinned certificate)
+# in the camera worker, JPEG/PNG decoded there with libjpeg-turbo and png, and
+# RTSP restreams through FFmpeg. Secrets come from the environment, or from the
+# OS credential store when `keychain` is also enabled.
+hubs = ["jpeg", "dep:rustls", "dep:rustls-platform-verifier"]
 # Apple's hardware JPEG engine through VideoToolbox (system frameworks; no-op off macOS).
 videotoolbox = []
+# The browser client (web-client/dist, or CAPTUREFAB_WEB_DIST) built into the
+# executable for `serve --listen`; release builds enable it when it is built.
+embedded-web = []
 # The GUI always renders with wgpu (falling back to tiny-skia without a GPU);
 # kept so existing `--features wgpu` builds keep working.
 wgpu = ["gui"]
@@ -57,13 +69,14 @@ wgpu = ["gui"]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4.5"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 roxmltree = "0.20"
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
 png = "0.17"
 if-addrs = "0.13"
 socket2 = "0.6"
+# SIGINT, plus SIGTERM (systemctl stop) and SIGHUP (a closed terminal).
 ctrlc = { version = "3.4", features = ["termination"] }
 getrandom = "0.3"
 iced = { version = "0.14", optional = true, default-features = false, features = ["wgpu", "tiny-skia", "crisp", "web-colors", "smol", "linux-theme-detection", "x11", "wayland", "image-without-codecs", "svg", "canvas", "advanced"] }
@@ -115,7 +128,7 @@ libm = { version = "0.2", optional = true }
 accesskit_macos = { version = "0.22.2", optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "NSAccessibility", "NSApplication", "NSCell", "NSEvent", "NSImage", "NSMenu", "NSMenuItem", "NSResponder", "NSScreen", "NSScroller", "NSView", "NSWindow", "NSWorkspace"] }
-objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSData", "NSUserDefaults", "NSDate", "NSDateFormatter", "NSFormatter", "NSLocale", "NSTimeZone", "NSString"] }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSData", "NSUserDefaults", "NSDate", "NSDateFormatter", "NSFormatter", "NSLocale", "NSProcessInfo", "NSTimeZone", "NSString"] }
 
 # Native accessibility preferences. iced already uses mundy for Linux theme
 # detection; its stream keeps portal/WinRT reads off the UI thread.
@@ -128,15 +141,24 @@ mundy = { version = "0.2.3", optional = true, default-features = false, features
 [target.'cfg(windows)'.dependencies]
 accesskit_windows = { version = "0.29.2", optional = true }
 windows = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_System_Power", "Win32_System_SystemInformation"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 accesskit_unix = { version = "0.17.2", optional = true }
 x11-dl = { version = "2.21", optional = true }
-libc = { version = "0.2", optional = true }
+
+# Host facts for doctor and efficiency mode (sysctl, statfs, access), and
+# anonymous shared memory for frame rings (memfd_create, shm_open) with
+# descriptor inheritance by camera workers.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }
+
+[build-dependencies]
+# Digest of the embedded FFmpeg, which names its extracted copy.
+sha2 = "0.10"
 
 [dev-dependencies]
 # Exercises the same semantic value/transition consumer as native adapters.

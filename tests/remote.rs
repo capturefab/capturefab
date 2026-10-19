@@ -30,6 +30,12 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.root);
     }
 }
+/// Spawned binaries keep their cache, such as dataset staging, out of the
+/// user's.
+fn test_cache() -> PathBuf {
+    std::env::temp_dir().join("capturefab-test-cache")
+}
+
 fn root(name: &str) -> PathBuf {
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
     std::env::temp_dir().join(format!(
@@ -51,9 +57,19 @@ impl Fixture {
     fn start() -> Self {
         let root = root("session");
         assets(&root);
-        let child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
-            .current_dir(&root)
+        Self::serve(
+            root.clone(),
+            Path::new(env!("CARGO_BIN_EXE_capturefab")),
+            &root,
+            &["--web-dir", "web"],
+        )
+    }
+    /// `serve --listen` from `executable` in `cwd`, with sessions under `root`.
+    fn serve(root: PathBuf, executable: &Path, cwd: &Path, args: &[&str]) -> Self {
+        let child = Command::new(executable)
+            .current_dir(cwd)
             .env("CAPTUREFAB_SESSION_DIR", root.join("sessions"))
+            .env("CAPTUREFAB_CACHE_DIR", test_cache())
             .env_remove("CAPTUREFAB_SESSION")
             .env("CAPTUREFAB_FRAME_BYTES", "1048576")
             .args([
@@ -63,9 +79,8 @@ impl Fixture {
                 "remote-ci",
                 "--listen",
                 "127.0.0.1:0",
-                "--web-dir",
-                "web",
             ])
+            .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -104,6 +119,16 @@ impl Fixture {
         fixture
     }
     fn http(&self, method: &str, path: &str, origin: Option<&str>, body: &[u8]) -> Response {
+        let origin = origin.map(|origin| ("Origin", origin));
+        self.http_with(method, path, origin.as_slice(), body)
+    }
+    fn http_with(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Response {
         let mut stream = TcpStream::connect_timeout(&self.address, Duration::from_secs(5)).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -118,8 +143,8 @@ impl Fixture {
             body.len()
         )
         .unwrap();
-        if let Some(origin) = origin {
-            write!(stream, "Origin: {origin}\r\n").unwrap();
+        for (name, value) in headers {
+            write!(stream, "{name}: {value}\r\n").unwrap();
         }
         if method == "POST" {
             write!(stream, "Content-Type: application/json\r\n").unwrap();
@@ -171,6 +196,7 @@ impl Fixture {
         let output = Command::new(env!("CARGO_BIN_EXE_capturefab"))
             .current_dir(&self.root)
             .env("CAPTUREFAB_SESSION_DIR", self.root.join("sessions"))
+            .env("CAPTUREFAB_CACHE_DIR", test_cache())
             .env_remove("CAPTUREFAB_SESSION")
             .args(["--json", "--session", "remote-ci"])
             .args(args)
@@ -659,10 +685,18 @@ fn analytics_collects_without_scraping_and_charts_current_capture_session() {
     let metrics = fixture.http("GET", "/metrics", None, b"");
     assert_eq!(metrics.status, 200);
     let metrics = std::str::from_utf8(&metrics.body).unwrap();
+    // Nobody watched the stream: no frame was lost or skipped for a preview.
+    assert_eq!(report["totals"]["lost"], 0, "{report}");
+    assert_eq!(report["totals"]["preview_skipped"], 0, "{report}");
     for (name, field) in [
         ("capturefab_session_frames_total", "frames"),
         ("capturefab_session_dropped_frames_total", "dropped"),
         ("capturefab_session_received_bytes_total", "bytes"),
+        ("capturefab_session_lost_frames_total", "lost"),
+        (
+            "capturefab_session_preview_skipped_frames_total",
+            "preview_skipped",
+        ),
     ] {
         assert_eq!(
             metric(metrics, name),
@@ -670,10 +704,16 @@ fn analytics_collects_without_scraping_and_charts_current_capture_session() {
             "{name}"
         );
     }
-    assert!(
-        metrics.contains("capturefab_camera_frames_total{camera_id=\"sim:0\""),
-        "{metrics}"
-    );
+    for name in [
+        "capturefab_camera_frames_total",
+        "capturefab_camera_lost_frames_total",
+        "capturefab_camera_preview_skipped_frames_total",
+    ] {
+        assert!(
+            metrics.contains(&format!("{name}{{camera_id=\"sim:0\"")),
+            "{metrics}"
+        );
+    }
     let health = fixture.http("GET", "/health", None, b"").json();
     assert_eq!(health["ready"], true);
     assert_eq!(health["cameras"]["connected"], 1);
@@ -739,6 +779,14 @@ fn analytics_keeps_short_capture_and_same_camera_reconnect_totals() {
     let first_bytes = first["totals"]["bytes"].as_u64().unwrap();
     assert!(first_frames > 0, "short acquisition vanished: {first}");
     assert_eq!(first_bytes, first_frames * 64 * 64, "{first}");
+    // Charted at once, not when the next camera connects.
+    let charted: u64 = first["points"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|point| point["frames"].as_u64().unwrap())
+        .sum();
+    assert_eq!(charted, first_frames, "{first}");
     assert_eq!(
         fixture.http("GET", "/health", None, b"").json()["cameras"]["connected"],
         0
@@ -779,6 +827,7 @@ fn remote_requires_web_assets_before_creating_session_resources() {
         let output = Command::new(env!("CARGO_BIN_EXE_capturefab"))
             .current_dir(&root)
             .env("CAPTUREFAB_SESSION_DIR", root.join("sessions"))
+            .env("CAPTUREFAB_CACHE_DIR", test_cache())
             .env_remove("CAPTUREFAB_SESSION")
             .args([
                 "--json",
@@ -878,6 +927,165 @@ fn remote_network_access_and_wasm_assets() {
             String::from_utf8_lossy(&response.body)
         );
         assert_eq!(response.json()["ok"], false);
+    }
+}
+
+#[test]
+fn previews_answer_a_frame_the_client_has_with_304_and_send_jpeg_on_request() {
+    let fixture = Fixture::start();
+    fixture.command(
+        None,
+        json!({"op":"connect","camera":"sim:0","timeout_ms":2000}),
+    );
+    for (feature, value) in [("Width", "64"), ("Height", "64")] {
+        fixture.command(
+            Some("sim:0"),
+            json!({"op":"set","feature":feature,"value":value}),
+        );
+    }
+    fixture.command(Some("sim:0"), json!({"op":"start"}));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fixture
+        .http("GET", "/api/preview?camera=sim%3A0", None, b"")
+        .status
+        != 200
+    {
+        assert!(Instant::now() < deadline, "preview did not receive a frame");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    fixture.command(Some("sim:0"), json!({"op":"stop"}));
+    for (query, content_type) in [
+        ("camera=sim%3A0", "image/png"),
+        (
+            "camera=sim%3A0&format=jpeg",
+            if cfg!(feature = "jpeg") {
+                "image/jpeg"
+            } else {
+                "image/png"
+            },
+        ),
+    ] {
+        let path = format!("/api/preview?{query}");
+        // A stopped stream ends on its newest frame, which the next polls keep.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (frame, unchanged) = loop {
+            let frame = fixture.http("GET", &path, None, b"");
+            assert_eq!(frame.status, 200);
+            let etag = frame.header("ETag").unwrap().to_owned();
+            let unchanged = fixture.http_with("GET", &path, &[("If-None-Match", &etag)], b"");
+            if unchanged.status == 304 {
+                break (frame, unchanged);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the stopped preview kept changing"
+            );
+        };
+        assert_eq!(frame.header("Content-Type"), Some(content_type));
+        assert_eq!(unchanged.header("ETag"), frame.header("ETag"));
+        assert_eq!(unchanged.header("X-Frame-Id"), frame.header("X-Frame-Id"));
+        assert_eq!(unchanged.header("Content-Length"), None);
+        assert!(unchanged.body.is_empty());
+        if content_type == "image/jpeg" {
+            assert!(frame.body.starts_with(&[0xff, 0xd8]));
+            assert!(frame.header("ETag").unwrap().ends_with("-jpeg\""));
+        } else {
+            assert!(frame.body.starts_with(b"\x89PNG\r\n\x1a\n"));
+        }
+    }
+}
+
+#[test]
+fn serve_finds_the_browser_client_beside_its_executable_from_any_directory() {
+    let root = root("beside");
+    let bin = root.join("bin");
+    let elsewhere = root.join("elsewhere");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&elsewhere).unwrap();
+    let source = Path::new(env!("CARGO_BIN_EXE_capturefab"));
+    let executable = bin.join(source.file_name().unwrap());
+    if fs::hard_link(source, &executable).is_err() {
+        fs::copy(source, &executable).unwrap();
+    }
+    assets(&bin);
+    let embedded = Command::new(&executable)
+        .env("CAPTUREFAB_SESSION_DIR", root.join("sessions"))
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    let embedded = serde_json::from_slice::<Value>(&embedded.stdout).unwrap()["result"]["features"]
+        ["embedded_web"]
+        .as_bool()
+        .expect("doctor reports whether the browser client is built in");
+    let fixture = Fixture::serve(root, &executable, &elsewhere, &[]);
+    let index = fixture.http("GET", "/", None, b"");
+    assert_eq!(index.status, 200);
+    assert_eq!(
+        index.header("Content-Type"),
+        Some("text/html; charset=utf-8")
+    );
+    let wasm = fixture.http("GET", "/capturefab_web_bg.wasm", None, b"");
+    assert_eq!(wasm.header("Content-Type"), Some("application/wasm"));
+    assert!(wasm.body.starts_with(b"\0asm"));
+    if !embedded {
+        assert_eq!(index.body, INDEX.as_bytes());
+        assert_eq!(wasm.body, WASM);
+    }
+}
+
+/// How many times a thread has gone to sleep and been woken.
+#[cfg(target_os = "linux")]
+fn voluntary_switches(task: &Path) -> u64 {
+    fs::read_to_string(task.join("status"))
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+        .expect("Linux reports context switches per thread")
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_idle_serve_and_its_listener_sleep_until_there_is_work() {
+    let fixture = Fixture::start();
+    let pid = fixture.child.as_ref().unwrap().id();
+    let tasks = Path::new("/proc").join(pid.to_string()).join("task");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    // A thread takes its name once it first runs, which can be after serve
+    // reports that it is ready.
+    let listener = loop {
+        let listener = fs::read_dir(&tasks)
+            .unwrap()
+            .map(|task| task.unwrap().path())
+            .find(|task| {
+                fs::read_to_string(task.join("comm"))
+                    .is_ok_and(|name| name.trim() == "capturefab-http")
+            });
+        if let Some(listener) = listener {
+            break listener;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "serve --listen runs a listener thread"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // The main thread waits for Ctrl-C and the listener for a connection;
+    // they used to wake 10 and 40 times a second to check for those.
+    let threads = [tasks.join(pid.to_string()), listener];
+    std::thread::sleep(Duration::from_millis(300));
+    let before = threads.each_ref().map(|task| voluntary_switches(task));
+    std::thread::sleep(Duration::from_secs(1));
+    for (task, before) in threads.iter().zip(before) {
+        let woken = voluntary_switches(task) - before;
+        assert!(
+            woken <= 2,
+            "{} woke {woken} times in a second",
+            task.display()
+        );
     }
 }
 

@@ -38,7 +38,7 @@ impl ScreenshotSequence {
         )
     }
 
-    fn parse(frames: Option<&str>, fps: Option<&str>) -> Result<Self> {
+    pub(super) fn parse(frames: Option<&str>, fps: Option<&str>) -> Result<Self> {
         let frames = frames.unwrap_or("1").parse::<u32>().map_err(|_| {
             anyhow::anyhow!("CAPTUREFAB_SCREENSHOT_FRAMES must be an integer from 1 to 240")
         })?;
@@ -126,6 +126,9 @@ pub(super) struct Scene {
     /// Welcome discovery is display-only and never enumerates real devices.
     welcome: bool,
     searching: bool,
+    /// Cameras on saved hubs are in the camera list, as discovery finds
+    /// them (synthetic: no hub is contacted).
+    hubs: bool,
 }
 
 impl Scene {
@@ -141,6 +144,29 @@ impl Scene {
                     .map(crate::transport::simulator::info_named)
                     .collect()
             };
+        }
+        if self.hubs
+            && !snapshot
+                .devices
+                .iter()
+                .any(|d| crate::hubs::is_source(&d.id))
+        {
+            for (hub, camera, vendor, model) in [
+                ("home", "camera.front_door", "Home Assistant", "Front door"),
+                ("home", "camera.garage", "Home Assistant", "Garage"),
+                ("nvr", "driveway", "Frigate", "Driveway"),
+            ] {
+                let id = format!("hub:{hub}/{camera}");
+                snapshot.devices.push(crate::types::CameraInfo {
+                    id: id.clone(),
+                    transport: crate::types::Transport::Media,
+                    vendor: vendor.into(),
+                    model: model.into(),
+                    serial: format!("{hub}/{camera}"),
+                    address: Some(id),
+                    profile: Default::default(),
+                });
+            }
         }
         if self.forwarding.is_none() && !self.stopped {
             return;
@@ -198,7 +224,8 @@ impl Workbench {
     ///   `recording` (the selected camera records to a file, for 1:23),
     ///   `timed` (with `recording`: the session stops it after 1 h)
     /// - `tags`: the capture tags filled in and open; `dataset`: the Dataset
-    ///   section open
+    ///   section open; `side-hub`: cameras from saved hubs in the camera
+    ///   list (with `welcome`, on the welcome cards)
     /// - review fixtures: `network`, `network-empty`, `network-error`,
     ///   `destinations-remove`, `bucket-editor-advanced`, `settings-credentials`,
     ///   `settings-credential-error`, `settings-assistant`,
@@ -210,7 +237,7 @@ impl Workbench {
     ///   `quick-command-task-approval`, `quick-command-task-paused-human`,
     ///   `quick-command-task-limit`, `quick-command-task-done`,
     ///   `analytics-measurements-populated`, `analytics-invalid`,
-    ///   `close-error`;
+    ///   `close-error`, `uploads-offline`;
     ///   `sheet-bottom` and `inspector-bottom` expose their lower content
     /// - failures: `write-error` (setting the selected camera's exposure
     ///   time was refused) and `connect-failed` (connecting to a typed
@@ -225,6 +252,7 @@ impl Workbench {
                 // run_capture connects no cameras. The snapshot supplies only
                 // built-in simulator cards, without real device discovery.
                 "welcome" => self.scene.welcome = true,
+                "side-hub" => self.scene.hubs = true,
                 "help" => self.help_open = true,
                 "analytics" => self.analytics.open = true,
                 "capture" => self.tab = Tab::Capture,
@@ -360,6 +388,7 @@ impl Workbench {
             || self.scene_assistant_settings(word, late)
             || self.scene_assistant_quick(word, late)
             || self.scene_assistant_task(word, late)
+            || self.scene_performance(word, late)
             || self.scene_sheets(word, late)
     }
 
@@ -536,7 +565,7 @@ impl Workbench {
             camera.info = info.clone();
             if scanner {
                 camera.streaming = false;
-                camera.features = self.snapshot.features.clone();
+                camera.features = self.snapshot.features.clone().into();
             }
         }
         self.snapshot.connected = Some(info);

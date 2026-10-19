@@ -132,12 +132,34 @@ pub(super) fn checkbox_named<'a, M: Clone + 'static>(
     checkbox_named_maybe(label, accessible_name, checked, Some(on))
 }
 
+/// `checkbox_named` that keyboard focus can be sent to by `id`.
+pub(super) fn checkbox_named_id<'a, M: Clone + 'static>(
+    label: &'a str,
+    accessible_name: &str,
+    checked: bool,
+    on: impl Fn(bool) -> M + 'a,
+    id: String,
+) -> Element<'a, M> {
+    checkbox_button(label, accessible_name, checked, Some(on))
+        .id(id)
+        .into()
+}
+
 fn checkbox_named_maybe<'a, M: Clone + 'static>(
     label: &'a str,
     accessible_name: &str,
     checked: bool,
     on: Option<impl Fn(bool) -> M + 'a>,
 ) -> Element<'a, M> {
+    checkbox_button(label, accessible_name, checked, on).into()
+}
+
+fn checkbox_button<'a, M: Clone + 'static>(
+    label: &'a str,
+    accessible_name: &str,
+    checked: bool,
+    on: Option<impl Fn(bool) -> M + 'a>,
+) -> button::Button<'a, M> {
     let toggle = on.as_ref().map(|on| on(!checked));
     let mut check = iced::widget::checkbox(checked)
         .on_toggle_maybe(on)
@@ -155,7 +177,6 @@ fn checkbox_named_maybe<'a, M: Clone + 'static>(
         .padding(0)
         .style(style::bare)
         .on_press_maybe(toggle)
-        .into()
 }
 
 /// The quality/frame-rate balance slider participates in Tab traversal and

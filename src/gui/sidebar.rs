@@ -41,13 +41,13 @@ const TRAIL: f32 = 21.0;
 const ROW_HEIGHT: f32 = 48.0;
 
 /// What discovery looks for, in its tooltips.
-pub(super) const DISCOVERS: &str = "Find webcams, GigE Vision, USB3 Vision and ONVIF cameras";
+pub(super) const DISCOVERS: &str =
+    "Find webcams, GigE Vision, USB3 Vision, ONVIF and saved hub cameras";
 /// What discovery looks for, while it does.
 pub(super) const DISCOVERING: &str =
-    "Looking for webcams, GigE Vision, USB3 Vision and ONVIF cameras…";
+    "Looking for webcams, GigE Vision, USB3 Vision, ONVIF and saved hub cameras…";
 /// What the address field takes, in full.
-pub(super) const ADDRESSES: &str =
-    "IP address, stream URL (RTSP, SRT, RTMP, HTTP), onvif: address, video file or sim:replay:PATH";
+pub(super) const ADDRESSES: &str = "IP address, stream URL (RTSP, SRT, RTMP, HTTP), onvif: address, hub:NAME/CAMERA, video file or sim:replay:PATH";
 /// What the address field takes, in the room under it.
 const ADDRESS_HINT: &str = "e.g. 192.168.1.20 or rtsp://host/stream";
 
@@ -383,6 +383,10 @@ fn host(address: &str) -> String {
 /// Where a camera is, identifier first: its address or serial (see
 /// `identity`), then its transport. Two cameras of one model differ here.
 pub(super) fn place(camera: &CameraInfo) -> String {
+    // A hub camera's product says more than its transport ("Media").
+    if crate::hubs::is_source(&camera.id) {
+        return format!("{} · {}", identity(camera), camera.vendor);
+    }
     format!("{} · {}", identity(camera), camera.transport)
 }
 
@@ -390,7 +394,7 @@ pub(super) fn place(camera: &CameraInfo) -> String {
 /// as "transport · address or serial".
 pub(super) fn recent_place(recent: &Recent) -> String {
     match recent.detail.split_once(" · ") {
-        Some((transport, place)) if place.contains("://") => {
+        Some((transport, place)) if place.contains("://") || crate::hubs::is_source(place) => {
             format!("{} · {transport}", short_address(place))
         }
         Some((transport, place)) => format!("{place} · {transport}"),
@@ -407,6 +411,20 @@ fn read_address(input: &str, devices: &[CameraInfo], file: Option<bool>) -> Opti
     }
     if crate::onvif::is_source(input) {
         return Some(format!("Will try ONVIF at {}", host(input)));
+    }
+    // Saved hubs are not read here: this runs on every edit, on the UI
+    // thread. A missing hub is reported when connecting.
+    if crate::hubs::is_source(input) {
+        return Some(match crate::hubs::Selector::parse(input) {
+            Ok(selector) => match devices.iter().find(|device| device.id == selector.id()) {
+                Some(device) => format!(
+                    "Will open {} from {} hub {}",
+                    device.model, device.vendor, selector.hub
+                ),
+                None => format!("Will try {} on hub {}", selector.camera, selector.hub),
+            },
+            Err(_) => "Hub cameras look like hub:NAME/CAMERA".into(),
+        });
     }
     if crate::transport::simulator::replay_source(input).is_some() {
         return Some("Will loop the test file or folder as a simulated camera".into());
@@ -1170,10 +1188,32 @@ mod tests {
             ("sim0", None),
             ("192.168.1", None),
             ("line-7 camera", None),
+            (
+                "hub:home/camera.porch?stream=snapshot",
+                Some("Will try camera.porch on hub home"),
+            ),
+            ("hub:home", Some("Hub cameras look like hub:NAME/CAMERA")),
         ];
         for (input, expected) in cases {
             assert_eq!(read(input).as_deref(), expected, "{input:?}");
         }
+        let mut hub_camera = device("hub:home/camera.front_door", "home/camera.front_door");
+        hub_camera.vendor = "Home Assistant".into();
+        hub_camera.model = "Front door".into();
+        assert_eq!(
+            read_address(
+                "hub:home/camera.front_door",
+                std::slice::from_ref(&hub_camera),
+                None
+            )
+            .as_deref(),
+            Some("Will open Front door from Home Assistant hub home")
+        );
+        hub_camera.address = Some(hub_camera.id.clone());
+        assert_eq!(
+            place(&hub_camera),
+            "home/camera.front_door · Home Assistant"
+        );
         // Reading never asks the disk itself.
         assert_eq!(read_address("Cargo.toml", &devices, None), None);
     }

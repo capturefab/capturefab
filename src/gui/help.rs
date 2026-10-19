@@ -98,7 +98,7 @@ impl Workbench {
     /// whether the word was taken; see `apply_scene`. Words: `help-more`
     /// (the guide with its connection notes open), and the destination
     /// sheet's `destinations-list`, `folder-editor`, `bucket-editor` and
-    /// `testing` (see `Picker::scene`).
+    /// `testing`, and `uploads-offline` (see `Picker::scene`).
     pub(super) fn scene_sheets(&mut self, word: &str, late: bool) -> bool {
         if late {
             return false;
@@ -114,7 +114,7 @@ impl Workbench {
                 self.sheets.more_turn.set(1.0);
                 true
             }
-            word => self.capture_to.scene(word),
+            word => self.capture_to.scene(word, &mut self.output),
         }
     }
 }
@@ -576,6 +576,11 @@ fn connection_notes<'a>(p: &'static Palette) -> Element<'a, Message> {
             Some("sim:replay:PATH")
         ),
         note("Webcams", "Built-in and USB webcams.", Some(webcam_scheme())),
+        note(
+            "Hubs",
+            "Cameras from Home Assistant, Frigate, go2rtc and UniFi Protect, after you save the server with capturefab hub add-home-assistant (or add-frigate, add-go2rtc, add-unifi-protect).",
+            Some("hub:NAME/CAMERA")
+        ),
         note("GigE", "Use an address on the camera's subnet.", None).push(tip(
             step_button("Check network", None, "Check network", Some(Message::ScanNetwork), p),
             "Tunes connected GigE cameras for the available bandwidth and checks network adapters. Live previews may pause briefly.",

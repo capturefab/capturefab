@@ -24,6 +24,7 @@ Use the built-in simulators to try commands without camera or PLC hardware.
 - [Source and build guide](https://github.com/capturefab/capturefab): Rust source, build instructions and MIT license.
 - [FFmpeg build notes](https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md): Media dependencies, corresponding source and build provenance.
 - [Remote control](https://github.com/capturefab/capturefab/blob/main/docs/remote-control.md): Local browser interface and HTTP activity observation.
+- [Line computer guide](https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md): Headless `serve` as a Linux service on a Raspberry Pi, Jetson or industrial PC: archive choice, camera permissions, systemd, storage budget and efficiency mode.
 
 ## Examine the installed version
 
@@ -50,6 +51,16 @@ Plain `schema` prints the contract directly.
 Data goes to stdout; diagnostics go to stderr.
 Read the process exit code before you use the result.
 Binary image stdout, raw XML, completions, help and version output use their command-specific formats.
+
+Plain `doctor` checks the host and prints a fix for each warning.
+`doctor --json` adds `host`, `efficiency`, `paths`, `limits`, `graphics` and `checks` (`{id,level,message,fix}`).
+`doctor --json` reports `runtime_directory` (sessions; `session_directory` is the same) and `state_directory` (settings, saved hubs and destinations, upload queue, storage ledger); on Linux state is in `~/.local/state/capturefab` and survives reboots, and state an older version left in another folder moves there once or is named by the `old_state` check.
+`cache_directory` holds extracted FFmpeg, encoder probes and Linux dataset staging; `CAPTUREFAB_CACHE_DIR` overrides it.
+`--efficiency auto|smooth|efficient` or `CAPTUREFAB_EFFICIENCY` sets efficiency mode for a process and the camera workers it starts, over Settings > Performance, which only the desktop window reads; `doctor` reports the mode in force and why.
+Workers follow a change in their session's mode for decoders they start afterwards; efficient halves how often a session polls its workers for status.
+Auto is efficient with at most 2 CPU cores or 2 GiB of memory, in the OS low-power mode, or on a desktop hint such as software rendering or a preview falling behind.
+Efficient mode reduces preview, polling and CPU embedding work (desktop previews at most 15 frames a second, 5 per overview tile, 1280 pixels a side; auto capture's CPU embedding a fifth of a core); captures and recordings keep every frame.
+A headless build without a subcommand exits 5 and suggests `serve`.
 
 Exit codes are 1 `operation_failed`, 2 `usage`, 3 `unavailable`, 4 `timeout`, 5 `unsupported` and 6 `storage_full`.
 Capturefab rejects malformed supplied fields before connection and before capture/forward `--set` or `--auto` changes.
@@ -98,6 +109,9 @@ Use `--actor NAME --actor-kind agent` for an automation agent.
 `CAPTUREFAB_ACTOR` and `CAPTUREFAB_ACTOR_KIND` provide defaults; the default kind is `human`.
 Actor metadata is display attribution, not authentication.
 
+In `status --json`, `lost` counts frames lost on the camera link or in the worker; use it for acquisition health. `preview_skipped` counts preview frames a viewer missed because a newer one was ready. `dropped` keeps its v1 meaning: worker receive errors plus `preview_skipped`.
+Analytics (`/api/analytics`, the charts and `/metrics`) count missed frames as `lost`; totals and cameras add `lost` and `preview_skipped`, Prometheus adds `capturefab_{session,camera}_lost_frames_total` and `capturefab_{session,camera}_preview_skipped_frames_total`, and `samples` counts one-second samples of all cameras together, so 24 hours fit for any camera count.
+
 `status --json` includes global `result.activity` and `result.activity_revision`, even for a busy target camera.
 Activity retains the latest 200 completed entries plus active commands and schedules.
 Sequences include `file_count` and at most eight path previews; capture results still return the full file list.
@@ -114,6 +128,7 @@ Activity responses contain `{revision,activity}` inside the versioned result.
 These read-only calls bypass camera queues and create no Activity entries.
 RPC supports `{"op":"activity","after":12,"timeout_ms":20000}`.
 HTTP observers use `/api/activity?after=REV&timeout_ms=20000`; the maximum timeout is 25000 ms.
+HTTP previews: `/api/preview?camera=ID&format=jpeg` (PNG by default); send the returned `ETag` as `If-None-Match` to get 304 while the frame is unchanged.
 All observers wake on shared command and scheduled-job changes.
 See the agent instructions for actor fields, log timestamps and HTTP command envelopes.
 
@@ -131,6 +146,9 @@ Durations and timestamp fractions must resolve to whole milliseconds.
 `1.001s` is valid; `1.1ms` fails.
 All scheduled frames must occur within 10 years.
 Keep the GUI, headless session or direct command active for the schedule lifetime.
+Scheduled frames are saved on their own thread, which holds at most two frames, so acquisition continues while they save.
+A job's `skipped` counts shots not taken because that thread was full; `retries` counts shots that failed because the storage ledger stayed busy or the disk timed out.
+Both are taken again at a later interval, so each one moves `next_at_ms` one interval later; Storage full and other save errors fail the job.
 
 `record` is an alias for `forward`.
 `record --duration 30s` keeps the CLI active until the camera worker stops the encoder at the deadline.
@@ -138,9 +156,15 @@ Elapsed time and computer sleep count. A backward clock change does not extend t
 Ctrl-C stops the encoder early.
 This works with temporary workers and persistent sessions.
 RPC and workflow `forward` commands use `duration_ms` for the same limit.
-Set the maximum file size for the full duration; a recording that gets to its limit is lost.
+Set the maximum file size for the full duration; a recording that reaches its limit stops with storage_full and keeps the video written until then, recorded in the ledger and queued for upload.
 Without a duration, a session command returns immediately and records until `stop-forward`.
 A direct recording command stays active until Ctrl-C.
+`stop-forward` returns final `stats`: `accepted`, `written`, `dropped`, `late`, `stalled`, `encoder`, `error`; `record --duration` adds them as `stopped`.
+`late` counts frames lost while the encoder was busy; `stalled` means no new camera frame for 2 s.
+Recordings keep wall-clock time, so a file lasts as long as its recording and a camera stall leaves a gap.
+H.265 or AV1 without a working hardware encoder fails before recording with exit 5 and names the working codecs.
+Network stream sources reconnect by themselves, backing off from 1 s to 30 s; frame waits meanwhile time out (exit 4). Only repeated credential rejections stop them.
+Video file sources play at their frame rate in live view; captures that start acquisition read them as fast as they ask; `PlaybackSpeed=Fastest` decodes every frame as fast as possible.
 
 Saved destinations include folders, external drives, network folders, S3-compatible buckets, FTP/FTPS servers and SFTP servers.
 Use `destination list --json`, `volumes --json` and `uploads --json` to inspect them.
@@ -149,10 +173,14 @@ SFTP destinations must have a pinned host key: `--host-key SHA256:...` or `--acc
 `add-s3 --preset rustfs` or `--preset minio` must have `--endpoint`.
 A remote file is never replaced; FTP rename can replace on some servers, so use one writer per FTP folder.
 Persistent sessions return local capture results before upload completion; inspect the upload queue.
+`uploads --json` has `destinations:{NAME:{pending,uploading,failed,waiting_bytes,next_attempt,last_error}}` over every queued upload; `next_attempt` is in Unix seconds.
+A failing destination backs off as a whole for uploads it already tried, while new ones still go ahead; `uploads retry --now` retries waiting uploads at once, and `uploads retry` retries failed ones at once.
+An item queued while the storage ledger was busy has `unheld:true` until the uploader holds it back from retention.
 
-Captures and recordings share a storage budget across processes with the same `CAPTUREFAB_SESSION_DIR`.
+Captures and recordings share a storage budget across processes with the same state directory; `CAPTUREFAB_SESSION_DIR` sets it, and the runtime directory, for isolated experiments.
 Defaults are 10 GiB and 10,000 files; each recording defaults to a 512 MiB file limit.
-Use `storage --json` to inspect usage and reservations.
+Use `storage --json` to inspect usage and reservations; `free_bytes` is the free space on the default capture folder's disk.
+Every save must leave 512 MiB free on its disk, counting what active recordings may still write.
 A storage-full error has exit code 6.
 You must have explicit user authorization for retention deletion or an increased global budget.
 
@@ -243,10 +271,16 @@ capturefab --session bench --camera sim:0 capture-session review --json
 capturefab --session bench --camera sim:0 capture-session keep 2 --json
 ```
 
-A capture session is one camera-bound `.duckdb` file; it needs a running GUI or `serve` session and a connected camera.
+A capture session is a camera-bound `NAME.duckdb` plus a `NAME.frames` folder of raw frames beside it; it needs a running GUI or `serve` session and a connected camera.
+Close it, then copy the database and its `.frames` folder together.
 `teach` captures positive examples; `keep` and `discard` label pending suggestions. Pending suggestions never train.
+`keep ID` only relabels; `discard ID` deletes the frame file if it is unchanged.
+Frames count against the storage budget; a full budget is exit 6.
+A refused suggestion is retried after a minute, or at once after `discard` or `auto`; free space or raise the budget.
+`status.capture_session.note` says why a suggestion was skipped.
 `new --encoder auto` (the default) uses the DINOv2 ViT-S/14 model bundled in the executable; nothing is downloaded.
-Embeddings run on the GPU in an isolated helper process when possible (up to 30 frames per second), otherwise on the CPU.
+Embeddings run on the GPU in an isolated helper process when possible (up to 30 frames per second), otherwise on the CPU, paced to at most half of one core (a fifth in efficiency mode).
+`auto` picks DINOv2 even without a GPU; `--encoder native` samples 4 times a second on CPU-only small computers.
 `status --json` reports `capture_session.accelerator` and `samples_per_second`; `doctor --json` reports `auto_capture.dinov2.gpu`.
 `--encoder native` uses a color/edge descriptor; `CAPTUREFAB_DINOV2_GPU=0` keeps DINOv2 on the CPU.
 A session keeps its encoder and model fingerprint: `resume` refuses a session learned with a different bundled model (exit 1).
@@ -362,7 +396,7 @@ Restore proposals skip human-changed, reconnected and selector-dependent setting
 Runs use an `assistant:{pid}:{run8}` actor with kind `agent`.
 External agents must use `--actor NAME --actor-kind agent`.
 
-Private action logs use `<session_dir>/assistant/runs/<run_id>.jsonl`.
+Private action logs use `<state_dir>/assistant/runs/<run_id>.jsonl`.
 Records contain `v`, `t`, `run`, `seq` and `kind`; `t` is UTC Unix milliseconds.
 Logs exclude credentials, image bytes, provider thinking and full response bodies.
 `--events FILE|-` tails the exact JSONL records; `-` selects stderr.
@@ -471,6 +505,24 @@ The scan can briefly pause previews for packet probes.
 Active recordings, forwarding or schedules prevent tuning.
 It does not change host IP addresses, routes or MTUs.
 See the agent instructions for network health values and RPC fields.
+
+## Open cameras from hubs
+
+```sh
+capturefab hub cameras --json
+capturefab --camera 'hub:home/camera.front_door' capture -o front.png --json
+capturefab --camera 'hub:home/camera.porch?stream=snapshot&fps=0.5' capture --interval 1m -n 60 -o porch --json
+```
+
+A hub is a Home Assistant, Frigate, go2rtc or UniFi Protect server saved with `capturefab hub add-home-assistant`, `add-frigate`, `add-go2rtc` or `add-unifi-protect`.
+Ask the user before you add or replace a hub or store a token; a Home Assistant token carries that user's access.
+Selectors are `hub:NAME/CAMERA[?stream=auto|mjpeg|snapshot|rtsp&fps=F]`; always quote them.
+`discover` and `hub cameras` list cameras on saved hubs; each `id` is a `--camera` selector.
+Secrets come from the OS credential store (`--secret-stdin`) or a `CAPTUREFAB_HUB_*` variable (`--secret-env VAR`) in the process that opens or lists the camera, never from the command line. Builds without the `keychain` feature take environment secrets only.
+`stream=auto` tries MJPEG then snapshots on Home Assistant, RTSP then snapshots on Frigate and go2rtc, and snapshots on UniFi Protect. Each attempt allows at least 12 seconds for its first frame (15 for RTSP); API checks and fallback add to the total connection time.
+Hub camera settings are read-only; Home Assistant MJPEG sends nothing while the image is unchanged, so use `stream=snapshot` for time-lapses.
+`serve --listen` refuses hub cameras unless it was started with `--allow-hubs`.
+Exit codes: 1 secret or certificate refused, 2 invalid name, URL, flags or selector, 3 hub or camera unavailable, 4 timeout, 5 hubs or the credential store not compiled in.
 
 ## Camera types and limits
 

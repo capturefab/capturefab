@@ -871,6 +871,9 @@ impl SignalHub {
     fn sources(&self) -> Vec<Arc<Source>> {
         lock(&self.inner.sources).values().cloned().collect()
     }
+    pub fn has_sources(&self) -> bool {
+        !lock(&self.inner.sources).is_empty()
+    }
     /// Attach or detach the sink after the batches already queued. The old
     /// sink is finished; its error, if any, is returned.
     pub fn set_sink(&self, sink: Option<Arc<dyn SampleSink>>, timeout: Duration) -> Result<()> {

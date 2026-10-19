@@ -10,7 +10,17 @@ struct Activate {
 }
 impl ActivationHandler for Activate {
     fn request_initial_tree(&mut self) -> Option<TreeUpdate> {
-        self.bridge.tree(self.id)
+        self.bridge.listen(self.id)
+    }
+}
+
+/// The screen reader turned off: AT-SPI says when, other platforms never do.
+#[cfg(target_os = "linux")]
+struct Deactivate(Bridge);
+#[cfg(target_os = "linux")]
+impl accesskit::DeactivationHandler for Deactivate {
+    fn deactivate_accessibility(&mut self) {
+        self.0.quiet();
     }
 }
 
@@ -41,6 +51,8 @@ pub(super) fn attach(id: window::Id, handle: &dyn window::Window, bridge: Bridge
         bridge: bridge.clone(),
         id,
     };
+    #[cfg(target_os = "linux")]
+    let deactivation = Deactivate(bridge.clone());
     let actions = Actions { bridge, id };
     #[cfg(target_os = "macos")]
     let adapter = {
@@ -71,11 +83,7 @@ pub(super) fn attach(id: window::Id, handle: &dyn window::Window, bridge: Bridge
     #[cfg(target_os = "linux")]
     let adapter = {
         let _ = handle;
-        struct Deactivate;
-        impl accesskit::DeactivationHandler for Deactivate {
-            fn deactivate_accessibility(&mut self) {}
-        }
-        Adapter::new(activation, actions, Deactivate)
+        Adapter::new(activation, actions, deactivation)
     };
     ADAPTERS.with(|adapters| {
         adapters.borrow_mut().insert(id, adapter);
@@ -223,4 +231,37 @@ pub(super) fn detach(id: window::Id) -> bool {
     // Keep that teardown outside the adapter map's runtime borrow as well.
     drop(adapter);
     removed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activation_starts_collection_and_linux_deactivation_stops_it() {
+        let bridge = Bridge::default();
+        let id = window::Id::unique();
+        let mut activate = Activate {
+            bridge: bridge.clone(),
+            id,
+        };
+        assert!(!bridge.listening());
+        // Nothing was collected while nothing listened: the adapter shows a
+        // placeholder until the next draw's tree arrives through `sync`.
+        assert!(activate.request_initial_tree().is_none());
+        assert!(bridge.listening());
+        let (tree, routes) =
+            super::super::Collector::new(1.0).finish("Capturefab", Default::default());
+        bridge.store(id, tree, routes);
+        assert!(
+            activate.request_initial_tree().is_some(),
+            "listening already"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            use accesskit::DeactivationHandler;
+            Deactivate(bridge.clone()).deactivate_accessibility();
+            assert!(!bridge.listening());
+        }
+    }
 }
