@@ -624,7 +624,9 @@ fn describe(command: &SessionCommand) -> (&'static str, String) {
                 output_label(output, destination)
             ),
         ),
-        StopForward => ("stop_forward", "Stop forwarding / recording".into()),
+        StopForward | StopForwardIf { .. } => {
+            ("stop_forward", "Stop forwarding / recording".into())
+        }
         DatasetOpen { path, .. } => ("dataset_open", format!("Open dataset {}", file_name(path))),
         DatasetClose => ("dataset_close", "Close dataset".into()),
         DatasetStatus => ("dataset_status", "Read dataset status".into()),

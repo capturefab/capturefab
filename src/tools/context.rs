@@ -334,6 +334,10 @@ impl Default for RecordingDefaults {
 /// or the home folder's path.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DestinationInfo {
+    /// Private approval identity for the complete saved target, including
+    /// login and credential selection. Never part of model or CLI output.
+    #[serde(skip)]
+    pub(crate) approval_identity: Option<String>,
     pub name: String,
     /// `folder`, `s3`, `ftp` or `sftp`.
     pub kind: String,
@@ -369,6 +373,7 @@ impl DestinationInfo {
             _ => sources.volume_problem(&root),
         };
         Self {
+            approval_identity: Self::identity(destination),
             name: destination.name.clone(),
             kind: destination.target.kind().into(),
             location: match &remote {
@@ -381,6 +386,13 @@ impl DestinationInfo {
             problem,
             remote: remote.is_some(),
         }
+    }
+
+    pub(crate) fn identity(destination: &Destination) -> Option<String> {
+        use sha2::Digest;
+        serde_json::to_vec(destination)
+            .ok()
+            .map(|bytes| format!("{:x}", sha2::Sha256::digest(bytes)))
     }
 }
 
@@ -598,4 +610,35 @@ pub(crate) fn gather_with(
         compiled,
         defaults,
     })
+}
+
+#[cfg(test)]
+mod approval_identity_tests {
+    use super::*;
+    use crate::destination::{FtpServer, SecretSource, Target};
+
+    #[test]
+    fn identity_binds_the_login_and_credential_selection_omitted_from_location() {
+        let mut destination: Destination = serde_json::from_value(serde_json::json!({
+            "name":"server", "kind":"ftp", "host":"files.example.test", "user":"alice"
+        }))
+        .unwrap();
+        let Target::Ftp(server) = &destination.target else {
+            panic!("FTP fixture");
+        };
+        let location = Remote::Ftp(server.clone()).location();
+        let first = DestinationInfo::identity(&destination).unwrap();
+        let Target::Ftp(server) = &mut destination.target else {
+            unreachable!()
+        };
+        server.user = "bob".into();
+        assert_eq!(Remote::Ftp(server.clone()).location(), location);
+        let second = DestinationInfo::identity(&destination).unwrap();
+        assert_ne!(first, second);
+        let Target::Ftp(FtpServer { password, .. }) = &mut destination.target else {
+            unreachable!()
+        };
+        *password = SecretSource::Environment;
+        assert_ne!(second, DestinationInfo::identity(&destination).unwrap());
+    }
 }

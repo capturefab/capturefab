@@ -1267,6 +1267,9 @@ impl Workbench {
         if self.closing.is_some() {
             return Task::none();
         }
+        if self.assistant.tasks.active() {
+            return self.guard_assistant_quit(target);
+        }
         self.dismiss_close_error();
         self.closing = Some(target);
         self.assistant.settings.clear_secret();
@@ -1355,16 +1358,17 @@ impl Workbench {
         // Pending commands (connecting, discovering) tick fast enough to
         // step spinners and pulses without per-frame redraws.
         let busy = !self.pending.is_empty()
-            || self
-                .snapshot
-                .activity
-                .iter()
-                .any(|entry| entry.state.active())
+            || self.snapshot.activity.iter().any(|entry| {
+                entry.state.active()
+                    && !(self.assistant_actor_is_local(
+                        entry.actor.as_ref().map_or("", |actor| actor.id.as_str()),
+                    ) && !self.assistant.quick.open)
+            })
             || self.screenshot.is_some()
             || self.capture_to.busy()
             || self.record_to.busy()
             || self.assistant.settings.busy()
-            || self.assistant.quick.busy();
+            || self.assistant_ui_busy();
         let interval = if busy {
             Duration::from_millis(60)
         } else if streaming {
@@ -1863,6 +1867,9 @@ impl Workbench {
         {
             self.balance = status.balance;
         }
+        // Poll task actor identities before attributing this snapshot's
+        // activity, including a first fast assistant action.
+        self.tick_assistant();
         self.sync_client_activity();
         self.sample_throughput();
         self.observe_liveness();
@@ -1883,7 +1890,6 @@ impl Workbench {
         self.tick_inspector();
         self.tick_analytics();
         self.tick_video_analytics();
-        self.tick_assistant();
         self.tick_autocapture();
         self.tick_signals();
         self.save_prefs();
@@ -2693,6 +2699,9 @@ impl Workbench {
                 self.window_scales.insert(id, scale);
             }
             Message::WindowFocused(id) => {
+                if self.assistant.quit.is_some() && id != self.main_window {
+                    return window::gain_focus(self.main_window);
+                }
                 if let Some(error) = &self.close_error
                     && id != error.window
                 {
@@ -2716,6 +2725,11 @@ impl Workbench {
             }
             Message::CloseRequested(id) if self.settings_window == Some(id) => {
                 return self.handle_message(Message::Settings(false));
+            }
+            Message::CloseRequested(id)
+                if id == self.main_window && self.assistant.tasks.active() =>
+            {
+                return self.guard_assistant_quit(CloseTarget::Window(id));
             }
             Message::CloseRequested(id) if id == self.main_window && self.sheet_open() => {
                 return self.dispatch_action(Action::Overview);
@@ -3372,7 +3386,8 @@ impl Workbench {
     }
 
     fn shortcut(&mut self, chord: Chord, keyboard_free: bool) -> Task<Message> {
-        let modal = self.sheet_open() || self.close_error.is_some();
+        let modal =
+            self.sheet_open() || self.close_error.is_some() || self.assistant.quit.is_some();
         // In a sheet Esc cancels or closes it, even from the field it
         // focused on opening, which took the key to leave itself.
         let keyboard_free = keyboard_free
@@ -3389,6 +3404,14 @@ impl Workbench {
     pub(super) fn dispatch_action(&mut self, action: Action) -> Task<Message> {
         if action == Action::Quit {
             return self.handle_message(Message::Quit);
+        }
+        if self.assistant.quit.is_some() {
+            if matches!(action, Action::Overview | Action::CloseWindow) {
+                return self.update_assistant(assistant::Input::Task(
+                    assistant::tasks::Input::KeepRunning,
+                ));
+            }
+            return Task::none();
         }
         if self.close_error.is_some() {
             if matches!(action, Action::Overview | Action::CloseWindow) {
@@ -3528,8 +3551,11 @@ impl Workbench {
             container(self.view()).id("workbench-root").into()
         };
         accessibility::wrap(
-            self.close_error_view(
-                keyboard_history::background(content, self.closing.is_some()),
+            self.assistant_quit_view(
+                self.close_error_view(
+                    keyboard_history::background(content, self.closing.is_some()),
+                    id,
+                ),
                 id,
             ),
             self.accessibility.clone(),
@@ -3624,7 +3650,10 @@ impl Workbench {
                 None
             },
             self.desktop_menu.active(),
-            self.sheet_open() || self.close_error.is_some() || self.closing.is_some(),
+            self.sheet_open()
+                || self.close_error.is_some()
+                || self.assistant.quit.is_some()
+                || self.closing.is_some(),
         )
     }
 

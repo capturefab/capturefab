@@ -199,6 +199,7 @@ pub(crate) fn camera(info: CameraInfo) -> CameraSnapshot {
         last_error: None,
         worker_pid: 1,
         forwarding: None,
+        forwarding_id: None,
         forwarding_since_ms: None,
         forwarding_until_ms: None,
         jobs: Vec::new(),
@@ -329,6 +330,7 @@ pub(crate) fn fixture_snapshot() -> SessionSnapshot {
     let mut sim1 = camera(crate::transport::simulator::info_named("sim:1"));
     sim1.streaming = true;
     sim1.forwarding = Some(format!("{}/Capturefab/line.mp4", home().display()));
+    sim1.forwarding_id = Some("11111111111111111111111111111111".into());
     sim1.forwarding_since_ms = Some(NOW - 600_000);
     sim1.forwarding_until_ms = Some(NOW + 1_800_000);
 
@@ -340,6 +342,7 @@ pub(crate) fn fixture_snapshot() -> SessionSnapshot {
     ));
     stream.streaming = true;
     stream.forwarding = Some("rtmp://h/live2/KEY".into());
+    stream.forwarding_id = Some("22222222222222222222222222222222".into());
     stream.forwarding_since_ms = Some(NOW - 60_000);
     stream.last_error = Some("could not open rtsp://u:p@h/s: refused".into());
 
@@ -381,6 +384,7 @@ pub(crate) fn fixture_context(snapshot: SessionSnapshot) -> Context {
         snapshot,
         destinations: vec![
             DestinationInfo {
+                approval_identity: None,
                 name: "line-1".into(),
                 kind: "folder".into(),
                 location: "~/Captures/line-1".into(),
@@ -391,6 +395,7 @@ pub(crate) fn fixture_context(snapshot: SessionSnapshot) -> Context {
                 remote: false,
             },
             DestinationInfo {
+                approval_identity: None,
                 name: "archive".into(),
                 kind: "s3".into(),
                 location: "s3://acme/cams/ at https://minio.example:9000".into(),

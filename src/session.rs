@@ -220,6 +220,10 @@ pub enum SessionCommand {
         duration_ms: Option<u64>,
     },
     StopForward,
+    /// Stop only the forward whose opaque worker-issued identity still matches.
+    StopForwardIf {
+        forwarding_id: String,
+    },
     /// Open or create the session's dataset catalog (one .duckdb file).
     DatasetOpen {
         path: String,
@@ -298,6 +302,13 @@ pub struct FeatureValue {
 }
 /// Most values one `SetMany` writes.
 pub const MAX_SET_MANY: usize = 32;
+/// The opaque identity of one worker-created recording or forward.
+pub fn valid_forwarding_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 /// Deserialize JSON control messages without accepting ignored fields on
 /// Serde's internally tagged unit variants or duplicate object fields.
 pub fn deserialize_command<'de, D: serde::Deserializer<'de>>(
@@ -578,6 +589,10 @@ impl SessionCommand {
                 }
             }
             Self::CancelJob { id } => ensure!(*id > 0, "capture job ID must be positive"),
+            Self::StopForwardIf { forwarding_id } => ensure!(
+                valid_forwarding_id(forwarding_id),
+                "forwarding ID must be 32 lowercase hexadecimal characters"
+            ),
             Self::ReadMemory { address, length } => validate_memory(*address, *length)?,
             Self::WriteMemory { address, data } => validate_memory(*address, data.len())?,
             Self::Forward {
@@ -800,6 +815,9 @@ pub struct CameraSnapshot {
     pub worker_pid: u32,
     #[serde(default)]
     pub forwarding: Option<String>,
+    /// Opaque identity of this exact recording or forward, including replacements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarding_id: Option<String>,
     /// When the current recording or forward started, UTC Unix milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding_since_ms: Option<u64>,
@@ -858,6 +876,9 @@ pub struct SessionSnapshot {
     pub active_camera: Option<String>,
     #[serde(default)]
     pub forwarding: Option<String>,
+    /// Opaque identity of this exact recording or forward, including replacements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarding_id: Option<String>,
     /// When the current recording or forward started, UTC Unix milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding_since_ms: Option<u64>,
@@ -905,6 +926,7 @@ fn project_selected(state: &mut SessionSnapshot) {
         state.dropped = camera.dropped;
         state.fps = camera.fps;
         state.forwarding = camera.forwarding.clone();
+        state.forwarding_id = camera.forwarding_id.clone();
         state.forwarding_since_ms = camera.forwarding_since_ms;
         state.forwarding_until_ms = camera.forwarding_until_ms;
         state.jobs = camera.jobs.clone();
@@ -922,6 +944,7 @@ fn project_selected(state: &mut SessionSnapshot) {
         state.dropped = 0;
         state.fps = 0.0;
         state.forwarding = None;
+        state.forwarding_id = None;
         state.forwarding_since_ms = None;
         state.forwarding_until_ms = None;
         state.jobs.clear();
@@ -1475,6 +1498,7 @@ impl SessionHandle {
                         last_error: s.last_error.clone(),
                         worker_pid: p.child.id(),
                         forwarding: s.forwarding.clone(),
+                        forwarding_id: s.forwarding_id.clone(),
                         forwarding_since_ms: s.forwarding_since_ms,
                         forwarding_until_ms: s.forwarding_until_ms,
                         jobs: s.jobs.clone(),
@@ -1606,13 +1630,16 @@ impl SessionHandle {
             )
         })?;
         loop {
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
             // The feed lock is released before the worker's is tried below.
             {
                 let mut feed = locked(&feed);
                 if let Some(frame) = feed.poll() {
                     let meta = feed.latest_meta();
                     let ahead = meta.seq.wrapping_sub(after_seq);
-                    if ahead < u32::MAX / 2 && ahead >= fresh {
+                    if ahead < u32::MAX / 2 && ahead >= fresh && Instant::now() < deadline {
                         return Ok(Some((frame, meta)));
                     }
                 }
@@ -2393,6 +2420,7 @@ impl SessionHandle {
             ("live", fresh, Vec::new())
         } else {
             let remaining = deadline.saturating_duration_since(Instant::now());
+            ensure!(!remaining.is_zero(), "{}", no_new_frame(&info.id, timeout));
             let grab = SessionCommand::Grab {
                 timeout_ms: u64::try_from(remaining.as_millis())
                     .unwrap_or(u64::MAX)
@@ -2760,6 +2788,40 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(camera.forwarding_until_ms, None);
+        assert_eq!(camera.forwarding_id, None);
+        assert!(
+            serde_json::to_value(camera)
+                .unwrap()
+                .get("forwarding_id")
+                .is_none()
+        );
+    }
+    #[test]
+    fn conditional_forward_stop_requires_an_exact_opaque_identity() {
+        let command = SessionCommand::from_json_slice(
+            br#"{"op":"stop_forward_if","forwarding_id":"0123456789abcdef0123456789abcdef"}"#,
+        )
+        .unwrap();
+        command.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(command).unwrap(),
+            json!({"op":"stop_forward_if","forwarding_id":"0123456789abcdef0123456789abcdef"})
+        );
+        for id in [
+            "",
+            "short",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "0123456789abcdef0123456789abcdeg",
+        ] {
+            assert!(
+                (SessionCommand::StopForwardIf {
+                    forwarding_id: id.into()
+                })
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(SessionCommand::from_json_slice(br#"{"op":"stop_forward_if","forwarding_id":"0123456789abcdef0123456789abcdef","extra":1}"#).is_err());
     }
     #[test]
     fn recording_duration_matches_the_cli_duration_range() {
@@ -2812,6 +2874,7 @@ mod tests {
             ring_dropped: 0,
             stale: true,
             error_logged: None,
+            forwarding_id: Some(format!("{frames:032x}")),
             forwarding_since_ms: Some(frames * 1000),
             forwarding_until_ms: Some(frames * 1000 + 60_000),
         }
@@ -3632,6 +3695,13 @@ mod tests {
         }
         let start = handle.frame_sequence_for("sim:feed").unwrap();
         assert_eq!(start, 5);
+        assert!(
+            handle
+                .await_frame("sim:feed", start, 0, Instant::now())
+                .unwrap()
+                .is_none(),
+            "An already cached frame cannot satisfy an expired inspection deadline."
+        );
         // The newest frame counts for fresh 0, not for fresh 1.
         let (newest, meta) = handle.wait_frame("sim:feed", start, 0, soon()).unwrap();
         assert_eq!((newest.id, meta.seq), (5, 5));

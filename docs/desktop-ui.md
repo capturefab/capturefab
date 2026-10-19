@@ -80,6 +80,38 @@ screenshot command requires at least 900×620; smaller sheets are covered by
 actual-widget rendering and focus tests. These checks do not establish a
 complete screen-reader workflow on any operating system.
 
+## Bounded assistant tasks
+
+The two task modes ask for camera scope, allowed destinations, explicit image
+permission and hard limits before starting. Approvals display checked action
+facts and expire; secure inputs belong to one request. The running sheet shows
+the exact sent preview, measurements, numeric accessible budget meters and
+source-recorded setting changes. Stop stays pinned. Return cannot start,
+approve, stop or restore camera work, even with its button focused; Space,
+pointer and native accessibility activation remain available.
+
+Closing the sheet retains the task and exposes toolbar progress, Stop and an
+approval notice. Scope cameras show Stop and Take over in the inspector while
+human controls remain enabled. Take over waits for the accepted command to
+finish before selecting the camera. Native main-window close and Quit require
+an explicit Keep running or Stop and quit decision. A real runtime held by a
+stub credential resolver or HTTP transport verifies that the private journal's
+app_quit end record is written synchronously and cannot be overwritten by a
+late reply. Interrupted tasks appear in Plan first on the next open and never
+resume automatically.
+
+Actual-widget tests cover setup, running, approvals, paused, limit and done
+states at all interface scales, compact geometry, focus reveal, secret roles,
+expired decisions, numeric meter values, deliberate keyboard activation and
+nested native log actions. Recovery previews recheck ownership and the exact
+operations before applying human actions; recording cleanup uses an opaque
+identity rather than a timestamp.
+
+All 24 software views at 1440×900 and 480×620 and all 24 native simulator
+screenshots at 1440×900 and 900×620 were inspected in light and dark. The native
+screenshots are synthetic task displays; real provider accounts, OS credential
+prompts and hardware cameras were not exercised.
+
 ## Everyday controls and progressive disclosure
 
 The October 15, 2026 interface pass puts live adjustments and saving ahead of

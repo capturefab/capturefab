@@ -500,11 +500,21 @@ pub(crate) fn check(
             let a = args!(Camera);
             if let Some(camera) = camera_for(ctx, plan, checked, &a.camera, false) {
                 checked.summary = format!("Stop recording or streaming on {}.", camera.selector());
-                checked.ops.push(Op::Command {
-                    camera: camera.clone(),
-                    command: SessionCommand::StopForward,
-                });
+                let forwarding_id = plan.forwarding_ids.get(camera.selector()).cloned();
+                if plan.forwarding.contains(camera.selector()) && forwarding_id.is_none() {
+                    checked.error("camera", "This camera worker did not identify its recording. Stop it in the camera inspector.");
+                }
+                if plan.forwarding.contains(camera.selector()) {
+                    checked.ops.push(Op::StopForward {
+                        camera: camera.clone(),
+                        forwarding_id: forwarding_id.flatten(),
+                    });
+                } else {
+                    checked.summary =
+                        format!("No recording or stream is active on {}.", camera.selector());
+                }
                 plan.forwarding.remove(camera.selector());
+                plan.forwarding_ids.remove(camera.selector());
             }
         }
         "cancel_job" => {
@@ -1122,6 +1132,7 @@ fn recording(ctx: &Context, plan: &mut PlanState, checked: &mut Checked, a: Reco
     });
     if checked.ready() {
         plan.forwarding.insert(camera.selector().into());
+        plan.forwarding_ids.insert(camera.selector().into(), None);
     }
 }
 fn schedule(ctx: &Context, plan: &mut PlanState, checked: &mut Checked, a: Schedule) {
@@ -1385,6 +1396,7 @@ fn stream(ctx: &Context, plan: &mut PlanState, checked: &mut Checked, a: Stream)
     });
     if checked.ready() {
         plan.forwarding.insert(camera.selector().into());
+        plan.forwarding_ids.insert(camera.selector().into(), None);
     }
 }
 

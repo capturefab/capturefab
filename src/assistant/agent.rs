@@ -25,11 +25,11 @@ use std::{
     fmt,
     path::PathBuf,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub trait Clock: Send + Sync {
@@ -39,14 +39,61 @@ pub trait Clock: Send + Sync {
     fn wait(&self, duration: Duration, cancel: &AtomicBool) -> bool;
 }
 pub struct SystemClock;
+
+struct ClockFloor {
+    wall_ms: u64,
+    elapsed: Duration,
+}
+impl ClockFloor {
+    fn new(wall_ms: u64) -> Self {
+        Self {
+            wall_ms,
+            elapsed: Duration::ZERO,
+        }
+    }
+    fn observe(&mut self, wall_ms: u64, elapsed: Duration) -> u64 {
+        let advanced = elapsed.saturating_sub(self.elapsed).as_millis();
+        let projected = self
+            .wall_ms
+            .saturating_add(u64::try_from(advanced).unwrap_or(u64::MAX));
+        if wall_ms > projected {
+            self.wall_ms = wall_ms;
+            self.elapsed = elapsed;
+            wall_ms
+        } else {
+            projected
+        }
+    }
+}
+struct ClockAnchor {
+    start: Instant,
+    floor: ClockFloor,
+}
+
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
-        SystemTime::now()
+        let wall_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis()
             .try_into()
-            .unwrap_or(u64::MAX)
+            .unwrap_or(u64::MAX);
+        static ANCHOR: OnceLock<Mutex<ClockAnchor>> = OnceLock::new();
+        let mut anchor = ANCHOR
+            .get_or_init(|| {
+                Mutex::new(ClockAnchor {
+                    start: Instant::now(),
+                    floor: ClockFloor::new(wall_ms),
+                })
+            })
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Read monotonic elapsed time while holding the lock, so concurrent
+        // callers cannot observe the same anchor in reverse time order.
+        // Re-anchor only for a forward wall-clock jump; ordinary polls retain
+        // fractional milliseconds instead of silently extending a deadline.
+        let elapsed = anchor.start.elapsed();
+        anchor.floor.observe(wall_ms, elapsed)
     }
     fn wait(&self, duration: Duration, cancel: &AtomicBool) -> bool {
         let end = std::time::Instant::now() + duration;
@@ -257,6 +304,7 @@ impl ModelSession {
                         !cancel.load(Ordering::Relaxed),
                         "The assistant task was stopped."
                     );
+                    super::http::reject_credential_reflection(&body, &self.auth)?;
                     let mut reply = self.wire.parse(&body, &headers)?;
                     if reply.usage.estimated {
                         reply.usage = Usage::from_protocol(
@@ -697,9 +745,11 @@ pub fn plan_turn(
                 }
                 Err(source) if cancel.load(Ordering::Relaxed) => {
                     let _ = source;
+                    let mut restored = plan.clone();
+                    restored.restore_from(&original_plan);
                     return Ok(PlanOutcome {
                         text,
-                        plan: original_plan,
+                        plan: restored,
                         conversation: Conversation::new(
                             provider,
                             &session.model,

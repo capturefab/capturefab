@@ -1895,6 +1895,7 @@ mod enabled {
             let by = SessionActor::new("cli-human", "Operator", ActorKind::Human).unwrap();
             let mut request = ApprovalRequest {
                 id: 42,
+                step: tools::StepId(7),
                 run: "r-20261018-120000-abcd".into(),
                 tool: "set_camera_features".into(),
                 risk: tools::Risk::Disruptive,

@@ -31,7 +31,7 @@ mod scroll;
 mod text_geometry;
 pub(super) use decorate::{mapped, named};
 pub(super) use group::{group, group_with_id, modal_group, scope};
-pub(super) use label::{label, label_description};
+pub(super) use label::{label, label_description, meter};
 pub(super) use scroll::VerticalAnchorMarker;
 
 const ROOT: NodeId = NodeId(0);

@@ -310,6 +310,7 @@ fn folder(_ctx: &Context, plan: &mut PlanState, checked: &mut Checked, args: Fol
     }
     checked.call.args["path"] = json!(path);
     let info = DestinationInfo {
+        approval_identity: DestinationInfo::identity(&destination),
         name: args.name.clone(),
         kind: "folder".into(),
         location: super::redact::home_path(&path),
@@ -464,6 +465,7 @@ fn s3(
         .trim_end_matches('/')
         .to_owned();
     let info = DestinationInfo {
+        approval_identity: DestinationInfo::identity(&destination),
         name: args.name.clone(),
         kind: "s3".into(),
         location: format!("s3://{}/{} at {}", bucket.bucket, bucket.prefix, url),

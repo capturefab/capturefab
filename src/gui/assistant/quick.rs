@@ -75,6 +75,8 @@ pub(in crate::gui) enum Input {
     Details(StepId, bool),
     Options(StepId, bool),
     Copy(String),
+    TaskMode(super::tasks::Mode),
+    Task(super::tasks::Input),
 }
 impl fmt::Debug for Input {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -120,6 +122,8 @@ impl fmt::Debug for Input {
                 f.debug_tuple("Options").field(step).field(value).finish()
             }
             Self::Copy(_) => f.write_str("Copy([redacted])"),
+            Self::TaskMode(mode) => f.debug_tuple("TaskMode").field(mode).finish(),
+            Self::Task(input) => f.debug_tuple("Task").field(input).finish(),
         }
     }
 }

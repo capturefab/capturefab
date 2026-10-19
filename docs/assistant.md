@@ -149,6 +149,32 @@ Run defaults to supervised mode. Approval handling defaults to `ask` when stdin 
 
 ## Run a bounded camera task
 
+In Quick Command, select **Ask before each change** or **Run on its own**.
+Choose the cameras and allowed destinations, describe the goal, review the
+Short, Standard or Long limits, and select **Start task**. Image permission is
+off for a new task. The setup shows the selected model's vision capability;
+numeric measurements remain available without images. Modes, scope and consent
+are fixed for the running task. A new conversation returns to **Plan first**.
+
+Approvals show Capturefab's checked action facts and expire if unanswered.
+Secret fields belong only to that exact action. **Approve for this task** cannot
+extend the chosen cameras, destinations or egress target. Activity and Changes
+show progress and before/after values; the latest-view thumbnail shows the
+preview actually sent to the model. Budget meters turn amber at 80% and red
+at the limit. Cost is an estimate when prices are known; otherwise tokens are
+shown.
+
+**Stop**, **Pause/Resume**, and **Take over** remain available while working.
+Take over stops the task and selects its camera in the inspector. Human camera
+controls stay enabled. Messages reach the assistant at the next round. Closing
+the sheet keeps the task running; the toolbar shows progress, Stop and pending
+approval. Quitting asks whether to keep running or stop and quit. After a task,
+review remaining recordings, schedules and auto modes, or review a settings
+restore before applying it. Restore skips reconnects and settings changed since
+the assistant's last write. Selector-dependent settings require inspector
+review. Export log writes a private, redacted JSONL file. An unfinished task
+found on the next open offers its log and never resumes automatically.
+
 ```sh
 capturefab --session bench assistant run \
   'Examine sim:0, improve exposure if necessary, capture two photos, then verify them.' \

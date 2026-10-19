@@ -155,6 +155,7 @@ pub(in crate::gui) fn context(mut snapshot: SessionSnapshot) -> Context {
         session: true,
         snapshot,
         destinations: vec![DestinationInfo {
+            approval_identity: None,
             name: "inspection-archive".into(),
             kind: "folder".into(),
             location: "~/Capturefab/Inspection".into(),

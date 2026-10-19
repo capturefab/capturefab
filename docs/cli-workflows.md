@@ -252,3 +252,8 @@ Get-Content -Raw .\workflow.json | capturefab workflow validate - --json
 
 The stdin form resolves outputs in the current terminal directory. Shell users
 can similarly redirect stdin with `capturefab workflow validate - --json < workflow.json`.
+
+Forward replies and active status include `forwarding_id`, an opaque 32-character
+lowercase hexadecimal identity. RPC `stop_forward_if` with that identity refuses
+a replacement recording. Timed CLI fallback and assistant cleanup use it;
+explicit human `stop-forward` still stops the current recording.

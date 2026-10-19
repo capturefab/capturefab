@@ -1530,6 +1530,9 @@ impl Workbench {
                     .into()
             )
         ];
+        if let Some(status) = self.assistant_inspector_status(p) {
+            panel = panel.push(status);
+        }
         if let Some(context) = self.camera_context(p) {
             panel = panel.push(context);
         }

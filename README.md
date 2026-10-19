@@ -134,6 +134,11 @@ Plan first mode, ask for a task, inspect its checked steps and edit their fields
 Select **Run plan** to execute the reviewed revision. Return sends a request or
 commits an edit; it never runs a plan. Closing the sheet keeps the conversation
 and work in progress. Use Stop to cancel a turn or stop after the current step.
+For a camera task, choose **Ask before each change** or **Run on its own**, then
+review its camera scope, allowed destinations, image permission and hard limits.
+The sheet shows approvals, the exact preview sent, budget meters and setting
+changes. Stop and Take over remain available while the task runs. Quitting
+requires a separate decision; new conversations start in Plan first mode.
 
 ```sh
 capturefab assistant providers --json
@@ -337,7 +342,7 @@ capturefab --camera sim:0 capture -o 'qa/{camera}-{seq}.png' --context line=L1 -
 
 `{seq}` may appear once, only in the file name, and never directly before a digit or `{date}`, `{time}`, `{datetime}` or `{frame}`. Any other `{name}` is a usage error (exit 2). With `-n` above 1, a template needs `{frame}` or `{seq}`, or `--on-exists number`. `--on-exists fail` (the CLI and RPC default) refuses an existing name; `number` writes `stem-0001.ext`, `stem-0002.ext` and so on. A directory output continues `frame-NNNNNN` after the highest existing number, so a rerun into the same folder adds files. If no free name is found after 64 attempts, the capture fails with exit 1.
 
-`--context KEY=VALUE` tags captures and recordings; keys match `^[a-z][a-z0-9_]{0,31}$`, with at most 16 entries of 256 bytes each. The JSON capture result is `{files, frames:[{id,width,height,pixel_format,timestamp_ns,bytes,wall_ms,file}], count, context?, destination?, queued_uploads?, queued?}`; `wall_ms` is UTC milliseconds. `record` returns `{forwarding, since_ms, path}` with the resolved file, plus `until_ms` when it has a duration, and `status` shows `forwarding_since_ms` (and `forwarding_until_ms`) while it records.
+`--context KEY=VALUE` tags captures and recordings; keys match `^[a-z][a-z0-9_]{0,31}$`, with at most 16 entries of 256 bytes each. The JSON capture result is `{files, frames:[{id,width,height,pixel_format,timestamp_ns,bytes,wall_ms,file}], count, context?, destination?, queued_uploads?, queued?}`; `wall_ms` is UTC milliseconds. `record` returns `{forwarding, forwarding_id, since_ms, path}` with the resolved file, plus `until_ms` when it has a duration, and `status` shows its opaque `forwarding_id`, `forwarding_since_ms` and optional `forwarding_until_ms`. Timed fallback and assistant cleanup stop only that identity, so they cannot stop a replacement recording.
 
 The desktop app saves to `~/Capturefab/{date}/{camera}-{datetime}-{seq}.png` by default, records to the same pattern with `.mp4`, and always numbers names that exist. **Next file** in the Capture panel shows the next file's path from the chosen folder. The toolbar **Record** button and Cmd/Ctrl-Shift-R start and stop a local recording, with an elapsed-time pill (the time left, for a recording started with a duration); the File menu has the same action. **Show in Finder** (Explorer, or the folder on Linux) opens the last capture or recording. The overview has **Capture all** and **Record all**; each camera writes its own file. **Capture tags** (Line, Station, Part, Lot, Note) are sent with every capture and recording as the context keys `line`, `station`, `part`, `lot` and `note`. The setting **Start the live view when a camera connects** is on by default and never starts a document scanner.
 

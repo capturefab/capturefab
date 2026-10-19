@@ -177,6 +177,9 @@ A directory output continues its `frame-NNNNNN` numbers.
 Read saved names from `result.files` and `result.frames[].file`.
 `frames[].wall_ms` is UTC milliseconds.
 A recording result gives the resolved file in `path` and the start time in `since_ms`.
+Forward replies and active status include an opaque 32-character lowercase hexadecimal `forwarding_id`.
+RPC `{"op":"stop_forward_if","forwarding_id":"ID"}` stops only that instance and refuses a replacement.
+Timed CLI fallback and assistant recording cleanup use that identity. Explicit human stop-forward stops the current recording.
 A timed recording result also gives the stop time in `until_ms`; `status` shows it in `forwarding_until_ms`.
 When the session stops a timed recording on time, `record --duration` returns `"stopped":{"forwarding":null,"by":"duration"}`.
 The desktop saves to `~/Capturefab/{date}/{camera}-{datetime}-{seq}.png` by default.
@@ -258,6 +261,11 @@ Select Run plan to run the displayed revision after a new check.
 Return sends a request or commits a field edit. It never runs a plan.
 Close keeps the conversation and active work. Stop cancels a turn or stops after the accepted step.
 Select the image-permission checkbox before the assistant can send camera previews.
+For a camera task select Ask before each change or Run on its own.
+Choose the cameras, allowed destinations, image permission and hard limits before Start task.
+Review checked approval cards. Stop, Pause, Resume and Take over control the task.
+The closed sheet leaves a toolbar status and Stop action. Quit asks before stopping.
+Review remaining effects or eligible settings restores after the task. New conversations use Plan first.
 
 The optional `ai` feature supplies the `assistant` commands.
 Builds without it return unsupported, exit 5.

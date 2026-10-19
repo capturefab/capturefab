@@ -348,6 +348,9 @@ fn next_frame(
         }
         match c.next_frame(remaining.min(Duration::from_millis(100))) {
             Ok(frame) => {
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
                 if let Some(a) = auto.as_mut() {
                     a.observe(&frame, Instant::now());
                 }
@@ -512,6 +515,7 @@ fn end_forward(
         push_log(&mut s, level, message);
     }
     s.forwarding = None;
+    s.forwarding_id = None;
     s.forwarding_since_ms = None;
     s.forwarding_until_ms = None;
     stopped
@@ -745,23 +749,31 @@ fn process_plain(
             Ok(value)
         }
         SessionCommand::Grab { timeout_ms } => {
+            let duration = timeout(timeout_ms)?;
+            let deadline = Instant::now() + duration;
             let c = camera_mut(camera)?;
             ensure!(
                 !c.is_scanner(),
                 "a document scanner cannot be inspected without scanning a page"
             );
-            let duration = timeout(timeout_ms)?;
             let was_streaming = c.is_streaming();
             c.start()?;
             // Capture without a file, name, capture-session example,
             // auto-capture observation or log line: the frame only reaches
             // the shared ring.
             let result = (|| -> Result<Value> {
-                let settled =
-                    was_streaming || auto.is_none() || settle_auto(h, c, auto, duration, false)?;
+                let settled = was_streaming
+                    || auto.is_none()
+                    || settle_auto(
+                        h,
+                        c,
+                        auto,
+                        deadline.saturating_duration_since(Instant::now()),
+                        false,
+                    )?;
+                ensure!(Instant::now() < deadline, GRAB_TIMEOUT);
                 c.request_frame()?;
-                let frame =
-                    next_frame(h, c, auto, Instant::now() + duration)?.context(GRAB_TIMEOUT)?;
+                let frame = next_frame(h, c, auto, deadline)?.context(GRAB_TIMEOUT)?;
                 let mut value = json!({"frame":frame});
                 if !settled {
                     value["auto_settled"] = json!(false);
@@ -889,6 +901,19 @@ fn process_plain(
                 forwarder.is_none(),
                 "forwarding is already active; stop-forward first"
             );
+            let mut identity = [0u8; 16];
+            getrandom::fill(&mut identity)
+                .map_err(|_| anyhow::anyhow!("could not allocate a recording identity"))?;
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let forwarding_id: String = identity
+                .iter()
+                .flat_map(|byte| {
+                    [
+                        char::from(HEX[usize::from(byte >> 4)]),
+                        char::from(HEX[usize::from(byte & 15)]),
+                    ]
+                })
+                .collect();
             let f_destination = destination.clone();
             let mut config = ForwardConfig {
                 output: output.clone(),
@@ -930,10 +955,12 @@ fn process_plain(
             {
                 let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
                 s.forwarding = Some(shown.clone());
+                s.forwarding_id = Some(forwarding_id.clone());
                 s.forwarding_since_ms = Some(since_ms);
                 s.forwarding_until_ms = until_ms;
             }
-            let mut value = json!({"forwarding":shown,"since_ms":since_ms});
+            let mut value =
+                json!({"forwarding":shown,"forwarding_id":forwarding_id,"since_ms":since_ms});
             if let Some(until_ms) = until_ms {
                 value["until_ms"] = json!(until_ms);
             }
@@ -950,6 +977,14 @@ fn process_plain(
             Ok(value)
         }
         SessionCommand::StopForward => {
+            stop_forward(h, forwarder, auto)?;
+            Ok(json!({"forwarding":null}))
+        }
+        SessionCommand::StopForwardIf { forwarding_id } => {
+            ensure!(
+                h.snapshot().forwarding_id.as_deref() == Some(forwarding_id.as_str()),
+                "the recording changed before it could be stopped; the current recording was preserved"
+            );
             stop_forward(h, forwarder, auto)?;
             Ok(json!({"forwarding":null}))
         }
@@ -2049,6 +2084,99 @@ mod tests {
         }
     }
     #[test]
+    fn conditional_stop_preserves_a_replacement_with_the_same_start_time_and_output() {
+        // No acquisition loop runs here, so the encoder never starts and
+        // no FFmpeg, socket connection or saved recording is needed.
+        let h = WorkerHandle::new();
+        let mut camera = None;
+        let mut forwarder = None;
+        let mut auto = None;
+        let mut run =
+            |camera: &mut Option<Camera>, forwarder: &mut Option<(Forwarder, f64)>, command| {
+                process(
+                    &h,
+                    camera,
+                    forwarder,
+                    &mut auto,
+                    &mut Vec::new(),
+                    &mut 1,
+                    &mut false,
+                    command,
+                )
+            };
+        run(
+            &mut camera,
+            &mut forwarder,
+            SessionCommand::Connect {
+                camera: "sim:0".into(),
+                timeout_ms: 100,
+            },
+        )
+        .unwrap();
+        let target = Path::new("udp://127.0.0.1:9");
+        let first = run(
+            &mut camera,
+            &mut forwarder,
+            timed_forward(target, Some(60_000)),
+        )
+        .unwrap();
+        let first_id = first["forwarding_id"].as_str().unwrap().to_owned();
+        assert!(crate::session::valid_forwarding_id(&first_id));
+        run(
+            &mut camera,
+            &mut forwarder,
+            SessionCommand::StopForwardIf {
+                forwarding_id: first_id.clone(),
+            },
+        )
+        .unwrap();
+        assert!(h.snapshot().forwarding_id.is_none());
+        let next = run(
+            &mut camera,
+            &mut forwarder,
+            timed_forward(target, Some(120_000)),
+        )
+        .unwrap();
+        let next_id = next["forwarding_id"].as_str().unwrap().to_owned();
+        assert_ne!(first_id, next_id);
+        {
+            let mut state = h.state.write().unwrap();
+            state.forwarding_since_ms = first["since_ms"].as_u64();
+        }
+        let before = h.snapshot();
+        let error = run(
+            &mut camera,
+            &mut forwarder,
+            SessionCommand::StopForwardIf {
+                forwarding_id: first_id,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("current recording was preserved")
+        );
+        let after = h.snapshot();
+        assert!(forwarder.is_some());
+        assert_eq!(after.forwarding, before.forwarding);
+        assert_eq!(after.forwarding_id, before.forwarding_id);
+        assert_eq!(after.forwarding_until_ms, before.forwarding_until_ms);
+        run(
+            &mut camera,
+            &mut forwarder,
+            SessionCommand::StopForwardIf {
+                forwarding_id: next_id,
+            },
+        )
+        .unwrap();
+        let stopped = h.snapshot();
+        assert!(forwarder.is_none());
+        assert!(stopped.forwarding_id.is_none());
+        assert!(stopped.forwarding_until_ms.is_none());
+        h.shutdown();
+    }
+    #[test]
     fn timed_forwards_keep_their_end_time_until_stopped() {
         // The deadline falls due at its end time, never before.
         let state = |since, until| SessionSnapshot {
@@ -2850,6 +2978,71 @@ mod tests {
             &mut false,
             command,
         )
+    }
+
+    struct SlowInspection {
+        simulator: crate::transport::simulator::Simulator,
+        start_delay: Duration,
+        frame_delay: Duration,
+        reads: Arc<AtomicU64>,
+    }
+    impl crate::types::RegisterIo for SlowInspection {
+        fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
+            self.simulator.read_memory(address, length)
+        }
+        fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
+            self.simulator.write_memory(address, data)
+        }
+    }
+    impl crate::types::Backend for SlowInspection {
+        fn xml(&mut self) -> Result<String> {
+            self.simulator.xml()
+        }
+        fn start(&mut self, payload: usize) -> Result<()> {
+            self.simulator.start(payload)?;
+            std::thread::sleep(self.start_delay);
+            Ok(())
+        }
+        fn next_frame(&mut self, _: Duration) -> Result<Frame> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(self.frame_delay);
+            // Deliberately violate the backend deadline: the caller must
+            // reject a late successful frame too, not only timeout errors.
+            self.simulator.next_frame(Duration::from_secs(1))
+        }
+        fn stop(&mut self) -> Result<()> {
+            self.simulator.stop()
+        }
+    }
+
+    #[test]
+    fn inspection_uses_one_deadline_including_startup_and_rejects_late_frames() {
+        for (start_delay, frame_delay, expected_reads) in [(40, 0, 0), (0, 40, 1)] {
+            let reads = Arc::new(AtomicU64::new(0));
+            let mut camera = Some(
+                Camera::from_backend(
+                    crate::transport::simulator::info(),
+                    Box::new(SlowInspection {
+                        simulator: Default::default(),
+                        start_delay: Duration::from_millis(start_delay),
+                        frame_delay: Duration::from_millis(frame_delay),
+                        reads: reads.clone(),
+                    }),
+                )
+                .unwrap(),
+            );
+            let h = WorkerHandle::new();
+            let error = scanner_command(&h, &mut camera, SessionCommand::Grab { timeout_ms: 10 })
+                .unwrap_err();
+            assert_eq!(error.to_string(), GRAB_TIMEOUT);
+            assert_eq!(reads.load(Ordering::Relaxed), expected_reads);
+            assert!(
+                h.frame.read().unwrap().is_none(),
+                "A late frame must never enter the preview feed."
+            );
+            assert!(!camera.as_ref().unwrap().is_streaming());
+            h.shutdown();
+        }
     }
     fn scanner_capture(timeout_ms: u64) -> SessionCommand {
         SessionCommand::Capture {

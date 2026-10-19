@@ -2,7 +2,7 @@
 //! silently add a new camera, risk class or egress target.
 use crate::{
     session::{ActivityOrigin, ActorKind, SessionActor},
-    tools::{Checked, Op, Risk, redact},
+    tools::{Checked, Op, Risk, StepId, redact},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -39,6 +39,7 @@ pub enum ApprovalScope {
 #[derive(Clone, Debug, Serialize)]
 pub struct ApprovalRequest {
     pub id: u64,
+    pub step: StepId,
     pub run: String,
     pub tool: String,
     pub risk: Risk,
@@ -55,6 +56,7 @@ impl ApprovalRequest {
     pub fn new(id: u64, run: &str, checked: &Checked, expires_at_ms: u64) -> Self {
         Self {
             id,
+            step: checked.id,
             run: redact::for_output_text(run),
             tool: checked.call.tool.clone(),
             risk: checked.risk,
@@ -256,7 +258,7 @@ fn grant_key(checked: &Checked) -> GrantKey {
         let destination = checked.destination.as_ref().map(|destination| {
             json!({
                 "name":destination.name,"kind":destination.kind,"location":destination.location,
-                "host":destination.host,"remote":destination.remote,"insecure":destination.insecure,
+                "host":destination.host,"remote":destination.remote,"insecure":destination.insecure,"identity":destination.approval_identity,
             })
         });
         Sha256::digest(
@@ -369,6 +371,7 @@ pub fn recheck_approved(approved: &Checked, fresh: &Checked) -> Result<(), Appro
                 destination.host.clone(),
                 destination.remote,
                 destination.insecure,
+                destination.approval_identity.clone(),
             )
         })
     };
@@ -481,6 +484,7 @@ mod tests {
         let mut upload = checked(Risk::Bounded);
         upload.leaves_computer = true;
         upload.destination = Some(DestinationInfo {
+            approval_identity: None,
             name: "captures".into(),
             kind: "s3".into(),
             location: "one-bucket".into(),
@@ -496,6 +500,11 @@ mod tests {
         assert!(!policy.requires(&changed));
         changed.destination.as_mut().unwrap().location = "two-bucket".into();
         assert!(policy.requires(&changed));
+        changed = upload.clone();
+        changed.destination.as_mut().unwrap().approval_identity =
+            Some("new-login-or-credentials".into());
+        assert!(policy.requires(&changed));
+        assert!(recheck_approved(&upload, &changed).is_err());
     }
 
     #[test]

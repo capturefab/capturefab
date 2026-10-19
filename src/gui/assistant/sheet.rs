@@ -89,11 +89,22 @@ fn decode(part: &ImagePart) -> Option<Vec<u8>> {
     }
 }
 
+#[cfg(test)]
 pub(in crate::gui) fn content<'a>(
     state: &'a quick::State,
     p: &'static Palette,
     height: f32,
     spin: usize,
+) -> Element<'a, quick::Input> {
+    content_with_banner(state, p, height, spin, None)
+}
+
+pub(in crate::gui) fn content_with_banner<'a>(
+    state: &'a quick::State,
+    p: &'static Palette,
+    height: f32,
+    spin: usize,
+    banner: Option<Element<'a, quick::Input>>,
 ) -> Element<'a, quick::Input> {
     let provider = state.provider_label();
     let model = state.model_label();
@@ -104,6 +115,9 @@ pub(in crate::gui) fn content<'a>(
     };
     let busy = !state.editable();
     let mut body = column![].spacing(16).width(Fill);
+    if let Some(banner) = banner {
+        body = body.push(banner);
+    }
     if !state.has_provider() {
         body = body.push(setup(state, p));
     } else if state.transcript.is_empty() && state.plan.steps.is_empty() {
@@ -205,7 +219,7 @@ pub(in crate::gui) fn content<'a>(
         format!("{identity} · AI assistant Settings"),
     );
     let controls = column![
-        modes(p),
+        modes(p, !busy),
         row![
             provider_chip,
             button(text("New conversation").size(style::SMALL))
@@ -245,13 +259,14 @@ pub(in crate::gui) fn content<'a>(
         .into()
 }
 
-fn modes<'a>(_p: &'static Palette) -> Element<'a, quick::Input> {
+fn modes<'a>(_p: &'static Palette, enabled: bool) -> Element<'a, quick::Input> {
     let mut modes = row![].spacing(2).width(Fill);
-    for (label, active) in [
-        ("Plan first", true),
-        ("Ask before each change", false),
-        ("Run on its own", false),
+    for (label, mode) in [
+        ("Plan first", super::tasks::Mode::Plan),
+        ("Ask before each change", super::tasks::Mode::Supervised),
+        ("Run on its own", super::tasks::Mode::Autonomous),
     ] {
+        let active = mode == super::tasks::Mode::Plan;
         modes = modes.push(
             button(
                 text(label)
@@ -269,10 +284,15 @@ fn modes<'a>(_p: &'static Palette) -> Element<'a, quick::Input> {
             })
             .width(Fill)
             .padding([5, 6])
-            .style(style::toggle(active)),
+            .style(style::toggle(active))
+            .on_press_maybe(enabled.then_some(quick::Input::TaskMode(mode))),
         );
     }
-    container(modes).style(style::well).padding(2).into()
+    accessibility::group(
+        container(modes).style(style::well).padding(2).into(),
+        "How the assistant works".into(),
+        accessibility::Role::RadioGroup,
+    )
 }
 
 fn footer<'a>(
@@ -299,6 +319,7 @@ fn footer<'a>(
             .description("Stop this turn or the remaining plan steps.")
             .padding(8)
             .style(style::stop)
+            .on_key_press(super::no_return)
             .on_press(quick::Input::Stop)
     } else {
         button(icon(Icon::PaperPlaneRight, 15.0, p.accent))
@@ -367,6 +388,7 @@ fn footer<'a>(
             .into();
         let run: Element<'a, quick::Input> = button(text(state.run_label()).size(style::BODY))
             .id("quick-command-run")
+            .on_key_press(super::no_return)
             .name(state.run_label())
             .description(if busy {
                 "Waiting for the assistant…".into()

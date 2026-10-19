@@ -153,6 +153,10 @@ impl Scene {
         for camera in selected {
             if self.forwarding.is_some() {
                 camera.forwarding = self.forwarding.clone();
+                camera.forwarding_id = self
+                    .forwarding
+                    .as_ref()
+                    .map(|_| "00000000000000000000000000000001".into());
                 camera.forwarding_since_ms = self.forwarding_since_ms;
                 camera.forwarding_until_ms = self.forwarding_until_ms;
             }
@@ -160,6 +164,10 @@ impl Scene {
         }
         if self.forwarding.is_some() {
             snapshot.forwarding = self.forwarding.clone();
+            snapshot.forwarding_id = self
+                .forwarding
+                .as_ref()
+                .map(|_| "00000000000000000000000000000001".into());
             snapshot.forwarding_since_ms = self.forwarding_since_ms;
             snapshot.forwarding_until_ms = self.forwarding_until_ms;
         }
@@ -198,6 +206,9 @@ impl Workbench {
     ///   `quick-command`, `quick-command-plan`, `quick-command-invalid`,
     ///   `quick-command-running`, `quick-command-done`, `quick-command-setup`,
     ///   `quick-command-thinking`, `quick-command-error`,
+    ///   `quick-command-task-setup`, `quick-command-task-running`,
+    ///   `quick-command-task-approval`, `quick-command-task-paused-human`,
+    ///   `quick-command-task-limit`, `quick-command-task-done`,
     ///   `analytics-measurements-populated`, `analytics-invalid`,
     ///   `close-error`;
     ///   `sheet-bottom` and `inspector-bottom` expose their lower content
@@ -348,6 +359,7 @@ impl Workbench {
             || self.scene_video_analytics(word, late)
             || self.scene_assistant_settings(word, late)
             || self.scene_assistant_quick(word, late)
+            || self.scene_assistant_task(word, late)
             || self.scene_sheets(word, late)
     }
 

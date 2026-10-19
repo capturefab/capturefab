@@ -145,6 +145,8 @@ pub struct RunRecord {
     pub actor_id: String,
     pub settings: Vec<SettingChange>,
     pub worker_pids: BTreeMap<String, u32>,
+    /// Opaque worker identity for recordings this task actually started.
+    pub forwarders: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -174,6 +176,7 @@ pub enum RunEvent {
     Agent(Event),
     State(RunSnapshot),
     Approval(ApprovalRequest),
+    Changes(Vec<SettingChange>),
     Finished(RunOutcome),
 }
 
@@ -695,7 +698,7 @@ struct Runtime<'a> {
     record: RunRecord,
     context: Context,
     humans: HumanTracker,
-    owned_forwarders: BTreeMap<String, (u64, String)>,
+    owned_forwarders: BTreeMap<String, String>,
     owned_auto: BTreeSet<String>,
     notes: Vec<String>,
     experiments: Vec<String>,
@@ -733,7 +736,7 @@ fn forget_worker(
     record: &mut RunRecord,
     tokens: &mut Vec<(String, String)>,
     policy: &mut ApprovalPolicy,
-    forwarders: &mut BTreeMap<String, (u64, String)>,
+    forwarders: &mut BTreeMap<String, String>,
     auto: &mut BTreeSet<String>,
 ) {
     facts.jobs.retain(|(id, _)| id != camera);
@@ -742,6 +745,7 @@ fn forget_worker(
     facts.forwarders.remove(camera);
     facts.worker_pids.remove(camera);
     record.worker_pids.remove(camera);
+    record.forwarders.remove(camera);
     forwarders.remove(camera);
     auto.remove(camera);
     policy.invalidate_camera(camera);
@@ -822,24 +826,45 @@ pub fn run_blocking(
         .free_budget()
         .min(initial.storage.free_disk.unwrap_or(u64::MAX));
     let limiter = Limiter::new(request.limits.clone(), start_ms, ceiling, prices)?;
-    let model = ModelSession::resolve(
-        deps,
-        provider,
-        settings,
-        Mode::Run,
-        request.scope.allow_images,
-    )?;
     limiter.check_wall(deps.clock.now_ms())?;
-    let mut logger = ActionLog::create(&deps.log_directory, start_ms)?;
-    let run_id = logger.id().to_owned();
-    let run8 = format!("{:x}", sha2::Sha256::digest(run_id.as_bytes()))[..8].to_owned();
-    let actor = SessionActor::new(
-        format!("assistant:{}:{run8}", std::process::id()),
-        "Assistant",
-        ActorKind::Agent,
-    )?;
-    logger.record("start",json!({"goal":request.goal,"mode":request.mode,"scope":request.scope,"limits":request.limits,"provider":provider,"model":model.model,"effort":model.settings.effort,"app_version":env!("CARGO_PKG_VERSION"),"actor":actor}),start_ms)?;
-    let log = Arc::new(Mutex::new(logger));
+    // Quit takes this same lock before writing its final record. Either no
+    // journal starts after cancellation, or quit sees the attached journal and
+    // finishes it synchronously before returning to the desktop close filter.
+    let (log, run_id, actor) = {
+        let mut slot = control
+            .shared
+            .log
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        ensure!(
+            !control.cancel().load(Ordering::SeqCst)
+                && !control.shared.ended.load(Ordering::SeqCst),
+            "The assistant task was stopped."
+        );
+        let mut logger = ActionLog::create(&deps.log_directory, start_ms)?;
+        let run_id = logger.id().to_owned();
+        let run8 = format!("{:x}", sha2::Sha256::digest(run_id.as_bytes()))[..8].to_owned();
+        let actor = SessionActor::new(
+            format!("assistant:{}:{run8}", std::process::id()),
+            "Assistant",
+            ActorKind::Agent,
+        )?;
+        logger.record("start",json!({"goal":request.goal,"mode":request.mode,"scope":request.scope,"limits":request.limits,"provider":provider,"model":settings.model(provider),"effort":settings.effort,"app_version":env!("CARGO_PKG_VERSION"),"actor":actor}),start_ms)?;
+        let log = Arc::new(Mutex::new(logger));
+        *slot = Some(log.clone());
+        *control
+            .shared
+            .status
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = RunSnapshot {
+            run_id: run_id.clone(),
+            actor_id: actor.id.clone(),
+            state: RunState::Starting,
+            summary: "Connecting to the assistant provider…".into(),
+            ..RunSnapshot::default()
+        };
+        (log, run_id, actor)
+    };
     // Every failure after the start record must close the log, including
     // failures gathering the attributed host's first snapshot.
     struct EndGuard<'a> {
@@ -857,11 +882,23 @@ pub fn run_blocking(
         log: log.clone(),
         deps,
     };
-    *control
-        .shared
-        .log
-        .lock()
-        .unwrap_or_else(|error| error.into_inner()) = Some(log.clone());
+    ensure!(
+        !control.cancel().load(Ordering::SeqCst),
+        "The assistant task was stopped."
+    );
+    events(RunEvent::State(control.status()));
+    let model = ModelSession::resolve(
+        deps,
+        provider,
+        settings,
+        Mode::Run,
+        request.scope.allow_images,
+    )?;
+    limiter.check_wall(deps.clock.now_ms())?;
+    ensure!(
+        !control.cancel().load(Ordering::SeqCst),
+        "The assistant task was stopped."
+    );
     let host = match deps.host.with_actor(actor.clone()) {
         Ok(host) => host,
         Err(error) => {
@@ -1057,9 +1094,8 @@ impl Runtime<'_> {
                     && self
                         .owned_forwarders
                         .get(camera)
-                        .is_some_and(|(since, target)| {
-                            Some(*since) == state.forwarding_since_ms
-                                && Some(target) == state.forwarding.as_ref()
+                        .is_some_and(|forwarding_id| {
+                            Some(forwarding_id) == state.forwarding_id.as_ref()
                         })
                     && state.forwarding.is_some()
             })
@@ -1505,11 +1541,23 @@ impl Runtime<'_> {
     }
 
     fn checked(&self, id: StepId, call: &ToolCall) -> (Checked, ToolImpact) {
+        self.checked_with_secret_preview(id, call, false)
+    }
+    fn checked_with_secret_preview(
+        &self,
+        id: StepId,
+        call: &ToolCall,
+        preview: bool,
+    ) -> (Checked, ToolImpact) {
         let mut plan = PlanState::assistant(&self.context);
         plan.actor_id = Some(self.facts.actor_id.clone());
         plan.run = Some(self.facts.clone());
         let checked = tools::check(&self.context, &mut plan, id, call, &|step, field| {
             self.deps.secrets.secret(step, field).is_some()
+                || preview
+                    && call.tool == "create_s3_destination"
+                    && call.args["credentials"] == "keychain"
+                    && field == "secret"
         });
         let impact = ToolImpact::from_checked(&checked, plan.planned_bytes, self.now());
         (checked, impact)
@@ -1601,6 +1649,19 @@ impl Runtime<'_> {
         let id = StepId(self.next_step);
         self.next_step = self.next_step.saturating_add(1);
         let (mut checked, _) = self.checked(id, &scoped);
+        if !checked.ready()
+            && checked.call.tool == "create_s3_destination"
+            && checked
+                .issues
+                .iter()
+                .filter(|issue| issue.is_error())
+                .all(|issue| issue.field.as_deref() == Some("secret"))
+        {
+            let (preview, _) = self.checked_with_secret_preview(id, &scoped, true);
+            if preview.ready() {
+                checked = preview;
+            }
+        }
         self.limiter.record_call(&checked.call)?;
         if !checked.ready() {
             self.log("tool",json!({"call_id":call.id,"name":call.name,"risk":checked.risk,"args":checked.call.args,"outcome":"refused","issues":checked.issues,"summary":checked.summary}))?;
@@ -1921,6 +1982,30 @@ impl Runtime<'_> {
         call: &CallRecord,
         checked: &Checked,
     ) -> Result<(ResultRecord, Option<(Outcome, String)>)> {
+        if checked.call.tool == "wait_for" {
+            let condition = match checked.call.args["until"].as_str() {
+                Some("time") => "the chosen delay",
+                Some("frames") => "new camera frames",
+                Some("auto_settled") => "auto exposure to settle",
+                Some("job_done") => "the capture schedule to finish",
+                Some("recording_stopped") => "the recording to stop",
+                Some("activity") => "session activity",
+                _ => "the checked condition",
+            };
+            let timeout = checked.call.args["timeout"]
+                .as_str()
+                .unwrap_or("the checked timeout");
+            let camera = checked.call.args["camera"]
+                .as_str()
+                .map(|camera| format!(" on {camera}"))
+                .unwrap_or_default();
+            self.state(
+                RunState::Waiting,
+                format!("Waiting up to {timeout} for {condition}{camera}."),
+            );
+        } else {
+            self.state(RunState::Running, checked.summary.clone());
+        }
         let baseline = self.context.clone();
         let scope = self.facts.scope.clone();
         let actor = self.facts.actor_id.clone();
@@ -2012,9 +2097,13 @@ impl Runtime<'_> {
         executor: &mut Executor<'_>,
     ) -> Result<()> {
         let fresh = self.deps.gather(self.host.as_ref())?;
-        fn acknowledgements(value: &Value, since: &mut Option<u64>, jobs: &mut BTreeSet<u64>) {
-            if let Some(time) = value["since_ms"].as_u64() {
-                *since = Some(time);
+        fn acknowledgements(
+            value: &Value,
+            forwarding_id: &mut Option<String>,
+            jobs: &mut BTreeSet<u64>,
+        ) {
+            if let Some(id) = value["forwarding_id"].as_str() {
+                *forwarding_id = Some(id.to_owned());
             }
             if let Some(id) = value["job"]["id"].as_u64() {
                 jobs.insert(id);
@@ -2022,21 +2111,25 @@ impl Runtime<'_> {
             match value {
                 Value::Array(values) => {
                     for value in values {
-                        acknowledgements(value, since, jobs);
+                        acknowledgements(value, forwarding_id, jobs);
                     }
                 }
                 Value::Object(values) => {
                     for value in values.values() {
-                        acknowledgements(value, since, jobs);
+                        acknowledgements(value, forwarding_id, jobs);
                     }
                 }
                 _ => {}
             }
         }
-        let mut acknowledged_since = None;
+        let mut acknowledged_forwarding_id = None;
         let mut acknowledged_jobs = BTreeSet::new();
         for result in &outcome.results {
-            acknowledgements(result, &mut acknowledged_since, &mut acknowledged_jobs);
+            acknowledgements(
+                result,
+                &mut acknowledged_forwarding_id,
+                &mut acknowledged_jobs,
+            );
         }
         self.facts.scope = scope_ids(&self.request.scope, &executor.aliases);
         let camera = checked.call.args["camera"].as_str().map(|camera| {
@@ -2083,14 +2176,13 @@ impl Runtime<'_> {
                 if matches!(
                     checked.call.tool.as_str(),
                     "start_recording" | "stream_to_url"
-                ) && let Some(since) =
-                    acknowledged_since.filter(|since| Some(*since) == state.forwarding_since_ms)
+                ) && let Some(id) = acknowledged_forwarding_id
+                    .as_ref()
+                    .filter(|id| Some(*id) == state.forwarding_id.as_ref())
                 {
                     self.facts.forwarders.insert(camera.clone());
-                    if let Some(target) = state.forwarding.as_ref() {
-                        self.owned_forwarders
-                            .insert(camera.clone(), (since, target.clone()));
-                    }
+                    self.owned_forwarders.insert(camera.clone(), id.clone());
+                    self.record.forwarders.insert(camera.clone(), id.clone());
                 }
                 if checked.call.tool == "schedule_captures" {
                     for job in &state.jobs {
@@ -2194,6 +2286,7 @@ impl Runtime<'_> {
             }
         }
         self.facts.tokens = executor.tokens.clone();
+        (self.events)(RunEvent::Changes(self.record.settings.clone()));
         self.refresh()?;
         self.state(RunState::Running, checked.summary.clone());
         Ok(())
@@ -2321,9 +2414,8 @@ impl Runtime<'_> {
                 && self
                     .owned_forwarders
                     .get(&camera.info.id)
-                    .is_some_and(|(since, target)| {
-                        Some(*since) == camera.forwarding_since_ms
-                            && Some(target) == camera.forwarding.as_ref()
+                    .is_some_and(|forwarding_id| {
+                        Some(forwarding_id) == camera.forwarding_id.as_ref()
                     })
             {
                 leftovers.push(Leftover {
@@ -3209,6 +3301,156 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "s3")]
+    fn a_missing_human_secret_reaches_approval_but_never_executes_without_it() {
+        struct SecretApproval(Mutex<Vec<ApprovalRequest>>);
+        impl Approver for SecretApproval {
+            fn request(
+                &self,
+                req: ApprovalRequest,
+                _: &AtomicBool,
+                _: Duration,
+            ) -> ApprovalDecision {
+                self.0.lock().unwrap().push(req);
+                ApprovalDecision::Approved {
+                    scope: ApprovalScope::Once,
+                    by: SessionActor::new("desktop:secret-test", "Desktop", ActorKind::Human)
+                        .unwrap(),
+                }
+            }
+        }
+        let args = json!({"name":"new-archive","bucket":"camera-archive","region":"us-east-1","endpoint":null,"prefix":null,"path_style":null,"credentials":"keychain","profile":null,"access_key_id":"AKIAIOSFODNN7EXAMPLE","keep_local":null});
+        let (deps, script, host) = fixture(vec![
+            reply("destination", "create_s3_destination", args),
+            finished(),
+        ]);
+        let approver = Arc::new(SecretApproval(Mutex::new(Vec::new())));
+        let report = run(&deps, request(), approver.clone());
+        assert_eq!(report.outcome, Outcome::Finished);
+        let approvals = approver.0.lock().unwrap();
+        assert_eq!(approvals.len(), 1);
+        assert!(approvals[0].needs_secret);
+        assert!(!approvals[0].allow_run_scope);
+        assert_eq!(approvals[0].step, StepId(1));
+        assert!(host.sent.lock().unwrap().is_empty());
+        let bodies = script.requests.lock().unwrap();
+        let text = serde_json::to_string(&bodies[1].1).unwrap();
+        assert!(text.contains("changed while it was being reviewed"));
+        drop(bodies);
+        drop(approvals);
+        cleanup(deps);
+    }
+
+    #[test]
+    fn observation_wait_publishes_a_source_checked_waiting_state() {
+        let args = json!({"camera":"sim:0","until":"recording_stopped","timeout":"1s","frames":null,"job_id":null});
+        let (deps, _, _) = fixture(vec![reply("wait", "wait_for", args), finished()]);
+        let mut waiting = Vec::new();
+        let report = run_blocking(
+            request(),
+            &deps,
+            Arc::new(DenyApprover::default()),
+            &RunControl::default(),
+            &mut |event| {
+                if let RunEvent::State(state) = event
+                    && state.state == RunState::Waiting
+                {
+                    waiting.push(state.summary);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(report.outcome, Outcome::Finished);
+        assert_eq!(waiting.len(), 1);
+        assert!(waiting[0].contains("recording"));
+        cleanup(deps);
+    }
+
+    #[test]
+    fn quit_during_credential_resolution_synchronously_finishes_the_registered_journal() {
+        struct Credentials {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl super::super::agent::CredentialResolver for Credentials {
+            fn resolve(
+                &self,
+                id: ProviderId,
+                settings: &super::super::ProviderSettings,
+            ) -> Result<super::super::credentials::ResolvedCredentials> {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                super::super::agent::CredentialResolver::resolve(
+                    &super::super::agent::tests::Credentials(AtomicUsize::new(0)),
+                    id,
+                    settings,
+                )
+            }
+        }
+        let (mut deps, script, _) = fixture(vec![finished()]);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        deps.credentials = Arc::new(Credentials {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let directory = deps.log_directory.clone();
+        let deps = Arc::new(deps);
+        let control = RunControl::default();
+        let worker = control.clone();
+        let worker_deps = deps.clone();
+        let thread = thread::spawn(move || {
+            run_blocking(
+                request(),
+                &worker_deps,
+                Arc::new(DenyApprover::default()),
+                &worker,
+                &mut |_| {},
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let run_id = control.status().run_id;
+        assert!(!run_id.is_empty());
+        control.finish_app_quit();
+        let records = super::super::log::read_log_in(&directory, &run_id).unwrap();
+        assert_eq!(records.last().unwrap()["outcome"], "app_quit");
+        release_tx.send(()).unwrap();
+        assert!(thread.join().unwrap().is_err());
+        let records = super::super::log::read_log_in(&directory, &run_id).unwrap();
+        assert_eq!(records.iter().filter(|r| r["kind"] == "end").count(), 1);
+        assert_eq!(records.last().unwrap()["outcome"], "app_quit");
+        assert!(script.requests.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn quit_before_initialization_never_creates_a_late_action_log() {
+        let (deps, script, _) = fixture(vec![finished()]);
+        let control = RunControl::default();
+        control.finish_app_quit();
+        let result = run_blocking(
+            request(),
+            &deps,
+            Arc::new(DenyApprover::default()),
+            &control,
+            &mut |_| {},
+        );
+        assert!(result.is_err());
+        assert!(control.is_finished());
+        assert!(script.requests.lock().unwrap().is_empty());
+        assert!(
+            super::super::log::runs_in(&deps.log_directory)
+                .unwrap()
+                .is_empty()
+        );
+        cleanup(deps);
+    }
+
+    #[test]
     fn reconnect_revokes_old_worker_ownership_grants_and_restore_rows() {
         let mut facts = RunFacts {
             jobs: BTreeSet::from([("sim:0".into(), 1), ("sim:1".into(), 1)]),
@@ -3253,8 +3495,8 @@ mod tests {
         );
         assert!(policy.granted(&checked).is_some());
         let mut forwarders = BTreeMap::from([
-            ("sim:0".into(), (1, "one.mkv".into())),
-            ("sim:1".into(), (2, "two.mkv".into())),
+            ("sim:0".into(), "forward-one".into()),
+            ("sim:1".into(), "forward-two".into()),
         ]);
         let mut auto = BTreeSet::from(["sim:0".into(), "sim:1".into()]);
         forget_worker(

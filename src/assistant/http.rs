@@ -169,25 +169,115 @@ impl<'a> HttpRequest<'a> {
 
     fn known_secrets(&self) -> Vec<&str> {
         let mut values: Vec<_> = self.secrets.iter().map(|value| value.as_str()).collect();
-        match self.auth {
-            Auth::None => (),
-            Auth::Header { value, .. } => {
-                values.push(value.as_str());
-                if let Some((_, token)) = value.split_once(' ') {
-                    values.push(token);
-                }
-            }
-            Auth::Aws { keys, .. } => {
-                values.push(keys.id());
-                values.push(keys.secret());
-                if let Some(token) = keys.token() {
-                    values.push(token);
-                }
-            }
-        }
+        values.extend(auth_secrets(self.auth));
         values.sort_by_key(|value| std::cmp::Reverse(value.len()));
         values
     }
+}
+
+fn auth_secrets(auth: &Auth) -> Vec<&str> {
+    match auth {
+        Auth::None => Vec::new(),
+        Auth::Header { value, .. } => {
+            let mut values = vec![value.as_str()];
+            if let Some((_, token)) = value.split_once(' ') {
+                values.push(token);
+            }
+            values
+        }
+        Auth::Aws { keys, .. } => {
+            let mut values = vec![keys.id(), keys.secret()];
+            if let Some(token) = keys.token() {
+                values.push(token);
+            }
+            values
+        }
+    }
+}
+
+/// A model response is retained verbatim for protocol replay. Refuse an
+/// authentication reflection before parsing it into text, calls or opaque
+/// history, rather than rewriting signed provider artifacts. OAuth exchanges
+/// deliberately do not call this: their successful response is a credential.
+pub(super) fn reject_credential_reflection(body: &Value, auth: &Auth) -> Result<(), ProviderError> {
+    fn contains(text: &str, known: &[&str]) -> bool {
+        let present = |bytes: &[u8]| {
+            let check = |text: &str| {
+                known
+                    .iter()
+                    .any(|secret| !secret.is_empty() && text.contains(secret))
+            };
+            match std::str::from_utf8(bytes) {
+                Ok(text) => check(text),
+                Err(_) => {
+                    let text = Zeroizing::new(String::from_utf8_lossy(bytes).into_owned());
+                    check(&text)
+                }
+            }
+        };
+        if present(text.as_bytes()) {
+            return true;
+        }
+        if !text.as_bytes().contains(&b'%') && !text.as_bytes().contains(&b'+') {
+            return false;
+        }
+        // Decode percent escapes regardless of hex case, including escaped
+        // unreserved bytes. Invalid escapes stay literal. This temporary can
+        // contain the actual credential and is cleared when dropped.
+        let mut decoded = Zeroizing::new(Vec::with_capacity(text.len()));
+        let bytes = text.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%'
+                && let (Some(a), Some(b)) = (bytes.get(index + 1), bytes.get(index + 2))
+                && let (Some(a), Some(b)) = ((*a as char).to_digit(16), (*b as char).to_digit(16))
+            {
+                decoded.push((a * 16 + b) as u8);
+                index += 3;
+            } else {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+        if present(&decoded) {
+            return true;
+        }
+        // Form encoding also uses + for a space. Check it separately so a
+        // real + in a bearer token is preserved by the ordinary URI check.
+        for byte in decoded.iter_mut().filter(|byte| **byte == b'+') {
+            *byte = b' ';
+        }
+        present(&decoded)
+    }
+    fn reflected(value: &Value, known: &[&str], nested_json: u8) -> bool {
+        match value {
+            Value::String(text) => {
+                contains(text, known)
+                    // Chat and Responses carry function arguments as JSON
+                    // strings. Their own escapes are decoded by the wire
+                    // parser, after the outer HTTP JSON has been parsed.
+                    // Inspect bounded decoded copies without rewriting the
+                    // original signed or opaque provider content.
+                    || (nested_json < 8
+                        && text.len() <= MAX_BODY_BYTES
+                        && text.contains('\\')
+                        && serde_json::from_str::<Value>(text)
+                            .is_ok_and(|decoded| reflected(&decoded, known, nested_json + 1)))
+            }
+            Value::Array(values) => values
+                .iter()
+                .any(|value| reflected(value, known, nested_json)),
+            Value::Object(values) => values
+                .iter()
+                .any(|(key, value)| contains(key, known) || reflected(value, known, nested_json)),
+            _ => false,
+        }
+    }
+    let known = auth_secrets(auth);
+    if !known.is_empty() && reflected(body, &known, 0) {
+        return Err(ProviderError::new(ProviderErrorKind::Malformed));
+    }
+    Ok(())
 }
 
 /// An untrusted response, which can contain reflected credentials. No Debug.
@@ -814,6 +904,64 @@ mod tests {
     }
     fn no_wait(http: &mut Http) {
         http.wait = Arc::new(|_, cancel| !cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn model_reflection_guard_covers_aws_credentials_and_nested_json_keys() {
+        let auth = Auth::Aws {
+            keys: crate::aws::Keys::new(
+                "fixture-aws-id".into(),
+                "fixture/aws+secret".into(),
+                Some("fixture/aws+session".into()),
+            ),
+            region: "us-east-1".into(),
+        };
+        for reflected in [
+            "fixture-aws-id",
+            "fixture/aws+secret",
+            "fixture/aws+session",
+        ] {
+            for value in [
+                reflected.to_owned(),
+                crate::aws::uri_encode(reflected, true),
+            ] {
+                for body in [
+                    json!({"nested":[{"value":value}]}),
+                    json!({(value): "opaque"}),
+                ] {
+                    let error = reject_credential_reflection(&body, &auth).unwrap_err();
+                    assert_eq!(error.kind, ProviderErrorKind::Malformed);
+                    assert!(error.excerpt.is_none());
+                    assert!(!format!("{error:?}").contains(reflected));
+                }
+            }
+        }
+        assert!(
+            reject_credential_reflection(&json!({"signature":"legitimate/opaque+bytes=="}), &auth)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn successful_oauth_exchange_is_not_subject_to_the_model_reflection_guard() {
+        let token = "fixture-oauth-access-token";
+        let script = Arc::new(Script::new(vec![response(
+            200,
+            json!({"access_token":token}),
+        )]));
+        let http = Http::with_transport(script);
+        let auth = Auth::None;
+        let (body, _) = http
+            .post_json(
+                HttpRequest::form(
+                    "https://example.test/token",
+                    &[("refresh_token", token)],
+                    &auth,
+                ),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(body["access_token"], token);
     }
 
     #[test]

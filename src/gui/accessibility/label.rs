@@ -13,6 +13,7 @@ pub(in crate::gui) fn label<'a, M: 'static>(
         description: None,
         id: None,
         role,
+        numeric: None,
     })
 }
 
@@ -29,6 +30,26 @@ pub(in crate::gui) fn label_description<'a, M: 'static>(
         description: Some(description),
         id,
         role,
+        numeric: None,
+    })
+}
+
+/// A read-only budget meter exposes both its human-readable value and the
+/// native numeric range. The descriptive value still names an exhausted
+/// zero allowance, for which no positive numeric range exists.
+pub(in crate::gui) fn meter<'a, M: 'static>(
+    content: Element<'a, M>,
+    name: String,
+    current: f64,
+    max: f64,
+) -> Element<'a, M> {
+    Element::new(Label {
+        content,
+        name,
+        description: None,
+        id: None,
+        role: Role::ProgressIndicator,
+        numeric: Some((current, max)),
     })
 }
 
@@ -38,6 +59,7 @@ struct Label<'a, M, R: renderer::Renderer = iced::Renderer> {
     description: Option<String>,
     id: Option<NodeId>,
     role: Role,
+    numeric: Option<(f64, f64)>,
 }
 
 impl<M: 'static, R: renderer::Renderer> Widget<M, Theme, R> for Label<'_, M, R> {
@@ -116,6 +138,18 @@ impl<M: 'static, R: renderer::Renderer> Widget<M, Theme, R> for Label<'_, M, R> 
                 control.node.set_live_atomic();
             }
             Role::Heading => control.node.set_level(2),
+            Role::ProgressIndicator => {
+                control.node.set_value(self.name.as_str());
+                if let Some((current, max)) = self.numeric
+                    && current.is_finite()
+                    && max.is_finite()
+                    && max > 0.0
+                {
+                    control.node.set_numeric_value(current.clamp(0.0, max));
+                    control.node.set_min_numeric_value(0.0);
+                    control.node.set_max_numeric_value(max);
+                }
+            }
             _ => {}
         }
         operation.custom(None, layout.bounds(), control);
@@ -194,6 +228,7 @@ mod tests {
             content: iced::widget::Text::<Theme, ()>::new("Measurement").into(),
             name: "Measurement".into(),
             role: Role::Label,
+            numeric: None,
         };
         let mut tree = Tree::new(&label as &dyn Widget<Message, Theme, ()>);
         let original = tree.state.downcast_ref::<Control<Message>>().id;
@@ -225,6 +260,7 @@ mod tests {
             content: iced::widget::Text::<Theme, ()>::new("Connection failed").into(),
             name: "Connection failed".into(),
             role: Role::Alert,
+            numeric: None,
         };
         let mut tree = Tree::new(&label as &dyn Widget<Message, Theme, ()>);
         let node = label.layout(

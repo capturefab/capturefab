@@ -17,11 +17,11 @@ pub(in crate::gui) fn named<'a, M: Clone + 'static>(
 
 /// `Element::map` translates event messages; this also translates semantic
 /// actions collected from a child component's own message type.
-pub(in crate::gui) fn mapped<'a, M: Clone + 'static>(
+pub(in crate::gui) fn mapped<'a, M: Clone + 'static, N: Clone + 'static>(
     content: Element<'a, M>,
-    map: fn(M) -> Message,
-) -> Element<'a, Message> {
-    Element::new(Decorate::<M, Message> {
+    map: fn(M) -> N,
+) -> Element<'a, N> {
+    Element::new(Decorate::<M, N> {
         content: content.map(map),
         decoration: Decoration::Map(map),
         marker: PhantomData,

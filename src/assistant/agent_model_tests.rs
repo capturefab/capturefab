@@ -75,6 +75,196 @@ fn conversation(session: &ModelSession) -> Conversation {
         .unwrap();
     conv
 }
+
+#[test]
+fn wall_clock_rollback_cannot_extend_a_runtime_deadline() {
+    let mut floor = ClockFloor::new(100_000);
+    assert_eq!(floor.observe(95_000, Duration::from_secs(2)), 102_000);
+    assert_eq!(floor.observe(96_000, Duration::from_secs(3)), 103_000);
+}
+
+#[test]
+fn forward_clock_jumps_remain_the_floor_after_a_later_rollback() {
+    let mut floor = ClockFloor::new(100_000);
+    assert_eq!(floor.observe(200_000, Duration::from_secs(1)), 200_000);
+    assert_eq!(floor.observe(150_000, Duration::from_secs(3)), 202_000);
+    assert_eq!(floor.observe(203_000, Duration::from_secs(4)), 203_000);
+    let mut ceiling = ClockFloor::new(u64::MAX - 1);
+    assert_eq!(ceiling.observe(0, Duration::from_secs(10)), u64::MAX);
+}
+
+#[test]
+fn frequent_clock_polls_keep_fractional_milliseconds() {
+    let mut floor = ClockFloor::new(1_000);
+    assert_eq!(floor.observe(0, Duration::from_micros(400)), 1_000);
+    assert_eq!(floor.observe(0, Duration::from_micros(900)), 1_000);
+    assert_eq!(floor.observe(0, Duration::from_micros(1_100)), 1_001);
+    assert_eq!(floor.observe(1_005, Duration::from_micros(1_600)), 1_005);
+    assert_eq!(floor.observe(0, Duration::from_micros(2_000)), 1_005);
+    assert_eq!(floor.observe(0, Duration::from_micros(2_600)), 1_006);
+}
+
+#[test]
+fn successful_responses_cannot_reflect_auth_into_text_calls_or_opaque_history() {
+    let token = "fixture/private+auth?value";
+    let encoded = crate::aws::uri_encode(token, true);
+    let fully_encoded: String = token.bytes().map(|byte| format!("%{byte:02x}")).collect();
+    for reflected in [
+        token.to_owned(),
+        encoded.clone(),
+        encoded.to_lowercase(),
+        fully_encoded,
+    ] {
+        for location in ["text", "arguments", "signature"] {
+            let provider = ProviderId::Anthropic;
+            let body = match location {
+                "text" => {
+                    json!({"content":[{"type":"text","text":format!("Provider echoed {reflected}")}],"stop_reason":"end_turn"})
+                }
+                "arguments" => tool_reply(
+                    provider,
+                    "reflected-call",
+                    "inspect_frame",
+                    json!({"camera":reflected}),
+                ),
+                "signature" => {
+                    json!({"content":[{"type":"thinking","thinking":"Exposure looks balanced.","signature":reflected},{"type":"text","text":"Ready for review."}],"stop_reason":"end_turn"})
+                }
+                _ => unreachable!(),
+            };
+            let (mut deps, _, _) = deps(provider, Vec::new());
+            let host = Arc::new(FakeHost::new(fixture_snapshot()));
+            deps.host = host.clone();
+            let script = Script::install(&mut deps, vec![(200, body)]);
+            let mut session = ModelSession::resolve(
+                &deps,
+                provider,
+                ProviderSettings::default(),
+                Mode::Plan,
+                false,
+            )
+            .unwrap();
+            session.auth = Auth::Header {
+                name: "authorization",
+                value: zeroize::Zeroizing::new(format!("Bearer {token}")),
+                quota_project: None,
+            };
+            let mut conv = conversation(&session);
+            let error = session
+                .request(&mut conv, &deps, &AtomicBool::new(false))
+                .unwrap_err();
+            let provider_error = error.downcast_ref::<ProviderError>().unwrap();
+            assert_eq!(
+                provider_error.kind,
+                ProviderErrorKind::Malformed,
+                "{location}"
+            );
+            assert!(provider_error.excerpt.is_none());
+            assert_eq!(
+                conv.turns.len(),
+                1,
+                "reflected data never reaches replay history"
+            );
+            conv.check_invariant().unwrap();
+            assert!(host.ops().is_empty());
+            assert_eq!(script.requests.lock().unwrap().len(), 1);
+            let replay = String::from_utf8(session.build(&conv).unwrap().body.to_vec()).unwrap();
+            for forbidden in [token, reflected.as_str()] {
+                assert!(!replay.contains(forbidden));
+                assert!(!format!("{error:?} {provider_error:?} {conv:?}").contains(forbidden));
+            }
+            assert!(fs::read_dir(&deps.log_directory).unwrap().next().is_none());
+            fs::remove_dir_all(deps.log_directory).unwrap();
+        }
+    }
+}
+
+#[test]
+fn legitimate_opaque_signatures_replay_byte_identically() {
+    let provider = ProviderId::Anthropic;
+    let opaque = "opaque-signature-is-not-a-credential+/==";
+    let body = json!({"content":[{"type":"thinking","thinking":"Checking the measurements.","signature":opaque},{"type":"text","text":"Ready for review."}],"stop_reason":"end_turn"});
+    let (mut deps, _, _) = deps(provider, Vec::new());
+    let script = Script::install(
+        &mut deps,
+        vec![(200, body.clone()), (200, end_reply(provider))],
+    );
+    let mut session = ModelSession::resolve(
+        &deps,
+        provider,
+        ProviderSettings::default(),
+        Mode::Plan,
+        false,
+    )
+    .unwrap();
+    let mut conv = conversation(&session);
+    let reply = session
+        .request(&mut conv, &deps, &AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(reply.raw["content"], body["content"]);
+    conv.push_reply(reply).unwrap();
+    conv.append_user("Inspect again.", session.wire.as_ref())
+        .unwrap();
+    session
+        .request(&mut conv, &deps, &AtomicBool::new(false))
+        .unwrap();
+    let requests = script.requests.lock().unwrap();
+    assert_eq!(requests[1].body["messages"][1]["content"], body["content"]);
+    assert_eq!(
+        requests[1].body["messages"][1]["content"][0]["signature"],
+        opaque
+    );
+    drop(requests);
+    fs::remove_dir_all(deps.log_directory).unwrap();
+}
+
+#[test]
+fn chat_function_argument_json_escapes_cannot_hide_reflected_auth() {
+    let token = "fixture/private+auth?value";
+    let unicode: String = token.bytes().map(|byte| format!("\\u{byte:04x}")).collect();
+    for escaped in [token.replace('/', "\\/"), unicode] {
+        let provider = ProviderId::DeepSeek;
+        let mut body = tool_reply(
+            provider,
+            "reflected-json",
+            "inspect_frame",
+            json!({"camera":"sim:0"}),
+        );
+        body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
+            format!(r#"{{"camera":"{escaped}"}}"#).into();
+        let (mut deps, _, _) = deps(provider, Vec::new());
+        let script = Script::install(&mut deps, vec![(200, body)]);
+        let mut session = ModelSession::resolve(
+            &deps,
+            provider,
+            ProviderSettings::default(),
+            Mode::Plan,
+            false,
+        )
+        .unwrap();
+        session.auth = Auth::Header {
+            name: "authorization",
+            value: zeroize::Zeroizing::new(format!("Bearer {token}")),
+            quota_project: None,
+        };
+        let mut conv = conversation(&session);
+        let error = session
+            .request(&mut conv, &deps, &AtomicBool::new(false))
+            .unwrap_err();
+        let error = error.downcast_ref::<ProviderError>().unwrap();
+        assert_eq!(error.kind, ProviderErrorKind::Malformed);
+        assert!(error.excerpt.is_none());
+        assert_eq!(conv.turns.len(), 1);
+        assert_eq!(script.requests.lock().unwrap().len(), 1);
+        assert!(
+            !String::from_utf8(session.build(&conv).unwrap().body.to_vec())
+                .unwrap()
+                .contains(token)
+        );
+        conv.check_invariant().unwrap();
+        fs::remove_dir_all(deps.log_directory).unwrap();
+    }
+}
 fn image_conversation(session: &ModelSession) -> Conversation {
     let mut conv = conversation(session);
     conv.mark_sent().unwrap();

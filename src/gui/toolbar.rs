@@ -707,6 +707,9 @@ impl Workbench {
     /// The toolbar's status: the notice, else the newest command on its
     /// way that shows nowhere else, else the camera's link.
     fn status(&self, width: f32, p: &'static Palette) -> Element<'_, Message> {
+        if let Some(status) = self.assistant_toolbar_status(p) {
+            return status;
+        }
         let snapshot = &self.snapshot;
         // A long schedule must not hide a different participant's completed
         // edit or failure. Show the newest outcome before returning to work

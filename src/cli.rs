@@ -2241,7 +2241,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                             break;
                         }
                         RecordingWait::Stop => {
-                            result["stopped"] = client.call(SessionCommand::StopForward)?;
+                            result["stopped"] =
+                                client.call(timed.as_ref().unwrap().stop_command()?)?;
                             break;
                         }
                         RecordingWait::Failed => anyhow::bail!(
@@ -2285,7 +2286,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                             break;
                         }
                         RecordingWait::Stop => {
-                            result["stopped"] = client.call(SessionCommand::StopForward)?;
+                            result["stopped"] = client.call(timed.stop_command()?)?;
                             break;
                         }
                         RecordingWait::Failed => anyhow::bail!(
@@ -2854,8 +2855,9 @@ fn schema() -> Value {
     });
     contract["capture"]["result"] = json!({
         "capture":"{files:[path],frames:[{id,width,height,pixel_format,timestamp_ns,bytes,wall_ms,file?}],count,context?,destination?,queued_uploads?,queued?:[{file,upload_id,key,url}]}",
-        "record":"{forwarding,since_ms,until_ms?,path?,stopped?}; path is the local recording file; until_ms is when the session stops a timed recording; with --duration, stopped is {forwarding:null,by:\"duration\"} when the session ended it on time, else the stop-forward result",
-        "status":"forwarding_since_ms per camera and at the top level while forwarding, and forwarding_until_ms while a timed recording or forward runs"
+        "record":"{forwarding,forwarding_id,since_ms,until_ms?,path?,stopped?}; path is the local recording file; until_ms is when the session stops a timed recording; with --duration, stopped is {forwarding:null,by:\"duration\"} when the session ended it on time, else the conditional-stop result",
+        "status":"forwarding_id and forwarding_since_ms per camera and at the top level while forwarding, and forwarding_until_ms while a timed recording or forward runs",
+        "conditional_stop":{"rpc":{"op":"stop_forward_if","forwarding_id":"32 lowercase hexadecimal characters"},"behavior":"Stops only the acknowledged forwarding instance. A different current identity is refused without stopping it. Timed CLI fallback and assistant cleanup use this form; explicit human stop-forward stops the current instance."}
     });
     contract["capture_session"] = json!({
         "cli":"--session NAME [--camera ID] capture-session new PATH.duckdb [--encoder auto|dinov2|native] | resume PATH.duckdb | close | teach | auto [--pause] [--sensitivity 0.5] [--cooldown-ms 2000] | review [--id ID] | keep ID | discard ID",
@@ -3005,7 +3007,7 @@ fn schema() -> Value {
         json!({"op":"network_scan","timeout_ms":1000}),
         json!({"op":"optimize_network","bytes_per_second":100000000}),
     ]);
-    commands.extend([json!({"op":"select","camera":"sim:0"}),json!({"op":"jobs"}),json!({"op":"cancel_job","id":1}),json!({"op":"schedule","output":"timelapse","count":10,"timeout_ms":2000,"format":"png","first_at_ms":crate::scheduling::now_ms()+60000,"interval_ms":10000,"storage":crate::storage::StoragePolicy::default()}),json!({"op":"forward","output":"rtsp://localhost:8554/camera","codec":"h264","encoder":"auto","fps":30,"bitrate":"4M","storage":crate::storage::StoragePolicy::default(),"max_file_bytes":crate::media::default_recording_cap()}),json!({"op":"forward","output":"video/run-{seq}.mkv","codec":"h264","encoder":"auto","fps":30,"bitrate":"4M","storage":crate::storage::StoragePolicy::default(),"max_file_bytes":crate::media::recording_reservation("4M",3_600_000).expect("a valid bitrate"),"on_exists":"number","duration_ms":3_600_000}),json!({"op":"stop_forward"}),json!({"op":"auto","balance":0.5}),json!({"op":"manual"})]);
+    commands.extend([json!({"op":"select","camera":"sim:0"}),json!({"op":"jobs"}),json!({"op":"cancel_job","id":1}),json!({"op":"schedule","output":"timelapse","count":10,"timeout_ms":2000,"format":"png","first_at_ms":crate::scheduling::now_ms()+60000,"interval_ms":10000,"storage":crate::storage::StoragePolicy::default()}),json!({"op":"forward","output":"rtsp://localhost:8554/camera","codec":"h264","encoder":"auto","fps":30,"bitrate":"4M","storage":crate::storage::StoragePolicy::default(),"max_file_bytes":crate::media::default_recording_cap()}),json!({"op":"forward","output":"video/run-{seq}.mkv","codec":"h264","encoder":"auto","fps":30,"bitrate":"4M","storage":crate::storage::StoragePolicy::default(),"max_file_bytes":crate::media::recording_reservation("4M",3_600_000).expect("a valid bitrate"),"on_exists":"number","duration_ms":3_600_000}),json!({"op":"stop_forward"}),json!({"op":"stop_forward_if","forwarding_id":"0123456789abcdef0123456789abcdef"}),json!({"op":"auto","balance":0.5}),json!({"op":"manual"})]);
     commands.extend([
         json!({"op":"undo"}),
         json!({"op":"redo"}),
@@ -3387,6 +3389,7 @@ enum RecordingWait {
 #[derive(Clone, Copy)]
 struct ForwardStatus<'a> {
     forwarding: bool,
+    forwarding_id: Option<&'a str>,
     /// `forwarding_since_ms`: when the forward it reports started.
     since_ms: Option<u64>,
     last_error: Option<&'a str>,
@@ -3399,6 +3402,7 @@ impl<'a> ForwardStatus<'a> {
     fn of_snapshot(state: &'a crate::session::SessionSnapshot) -> Self {
         Self {
             forwarding: state.forwarding.is_some(),
+            forwarding_id: state.forwarding_id.as_deref(),
             since_ms: state.forwarding_since_ms,
             last_error: state.last_error.as_deref(),
             error_logged_ms: state
@@ -3414,6 +3418,7 @@ impl<'a> ForwardStatus<'a> {
                 .unwrap_or_default();
         Self {
             forwarding: !state["forwarding"].is_null(),
+            forwarding_id: state["forwarding_id"].as_str(),
             since_ms: state["forwarding_since_ms"].as_u64(),
             last_error: state["last_error"].as_str(),
             error_logged_ms: state["connected"]["id"]
@@ -3450,6 +3455,9 @@ struct TimedRecording {
     duration: Duration,
     /// When the session ends it (the reply's `until_ms`, UTC Unix ms).
     until_ms: Option<u64>,
+    /// The worker-issued identity is authoritative even when a replacement
+    /// starts in the same millisecond with the same output name.
+    forwarding_id: Option<String>,
     /// When it started (the reply's `since_ms`), which tells it from a
     /// recording started later on the same camera.
     since_ms: Option<u64>,
@@ -3465,6 +3473,7 @@ impl TimedRecording {
         Self {
             duration: Duration::from_millis(duration_ms),
             until_ms: reply["until_ms"].as_u64(),
+            forwarding_id: reply["forwarding_id"].as_str().map(str::to_owned),
             since_ms: reply["since_ms"].as_u64(),
             errors,
         }
@@ -3472,6 +3481,12 @@ impl TimedRecording {
     /// The `stopped` result of a recording the session ended on time.
     fn finished() -> Value {
         json!({"forwarding": null, "by": "duration"})
+    }
+    fn stop_command(&self) -> Result<SessionCommand> {
+        let forwarding_id = self.forwarding_id.clone().context(
+            "This camera worker did not identify the recording; inspect status and stop it explicitly."
+        )?;
+        Ok(SessionCommand::StopForwardIf { forwarding_id })
     }
     /// Decide from a `status` read at `now_ms` (UTC Unix ms), `elapsed`
     /// after the forward reply.
@@ -3483,9 +3498,13 @@ impl TimedRecording {
         interrupted: bool,
     ) -> RecordingWait {
         let ours = status.forwarding
-            && match (status.since_ms, self.since_ms) {
-                (Some(reported), Some(started)) => reported == started,
-                _ => true,
+            && if let Some(id) = &self.forwarding_id {
+                status.forwarding_id == Some(id.as_str())
+            } else {
+                match (status.since_ms, self.since_ms) {
+                    (Some(reported), Some(started)) => reported == started,
+                    _ => true,
+                }
             };
         if !ours {
             let grace = RECORDING_GRACE.as_millis() as u64;
@@ -4452,6 +4471,7 @@ mod tests {
         let logged = Some(since - 5_000);
         let status = |forwarding, since_ms, last_error, error_logged_ms| ForwardStatus {
             forwarding,
+            forwarding_id: None,
             since_ms,
             last_error,
             error_logged_ms,
@@ -4528,6 +4548,40 @@ mod tests {
         assert_eq!(
             TimedRecording::finished(),
             json!({"forwarding":null,"by":"duration"})
+        );
+    }
+    #[test]
+    fn timed_recording_fallback_cannot_stop_a_same_millisecond_replacement() {
+        let first = "11111111111111111111111111111111";
+        let replacement = "22222222222222222222222222222222";
+        let reply = json!({"forwarding_id":first,"since_ms":1000,"until_ms":31000});
+        let mut timed = TimedRecording::new(30_000, &reply, ErrorMark::default());
+        let status = |id| ForwardStatus {
+            forwarding: true,
+            forwarding_id: Some(id),
+            since_ms: Some(1000),
+            last_error: None,
+            error_logged_ms: None,
+        };
+        assert_eq!(
+            timed.next(status(first), 2000, Duration::from_secs(1), true),
+            RecordingWait::Stop
+        );
+        assert!(
+            matches!(timed.stop_command().unwrap(), SessionCommand::StopForwardIf { forwarding_id } if forwarding_id == first)
+        );
+        assert_eq!(
+            timed.next(status(replacement), 32000, Duration::from_secs(32), true),
+            RecordingWait::Finished
+        );
+        assert_eq!(
+            timed.next(status(replacement), 2000, Duration::from_secs(1), true),
+            RecordingWait::Failed
+        );
+        let legacy = TimedRecording::new(30_000, &json!({"since_ms":1000}), ErrorMark::default());
+        assert!(
+            legacy.stop_command().is_err(),
+            "an old worker's missing ID cannot authorize an unconditional stop"
         );
     }
     #[test]

@@ -130,6 +130,7 @@ fn later_capture_steps_reuse_prior_connections_and_destination_overlays() {
     let mut plan = PlanState::new(&ctx);
     plan.destinations
         .push(crate::tools::context::DestinationInfo {
+            approval_identity: None,
             name: "new-folder".into(),
             location: "~/Captures/new".into(),
             ..ctx.destinations[0].clone()
@@ -274,7 +275,10 @@ fn stop_and_cancel_emit_explicit_commands_and_update_plan_state() {
     input["camera"] = json!("sim:1");
     let stopped = run_in(&ctx, &mut plan, "stop_recording", input);
     ready(&stopped);
-    assert!(matches!(command(&stopped), SessionCommand::StopForward));
+    assert!(
+        matches!(&stopped.ops[..], [Op::StopForward { forwarding_id: Some(id), .. }]
+        if id == "11111111111111111111111111111111")
+    );
     assert!(!plan.is_forwarding("sim:1"));
     let cancelled = run_in(&ctx, &mut plan, "cancel_job", args("cancel_job"));
     ready(&cancelled);
@@ -283,6 +287,59 @@ fn stop_and_cancel_emit_explicit_commands_and_update_plan_state() {
         SessionCommand::CancelJob { id: 7 }
     ));
     assert_eq!(plan.active_jobs("sim:0"), 0);
+}
+
+#[test]
+fn stop_recording_pins_the_exact_forward_and_preserves_planned_start_references() {
+    let mut ctx = context();
+    let mut input = args("stop_recording");
+    input["camera"] = json!("sim:1");
+    let before = run(&ctx, "stop_recording", input.clone());
+    ready(&before);
+    let camera = ctx
+        .snapshot
+        .cameras
+        .iter_mut()
+        .find(|c| c.info.id == "sim:1")
+        .unwrap();
+    camera.forwarding_id = Some("33333333333333333333333333333333".into());
+    let after = run(&ctx, "stop_recording", input.clone());
+    ready(&after);
+    assert!(
+        crate::tools::exec::changed(&before, &after).is_some(),
+        "same-time replacements require a new review"
+    );
+    ctx.snapshot
+        .cameras
+        .iter_mut()
+        .find(|c| c.info.id == "sim:1")
+        .unwrap()
+        .forwarding_id = None;
+    let legacy = run(&ctx, "stop_recording", input);
+    assert!(
+        !legacy.ready(),
+        "an unidentified live recording cannot be stopped by a tool"
+    );
+
+    let mut plan = PlanState::new(&ctx);
+    ready(&run_in(
+        &ctx,
+        &mut plan,
+        "start_recording",
+        args("start_recording"),
+    ));
+    let planned = run_in(&ctx, &mut plan, "stop_recording", args("stop_recording"));
+    ready(&planned);
+    assert!(
+        matches!(
+            &planned.ops[..],
+            [Op::StopForward {
+                forwarding_id: None,
+                ..
+            }]
+        ),
+        "only the earlier executor's Forward acknowledgement can resolve this reference"
+    );
 }
 
 #[test]

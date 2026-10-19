@@ -28,6 +28,12 @@ pub enum Op {
         camera: CameraRef,
         command: SessionCommand,
     },
+    /// Stop the checked recording, or one a preceding step in this executor
+    /// started. An absent identity never means stop whatever is current.
+    StopForward {
+        camera: CameraRef,
+        forwarding_id: Option<String>,
+    },
     /// Stop, write and resume acquisition. A resume is attempted even when
     /// cancellation or a failed write interrupts the sequence.
     Restartable {
@@ -57,6 +63,12 @@ impl Serialize for Op {
             Self::Connect { selector } => json!({"op":"connect","selector":selector}),
             Self::Command { camera, command } => {
                 json!({"camera":camera.selector(),"command":command})
+            }
+            Self::StopForward {
+                camera,
+                forwarding_id,
+            } => {
+                json!({"op":"stop_forward_if","camera":camera.selector(),"forwarding_id":forwarding_id})
             }
             Self::Restartable { camera, commands } => {
                 json!({"op":"restartable","camera":camera.selector(),"commands":commands})
@@ -174,6 +186,9 @@ pub struct PlanState {
     pub connected: BTreeSet<String>,
     pub streaming: BTreeMap<String, bool>,
     pub forwarding: BTreeSet<String>,
+    /// None denotes a recording proposed by an earlier step; live forwards
+    /// without a worker-issued identity are deliberately absent.
+    pub forwarding_ids: BTreeMap<String, Option<String>>,
     pub jobs: BTreeMap<String, usize>,
     pub canceled_jobs: BTreeSet<(String, u64)>,
     pub changed_features: BTreeMap<String, BTreeSet<String>>,
@@ -206,6 +221,15 @@ impl PlanState {
                 .iter()
                 .filter(|c| c.forwarding.is_some())
                 .map(|c| c.info.id.clone())
+                .collect(),
+            forwarding_ids: ctx
+                .snapshot
+                .cameras
+                .iter()
+                .filter_map(|camera| {
+                    camera.forwarding.as_ref()?;
+                    Some((camera.info.id.clone(), Some(camera.forwarding_id.clone()?)))
+                })
                 .collect(),
             jobs: ctx
                 .snapshot
@@ -397,14 +421,6 @@ pub fn classify(ctx: &Context, run: Option<&RunFacts>, checked: &mut Checked) {
                     .as_ref()
                     .is_none_or(|a| a.kind != crate::session::ActorKind::Agent)
                 && a.state != crate::session::ActivityState::Failed
-        })
-        .max_by_key(|a| a.id)
-        .is_some_and(|a| {
-            ctx.now_ms.saturating_sub(
-                a.finished_at_ms
-                    .or(a.started_at_ms)
-                    .unwrap_or(a.submitted_at_ms),
-            ) <= 600_000
                 && matches!(
                     a.operation.as_str(),
                     "set"
@@ -416,6 +432,14 @@ pub fn classify(ctx: &Context, run: Option<&RunFacts>, checked: &mut Checked) {
                         | "undo"
                         | "redo"
                 )
+        })
+        .max_by_key(|a| a.id)
+        .is_some_and(|a| {
+            ctx.now_ms.saturating_sub(
+                a.finished_at_ms
+                    .or(a.started_at_ms)
+                    .unwrap_or(a.submitted_at_ms),
+            ) <= 600_000
         });
     if foreign_recent_write {
         raise(checked, "A person recently changed this camera.");
@@ -423,23 +447,9 @@ pub fn classify(ctx: &Context, run: Option<&RunFacts>, checked: &mut Checked) {
     let run_owns_lifetime = run.is_some_and(|run| {
         state.is_some_and(|state| run.worker_pids.get(&camera) == Some(&state.worker_pid))
     });
-    let own_forwarder = run_owns_lifetime && run.is_some_and(|r| r.forwarders.contains(&camera))
-        || activity()
-            .filter(|a| {
-                a.operation == "forward" && a.state != crate::session::ActivityState::Failed
-            })
-            .max_by_key(|a| a.id)
-            .is_some_and(|a| {
-                owns(a)
-                    && state
-                        .and_then(|s| s.forwarding_since_ms)
-                        .is_some_and(|since| {
-                            a.finished_at_ms
-                                .or(a.started_at_ms)
-                                .unwrap_or(a.submitted_at_ms)
-                                >= since
-                        })
-            });
+    // Timestamps and actor labels cannot prove which forwarding instance is
+    // current. The run supplies only identities it still owns exactly.
+    let own_forwarder = run_owns_lifetime && run.is_some_and(|r| r.forwarders.contains(&camera));
     let foreign_jobs = state.is_some_and(|c| {
         c.jobs.iter().filter(|j| j.active()).any(|j| {
             !(run_owns_lifetime && run.is_some_and(|r| r.jobs.contains(&(camera.clone(), j.id))))
@@ -571,6 +581,7 @@ pub struct Executor<'a> {
     pub aliases: HashMap<String, String>,
     pub tokens: Vec<(String, String)>,
     acknowledged: Vec<Value>,
+    forwarders: BTreeMap<String, String>,
     #[cfg(test)]
     destination_creator: Option<&'a DestinationCreator<'a>>,
 }
@@ -583,6 +594,7 @@ impl<'a> Executor<'a> {
             aliases: HashMap::new(),
             tokens: Vec::new(),
             acknowledged: Vec::new(),
+            forwarders: BTreeMap::new(),
             #[cfg(test)]
             destination_creator: None,
         }
@@ -612,6 +624,13 @@ impl<'a> Executor<'a> {
         command.validate()?;
         let camera = self.camera(camera)?;
         let forward = matches!(command, SessionCommand::Forward { .. });
+        let stops_forward = matches!(
+            command,
+            SessionCommand::StopForwardIf { .. }
+                | SessionCommand::StopForward
+                | SessionCommand::Stop
+                | SessionCommand::Disconnect
+        );
         let changes = match &command {
             SessionCommand::SetMany { values } => values
                 .iter()
@@ -653,6 +672,15 @@ impl<'a> Executor<'a> {
         }
         if let Some(before) = before.filter(|_| forward) {
             self.verify_forward(&camera, &before, duration_ms, started, &result)?;
+            if let Some(id) = result["forwarding_id"]
+                .as_str()
+                .filter(|id| crate::session::valid_forwarding_id(id))
+            {
+                self.forwarders.insert(camera.clone(), id.into());
+            }
+        }
+        if stops_forward {
+            self.forwarders.remove(&camera);
         }
         Ok(redact::for_output(result))
     }
@@ -683,6 +711,12 @@ impl<'a> Executor<'a> {
                 );
             }
             let forwarding = state.is_some_and(|c| c.forwarding.is_some());
+            if forwarding && let Some(id) = reply["forwarding_id"].as_str() {
+                ensure!(
+                    state.and_then(|state| state.forwarding_id.as_deref()) == Some(id),
+                    "The recording or stream changed while it was starting."
+                );
+            }
             let reached_deadline = until_ms.map_or_else(
                 || {
                     duration_ms.is_some_and(|duration| {
@@ -777,6 +811,17 @@ impl<'a> Executor<'a> {
                     result
                 }
                 Op::Command { camera, command } => self.command(camera, command.clone())?,
+                Op::StopForward {
+                    camera,
+                    forwarding_id,
+                } => {
+                    let id = self.camera(camera)?;
+                    let forwarding_id = forwarding_id
+                        .clone()
+                        .or_else(|| self.forwarders.get(&id).cloned());
+                    let forwarding_id = forwarding_id.context("The earlier step did not identify its recording. Review the camera before stopping it.")?;
+                    self.command(camera, SessionCommand::StopForwardIf { forwarding_id })?
+                }
                 Op::Stream { camera, command } => {
                     let mut command = command.clone();
                     let password = self.secrets.secret(checked.id, "password");
@@ -1239,7 +1284,6 @@ pub(crate) fn approval_facts(checked: &Checked) -> Vec<(&str, &str)> {
 /// An immediate schedule means start when execution begins. Only that start
 /// timestamp may move during approval; count, interval, output, destination and
 /// every other command field must still match the checked operations.
-#[cfg(any(feature = "ai", test))]
 pub(crate) fn same_approval_operations(approved: &Checked, fresh: &Checked) -> bool {
     fn comparable(checked: &Checked) -> Result<Value, serde_json::Error> {
         let mut ops = checked.ops.clone();
@@ -1321,6 +1365,9 @@ pub(crate) fn changed(approved: &Checked, current: &Checked) -> Option<&'static 
     if a != b {
         return Some("the arguments");
     }
+    if !same_approval_operations(approved, current) {
+        return Some("the checked operations");
+    }
     None
 }
 
@@ -1333,6 +1380,7 @@ fn same_destination(a: Option<&DestinationInfo>, b: Option<&DestinationInfo>) ->
                 && a.host == b.host
                 && a.remote == b.remote
                 && a.insecure == b.insecure
+                && a.approval_identity == b.approval_identity
         }
         (None, None) => true,
         _ => false,
@@ -1660,6 +1708,36 @@ mod tests {
         explicit_later.call.args["start_at"] = explicit.call.args["start_at"].clone();
         assert!(!same_approval_operations(&explicit, &explicit_later));
         assert_ne!(approval_facts(&explicit), approval_facts(&explicit_later));
+    }
+
+    #[test]
+    fn a_storage_retention_change_invalidates_unchanged_displayed_capture_facts() {
+        let ctx = fixture_context(fixture_snapshot());
+        let approved = checked_capture(&ctx, "capture_photos");
+        assert!(approved.ready(), "{approved:?}");
+        let mut fresh_context = ctx.clone();
+        fresh_context.storage.request.max_age_seconds = Some(1);
+        let fresh = checked_capture(&fresh_context, "capture_photos");
+        assert_eq!(approved.facts, fresh.facts);
+        assert_eq!(approved.call, fresh.call);
+        assert_eq!(changed(&approved, &fresh), Some("the checked operations"));
+    }
+
+    #[test]
+    fn a_saved_destination_login_change_is_a_different_approval_target() {
+        let ctx = fixture_context(fixture_snapshot());
+        let mut approved = checked_capture(&ctx, "capture_photos");
+        let mut destination = ctx.destinations[1].clone();
+        destination.approval_identity = Some("alice-credential-selection".into());
+        approved.destination = Some(destination);
+        let mut fresh = approved.clone();
+        fresh.destination.as_mut().unwrap().approval_identity =
+            Some("bob-credential-selection".into());
+        assert_eq!(
+            serde_json::to_value(&approved.destination).unwrap(),
+            serde_json::to_value(&fresh.destination).unwrap()
+        );
+        assert_eq!(changed(&approved, &fresh), Some("the destination"));
     }
 
     fn forward(output: &str) -> SessionCommand {
@@ -2177,6 +2255,63 @@ mod tests {
     }
 
     #[test]
+    fn pinned_recording_stop_is_conditional_even_after_a_replacement_race() {
+        let first = "11111111111111111111111111111111";
+        let host = FakeHost::new(fixture_snapshot()).reply(
+            "stop_forward_if",
+            Err("the recording changed; the current recording was preserved".into()),
+        );
+        let mut checked = step("stop_recording", json!({"camera":"sim:1"}));
+        checked.ops.push(Op::StopForward {
+            camera: CameraRef::Connected("sim:1".into()),
+            forwarding_id: Some(first.into()),
+        });
+        let mut executor = Executor::new(&host, &EmptySecrets);
+        let error = executor
+            .run_step(&checked, &AtomicBool::new(false))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("current recording was preserved")
+        );
+        assert_eq!(host.ops(), ["stop_forward_if"]);
+        assert_eq!(host.sent()[0].1["forwarding_id"], first);
+    }
+
+    #[test]
+    fn unpinned_stop_uses_only_this_executors_forward_acknowledgement() {
+        let id = "33333333333333333333333333333333";
+        let host = FakeHost::new(fixture_snapshot()).reply("forward", Ok(json!({"forwarding":"udp://127.0.0.1:9","forwarding_id":id,"since_ms":0,"until_ms":1})));
+        let mut executor = Executor::new(&host, &EmptySecrets);
+        let mut stop = step("stop_recording", json!({"camera":"sim:0"}));
+        stop.ops.push(Op::StopForward {
+            camera: CameraRef::Connected("sim:0".into()),
+            forwarding_id: None,
+        });
+        assert!(executor.run_step(&stop, &AtomicBool::new(false)).is_err());
+        assert!(
+            host.ops().is_empty(),
+            "an unresolved earlier recording cannot stop current work"
+        );
+        let mut start = step("start_recording", json!({"camera":"sim:0"}));
+        start.ops.push(Op::Command {
+            camera: CameraRef::Connected("sim:0".into()),
+            command: forward("udp://127.0.0.1:9"),
+        });
+        executor.run_step(&start, &AtomicBool::new(false)).unwrap();
+        executor.run_step(&stop, &AtomicBool::new(false)).unwrap();
+        assert_eq!(host.ops(), ["forward", "stop_forward_if"]);
+        assert_eq!(host.sent()[1].1["forwarding_id"], id);
+        assert!(executor.run_step(&stop, &AtomicBool::new(false)).is_err());
+        assert_eq!(
+            host.ops().len(),
+            2,
+            "a completed stop consumes its earlier acknowledgement"
+        );
+    }
+
+    #[test]
     fn indirect_auto_writes_keep_human_values_protected_without_recent_activity() {
         let mut ctx = fixture_context(fixture_snapshot());
         ctx.snapshot.activity.clear();
@@ -2296,6 +2431,19 @@ mod tests {
                 .reasons
                 .iter()
                 .any(|reason| reason.contains("recently changed"))
+        );
+        let mut newer_read = ctx.snapshot.activity.last().unwrap().clone();
+        newer_read.id += 1;
+        newer_read.operation = "capture".into();
+        ctx.snapshot.activity.push(newer_read);
+        let mut after_read = step("start_live_view", json!({"camera":"sim:0"}));
+        classify(&ctx, None, &mut after_read);
+        assert!(
+            after_read
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("recently changed")),
+            "A later capture must not conceal the person's feature write."
         );
     }
 }

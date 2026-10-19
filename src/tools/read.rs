@@ -1522,6 +1522,9 @@ fn forwarding_summary(ctx: &Context, camera: &CameraSnapshot) -> Option<Value> {
         "kind": if crate::media::is_recording(target) { "recording" } else { "stream" },
         "to": target,
     });
+    if let Some(id) = &camera.forwarding_id {
+        summary["forwarding_id"] = json!(id);
+    }
     if let Some(since) = camera.forwarding_since_ms {
         summary["since"] = json!(ctx.zone.rfc3339(since));
         summary["since_ms"] = json!(since);
