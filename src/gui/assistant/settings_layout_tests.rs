@@ -98,9 +98,18 @@ fn footer(snapshot: &accesskit::TreeUpdate) -> accesskit::Rect {
                 .nodes
                 .iter()
                 .filter_map(|(_, node)| node.label())
-                .filter(|label| label.contains("Preferences") || label.contains("automatic"))
+                .take(40)
                 .collect();
-            panic!("the actual Settings footer is exposed; labels: {labels:?}")
+            let texts: Vec<_> = snapshot
+                .nodes
+                .iter()
+                .filter_map(|(_, node)| node.value())
+                .take(40)
+                .collect();
+            panic!(
+                "the actual Settings footer is exposed; {} nodes, labels: {labels:?}, values: {texts:?}",
+                snapshot.nodes.len()
+            )
         })
         .1
         .bounds()

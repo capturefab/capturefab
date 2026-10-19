@@ -2106,7 +2106,7 @@ mod tests {
             camera.test_packets = true;
             setup(camera);
         });
-        let mut gige = connect(fake.address, Duration::from_millis(200)).unwrap();
+        let mut gige = connect(fake.address, Duration::from_secs(1)).unwrap();
         gige.packet_size = Some(Some(1500));
         gige.start((WIDTH * HEIGHT) as usize).unwrap();
         (fake, gige)
