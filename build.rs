@@ -72,6 +72,18 @@ fn bundle_dinov2() {
     if release && env::var_os("CAPTUREFAB_DINOV2_WEIGHTS").is_none() {
         println!("cargo:rerun-if-changed={}", default.display());
     }
+    if release && env::var_os("CAPTUREFAB_DINOV2_WEIGHTS").is_none() && !default.is_file() {
+        let script = default
+            .ancestors()
+            .nth(4)
+            .expect("repository root")
+            .join("scripts/fetch-dinov2.py");
+        let status = Command::new("python3")
+            .arg(&script)
+            .status()
+            .expect("cannot run python3 to fetch DINOv2 weights");
+        assert!(status.success(), "cannot fetch DINOv2 weights");
+    }
     let source = env::var_os("CAPTUREFAB_DINOV2_WEIGHTS")
         .map(PathBuf::from)
         .or_else(|| (release && default.is_file()).then(|| default.clone()));
@@ -81,11 +93,6 @@ fn bundle_dinov2() {
         println!("cargo:rustc-env=CAPTUREFAB_DINOV2_EMBED={}", path.display());
         println!("cargo:rustc-cfg=dinov2_embedded");
     } else {
-        if release {
-            println!(
-                "cargo:warning=DINOv2 weights are not bundled; run scripts/fetch-dinov2.py before building releases"
-            );
-        }
         println!(
             "cargo:rustc-env=CAPTUREFAB_DINOV2_PATH={}",
             default.display()
