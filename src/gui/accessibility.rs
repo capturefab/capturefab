@@ -660,7 +660,9 @@ impl Operation for Collector {
                     && parent.y0 <= full.y0
                     && parent.x1 >= full.x1
                     && parent.y1 >= full.y1
-            })
+            }) && node
+                .bounds()
+                .is_some_and(|shown| unseen(shown) == unseen(bounds))
         }) {
             if node
                 .label()
@@ -691,6 +693,14 @@ impl Operation for Collector {
         node.set_bounds(bounds);
         self.nodes.push((id, node));
     }
+}
+
+/// Whether scrolling or clipping leaves nothing of `bounds` on screen. A
+/// control scrolled out of its viewport keeps full bounds that can reach
+/// beneath text outside that viewport, such as a footer, which must not become
+/// part of the hidden control's name.
+fn unseen(bounds: Rect) -> bool {
+    bounds.width() <= 0.0 || bounds.height() <= 0.0
 }
 
 struct WidgetAction(ActionRequest, window::Id);

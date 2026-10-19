@@ -255,6 +255,7 @@ fn local_times_name_their_date_unless_it_is_today() {
     assert!(!time.is_empty() && !time.contains(&year), "{time}");
     let (later, year) = noon(3);
     let time = local_time(later).unwrap();
-    assert!(time.contains(&year), "{time}");
+    // The C locale writes two digits of the year.
+    assert!(time.contains(&year) || time.contains(&year[2..]), "{time}");
     assert!(local_time(u64::MAX).is_none());
 }
