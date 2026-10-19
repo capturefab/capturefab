@@ -93,7 +93,15 @@ fn footer(snapshot: &accesskit::TreeUpdate) -> accesskit::Rect {
             node.label()
                 .is_some_and(|label| label.starts_with("Preferences apply automatically."))
         })
-        .expect("the actual Settings footer is exposed")
+        .unwrap_or_else(|| {
+            let labels: Vec<_> = snapshot
+                .nodes
+                .iter()
+                .filter_map(|(_, node)| node.label())
+                .filter(|label| label.contains("Preferences") || label.contains("automatic"))
+                .collect();
+            panic!("the actual Settings footer is exposed; labels: {labels:?}")
+        })
         .1
         .bounds()
         .expect("the footer has its actual text bounds")
