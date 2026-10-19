@@ -385,6 +385,17 @@ impl Workbench {
             .wrap()
             .vertical_spacing(8);
         let guide = row![
+            button(text("Quick command…").size(style::SMALL))
+                .name("Open quick command")
+                .style(style::link)
+                .padding([2, 6])
+                .on_press(Message::Assistant(assistant::Input::Quick(
+                    assistant::quick::Input::Open(true)
+                ))),
+            text(Action::QuickCommand.key_label(os))
+                .size(style::CAPTION)
+                .color(p.secondary),
+            space().width(8),
             button(text("Quick guide").size(style::SMALL))
                 .style(style::link)
                 .padding([2, 6])

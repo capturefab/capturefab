@@ -9,6 +9,15 @@ struct Frame {
     bounds: Rectangle,
     content: Rectangle,
     translation: Vector,
+    vertical_anchor: iced::widget::scrollable::Anchor,
+}
+
+/// A scroll wrapper declares its direction before traversing its child.
+/// Native reveal computes visual offsets, then translates them to the
+/// scrollable's own start- or end-relative coordinates.
+pub(in crate::gui) struct VerticalAnchorMarker {
+    pub target: Id,
+    pub anchor: iced::widget::scrollable::Anchor,
 }
 
 fn key(state: &mut dyn Scrollable) -> usize {
@@ -66,6 +75,7 @@ impl Viewport {
             bounds,
             content,
             translation,
+            vertical_anchor: iced::widget::scrollable::Anchor::Start,
         });
     }
     pub fn enter(&mut self) -> Option<Saved> {
@@ -120,6 +130,7 @@ pub(super) struct Locate {
     active: bool,
     viewport: Viewport,
     found: Option<(Id, Rectangle, Vec<Frame>)>,
+    anchors: HashMap<Id, iced::widget::scrollable::Anchor>,
 }
 
 impl Locate {
@@ -141,6 +152,7 @@ impl Locate {
             active: true,
             viewport: Viewport::default(),
             found: None,
+            anchors: HashMap::new(),
         }
     }
 }
@@ -155,7 +167,7 @@ impl Operation<Message> for Locate {
     }
     fn scrollable(
         &mut self,
-        _: Option<&Id>,
+        id: Option<&Id>,
         bounds: Rectangle,
         content: Rectangle,
         translation: Vector,
@@ -163,9 +175,16 @@ impl Operation<Message> for Locate {
     ) {
         self.viewport
             .scrollable(bounds, content, translation, state);
+        if let Some(anchor) = id.and_then(|id| self.anchors.get(id))
+            && let Some(frame) = self.viewport.pending.as_mut()
+        {
+            frame.vertical_anchor = *anchor;
+        }
     }
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
-        if let Some(marker) = state.downcast_ref::<WindowMarker>() {
+        if let Some(marker) = state.downcast_ref::<VerticalAnchorMarker>() {
+            self.anchors.insert(marker.target.clone(), marker.anchor);
+        } else if let Some(marker) = state.downcast_ref::<WindowMarker>() {
             self.marked = true;
             self.active = marker.begin && marker.id == self.window;
         } else if self.active
@@ -229,7 +248,11 @@ impl Operation<Message> for Locate {
                     frame.content.height - frame.bounds.height,
                 ),
             );
-            offsets.push((frame.key, offset));
+            let mut native_offset = offset;
+            if frame.vertical_anchor == iced::widget::scrollable::Anchor::End {
+                native_offset.y = (frame.content.height - frame.bounds.height - offset.y).max(0.0);
+            }
+            offsets.push((frame.key, native_offset));
             target = target - offset;
         }
         Outcome::Chain(Box::new(Reveal {

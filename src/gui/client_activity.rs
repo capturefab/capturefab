@@ -481,7 +481,7 @@ impl Workbench {
             .actor
             .as_ref()
             .map_or(entry.origin == ActivityOrigin::Client, |actor| {
-                actor.id != self.actor.id
+                actor.id != self.actor.id && !self.assistant_actor_is_local(&actor.id)
             })
     }
 }

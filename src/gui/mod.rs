@@ -1363,7 +1363,8 @@ impl Workbench {
             || self.screenshot.is_some()
             || self.capture_to.busy()
             || self.record_to.busy()
-            || self.assistant.settings.busy();
+            || self.assistant.settings.busy()
+            || self.assistant.quick.busy();
         let interval = if busy {
             Duration::from_millis(60)
         } else if streaming {
@@ -3396,6 +3397,14 @@ impl Workbench {
             return Task::none();
         }
         if self.settings_window == Some(self.focused_window) {
+            if action == Action::QuickCommand {
+                let open = !self.assistant.quick.open;
+                return self
+                    .handle_message(Message::Settings(false))
+                    .chain(Task::done(Message::Assistant(assistant::Input::Quick(
+                        assistant::quick::Input::Open(open),
+                    ))));
+            }
             return match action {
                 Action::Settings => window::gain_focus(self.focused_window),
                 Action::CloseWindow | Action::Overview => {
@@ -3409,14 +3418,24 @@ impl Workbench {
         let modal = self.sheet_open();
         let connected = self.snapshot.connected.is_some();
         match action {
+            Action::QuickCommand => {
+                return self.update_assistant(assistant::Input::Quick(
+                    assistant::quick::Input::Open(!self.assistant.quick.open),
+                ));
+            }
             Action::Undo => return self.replay_history(true),
             Action::Redo => return self.replay_history(false),
             Action::Overview if self.help_open => self.help_open = false,
+            Action::Overview if self.assistant.quick.open => {
+                return self.update_assistant(assistant::Input::Quick(
+                    assistant::quick::Input::Open(false),
+                ));
+            }
             Action::Overview if self.network_open => self.network_open = false,
             Action::Overview if self.analytics.open => self.analytics.open = false,
             Action::Overview if self.auto_capture.open => self.auto_capture.open = false,
             Action::Overview if self.settings_open && self.settings_window.is_none() => {
-                self.settings_open = false
+                return self.handle_message(Message::Settings(false));
             }
             Action::Settings => return self.handle_message(Message::Settings(true)),
             Action::Overview if self.capture_to.editing() => {

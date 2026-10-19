@@ -128,6 +128,13 @@ Action dry runs return `{checked,commands}` without executing. Review issues, ri
 
 The optional `ai` feature adds `capturefab assistant`. Select one of 22 provider entries, including OpenAI, Anthropic, Gemini, Vertex AI, Bedrock, OpenRouter, Cloudflare, Groq and DeepSeek. Local Ollama, LM Studio and custom endpoints are also configurable. These are catalog entries, not provider compatibility claims.
 
+In the desktop app, set up the provider in **Settings → AI assistant**, then open
+**Quick Command…** with **⌘K** on macOS or **Ctrl+Shift+K** on Windows/Linux. In
+Plan first mode, ask for a task, inspect its checked steps and edit their fields.
+Select **Run plan** to execute the reviewed revision. Return sends a request or
+commits an edit; it never runs a plan. Closing the sheet keeps the conversation
+and work in progress. Use Stop to cancel a turn or stop after the current step.
+
 ```sh
 capturefab assistant providers --json
 capturefab assistant use anthropic --model claude-sonnet-5-5 --vision auto

@@ -58,6 +58,28 @@ four simulator-backed 1440×900 light/dark valid/error scene screenshots. The
 scene screenshots present Settings as a sheet; native OS credential prompts
 were not exercised.
 
+## Quick Command and reviewed plans
+
+Quick Command uses the shared sheet, registry fields and camera context. Its
+history is anchored at the bottom; keyboard scrolling and native focus reveal
+respect that direction. The prompt, active status and review actions stay
+pinned. Return sends the prompt or commits a field; the sheet has no default
+action and never treats Return as permission to run a plan.
+
+Actual-widget checks cover every field kind, stale camera choices, native
+invalid descriptions, forward and reverse focus traversal, all interface
+scales, and Mac, Windows and Linux default-action rules. Worker tests cover
+cancellation, abandoned step identities, stale displayed revisions, secret
+isolation, and partial execution. Closing the sheet preserves work. Synthetic
+scenes exercise empty, plan, invalid, thinking, running, completed, setup and
+error states without contacting a provider, keychain or camera.
+
+The 32 software views at 1440×900 and 480×620 and the 32 native simulator
+screenshots at 1440×900 and 900×620 were inspected in light and dark. The native
+screenshot command requires at least 900×620; smaller sheets are covered by
+actual-widget rendering and focus tests. These checks do not establish a
+complete screen-reader workflow on any operating system.
+
 ## Everyday controls and progressive disclosure
 
 The October 15, 2026 interface pass puts live adjustments and saving ahead of

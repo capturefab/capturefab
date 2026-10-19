@@ -67,6 +67,10 @@ fn cancelled_late_reply_restores_pre_turn_plan_and_resets_wire_history() {
     assert_eq!(script.requests.lock().unwrap().len(), 2);
     assert!(outcome.plan.steps.is_empty());
     assert!(
+        outcome.plan.revision > 1,
+        "Restoration advances the proposal revision."
+    );
+    assert!(
         outcome.conversation.turns.is_empty(),
         "Discarded proposals must not survive in model tool-result history."
     );
@@ -79,6 +83,10 @@ fn cancelled_late_reply_restores_pre_turn_plan_and_resets_wire_history() {
     assert!(!follow_up.cancelled);
     assert!(follow_up.error.is_none());
     assert_eq!(follow_up.plan.steps.len(), 1);
+    assert!(
+        follow_up.plan.steps[0].id.0 > 1,
+        "A discarded proposal's ID is never reused."
+    );
     assert_eq!(follow_up.plan.steps[0].call.args["count"], 2);
     follow_up.conversation.check_invariant().unwrap();
     std::fs::remove_dir_all(deps.log_directory).unwrap();

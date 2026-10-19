@@ -1029,6 +1029,7 @@ pub(super) struct SheetFrame<'a, M> {
     controls: Option<Element<'a, M>>,
     footer: Option<Element<'a, M>>,
     default_action: Option<M>,
+    anchor: scrollable::Anchor,
     width: f32,
     max_height: f32,
     scrolled: bool,
@@ -1055,6 +1056,7 @@ pub(super) fn sheet_frame<'a, M: Clone + 'static>(
         controls: None,
         footer: None,
         default_action: None,
+        anchor: scrollable::Anchor::Start,
         width: 560.0,
         max_height: 640.0,
         scrolled: false,
@@ -1110,6 +1112,12 @@ impl<'a, M: Clone + 'a> SheetFrame<'a, M> {
         self
     }
 
+    /// Keep the newest conversation content at the bottom as it grows.
+    pub(super) fn anchor(mut self, anchor: scrollable::Anchor) -> Self {
+        self.anchor = anchor;
+        self
+    }
+
     pub(super) fn size(mut self, width: f32, max_height: f32) -> Self {
         self.width = width;
         self.max_height = max_height;
@@ -1144,6 +1152,7 @@ impl<'a, M: Clone + 'static> From<SheetFrame<'a, M>> for Element<'a, M> {
             controls,
             footer,
             default_action,
+            anchor,
             width,
             max_height,
             scrolled,
@@ -1207,6 +1216,7 @@ impl<'a, M: Clone + 'static> From<SheetFrame<'a, M>> for Element<'a, M> {
                 }),
         )
         .id(SHEET_BODY)
+        .anchor_y(anchor)
         .width(Fill)
         .style(style::sheet_scroll);
         // A hairline under the header once the body scrolls beneath it; the
@@ -1244,13 +1254,14 @@ impl<'a, M: Clone + 'static> From<SheetFrame<'a, M>> for Element<'a, M> {
         }
         accessibility::modal_group(
             keyboard_history::default_action(
-                keyboard_scroll::wrap(
+                keyboard_scroll::wrap_anchored(
                     container(pinned_body::column(sheet.into()))
                         .width(width)
                         .max_height(max_height.max(0.0))
                         .style(style::sheet)
                         .into(),
                     SHEET_BODY,
+                    anchor,
                 ),
                 default_action,
             ),

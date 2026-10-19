@@ -167,7 +167,11 @@ fn pick_list_and_menu_outputs_keep_choices_and_placeholders_readable() {
             pick_list::Status::Opened { is_hovered: false },
             pick_list::Status::Opened { is_hovered: true },
         ] {
-            let mut styles = vec![pick(&theme, status)];
+            let mut styles = vec![
+                pick(&theme, status),
+                pick_invalid(&theme, status),
+                pick_dirty(&theme, status),
+            ];
             styles.extend([0.01, 0.25, 0.5, 0.75, 1.0].map(|t| pick_flash(t)(&theme, status)));
             for style in styles {
                 for surface in [p.base, p.sidebar, solid(well(&theme).background.unwrap())] {

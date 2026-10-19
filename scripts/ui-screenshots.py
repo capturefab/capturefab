@@ -53,6 +53,12 @@ BASELINE = (
     Scene("help", "help-more,noscopes", "Quick guide steps with connection notes expanded beneath them"),
     Scene("settings", "settings-credentials,noscopes", "Settings sheet fixture including API-key controls"),
     Scene("settings-assistant", "settings-assistant,noscopes", "AI assistant provider, model and credential setup with synthetic status"),
+    Scene("quick-command", "quick-command,noscopes", "Quick command before a request, with local suggestions", 2),
+    Scene("quick-command-plan", "quick-command-plan,noscopes", "Reviewable assistant plan and editable camera-tool cards", 2),
+    Scene("quick-command-invalid", "quick-command-invalid,noscopes", "Assistant plan with invalid fields and a blocking reason", 2),
+    Scene("quick-command-running", "quick-command-running,noscopes", "Assistant plan execution with synthetic progress", 2),
+    Scene("quick-command-done", "quick-command-done,noscopes", "Completed assistant plan and outcome rows", 2),
+    Scene("quick-command-setup", "quick-command-setup,noscopes", "Quick command without a configured provider", 2),
     Scene("network", "network,noscopes", "Camera network report with synthetic adapter and unreachable camera"),
     Scene("analytics", "analytics,noscopes", "Session acquisition analytics with live simulator statistics"),
     Scene("measurements", "analytics-measurements,noscopes", "Default prompt measurements form before collection starts"),
@@ -76,6 +82,8 @@ COMPACT = (
     Scene("settings", "settings-credential-error,noscopes,sheet-bottom", "API-key controls, credential error and pinned Settings footer"),
     Scene("settings-assistant", "settings-assistant-error,noscopes", "Compact AI assistant setup with field validation and a synthetic provider refusal"),
     Scene("settings-assistant-bottom", "settings-assistant,noscopes,sheet-bottom", "Lower assistant settings and pinned Settings footer after scrolling"),
+    Scene("quick-command-plan", "quick-command-plan,noscopes", "Compact assistant plan with pinned actions", 2),
+    Scene("quick-command-invalid", "quick-command-invalid,noscopes", "Compact assistant plan validation and focus target", 2),
     Scene("network", "network-error,noscopes,sheet-bottom", "Unreachable camera details and pinned Scan network action"),
     Scene("analytics", "analytics,noscopes,sheet-bottom", "Lower acquisition analytics and native camera statistics"),
     Scene("measurements", "analytics-invalid,noscopes", "Compact prompt measurement rows and invalid sample interval"),
@@ -91,6 +99,8 @@ VARIANTS = (
     Scene("notice-long", "notice-long,noscopes", "Long command-error notice with disclosure action"),
     Scene("measurement-history", "analytics-measurements-populated,noscopes,sheet-bottom", "Measurement chart, unknown value and wrapped result notes"),
     Scene("settings-assistant-error", "settings-assistant-error,noscopes", "AI assistant field validation and synthetic provider error details"),
+    Scene("quick-command-thinking", "quick-command-thinking,noscopes", "Pending assistant turn with Stop and read-only plan cards", 2),
+    Scene("quick-command-error", "quick-command-error,noscopes", "Assistant provider failure and retry action", 2),
 )
 
 EXTRA_STATES = (

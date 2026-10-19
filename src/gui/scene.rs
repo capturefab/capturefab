@@ -195,6 +195,9 @@ impl Workbench {
     ///   `destinations-remove`, `bucket-editor-advanced`, `settings-credentials`,
     ///   `settings-credential-error`, `settings-assistant`,
     ///   `settings-assistant-error`, `analytics-measurements`,
+    ///   `quick-command`, `quick-command-plan`, `quick-command-invalid`,
+    ///   `quick-command-running`, `quick-command-done`, `quick-command-setup`,
+    ///   `quick-command-thinking`, `quick-command-error`,
     ///   `analytics-measurements-populated`, `analytics-invalid`,
     ///   `close-error`;
     ///   `sheet-bottom` and `inspector-bottom` expose their lower content
@@ -344,6 +347,7 @@ impl Workbench {
             || self.scene_network(word, late)
             || self.scene_video_analytics(word, late)
             || self.scene_assistant_settings(word, late)
+            || self.scene_assistant_quick(word, late)
             || self.scene_sheets(word, late)
     }
 

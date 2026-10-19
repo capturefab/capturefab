@@ -250,6 +250,15 @@ RPC operations are `capture_session_open` (`path`, `create`, optional `encoder`)
 
 ## Use the AI assistant
 
+In the desktop app, open Settings and select AI assistant.
+Select a provider and model.
+Open Quick Command with Command-K on macOS or Control-Shift-K on Windows or Linux.
+In Plan first mode, enter a request. Review and edit the checked steps.
+Select Run plan to run the displayed revision after a new check.
+Return sends a request or commits a field edit. It never runs a plan.
+Close keeps the conversation and active work. Stop cancels a turn or stops after the accepted step.
+Select the image-permission checkbox before the assistant can send camera previews.
+
 The optional `ai` feature supplies the `assistant` commands.
 Builds without it return unsupported, exit 5.
 The catalog has 22 provider entries, including Vertex, Bedrock, OpenRouter, Cloudflare, Groq and DeepSeek.

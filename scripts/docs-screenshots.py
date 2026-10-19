@@ -25,11 +25,13 @@ SCENES = {
     "destinations": (1, "dark,destinations-list,noscopes"),
     "scopes": (1, "dark,noinspector,nosidebar,focus,exposure"),
     "forwarding": (1, "dark,forward,noscopes,inspector-storage-default"),
+    "quick-command": (2, "dark,quick-command-plan,noscopes"),
 }
 
 # Crop boxes are in logical desktop pixels at the fixed 1100 x 700 window.
 # Originals remain beside the crops so every illustration can be audited.
 CROPS = {
+    "quick-command": ("quick-command", (0, 0, 1100, 700), "Quick command plan with checked, editable camera tools and an explicit Run plan action. Provider and camera observations are synthetic display fixtures."),
     "workspace": ("workspace", (0, 0, 1100, 700), "Four simulator cameras in the live workbench, with camera list and the selected camera's inspector."),
     "cameras": ("workspace", (0, 0, 240, 700), "Connected simulator camera list and controls for finding or adding a source."),
     "features": ("features", (784, 0, 1100, 652), "Quick controls for the selected camera, with search and collapsed feature groups for less common settings."),

@@ -16,6 +16,7 @@ pub(in crate::gui) struct Loaded {
     pub settings: Settings,
     pub warnings: Vec<String>,
     pub environment_ready: BTreeSet<ProviderId>,
+    pub environment_names: Vec<String>,
     /// Only documented non-secret configuration variables, never API keys.
     pub environment: BTreeMap<String, String>,
 }
@@ -44,6 +45,15 @@ impl Services for Native {
             .into_iter()
             .filter(|id| environment_ready(*id, &present))
             .collect();
+        let environment_names = ProviderId::ALL
+            .into_iter()
+            .flat_map(|id| id.info().key_envs.iter().copied())
+            .chain(["GOOGLE_APPLICATION_CREDENTIALS", "AWS_PROFILE"])
+            .filter(|name| present(name))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let environment = [
             "CLOUDFLARE_ACCOUNT_ID",
             "AZURE_OPENAI_ENDPOINT",
@@ -66,6 +76,7 @@ impl Services for Native {
             settings: loaded.settings,
             warnings: loaded.warnings,
             environment_ready,
+            environment_names,
             environment,
         }
     }

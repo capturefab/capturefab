@@ -43,6 +43,8 @@ where
     enabled: bool,
     id: Option<Id>,
     name: Option<String>,
+    description: Option<String>,
+    invalid: Option<String>,
 }
 
 pub(super) fn pick_list<'a, T, M, L, V>(
@@ -90,10 +92,20 @@ impl<'a, T: ToString + PartialEq + Clone + 'a, M: Clone + 'static, R: text::Rend
             enabled: true,
             id: None,
             name: None,
+            description: None,
+            invalid: None,
         }
     }
     pub(super) fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
+        self
+    }
+    pub(super) fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+    pub(super) fn invalid(mut self, invalid: Option<String>) -> Self {
+        self.invalid = invalid;
         self
     }
     pub(super) fn placeholder(mut self, placeholder: impl Into<String>) -> Self {
@@ -418,6 +430,12 @@ impl<'a, T: ToString + PartialEq + Clone + 'a, M: Clone + 'static, R: text::Rend
         }
         let mut node = accessibility::Node::new(accessibility::Role::ComboBox);
         node.set_label(self.name.as_deref().unwrap_or("Options"));
+        if let Some(error) = &self.invalid {
+            node.set_invalid(accesskit::Invalid::True);
+            node.set_description(error.as_str());
+        } else if let Some(description) = &self.description {
+            node.set_description(description.as_str());
+        }
         node.set_value(
             self.selected
                 .as_ref()
@@ -958,6 +976,43 @@ mod tests {
     use super::*;
     use iced::event;
     use keyboard::{Key, key::Named};
+
+    #[test]
+    fn invalid_choices_expose_their_error_and_valid_choices_keep_help_text() {
+        for error in [
+            None,
+            Some("Choose a camera that is still connected.".to_owned()),
+        ] {
+            let mut pick = PickList::<_, _, ()>::new(["sim:0"], Some("sim:0"), |value| value)
+                .name("Step 1 camera")
+                .description("The camera this step controls.")
+                .invalid(error.clone());
+            let mut tree = Tree::new(&pick as &dyn Widget<&str, Theme, ()>);
+            let node = pick.layout(
+                &mut tree,
+                &(),
+                &layout::Limits::new(Size::ZERO, Size::new(200.0, 30.0)),
+            );
+            let mut operation = iced::advanced::widget::operation::focusable::count();
+            pick.operate(
+                &mut tree,
+                Layout::new(&node),
+                &(),
+                &mut iced::advanced::widget::operation::black_box(&mut operation),
+            );
+            let control = &tree.state.downcast_ref::<State<&str>>().control;
+            assert_eq!(control.node.label(), Some("Step 1 camera"));
+            assert_eq!(
+                control.node.invalid(),
+                error.as_ref().map(|_| accesskit::Invalid::True)
+            );
+            assert_eq!(
+                control.node.description(),
+                Some(error.as_deref().unwrap_or("The camera this step controls."))
+            );
+            assert_eq!(control.node.role(), accessibility::Role::ComboBox);
+        }
+    }
 
     fn press(key: Key) -> Event {
         Event::Keyboard(keyboard::Event::KeyPressed {

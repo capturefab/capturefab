@@ -61,6 +61,12 @@ capturefab --session bench status --json
 
 ## Use the built-in assistant
 
+Desktop users can configure **Settings → AI assistant** and open **Quick Command…**
+with ⌘K or Ctrl+Shift+K. Plan first uses the same registry and checked operations:
+editable cards, a fresh check and approval of the displayed revision before Run.
+Return never runs a plan. GUI assistant commands retain an Agent actor label
+without being reported as another participant in that same GUI.
+
 The optional `ai` feature provides `assistant`; builds without it return `unsupported` (exit 5).
 The catalog contains 22 provider entries, including Vertex, Bedrock, OpenRouter, Cloudflare, Groq and DeepSeek.
 Use the installed schema for provider IDs, environment variables, model defaults, settings and vision decisions.

@@ -94,6 +94,7 @@ impl Workbench {
                     && !busy
                     && !self.help_open
                     && !self.network_open
+                    && !self.assistant.quick.open
                     && !self.analytics.open,
             ))
         };
@@ -115,6 +116,11 @@ impl Workbench {
                 title: "File",
                 items: vec![
                     action("Connect to Camera…", Action::ConnectAddress, ready),
+                    action(
+                        "Quick Command…",
+                        Action::QuickCommand,
+                        ready || self.assistant.quick.open,
+                    ),
                     action(
                         "Discover Cameras",
                         Action::Discover,

@@ -661,6 +661,7 @@ capturefab assistant test anthropic --vision --json</code></pre><button class="c
           <p>Provider environment keys precede saved keys. OpenAI, Gemini and Anthropic share saved keys with prompt measurements. Vertex uses Google Cloud credentials or a Gemini express key. Claude on Vertex must have Google Cloud credentials. Bedrock uses a bearer token or AWS SigV4 credentials.</p>
           <p><code>assistant.json</code> stores non-secret provider settings, saved-key hints, autonomy defaults and optional user prices. The OS credential store holds saved keys. Never put secrets in prompts, command arguments, URLs or plan files. <code>assistant key remove PROVIDER</code> removes the saved key.</p>
           <h3>Review a plan</h3>
+          <p>On the desktop, open <strong>Quick Command…</strong> with ⌘K on macOS or Ctrl+Shift+K on Windows/Linux. Configure the provider in <strong>Settings → AI assistant</strong>. In Plan first mode, type a request, review the checked step cards and edit their fields. <strong>Run plan</strong> executes the displayed revision after a fresh check. Return sends a request or commits an edit; it never runs a plan. Closing the sheet retains the conversation and active work; Stop cancels a turn or stops after the accepted step. Camera previews require the image-permission checkbox.</p>
           <div class="code-wrap"><pre><code>capturefab serve --name bench
 # In another terminal:
 capturefab --session bench connect sim:0

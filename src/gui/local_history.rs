@@ -715,7 +715,7 @@ impl Workbench {
             }
             return Task::none();
         }
-        if self.help_open || self.network_open || self.analytics.open {
+        if self.help_open || self.network_open || self.analytics.open || self.assistant.quick.open {
             return Task::none();
         }
         let entry = if undo {

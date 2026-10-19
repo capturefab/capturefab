@@ -202,6 +202,7 @@ pub(in crate::gui) struct State {
     /// on the UI having received that reply first.
     unsaved: BTreeMap<ProviderId, ProviderSettings>,
     environment_ready: BTreeSet<ProviderId>,
+    environment_names: Vec<String>,
     environment: BTreeMap<String, String>,
     original: BTreeMap<ProviderId, ProviderSettings>,
     status: Option<ai::CredentialStatus>,
@@ -235,6 +236,7 @@ impl State {
             dirty: BTreeMap::new(),
             unsaved: BTreeMap::new(),
             environment_ready: BTreeSet::new(),
+            environment_names: vec![],
             environment: BTreeMap::new(),
             original: BTreeMap::new(),
             status: None,
@@ -259,13 +261,14 @@ impl State {
             Err(error) => self.error = Some(error),
         }
     }
-    #[cfg(test)]
     pub(in crate::gui) fn loaded(&self) -> bool {
         self.loaded
     }
-    #[cfg(test)]
     pub(in crate::gui) fn settings(&self) -> &Settings {
         &self.settings
+    }
+    pub(in crate::gui) fn detected_environment(&self) -> Vec<String> {
+        self.environment_names.clone()
     }
     #[cfg(test)]
     pub(in crate::gui) fn open(&self) -> bool {
@@ -525,6 +528,7 @@ impl State {
                 self.settings = loaded.settings;
                 self.original = self.settings.providers.clone();
                 self.environment_ready = loaded.environment_ready;
+                self.environment_names = loaded.environment_names;
                 self.environment = loaded.environment;
                 self.error = (!loaded.warnings.is_empty()).then(|| loaded.warnings.join(" "));
                 self.loaded = true;
@@ -1025,6 +1029,7 @@ mod tests {
                 },
                 warnings: vec![],
                 environment_ready: BTreeSet::from([ProviderId::OpenAi]),
+                environment_names: vec!["OPENAI_API_KEY".into()],
                 environment: BTreeMap::new(),
             }
         }

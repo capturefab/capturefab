@@ -90,6 +90,26 @@ Choosing a local endpoint changes where the request goes; it does not change the
 
 ## Plan before changes
 
+Open **Quick Command…** from the desktop menu, sparkle toolbar button or welcome
+screen. The shortcut is **⌘K** on macOS and **Ctrl+Shift+K** on Windows/Linux.
+Type a request and press Return. Plan first lets the assistant run observations;
+other tools become editable, checked step cards. Select **Let the assistant see
+camera images** only when you want inspected previews sent to the provider.
+Thumbnails show the pixels from those exact resized preview bytes.
+
+Check the camera, destination, file name, before/after values, warnings and any
+**Leaves this computer** marker. Fill required fields, including separate secure
+secrets when needed. **Run plan** executes the displayed revision after a fresh
+check. A changed action stops execution for another review. Return commits field
+edits and never runs the plan. After a partial failure, completed steps stay in
+the transcript and **Run remaining steps** keeps the failed and later steps.
+
+Closing with the close button, Escape or the shortcut keeps the conversation and
+active work. **Stop** cancels a model turn and restores its earlier plan, or stops
+plan execution after the accepted command finishes. Closing clears unsaved
+secrets. **New conversation** clears the plan and history. **Export plan…** writes
+a private plan file and offers a command for `capturefab tools apply`.
+
 ```sh
 capturefab serve --name bench
 # In another terminal:

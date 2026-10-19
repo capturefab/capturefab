@@ -298,6 +298,7 @@ impl Workbench {
             page_top(&mut self.capture_to),
             page_top(&mut self.record_to),
             self.take_settings_request(),
+            self.take_assistant_handoff(),
         ])
     }
 
@@ -334,6 +335,15 @@ impl Workbench {
             )
         } else if self.help_open {
             modal(body, self.help(p, height), Some(Message::Help(false)), t)
+        } else if self.assistant.quick.open {
+            modal(
+                body,
+                self.assistant_sheet(p, height),
+                Some(Message::Assistant(assistant::Input::Quick(
+                    assistant::quick::Input::Open(false),
+                ))),
+                t,
+            )
         } else if self.network_open {
             modal(
                 body,

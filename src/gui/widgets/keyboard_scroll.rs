@@ -22,6 +22,23 @@ pub(super) fn wrap<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a>(
     })
 }
 
+/// A sheet's fallback keys use the same coordinate direction as its body.
+pub(super) fn wrap_anchored<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a>(
+    content: Element<'a, M, T, R>,
+    target: &'static str,
+    vertical_anchor: Anchor,
+) -> Element<'a, M, T, R> {
+    if vertical_anchor == Anchor::Start {
+        return wrap(content, target);
+    }
+    Element::new(KeyboardScroll {
+        content,
+        target: Id::new(target),
+        focused_only: false,
+        vertical_anchor,
+    })
+}
+
 /// A nonmodal pane scrolls only while one of its actual controls has focus.
 /// This keeps its keys from taking over an unrelated editor or camera pane.
 pub(super) fn panel<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a>(
@@ -171,6 +188,14 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for KeyboardScroll<'_, M, T, R
         renderer: &R,
         operation: &mut dyn Operation,
     ) {
+        operation.custom(
+            None,
+            layout.bounds(),
+            &mut super::super::accessibility::VerticalAnchorMarker {
+                target: self.target.clone(),
+                anchor: self.vertical_anchor,
+            },
+        );
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);

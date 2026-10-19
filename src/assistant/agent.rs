@@ -405,6 +405,15 @@ impl Default for Plan {
     }
 }
 impl Plan {
+    /// Restore reviewed contents without reusing an abandoned proposal's
+    /// identity or making an old rendered revision current again.
+    pub fn restore_from(&mut self, snapshot: &Self) {
+        let revision = self.revision.max(snapshot.revision).saturating_add(1);
+        let next_id = self.next_id.max(snapshot.next_id);
+        *self = snapshot.clone();
+        self.revision = revision;
+        self.next_id = next_id;
+    }
     pub fn calls(&self) -> Vec<(StepId, ToolCall)> {
         self.steps
             .iter()
@@ -616,9 +625,11 @@ pub fn plan_turn(
         let mut pending_results: Option<(Conversation, Vec<ResultRecord>)> = None;
         for round in 1..=10 {
             if cancel.load(Ordering::Relaxed) {
+                let mut restored = plan.clone();
+                restored.restore_from(&original_plan);
                 return Ok(PlanOutcome {
                     text,
-                    plan: original_plan,
+                    plan: restored,
                     conversation: Conversation::new(
                         provider,
                         &session.model,
@@ -773,9 +784,11 @@ pub fn plan_turn(
             let mut results = Vec::new();
             for call in calls.iter().take(super::conversation::MAX_CALLS) {
                 if cancel.load(Ordering::Relaxed) {
+                    let mut restored = plan.clone();
+                    restored.restore_from(&original_plan);
                     return Ok(PlanOutcome {
                         text,
-                        plan: original_plan,
+                        plan: restored,
                         conversation: Conversation::new(
                             provider,
                             &session.model,

@@ -354,6 +354,17 @@ impl Workbench {
         let session_actions = row![
             history,
             tip_above(
+                button(icon(Icon::Sparkle, 15.0, p.accent))
+                    .name("Quick command")
+                    .padding([4, 6])
+                    .style(style::plain)
+                    .on_press(Message::Assistant(assistant::Input::Quick(
+                        assistant::quick::Input::Open(!self.assistant.quick.open)
+                    ))),
+                Action::QuickCommand.hint("Quick command", Os::CURRENT),
+            ),
+            space().width(8),
+            tip_above(
                 button(analytics)
                     .name("Session analytics for all cameras")
                     .padding([4, 6])
@@ -418,6 +429,7 @@ impl Workbench {
                 0.0
             };
             let actions = if fit.analytics_label { 76.0 } else { 28.0 }
+                + 36.0
                 + if fit.activity_label { 80.0 } else { 28.0 }
                 + if fit.history { 104.0 } else { 0.0 };
             let gaps = if fit.history { 4.0 } else { 3.0 } * 10.0;

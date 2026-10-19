@@ -1151,6 +1151,26 @@ pub fn pick(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
     }
 }
 
+/// A choice that no longer names an available camera or destination.
+pub fn pick_invalid(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
+    pick_list::Style {
+        border: Border {
+            color: Palette::from(theme).danger,
+            width: 1.5,
+            radius: RADIUS_SMALL.into(),
+        },
+        ..pick(theme, status)
+    }
+}
+
+/// A reviewed choice changed by the assistant after the person edited it.
+pub fn pick_dirty(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
+    pick_list::Style {
+        border: hairline(Palette::from(theme).accent, RADIUS_SMALL),
+        ..pick(theme, status)
+    }
+}
+
 /// A `pick` acknowledging an accepted choice, as `input_flash` does a field.
 pub fn pick_flash(t: f32) -> impl Fn(&Theme, pick_list::Status) -> pick_list::Style {
     move |theme, status| {

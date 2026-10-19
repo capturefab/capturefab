@@ -246,13 +246,14 @@ pub enum Action {
     CopySessionCommand,
     Fullscreen,
     Help,
+    QuickCommand,
     Settings,
     CloseWindow,
     Quit,
 }
 
 impl Action {
-    pub const ALL: [Action; 32] = [
+    pub const ALL: [Action; 33] = [
         Action::Undo,
         Action::Redo,
         Action::Discover,
@@ -282,6 +283,7 @@ impl Action {
         Action::CopySessionCommand,
         Action::Fullscreen,
         Action::Help,
+        Action::QuickCommand,
         Action::Settings,
         Action::CloseWindow,
         Action::Quit,
@@ -327,6 +329,7 @@ impl Action {
         (
             "Panels",
             &[
+                Action::QuickCommand,
                 Action::FeaturesTab,
                 Action::CaptureTab,
                 Action::ForwardTab,
@@ -380,6 +383,7 @@ impl Action {
             Action::CopySessionCommand => "Copy session command",
             Action::Fullscreen => "Full screen",
             Action::Help => "This guide",
+            Action::QuickCommand => "Quick command",
             Action::Settings => "Settings",
             Action::CloseWindow => "Close window",
             Action::Quit => "Quit Capturefab",
@@ -447,6 +451,8 @@ impl Action {
             Action::Fullscreen => vec![bare(Key::F11)],
             Action::Help if mac => vec![cmd('?'), bare(Key::F1)],
             Action::Help => vec![bare(Key::F1), cmd('/')],
+            Action::QuickCommand if mac => vec![cmd('k')],
+            Action::QuickCommand => vec![with(cmd_shift, Key::Char('k'))],
             Action::Settings => vec![cmd(',')],
             Action::CloseWindow if mac => vec![cmd('w')],
             Action::CloseWindow if os == Os::Nix => vec![cmd('w')],

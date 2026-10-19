@@ -230,6 +230,53 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn review_dialogs_without_a_default_never_turn_return_into_an_approval() {
+        for os in [Os::Mac, Os::Windows, Os::Nix] {
+            for submit in [false, true] {
+                let mut dialog = dialog(os, submit);
+                dialog.action = None;
+                let (mut tree, node) = setup(&mut dialog);
+                focus(&mut dialog, &mut tree, &node, "field");
+                let messages = event(
+                    &mut dialog,
+                    &mut tree,
+                    &node,
+                    press(keyboard::key::Named::Enter, false),
+                );
+                assert_eq!(messages, if submit { vec!["save"] } else { vec![] });
+                // A focused secondary button may handle its own activation,
+                // but Return cannot fall through to the absent primary.
+                focus(&mut dialog, &mut tree, &node, "cancel");
+                assert!(
+                    event(
+                        &mut dialog,
+                        &mut tree,
+                        &node,
+                        press(keyboard::key::Named::Enter, false),
+                    )
+                    .iter()
+                    .all(|message| message == "cancel")
+                );
+                dialog.operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &(),
+                    &mut operation::focusable::unfocus::<()>(),
+                );
+                assert!(
+                    event(
+                        &mut dialog,
+                        &mut tree,
+                        &node,
+                        press(keyboard::key::Named::Enter, false),
+                    )
+                    .is_empty()
+                );
+            }
+        }
+    }
 }
 struct DefaultAction<'a, M, T, R> {
     content: Element<'a, M, T, R>,
