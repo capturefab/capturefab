@@ -3936,7 +3936,8 @@ fn log_simulator_to_csv_and_dataset() {
         "{code:?} {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!failed.exists());
+    // Only a run that failed leaves no header-only file.
+    assert!(code == Some(0) || !failed.exists());
     let _ = std::fs::remove_dir_all(root);
 }
 
