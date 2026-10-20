@@ -49,8 +49,7 @@ function openPage(options = {}) {
   const events = [];
   const ids = new Map();
   if (options.downloads !== false) {
-    for (const id of ['os-select', 'arch-select', 'variant-select', 'primary-download', 'verify-box', 'asset-detail', 'verify-links', 'install-hint', 'download-label', 'download-description', 'checksum-text', 'verify-command', 'platform-hint', 'release-version']) ids.set(id, new Element());
-    ids.get('variant-select').value = 'desktop';
+    for (const id of ['os-select', 'arch-select', 'primary-download', 'verify-box', 'asset-detail', 'verify-links', 'install-hint', 'download-label', 'download-description', 'checksum-text', 'verify-command', 'platform-hint', 'release-version']) ids.set(id, new Element());
     ids.get('primary-download').hidden = true;
   }
   const result = new Element();
@@ -135,25 +134,21 @@ async function downloads() {
   // One build of the latest release left unpublished, to check unavailable selections.
   const partial = structuredClone(published);
   const missing = partial.releases.find((release) => release.version === partial.latest).assets
-    .find((asset) => asset.os === 'windows' && asset.arch === 'x86_64' && asset.variant === 'headless');
+    .find((asset) => asset.os === 'windows' && asset.arch === 'x86_64');
   missing.available = false;
   const page = openPage({ platform: 'MacIntel', userAgent: 'Macintosh; Intel Mac OS X', manifest: partial });
   await page.settle();
   assert.equal(page.ids.get('os-select').value, 'macos');
-  assert.equal(page.ids.get('arch-select').value, '', 'Mac user agents must not guess Intel on Apple silicon');
-  assert.equal(page.ids.get('primary-download').hidden, true);
+  assert.equal(page.ids.get('arch-select').value, 'aarch64', 'Mac user agents cannot report Apple silicon, so the best guess is ARM64');
+  assert.match(page.ids.get('download-label').textContent, /^Best match: /);
   page.change('arch-select', 'aarch64');
-  const desktop = latest.assets.find((asset) => asset.os === 'macos' && asset.arch === 'aarch64' && asset.variant === 'desktop' && asset.available);
+  const desktop = latest.assets.find((asset) => asset.os === 'macos' && asset.arch === 'aarch64' && asset.available);
   assert.equal(page.ids.get('primary-download').href, desktop.url);
   assert.equal(page.ids.get('primary-download').hidden, false);
   assert.match(page.ids.get('primary-download').getAttribute('aria-label'), /macOS ARM64/);
   assert.equal(page.ids.get('verify-command').textContent, `shasum -a 256 ${desktop.name}`);
   assert.match(page.ids.get('checksum-text').textContent, new RegExp(desktop.sha256));
   assert.match(page.ids.get('install-hint').textContent, /Extract.*Capturefab\.app/);
-  page.change('variant-select', 'headless');
-  const headless = latest.assets.find((asset) => asset.os === 'macos' && asset.arch === 'aarch64' && asset.variant === 'headless' && asset.available);
-  assert.equal(page.ids.get('primary-download').href, headless.url);
-  assert.match(page.ids.get('install-hint').textContent, /terminal/);
   page.change('os-select', 'windows');
   assert.ok(page.ids.get('install-hint').textContent.includes('.\\capturefab.exe --help'), 'PowerShell instructions must retain the relative-path backslash');
   page.change('arch-select', 'x86_64');

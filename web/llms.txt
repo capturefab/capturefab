@@ -84,7 +84,7 @@ Plain `doctor` checks the host and prints a fix for each warning.
 Workers follow a change in their session's mode for decoders they start afterwards; efficient halves how often a session polls its workers for status.
 Auto is efficient with at most 2 CPU cores or 2 GiB of memory, in the OS low-power mode, or on a desktop hint such as software rendering or a preview falling behind.
 Efficient mode reduces preview, polling and CPU embedding work (desktop previews at most 15 frames a second, 5 per overview tile, 1280 pixels a side; auto capture's CPU embedding a fifth of a core); captures and recordings keep every frame.
-A headless build without a subcommand exits 5 and suggests `serve`.
+With no display (a Linux login without DISPLAY or WAYLAND_DISPLAY), running with no subcommand prints the CLI help and suggests `serve`; a source build without the `gui` feature exits 5.
 
 Exit codes are 1 `operation_failed`, 2 `usage`, 3 `unavailable`, 4 `timeout`, 5 `unsupported` and 6 `storage_full`.
 Capturefab rejects malformed supplied fields before connection and before capture/forward `--set` or `--auto` changes.

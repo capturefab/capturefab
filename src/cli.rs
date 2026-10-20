@@ -1904,9 +1904,24 @@ pub fn run(mut cli: Cli) -> Result<()> {
         }
         None | Some(Command::Gui { .. }) => {
             // Before a session, IPC server and uploader start for nothing,
-            // and before the checks below, so a headless build is
+            // and before the checks below, so a build without the window is
             // `unsupported` with or without --json or --session.
-            if let Some(error) = window_unavailable(cfg!(feature = "gui"), display_available()) {
+            let display = display_available();
+            if let Some(error) = window_unavailable(cfg!(feature = "gui"), display) {
+                // A bare `capturefab` on a computer with no display is
+                // the CLI: show its commands instead of failing.
+                if cli.command.is_none()
+                    && cfg!(feature = "gui")
+                    && !display
+                    && !cli.json
+                    && cli.session.is_none()
+                {
+                    Cli::command().print_long_help()?;
+                    println!(
+                        "\nNo display is available, so the desktop window did not open. {SERVE_HINT}"
+                    );
+                    return Ok(());
+                }
                 return Err(error);
             }
             ensure!(
@@ -4305,18 +4320,18 @@ fn uploads_command(command: Option<&UploadsCommand>) -> Result<Value> {
     }
 }
 
+const SERVE_HINT: &str = "Start a session with `capturefab serve --name bench`, then run `capturefab --session bench discover`.";
+
 /// Why this process cannot open the desktop window, with what to run instead.
 fn window_unavailable(compiled: bool, display: bool) -> Option<anyhow::Error> {
     let reason = if !compiled {
-        "The desktop window is disabled in this headless build"
+        "The desktop window is disabled in this build"
     } else if !display {
         "No display is available (DISPLAY and WAYLAND_DISPLAY are unset), so the desktop window cannot open"
     } else {
         return None;
     };
-    Some(anyhow::anyhow!(
-        "{reason}. Start a session with `capturefab serve --name bench`, then run `capturefab --session bench discover`."
-    ))
+    Some(anyhow::anyhow!("{reason}. {SERVE_HINT}"))
 }
 /// An SSH login on a Linux board has no display to open a window on.
 fn display_available() -> bool {
@@ -5317,11 +5332,11 @@ mod tests {
     #[test]
     fn missing_window_explains_how_to_start_a_session() {
         assert!(window_unavailable(true, true).is_none());
-        let headless = window_unavailable(false, true).unwrap();
-        assert_eq!(error_code(&headless), ("unsupported", 5));
+        let uncompiled = window_unavailable(false, true).unwrap();
+        assert_eq!(error_code(&uncompiled), ("unsupported", 5));
         let no_display = window_unavailable(true, false).unwrap();
         assert_eq!(error_code(&no_display), ("operation_failed", 1));
-        for error in [headless, no_display] {
+        for error in [uncompiled, no_display] {
             let message = error.to_string();
             assert!(
                 message.contains("capturefab serve --name bench"),

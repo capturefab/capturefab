@@ -9,7 +9,7 @@ Capturefab is an MIT-licensed Rust camera workbench: one binary that is both an 
 ## Vendor and native dependencies
 
 Linking vendor SDKs and native libraries (camera SDKs, CUDA/nvJPEG, platform media frameworks, libusb, Aravis) is permitted when it fits the repo's structure:
-- Gate each one behind an optional Cargo feature so the default and headless builds keep working without it, and so `doctor` can report whether it was compiled in.
+- Gate each one behind an optional Cargo feature so the default and GUI-less builds keep working without it, and so `doctor` can report whether it was compiled in.
 - Keep it in the process that uses it: camera SDKs belong in the per-camera worker (`session::run_worker`), never in the GUI or coordinator.
 - Isolate it in a separate helper process, the way FFmpeg is run, when its license cannot be combined with Capturefab's MIT code in release binaries (for example GPL), when it can crash, hang or leak and would take the camera worker down with it, or when it would bloat or complicate every build. Talk to helpers over the existing patterns: bounded stdio JSON for control, shared memory or pipes for pixels.
 - Check the vendor's redistribution terms before bundling its runtime, and add its notices to the release license output.
@@ -20,7 +20,7 @@ FFmpeg stays a separate executable. Never enable nonfree FFmpeg components: the 
 
 ```sh
 cargo build                                                   # desktop (default features: gui, usb, scanner, jpeg, nvjpeg, vaapi, videotoolbox, s3, ftp, sftp, parquet, modbus, mqtt, opcua, mtconnect, dinov2, hubs)
-cargo build --release --no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,s3,ftp,sftp,parquet,modbus,mqtt,opcua,mtconnect,dinov2,hubs  # headless, as CI and scripts/release.py build it
+cargo build --release --no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,s3,ftp,sftp,parquet,modbus,mqtt,opcua,mtconnect,dinov2,hubs  # no GUI (CI checks it); scripts/release.py builds the default features plus wgpu, with no separate headless release
 cargo test
 cargo test --test cli                                         # end-to-end binary tests (tests/cli.rs)
 cargo test --lib storage::                                    # unit tests in one module

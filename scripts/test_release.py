@@ -40,9 +40,9 @@ checker = load('test-site')
 
 
 def published(version, date='2026-10-05', **asset):
-    item = dict(name=f'capturefab-{version}-linux-x86_64-headless.tar.gz', os='linux', arch='x86_64', variant='headless', available=True, sha256='a' * 64, size=2097152, url=f'https://example.invalid/v{version}/capturefab.tar.gz', validation='native-smoke-passed', platform_signature='unsigned')
+    item = dict(name=f'capturefab-{version}-linux-x86_64.tar.gz', os='linux', arch='x86_64', available=True, sha256='a' * 64, size=2097152, url=f'https://example.invalid/v{version}/capturefab.tar.gz', validation='native-smoke-passed', platform_signature='unsigned')
     item.update(asset)
-    missing = dict(name=f'capturefab-{version}-linux-armv7-desktop', os='linux', arch='armv7', variant='desktop', available=False, reason='Not built for this release')
+    missing = dict(name=f'capturefab-{version}-linux-armv7', os='linux', arch='armv7', available=False, reason='Not built for this release')
     return dict(version=version, date=date, url=f'https://example.invalid/releases/tag/v{version}', checksums_url=f'https://example.invalid/v{version}/SHA256SUMS', assets=[item, missing])
 
 
@@ -186,7 +186,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(bom['components'][1]['hashes'], [dict(alg='SHA-256', content='d' * 64)])
         self.assertIn('pkg:cargo/wasm-bindgen@1.0.0', bom['dependencies'][0]['dependsOn'])
 
-    def test_build_embeds_the_browser_client_once_it_is_built_and_headless_uploads(self):
+    def test_build_embeds_the_browser_client_once_it_is_built(self):
         with tempfile.TemporaryDirectory() as temp:
             temp = Path(temp)
             source = temp / 'media-sources.tar.gz'
@@ -195,7 +195,7 @@ class ReleaseTests(unittest.TestCase):
             builds = []
             def run(command, **kwargs):
                 builds.append((command, kwargs['env']))
-            args = SimpleNamespace(version=release.version(), target='aarch64-unknown-linux-gnu', os='linux', arch='aarch64', variants='desktop,headless',
+            args = SimpleNamespace(version=release.version(), target='aarch64-unknown-linux-gnu', os='linux', arch='aarch64',
                                    ffmpeg_bundle=temp / 'bundle', binary=None, repackage=False, output=temp / 'out')
             for web in [dist, None]:
                 builds.clear()
@@ -203,15 +203,13 @@ class ReleaseTests(unittest.TestCase):
                         mock.patch.object(release, 'dinov2_weights', return_value=temp / 'model.safetensors'), \
                         mock.patch.object(release, 'package', return_value={}), mock.patch.object(release, 'media_sources', return_value=source):
                     release.build(args)
-                self.assertEqual(len(builds), 2)
+                self.assertEqual(len(builds), 1)
                 for command, env in builds:
                     features = command[-1].split(',')
                     self.assertEqual('embedded-web' in features, web is not None, command)
                     self.assertEqual(env.get('CAPTUREFAB_WEB_DIST'), str(dist.resolve()) if web else None)
                 self.assertIn('wgpu', builds[0][0][-1].split(','))
-                self.assertIn('--no-default-features', builds[1][0])
-                # Headless line computers upload too.
-                self.assertTrue({'s3', 'ftp', 'sftp'} <= set(builds[1][0][-1].split(',')))
+                self.assertNotIn('--no-default-features', builds[0][0])
 
     def test_package_records_and_licenses_an_embedded_browser_client(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -230,7 +228,7 @@ class ReleaseTests(unittest.TestCase):
             (dist / 'capturefab_web_bg.wasm').write_bytes(wasm)
             args = SimpleNamespace(os='linux', arch='aarch64', target='aarch64-unknown-linux-gnu', version='1.2.3', ffmpeg_bundle=bundle, output=temp / 'out', skip_smoke=True)
             licensed = []
-            def notices(target, variant, web=False):
+            def notices(target, web=False):
                 licensed.append(web)
                 return 'crate licenses'
             items, readmes = [], []
@@ -238,9 +236,9 @@ class ReleaseTests(unittest.TestCase):
                 for name, payload in [('embedded', ffmpeg + wasm), ('plain', ffmpeg)]:
                     binary = temp / name
                     binary.write_bytes(self.elf(['GLIBC_2.17']) + payload)
-                    items.append(release.package(args, binary, 'headless'))
+                    items.append(release.package(args, binary))
                     with tarfile.open(temp / 'out' / items[-1]['name']) as archive:
-                        readmes.append(archive.extractfile('capturefab-1.2.3-linux-aarch64-headless/README.txt').read().decode())
+                        readmes.append(archive.extractfile('capturefab-1.2.3-linux-aarch64/README.txt').read().decode())
             self.assertEqual([item.get('browser_client') for item in items], [True, None])
             self.assertEqual(licensed, [True, False])
             self.assertIn('serve --name line1 --listen', readmes[0])
@@ -350,18 +348,18 @@ class ReleaseTests(unittest.TestCase):
             binary.write_bytes(self.macho((11, 0)) + b'code' + ffmpeg)
             args = SimpleNamespace(os='macos', arch='aarch64', target='aarch64-apple-darwin', version='1.2.3-rc.1', ffmpeg_bundle=bundle, output=temp / 'dist', skip_smoke=True)
             with mock.patch.object(release, 'notices', return_value='crate licenses'), mock.patch.dict(os.environ, {'MACOS_SIGN_IDENTITY': ''}):
-                item = release.package(args, binary, 'desktop')
+                item = release.package(args, binary)
                 (bundle / 'bin' / 'ffmpeg').write_bytes(self.macho((11, 0)) + os.urandom(70000))
                 with self.assertRaisesRegex(ValueError, 'does not embed'):
-                    release.package(args, binary, 'headless')
+                    release.package(args, binary)
                 # An embedded FFmpeg built for a newer macOS is refused too.
                 (bundle / 'bin' / 'ffmpeg').write_bytes(self.macho((13, 0)) + os.urandom(70000))
                 with self.assertRaisesRegex(ValueError, 'requires macOS'):
-                    release.package(args, binary, 'headless')
+                    release.package(args, binary)
             path = temp / 'dist' / item['name']
             self.assertEqual((item['validation'], item['platform_signature'], item['sha256']), ('cross-compiled', 'unsigned', release.digest(path)))
             with zipfile.ZipFile(path) as archive:
-                stem = 'capturefab-1.2.3-rc.1-macos-aarch64-desktop'
+                stem = 'capturefab-1.2.3-rc.1-macos-aarch64'
                 info = plistlib.loads(archive.read(f'{stem}/Capturefab.app/Contents/Info.plist'))
                 self.assertEqual(info['CFBundleIconFile'], 'capturefab.icns')
                 self.assertEqual(archive.read(f'{stem}/Capturefab.app/Contents/Resources/capturefab.icns'),
@@ -468,12 +466,12 @@ class ReleaseTests(unittest.TestCase):
     def assemble_fixture(self, temp, **options):
         builds = temp / 'builds' / 'build-linux-x86_64'
         builds.mkdir(parents=True)
-        asset = builds / 'capturefab-1.2.3-linux-x86_64-headless.tar.gz'
+        asset = builds / 'capturefab-1.2.3-linux-x86_64.tar.gz'
         asset.write_bytes(b'archive')
         media = builds / 'capturefab-1.2.3-linux-x86_64-media-sources.tar.gz'
         media.write_bytes(b'sources')
-        item = release.record(asset, 'linux', 'x86_64', 'headless', target='x86_64-unknown-linux-gnu', platform_signature='unsigned', validation='native-smoke-passed')
-        failure = dict(os='linux', arch='x86_64', variant='desktop', error='cargo exited with status 101')
+        item = release.record(asset, 'linux', 'x86_64', target='x86_64-unknown-linux-gnu', platform_signature='unsigned', validation='native-smoke-passed')
+        failure = dict(os='linux', arch='aarch64', error='cargo exited with status 101')
         (builds / 'build-linux-x86_64.json').write_text(json.dumps(dict(schema_version=1, version='1.2.3', assets=[item], failures=[failure],
                                                                   media_source=dict(name=media.name, sha256=release.digest(media), size=media.stat().st_size))))
 
@@ -556,31 +554,27 @@ class ReleaseTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'does not identify'):
                     release.media_sources(args)
 
-    def test_repackage_reuses_each_verified_variant_without_compiling(self):
+    def test_repackage_reuses_the_verified_package_without_compiling(self):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp)
-            items = []
-            for variant in ['desktop', 'headless']:
-                stem = f'capturefab-1.2.3-macos-aarch64-{variant}'
-                archive_path = output / f'{stem}.zip'
-                with zipfile.ZipFile(archive_path, 'w') as archive:
-                    archive.writestr(f'{stem}/capturefab', b'CLI launcher' if variant == 'desktop' else variant.encode())
-                    if variant == 'desktop':
-                        archive.writestr(f'{stem}/Capturefab.app/Contents/MacOS/capturefab', variant.encode())
-                items.append(release.record(archive_path, 'macos', 'aarch64', variant))
+            stem = 'capturefab-1.2.3-macos-aarch64'
+            archive_path = output / f'{stem}.zip'
+            with zipfile.ZipFile(archive_path, 'w') as archive:
+                archive.writestr(f'{stem}/capturefab', b'CLI launcher')
+                archive.writestr(f'{stem}/Capturefab.app/Contents/MacOS/capturefab', b'desktop')
+            item = release.record(archive_path, 'macos', 'aarch64')
             report_path = output / 'build-macos-aarch64.json'
-            report_path.write_text(json.dumps(dict(version='1.2.3', assets=items)))
+            report_path.write_text(json.dumps(dict(version='1.2.3', assets=[item])))
             args = SimpleNamespace(version='1.2.3', os='macos', arch='aarch64', output=output)
-            def package(args, binary, variant):
-                self.assertEqual(binary.read_bytes(), variant.encode())
+            def package(args, binary):
+                self.assertEqual(binary.read_bytes(), b'desktop')
                 self.assertTrue(binary.stat().st_mode & 0o100)
-                return variant
+                return 'packaged'
             with mock.patch.object(release, 'package', side_effect=package), mock.patch.object(release, 'run', side_effect=AssertionError('repackaging must not compile')):
-                self.assertEqual(release.repackage(args, 'desktop'), 'desktop')
-                self.assertEqual(release.repackage(args, 'headless'), 'headless')
-                (output / items[0]['name']).write_bytes(b'modified')
+                self.assertEqual(release.repackage(args), 'packaged')
+                archive_path.write_bytes(b'modified')
                 with self.assertRaisesRegex(ValueError, 'missing or modified'):
-                    release.repackage(args, 'desktop')
+                    release.repackage(args)
 
     def test_assemble_lists_every_target_and_checksums_every_file(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -588,12 +582,12 @@ class ReleaseTests(unittest.TestCase):
             output = Path(temp) / 'release'
             manifest = json.loads((output / 'releases.json').read_text())
             entry = manifest['releases'][0]
-            assets = {(a['os'], a['arch'], a['variant']): a for a in entry['assets']}
+            assets = {(a['os'], a['arch']): a for a in entry['assets']}
             self.assertEqual((manifest['latest'], len(assets)), ('1.2.3', len(release.TARGETS)))
-            self.assertEqual(assets[('linux', 'x86_64', 'headless')]['url'], f'https://example.invalid/v1.2.3/{asset.name}')
-            self.assertEqual(assets[('linux', 'x86_64', 'desktop')]['reason'], 'cargo exited with status 101')
-            self.assertEqual(assets[('macos', 'aarch64', 'desktop')]['reason'], 'Not built for this release')
-            self.assertNotIn(('linux', 'armv7', 'desktop'), assets)
+            self.assertEqual(assets[('linux', 'x86_64')]['url'], f'https://example.invalid/v1.2.3/{asset.name}')
+            self.assertEqual(assets[('linux', 'aarch64')]['reason'], 'cargo exited with status 101')
+            self.assertEqual(assets[('macos', 'aarch64')]['reason'], 'Not built for this release')
+            self.assertNotIn(('linux', 'armv7'), assets)
             self.assertEqual((entry['checksums_url'], entry['source_url']), ('https://example.invalid/v1.2.3/SHA256SUMS', 'https://example.invalid/v1.2.3/capturefab-1.2.3-source.tar.gz'))
             self.assertNotIn('checksums_signature_url', entry)
             sums = {name: digest for digest, name in (line.split('  ') for line in (output / 'SHA256SUMS').read_text().splitlines())}
@@ -604,7 +598,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn('pkg:cargo/serde', {c.get('purl', '').split('@')[0] for c in bom['components']})
             self.assertEqual(sums['releases.json'], release.digest(output / 'releases.json'))
             notes = (output / 'release-notes.md').read_text()
-            self.assertIn('- linux x86_64 desktop: cargo exited with status 101', notes)
+            self.assertIn('- linux aarch64: cargo exited with status 101', notes)
             self.assertIn('gh attestation verify FILE --repo owner/repo', notes)
             self.assertIn('--predicate-type https://cyclonedx.org/bom', notes)
             self.assertNotIn('SHA256SUMS.asc', notes)
@@ -666,20 +660,20 @@ class SiteTests(unittest.TestCase):
         feed = ET.fromstring(site.feed(manifest, SITE))
         self.assertEqual([e.findtext(f'{ATOM}title') for e in feed.findall(f'{ATOM}entry')], ['capturefab 2.0.0-rc.1', 'capturefab 1.10.0', 'capturefab 1.2.0'])
         self.assertEqual(feed.findtext(f'{ATOM}updated'), '2026-03-01T00:00:00Z')
-        self.assertEqual(feed.find(f'{ATOM}entry/{ATOM}summary').text, 'Published downloads: Linux x64 headless.')
+        self.assertEqual(feed.find(f'{ATOM}entry/{ATOM}summary').text, 'Published downloads: Linux x64.')
 
     def test_precedence_follows_semver(self):
         versions = ['1.0.0-alpha', '1.0.0-alpha.1', '1.0.0-alpha.beta', '1.0.0-beta', '1.0.0-beta.2', '1.0.0-beta.11', '1.0.0-rc.1', '1.0.0']
         self.assertEqual(sorted(reversed(versions), key=site.precedence), versions)
 
-    def test_merge_replaces_versions_and_prefers_stable_latest(self):
+    def test_merge_keeps_only_the_latest_stable_release(self):
         empty = dict(schema_version=1, latest=None, releases=[])
         merged = site.merge(empty, dict(schema_version=1, latest='1.1.0-rc.1', releases=[published('1.1.0-rc.1')]))
         self.assertEqual(merged['latest'], '1.1.0-rc.1')
         merged = site.merge(merged, dict(schema_version=1, latest='1.0.0', releases=[published('1.0.0', '2026-01-01')]))
-        self.assertEqual(([r['version'] for r in merged['releases']], merged['latest']), (['1.1.0-rc.1', '1.0.0'], '1.0.0'))
+        self.assertEqual(([r['version'] for r in merged['releases']], merged['latest']), (['1.0.0'], '1.0.0'))
         merged = site.merge(merged, dict(schema_version=1, latest='1.0.0', releases=[published('1.0.0', '2026-02-02')]))
-        self.assertEqual([r['date'] for r in merged['releases']], ['2026-10-05', '2026-02-02'])
+        self.assertEqual([r['date'] for r in merged['releases']], ['2026-02-02'])
 
     def test_check_reports_stale_pages(self):
         with tempfile.TemporaryDirectory() as temp:

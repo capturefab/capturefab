@@ -10,7 +10,7 @@ This is an initial implementation, not complete Aravis or vendor-SDK feature par
 
 ## Start here
 
-Download the matching desktop or headless binary from [GitHub Releases](https://github.com/capturefab/capturefab/releases). The [project site](https://capturefab.com/) selects from published artifacts, with explicit architecture choices and SHA-256 checksums. Until a release is actually published, the site displays that state instead of fabricated download links.
+Download the matching binary from [GitHub Releases](https://github.com/capturefab/capturefab/releases). The [project site](https://capturefab.com/) selects from published artifacts, with explicit architecture choices and SHA-256 checksums. Until a release is actually published, the site displays that state instead of fabricated download links.
 
 Choose how to drive the capture. Each route can share a visible desktop session for review and manual intervention.
 
@@ -242,7 +242,7 @@ Relative capture and recording paths resolve beside the workflow file; stdin wor
 
 ## Remote browser control
 
-Release executables from 0.2.2 on have the WebAssembly browser client built in. Run a headless server with `capturefab serve --name remote --listen 100.101.102.103:8787` and open the server URL from another laptop on the same tailnet to discover cameras, edit settings, preview frames and set up captures or schedules. Anyone who can reach the listener can control captures; tailnet policy and the host firewall provide the access boundary. Capture files and jobs stay on the server; the local CLI can control the same session. Each tab costs the server one JPEG encode per new frame, shared with every other tab, and nothing while the frame is unchanged or the tab is hidden. Source builds build the client with `./web-client/build.sh` and either the `embedded-web` feature or `--web-dir web-client/dist`; an older release needs that `--web-dir` too. See [remote setup and Tailscale HTTPS](docs/remote-control.md), and the [line computer guide](docs/line-computer.md) to run it as a service on a Raspberry Pi, Jetson or industrial PC: the headless archive, camera permissions, a systemd unit, the storage budget and efficiency mode.
+Release executables from 0.2.2 on have the WebAssembly browser client built in. Run a headless server with `capturefab serve --name remote --listen 100.101.102.103:8787` and open the server URL from another laptop on the same tailnet to discover cameras, edit settings, preview frames and set up captures or schedules. Anyone who can reach the listener can control captures; tailnet policy and the host firewall provide the access boundary. Capture files and jobs stay on the server; the local CLI can control the same session. Each tab costs the server one JPEG encode per new frame, shared with every other tab, and nothing while the frame is unchanged or the tab is hidden. Source builds build the client with `./web-client/build.sh` and either the `embedded-web` feature or `--web-dir web-client/dist`; an older release needs that `--web-dir` too. See [remote setup and Tailscale HTTPS](docs/remote-control.md), and the [line computer guide](docs/line-computer.md) to run it as a service on a Raspberry Pi, Jetson or industrial PC: the Linux archive, camera permissions, a systemd unit, the storage budget and efficiency mode.
 
 ## Session analytics
 
@@ -537,7 +537,7 @@ RTSP, SRT, RTMP, HTTP, UDP, TCP and RTP sources reconnect by themselves when the
 `capturefab doctor` checks this computer and prints one line per check, with a copyable fix under each warning:
 
 - **Efficiency mode**: the setting in force and why.
-- **GPU** (desktop builds): the adapter the desktop window would get, asked in a helper process with a 3-second limit. A software rasterizer such as llvmpipe is a warning.
+- **GPU** (builds with the GUI): the adapter the desktop window would get, asked in a helper process with a 3-second limit. A software rasterizer such as llvmpipe is a warning.
 - **Session state**: on Linux, sessions are found in the runtime directory, `$XDG_RUNTIME_DIR/capturefab`, a tmpfs that is fast and spares SD cards. Without `XDG_RUNTIME_DIR`, which system services often lack, Capturefab uses `/run/user/<uid>/capturefab` when the user lingers (`loginctl enable-linger`) and `/run/user/<uid>` belongs to them with mode 0700, so a service and an SSH shell find the same sessions; otherwise it falls back to `~/.cache/capturefab/sessions` on disk, and doctor warns where logind runs. From a login that has `XDG_RUNTIME_DIR`, such as SSH, doctor's `runtime_dir` line says where a service without it would keep its sessions, and warns once one runs there; `sessions` and `--session` name a session they find there. Without lingering, logind removes `/run/user/<uid>` at logout, and with it any session a service kept there, so a service needs `loginctl enable-linger` and `Wants=` and `After=user@<uid>.service`; a service no login needs to reach with `--session` can instead set `RuntimeDirectory=capturefab`, `RuntimeDirectoryMode=0700` and `Environment=XDG_RUNTIME_DIR=/run/capturefab`. Settings, saved hubs and destinations, the upload queue and the storage ledger live in the state directory, `$XDG_STATE_HOME/capturefab` or `~/.local/state/capturefab`, so they survive logout and reboot. Files an older version kept in `$XDG_RUNTIME_DIR/capturefab`, `/run/user/<uid>/capturefab` or `~/.cache/capturefab/sessions` move there once, and the move is logged; when the state directory already has its own copy, or more than one of those folders holds one, the old copies stay where they are and doctor warns (`old_state`) with how to keep one. macOS and Windows keep both in one session directory on disk, and `CAPTUREFAB_SESSION_DIR` sets both at once. Camera frame rings are anonymous shared memory, not files (except on Windows or where shared memory is unavailable), but JPEG captures encoded by nvJPEG or VA-API pass their pixels through a mapped file in the runtime directory. A state directory in memory, such as a `CAPTUREFAB_SESSION_DIR` on tmpfs, is noted without a warning.
 - **GigE receive buffer** (Linux): `net.core.rmem_max` caps every socket buffer, and the usual 208 KiB loses packets from larger frames. The fix raises it now and keeps it in `/etc/sysctl.d`.
 - **USB3 Vision access** (Linux): a connected camera whose `/dev/bus/usb` node this user cannot open, with a udev rule file per camera vendor.
@@ -552,7 +552,7 @@ capturefab doctor
 capturefab --efficiency efficient serve --name line1
 ```
 
-Run without a command, a headless build (exit 5) or a Linux login without `DISPLAY` or `WAYLAND_DISPLAY` explains how to start a `serve` session instead of opening a window.
+Run without a command, a Linux login without `DISPLAY` or `WAYLAND_DISPLAY` (an SSH session, a line computer) lists the CLI commands and explains how to start a `serve` session instead of opening a window. A source build compiled without the `gui` feature exits 5 with the same explanation.
 
 ## Cameras from Home Assistant, Frigate, go2rtc and UniFi Protect
 
@@ -605,7 +605,7 @@ Single-component image conversion also accepts `Coord3D_C8`, `Coord3D_C16`, `Con
 ```sh
 cargo build --release                              # Rust desktop; bundles FFmpeg when supplied
 cargo build --release --no-default-features \
-  --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,s3,ftp,sftp,parquet,modbus,mqtt,opcua,mtconnect,dinov2,hubs   # headless release set
+  --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,s3,ftp,sftp,parquet,modbus,mqtt,opcua,mtconnect,dinov2,hubs   # no GUI: CLI and serve only
 cargo test
 cargo clippy --all-features --all-targets -- -D warnings
 ```

@@ -23,8 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 LINE_COMPUTER = re.search(r'^repository\s*=\s*"([^"]+)"', (ROOT / 'Cargo.toml').read_text(), re.M)[1] + '/blob/main/docs/line-computer.md'
 SEMVER = re.compile(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?')
 # No 32-bit ARM: Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS.
-TARGETS = [(os_, arch, variant) for os_, arches in [('linux', ['x86_64', 'aarch64']), ('macos', ['x86_64', 'aarch64']), ('windows', ['x86_64', 'aarch64'])] for arch in arches for variant in ['desktop', 'headless']]
-FEATURES = {'desktop': ['--features', 'wgpu'], 'headless': ['--no-default-features', '--features', 'usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,s3,ftp,sftp,parquet,modbus,mqtt,opcua,mtconnect,dinov2,hubs']}
+TARGETS = [(os_, arch) for os_, arches in [('linux', ['x86_64', 'aarch64']), ('macos', ['x86_64', 'aarch64']), ('windows', ['x86_64', 'aarch64'])] for arch in arches]
+FEATURES = ['--features', 'wgpu']
 # The oldest systems release executables must start on: glibc 2.28 (RHEL,
 # Rocky and Alma 8, Debian 10, Ubuntu 18.10 and newer) and the macOS
 # deployment targets. Windows executables must not need the Visual C++
@@ -276,9 +276,9 @@ def web_dist():
 def web_metadata():
     return json.loads(run(['cargo', 'metadata', '--format-version', '1', '--locked', '--filter-platform', 'wasm32-unknown-unknown', '--manifest-path', WEB_CLIENT / 'Cargo.toml'], cwd=ROOT, capture_output=True, text=True).stdout)
 
-def cargo_features(variant, web):
-    """The variant's cargo feature flags, plus embedded-web with a built client."""
-    flags = list(FEATURES[variant])
+def cargo_features(web):
+    """The release cargo feature flags, plus embedded-web with a built client."""
+    flags = list(FEATURES)
     if web:
         flags[-1] += ',embedded-web'
     return flags
@@ -372,23 +372,22 @@ def license_notices(metadata, title='Rust crates compiled into this Capturefab e
             texts.setdefault(text, []).append(label)
     return f'{title}\n' + ''.join(f'\n===== {", ".join(names)} =====\n\n{text}\n' for text, names in texts.items())
 
-def notices(target, variant, web=False):
-    metadata = run(['cargo', 'metadata', '--format-version', '1', '--locked', '--filter-platform', target, *FEATURES[variant]], cwd=ROOT, capture_output=True, text=True).stdout
+def notices(target, web=False):
+    metadata = run(['cargo', 'metadata', '--format-version', '1', '--locked', '--filter-platform', target, *FEATURES], cwd=ROOT, capture_output=True, text=True).stdout
     text = license_notices(json.loads(metadata))
     if web:
         text += '\n' + license_notices(web_metadata(), 'Rust crates compiled into the browser client (web-client) built into this executable for serve --listen, and their license texts.')
     pins = dinov2_pins()
     dinov2_weights()
     text += f"\n===== DINOv2 ViT-S/14 model weights ({pins['REPOSITORY']}@{pins['REVISION']}, Apache-2.0), embedded for automatic capture =====\n\n{(DINOV2_DIR / 'LICENSE').read_text(encoding='utf-8').strip()}\n"
-    if variant == 'desktop':
-        text += f"\n===== Phosphor Icons 2.1.2 font (MIT), assets/fonts =====\n\n{(ROOT / 'assets/fonts/Phosphor-LICENSE.txt').read_text(encoding='utf-8').strip()}\n"
+    text += f"\n===== Phosphor Icons 2.1.2 font (MIT), assets/fonts =====\n\n{(ROOT / 'assets/fonts/Phosphor-LICENSE.txt').read_text(encoding='utf-8').strip()}\n"
     return text
 
 def link(base, name):
     return f'{base.rstrip("/")}/{name}' if base else name
 
-def record(path, os_, arch, variant, **extra):
-    return dict(name=path.name, os=os_, arch=arch, variant=variant, available=True,
+def record(path, os_, arch, **extra):
+    return dict(name=path.name, os=os_, arch=arch, available=True,
                 sha256=digest(path), size=path.stat().st_size, **extra)
 
 def verified_file(parent, item, label):
@@ -459,7 +458,7 @@ def gatekeeper(app):
     stapler('validate', app)
     run(['spctl', '--assess', '--type', 'execute', '--verbose', app])
 
-def package(args, binary, variant):
+def package(args, binary):
     inspect_binary(binary, args.os, args.arch)
     ffmpeg = Path(args.ffmpeg_bundle) / 'bin' / ('ffmpeg.exe' if args.os == 'windows' else 'ffmpeg')
     inspect_binary(ffmpeg, args.os, args.arch)
@@ -473,7 +472,7 @@ def package(args, binary, variant):
         smoke(binary)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    stem = f'capturefab-{args.version}-{args.os}-{args.arch}-{variant}'
+    stem = f'capturefab-{args.version}-{args.os}-{args.arch}'
     signed = 'unsigned'
     with tempfile.TemporaryDirectory(prefix='capturefab-package-') as temp:
         stage = Path(temp) / stem
@@ -493,14 +492,14 @@ def package(args, binary, variant):
         shutil.copy2(ROOT / 'LICENSE', stage / 'LICENSE')
         shutil.copytree(Path(args.ffmpeg_bundle) / 'licenses', stage / 'media-licenses')
         shutil.copy2(Path(args.ffmpeg_bundle) / 'build-manifest.txt', stage / 'media-build-manifest.txt')
-        (stage / 'THIRD-PARTY-LICENSES.txt').write_text(notices(args.target, variant, browser), encoding='utf-8')
-        readme = f'Capturefab {args.version}\n{args.os}/{args.arch}; {variant}\nRun capturefab --help for CLI usage. Desktop builds open the GUI with no arguments. capturefab doctor checks this computer.\nFFmpeg is embedded; no separately installed media executable or camera SDK is required.\nPlatform signature: {signed}. Verify the download against the release SHA256SUMS.\nLicenses: LICENSE (Capturefab), THIRD-PARTY-LICENSES.txt (Rust crates and bundled fonts), media-licenses/ (FFmpeg payload).\nCorresponding source: the release source and media-sources archives.\n'
+        (stage / 'THIRD-PARTY-LICENSES.txt').write_text(notices(args.target, browser), encoding='utf-8')
+        readme = f'Capturefab {args.version}\n{args.os}/{args.arch}\nRun capturefab --help for CLI usage. With no arguments it opens the GUI, or lists the CLI commands when no display is available. capturefab doctor checks this computer.\nFFmpeg is embedded; no separately installed media executable or camera SDK is required.\nPlatform signature: {signed}. Verify the download against the release SHA256SUMS.\nLicenses: LICENSE (Capturefab), THIRD-PARTY-LICENSES.txt (Rust crates and bundled fonts), media-licenses/ (FFmpeg payload).\nCorresponding source: the release source and media-sources archives.\n'
         if browser:
             readme += 'Remote browser: capturefab serve --name line1 --listen TAILNET-IP:8787 serves the browser interface. Anyone who can reach that address can control the cameras; bind it to a Tailscale or loopback address.\n'
         if args.os == 'linux':
             readme += f'Run it as a service on a Raspberry Pi, Jetson or industrial PC: {LINE_COMPUTER}\n'
         (stage / 'README.txt').write_text(readme)
-        if args.os == 'macos' and variant == 'desktop':
+        if args.os == 'macos':
             app = stage / 'Capturefab.app' / 'Contents'
             (app / 'MacOS').mkdir(parents=True)
             (app / 'Resources').mkdir()
@@ -523,7 +522,7 @@ def package(args, binary, variant):
             (app / 'Info.plist').write_bytes(plistlib.dumps(info))
             if signed == 'apple-developer-id':
                 codesign(app.parent, entitlements)
-        if args.os == 'linux' and variant == 'desktop':
+        if args.os == 'linux':
             applications = stage / 'share/applications'
             applications.mkdir(parents=True)
             shutil.copy2(ROOT / 'assets/capturefab.desktop', applications / 'capturefab.desktop')
@@ -541,13 +540,11 @@ def package(args, binary, variant):
         if args.os == 'macos' and signed == 'apple-developer-id' and os.environ.get('MACOS_NOTARY_PROFILE'):
             notarize(path)
             # Staple the app, then recreate the archive with its ticket included.
-            # A headless executable cannot hold a ticket; Gatekeeper fetches it online.
-            if variant == 'desktop':
-                gatekeeper(app.parent)
-                archive_tree(stage, path, stem)
+            gatekeeper(app.parent)
+            archive_tree(stage, path, stem)
             signed = 'apple-notarized'
     extra = dict(browser_client=True) if browser else {}
-    return record(path, args.os, args.arch, variant, target=args.target, platform_signature=signed, validation='cross-compiled' if args.skip_smoke else 'native-smoke-passed', **extra)
+    return record(path, args.os, args.arch, target=args.target, platform_signature=signed, validation='cross-compiled' if args.skip_smoke else 'native-smoke-passed', **extra)
 
 def media_sources(args):
     output = Path(args.output)
@@ -591,23 +588,23 @@ def media_sources(args):
         archive.add(recipe, arcname='media-sources/build-ffmpeg.sh')
     return path
 
-def repackage(args, variant):
+def repackage(args):
     output = Path(args.output)
     report = json.loads((output / f'build-{args.os}-{args.arch}.json').read_text())
     if report.get('version') != args.version:
         raise ValueError('existing package has a different release version')
-    item = next((item for item in report.get('assets', []) if (item['os'], item['arch'], item['variant']) == (args.os, args.arch, variant)), None)
+    item = next((item for item in report.get('assets', []) if (item['os'], item['arch']) == (args.os, args.arch)), None)
     if item is None:
-        raise ValueError(f'no verified {variant} package exists to repackage')
+        raise ValueError('no verified package exists to repackage')
     archive_path = verified_file(output, item, 'existing package')
-    stem = f'capturefab-{args.version}-{args.os}-{args.arch}-{variant}'
+    stem = f'capturefab-{args.version}-{args.os}-{args.arch}'
     name = 'capturefab.exe' if args.os == 'windows' else 'capturefab'
     with tempfile.TemporaryDirectory(prefix='capturefab-repackage-') as temp:
         binary = Path(temp) / name
         if archive_path.suffix == '.zip':
             with zipfile.ZipFile(archive_path) as archive:
                 member = f'{stem}/{name}'
-                if args.os == 'macos' and variant == 'desktop':
+                if args.os == 'macos':
                     app_binary = f'{stem}/Capturefab.app/Contents/MacOS/capturefab'
                     if app_binary in archive.namelist():
                         member = app_binary
@@ -617,7 +614,7 @@ def repackage(args, variant):
                 with archive.extractfile(f'{stem}/{name}') as stream:
                     binary.write_bytes(stream.read())
         binary.chmod(0o755)
-        return package(args, binary, variant)
+        return package(args, binary)
 
 def build(args):
     args.version = version(args.version)
@@ -626,33 +623,30 @@ def build(args):
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     assets, failures = [], []
-    for variant in args.variants.split(','):
-        if variant not in FEATURES:
-            raise ValueError('variants must be desktop and/or headless')
-        try:
-            if args.repackage:
-                assets.append(repackage(args, variant))
-                continue
+    try:
+        if args.repackage:
+            assets.append(repackage(args))
+        else:
             if args.binary:
                 binary = Path(args.binary).resolve()
             else:
                 web = web_dist()
-                command = ['cargo', 'build', '--locked', '--release', '--target', args.target, *cargo_features(variant, web)]
+                command = ['cargo', 'build', '--locked', '--release', '--target', args.target, *cargo_features(web)]
                 env = dict(os.environ, CAPTUREFAB_DINOV2_WEIGHTS=str(dinov2_weights()), CAPTUREFAB_FFMPEG_BINARY=str((Path(args.ffmpeg_bundle) / 'bin' / ('ffmpeg.exe' if args.os == 'windows' else 'ffmpeg')).resolve()), CAPTUREFAB_FFMPEG_LICENSE=str((Path(args.ffmpeg_bundle) / 'licenses/NOTICE.txt').resolve()))
                 if web:
                     env['CAPTUREFAB_WEB_DIST'] = str(web.resolve())
                 run(command, cwd=ROOT, env=env)
                 binary = (ROOT / os.environ.get('CARGO_TARGET_DIR', 'target') / args.target / 'release' / ('capturefab.exe' if args.os == 'windows' else 'capturefab')).resolve()
-            assets.append(package(args, binary, variant))
-        except (ValueError, RuntimeError, OSError) as error:
-            failures.append(dict(os=args.os, arch=args.arch, variant=variant, error=str(error)))
-            print(f'{variant}: {error}', file=sys.stderr)
+            assets.append(package(args, binary))
+    except (ValueError, RuntimeError, OSError) as error:
+        failures.append(dict(os=args.os, arch=args.arch, error=str(error)))
+        print(f'build: {error}', file=sys.stderr)
     source = media_sources(args)
     report = dict(schema_version=1, version=args.version, target=args.target, assets=assets, failures=failures,
                   media_source=dict(name=source.name, sha256=digest(source), size=source.stat().st_size))
     (output / f'build-{args.os}-{args.arch}.json').write_text(json.dumps(report, indent=2) + '\n')
     if failures:
-        raise RuntimeError(f'{len(failures)} variant(s) failed; successful artifacts and failure report retained')
+        raise RuntimeError(f'{len(failures)} build(s) failed; successful artifacts and failure report retained')
 
 def assemble(args):
     ver = version(args.version)
@@ -676,17 +670,17 @@ def assemble(args):
             shutil.copy2(media_path, output / media_path.name)
         for item in report.get('assets', []):
             path = verified_file(report_path.parent, item, 'asset')
-            key = item['os'], item['arch'], item['variant']
+            key = item['os'], item['arch']
             if key in successes:
                 raise ValueError(f'duplicate platform artifact: {key}')
             shutil.copy2(path, output / path.name)
             item['url'] = link(args.download_base, path.name)
             successes[key] = item
         for item in report.get('failures', []):
-            failures[(item['os'], item['arch'], item['variant'])] = item['error']
+            failures[(item['os'], item['arch'])] = item['error']
     if not successes:
         raise ValueError('no verified build assets found; refusing to create a release')
-    assets = [successes.get(key) or dict(os=key[0], arch=key[1], variant=key[2], name=f'capturefab-{ver}-{key[0]}-{key[1]}-{key[2]}', available=False, reason=failures.get(key, 'Not built for this release')) for key in TARGETS]
+    assets = [successes.get(key) or dict(os=key[0], arch=key[1], name=f'capturefab-{ver}-{key[0]}-{key[1]}', available=False, reason=failures.get(key, 'Not built for this release')) for key in TARGETS]
     source = source_archive(output, ver)
     bill = sbom(output, ver, args.repository, any(item.get('browser_client') for item in successes.values()))
     signature = 'SHA256SUMS.asc' if args.gpg_key else None
@@ -698,14 +692,14 @@ def assemble(args):
     (output / 'SHA256SUMS').write_text(''.join(f'{digest(p)}  {p.name}\n' for p in files))
     if signature:
         run(['gpg', '--batch', '--yes', '--pinentry-mode', 'loopback', '--passphrase-fd', '0', '--local-user', args.gpg_key, '--armor', '--detach-sign', '--output', output / signature, output / 'SHA256SUMS'], input=os.environ.get('RELEASE_GPG_PASSPHRASE', ''), text=True)
-    unavailable = [f'- {a["os"]} {a["arch"]} {a["variant"]}: {a["reason"]}' for a in assets if not a['available']]
-    notes = [f'Capturefab {ver}', '', 'One executable per platform: GUI by default in desktop builds; CLI and authenticated session automation in both variants.', '', 'Build artifacts:']
-    notes += [f'- {key[0]} {key[1]} {key[2]}: {item["validation"]}, platform signature {item["platform_signature"]}' for key, item in successes.items()]
+    unavailable = [f'- {a["os"]} {a["arch"]}: {a["reason"]}' for a in assets if not a['available']]
+    notes = [f'Capturefab {ver}', '', 'One executable per platform: it opens the GUI with no arguments (or lists the CLI commands when no display is available) and provides the CLI and authenticated session automation.', '', 'Build artifacts:']
+    notes += [f'- {key[0]} {key[1]}: {item["validation"]}, platform signature {item["platform_signature"]}' for key, item in successes.items()]
     notes += ['', 'Unavailable targets:'] + unavailable if unavailable else []
     notes += ['', 'Verification:', '- Check downloads against SHA256SUMS, for example `sha256sum --check --ignore-missing SHA256SUMS`.']
     notes += [f'- SHA256SUMS.asc is an OpenPGP signature by key {args.gpg_key}: `gpg --verify SHA256SUMS.asc SHA256SUMS`.'] if signature else []
     notes += [f'- GitHub build provenance and an SBOM attestation cover every file in SHA256SUMS: `gh attestation verify FILE --repo {args.repository}` (add `--predicate-type https://cyclonedx.org/bom` for the SBOM).'] if args.provenance else []
-    notes += [f'- {bill.name} is a CycloneDX software bill of materials: the Rust crates linked into any variant, with Cargo.lock checksums, and the pinned media components.']
+    notes += [f'- {bill.name} is a CycloneDX software bill of materials: the Rust crates linked into the executable, with Cargo.lock checksums, and the pinned media components.']
     notes += ['- Apple Developer ID, notarization and Windows Authenticode apply only where the platform signature above says so.', '', f'Corresponding source: {source.name} contains the exact Capturefab commit and vendored Cargo.lock dependency sources with an offline build configuration; each *-media-sources.tar.gz holds the verified FFmpeg, x264, SRT, OpenSSL and enabled header archives with their build manifest. Packages list Rust crate licenses in THIRD-PARTY-LICENSES.txt.']
     (output / 'release-notes.md').write_text('\n'.join(notes) + '\n')
     print(f'Prepared {ver}: {len(successes)} platform assets; {len(assets) - len(successes)} unavailable selections.')
@@ -720,9 +714,8 @@ def main():
     build_parser.add_argument('--target', required=True)
     build_parser.add_argument('--os', choices=['linux', 'macos', 'windows'], required=True)
     build_parser.add_argument('--arch', choices=['x86_64', 'aarch64'], required=True)
-    build_parser.add_argument('--variants', default='desktop,headless')
     build_parser.add_argument('--ffmpeg-bundle', required=True)
-    build_parser.add_argument('--binary', help='package an already built release executable (one --variants value)')
+    build_parser.add_argument('--binary', help='package an already built release executable')
     build_parser.add_argument('--repackage', action='store_true', help='sign/repackage verified archives already in --output without recompiling')
     build_parser.add_argument('--skip-smoke', action='store_true', help='cross build: label unexecuted target honestly')
     build_parser.add_argument('--output', default='dist')
@@ -749,8 +742,6 @@ def main():
         elif args.command == 'build':
             if args.binary and args.repackage:
                 raise ValueError('--binary and --repackage cannot be combined')
-            if args.binary and ',' in args.variants:
-                raise ValueError('--binary requires one explicit --variants value')
             build(args)
         else:
             if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', args.repository):

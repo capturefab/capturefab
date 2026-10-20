@@ -50,9 +50,8 @@
           <form class="platform-form" aria-label="Select a download">
             <label>Operating system<select id="os-select" name="os"><option value="">Choose OS</option><option value="macos">macOS</option><option value="windows">Windows</option><option value="linux">Linux</option></select></label>
             <label>Processor<select id="arch-select" name="arch"><option value="">Choose processor</option><option value="aarch64">ARM64 / Apple silicon</option><option value="x86_64">x64 / Intel or AMD</option></select></label>
-            <label>Build<select id="variant-select" name="variant"><option value="desktop">Desktop / app + CLI</option><option value="headless">Headless / CLI only</option></select></label>
           </form>
-          <p class="platform-hint" id="platform-hint">Choose your operating system and processor. Desktop builds include the app and CLI. Headless builds contain the CLI only.</p>
+          <p class="platform-hint" id="platform-hint">Choose your operating system and processor. Every download includes the app and the CLI.</p>
           <div class="download-result" aria-live="polite" aria-atomic="true">
             <div><p class="result-label" id="download-label">Published downloads</p><p id="download-description">Select a build, or open all downloads below.</p><p class="asset-detail" id="asset-detail" hidden></p></div>
             <a id="primary-download" class="button primary" hidden>Download</a>

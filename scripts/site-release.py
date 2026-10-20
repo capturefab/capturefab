@@ -46,7 +46,7 @@ PAGE = '''<!doctype html>
     <main id="main">
       <section class="page-head" aria-labelledby="downloads-title">
         <h1 id="downloads-title">All downloads</h1>
-        <p class="lead">Select a desktop build for the app and CLI. Select a headless build for the CLI only. Latest release: {status}.</p>
+        <p class="lead">Every download includes the desktop app and the CLI; with no display it lists the CLI commands. Latest release: {status}.</p>
         <p>Extract the archive before you open the app. Read the <a href="docs.html#installation">installation instructions and system requirements</a>.</p>
       </section>
 {body}    </main>
@@ -66,10 +66,7 @@ EMPTY = '''      <section class="section" aria-labelledby="none-title">
           <div><h3>Build it yourself</h3><p>Use a stable Rust toolchain, a C compiler and CMake. For x86 builds, NASM is necessary for libjpeg-turbo. GigE Vision and USB3 Vision capture work without FFmpeg. FFmpeg is necessary for webcams, streams and recording. A build can include FFmpeg or select it with <code>CAPTUREFAB_FFMPEG</code>. Read the <a href="https://github.com/capturefab/capturefab#build-test-and-release">build guide</a> for configuration.</p></div>
           <div class="code-wrap"><pre><code>git clone https://github.com/capturefab/capturefab
 cd capturefab
-# desktop app and CLI
 cargo build --release
-# headless CLI
-cargo build --release --no-default-features --features usb,jpeg
 target/release/capturefab --camera sim:0 capture -o first.png</code></pre></div>
         </div>
       </section>
@@ -96,7 +93,9 @@ def merge(manifest, addition):
     releases.update((r['version'], r) for r in ordered(addition))
     newest = ordered(dict(schema_version=1, releases=list(releases.values())))
     stable = [r for r in newest if not precedence(r['version'])[4]]
-    return dict(schema_version=1, latest=(stable or newest)[0]['version'] if newest else None, releases=newest)
+    # The site lists only the latest release.
+    latest = (stable or newest)[:1]
+    return dict(schema_version=1, latest=latest[0]['version'] if latest else None, releases=latest)
 
 def href(url):
     if urlsplit(url).scheme not in ('', 'https', 'http') or url.startswith('//'):
@@ -107,7 +106,7 @@ def size(value):
     return f'{value / 1048576:.1f} MiB'
 
 def row(asset):
-    cells = [OS.get(asset['os'], asset['os']), ARCH.get(asset['arch'], asset['arch']), asset['variant']]
+    cells = [OS.get(asset['os'], asset['os']), ARCH.get(asset['arch'], asset['arch'])]
     head = ''.join(f'<td>{html.escape(c)}</td>' for c in cells)
     if not asset.get('available'):
         return f'<tr>{head}<td class="unavailable">Not published</td><td>—</td><td>{html.escape(asset.get("reason", ""))}</td></tr>'
@@ -123,7 +122,7 @@ def section(release, latest):
         <div class="section-heading"><p class="eyebrow">{html.escape(release['date'])}{' / latest' if latest else ''}</p><h2 id="v{version}-title">capturefab {version}</h2></div>
         <p class="section-intro">{' · '.join(f'<a href="{href(url)}">{label}</a>' for url, label in links if url)}</p>
 {cards}
-        <details class="all-builds"><summary>File details and SHA-256 checksums</summary><div class="table-scroll"><table class="release-assets"><caption>capturefab {version} release assets</caption><thead><tr><th scope="col">System</th><th scope="col">Processor</th><th scope="col">Build</th><th scope="col">File</th><th scope="col">SHA-256</th><th scope="col">Notes</th></tr></thead><tbody>
+        <details class="all-builds"><summary>File details and SHA-256 checksums</summary><div class="table-scroll"><table class="release-assets"><caption>capturefab {version} release assets</caption><thead><tr><th scope="col">System</th><th scope="col">Processor</th><th scope="col">File</th><th scope="col">SHA-256</th><th scope="col">Notes</th></tr></thead><tbody>
 {rows}
         </tbody></table></div></details>
       </section>
@@ -136,28 +135,23 @@ def download_cards(release):
         builds = [asset for asset in release['assets'] if asset['os'] == system and asset.get('available')]
         if not builds:
             continue
-        lists = {}
-        for variant in ('desktop', 'headless'):
-            items = []
-            for asset in builds:
-                if asset['variant'] != variant:
-                    continue
-                processor = ARCH.get(asset['arch'], asset['arch'])
-                detail = ' · '.join(filter(None, (size(asset['size']), NOTES.get(asset.get('platform_signature'), ''))))
-                items.append(f'<li><div><strong>{html.escape(processor)}</strong><small>{html.escape(detail)}</small></div><a class="button {"primary" if variant == "desktop" else ""}" href="{href(asset["url"])}" aria-label="Download Capturefab {html.escape(release["version"])} for {label} {html.escape(processor)} {variant}">Download {html.escape(processor)} <span aria-hidden="true">↓</span></a></li>')
-            lists[variant] = '<ul class="static-build-list">' + ''.join(items) + '</ul>' if items else '<p>No published build.</p>'
-        cards.append(f'<article class="platform-download-card"><h3>{label}</h3><p>Desktop app and CLI</p>{lists["desktop"]}<details><summary>Headless CLI builds</summary>{lists["headless"]}</details></article>')
+        items = []
+        for asset in builds:
+            processor = ARCH.get(asset['arch'], asset['arch'])
+            detail = ' · '.join(filter(None, (size(asset['size']), NOTES.get(asset.get('platform_signature'), ''))))
+            items.append(f'<li><div><strong>{html.escape(processor)}</strong><small>{html.escape(detail)}</small></div><a class="button primary" href="{href(asset["url"])}" aria-label="Download Capturefab {html.escape(release["version"])} for {label} {html.escape(processor)}">Download {html.escape(processor)} <span aria-hidden="true">↓</span></a></li>')
+        cards.append(f'<article class="platform-download-card"><h3>{label}</h3><p>Desktop app and CLI</p><ul class="static-build-list">{"".join(items)}</ul></article>')
     return '<div class="platform-download-grid">' + ''.join(cards) + '</div>' if cards else ''
 
 def downloads(manifest, site):
-    releases = ordered(manifest)
-    body = ''.join(section(r, r['version'] == manifest.get('latest')) for r in releases) or EMPTY
+    releases = [r for r in ordered(manifest) if r['version'] == manifest.get('latest')] or ordered(manifest)[:1]
+    body = ''.join(section(r, True) for r in releases) or EMPTY
     status = f'v{html.escape(manifest["latest"])}' if manifest.get('latest') else 'none published yet'
     return PAGE.format(site=html.escape(site), status=status, body=body)
 
 def entry(release, site):
     page = f'{site}downloads.html#v{release["version"]}'
-    published = [f'{OS.get(a["os"], a["os"])} {ARCH.get(a["arch"], a["arch"])} {a["variant"]}' for a in release['assets'] if a.get('available')]
+    published = [f'{OS.get(a["os"], a["os"])} {ARCH.get(a["arch"], a["arch"])}' for a in release['assets'] if a.get('available')]
     summary = f'Published downloads: {", ".join(published)}.' if published else 'No published downloads.'
     return f'''  <entry>
     <id>{href(release.get('url') or page)}</id>

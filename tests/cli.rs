@@ -3118,6 +3118,30 @@ fn headless_build_without_a_command_explains_serve() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(all(feature = "gui", target_os = "linux"))]
+#[test]
+fn no_display_without_a_command_lists_the_cli() {
+    let dir = temp_root("no-display");
+    let out = cmd_env(&dir, &[("DISPLAY", ""), ("WAYLAND_DISPLAY", "")], &[]);
+    assert_eq!(out.status.code(), Some(0));
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains("Usage:") && help.contains("discover"),
+        "{help}"
+    );
+    assert!(help.contains("capturefab serve --name bench"), "{help}");
+    // No window means no session: nothing was created.
+    assert!(!dir.exists());
+    // Asked for JSON, it is still an error, since there is no command to run.
+    let out = cmd_env(
+        &dir,
+        &[("DISPLAY", ""), ("WAYLAND_DISPLAY", "")],
+        &["--json"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn dataset_rows(dir: &PathBuf, file: &std::path::Path, sql: &str) -> Value {
     json(
         dir,

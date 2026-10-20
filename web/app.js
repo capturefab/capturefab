@@ -5,7 +5,6 @@
   const $ = (id) => document.getElementById(id);
   const os = $('os-select');
   const arch = $('arch-select');
-  const variant = $('variant-select');
   let manifest = null;
   let release = null;
   let assets = [];
@@ -27,7 +26,7 @@
   };
   const text = (id, value) => { $(id).textContent = value; };
   const formatSize = (value) => typeof value === 'number' && value > 0 ? `${(value / 1048576).toFixed(1)} MiB` : '';
-  const isPublished = (asset) => asset.available === true && safeUrl(asset.url) && /^[a-f0-9]{64}$/i.test(asset.sha256 || '') && osNames[asset.os] && archNames[asset.arch] && ['desktop', 'headless'].includes(asset.variant);
+  const isPublished = (asset) => asset.available === true && safeUrl(asset.url) && /^[a-f0-9]{64}$/i.test(asset.sha256 || '') && osNames[asset.os] && archNames[asset.arch];
   const makeLink = (label, value) => {
     const href = safeUrl(value);
     if (!href) return document.createTextNode(label);
@@ -79,9 +78,9 @@
       text('download-description', 'Select your operating system and processor to find the applicable build.');
       return;
     }
-    const matching = assets.filter((asset) => asset.os === os.value && asset.arch === arch.value && asset.variant === variant.value);
+    const matching = assets.filter((asset) => asset.os === os.value && asset.arch === arch.value);
     const selected = matching.find(isPublished);
-    text('download-label', `${archGuessed ? 'Best match: ' : ''}${osNames[os.value]} / ${archNames[arch.value]} / ${variant.value}`);
+    text('download-label', `${archGuessed ? 'Best match: ' : ''}${osNames[os.value]} / ${archNames[arch.value]}`);
     if (!selected) {
       text('download-description', 'This build is not available. Open all downloads or read the release feed.');
       return;
@@ -92,15 +91,15 @@
     const download = $('primary-download');
     download.href = safeUrl(selected.url);
     download.setAttribute('download', selected.name);
-    download.setAttribute('aria-label', `Download capturefab ${release.version} for ${osNames[os.value]} ${archNames[arch.value]} (${variant.value})`);
+    download.setAttribute('aria-label', `Download capturefab ${release.version} for ${osNames[os.value]} ${archNames[arch.value]}`);
     download.hidden = false;
     download.textContent = `Download for ${osNames[os.value]} (${chipName(os.value, arch.value)})`;
-    if (selected.variant === 'desktop') armOneclick(selected);
+    armOneclick(selected);
     if ($('install-hint')) {
       const instructions = {
-        macos: selected.variant === 'desktop' ? 'Extract the ZIP file. Move Capturefab.app to Applications. Open Capturefab.app.' : 'Extract the ZIP file. In a terminal, run capturefab --help from the extracted folder.',
-        windows: 'Extract all files from the ZIP archive.' + (selected.variant === 'headless' ? ' In PowerShell, run .\\capturefab.exe --help from the extracted folder.' : ' Open capturefab.exe from the extracted folder.'),
-        linux: 'Extract the .tar.gz archive. From the extracted folder, use ./capturefab for the desktop or ./capturefab --help for CLI options.'
+        macos: 'Extract the ZIP file. Move Capturefab.app to Applications. Open Capturefab.app.',
+        windows: 'Extract all files from the ZIP archive. Open capturefab.exe from the extracted folder, or run .\\capturefab.exe --help in PowerShell for the CLI.',
+        linux: 'Extract the .tar.gz archive. From the extracted folder, run ./capturefab to open the desktop app, or ./capturefab --help for CLI options. On a computer with no display it lists the CLI commands.'
       };
       text('install-hint', instructions[os.value]);
       $('install-hint').hidden = false;
@@ -126,9 +125,9 @@
     const guess = archGuessed && arch.value ? `Best guess: ${archNames[arch.value]}${os.value === 'macos' ? ' (Apple silicon)' : ''}. Your browser did not report the processor. If wrong, choose another processor. ` : '';
     text('platform-hint', guess + (thirtyTwoBitArm && os.value === 'linux' && !arch.value ? armhf : hints[os.value]) || 'Select the computer that runs Capturefab. If the browser cannot identify the processor architecture, select it.');
   };
-  const hasDownloadPanel = Boolean(os && arch && variant);
+  const hasDownloadPanel = Boolean(os && arch);
   if (hasDownloadPanel) {
-    for (const control of [os, arch, variant]) control.addEventListener('change', () => { if (control === arch || control === os) processorChosen = true; if (control === arch) archGuessed = false; updateHint(); renderSelection(); });
+    for (const control of [os, arch]) control.addEventListener('change', () => { if (control === arch || control === os) processorChosen = true; if (control === arch) archGuessed = false; updateHint(); renderSelection(); });
     document.querySelector('.platform-form').addEventListener('submit', (event) => event.preventDefault());
   }
   const detectPlatform = async () => {

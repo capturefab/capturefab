@@ -13,7 +13,6 @@ import zipfile
 import release
 
 ARCHES = ('x86_64', 'aarch64')
-VARIANTS = ('desktop', 'headless')
 
 
 def empty_output(path):
@@ -23,9 +22,9 @@ def empty_output(path):
     return path
 
 
-def read_package(path, ver, arch, variant):
+def read_package(path, ver, arch):
     """Read only named members; never extract an artifact-controlled path."""
-    stem = f'capturefab-{ver}-windows-{arch}-{variant}'
+    stem = f'capturefab-{ver}-windows-{arch}'
     binary_name, readme_name = f'{stem}/capturefab.exe', f'{stem}/README.txt'
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
@@ -40,7 +39,7 @@ def read_package(path, ver, arch, variant):
         if binary_name not in names or readme_name not in names:
             raise ValueError(f'executable or README missing from {path.name}')
         binary, readme = archive.read(binary_name), archive.read(readme_name)
-        if readme.decode('utf-8').splitlines()[:2] != [f'Capturefab {ver}', f'windows/{arch}; {variant}']:
+        if readme.decode('utf-8').splitlines()[:2] != [f'Capturefab {ver}', f'windows/{arch}']:
             raise ValueError(f'README has the wrong release identity: {path.name}')
         if readme.count(b'Platform signature: unsigned.') != 1:
             raise ValueError(f'README must declare an unsigned executable: {path.name}')
@@ -48,7 +47,7 @@ def read_package(path, ver, arch, variant):
 
 
 def builds(ver, root):
-    """Require every native-validated Windows variant and verified source."""
+    """Require every native-validated Windows package and verified source."""
     root = Path(root)
     reports = sorted(root.rglob('build-*.json'))
     expected = {f'build-windows-{arch}.json' for arch in ARCHES}
@@ -64,26 +63,23 @@ def builds(ver, root):
                 or report.get('failures') != []):
             raise ValueError(f'invalid or failed Windows build report: {report_path.name}')
         assets = report.get('assets')
-        if not isinstance(assets, list) or len(assets) != len(VARIANTS):
-            raise ValueError(f'both Windows variants are required: {report_path.name}')
-        seen, packages = set(), []
+        if not isinstance(assets, list) or len(assets) != 1:
+            raise ValueError(f'the Windows desktop package is required: {report_path.name}')
+        packages = []
         for item in assets:
             if not isinstance(item, dict):
                 raise ValueError(f'invalid Windows asset: {report_path.name}')
-            variant = item.get('variant')
-            if (variant not in VARIANTS or variant in seen
-                    or item.get('os') != 'windows' or item.get('arch') != arch
+            if (item.get('os') != 'windows' or item.get('arch') != arch
                     or item.get('target') != target or item.get('available') is not True
                     or item.get('validation') != 'native-smoke-passed'
                     or item.get('platform_signature') != 'unsigned'
-                    or item.get('name') != f'capturefab-{ver}-windows-{arch}-{variant}.zip'):
-                raise ValueError(f'Windows asset is not a native-tested unsigned {arch} variant')
-            seen.add(variant)
+                    or item.get('name') != f'capturefab-{ver}-windows-{arch}.zip'):
+                raise ValueError(f'Windows asset is not a native-tested unsigned {arch} package')
             path = release.verified_file(report_path.parent, item, 'Windows package')
-            binary, binary_name, readme_name = read_package(path, ver, arch, variant)
+            binary, binary_name, readme_name = read_package(path, ver, arch)
             packages.append(dict(item=item, path=path, binary=binary,
                                  binary_name=binary_name, readme_name=readme_name,
-                                 signed_name=f'capturefab-{arch}-{variant}.exe'))
+                                 signed_name=f'capturefab-{arch}.exe'))
         media = report.get('media_source')
         media_path = release.verified_file(report_path.parent, media, 'corresponding media source')
         if media['name'] != f'capturefab-{ver}-windows-{arch}-media-sources.tar.gz':

@@ -77,7 +77,7 @@
           <p class="doc-summary">Let Claude Code, Codex, Antigravity or another CLI harness drive Capturefab. Keep the desktop open to review captures and intervene.</p>
           <p>Your harness supplies model access. Capturefab provider credentials are unnecessary for this route. The built-in <a href="#assistant">AI assistant</a> has separate provider settings. Your harness controls whether its model receives images and tool results.</p>
           <h3>1. Make the CLI available</h3>
-          <p><a href="#installation">Install a desktop build</a> for a visible workspace. Use a headless build for a computer without a display. Add the executable directory to your harness's <code>PATH</code>, or give it the executable's full path.</p>
+          <p><a href="#installation">Install Capturefab</a> for a visible workspace. On a computer without a display, the same download lists the CLI commands. Add the executable directory to your harness's <code>PATH</code>, or give it the executable's full path.</p>
           <div class="code-wrap"><pre><code>capturefab --version
 capturefab doctor --json
 capturefab tools list --compact --json
@@ -157,16 +157,16 @@ capturefab --session line1 dataset export -o exports/line1-shift-b</code></pre><
 
         <article class="doc-section" id="installation" data-doc-section data-doc-title="Install and verify a release" data-doc-category="Start here" data-doc-tags="install,download,linux,macos,windows,arm64,checksum,headless">
           <p class="eyebrow">Start here</p><h2>Install and verify a release</h2>
-          <p class="doc-summary">Choose a desktop build for the app and command-line interface (CLI). Choose a headless build for a computer without a display.</p>
+          <p class="doc-summary">Every download includes the app and the command-line interface (CLI). On a computer without a display, the same executable works as a CLI.</p>
           <p>The <a href="downloads.html">download page</a> lists release files and their SHA-256 checksums. Select the build for your installed operating system and processor architecture. Apple silicon uses ARM64. Intel and AMD PCs usually use x64. On Raspberry Pi and Jetson, a 64-bit processor can have a 32-bit operating system.</p>
           <div class="table-scroll"><table><caption>Verify the downloaded file</caption><thead><tr><th scope="col">System</th><th scope="col">Command</th></tr></thead><tbody><tr><td>Linux</td><td><code>sha256sum DOWNLOADED_FILE</code></td></tr><tr><td>macOS</td><td><code>shasum -a 256 DOWNLOADED_FILE</code></td></tr><tr><td>Windows PowerShell</td><td><code>Get-FileHash DOWNLOADED_FILE -Algorithm SHA256</code></td></tr></tbody></table></div>
           <p>Compare the result with the checksum for the same release file. Then extract the archive. Keep the included license files with the application.</p>
-          <div class="table-scroll"><table><caption>Open the extracted desktop build</caption><thead><tr><th scope="col">System</th><th scope="col">Steps</th></tr></thead><tbody>
+          <div class="table-scroll"><table><caption>Open the extracted download</caption><thead><tr><th scope="col">System</th><th scope="col">Steps</th></tr></thead><tbody>
             <tr><td>macOS</td><td>Extract the <code>.zip</code> file. Open <code>Capturefab.app</code> from the extracted folder. For the CLI, run <code>./capturefab --help</code> from that folder. Keep this launcher beside the app.</td></tr>
             <tr><td>Windows</td><td>Extract the <code>.zip</code> file. Open <code>capturefab.exe</code> from the extracted folder. In PowerShell, run <code>.\capturefab.exe</code> from that folder.</td></tr>
             <tr><td>Linux</td><td>Extract the <code>.tar.gz</code> file. Open a terminal in the extracted folder. Run <code>./capturefab</code>. If necessary, set executable permission with <code>chmod +x ./capturefab</code>.</td></tr>
           </tbody></table></div>
-          <p>The extracted executable also provides the CLI. Add its directory to your <code>PATH</code> to use the shorter commands in these guides. A headless build opens no desktop window. Use an explicit subcommand such as <code>doctor --json</code> or <code>serve</code>. To run <code>serve</code> as a service on a Raspberry Pi, Jetson or industrial PC and use it from a laptop's browser, follow the <a href="https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md">line computer guide</a>.</p>
+          <p>The extracted executable also provides the CLI. Add its directory to your <code>PATH</code> to use the shorter commands in these guides. With no display (an SSH login on Linux), running it without a subcommand lists the CLI commands instead of opening a window. Use an explicit subcommand such as <code>doctor --json</code> or <code>serve</code>. To run <code>serve</code> as a service on a Raspberry Pi, Jetson or industrial PC and use it from a laptop's browser, follow the <a href="https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md">line computer guide</a>.</p>
           <p>After moving the macOS app to Applications, use <code>/Applications/Capturefab.app/Contents/MacOS/capturefab</code> as the executable path. Run your harness under the same operating-system account as the local session.</p>
           <div class="table-scroll"><table><caption>Minimum operating system versions</caption><thead><tr><th scope="col">Build</th><th scope="col">Minimum requirement</th></tr></thead><tbody>
             <tr><td>macOS ARM64</td><td>macOS 11.0</td></tr>
@@ -683,7 +683,7 @@ capturefab workflow validate examples/workflows/multi-camera-timelapse.json --js
 
         <article class="doc-section" id="camera-tools" data-doc-section data-doc-title="Camera tools for agents" data-doc-category="Record and automate" data-doc-tags="tools,agents,codex,claude code,inspect_frame,set_camera_features,wait_for,plan,dry run,confirmation,IssueCode,images">
           <p class="eyebrow">Record &amp; automate</p><h2>Camera tools for agents</h2>
-          <p class="doc-summary">External agents use the shared tool registry to examine frames, adjust settings, acquire sensor values and verify image and data captures. Desktop and headless builds provide the same tools.</p>
+          <p class="doc-summary">External agents use the shared tool registry to examine frames, adjust settings, acquire sensor values and verify image and data captures. The app and a headless <code>serve</code> session provide the same tools.</p>
           <ol><li>Start <code>serve --name bench</code> or <code>gui --name bench</code>.</li><li>Read <code>tools list --compact --json</code>, the relevant <code>tools describe NAME --json</code> schemas and <code>get_overview</code>.</li><li>Connect a listed camera, then start live view.</li><li>Examine the returned image file and numeric measurements.</li><li>Read settings before a change, and supply their current values in <code>expect</code>.</li><li>Use <code>wait_for</code>, then acquire another observation to verify the change.</li><li>Capture the requested files after verification.</li></ol>
           <div class="code-wrap"><pre><code>capturefab serve --name bench
 # In another terminal:
@@ -884,7 +884,7 @@ capturefab --session bench status --json</code></pre><button class="copy-button"
           <div class="code-wrap"><pre><code>git clone https://github.com/capturefab/capturefab
 cd capturefab
 cargo build --release
-# Headless release set: cameras, scanners, images, uploads, signals, exports and DINOv2
+# Without the GUI: cameras, scanners, images, uploads, signals, exports and DINOv2
 cargo build --release --no-default-features \
   --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,s3,ftp,sftp,parquet,modbus,mqtt,opcua,mtconnect,dinov2,hubs
 target/release/capturefab --camera sim:0 capture -o first.png

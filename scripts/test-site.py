@@ -291,11 +291,11 @@ def check_manifest(root, errors):
     for release in manifest["releases"]:
         targets = set()
         for asset in release["assets"]:
-            identity = (asset["os"], asset["arch"], asset["variant"])
+            identity = (asset["os"], asset["arch"])
             if identity in targets:
                 errors.append(f"duplicate download selection: {identity}")
             targets.add(identity)
-            if asset["os"] not in {"macos", "windows", "linux"} or asset["arch"] not in {"x86_64", "aarch64", "armv7"} or asset["variant"] not in {"desktop", "headless"}:
+            if asset["os"] not in {"macos", "windows", "linux"} or asset["arch"] not in {"x86_64", "aarch64", "armv7"}:
                 errors.append(f"unknown download selection: {identity}")
             if not asset.get("available"):
                 continue
@@ -317,7 +317,7 @@ def check_processors(root, errors):
     spec = importlib.util.spec_from_file_location("release", Path(__file__).with_name("release.py"))
     release = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(release)
-    built = {arch for _, arch, _ in release.TARGETS}
+    built = {arch for _, arch in release.TARGETS}
     select = re.search(r'<select id="arch-select"[^>]*>(.*?)</select>', (root / "index.html").read_text(encoding="utf-8"), re.S)
     offered = set(re.findall(r'<option value="([^"]+)"', select[1])) if select else set()
     if not offered or offered - built:

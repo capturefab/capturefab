@@ -316,7 +316,7 @@ Execution failure `applied` contains `{completed,failed_step,step_count}`; reche
 ## Let an agent drive cameras
 
 Use `tools` for checked camera operations from Claude Code, Codex or another external agent.
-The same registry is available in desktop and headless builds.
+The same registry is available in the app and in headless `serve` sessions.
 Use the installed catalog to obtain names, schemas, ranges and risk classes.
 
 1. Start a shared session with `serve --name bench` or `gui --name bench`.
@@ -790,7 +790,7 @@ Explicit `--delete-oldest` retention only removes completed Capturefab files who
 
 ## Install the correct release
 
-Read [`releases.json`](releases.json). Its schema is version 1. Each available asset identifies its operating system, architecture, desktop/headless variant, file name, download URL, SHA-256 checksum, and optional signature/application bundle; `browser_client: true` marks an executable with the browser client for `serve --listen` built in. An empty releases list is not a published release. Assets marked `available: false` must not be offered as downloads. A release may also link `sbom_url`, a CycloneDX software bill of materials, and its files carry GitHub build-provenance and SBOM attestations (`gh attestation verify FILE --repo capturefab/capturefab`).
+Read [`releases.json`](releases.json). Its schema is version 1. Each available asset identifies its operating system, architecture, file name, download URL, SHA-256 checksum, and optional signature/application bundle; `browser_client: true` marks an executable with the browser client for `serve --listen` built in. An empty releases list is not a published release. Assets marked `available: false` must not be offered as downloads. A release may also link `sbom_url`, a CycloneDX software bill of materials, and its files carry GitHub build-provenance and SBOM attestations (`gh attestation verify FILE --repo capturefab/capturefab`).
 
 On Debian-based Linux, including Raspberry Pi OS and Jetson Linux, use `dpkg --print-architecture`: `amd64` is x64 and `arm64` is ARM64. `armhf` is a 32-bit ARM system, which has no build; tell the user to install the 64-bit OS (Raspberry Pi 3 and later run it). Do not rely on `uname -m` there, which prints `aarch64` on 32-bit Raspberry Pi OS too. Elsewhere use `uname -m` on Linux and macOS (`x86_64` is x64, `aarch64` and `arm64` are ARM64) or the operating system's system information on Windows. Apple Silicon uses ARM64. Verify the release checksum before running a downloaded binary.
 

@@ -19,7 +19,7 @@ sign_windows = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sign_windows)
 
 
-def executable(arch, variant):
+def executable(arch):
     """A PE32+ with a native target header and an empty import directory."""
     data = bytearray(1024)
     data[:2] = b'MZ'
@@ -32,7 +32,7 @@ def executable(arch, variant):
     # Section virtual size/address/raw size/offset; no imported DLLs.
     struct.pack_into('<IIII', data, 152 + 240 + 8, 512, 4096, 512, 512)
     data[512:520] = b'CODETEST'
-    return bytes(data) + f'{arch}/{variant}/embedded-ffmpeg'.encode()
+    return bytes(data) + f'{arch}/embedded-ffmpeg'.encode()
 
 
 def signed_binary(data):
@@ -54,33 +54,32 @@ class WindowsSigningTests(unittest.TestCase):
             folder = args.input / f'build-windows-{arch}'
             folder.mkdir(parents=True)
             assets = []
-            for variant in sign_windows.VARIANTS:
-                stem = f'capturefab-1.2.3-windows-{arch}-{variant}'
-                path = folder / f'{stem}.zip'
-                binary = executable(arch, variant)
-                members = {
-                    f'{stem}/capturefab.exe': binary,
-                    f'{stem}/README.txt': (f'Capturefab 1.2.3\r\nwindows/{arch}; {variant}\r\n'
-                                         'Platform signature: unsigned. Verify SHA256SUMS.\r\n').encode(),
-                    f'{stem}/LICENSE': b'capturefab license',
-                    f'{stem}/THIRD-PARTY-LICENSES.txt': b'crate licenses',
-                    f'{stem}/media-licenses/FFmpeg.txt': b'FFmpeg license',
-                    f'{stem}/media-build-manifest.txt': b'native media metadata',
-                }
-                with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as archive:
-                    archive.comment = b'original archive comment'
-                    for name, data in members.items():
-                        info = zipfile.ZipInfo(name, date_time=(2026, 10, 15, 12, 0, 0))
-                        info.external_attr = 0o100755 << 16
-                        info.comment = b'original member comment'
-                        info.compress_type = zipfile.ZIP_DEFLATED
-                        archive.writestr(info, data)
-                originals[(arch, variant)] = (path, members)
-                assets.append(release.record(path, 'windows', arch, variant,
-                                             target=f'{arch}-pc-windows-msvc',
-                                             platform_signature='unsigned',
-                                             validation='native-smoke-passed',
-                                             native_metadata='retain this'))
+            stem = f'capturefab-1.2.3-windows-{arch}'
+            path = folder / f'{stem}.zip'
+            binary = executable(arch)
+            members = {
+                f'{stem}/capturefab.exe': binary,
+                f'{stem}/README.txt': (f'Capturefab 1.2.3\r\nwindows/{arch}\r\n'
+                                     'Platform signature: unsigned. Verify SHA256SUMS.\r\n').encode(),
+                f'{stem}/LICENSE': b'capturefab license',
+                f'{stem}/THIRD-PARTY-LICENSES.txt': b'crate licenses',
+                f'{stem}/media-licenses/FFmpeg.txt': b'FFmpeg license',
+                f'{stem}/media-build-manifest.txt': b'native media metadata',
+            }
+            with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as archive:
+                archive.comment = b'original archive comment'
+                for name, data in members.items():
+                    info = zipfile.ZipInfo(name, date_time=(2026, 10, 15, 12, 0, 0))
+                    info.external_attr = 0o100755 << 16
+                    info.comment = b'original member comment'
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    archive.writestr(info, data)
+            originals[arch] = (path, members)
+            assets.append(release.record(path, 'windows', arch,
+                                         target=f'{arch}-pc-windows-msvc',
+                                         platform_signature='unsigned',
+                                         validation='native-smoke-passed',
+                                         native_metadata='retain this'))
             media = folder / f'capturefab-1.2.3-windows-{arch}-media-sources.tar.gz'
             media.write_bytes(b'verified native media source ' + arch.encode())
             report = dict(schema_version=1, version='1.2.3', target=f'{arch}-pc-windows-msvc',
@@ -95,7 +94,7 @@ class WindowsSigningTests(unittest.TestCase):
             path.write_bytes(signed_binary(path.read_bytes()))
         args.output = args.output.parent / 'signed-output'
 
-    def test_both_architectures_and_variants_preserve_native_artifacts(self):
+    def test_both_architectures_preserve_native_artifacts(self):
         with tempfile.TemporaryDirectory() as temp:
             args, originals = self.fixture(Path(temp))
             self.prepare_signed(args)
@@ -106,8 +105,8 @@ class WindowsSigningTests(unittest.TestCase):
                 self.assertEqual(len(command), 6)
             with mock.patch.dict(os.environ, WINDOWS_SIGNTOOL='custom-signtool'), mock.patch.object(release, 'run', side_effect=verify):
                 sign_windows.finish(args)
-            self.assertEqual(len(calls), 4)
-            self.assertEqual(len(list(args.output.iterdir())), 8)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(list(args.output.iterdir())), 6)
             for arch in sign_windows.ARCHES:
                 source_folder = args.input / f'build-windows-{arch}'
                 report_name = f'build-windows-{arch}.json'
@@ -119,8 +118,7 @@ class WindowsSigningTests(unittest.TestCase):
                                  (source_folder / before['media_source']['name']).read_bytes())
                 self.assertEqual(after['failures'], [])
                 for item in after['assets']:
-                    variant = item['variant']
-                    path, members = originals[(arch, variant)]
+                    path, members = originals[arch]
                     output = release.verified_file(args.output, item, 'signed output')
                     self.assertEqual(item['validation'], 'native-smoke-passed')
                     self.assertEqual(item['platform_signature'], 'authenticode')
@@ -141,7 +139,7 @@ class WindowsSigningTests(unittest.TestCase):
 
     def test_prepare_rejects_missing_duplicate_or_invalid_builds(self):
         for mutation in ('missing-report', 'duplicate-report', 'version', 'schema', 'target', 'failures',
-                         'missing-variant', 'duplicate-variant', 'wrong-platform', 'cross-compiled',
+                         'missing-package', 'wrong-platform', 'cross-compiled',
                          'already-signed', 'wrong-asset-target', 'wrong-media', 'tampered-media',
                          'missing-media', 'tampered-package', 'unsafe-package-name'):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp:
@@ -156,10 +154,8 @@ class WindowsSigningTests(unittest.TestCase):
                     report[{'schema': 'schema_version'}.get(mutation, mutation)] = {'version': '2.0.0', 'schema': 2,
                                                                                   'target': 'aarch64-pc-windows-msvc',
                                                                                   'failures': [{'error': 'build failed'}]}[mutation]
-                elif mutation == 'missing-variant':
+                elif mutation == 'missing-package':
                     report['assets'].pop()
-                elif mutation == 'duplicate-variant':
-                    report['assets'][1] = report['assets'][0]
                 elif mutation == 'wrong-platform':
                     report['assets'][0]['os'] = 'linux'
                 elif mutation == 'cross-compiled':
@@ -201,19 +197,19 @@ class WindowsSigningTests(unittest.TestCase):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp:
                 args, _ = self.fixture(Path(temp))
                 self.prepare_signed(args)
-                path = args.signed / 'capturefab-aarch64-headless.exe'
+                path = args.signed / 'capturefab-aarch64.exe'
                 if mutation == 'missing':
                     path.unlink()
                 elif mutation == 'extra':
                     (args.signed / 'unexpected.exe').write_bytes(b'wrong')
                 elif mutation == 'wrong-arch':
-                    path.write_bytes((args.signed / 'capturefab-x86_64-headless.exe').read_bytes())
+                    path.write_bytes((args.signed / 'capturefab-x86_64.exe').read_bytes())
                 elif mutation == 'changed-code':
                     data = bytearray(path.read_bytes())
                     data[512] ^= 1
                     path.write_bytes(data)
                 elif mutation == 'unsigned':
-                    path.write_bytes(executable('aarch64', 'headless'))
+                    path.write_bytes(executable('aarch64'))
                 else:
                     path.write_bytes(path.read_bytes() + b'additional unverified bytes')
                 with self.assertRaises(ValueError), mock.patch.object(release, 'run'):
@@ -243,16 +239,16 @@ class WindowsSigningTests(unittest.TestCase):
             def verify(command):
                 self.assertFalse(args.output.exists())
                 calls.append(command)
-                if len(calls) == 4:
+                if len(calls) == 2:
                     raise RuntimeError('last signature failed')
             with mock.patch.object(release, 'run', side_effect=verify):
                 with self.assertRaisesRegex(RuntimeError, 'last signature failed'):
                     sign_windows.finish(args)
-            self.assertEqual(len(calls), 4)
+            self.assertEqual(len(calls), 2)
             self.assertFalse(args.output.exists())
 
     def test_only_authenticode_pe_mutations_are_allowed(self):
-        original = executable('aarch64', 'headless') + b'!'
+        original = executable('aarch64') + b'!!'
         valid = signed_binary(original)
         sign_windows.same_tested_binary(original, valid)
         for mutation in ('nonzero-padding', 'changed-checksum-neighbor', 'changed-header', 'bad-directory', 'truncated'):
@@ -289,7 +285,7 @@ class WindowsSigningTests(unittest.TestCase):
                            'media-licenses/../../escape.txt', 'extra.exe', 'duplicate'):
             with self.subTest(unexpected=unexpected), tempfile.TemporaryDirectory() as temp:
                 args, originals = self.fixture(Path(temp))
-                path, members = originals[('x86_64', 'desktop')]
+                path, members = originals['x86_64']
                 stem = path.stem
                 if unexpected == 'duplicate':
                     # Build a duplicate without zipfile's intentional warning.
