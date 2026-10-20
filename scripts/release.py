@@ -560,8 +560,9 @@ def media_sources(args):
         f'openssl-{pins["OPENSSL_VERSION"]}.tar.gz': pins['OPENSSL_SHA256'],
         f'srt-{pins["SRT_VERSION"]}.tar.gz': pins['SRT_SHA256'],
         f'x264-{pins["X264_COMMIT"]}.tar.gz': pins['X264_SHA256'],
+        f'zlib-{pins["ZLIB_VERSION"]}.tar.gz': pins['ZLIB_SHA256'],
     }
-    for label, key in [('FFmpeg', 'FFMPEG_VERSION'), ('OpenSSL', 'OPENSSL_VERSION'), ('SRT', 'SRT_VERSION'), ('x264', 'X264_COMMIT')]:
+    for label, key in [('FFmpeg', 'FFMPEG_VERSION'), ('OpenSSL', 'OPENSSL_VERSION'), ('SRT', 'SRT_VERSION'), ('x264', 'X264_COMMIT'), ('zlib', 'ZLIB_VERSION')]:
         if not re.search(rf'^{label} {re.escape(pins[key])}$', manifest, re.M):
             raise ValueError(f'FFmpeg build manifest does not match the pinned {label} source')
     for label, name, key, version_key, flags in [('NVENC/NVDEC', f'nv-codec-headers-{pins["NV_HEADERS_VERSION"]}.tar.gz', 'NV_HEADERS_SHA256', 'NV_HEADERS_VERSION', ['ffnvcodec', 'nvenc', 'nvdec', 'cuvid']), ('AMF', f'amf-headers-{pins["AMF_VERSION"]}.tar.gz', 'AMF_SHA256', 'AMF_VERSION', ['amf'])]:
@@ -700,7 +701,7 @@ def assemble(args):
     notes += [f'- SHA256SUMS.asc is an OpenPGP signature by key {args.gpg_key}: `gpg --verify SHA256SUMS.asc SHA256SUMS`.'] if signature else []
     notes += [f'- GitHub build provenance and an SBOM attestation cover every file in SHA256SUMS: `gh attestation verify FILE --repo {args.repository}` (add `--predicate-type https://cyclonedx.org/bom` for the SBOM).'] if args.provenance else []
     notes += [f'- {bill.name} is a CycloneDX software bill of materials: the Rust crates linked into the executable, with Cargo.lock checksums, and the pinned media components.']
-    notes += ['- Apple Developer ID, notarization and Windows Authenticode apply only where the platform signature above says so.', '', f'Corresponding source: {source.name} contains the exact Capturefab commit and vendored Cargo.lock dependency sources with an offline build configuration; each *-media-sources.tar.gz holds the verified FFmpeg, x264, SRT, OpenSSL and enabled header archives with their build manifest. Packages list Rust crate licenses in THIRD-PARTY-LICENSES.txt.']
+    notes += ['- Apple Developer ID, notarization and Windows Authenticode apply only where the platform signature above says so.', '', f'Corresponding source: {source.name} contains the exact Capturefab commit and vendored Cargo.lock dependency sources with an offline build configuration; each *-media-sources.tar.gz holds the verified FFmpeg, x264, SRT, OpenSSL, zlib and enabled header archives with their build manifest. Packages list Rust crate licenses in THIRD-PARTY-LICENSES.txt.']
     (output / 'release-notes.md').write_text('\n'.join(notes) + '\n')
     print(f'Prepared {ver}: {len(successes)} platform assets; {len(assets) - len(successes)} unavailable selections.')
 

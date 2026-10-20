@@ -7,10 +7,12 @@ FFMPEG_VERSION=9.0.2
 OPENSSL_VERSION=3.6.4
 SRT_VERSION=1.5.7
 X264_COMMIT=b35605ace3ddf7c1a5d67a2eb553f034aef41d55
+ZLIB_VERSION=1.3.1
 FFMPEG_SHA256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 OPENSSL_SHA256=9bffaa1ad1e07b354c21bd3324ec02fa15579f45a7d0494b3e74bc449b7333ef
 SRT_SHA256=017cd1e437ef2073a4dd10ddf7b55e86bc3d6ebac0393d13bd22f6a57055d32b
 X264_SHA256=cd71a7515b0e9a012e1ac9b1f8415bebcaf6fc97d4db32286642ac4c0fbe24f9
+ZLIB_SHA256=9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23
 # 12.0 adds AV1 NVENC; it requires NVIDIA driver 520 or newer at run time.
 NV_HEADERS_VERSION=12.0.16.2
 NV_HEADERS_SHA256=13b4d5d1f8781980629518977f15546c007d7331727b0c62e6be3b77f0e92297
@@ -30,7 +32,7 @@ if [[ ${1:-} == --help ]]; then
     cat <<'HELP'
 Usage: scripts/build-ffmpeg.sh [OUTPUT_DIRECTORY]
 
-Build pinned FFmpeg, x264, SRT, and OpenSSL from source. Output: bin/ffmpeg,
+Build pinned FFmpeg, x264, SRT, OpenSSL, and zlib from source. Output: bin/ffmpeg,
 source archives, licenses, build logs, and a manifest. Requires Bash, a C/C++
 compiler, make, CMake >= 3.15, pkg-config, Perl, curl, tar, and xz.
 
@@ -144,7 +146,8 @@ fetch "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" "$DOWNLOAD_DIR
 fetch "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz" "$DOWNLOAD_DIR/openssl-$OPENSSL_VERSION.tar.gz" "$OPENSSL_SHA256"
 fetch "https://github.com/Haivision/srt/archive/refs/tags/v$SRT_VERSION.tar.gz" "$DOWNLOAD_DIR/srt-$SRT_VERSION.tar.gz" "$SRT_SHA256"
 fetch "https://github.com/mirror/x264/archive/$X264_COMMIT.tar.gz" "$DOWNLOAD_DIR/x264-$X264_COMMIT.tar.gz" "$X264_SHA256"
-for archive in "$DOWNLOAD_DIR/ffmpeg-$FFMPEG_VERSION.tar.xz" "$DOWNLOAD_DIR/openssl-$OPENSSL_VERSION.tar.gz" "$DOWNLOAD_DIR/srt-$SRT_VERSION.tar.gz" "$DOWNLOAD_DIR/x264-$X264_COMMIT.tar.gz"; do
+fetch "https://github.com/madler/zlib/releases/download/v$ZLIB_VERSION/zlib-$ZLIB_VERSION.tar.gz" "$DOWNLOAD_DIR/zlib-$ZLIB_VERSION.tar.gz" "$ZLIB_SHA256"
+for archive in "$DOWNLOAD_DIR/ffmpeg-$FFMPEG_VERSION.tar.xz" "$DOWNLOAD_DIR/openssl-$OPENSSL_VERSION.tar.gz" "$DOWNLOAD_DIR/srt-$SRT_VERSION.tar.gz" "$DOWNLOAD_DIR/x264-$X264_COMMIT.tar.gz" "$DOWNLOAD_DIR/zlib-$ZLIB_VERSION.tar.gz"; do
     tar -xf "$archive" -C "$BUILD_DIR"
 done
 if [[ $ENABLE_NVENC == 1 ]]; then
@@ -189,7 +192,7 @@ openssl_flags=(no-shared no-module no-tests --prefix="$PREFIX" --openssldir="$PR
 ffmpeg_flags=(--prefix="$OUTPUT_DIR" --arch="$TARGET_ARCH" --target-os="$TARGET_OS"
     --cc="$CC" --cxx="$CXX" --ar="$AR" --ranlib="$RANLIB" --strip="$STRIP"
     --disable-autodetect --disable-shared --enable-static --enable-gpl --enable-version3
-    --enable-libx264 --enable-libsrt --enable-openssl --pkg-config-flags=--static
+    --enable-libx264 --enable-libsrt --enable-openssl --enable-zlib --pkg-config-flags=--static
     --disable-ffplay --disable-ffprobe --disable-doc --disable-debug
     # Keep all native decoders, demuxers, parsers, bitstream filters and network
     # protocols: unusual webcams/IP cameras and existing recordings need them.
@@ -275,6 +278,18 @@ printf 'Building OpenSSL %s (log: %s)\n' "$OPENSSL_VERSION" "$OUTPUT_DIR/logs/op
     make -j "$JOBS"
     make install_sw
 ) >"$OUTPUT_DIR/logs/openssl.log" 2>&1
+printf 'Building zlib %s (log: %s)\n' "$ZLIB_VERSION" "$OUTPUT_DIR/logs/zlib.log"
+(
+    cd "$BUILD_DIR/zlib-$ZLIB_VERSION"
+    pic=-fPIC
+    [[ $TARGET_OS != mingw32 ]] || pic=
+    for source in adler32 compress crc32 deflate infback inffast inflate inftrees trees uncompr zutil; do
+        "$CC" -O2 $pic -c "$source.c" -o "$source.o"
+    done
+    "$AR" rc "$PREFIX/lib/libz.a" ./*.o
+    "$RANLIB" "$PREFIX/lib/libz.a"
+    cp zlib.h zconf.h "$PREFIX/include/"
+) >"$OUTPUT_DIR/logs/zlib.log" 2>&1
 printf 'Building x264 %s (log: %s)\n' "$X264_COMMIT" "$OUTPUT_DIR/logs/x264.log"
 (
     cd "$BUILD_DIR/x264-$X264_COMMIT"
@@ -336,10 +351,11 @@ cp "$BUILD_DIR/ffmpeg-$FFMPEG_VERSION/COPYING.GPLv3" "$OUTPUT_DIR/licenses/FFmpe
 cp "$BUILD_DIR/x264-$X264_COMMIT/COPYING" "$OUTPUT_DIR/licenses/x264-GPLv2-or-later.txt"
 cp "$BUILD_DIR/srt-$SRT_VERSION/LICENSE" "$OUTPUT_DIR/licenses/SRT-MPLv2.txt"
 cp "$BUILD_DIR/openssl-$OPENSSL_VERSION/LICENSE.txt" "$OUTPUT_DIR/licenses/OpenSSL-Apache2.txt"
+cp "$BUILD_DIR/zlib-$ZLIB_VERSION/LICENSE" "$OUTPUT_DIR/licenses/zlib.txt"
 {
     printf 'Capturefab bundled FFmpeg media payload\nCombined distribution: GPL version 3 or later.\n'
-    printf 'FFmpeg %s; OpenSSL %s; SRT %s; x264 %s.\n\n' "$FFMPEG_VERSION" "$OPENSSL_VERSION" "$SRT_VERSION" "$X264_COMMIT"
-    for notice in "$OUTPUT_DIR/licenses/FFmpeg-GPLv3.txt" "$OUTPUT_DIR/licenses/x264-GPLv2-or-later.txt" "$OUTPUT_DIR/licenses/SRT-MPLv2.txt" "$OUTPUT_DIR/licenses/OpenSSL-Apache2.txt"; do
+    printf 'FFmpeg %s; OpenSSL %s; SRT %s; x264 %s; zlib %s.\n\n' "$FFMPEG_VERSION" "$OPENSSL_VERSION" "$SRT_VERSION" "$X264_COMMIT" "$ZLIB_VERSION"
+    for notice in "$OUTPUT_DIR/licenses/FFmpeg-GPLv3.txt" "$OUTPUT_DIR/licenses/x264-GPLv2-or-later.txt" "$OUTPUT_DIR/licenses/SRT-MPLv2.txt" "$OUTPUT_DIR/licenses/OpenSSL-Apache2.txt" "$OUTPUT_DIR/licenses/zlib.txt"; do
         printf '\n===== %s =====\n' "${notice##*/}"
         cat "$notice"
     done
@@ -352,7 +368,7 @@ binary="$OUTPUT_DIR/bin/ffmpeg"
 [[ $TARGET_OS != mingw32 ]] || binary="$binary.exe"
 [[ -f $binary ]] || die "missing output: $binary"
 {
-    printf 'FFmpeg %s\nOpenSSL %s\nSRT %s\nx264 %s\nOS %s\nArchitecture %s\n' "$FFMPEG_VERSION" "$OPENSSL_VERSION" "$SRT_VERSION" "$X264_COMMIT" "$TARGET_OS" "$TARGET_ARCH"
+    printf 'FFmpeg %s\nOpenSSL %s\nSRT %s\nx264 %s\nzlib %s\nOS %s\nArchitecture %s\n' "$FFMPEG_VERSION" "$OPENSSL_VERSION" "$SRT_VERSION" "$X264_COMMIT" "$ZLIB_VERSION" "$TARGET_OS" "$TARGET_ARCH"
     printf 'SHA256 %s\n' "$(digest "$binary")"
     printf 'NVENC/NVDEC headers enabled: %s (%s)\nAMF headers enabled: %s (%s)\nMedia Foundation enabled: %s\n' "$ENABLE_NVENC" "$NV_HEADERS_VERSION" "$ENABLE_AMF" "$AMF_VERSION" "$ENABLE_MF"
     printf 'Vulkan headers enabled: %s (%s)\nQSV libvpl enabled: %s (%s)\n' "$ENABLE_VULKAN" "$VULKAN_HEADERS_VERSION" "$ENABLE_QSV" "$LIBVPL_VERSION"
@@ -377,7 +393,7 @@ if [[ $run_checks == 1 ]]; then
         local category=$1 component=$2
         grep -Eq "^[[:space:]]*[^[:space:]]+[[:space:]]+([^[:space:]]*,)?${component}(,|[[:space:]])" "$OUTPUT_DIR/logs/$category.txt" || die "$category: $component missing"
     }
-    for component in rawvideo mjpeg h264 hevc av1 mpeg4 mpeg2video vp8 vp9 tiff; do
+    for component in rawvideo mjpeg h264 hevc av1 mpeg4 mpeg2video vp8 vp9 tiff png; do
         require_component decoders "$component"
     done
     for component in rawvideo image2 concat mov matroska mpegts rtsp sdp mjpeg; do

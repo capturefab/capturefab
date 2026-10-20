@@ -517,7 +517,7 @@ class ReleaseTests(unittest.TestCase):
             source.mkdir(parents=True)
             output = temp / 'dist'
             output.mkdir()
-            sources = [('FFMPEG_VERSION', 'FFMPEG_SHA256', 'ffmpeg-1.0.tar.xz'), ('OPENSSL_VERSION', 'OPENSSL_SHA256', 'openssl-1.0.tar.gz'), ('SRT_VERSION', 'SRT_SHA256', 'srt-1.0.tar.gz'), ('X264_COMMIT', 'X264_SHA256', 'x264-1.0.tar.gz'), ('NV_HEADERS_VERSION', 'NV_HEADERS_SHA256', 'nv-codec-headers-1.0.tar.gz'), ('AMF_VERSION', 'AMF_SHA256', 'amf-headers-1.0.tar.gz')]
+            sources = [('FFMPEG_VERSION', 'FFMPEG_SHA256', 'ffmpeg-1.0.tar.xz'), ('OPENSSL_VERSION', 'OPENSSL_SHA256', 'openssl-1.0.tar.gz'), ('SRT_VERSION', 'SRT_SHA256', 'srt-1.0.tar.gz'), ('X264_COMMIT', 'X264_SHA256', 'x264-1.0.tar.gz'), ('ZLIB_VERSION', 'ZLIB_SHA256', 'zlib-1.0.tar.gz'), ('NV_HEADERS_VERSION', 'NV_HEADERS_SHA256', 'nv-codec-headers-1.0.tar.gz'), ('AMF_VERSION', 'AMF_SHA256', 'amf-headers-1.0.tar.gz')]
             declarations = []
             for version_key, hash_key, name in sources:
                 archive = source / name
@@ -529,7 +529,7 @@ class ReleaseTests(unittest.TestCase):
                 (source / 'ffmpeg-1.0.tar.xz').rename(cached)
                 (source / 'ffmpeg-1.0.tar.xz').symlink_to(cached)
             manifest = temp / 'bundle/build-manifest.txt'
-            manifest.write_text('FFmpeg 1.0\nOpenSSL 1.0\nSRT 1.0\nx264 1.0\nNVENC/NVDEC headers enabled: 1 (1.0)\nAMF headers enabled: 0 (1.0)\n')
+            manifest.write_text('FFmpeg 1.0\nOpenSSL 1.0\nSRT 1.0\nx264 1.0\nzlib 1.0\nNVENC/NVDEC headers enabled: 1 (1.0)\nAMF headers enabled: 0 (1.0)\n')
             args = SimpleNamespace(version='1.2.3', os='linux', arch='x86_64', ffmpeg_bundle=temp / 'bundle', output=output)
             with mock.patch.object(release, 'ROOT', temp):
                 with tarfile.open(release.media_sources(args)) as archive:
@@ -547,7 +547,7 @@ class ReleaseTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, 'missing or modified'):
                         release.media_sources(args)
                     path.write_bytes(original)
-                manifest.write_text('FFmpeg 1.0\nOpenSSL 1.0\nSRT 1.0\nx264 1.0\nFFmpeg configure arguments:\n--disable-autodetect --enable-libx264\n')
+                manifest.write_text('FFmpeg 1.0\nOpenSSL 1.0\nSRT 1.0\nx264 1.0\nzlib 1.0\nFFmpeg configure arguments:\n--disable-autodetect --enable-libx264\n')
                 with tarfile.open(release.media_sources(args)) as archive:
                     self.assertNotIn('media-sources/nv-codec-headers-1.0.tar.gz', archive.getnames())
                 manifest.write_text(manifest.read_text() + '--enable-nvenc\n')

@@ -42,8 +42,11 @@ jobs:
         # Every architecture a release ships, on free hosted runners.
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025, windows-11-arm]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 150
     steps:
+      - name: Keep LF line endings
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -75,6 +78,42 @@ jobs:
         run: |
           choco install nasm --no-progress -y
           Add-Content $env:GITHUB_PATH 'C:\Program Files\NASM'
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        if: runner.os == 'Windows'
+        with:
+          msystem: ${{ runner.arch == 'ARM64' && 'CLANGARM64' || 'UCRT64' }}
+          install: curl diffutils make perl tar xz
+          pacboy: cmake:p ninja:p pkgconf:p ${{ runner.arch == 'ARM64' && 'clang:p' || 'gcc:p nasm:p' }}
+      - id: ffmpeg
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/ffmpeg-bundle
+          key: ffmpeg-ci-${{ matrix.os }}-${{ hashFiles('scripts/build-ffmpeg.sh', 'third_party/**') }}
+      - name: Build FFmpeg
+        if: steps.ffmpeg.outputs.cache-hit != 'true' && runner.os != 'Windows'
+        shell: bash
+        run: BUILD_DIR="$RUNNER_TEMP/ffmpeg-build" scripts/build-ffmpeg.sh target/ffmpeg-bundle
+      - name: Build FFmpeg with MinGW
+        if: steps.ffmpeg.outputs.cache-hit != 'true' && runner.os == 'Windows'
+        shell: msys2 {0}
+        env:
+          TARGET_OS: mingw32
+          TARGET_ARCH: ${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
+          CC: ${{ runner.arch == 'ARM64' && 'clang' || 'gcc' }}
+          CXX: ${{ runner.arch == 'ARM64' && 'clang++' || 'g++' }}
+          AR: ${{ runner.arch == 'ARM64' && 'llvm-ar' || '' }}
+          RANLIB: ${{ runner.arch == 'ARM64' && 'llvm-ranlib' || '' }}
+          STRIP: ${{ runner.arch == 'ARM64' && 'llvm-strip' || '' }}
+          OBJDUMP: ${{ runner.arch == 'ARM64' && 'llvm-objdump' || '' }}
+        run: BUILD_DIR="$(cygpath -u "$RUNNER_TEMP")/ffmpeg-build" scripts/build-ffmpeg.sh target/ffmpeg-bundle
+      - if: steps.ffmpeg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/ffmpeg-bundle
+          key: ${{ steps.ffmpeg.outputs.cache-primary-key }}
+      - name: Use the FFmpeg bundle
+        shell: bash
+        run: echo "CAPTUREFAB_FFMPEG_BINARY=$GITHUB_WORKSPACE/target/ffmpeg-bundle/bin/ffmpeg$([ "$RUNNER_OS" = Windows ] && echo .exe)" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Every test binary runs, so one failure does not hide the rest.
       - run: cargo test --locked --no-fail-fast
