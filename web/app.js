@@ -10,6 +10,8 @@
   let release = null;
   let assets = [];
   let processorChosen = false;
+  // The processor was inferred from the operating system, not reported by the browser.
+  let archGuessed = false;
   // A browser on a 32-bit ARM system, for which there is no build.
   let thirtyTwoBitArm = false;
   const osNames = { macos: 'macOS', windows: 'Windows', linux: 'Linux' };
@@ -34,7 +36,28 @@
     link.textContent = label;
     return link;
   };
+  // Page buttons that become a direct download once a build is matched.
+  const oneclick = [...document.querySelectorAll('[data-oneclick]')];
+  oneclick.forEach((link) => { link.dataset.fallback = link.innerHTML; });
+  const chipName = (osId, archId) => osId === 'macos' ? (archId === 'aarch64' ? 'Apple silicon' : 'Intel') : archNames[archId];
+  const resetOneclick = () => oneclick.forEach((link) => {
+    link.setAttribute('href', '#download');
+    link.removeAttribute('download');
+    link.removeAttribute('data-oneclick-state');
+    link.innerHTML = link.dataset.fallback;
+  });
+  const armOneclick = (asset) => oneclick.forEach((link) => {
+    const title = document.createElement('span');
+    title.textContent = `Download for ${osNames[asset.os]} (${chipName(asset.os, asset.arch)})`;
+    const detail = document.createElement('small');
+    detail.textContent = [`v${release.version}`, formatSize(asset.size), 'app + CLI'].filter(Boolean).join(' · ');
+    link.replaceChildren(title, detail);
+    link.href = safeUrl(asset.url);
+    link.setAttribute('download', asset.name);
+    link.dataset.oneclickState = 'ready';
+  });
   const clearDownload = () => {
+    resetOneclick();
     $('primary-download').hidden = true;
     $('primary-download').removeAttribute('href');
     $('verify-box').hidden = true;
@@ -58,7 +81,7 @@
     }
     const matching = assets.filter((asset) => asset.os === os.value && asset.arch === arch.value && asset.variant === variant.value);
     const selected = matching.find(isPublished);
-    text('download-label', `${osNames[os.value]} / ${archNames[arch.value]} / ${variant.value}`);
+    text('download-label', `${archGuessed ? 'Best match: ' : ''}${osNames[os.value]} / ${archNames[arch.value]} / ${variant.value}`);
     if (!selected) {
       text('download-description', 'This build is not available. Open all downloads or read the release feed.');
       return;
@@ -71,7 +94,8 @@
     download.setAttribute('download', selected.name);
     download.setAttribute('aria-label', `Download capturefab ${release.version} for ${osNames[os.value]} ${archNames[arch.value]} (${variant.value})`);
     download.hidden = false;
-    download.textContent = `Download for ${osNames[os.value]}`;
+    download.textContent = `Download for ${osNames[os.value]} (${chipName(os.value, arch.value)})`;
+    if (selected.variant === 'desktop') armOneclick(selected);
     if ($('install-hint')) {
       const instructions = {
         macos: selected.variant === 'desktop' ? 'Extract the ZIP file. Move Capturefab.app to Applications. Open Capturefab.app.' : 'Extract the ZIP file. In a terminal, run capturefab --help from the extracted folder.',
@@ -99,11 +123,12 @@
       linux: 'Run dpkg --print-architecture: amd64 means x64 and arm64 means ARM64. armhf is 32-bit ARM, which has no build; Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS. Without dpkg, run uname -m, but it prints aarch64 on 32-bit Raspberry Pi OS too.'
     };
     const armhf = 'This browser runs on 32-bit ARM, which has no Capturefab build. Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS, which uses ARM64. dpkg --print-architecture prints arm64 there and armhf on a 32-bit system; uname -m prints aarch64 on both.';
-    text('platform-hint', (thirtyTwoBitArm && os.value === 'linux' && !arch.value ? armhf : hints[os.value]) || 'Select the computer that runs Capturefab. If the browser cannot identify the processor architecture, select it.');
+    const guess = archGuessed && arch.value ? `Best guess: ${archNames[arch.value]}${os.value === 'macos' ? ' (Apple silicon)' : ''}. Your browser did not report the processor. If wrong, choose another processor. ` : '';
+    text('platform-hint', guess + (thirtyTwoBitArm && os.value === 'linux' && !arch.value ? armhf : hints[os.value]) || 'Select the computer that runs Capturefab. If the browser cannot identify the processor architecture, select it.');
   };
   const hasDownloadPanel = Boolean(os && arch && variant);
   if (hasDownloadPanel) {
-    for (const control of [os, arch, variant]) control.addEventListener('change', () => { if (control === arch || control === os) processorChosen = true; updateHint(); renderSelection(); });
+    for (const control of [os, arch, variant]) control.addEventListener('change', () => { if (control === arch || control === os) processorChosen = true; if (control === arch) archGuessed = false; updateHint(); renderSelection(); });
     document.querySelector('.platform-form').addEventListener('submit', (event) => event.preventDefault());
   }
   const detectPlatform = async () => {
@@ -125,6 +150,12 @@
       } catch (_) { /* Explicit selectors remain available. */ }
     } else if (/\baarch64\b|\barm64\b/i.test(ua) && os.value === 'linux') arch.value = 'aarch64';
     else if (/\barmv[67]l?\b|\barmhf\b/i.test(ua) && os.value === 'linux') thirtyTwoBitArm = true;
+    // A best guess beats an empty form: most current Macs are Apple silicon and
+    // most Windows and Linux PCs are x64. The processor menu stays visible to correct it.
+    if (os.value && !arch.value && !processorChosen && !thirtyTwoBitArm) {
+      arch.value = os.value === 'macos' ? 'aarch64' : 'x86_64';
+      archGuessed = true;
+    }
     updateHint(); renderSelection();
   };
   if (hasDownloadPanel) fetch('releases.json', { cache: 'no-cache' })

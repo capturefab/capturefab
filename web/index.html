@@ -41,7 +41,7 @@
           <p class="eyebrow"><span class="brand-dot" aria-hidden="true"></span> Cameras, agents and people in one workspace</p>
           <h1 id="hero-title">Let an agent capture.<br>Step in when needed.</h1>
           <p class="lead">Connect machine vision cameras, webcams and network streams. Your coding agent or the built-in assistant can set them up and capture images or video. Each step shows in the app, and you can take control at any time.</p>
-          <div class="actions"><a class="button primary" href="#download">Download Capturefab <span aria-hidden="true">↓</span></a><a class="button" href="#start">Choose how to start <span aria-hidden="true">→</span></a></div>
+          <div class="actions"><a class="button primary" href="#download" data-oneclick>Download Capturefab <span aria-hidden="true">↓</span></a><a class="button" href="#start">Choose how to start <span aria-hidden="true">→</span></a></div>
           <p class="hero-note">Free and open source. MIT license.<br>Desktop app and CLI for macOS, Windows and Linux.</p>
           <ul class="hero-facts"><li>GigE Vision and USB3 Vision without a vendor SDK.</li><li>A JSON CLI that coding agents and scripts can use.</li><li>Simulator cameras, so you can start without hardware.</li></ul>
         </section>
@@ -140,7 +140,7 @@ capturefab --session bench status --json</code></pre><button class="copy-button"
           <details><summary>How do I verify a download?</summary><p>The download selector shows a SHA-256 command and the correct checksum. Run the command for the downloaded file. Compare its result with the correct checksum. The <a href="downloads.html">full download list</a> also includes checksums. You can verify GitHub build provenance with <code>gh attestation verify FILE --repo capturefab/capturefab</code>.</p></details>
         </div>
       </section>
-      <section class="download-banner section" aria-labelledby="ready-title"><div><p class="eyebrow">Start with the simulator</p><h2 id="ready-title">Capture your first frame.</h2><p>Download the app. Try a simulator camera. Then connect your own source.</p></div><div class="actions"><a class="button primary" href="#download">Download Capturefab <span aria-hidden="true">↑</span></a><a href="docs.html#getting-started">Read the quickstart →</a></div></section>
+      <section class="download-banner section" aria-labelledby="ready-title"><div><p class="eyebrow">Start with the simulator</p><h2 id="ready-title">Capture your first frame.</h2><p>Download the app. Try a simulator camera. Then connect your own source.</p></div><div class="actions"><a class="button primary" href="#download" data-oneclick>Download Capturefab <span aria-hidden="true">↑</span></a><a href="docs.html#getting-started">Read the quickstart →</a></div></section>
       <details class="source-build-details"><summary>Build Capturefab from source</summary><div class="source-build"><div><h3>Build requirements</h3><p>Use a stable Rust toolchain, a C compiler and CMake. For x86 builds, NASM is also necessary for libjpeg-turbo. FFmpeg is necessary for webcams, streams and recording. Read the <a href="https://github.com/capturefab/capturefab#build-test-and-release">build guide</a> for configuration.</p></div><div class="code-wrap"><pre><code>git clone https://github.com/capturefab/capturefab
 cd capturefab
 # Desktop app and CLI

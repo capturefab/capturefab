@@ -352,3 +352,7 @@ main>.page-head+.section{padding-top:44px}
 .capability-routes{grid-template-columns:repeat(4,minmax(0,1fr))}
 @media(max-width:1050px){.capability-routes{grid-template-columns:repeat(2,minmax(0,1fr))}.capability-routes article:nth-child(3){border-left:0;padding-left:0}.capability-routes article:nth-child(n+3){border-top:1px solid var(--line)}}
 @media(max-width:800px){.capability-routes{grid-template-columns:1fr}.capability-routes article:nth-child(n+2){border-top:1px solid var(--line)}}
+
+/* One-click download: the page buttons name the matched build. */
+[data-oneclick-state=ready]{display:inline-flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;line-height:1.25}
+[data-oneclick-state=ready] small{font-size:11px;font-weight:400;opacity:.85}
