@@ -1,4 +1,5 @@
 pub(crate) mod assistant;
+mod folder_review;
 mod signal_profiles;
 mod tools;
 pub use assistant::{AssistantCommand, AssistantTaskFailure};
@@ -756,6 +757,11 @@ pub enum Command {
     CaptureSession {
         #[command(subcommand)]
         command: CaptureSessionCommand,
+    },
+    /// Rank a folder's images and video frames and review the interesting ones in a DuckDB session
+    FolderReview {
+        #[command(subcommand)]
+        command: folder_review::FolderReviewCommand,
     },
     /// Open the desktop GUI and expose its local automation session
     Gui {
@@ -1832,6 +1838,13 @@ pub fn run(mut cli: Cli) -> Result<()> {
     if matches!(cli.command, Some(Command::Hub { .. })) {
         cli.camera = None;
     }
+    // Folder review reads files in this process and never targets a camera.
+    if let Some(Command::FolderReview { command }) = &cli.command {
+        cli.camera = None;
+        crate::efficiency::configure(cli.efficiency);
+        let result = folder_review::run(&cli, command)?;
+        return output(&cli, result);
+    }
     if let Some(Command::Signals {
         command: Some(SignalsCommand::Profiles { command }),
     }) = &cli.command
@@ -2654,6 +2667,9 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
     if let Some(Command::Tools { command }) = &cli.command {
         return tools::print_human(command, &value);
     }
+    if let Some(Command::FolderReview { command }) = &cli.command {
+        return folder_review::print_human(command, &value);
+    }
     let mut out = io::stdout().lock();
     if matches!(&cli.command, Some(Command::Doctor)) {
         crate::doctor::print_checklist(&mut out, &value)?;
@@ -3084,6 +3100,29 @@ fn schema() -> Value {
         "review":"Returns {capture:null|{id,score,reason,width,height,rgba},capture_session:...}; rgba is a base64-encoded 480x360-or-smaller RGBA preview. Review IDs address pending captures; stale or repeated decisions fail.",
         "limits":{"sensitivity":[0.0,1.0],"cooldown_ms":[250,3600000],"pending":200,"stored_pixel_bytes":2147483648_u64},
         "research":"docs/auto-capture-models.md"
+    });
+    contract["folder_review"] = json!({
+        "cli":"folder-review new PATH.duckdb --folder DIR [--encoder auto|dinov2|native] [--rank auto|novelty|similar] [--examples CAPTURE.duckdb] [--sensitivity 0.5] [--video-interval-ms 2000] | scan PATH.duckdb | status PATH.duckdb | next PATH.duckdb [--all] [--inline-image] | keep PATH.duckdb ID | discard PATH.duckdb ID | configure PATH.duckdb [--rank novelty|similar] [--sensitivity S] | export PATH.duckdb (--to DIR | --destination NAME [--to SUBDIR])",
+        "scope":"Runs in the calling process on local files; no camera, GUI or serve session is involved, and --session is a usage error. A session file is held by one process at a time; another gets exit 3 (unavailable) until it is closed.",
+        "inputs":"Every regular file below the folder with an image (png, jpg, jpeg, bmp, tif, tiff, webp, ppm, pgm, pbm, pnm) or video (mp4, m4v, mov, mkv, avi, webm, mpg, mpeg, ts, mts, m2ts, vob, flv, wmv, ogv) extension, sorted by path. Hidden entries and symbolic links are skipped, never followed; at most 32 folder levels and 20000 media files. JPEG and PNG decode in process; other stills and videos go through FFmpeg, scaled into 1920x1080 (stills) or 960x540 (videos) keeping their aspect ratio. Videos are sampled every --video-interval-ms, at most 600 samples each.",
+        "folder":"Never written. Items are decoded again from their files to be shown and exported; a pending item whose file is gone or changed (size or modification time) leaves the queue with a note, and scan samples it afresh.",
+        "storage":"One DuckDB file holds the folder path, the file inventory (path, size, modification time, ok|failed|missing and the error), one embedding per item, every decision, nearest-distance ranking state and imported examples. scan commits each file on its own, so Ctrl-C or a crash keeps finished files; it samples new, changed and previously failed files, drops pending items of removed ones and keeps decisions.",
+        "encoders":"The same encoders as capture_session.encoders: auto is dinov2 when bundled, on the GPU in the isolated helper when possible, otherwise native. The encoder and model fingerprint are fixed when the session is created; open fails if the build bundles a different model.",
+        "ranking":{
+            "novelty":"Farthest first: the pending item least like everything reviewed, or before any decision the item least like the folder's average. Score is novelty (distance / encoder novelty scale, capped at 1) times one minus the similarity to the nearest discarded item, so discards suppress look-alikes.",
+            "similar":"Auto capture's preference: similarity to the nearest kept item or imported positive example, scaled by its distance ratio against discarded items and imported negatives, times 0.9 + 0.1 x novelty. With nothing kept yet it ranks by novelty.",
+            "examples":"--examples imports up to 1024 manual, kept and discarded captures of a capture session (read-only) using the same encoder and model; with --encoder auto the review adopts the session's encoder, and a different explicit encoder is refused. --rank auto is similar with examples, otherwise novelty.",
+            "repeats":"An item within the encoder's duplicate distance of one of the 64 items scanned before it, or of a reviewed item, is a duplicate and never queued; a decision also turns pending look-alikes into duplicates. A duplicate whose original is dropped by a rescan is pending again.",
+            "threshold":"next offers the best pending item scoring at least 0.90 - 0.35 x sensitivity; --all offers the best one regardless. Every decision teaches the ranking at once."
+        },
+        "results":{
+            "status":"{folder_review:{path,folder,encoder,model_fingerprint?,rank,sensitivity,threshold,video_interval_ms,files,failed_files,missing_files,items,pending,interesting,kept,discarded,duplicates,exported,examples,examples_from?,scanned_ms?,note?}}; new, configure, status, keep, discard, scan, next and export all include it",
+            "scan":"{scan:{files,added,changed,unchanged,missing,failed,skipped,items,duplicates,limited,stopped,accelerator?,errors:[{path,error}]}}; progress goes to stderr on a terminal",
+            "next":"{item:null|{id,path,kind:\"image\"|\"video\",offset_ms?,width,height,score,reason,preview?:{width,height,rgba}}}; path is relative to the folder and rgba a base64 480x360-or-smaller RGBA preview",
+            "decision":"{id,keep}; IDs address pending items and stale or repeated decisions fail (exit 1)",
+            "export":"{export:{output,exported:[{id,source,path,bytes,sha256,upload?}],skipped:[{path,error}]}}. Kept items not yet exported are copied below the output keeping their relative paths: stills byte for byte, video frames as STEM-OFFSETms.png. Writes go through the storage budget (exit 6 when full) and never replace a file: a taken name gets -1, -2 and so on. A bucket destination queues uploads; items whose source changed are skipped."
+        },
+        "limits":{"sensitivity":[0.0,1.0],"video_interval_ms":[100,3600000],"items":crate::folder_review::MAX_ITEMS,"files":20000,"video_samples":crate::folder_review::MAX_VIDEO_SAMPLES}
     });
     contract["selection"]["source_base"] = json!(
         "Relative file: and sim:replay: inputs, and existing bare media paths, resolve in the calling terminal for CLI/RPC and beside the file for workflows; network/device locators keep their meaning"
@@ -4787,6 +4826,64 @@ mod tests {
             prepare(&cli).unwrap().unwrap().validate().unwrap();
         }
     }
+    #[test]
+    fn folder_review_commands_parse_and_are_in_the_schema() {
+        let cli = Cli::try_parse_from([
+            "capturefab",
+            "folder-review",
+            "new",
+            "r.duckdb",
+            "--folder",
+            "media",
+            "--rank",
+            "similar",
+            "--examples",
+            "c.duckdb",
+            "--video-interval-ms",
+            "500",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Some(Command::FolderReview { .. })));
+        for bad in [
+            &["capturefab", "folder-review", "new", "r.duckdb"][..],
+            &[
+                "capturefab",
+                "folder-review",
+                "new",
+                "r.duckdb",
+                "--folder",
+                "m",
+                "--sensitivity",
+                "2",
+            ],
+            &[
+                "capturefab",
+                "folder-review",
+                "new",
+                "r.duckdb",
+                "--folder",
+                "m",
+                "--video-interval-ms",
+                "10",
+            ],
+            &["capturefab", "folder-review", "keep", "r.duckdb", "0"],
+            &["capturefab", "folder-review", "export", "r.duckdb"],
+        ] {
+            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
+        }
+        let contract = schema();
+        assert!(
+            contract["folder_review"]["cli"]
+                .as_str()
+                .unwrap()
+                .contains("folder-review new")
+        );
+        assert_eq!(
+            contract["folder_review"]["limits"]["items"],
+            crate::folder_review::MAX_ITEMS
+        );
+    }
+
     #[test]
     fn schema_commands_parse() {
         let contract = schema();

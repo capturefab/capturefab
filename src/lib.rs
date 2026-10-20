@@ -32,6 +32,7 @@ pub mod destination;
 pub mod doctor;
 pub mod efficiency;
 mod engine;
+pub mod folder_review;
 pub mod frame;
 pub mod genicam;
 #[cfg(feature = "gui")]

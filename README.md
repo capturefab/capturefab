@@ -206,6 +206,26 @@ The learner scores frames with nearest-example preference and background novelty
 
 `status --json` shows where embeddings run (`capture_session.accelerator`, for example `GPU: Apple M4 Max (Metal)`) and the achieved `samples_per_second`; `doctor --json` reports the bundled model and the GPU it would use. The GPU runs in a separate helper process with a deadline, so a driver fault or hang moves the session to the CPU instead of stopping the camera; `CAPTUREFAB_DINOV2_GPU=0` keeps it on the CPU. `auto` still chooses DINOv2 on a computer without a GPU: whether a GPU works is only known once its helper runs, while a session's encoder never changes. For frequent sampling on a CPU-only small computer, create the session with `--encoder native`, which samples four frames per second with a small fraction of a core. A session records a fingerprint of its model and refuses to resume in a build that bundles a different one. The DINOv2 weights are Apache-2.0; their license is included in `THIRD-PARTY-LICENSES.txt`. The [model research and evaluation plan](docs/auto-capture-models.md) explains the choice.
 
+## Review a folder
+
+Folder review brings the same ranking to images and videos already on disk: field photos, earlier captures or recordings. Choose **File › Review a Folder…** in the desktop app, or use the CLI. Capturefab searches the folder and its subfolders, samples each video every 2 seconds, and offers the most unusual item first. Each **Keep** or **Discard** reranks the rest at once, discards push down items that look like them, and near-identical repeats such as burst shots or a still scene in a video are set aside. The folder itself is only ever read; **Export** copies the kept items elsewhere.
+
+```sh
+capturefab folder-review new review.duckdb --folder ~/field/line-1
+capturefab folder-review scan review.duckdb          # Ctrl-C stops; finished files are kept
+capturefab folder-review next review.duckdb          # --all for items below the threshold, --json --inline-image for a preview
+capturefab folder-review keep review.duckdb 12
+capturefab folder-review discard review.duckdb 31
+capturefab folder-review export review.duckdb --to ~/field/keepers
+```
+
+Two rankings are available, and `configure --rank` switches between them at any time:
+
+- **novelty** (default): the item least like everything reviewed so far comes first, or before any decision the item least like the folder's average. A short review covers the whole folder rather than many variants of one scene.
+- **similar**: the item most like what you kept comes first, scored the way auto capture scores frames. `new --examples capture.duckdb` imports the kept and discarded captures of an auto capture session as a starting point, and uses that session's encoder.
+
+The session is one `.duckdb` file holding the folder's inventory, an embedding per item and every decision. Run `scan` again after the folder changes: new and changed files are sampled, files that failed before are retried, and pending items of removed files leave the queue; decisions are kept. Embeddings use the same encoders as auto capture, DINOv2 on the GPU when possible. JPEG and PNG are decoded in Capturefab and other formats through the bundled FFmpeg. Export keeps relative paths, copies stills unchanged, saves video frames as `NAME-OFFSETms.png`, never replaces a file, and counts against the storage budget; `--destination NAME` exports to a saved destination and queues uploads for bucket destinations. The desktop app keeps its sessions in the state directory, so choosing the same folder again resumes its review. A session holds up to 20,000 items; review large libraries a subfolder at a time. See [folder review](docs/folder-review.md) for how ranking works.
+
 ## Repeatable workflows
 
 Validate an ordered JSON plan before connecting to cameras, then apply it to the visible workbench or a headless session:

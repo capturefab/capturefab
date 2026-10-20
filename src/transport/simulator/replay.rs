@@ -40,13 +40,13 @@ fn extension(path: &Path) -> String {
         .unwrap_or("")
         .to_ascii_lowercase()
 }
-fn is_image(path: &Path) -> bool {
+pub(crate) fn is_image(path: &Path) -> bool {
     matches!(
         extension(path).as_str(),
         "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" | "webp" | "ppm" | "pgm" | "pbm" | "pnm"
     )
 }
-fn supported(path: &Path) -> bool {
+pub(crate) fn supported(path: &Path) -> bool {
     is_image(path)
         || matches!(
             extension(path).as_str(),

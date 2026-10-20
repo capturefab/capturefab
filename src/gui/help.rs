@@ -334,6 +334,13 @@ impl Workbench {
                 Some(Message::AutoCapture(autocapture::Input::Review(false))),
                 t,
             )
+        } else if self.folder_review.open {
+            modal(
+                body,
+                self.folder_review_sheet(p, height),
+                Some(Message::FolderReview(folder_review::Input::Open(false))),
+                t,
+            )
         } else if self.settings_open && self.settings_window.is_none() {
             modal(
                 body,

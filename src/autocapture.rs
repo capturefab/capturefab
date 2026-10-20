@@ -38,7 +38,7 @@ const FEATURES: usize = 84;
 const STALE_SAMPLE: Duration = Duration::from_secs(2);
 const MAX_PENDING: u64 = 200;
 const MAX_STORED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 const MAX_BACKGROUND: usize = 64;
 const MAX_RECENT: usize = 32;
 /// Frames live in files, so DuckDB only ever holds small rows.
@@ -59,7 +59,7 @@ const BUSY_NOTE: &str = "Skipped a suggestion while the previous capture was sti
 const CPU_SHARE: f64 = 0.5;
 const EFFICIENT_CPU_SHARE: f64 = 0.2;
 const MODEL: &str = "Session exemplar kNN + background novelty";
-type Descriptor = Vec<f32>;
+pub(crate) type Descriptor = Vec<f32>;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionStatus {
@@ -110,18 +110,18 @@ pub enum EncoderChoice {
 /// calibration. DINOv2 descriptors are unit vectors and use half the chord
 /// length (0 identical, 0.5 orthogonal, 1 opposite); the native descriptor
 /// uses the RMS difference of its bounded features.
-struct Metric {
-    chord: bool,
+pub(crate) struct Metric {
+    pub(crate) chord: bool,
     /// Width of the similarity kernel around each positive example.
-    sigma: f64,
+    pub(crate) sigma: f64,
     /// Closer than this to a recent capture is the same moment again.
-    duplicate: f64,
+    pub(crate) duplicate: f64,
     /// Background prototypes are at least this far apart.
-    distinct: f64,
+    pub(crate) distinct: f64,
     /// Distance from the background at which novelty saturates.
-    novelty: f64,
+    pub(crate) novelty: f64,
     /// At most one sample per interval.
-    interval: Duration,
+    pub(crate) interval: Duration,
 }
 
 const NATIVE_METRIC: Metric = Metric {
@@ -147,14 +147,14 @@ const DINOV2_METRIC: Metric = Metric {
 };
 
 #[derive(Clone)]
-enum Encoder {
+pub(crate) enum Encoder {
     Native,
     #[cfg(feature = "dinov2")]
     Dinov2(Arc<dinov2::Model>),
 }
 
 impl Encoder {
-    fn name(&self) -> &'static str {
+    pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::Native => "native",
             #[cfg(feature = "dinov2")]
@@ -162,31 +162,31 @@ impl Encoder {
         }
     }
     /// Bumped whenever preprocessing or pooling changes the descriptor.
-    fn version(&self) -> u32 {
+    pub(crate) fn version(&self) -> u32 {
         1
     }
-    fn dims(&self) -> usize {
+    pub(crate) fn dims(&self) -> usize {
         match self {
             Self::Native => FEATURES,
             #[cfg(feature = "dinov2")]
             Self::Dinov2(model) => model.dims(),
         }
     }
-    fn metric(&self) -> &'static Metric {
+    pub(crate) fn metric(&self) -> &'static Metric {
         match self {
             Self::Native => &NATIVE_METRIC,
             #[cfg(feature = "dinov2")]
             Self::Dinov2(_) => &DINOV2_METRIC,
         }
     }
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self {
             Self::Native => format!("{MODEL} (spatial color/edge descriptor v1)"),
             #[cfg(feature = "dinov2")]
             Self::Dinov2(model) => format!("{MODEL} ({})", model.label()),
         }
     }
-    fn fingerprint(&self) -> Option<String> {
+    pub(crate) fn fingerprint(&self) -> Option<String> {
         match self {
             Self::Native => None,
             #[cfg(feature = "dinov2")]
@@ -195,10 +195,10 @@ impl Encoder {
     }
     /// The native descriptor takes about a millisecond; a ViT pass must not
     /// stall acquisition on the camera worker thread.
-    fn background(&self) -> bool {
+    pub(crate) fn background(&self) -> bool {
         !matches!(self, Self::Native)
     }
-    fn describe(&self, frame: &Frame) -> Result<Descriptor> {
+    pub(crate) fn describe(&self, frame: &Frame) -> Result<Descriptor> {
         match self {
             Self::Native => descriptor(frame),
             #[cfg(feature = "dinov2")]
@@ -211,7 +211,7 @@ impl Encoder {
             }
         }
     }
-    fn decode(&self, bytes: &[u8]) -> Result<Descriptor> {
+    pub(crate) fn decode(&self, bytes: &[u8]) -> Result<Descriptor> {
         ensure!(
             bytes.len() == self.dims() * 4,
             "corrupt session descriptor length"
@@ -235,7 +235,7 @@ impl Encoder {
         ensure!(valid, "corrupt session descriptor values");
         Ok(feature)
     }
-    fn distance(&self, a: &Descriptor, b: &Descriptor) -> f64 {
+    pub(crate) fn distance(&self, a: &Descriptor, b: &Descriptor) -> f64 {
         let squares = a
             .iter()
             .zip(b)
@@ -247,7 +247,7 @@ impl Encoder {
             (squares / a.len().max(1) as f64).sqrt()
         }
     }
-    fn nearest(&self, examples: &[Descriptor], feature: &Descriptor) -> Option<f64> {
+    pub(crate) fn nearest(&self, examples: &[Descriptor], feature: &Descriptor) -> Option<f64> {
         // An exemplar nearest-neighbor model can learn immediately from a single
         // manual capture; unlike a fitted classifier it needs no balanced batch.
         examples
@@ -255,7 +255,7 @@ impl Encoder {
             .map(|example| self.distance(example, feature))
             .reduce(f64::min)
     }
-    fn similarity(&self, distance: f64) -> f64 {
+    pub(crate) fn similarity(&self, distance: f64) -> f64 {
         (-distance.powi(2) / (2.0 * self.metric().sigma.powi(2))).exp()
     }
 }
@@ -274,7 +274,7 @@ fn dinov2_encoder() -> Result<Option<Encoder>> {
     Ok(None)
 }
 
-fn new_encoder(choice: Option<EncoderChoice>) -> Result<Encoder> {
+pub(crate) fn new_encoder(choice: Option<EncoderChoice>) -> Result<Encoder> {
     match choice.unwrap_or_default() {
         EncoderChoice::Native => Ok(Encoder::Native),
         #[cfg(feature = "dinov2")]
@@ -287,7 +287,11 @@ fn new_encoder(choice: Option<EncoderChoice>) -> Result<Encoder> {
 
 /// Reopen the exact encoder a session learned with: descriptors from another
 /// model live in a different space and would silently corrupt every score.
-fn stored_encoder(name: &str, dims: usize, fingerprint: Option<&str>) -> Result<Encoder> {
+pub(crate) fn stored_encoder(
+    name: &str,
+    dims: usize,
+    fingerprint: Option<&str>,
+) -> Result<Encoder> {
     let encoder = match name {
         "native" => Encoder::Native,
         #[cfg(feature = "dinov2")]
@@ -578,7 +582,7 @@ fn process_cpu() -> Option<Duration> {
 /// Where the encoder thread computes embeddings. The GPU helper starts in the
 /// background; frames use the CPU until it is ready, and for the rest of the
 /// session if it is unavailable or misses a deadline.
-enum Backend {
+pub(crate) enum Backend {
     Cpu,
     #[cfg(feature = "dinov2")]
     Starting(mpsc::Receiver<Result<dinov2::helper::Client>>),
@@ -587,7 +591,7 @@ enum Backend {
 }
 
 impl Backend {
-    fn start(encoder: &Encoder) -> Self {
+    pub(crate) fn start(encoder: &Encoder) -> Self {
         match encoder {
             // Unit tests cannot re-execute their own binary as a helper.
             #[cfg(feature = "dinov2")]
@@ -609,7 +613,7 @@ impl Backend {
         }
     }
 
-    fn describe(&mut self, encoder: &Encoder, frame: &Frame) -> Result<Descriptor> {
+    pub(crate) fn describe(&mut self, encoder: &Encoder, frame: &Frame) -> Result<Descriptor> {
         #[cfg(feature = "dinov2")]
         if let Encoder::Dinov2(model) = encoder {
             if let Self::Starting(receiver) = self {
@@ -658,7 +662,7 @@ impl Backend {
         }
     }
 
-    fn accelerator(&self) -> Option<String> {
+    pub(crate) fn accelerator(&self) -> Option<String> {
         match self {
             Self::Cpu => Some("CPU".into()),
             #[cfg(feature = "dinov2")]
@@ -1921,7 +1925,7 @@ fn push_bounded<T>(items: &mut Vec<T>, feature: T, limit: usize) {
     }
     items.push(feature);
 }
-fn encode(feature: &Descriptor) -> Vec<u8> {
+pub(crate) fn encode(feature: &Descriptor) -> Vec<u8> {
     feature
         .iter()
         .flat_map(|value| value.to_le_bytes())

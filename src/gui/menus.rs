@@ -17,6 +17,7 @@ pub(super) enum Command {
     AllRecord,
     RefreshFeatures,
     Destinations,
+    FolderReview,
     Record,
     Schedule,
     Quit,
@@ -159,6 +160,11 @@ impl Workbench {
                     Some(Item::command(
                         "Manage Destinations…",
                         Command::Destinations,
+                        ready,
+                    )),
+                    Some(Item::command(
+                        "Review a Folder…",
+                        Command::FolderReview,
                         ready,
                     )),
                     None,
@@ -435,6 +441,7 @@ impl Workbench {
             Command::Destinations => {
                 self.handle_message(Message::CapturePicker(destinations::Message::OpenManager))
             }
+            Command::FolderReview => self.show_folder_review(),
             Command::Record => {
                 if self.snapshot.forwarding.is_some() {
                     self.handle_message(Message::StopForward)

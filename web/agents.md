@@ -499,6 +499,23 @@ Each saved frame is a raw file in the `.frames` folder, written through the stor
 
 Each session stores its encoder and a SHA-256 fingerprint of the model. `resume PATH` refuses a session learned with a different bundled model (exit 1) so incompatible embeddings are never mixed; the encoder of an existing session never changes, so create a new session to switch. Sessions from before encoder choice upgrade in place as `native`; later ones keep their encoder. RPC operations are `capture_session_open` (`path`, `create`, optional `encoder`), `capture_session_close`, `capture_example`, `auto_capture`, `capture_review` and `review_capture`.
 
+## Review a folder
+
+```sh
+capturefab folder-review new /data/review.duckdb --folder /data/photos --json
+capturefab folder-review scan /data/review.duckdb --json
+capturefab folder-review next /data/review.duckdb --json
+capturefab folder-review keep /data/review.duckdb 12 --json
+capturefab folder-review discard /data/review.duckdb 31 --json
+capturefab folder-review export /data/review.duckdb --to /data/keepers --json
+```
+
+Folder review ranks a folder's images and sampled video frames and queues the interesting ones, like auto capture for files on disk. It runs in the calling process: no camera, GUI or `serve` session is used, and `--session` is exit 2. The folder is only read. `new PATH --folder DIR [--encoder auto|dinov2|native] [--rank auto|novelty|similar] [--examples CAPTURE.duckdb] [--sensitivity 0.5] [--video-interval-ms 2000]` creates one `.duckdb` session; a missing folder is exit 3, and a session another process holds is exit 3. `scan` samples new, changed and previously failed files, commits each file on its own (Ctrl-C keeps finished files) and drops pending items of removed files; it returns `scan` with `files`, `added`, `changed`, `unchanged`, `missing`, `failed`, `items`, `duplicates`, `limited`, `stopped`, `accelerator` and up to 10 `errors` (`{path,error}`).
+
+`next [--all] [--inline-image]` returns `item: null` when nothing scores at least `0.90 - 0.35 * sensitivity` (with `--all`, the best pending item regardless), otherwise `{id,path,kind,offset_ms?,width,height,score,reason,preview?}`; `path` is relative to the folder and `offset_ms` locates a video frame. `keep ID` and `discard ID` fail (exit 1) for an item that is no longer pending. `novelty` ranking offers the item farthest from everything reviewed, discounted near discarded items; `similar` uses auto capture's preference against kept items and imported examples, and falls back to novelty with nothing kept. Items within the encoder's duplicate distance of a recently scanned or reviewed item are `duplicates` and never queued. `--examples` imports up to 1024 manual, kept and discarded captures from a capture session with the same encoder and model fingerprint.
+
+`export (--to DIR | --destination NAME [--to SUBDIR])` copies kept items not yet exported, keeping relative paths: stills byte for byte, video frames as `STEM-OFFSETms.png`. It never replaces a file (a taken name gets `-1`, `-2`…), counts against the storage budget (exit 6 when full), skips items whose source changed, and queues uploads for bucket destinations. Every result includes `folder_review` with counts (`pending`, `interesting`, `kept`, `discarded`, `duplicates`, `exported`), `rank`, `threshold`, `encoder` and `note`. Limits: 20,000 items and 20,000 media files per session, 600 samples per video. See `schema --json` key `folder_review`.
+
 ## Apply repeatable JSON workflows
 
 Use workflow files for ordered multi-camera setup and acquisition without shell escaping. [The workflow guide](https://github.com/capturefab/capturefab/blob/main/docs/cli-workflows.md) includes [validated examples](https://github.com/capturefab/capturefab/tree/main/examples/workflows) for timelapse, scanner feeders and bounded recording.

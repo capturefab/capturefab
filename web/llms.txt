@@ -310,6 +310,22 @@ Embeddings run on the GPU in an isolated helper process when possible (up to 30 
 A session keeps its encoder and model fingerprint: `resume` refuses a session learned with a different bundled model (exit 1).
 RPC operations are `capture_session_open` (`path`, `create`, optional `encoder`), `capture_session_close`, `capture_example`, `auto_capture`, `capture_review` and `review_capture`.
 
+## Review a folder
+
+```sh
+capturefab folder-review new review.duckdb --folder photos --json
+capturefab folder-review scan review.duckdb --json
+capturefab folder-review next review.duckdb --json
+capturefab folder-review keep review.duckdb 12 --json
+capturefab folder-review export review.duckdb --to keepers --json
+```
+
+Folder review ranks a folder's images and sampled video frames (every `--video-interval-ms`, default 2000) for keep/discard review. It runs locally without a camera or session; `--session` is exit 2. The folder is only read.
+`--rank novelty` (default) offers the item least like everything reviewed; `similar` the item most like kept items, optionally taught by `--examples CAPTURE.duckdb` from auto capture.
+`scan` commits each file on its own, retries failed files and drops pending items of removed files; `next` returns `item: null` when nothing reaches the threshold (`--all` ignores it).
+Repeats are set aside as `duplicates`. `export --to DIR` or `--destination NAME` copies kept items without overwriting; a full storage budget is exit 6.
+A missing folder, or a session another process holds, is exit 3. Limits: 20,000 items, 600 samples per video. `schema --json` key `folder_review` has the full contract.
+
 ## Use the AI assistant
 
 In the desktop app, open Settings and select AI assistant.

@@ -1561,30 +1561,58 @@ impl ReplayDecoder {
                 "none".into(),
             ]);
         } else {
-            let extension = path
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            let format = match extension.as_str() {
-                "mp4" | "m4v" | "mov" => "mov",
-                "mkv" | "webm" => "matroska",
-                "ts" | "mts" | "m2ts" => "mpegts",
-                "mpg" | "mpeg" | "vob" => "mpeg",
-                "avi" => "avi",
-                "flv" => "flv",
-                "wmv" => "asf",
-                "ogv" => "ogg",
-                _ => bail!("unsupported simulation video extension: {extension}"),
-            };
             // Do not autodetect a renamed playlist or manifest as local video.
-            options.extend(["-f".into(), format.into()]);
+            options.extend(["-f".into(), Self::video_format(path)?.into()]);
         }
         let mut output = Self::output(width, height, (!image).then_some(fps));
         if image {
             output.extend(["-frames:v".into(), "1".into()]);
         }
         Self::spawn(path, timeout, &options, &output)
+    }
+    /// The one frame of a local video shown `offset_ms` after it starts, as
+    /// `open` with the same box would have sampled it.
+    pub(crate) fn frame_at(
+        path: &std::path::Path,
+        width: u32,
+        height: u32,
+        offset_ms: u64,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let options = [
+            "-protocol_whitelist".into(),
+            "file,pipe".into(),
+            "-xerror".into(),
+            "-hwaccel".into(),
+            "none".into(),
+            "-threads".into(),
+            "1".into(),
+            "-f".into(),
+            Self::video_format(path)?.into(),
+            "-ss".into(),
+            format!("{}.{:03}", offset_ms / 1000, offset_ms % 1000),
+        ];
+        let mut output = Self::output(width, height, None);
+        output.extend(["-frames:v".into(), "1".into()]);
+        Self::spawn(path, timeout, &options, &output)
+    }
+    fn video_format(path: &std::path::Path) -> Result<&'static str> {
+        let extension = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        Ok(match extension.as_str() {
+            "mp4" | "m4v" | "mov" => "mov",
+            "mkv" | "webm" => "matroska",
+            "ts" | "mts" | "m2ts" => "mpegts",
+            "mpg" | "mpeg" | "vob" => "mpeg",
+            "avi" => "avi",
+            "flv" => "flv",
+            "wmv" => "asf",
+            "ogv" => "ogg",
+            _ => bail!("unsupported simulation video extension: {extension}"),
+        })
     }
     pub(crate) fn sequence(
         manifest: &std::path::Path,

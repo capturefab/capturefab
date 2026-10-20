@@ -128,13 +128,13 @@ fn state_guidance(state: &str) -> &'static str {
     }
 }
 
-fn swipe_decision(start: Point, end: Point) -> Option<bool> {
+pub(super) fn swipe_decision(start: Point, end: Point) -> Option<bool> {
     let dx = end.x - start.x;
     let dy = end.y - start.y;
     (dx.abs() >= 90.0 && dx.abs() > dy.abs() * 1.5).then_some(dx > 0.0)
 }
 
-fn key_decision(chord: Chord, captured: bool, editor: bool) -> Option<bool> {
+pub(super) fn key_decision(chord: Chord, captured: bool, editor: bool) -> Option<bool> {
     if captured || editor || chord.mods != keys::Mods::NONE {
         return None;
     }
