@@ -1,5 +1,4 @@
 pub(crate) mod assistant;
-mod folder_review;
 mod signal_profiles;
 mod tools;
 pub use assistant::{AssistantCommand, AssistantTaskFailure};
@@ -695,48 +694,6 @@ pub enum WorkflowCommand {
     },
 }
 #[derive(Debug, Subcommand)]
-pub enum CaptureSessionCommand {
-    /// Create a camera-bound DuckDB session and its .frames folder; existing files are never overwritten
-    New {
-        path: PathBuf,
-        /// Image encoder: auto uses the bundled DINOv2 model, on the GPU when possible
-        #[arg(long, value_enum, default_value_t = crate::autocapture::EncoderChoice::Auto)]
-        encoder: crate::autocapture::EncoderChoice,
-    },
-    /// Resume examples, feedback and pending reviews from an existing DuckDB session
-    Resume { path: PathBuf },
-    /// Close and checkpoint the active capture database
-    Close,
-    /// Save a positive training capture in the active database
-    Teach,
-    /// Enable automatic capture, or pause it while retaining the learned examples
-    Auto {
-        #[arg(long)]
-        pause: bool,
-        /// Suggestion sensitivity, from 0 (selective) to 1 (more suggestions)
-        #[arg(long, default_value_t = 0.5, value_parser = parse_sensitivity)]
-        sensitivity: f64,
-        /// Minimum delay between suggestions, in milliseconds
-        #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u64).range(250..=3_600_000))]
-        cooldown_ms: u64,
-    },
-    /// Fetch the next pending review, or one pending capture by ID
-    Review {
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=i64::MAX as u64))]
-        id: Option<u64>,
-    },
-    /// Keep a suggested capture and learn from the positive feedback
-    Keep {
-        #[arg(value_parser = clap::value_parser!(u64).range(1..=i64::MAX as u64))]
-        id: u64,
-    },
-    /// Discard a suggested capture and learn from the negative feedback
-    Discard {
-        #[arg(value_parser = clap::value_parser!(u64).range(1..=i64::MAX as u64))]
-        id: u64,
-    },
-}
-#[derive(Debug, Subcommand)]
 pub enum Command {
     /// Configure an AI provider, plan captures or run a bounded camera task
     Assistant {
@@ -752,16 +709,6 @@ pub enum Command {
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
-    },
-    /// Learn capture preferences and review suggestions in a persistent DuckDB session
-    CaptureSession {
-        #[command(subcommand)]
-        command: CaptureSessionCommand,
-    },
-    /// Rank a folder's images and video frames and review the interesting ones in a DuckDB session
-    FolderReview {
-        #[command(subcommand)]
-        command: folder_review::FolderReviewCommand,
     },
     /// Open the desktop GUI and expose its local automation session
     Gui {
@@ -1107,12 +1054,6 @@ fn parse_balance(s: &str) -> std::result::Result<f64, String> {
             }),
     }
 }
-fn parse_sensitivity(s: &str) -> std::result::Result<f64, String> {
-    s.parse::<f64>()
-        .ok()
-        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
-        .ok_or_else(|| "expected a finite sensitivity from 0 to 1".into())
-}
 fn assignment(s: &str) -> Result<(String, String)> {
     let (k, v) = s.split_once('=').context("expected FEATURE=VALUE")?;
     ensure!(
@@ -1294,7 +1235,6 @@ fn camera_command(command: Option<&Command>) -> bool {
             command,
             Some(
                 Command::Disconnect
-                    | Command::CaptureSession { .. }
                     | Command::Start
                     | Command::Stop
                     | Command::Auto { .. }
@@ -1455,43 +1395,6 @@ fn prepare_with(
     }
     crate::session::validate_timeout(cli.timeout_ms)?;
     let command = match &cli.command {
-        Some(Command::CaptureSession { command }) => Some(match command {
-            CaptureSessionCommand::New { path, .. } | CaptureSessionCommand::Resume { path } => {
-                SessionCommand::CaptureSessionOpen {
-                    path: path
-                        .to_str()
-                        .context("capture session path must be valid UTF-8")?
-                        .into(),
-                    create: matches!(command, CaptureSessionCommand::New { .. }),
-                    encoder: match command {
-                        CaptureSessionCommand::New { encoder, .. } => Some(*encoder),
-                        _ => None,
-                    },
-                }
-            }
-            CaptureSessionCommand::Close => SessionCommand::CaptureSessionClose,
-            CaptureSessionCommand::Teach => SessionCommand::CaptureExample {
-                timeout_ms: cli.timeout_ms,
-            },
-            CaptureSessionCommand::Auto {
-                pause,
-                sensitivity,
-                cooldown_ms,
-            } => SessionCommand::AutoCapture {
-                enabled: !pause,
-                sensitivity: *sensitivity,
-                cooldown_ms: *cooldown_ms,
-            },
-            CaptureSessionCommand::Review { id } => SessionCommand::CaptureReview { id: *id },
-            CaptureSessionCommand::Keep { id } => SessionCommand::ReviewCapture {
-                id: *id,
-                keep: true,
-            },
-            CaptureSessionCommand::Discard { id } => SessionCommand::ReviewCapture {
-                id: *id,
-                keep: false,
-            },
-        }),
         Some(Command::Activity { after, wait }) => Some(SessionCommand::Activity {
             after: *after,
             timeout_ms: wait
@@ -1837,13 +1740,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
     // environment selector before path resolution and shape validation.
     if matches!(cli.command, Some(Command::Hub { .. })) {
         cli.camera = None;
-    }
-    // Folder review reads files in this process and never targets a camera.
-    if let Some(Command::FolderReview { command }) = &cli.command {
-        cli.camera = None;
-        crate::efficiency::configure(cli.efficiency);
-        let result = folder_review::run(&cli, command)?;
-        return output(&cli, result);
     }
     if let Some(Command::Signals {
         command: Some(SignalsCommand::Profiles { command }),
@@ -2252,7 +2148,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
         &cli.command,
         Some(
             Command::Connect { .. }
-                | Command::CaptureSession { .. }
                 | Command::Select { .. }
                 | Command::Disconnect
                 | Command::Start
@@ -2520,7 +2415,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
             json!({"camera":status["connected"]["id"],"history":status["history"]})
         }
         Command::Status => client.call(SessionCommand::Status)?,
-        Command::CaptureSession { .. } => client.call(prepared.clone().unwrap())?,
         Command::Activity { .. } => client.call(prepared.clone().unwrap())?,
         Command::Capture {
             output: destination,
@@ -2684,9 +2578,6 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
     if let Some(Command::Tools { command }) = &cli.command {
         return tools::print_human(command, &value);
     }
-    if let Some(Command::FolderReview { command }) = &cli.command {
-        return folder_review::print_human(command, &value);
-    }
     let mut out = io::stdout().lock();
     if matches!(&cli.command, Some(Command::Doctor)) {
         crate::doctor::print_checklist(&mut out, &value)?;
@@ -2728,48 +2619,6 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
                 .as_str()
                 .unwrap_or("Nothing to redo")
         )?;
-    } else if let Some(Command::CaptureSession { command }) = &cli.command {
-        match command {
-            CaptureSessionCommand::Close => writeln!(out, "Capture session closed.")?,
-            CaptureSessionCommand::Review { .. } => {
-                if let Some(id) = value["capture"]["id"].as_u64() {
-                    writeln!(
-                        out,
-                        "Capture #{id}: {} (score {:.3})",
-                        value["capture"]["reason"].as_str().unwrap_or("Suggestion"),
-                        value["capture"]["score"].as_f64().unwrap_or(0.0)
-                    )?;
-                    writeln!(
-                        out,
-                        "Use capture-session keep {id} or discard {id}; --json includes the RGBA preview."
-                    )?;
-                } else {
-                    writeln!(out, "No captures pending review.")?;
-                }
-            }
-            CaptureSessionCommand::Keep { id } => {
-                writeln!(out, "Kept capture #{id}; session model updated.")?
-            }
-            CaptureSessionCommand::Discard { id } => {
-                writeln!(out, "Discarded capture #{id}; session model updated.")?
-            }
-            CaptureSessionCommand::Teach => {
-                writeln!(out, "Saved training capture #{}.", value["id"])?
-            }
-            _ => {
-                let session = &value["capture_session"];
-                writeln!(
-                    out,
-                    "{}: {} · {} manual · {} kept · {} discarded · {} pending",
-                    session["path"].as_str().unwrap_or("Capture session"),
-                    session["state"].as_str().unwrap_or("ready"),
-                    session["manual_count"],
-                    session["kept_count"],
-                    session["discarded_count"],
-                    session["pending_count"]
-                )?;
-            }
-        }
     } else if let Some(Command::Dataset { command }) = &cli.command {
         dataset_output(&mut out, command, &value)?;
     } else if matches!(
@@ -2984,7 +2833,7 @@ fn doctor() -> Value {
 /// What this build supports and where it runs; `doctor` adds the host checks.
 fn build_report() -> Value {
     let interfaces=if_addrs::get_if_addrs().map(|items|items.into_iter().filter_map(|i|match i.addr{if_addrs::IfAddr::V4(a)=>Some(json!({"name":i.name,"ip":a.ip,"netmask":a.netmask,"broadcast":a.broadcast})),_=>None}).collect::<Vec<_>>()).unwrap_or_default();
-    let mut value = json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"scanner":cfg!(feature="scanner"),"wgpu":cfg!(feature="gui"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox"),"s3":cfg!(feature="s3"),"ftp":cfg!(feature="ftp"),"sftp":cfg!(feature="sftp"),"parquet":cfg!(feature="parquet"),"modbus":cfg!(feature="modbus"),"mqtt":cfg!(feature="mqtt"),"opcua":cfg!(feature="opcua"),"mtconnect":cfg!(feature="mtconnect"),"dinov2":cfg!(feature="dinov2"),"embedded_web":crate::remote::embedded(),"hubs":cfg!(feature="hubs"),"keychain":cfg!(feature="keychain")},"auto_capture":crate::autocapture::doctor(),"signals":crate::signals::compiled_protocols(),"scanners":crate::scanner::doctor(),"jpeg":jpeg_backends(),"session_directory":ipc::runtime_dir(),"runtime_directory":ipc::runtime_dir(),"state_directory":ipc::state_dir(),"cache_directory":ipc::cache_dir(),"ring_backing":crate::shared_memory::backing(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox. Document scanning uses installed platform scanner drivers (SANE scanimage on Linux).","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}});
+    let mut value = json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"scanner":cfg!(feature="scanner"),"wgpu":cfg!(feature="gui"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox"),"s3":cfg!(feature="s3"),"ftp":cfg!(feature="ftp"),"sftp":cfg!(feature="sftp"),"parquet":cfg!(feature="parquet"),"modbus":cfg!(feature="modbus"),"mqtt":cfg!(feature="mqtt"),"opcua":cfg!(feature="opcua"),"mtconnect":cfg!(feature="mtconnect"),"embedded_web":crate::remote::embedded(),"hubs":cfg!(feature="hubs"),"keychain":cfg!(feature="keychain")},"signals":crate::signals::compiled_protocols(),"scanners":crate::scanner::doctor(),"jpeg":jpeg_backends(),"session_directory":ipc::runtime_dir(),"runtime_directory":ipc::runtime_dir(),"state_directory":ipc::state_dir(),"cache_directory":ipc::cache_dir(),"ring_backing":crate::shared_memory::backing(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox. Document scanning uses installed platform scanner drivers (SANE scanimage on Linux).","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}});
     value["features"]["ai"] = json!(cfg!(feature = "ai"));
     value["features"]["uploads"] = json!(cfg!(feature = "uploads"));
     value["assistant"] = assistant::doctor();
@@ -3098,48 +2947,6 @@ fn schema() -> Value {
         "preview_skipped":"preview frames the shared ring replaced while a viewer read it; captures and recordings still receive them",
         "dropped":"worker receive errors plus preview_skipped",
         "scope":"top level for the selected camera, and per camera in cameras[]"
-    });
-    contract["capture_session"] = json!({
-        "cli":"--session NAME [--camera ID] capture-session new PATH.duckdb [--encoder auto|dinov2|native] | resume PATH.duckdb | close | teach | auto [--pause] [--sensitivity 0.5] [--cooldown-ms 2000] | review [--id ID] | keep ID | discard ID",
-        "encoders":{
-            "auto":"default for new sessions: dinov2 when the build bundles it (release builds do), otherwise native. It stays dinov2 on computers without a usable GPU, where DINOv2 runs paced on the CPU; choose native there for 4 Hz sampling",
-            "dinov2":"L2-normalized CLS embedding of Meta's DINOv2 ViT-S/14 (facebook/dinov2-small, Apache-2.0), bundled in the executable; nothing is downloaded. Frames are squashed to 224x224 and ImageNet-normalized, then embedded on the GPU (wgpu: Metal, Vulkan or DX12) in an isolated helper process, or on the CPU when no hardware GPU is usable, the helper fails or it misses its 2 s deadline. Sampling follows the camera at up to 30 frames per second on the GPU; on the CPU it rests after each frame so embedding averages at most half of one core (a fifth in efficiency mode). status reports accelerator and samples_per_second (two decimals below 1). CAPTUREFAB_DINOV2_GPU=0 forces the CPU",
-            "native":"84-value spatial color/edge descriptor sampled at up to 4 frames per second",
-            "persistence":"The encoder, descriptor dimensions and a SHA-256 fingerprint of the model weights and configuration are stored in the session. Resume fails if the running build bundles a different model; the encoder of an existing session never changes",
-            "doctor":"doctor reports auto_capture.default_encoder and auto_capture.dinov2 {bundled,model,fingerprint,license,gpu:{available,adapter|reason}}"
-        },
-        "scope":"Camera-bound persistent controls; connect the camera in a GUI/serve session first. Temporary --direct workers are rejected.",
-        "storage":"A session is NAME.duckdb plus a NAME.frames folder beside it. The database stores descriptors, capture decisions, settings, background prototypes and each frame's file name and SHA-256; each saved frame is a raw file in the folder, written through the storage budget (Storage full is exit 6). New refuses existing paths and an existing .frames folder; resume requires an existing compatible session for this camera, and its .frames folder while the database names frame files. Close checkpoints the database; copy the database and its .frames folder together. Keep only relabels; discard deletes the frame file if it is unchanged and retains negative descriptors and the decision. Sessions from earlier versions keep their frames inside the database and still review.",
-        "paths":"CLI and RPC database paths resolve in the calling terminal; workflow database paths resolve beside the workflow file.",
-        "learning":"Manual training captures and kept suggestions are positive examples; discarded suggestions are negative examples. Pending suggestions do not train the model. Scoring is a session-local nearest-example model with background novelty over the session's encoder; the encoder itself is never trained, and Capturefab downloads no weights.",
-        "controls":"Auto capture is independent of auto exposure. auto enables acquisition; --pause pauses suggestions and keeps examples. Sensitivity and cooldown default to 0.5 and 2000ms on each auto command. Resume restores saved settings; hardware must be reconnected.",
-        "status":"status.capture_session and cameras[].capture_session ({...,encoder:\"dinov2\"|\"native\",model,accelerator?,samples_per_second?,note?}); null when no capture database is open. note, when present, says why a suggestion was skipped (the previous frame was still being saved, or storage refused or could not save it) or why a pending capture left the queue (its frame file was deleted or changed); notes fade after a minute. A storage budget refusal is retried after 60 s, or at once after discard or auto; free space or raise the budget (storage configure), since every session shares it",
-        "review":"Returns {capture:null|{id,score,reason,width,height,rgba},capture_session:...}; rgba is a base64-encoded 480x360-or-smaller RGBA preview. Review IDs address pending captures; stale or repeated decisions fail.",
-        "limits":{"sensitivity":[0.0,1.0],"cooldown_ms":[250,3600000],"pending":200,"stored_pixel_bytes":2147483648_u64},
-        "research":"docs/auto-capture-models.md"
-    });
-    contract["folder_review"] = json!({
-        "cli":"folder-review new PATH.duckdb --folder DIR [--encoder auto|dinov2|native] [--rank auto|novelty|similar] [--examples CAPTURE.duckdb] [--sensitivity 0.5] [--video-interval-ms 2000] | scan PATH.duckdb | status PATH.duckdb | next PATH.duckdb [--all] [--inline-image] | keep PATH.duckdb ID | discard PATH.duckdb ID | configure PATH.duckdb [--rank novelty|similar] [--sensitivity S] | export PATH.duckdb (--to DIR | --destination NAME [--to SUBDIR])",
-        "scope":"Runs in the calling process on local files; no camera, GUI or serve session is involved, and --session is a usage error. A session file is held by one process at a time; another gets exit 3 (unavailable) until it is closed.",
-        "inputs":"Every regular file below the folder with an image (png, jpg, jpeg, bmp, tif, tiff, webp, ppm, pgm, pbm, pnm) or video (mp4, m4v, mov, mkv, avi, webm, mpg, mpeg, ts, mts, m2ts, vob, flv, wmv, ogv) extension, sorted by path. Hidden entries and symbolic links are skipped, never followed; at most 32 folder levels and 20000 media files. JPEG and PNG decode in process; other stills and videos go through FFmpeg, scaled into 1920x1080 (stills) or 960x540 (videos) keeping their aspect ratio. Videos are sampled every --video-interval-ms, at most 600 samples each.",
-        "folder":"Never written. Items are decoded again from their files to be shown and exported; a pending item whose file is gone or changed (size or modification time) leaves the queue with a note, and scan samples it afresh.",
-        "storage":"One DuckDB file holds the folder path, the file inventory (path, size, modification time, ok|failed|missing and the error), one embedding per item, every decision, nearest-distance ranking state and imported examples. scan commits each file on its own, so Ctrl-C or a crash keeps finished files; it samples new, changed and previously failed files, drops pending items of removed ones and keeps decisions.",
-        "encoders":"The same encoders as capture_session.encoders: auto is dinov2 when bundled, on the GPU in the isolated helper when possible, otherwise native. The encoder and model fingerprint are fixed when the session is created; open fails if the build bundles a different model.",
-        "ranking":{
-            "novelty":"Farthest first: the pending item least like everything reviewed, or before any decision the item least like the folder's average. Score is novelty (distance / encoder novelty scale, capped at 1) times one minus the similarity to the nearest discarded item, so discards suppress look-alikes.",
-            "similar":"Auto capture's preference: similarity to the nearest kept item or imported positive example, scaled by its distance ratio against discarded items and imported negatives, times 0.9 + 0.1 x novelty. With nothing kept yet it ranks by novelty.",
-            "examples":"--examples imports up to 1024 manual, kept and discarded captures of a capture session (read-only) using the same encoder and model; with --encoder auto the review adopts the session's encoder, and a different explicit encoder is refused. --rank auto is similar with examples, otherwise novelty.",
-            "repeats":"An item within the encoder's duplicate distance of one of the 64 items scanned before it, or of a reviewed item, is a duplicate and never queued; a decision also turns pending look-alikes into duplicates. A duplicate whose original is dropped by a rescan is pending again.",
-            "threshold":"next offers the best pending item scoring at least 0.90 - 0.35 x sensitivity; --all offers the best one regardless. Every decision teaches the ranking at once."
-        },
-        "results":{
-            "status":"{folder_review:{path,folder,encoder,model_fingerprint?,rank,sensitivity,threshold,video_interval_ms,files,failed_files,missing_files,items,pending,interesting,kept,discarded,duplicates,exported,examples,examples_from?,scanned_ms?,note?}}; new, configure, status, keep, discard, scan, next and export all include it",
-            "scan":"{scan:{files,added,changed,unchanged,missing,failed,skipped,items,duplicates,limited,stopped,accelerator?,errors:[{path,error}]}}; progress goes to stderr on a terminal",
-            "next":"{item:null|{id,path,kind:\"image\"|\"video\",offset_ms?,width,height,score,reason,preview?:{width,height,rgba}}}; path is relative to the folder and rgba a base64 480x360-or-smaller RGBA preview",
-            "decision":"{id,keep}; IDs address pending items and stale or repeated decisions fail (exit 1)",
-            "export":"{export:{output,exported:[{id,source,path,bytes,sha256,upload?}],skipped:[{path,error}]}}. Kept items not yet exported are copied below the output keeping their relative paths: stills byte for byte, video frames as STEM-OFFSETms.png. Writes go through the storage budget (exit 6 when full) and never replace a file: a taken name gets -1, -2 and so on. A bucket destination queues uploads; items whose source changed are skipped."
-        },
-        "limits":{"sensitivity":[0.0,1.0],"video_interval_ms":[100,3600000],"items":crate::folder_review::MAX_ITEMS,"files":20000,"video_samples":crate::folder_review::MAX_VIDEO_SAMPLES}
     });
     contract["selection"]["source_base"] = json!(
         "Relative file: and sim:replay: inputs, and existing bare media paths, resolve in the calling terminal for CLI/RPC and beside the file for workflows; network/device locators keep their meaning"
@@ -3306,17 +3113,6 @@ fn schema() -> Value {
         json!({"op":"redo"}),
         json!({"op":"replay_camera_change","token":"TOKEN_FROM_CAMERA_CHANGE","undo":true}),
     ]);
-    commands.extend([
-        json!({"op":"capture_session_open","path":"session.duckdb","create":true,"encoder":"auto"}),
-        json!({"op":"capture_session_open","path":"session.duckdb","create":true,"encoder":"native"}),
-        json!({"op":"capture_session_open","path":"session.duckdb","create":false}),
-        json!({"op":"capture_session_close"}),
-        json!({"op":"capture_example","timeout_ms":2000}),
-        json!({"op":"auto_capture","enabled":true,"sensitivity":0.5,"cooldown_ms":2000}),
-        json!({"op":"capture_review","id":null}),
-        json!({"op":"review_capture","id":1,"keep":true}),
-        json!({"op":"review_capture","id":2,"keep":false}),
-    ]);
     commands.push(json!({"op":"capture","output":"line1/{date}/{camera}-{datetime}-{seq}.png","count":1,"timeout_ms":2000,"format":"png","on_exists":"number","context":{"line":"L1","part":"A-100"}}));
     commands.extend(crate::dataset::rpc_examples());
     commands.extend(crate::signals::rpc_examples());
@@ -3327,7 +3123,7 @@ fn schema() -> Value {
         "environment":crate::efficiency::ENV,
         "precedence":"--efficiency, then CAPTUREFAB_EFFICIENCY, then, in the desktop window only, its setting (Settings > Performance), then auto; serve and direct commands do not read the desktop setting; an unknown CAPTUREFAB_EFFICIENCY value means auto",
         "auto":"efficient with at most 2 CPU cores, at most 2 GiB of memory, the OS low-power or battery-saver mode, or a desktop runtime hint (software rendering, or a preview that keeps falling behind); running on battery alone stays smooth",
-        "scope":"The process that parses it, such as the desktop window, serve or a direct command, and the camera workers it starts, which are told efficient whenever that process resolved efficient; a running session keeps its own setting, and its workers follow when it changes, for decoders they start afterwards and from the next embedding. In workers, efficient decodes each live stream with one thread, picks a faster libx264 preset and limits automatic capture's CPU embedding to a fifth of one core instead of half; the session polls its workers for status every 500 ms instead of 250 ms while a camera streams or a view watches, and every 2 s instead of 1 s otherwise. In the desktop window it draws at most 15 camera frames a second in a camera's view and 5 per overview tile, keeps a scaled-down picture to 1280 pixels on its long side, checks for new frames less often and skips animations. Scaled-down previews, desktop and remote, keep one pixel of each block instead of averaging. Captures and recordings keep every frame in every mode.",
+        "scope":"The process that parses it, such as the desktop window, serve or a direct command, and the camera workers it starts, which are told efficient whenever that process resolved efficient; a running session keeps its own setting, and its workers follow when it changes, for decoders they start afterwards. In workers, efficient decodes each live stream with one thread and picks a faster libx264 preset; the session polls its workers for status every 500 ms instead of 250 ms while a camera streams or a view watches, and every 2 s instead of 1 s otherwise. In the desktop window it draws at most 15 camera frames a second in a camera's view and 5 per overview tile, keeps a scaled-down picture to 1280 pixels on its long side, checks for new frames less often and skips animations. Scaled-down previews, desktop and remote, keep one pixel of each block instead of averaging. Captures and recordings keep every frame in every mode.",
         "status":"doctor --json efficiency {setting,efficient,reasons}"
     });
     contract["doctor"] = json!({
@@ -4698,210 +4494,6 @@ mod tests {
         }
     }
     #[test]
-    fn capture_session_commands_are_camera_bound_and_prepare_before_execution() {
-        for (args, expected) in [
-            (
-                vec!["new", "session.duckdb"],
-                json!({"op":"capture_session_open","path":"session.duckdb","create":true,"encoder":"auto"}),
-            ),
-            (
-                vec!["new", "session.duckdb", "--encoder", "dinov2"],
-                json!({"op":"capture_session_open","path":"session.duckdb","create":true,"encoder":"dinov2"}),
-            ),
-            (
-                vec!["new", "session.duckdb", "--encoder", "native"],
-                json!({"op":"capture_session_open","path":"session.duckdb","create":true,"encoder":"native"}),
-            ),
-            (
-                vec!["resume", "session.duckdb"],
-                json!({"op":"capture_session_open","path":"session.duckdb","create":false}),
-            ),
-            (vec!["close"], json!({"op":"capture_session_close"})),
-            (
-                vec!["teach"],
-                json!({"op":"capture_example","timeout_ms":2000}),
-            ),
-            (
-                vec!["auto"],
-                json!({"op":"auto_capture","enabled":true,"sensitivity":0.5,"cooldown_ms":2000}),
-            ),
-            (
-                vec![
-                    "auto",
-                    "--pause",
-                    "--sensitivity",
-                    "0.25",
-                    "--cooldown-ms",
-                    "500",
-                ],
-                json!({"op":"auto_capture","enabled":false,"sensitivity":0.25,"cooldown_ms":500}),
-            ),
-            (vec!["review"], json!({"op":"capture_review","id":null})),
-            (
-                vec!["review", "--id", "2"],
-                json!({"op":"capture_review","id":2}),
-            ),
-            (
-                vec!["keep", "3"],
-                json!({"op":"review_capture","id":3,"keep":true}),
-            ),
-            (
-                vec!["discard", "4"],
-                json!({"op":"review_capture","id":4,"keep":false}),
-            ),
-        ] {
-            let cli = Cli::try_parse_from(
-                [
-                    "capturefab",
-                    "--session",
-                    "bench",
-                    "--camera",
-                    "sim:0",
-                    "capture-session",
-                ]
-                .into_iter()
-                .chain(args),
-            )
-            .unwrap();
-            assert!(camera_command(cli.command.as_ref()));
-            assert!(uses_session(cli.command.as_ref()));
-            assert!(
-                !one_shot_camera_command(cli.command.as_ref()),
-                "capture-session controls must not silently connect temporary cameras"
-            );
-            let command = prepare(&cli).unwrap().unwrap();
-            assert_eq!(serde_json::to_value(&command).unwrap(), expected);
-            command.validate().unwrap();
-        }
-        let cli = Cli::try_parse_from([
-            "capturefab",
-            "--session",
-            "bench",
-            "capture-session",
-            "resume",
-            "relative.duckdb",
-        ])
-        .unwrap();
-        let mut command = prepare(&cli).unwrap().unwrap();
-        caller_output(&mut command).unwrap();
-        assert!(
-            matches!(command, SessionCommand::CaptureSessionOpen { path, create: false, encoder: None } if std::path::Path::new(&path).is_absolute() && path.ends_with("relative.duckdb"))
-        );
-        for args in [
-            vec!["new", "s.duckdb", "--encoder", "dinov3"],
-            vec!["new", "s.duckdb", "--model", "weights"],
-            vec!["resume", "s.duckdb", "--encoder", "native"],
-        ] {
-            let cli = Cli::try_parse_from(
-                ["capturefab", "--session", "bench", "capture-session"]
-                    .into_iter()
-                    .chain(args.iter().copied()),
-            );
-            assert!(cli.is_err() || prepare(&cli.unwrap()).is_err(), "{args:?}");
-        }
-    }
-    #[test]
-    fn capture_session_rejects_invalid_settings_ids_and_paths() {
-        for args in [
-            vec!["auto", "--sensitivity", "NaN"],
-            vec!["auto", "--sensitivity", "inf"],
-            vec!["auto", "--sensitivity", "1.1"],
-            vec!["auto", "--cooldown-ms", "249"],
-            vec!["auto", "--cooldown-ms", "3600001"],
-            vec!["review", "--id", "0"],
-            vec!["keep", "0"],
-            vec!["discard", "9223372036854775808"],
-            vec!["new"],
-        ] {
-            assert!(
-                Cli::try_parse_from(["capturefab", "capture-session"].into_iter().chain(args))
-                    .is_err()
-            );
-        }
-        assert!(Cli::try_parse_from(["capturefab", "capture-session", "new", ""]).is_err());
-        for path in ["   ", ":memory:", "session.csv", "session\n.duckdb"] {
-            let cli = Cli::try_parse_from([
-                "capturefab",
-                "--session",
-                "bench",
-                "capture-session",
-                "new",
-                path,
-            ])
-            .unwrap();
-            assert!(prepare(&cli).is_err(), "invalid path accepted: {path:?}");
-        }
-        for sensitivity in ["0", "1"] {
-            let cli = Cli::try_parse_from([
-                "capturefab",
-                "capture-session",
-                "auto",
-                "--sensitivity",
-                sensitivity,
-            ])
-            .unwrap();
-            prepare(&cli).unwrap().unwrap().validate().unwrap();
-        }
-    }
-    #[test]
-    fn folder_review_commands_parse_and_are_in_the_schema() {
-        let cli = Cli::try_parse_from([
-            "capturefab",
-            "folder-review",
-            "new",
-            "r.duckdb",
-            "--folder",
-            "media",
-            "--rank",
-            "similar",
-            "--examples",
-            "c.duckdb",
-            "--video-interval-ms",
-            "500",
-        ])
-        .unwrap();
-        assert!(matches!(cli.command, Some(Command::FolderReview { .. })));
-        for bad in [
-            &["capturefab", "folder-review", "new", "r.duckdb"][..],
-            &[
-                "capturefab",
-                "folder-review",
-                "new",
-                "r.duckdb",
-                "--folder",
-                "m",
-                "--sensitivity",
-                "2",
-            ],
-            &[
-                "capturefab",
-                "folder-review",
-                "new",
-                "r.duckdb",
-                "--folder",
-                "m",
-                "--video-interval-ms",
-                "10",
-            ],
-            &["capturefab", "folder-review", "keep", "r.duckdb", "0"],
-            &["capturefab", "folder-review", "export", "r.duckdb"],
-        ] {
-            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
-        }
-        let contract = schema();
-        assert!(
-            contract["folder_review"]["cli"]
-                .as_str()
-                .unwrap()
-                .contains("folder-review new")
-        );
-        assert_eq!(
-            contract["folder_review"]["limits"]["items"],
-            crate::folder_review::MAX_ITEMS
-        );
-    }
-
-    #[test]
     fn schema_commands_parse() {
         let contract = schema();
         let commands = contract["rpc"]["commands"].as_array().unwrap();
@@ -4920,12 +4512,6 @@ mod tests {
                 "redo",
                 "replay_camera_change",
                 "activity",
-                "capture_session_open",
-                "capture_session_close",
-                "capture_example",
-                "auto_capture",
-                "capture_review",
-                "review_capture",
                 "dataset_open",
                 "dataset_close",
                 "dataset_status",

@@ -431,8 +431,6 @@ impl Workbench {
             || self.scene_side(word, late)
             || self.scene_stage(word, late)
             || self.scene_inspector(word, late)
-            || self.scene_autocapture(word, late)
-            || self.scene_folder_review(word, late)
             || self.scene_network(word, late)
             || self.scene_video_analytics(word, late)
             || self.scene_assistant_settings(word, late)

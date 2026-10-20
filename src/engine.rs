@@ -102,7 +102,6 @@ pub struct WorkerHandle {
     /// stream hits is logged once.
     ring_note: Arc<Mutex<Option<String>>>,
     history: Arc<Mutex<history::Journal>>,
-    capture_session: Arc<Mutex<Option<crate::autocapture::CaptureSession>>>,
     /// Files saved since the coordinator last collected them.
     saved: Arc<Mutex<crate::dataset::SavedLog>>,
     /// The local recording in progress, reported when it stops.
@@ -136,7 +135,6 @@ impl WorkerHandle {
             ring,
             ring_note: Arc::default(),
             history: Arc::default(),
-            capture_session: Arc::default(),
             saved: Arc::default(),
             recording: Arc::default(),
             forward_clock: Arc::default(),
@@ -241,22 +239,14 @@ impl WorkerHandle {
     /// retain it here. With `forward` the frame is handed back, so the
     /// forwarder takes its buffer.
     fn record(&self, frame: Frame, forward: bool) -> Option<Frame> {
-        self.publish(frame, false, forward, true)
+        self.publish(frame, false, forward)
     }
     /// Publish a frame a command captured. It always reaches the ring, so a
     /// reader such as `capture -o -` gets this frame, not a keep-alive.
     fn record_capture(&self, frame: Frame) {
-        self.publish(frame, true, false, true);
+        self.publish(frame, true, false);
     }
-    /// Publish an inspection without observing it in an auto capture session.
-    /// It must reach the ring immediately even if nobody was watching it.
-    fn publish_frame(&self, frame: Frame) {
-        self.publish(frame, true, false, false);
-    }
-    fn publish(&self, frame: Frame, force: bool, forward: bool, observe: bool) -> Option<Frame> {
-        if observe {
-            self.observe_capture(&frame);
-        }
+    fn publish(&self, frame: Frame, force: bool, forward: bool) -> Option<Frame> {
         let bytes = frame.data.len();
         let count = || {
             self.counters.frames.fetch_add(1, Ordering::Relaxed);
@@ -315,15 +305,6 @@ impl WorkerHandle {
                 .is_some()
         })
     }
-    /// Whether an open auto capture session waits for an embedding, which
-    /// only `poll_capture` collects while no frames arrive.
-    fn embedding(&self) -> bool {
-        self.capture_session
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .is_some_and(crate::autocapture::CaptureSession::embedding)
-    }
     /// Log a frame the ring could not take as it was, once while that keeps
     /// happening rather than for every frame.
     fn note_ring(&self, published: Result<Published>, bytes: usize, capacity: usize) {
@@ -349,123 +330,6 @@ impl WorkerHandle {
             *note = Some(message.clone());
             drop(note);
             self.log(level, message);
-        }
-    }
-    fn publish_capture(
-        &self,
-        session: &crate::autocapture::CaptureSession,
-    ) -> Result<crate::autocapture::SessionStatus> {
-        let status = session.status()?;
-        self.state
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .capture_session = Some(status.clone());
-        Ok(status)
-    }
-    /// Publish the session's status when it differs from the published one.
-    /// It also changes away from the camera thread's suggestions: the writer
-    /// refuses or fails a frame and frees its reserved count, a review drops
-    /// a capture whose frame is gone, the embedder measures its rate and
-    /// finds its accelerator, and notes fade.
-    fn sync_capture(&self, session: &crate::autocapture::CaptureSession) {
-        let Ok(status) = session.status() else {
-            return;
-        };
-        let current = self
-            .state
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .capture_session
-            .as_ref()
-            == Some(&status);
-        if !current {
-            self.state
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .capture_session = Some(status);
-        }
-    }
-    /// `sync_capture` for a status request answered off the camera thread,
-    /// as a camera worker answers the coordinator's polls. A camera thread
-    /// that holds the session is busy with it and publishes it itself.
-    pub fn refresh_capture(&self) {
-        let guard = match self.capture_session.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return,
-        };
-        if let Some(session) = guard.as_ref() {
-            self.sync_capture(session);
-        }
-    }
-    fn teach_capture(&self, frame: &Frame) -> Result<Option<u64>> {
-        let mut guard = self
-            .capture_session
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let Some(session) = guard.as_mut() else {
-            return Ok(None);
-        };
-        let id = session.manual(frame)?;
-        self.publish_capture(session)?;
-        Ok(Some(id))
-    }
-    /// Close the capture session even after its database failed: the user
-    /// must always be able to close it and disconnect. DuckDB replays the
-    /// WAL when the session is resumed.
-    fn close_capture(&self) {
-        let session = self
-            .capture_session
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(session) = session
-            && let Err(error) = session.close()
-        {
-            self.log(
-                "warn",
-                format!("Capture session closed without a final checkpoint: {error:#}"),
-            );
-        }
-        self.state
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .capture_session = None;
-    }
-    fn observe_capture(&self, frame: &Frame) {
-        self.drive_capture(|session| session.observe(frame));
-    }
-    /// Finish background embeddings while no frames arrive (slow, triggered
-    /// or stopped cameras).
-    fn poll_capture(&self) {
-        self.drive_capture(crate::autocapture::CaptureSession::poll);
-    }
-    fn drive_capture(
-        &self,
-        step: impl FnOnce(&mut crate::autocapture::CaptureSession) -> Result<Option<u64>>,
-    ) {
-        let mut guard = self
-            .capture_session
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let Some(session) = guard.as_mut() else {
-            return;
-        };
-        match step(session) {
-            Ok(Some(_)) => {
-                if let Err(error) = self.publish_capture(session) {
-                    self.log("error", format!("Auto capture status: {error:#}"));
-                }
-            }
-            Ok(None) => self.sync_capture(session),
-            Err(error) => {
-                // Preserve the database and all labels; acquisition continues.
-                if let Ok(status) = session.status() {
-                    let _ = session.configure(false, status.sensitivity, status.cooldown_ms);
-                }
-                let _ = self.publish_capture(session);
-                self.log("error", format!("Auto capture paused: {error:#}"));
-            }
         }
     }
 }
@@ -629,14 +493,14 @@ fn next_frame(
 
 /// Let auto exposure settle on a camera that has just started, publishing
 /// the frames it meters, for at most half of `timeout` and 3 s. False when
-/// it had not settled by then. Auto capture observes those frames when
-/// `observe` is set.
+/// it had not settled by then. With `force` they reach the ring even
+/// without a reader.
 fn settle_auto(
     h: &WorkerHandle,
     c: &mut Camera,
     auto: &mut Option<AutoController>,
     timeout: Duration,
-    observe: bool,
+    force: bool,
 ) -> Result<bool> {
     // Refresh the controller's streaming state before testing convergence:
     // a previously stable acquisition must settle again after a restart.
@@ -649,11 +513,7 @@ fn settle_auto(
         let Some(frame) = next_frame(h, c, auto, until)? else {
             return Ok(false);
         };
-        if observe {
-            h.record(frame, false);
-        } else {
-            h.publish_frame(frame);
-        }
+        h.publish(frame, force, false);
     }
     Ok(true)
 }
@@ -950,83 +810,6 @@ fn process_plain(
     command: SessionCommand,
 ) -> Result<Value> {
     match command {
-        SessionCommand::CaptureSessionOpen {
-            path,
-            create,
-            encoder,
-        } => {
-            let c = camera_mut(camera)?;
-            ensure!(
-                !c.is_scanner(),
-                "auto capture needs a streaming camera, not a document scanner"
-            );
-            let mut guard = h.capture_session.lock().unwrap_or_else(|e| e.into_inner());
-            ensure!(
-                guard.is_none(),
-                "close the current capture session before opening another"
-            );
-            let session = crate::autocapture::CaptureSession::open(
-                std::path::Path::new(&path),
-                &c.info.id,
-                create,
-                encoder,
-            )?;
-            if session.status()?.enabled {
-                c.start()?;
-            }
-            h.publish_capture(&session)?;
-            *guard = Some(session);
-            refresh(h, camera, false);
-            Ok(json!({"capture_session":h.snapshot().capture_session}))
-        }
-        SessionCommand::CaptureSessionClose => {
-            h.close_capture();
-            Ok(json!({"capture_session":null}))
-        }
-        SessionCommand::AutoCapture {
-            enabled,
-            sensitivity,
-            cooldown_ms,
-        } => {
-            let c = camera_mut(camera)?;
-            let mut guard = h.capture_session.lock().unwrap_or_else(|e| e.into_inner());
-            let session = guard
-                .as_mut()
-                .context("create or resume a capture session first")?;
-            // Start before arming; failed acquisition must not silently arm a session.
-            if enabled {
-                c.start()?;
-            }
-            session.configure(enabled, sensitivity, cooldown_ms)?;
-            h.publish_capture(session)?;
-            refresh(h, camera, false);
-            Ok(json!({"capture_session":h.snapshot().capture_session}))
-        }
-        SessionCommand::CaptureExample { timeout_ms } => {
-            ensure!(
-                h.capture_session
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .is_some(),
-                "create or resume a capture session first"
-            );
-            let c = camera_mut(camera)?;
-            let was_streaming = c.is_streaming();
-            c.start()?;
-            let result = (|| -> Result<Value> {
-                c.request_frame()?;
-                let frame = next_frame(h, c, auto, Instant::now() + timeout(timeout_ms)?)?
-                    .context("frame timeout")?;
-                let id = h.teach_capture(&frame)?.context("capture session closed")?;
-                h.record_capture(frame);
-                Ok(json!({"id":id,"capture_session":h.snapshot().capture_session}))
-            })();
-            let stopped = if !was_streaming { c.stop() } else { Ok(()) };
-            refresh(h, camera, false);
-            let value = result?;
-            stopped?;
-            Ok(value)
-        }
         SessionCommand::Grab { timeout_ms } => {
             let duration = timeout(timeout_ms)?;
             let deadline = Instant::now() + duration;
@@ -1037,9 +820,8 @@ fn process_plain(
             );
             let was_streaming = c.is_streaming();
             c.start()?;
-            // Capture without a file, name, capture-session example,
-            // auto-capture observation or log line: the frame only reaches
-            // the shared ring.
+            // Capture without a file, name or log line: the frame only
+            // reaches the shared ring.
             let result = (|| -> Result<Value> {
                 let settled = was_streaming
                     || auto.is_none()
@@ -1048,7 +830,7 @@ fn process_plain(
                         c,
                         auto,
                         deadline.saturating_duration_since(Instant::now()),
-                        false,
+                        true,
                     )?;
                 ensure!(Instant::now() < deadline, GRAB_TIMEOUT);
                 c.request_frame()?;
@@ -1057,7 +839,7 @@ fn process_plain(
                 if !settled {
                     value["auto_settled"] = json!(false);
                 }
-                h.publish_frame(frame);
+                h.record_capture(frame);
                 Ok(value)
             })();
             let stopped = if !was_streaming { c.stop() } else { Ok(()) };
@@ -1067,44 +849,8 @@ fn process_plain(
             Ok(value)
         }
         SessionCommand::Frame { .. } => anyhow::bail!("frames belong to the coordinator"),
-        SessionCommand::CaptureReview { id } => {
-            use base64::Engine;
-            let guard = h.capture_session.lock().unwrap_or_else(|e| e.into_inner());
-            let session = guard
-                .as_ref()
-                .context("create or resume a capture session first")?;
-            let capture = match id {
-                Some(id) => session.review_capture(id)?,
-                None => session.next_review()?,
-            };
-            // Loading drops captures whose frames are gone, with a note.
-            let status = h.publish_capture(session)?;
-            let capture = capture.map(|capture| -> Result<Value> {
-                let (width, height, rgba) = crate::frame::preview_rgba(&capture.frame, 480, 360)?;
-                Ok(json!({"id":capture.id,"score":capture.score,"reason":capture.reason,
-                    "width":width,"height":height,"rgba":base64::engine::general_purpose::STANDARD.encode(rgba)}))
-            }).transpose()?;
-            Ok(json!({"capture":capture,"capture_session":status}))
-        }
-        SessionCommand::ReviewCapture { id, keep } => {
-            let mut guard = h.capture_session.lock().unwrap_or_else(|e| e.into_inner());
-            let session = guard
-                .as_mut()
-                .context("create or resume a capture session first")?;
-            session.review(id, keep)?;
-            h.publish_capture(session)?;
-            Ok(json!({"id":id,"keep":keep,"capture_session":h.snapshot().capture_session}))
-        }
         SessionCommand::Status => {
             refresh(h, camera, false);
-            if let Some(session) = h
-                .capture_session
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-            {
-                h.publish_capture(session)?;
-            }
             Ok(serde_json::to_value(h.snapshot())?)
         }
         SessionCommand::Undo | SessionCommand::Redo | SessionCommand::ReplayCameraChange { .. } => {
@@ -1343,7 +1089,6 @@ fn process_plain(
             Ok(json!({"connected":h.snapshot().connected}))
         }
         SessionCommand::Disconnect => {
-            h.close_capture();
             cancel_jobs(jobs);
             sync_jobs(h, jobs);
             *scheduled_stream = false;
@@ -1619,7 +1364,7 @@ fn process_plain(
                 let mut frames = Vec::new();
                 let mut status = None;
                 let mut queued = Vec::new();
-                if !was_streaming && auto.is_some() && !settle_auto(h, c, auto, duration, true)? {
+                if !was_streaming && auto.is_some() && !settle_auto(h, c, auto, duration, false)? {
                     h.log(
                         "warn",
                         "Auto exposure had not settled; capturing anyway".into(),
@@ -1683,12 +1428,6 @@ fn process_plain(
                         files.push(file);
                     }
                     frames.push(metadata);
-                    if let Err(error) = h.teach_capture(&frame) {
-                        h.log(
-                            "error",
-                            format!("Capture saved but session learning failed: {error:#}"),
-                        );
-                    }
                     h.record_capture(frame);
                 }
                 let mut value = json!({"files":files,"frames":frames,"count":count});
@@ -2251,18 +1990,13 @@ fn output_path(output: &str, count: u32, index: u32, format: &str) -> PathBuf {
 /// The longest the camera thread waits while it receives no frames.
 /// Commands, saved shots and shutdown wake it sooner.
 const IDLE: Duration = Duration::from_secs(1);
-/// How often a frame the ring holds back, or a capture session's background
-/// work, is looked at while no frames arrive.
+/// How often a frame the ring holds back is looked at while no frames arrive.
 const TICK: Duration = Duration::from_millis(100);
 /// How long the camera thread may wait for a command while it receives no
 /// frames: until the next job is due, a requested frame times out or a timed
 /// forward ends, even if its media source has already stopped.
 fn idle_wait(h: &WorkerHandle, jobs: &[Scheduled]) -> Duration {
-    let mut wait = if h.holding() || h.embedding() {
-        TICK
-    } else {
-        IDLE
-    };
+    let mut wait = if h.holding() { TICK } else { IDLE };
     let now = Instant::now();
     let now_ms = crate::scheduling::now_ms();
     {
@@ -2370,7 +2104,6 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
         {
             publish_auto(&h, controller);
         }
-        h.poll_capture();
         h.flush_ring();
         sync_stream(&h, &camera);
         let scheduled_scan = jobs.iter().any(|j| j.info.active() && j.deadline.is_some());
@@ -2477,11 +2210,6 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
         let _ = f.stop();
     }
     let _ = release_auto(&h, &mut auto, &mut camera, true);
-    // Close/checkpoint the session even when callers retain WorkerHandle clones.
-    h.capture_session
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take();
     if let Some(mut c) = camera
         && let Err(e) = c.stop()
     {
@@ -2490,7 +2218,6 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
 }
 
 #[cfg(test)]
-mod autocapture_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3842,47 +3569,6 @@ mod tests {
             assert!(h.snapshot().auto.unwrap().state != "converging");
         }
         h.shutdown();
-    }
-    #[test]
-    fn grab_frames_never_reach_auto_capture() {
-        let dir = temp_dir("grab-auto-capture");
-        let h = WorkerHandle::new();
-        connect(&h, "1000");
-        h.request(SessionCommand::CaptureSessionOpen {
-            path: dir.join("session.duckdb").to_string_lossy().into_owned(),
-            create: true,
-            encoder: Some(crate::autocapture::EncoderChoice::Native),
-        })
-        .unwrap();
-        // Enabling auto capture starts the camera; it stays armed when stopped.
-        h.request(SessionCommand::AutoCapture {
-            enabled: true,
-            sensitivity: 0.5,
-            cooldown_ms: 250,
-        })
-        .unwrap();
-        h.request(SessionCommand::Stop).unwrap();
-        let sampled = || {
-            h.capture_session
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .sampled_at()
-        };
-        let before = sampled();
-        // Past the sampling interval, so an observed frame would be sampled.
-        std::thread::sleep(Duration::from_millis(300));
-        grab(&h);
-        assert_eq!(sampled(), before);
-        // Nor do the frames auto exposure meters while it settles.
-        auto(&h, None).unwrap();
-        grab(&h);
-        assert!(h.snapshot().frames >= 2);
-        assert_eq!(sampled(), before);
-        assert!(h.snapshot().capture_session.unwrap().enabled);
-        h.shutdown();
-        let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
     fn failed_grabs_leave_the_log_and_last_error_alone() {

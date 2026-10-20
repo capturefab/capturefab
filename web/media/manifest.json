@@ -1,15 +1,15 @@
 {
   "method": "Actual iced desktop renderer frames; H.264 encoding only. No reconstructed interface or desktop recording.",
   "source_note": "Current development desktop build from workspace source. The visible save and settings results come from real session CLI commands.",
-  "binary_sha256": "a825de30ab3d42a2b5c5e8e424918f3a5084c5c0295fc1971143f0dd364fa30f",
+  "binary_sha256": "d00accd95f41ebd43947336b8d5fbfb3dfbceaf880a616919fe3ff5acac5d2ef",
   "demo": "Built-in simulator cameras in isolated temporary sessions. No physical cameras or saved user data.",
   "clips": [
     {
       "file": "live-preview.mp4",
       "poster": "live-preview.png",
-      "sha256": "a99726ee6001a1d953f3ab42689197c89a7e654752f4d778a94d7bff3e4ba7ae",
-      "poster_sha256": "1419e28981f8f632d16dd1f50c662f3f192582235d34f0a261bfb1d66e8e5cc8",
-      "size_bytes": 210251,
+      "sha256": "3a6922111acae8577259c22d6b0eaa95f0833ecf843ce8188bc8cdcf1772cd7c",
+      "poster_sha256": "3649180d8097d8499038271e48c64d042f1b1db42103bdbd8befdf5357f1138c",
+      "size_bytes": 212744,
       "width": 1100,
       "height": 700,
       "duration_seconds": 8.0,
@@ -19,12 +19,12 @@
       "audio": false,
       "preview_frame_differences": [
         {
-          "mean_pixel_difference": 91.317,
-          "changed_fraction": 0.776
+          "mean_pixel_difference": 91.334,
+          "changed_fraction": 0.7774
         },
         {
-          "mean_pixel_difference": 91.468,
-          "changed_fraction": 0.7771
+          "mean_pixel_difference": 91.452,
+          "changed_fraction": 0.7769
         }
       ],
       "source": {
@@ -32,7 +32,7 @@
         "scene": "dark,features,noscopes",
         "cameras": 1,
         "frames": 64,
-        "duration_seconds": 22.078,
+        "duration_seconds": 22.077,
         "maximum_fps": 12,
         "observed_fps": 2.854,
         "playback_excerpt": {
@@ -40,11 +40,11 @@
           "end_seconds": 8,
           "speed": 1
         },
-        "first_frame_sha256": "65d55fc2ecf25992ab4f478d288e25b947beb50c25a5e7ccddabaff25edf34fe",
-        "last_frame_sha256": "bd6eba15ecd0657a0187bb6be388ff17536d8ecb329395ea1ce4bf1c123bbac8",
+        "first_frame_sha256": "d4bfd96823b50b4575c83354cf540bf61b95483cc573281abe045e33d08bad89",
+        "last_frame_sha256": "e744129634dfcf09e790162545b6e0c712cb875ae999dda54e533ff7abfce588",
         "actions": [
           {
-            "after_seconds": 1.802,
+            "after_seconds": 1.799,
             "arguments": [
               "--camera",
               "sim:0",
@@ -53,7 +53,7 @@
             ]
           },
           {
-            "after_seconds": 5.301,
+            "after_seconds": 5.328,
             "arguments": [
               "--camera",
               "sim:0",
@@ -68,9 +68,9 @@
     {
       "file": "capture-workflow.mp4",
       "poster": "capture-workflow.png",
-      "sha256": "8647145638f4d078276fa3715169b1128260ea9d8c826d837fb32deb3ee35a76",
-      "poster_sha256": "a4188dbbab599ae19ae39c8702305919b7762c263f127a96ebfaf065dd5fcbdf",
-      "size_bytes": 251990,
+      "sha256": "0bfee7ca3bb408399bcb804a2a9896d80112dac02f3d8f97f053ec0e33da34ea",
+      "poster_sha256": "43dd2f56eb0b99e4df758c16fd03afecd9fd9c490a468d50a63403b432c72399",
+      "size_bytes": 252196,
       "width": 1100,
       "height": 700,
       "duration_seconds": 8.0,
@@ -80,12 +80,12 @@
       "audio": false,
       "preview_frame_differences": [
         {
-          "mean_pixel_difference": 26.661,
-          "changed_fraction": 0.7711
+          "mean_pixel_difference": 26.657,
+          "changed_fraction": 0.7704
         },
         {
-          "mean_pixel_difference": 27.13,
-          "changed_fraction": 0.7709
+          "mean_pixel_difference": 27.67,
+          "changed_fraction": 0.7716
         }
       ],
       "source": {
@@ -93,7 +93,7 @@
         "scene": "dark,capture,noscopes",
         "cameras": 1,
         "frames": 64,
-        "duration_seconds": 22.557,
+        "duration_seconds": 22.558,
         "maximum_fps": 12,
         "observed_fps": 2.793,
         "playback_excerpt": {
@@ -101,11 +101,11 @@
           "end_seconds": 8,
           "speed": 1
         },
-        "first_frame_sha256": "14142ac4fdb3fd254e5271fb7b7d73136b9b59e81bb4a10c73d6ac4cefbc0271",
-        "last_frame_sha256": "e9c85d3fdc77cf6b06098b9547979251484821362dd501402a43d1fbc166086f",
+        "first_frame_sha256": "2ca452ff13917550d867c22ed5fc3a56b79bdd0cc4f2421c28864ed8025b6c38",
+        "last_frame_sha256": "87f1ceb2c9af994ade6acd65e96dbbbf2af711ca6a2c0e2aae43dbb2f57b0264",
         "actions": [
           {
-            "after_seconds": 2.59,
+            "after_seconds": 2.596,
             "arguments": [
               "--camera",
               "sim:0",
@@ -118,7 +118,7 @@
             "verified_saved_frames": 3
           },
           {
-            "after_seconds": 5.4,
+            "after_seconds": 5.417,
             "arguments": [
               "--camera",
               "sim:0",

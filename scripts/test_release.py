@@ -162,12 +162,7 @@ class ReleaseTests(unittest.TestCase):
         recipe = 'FFMPEG_VERSION=9.0.2\nFFMPEG_SHA256=' + 'f' * 64 + '\nX264_COMMIT=abc\n'
         bom = release.cyclonedx(metadata, lock, recipe, '1.2.3', 'owner/repo', '00000000-0000-0000-0000-000000000000')
         components = {c['bom-ref']: c for c in bom['components']}
-        self.assertEqual(set(components), {'pkg:cargo/a@1.0.0', 'pkg:cargo/b@1.0.0', 'media:ffmpeg', 'media:x264', 'model:dinov2-small'})
-        pins = release.dinov2_pins()
-        model = components['model:dinov2-small']
-        self.assertEqual((model['type'], model['version'], model['hashes'][0]['content'], model['licenses']),
-                         ('machine-learning-model', pins['REVISION'], pins['OUTPUT_SHA256'], [dict(license=dict(id='Apache-2.0'))]))
-        self.assertIn('model:dinov2-small', bom['dependencies'][0]['dependsOn'])
+        self.assertEqual(set(components), {'pkg:cargo/a@1.0.0', 'pkg:cargo/b@1.0.0', 'media:ffmpeg', 'media:x264'})
         self.assertEqual(components['pkg:cargo/a@1.0.0']['hashes'], [dict(alg='SHA-256', content='c' * 64)])
         self.assertNotIn('hashes', components['pkg:cargo/b@1.0.0'])
         self.assertNotIn('licenses', components['pkg:cargo/b@1.0.0'])
@@ -200,7 +195,6 @@ class ReleaseTests(unittest.TestCase):
             for web in [dist, None]:
                 builds.clear()
                 with mock.patch.object(release, 'run', side_effect=run), mock.patch.object(release, 'web_dist', return_value=web), \
-                        mock.patch.object(release, 'dinov2_weights', return_value=temp / 'model.safetensors'), \
                         mock.patch.object(release, 'package', return_value={}), mock.patch.object(release, 'media_sources', return_value=source):
                     release.build(args)
                 self.assertEqual(len(builds), 1)

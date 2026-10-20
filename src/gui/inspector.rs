@@ -2810,18 +2810,12 @@ impl Workbench {
                 ))
                 .push(self.copyable(self.session_command(), p));
         }
-        // Session lifecycle changes the workflow; incoming suggestions do not
-        // move controls under the pointer. Stable slots preserve the editors
-        // when the session opens or closes.
-        let automatic_first = self.snapshot.capture_session.is_some();
         column![
-            section_slot(automatic_first.then(|| self.auto_capture_settings(p))),
             section_slot(Some(save.into())),
             section_slot(super::tags::view(self, self.inspect.tags_open, p)),
             section_slot(
                 (self.schedule_enabled || !self.snapshot.jobs.is_empty()).then(|| self.jobs(p))
             ),
-            section_slot((!automatic_first).then(|| self.auto_capture_settings(p))),
             section_slot(Some(self.storage_settings(p))),
             section_slot(super::dataset::view(self, self.inspect.dataset_open, p)),
             section_slot(super::signals::view(self, self.inspect.signals_open, p)),

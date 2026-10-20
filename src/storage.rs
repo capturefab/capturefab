@@ -1618,8 +1618,7 @@ impl StorageWriter {
     /// Finish bytes written in one call just before, as `save_bytes` does:
     /// the streamed hash stands for the file (retention still verifies it
     /// before deleting), and a busy ledger is waited out, for a caller that
-    /// would otherwise save the same data again under another name, such as
-    /// an automatic capture's frame.
+    /// would otherwise save the same data again under another name.
     pub fn finish_written(mut self) -> Result<()> {
         self.reread = false;
         self.commit(COMMIT_TRIES)

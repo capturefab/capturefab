@@ -636,12 +636,6 @@ fn matches_job(entry: &SessionActivity, job: &Job) -> bool {
                     && entry.feature.as_deref() == Some("AcquisitionStop")
         }
         Job::Capture => entry.operation == "capture",
-        Job::CaptureSessionOpen => entry.operation == "capture_session_open",
-        Job::CaptureSessionClose => entry.operation == "capture_session_close",
-        Job::AutoCapture => entry.operation == "auto_capture",
-        Job::CaptureExample => entry.operation == "capture_example",
-        Job::CaptureReview => entry.operation == "capture_review",
-        Job::ReviewCapture => entry.operation == "review_capture",
         Job::AutoOn | Job::Balance => entry.operation == "auto",
         Job::AutoOff => entry.operation == "manual",
         Job::RefreshFeatures => entry.operation == "features",

@@ -327,21 +327,7 @@ impl Workbench {
         let body = keyboard_history::background(body, self.sheet_open());
         let t = self.sheets.shown.get(self.now);
         let (height, spin, now) = (self.sheet_height(), self.spin(), self.now);
-        if self.auto_capture.open {
-            modal(
-                body,
-                self.auto_capture_review(p, height),
-                Some(Message::AutoCapture(autocapture::Input::Review(false))),
-                t,
-            )
-        } else if self.folder_review.open {
-            modal(
-                body,
-                self.folder_review_sheet(p, height),
-                Some(Message::FolderReview(folder_review::Input::Open(false))),
-                t,
-            )
-        } else if self.settings_open && self.settings_window.is_none() {
+        if self.settings_open && self.settings_window.is_none() {
             modal(
                 body,
                 self.settings_sheet(p, height),

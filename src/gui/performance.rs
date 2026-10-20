@@ -489,7 +489,7 @@ impl Workbench {
                 index as f32,
             ),
             text(
-                "Efficient draws up to 15 camera frames a second, 5 in the overview, keeps scaled-down pictures to 1280 pixels and skips animations. Auto capture checks fewer frames on the CPU, and new recordings encode faster. Captures and recordings keep every frame."
+                "Efficient draws up to 15 camera frames a second, 5 in the overview, keeps scaled-down pictures to 1280 pixels and skips animations. New recordings encode faster. Captures and recordings keep every frame."
             )
             .size(style::SMALL)
             .color(p.secondary),

@@ -187,7 +187,7 @@ fn capture_and_video_prioritize_actions_and_reveal_invalid_advanced_fields() {
         .1
         .bounds()
         .unwrap();
-    assert!(action.y1 < named(&capture, "Automatic capture").1.bounds().unwrap().y0);
+    assert!(action.y1 < named(&capture, "Capture options").1.bounds().unwrap().y0);
     assert_eq!(
         named(&capture, "Capture options").1.is_expanded(),
         Some(false)
@@ -249,63 +249,6 @@ fn capture_and_video_prioritize_actions_and_reveal_invalid_advanced_fields() {
 }
 
 #[test]
-fn active_automatic_sessions_prioritize_review_without_moving_editors_on_suggestions() {
-    let renderer = destinations::layout_tests::renderer();
-    let mut app = app();
-    let mut tree = Tree::empty();
-    let manual = snapshot(&app, Pane::Capture, &mut tree, &renderer);
-    let output_id = output_control(&manual).0;
-    app.snapshot.capture_session = Some(crate::autocapture::SessionStatus {
-        path: "/isolated/review.duckdb".into(),
-        camera: "sim:0".into(),
-        enabled: true,
-        sensitivity: 0.5,
-        cooldown_ms: 2000,
-        manual_count: 1,
-        kept_count: 0,
-        discarded_count: 0,
-        pending_count: 0,
-        blocked_storage: false,
-        state: "watching".into(),
-        model: "Session exemplar kNN".into(),
-        encoder: "native".into(),
-        accelerator: None,
-        samples_per_second: None,
-        note: None,
-    });
-    let active = snapshot(&app, Pane::Capture, &mut tree, &renderer);
-    assert_eq!(output_control(&active).0, output_id);
-    let (review_id, review) = named(&active, "Review suggestions (0)");
-    let review_bounds = review.bounds().unwrap();
-    let teach_bounds = named(&active, "Capture example").1.bounds();
-    assert!(review_bounds.y1 < output_control(&active).1.bounds().unwrap().y0);
-    assert!(
-        review_bounds.y1 < 360.0,
-        "review is among the first visible actions"
-    );
-    app.snapshot.capture_session.as_mut().unwrap().pending_count = 3;
-    let suggestions = snapshot(&app, Pane::Capture, &mut tree, &renderer);
-    let (current_id, review) = named(&suggestions, "Review suggestions (3)");
-    assert_eq!(current_id, review_id);
-    assert_eq!(review.bounds(), Some(review_bounds));
-    assert_eq!(output_control(&suggestions).0, output_id);
-    // Notes appear and fade around suggestions without moving the actions.
-    app.snapshot.capture_session.as_mut().unwrap().note = Some(
-        "Discarded capture 12 but left /isolated/review.frames/00000012.raw in place: it changed after saving or was saved on another computer".into(),
-    );
-    let noted = snapshot(&app, Pane::Capture, &mut tree, &renderer);
-    assert_eq!(
-        named(&noted, "Review suggestions (3)").1.bounds(),
-        Some(review_bounds)
-    );
-    assert_eq!(named(&noted, "Capture example").1.bounds(), teach_bounds);
-    assert_eq!(output_control(&noted).0, output_id);
-    app.snapshot.capture_session = None;
-    let closed = snapshot(&app, Pane::Capture, &mut tree, &renderer);
-    assert_eq!(output_control(&closed).0, output_id);
-}
-
-#[test]
 fn the_schedule_command_shows_its_form_in_folded_capture_options() {
     let renderer = destinations::layout_tests::renderer();
     let mut app = app();
@@ -339,20 +282,6 @@ fn the_schedule_command_shows_its_form_in_folded_capture_options() {
             .iter()
             .any(|(_, node)| node.label() == Some("Capture interval"))
     );
-}
-
-/// The node a default capture output is edited through: the raw "Output
-/// path" field, or the "File names" choice that may replace it.
-fn output_control(tree: &accesskit::TreeUpdate) -> (accesskit::NodeId, &accesskit::Node) {
-    if tree
-        .nodes
-        .iter()
-        .any(|(_, node)| node.label() == Some("Output path"))
-    {
-        named(tree, "Output path")
-    } else {
-        named(tree, "File names")
-    }
 }
 
 fn labels(tree: &accesskit::TreeUpdate) -> Vec<&str> {

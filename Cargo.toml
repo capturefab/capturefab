@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/capturefab/capturefab"
 
 [features]
-default = ["gui", "usb", "scanner", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "s3", "ftp", "sftp", "parquet", "modbus", "mqtt", "opcua", "mtconnect", "dinov2", "hubs"]
+default = ["gui", "usb", "scanner", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "s3", "ftp", "sftp", "parquet", "modbus", "mqtt", "opcua", "mtconnect", "hubs"]
 gui = ["ai", "dep:iced", "dep:bytemuck", "dep:rfd", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:mundy", "dep:accesskit", "dep:accesskit_macos", "dep:accesskit_windows", "dep:accesskit_unix", "dep:raw-window-handle", "dep:windows", "dep:x11-dl", "dep:libloading"]
 usb = ["dep:nusb"]
 # Document scanners: SANE scanimage, Windows WIA and macOS ImageCaptureCore.
@@ -46,10 +46,6 @@ mtconnect = ["dep:ureq"]
 # Prompt measurements use HTTPS with the OS certificate store and native
 # Keychain / Credential Manager / Secret Service credentials.
 ai = ["dep:ureq", "keychain", "dep:ring"]
-# Bundled DINOv2 ViT-S/14 embeddings for auto capture (Apache-2.0 weights from
-# scripts/fetch-dinov2.py): wgpu compute shaders in an isolated helper process
-# (Metal, Vulkan, DX12), with a native CPU fallback.
-dinov2 = ["dep:matrixmultiply", "dep:half", "dep:libm", "dep:wgpu"]
 # Camera hubs (Home Assistant, Frigate, go2rtc, UniFi Protect): a hand-rolled
 # HTTP/1.1 client with rustls (ring; the OS trust store or a pinned certificate)
 # in the camera worker, JPEG/PNG decoded there with libjpeg-turbo and png, and
@@ -122,12 +118,6 @@ russh = { version = "0.64", optional = true, default-features = false, features 
 russh-sftp = { version = "3.0", optional = true }
 rumqttc = { version = "0.25.1", optional = true, default-features = false, features = ["use-rustls-no-provider"] }
 async-opcua = { version = "0.19.0", optional = true, default-features = false, features = ["client"] }
-# DINOv2 inference: SIMD f32 GEMM with a small thread pool, f16 weights, exact
-# erf GELU, and GPU compute through the wgpu version iced already uses.
-matrixmultiply = { version = "0.3.11", optional = true, features = ["threading"] }
-wgpu = { version = "27", optional = true, default-features = false, features = ["std", "wgsl", "metal", "vulkan", "dx12"] }
-half = { version = "2.7", optional = true }
-libm = { version = "0.2", optional = true }
 
 # The refresh rate of the GUI window's screen, and the Reduce Motion and Reduce
 # Transparency settings; already in the tree via rfd.

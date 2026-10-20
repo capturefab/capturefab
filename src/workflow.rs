@@ -156,8 +156,7 @@ fn validate_step(step: &Step) -> Result<()> {
 
 pub(crate) fn resolve_outputs(command: &mut SessionCommand, base: &Path) -> Result<()> {
     match command {
-        SessionCommand::CaptureSessionOpen { path, .. }
-        | SessionCommand::DatasetOpen { path, .. }
+        SessionCommand::DatasetOpen { path, .. }
         | SessionCommand::DatasetOpenIf { path, .. }
         | SessionCommand::DatasetExport { output: path, .. }
         | SessionCommand::DatasetExportIf { output: path, .. } => resolve_path(path, base),

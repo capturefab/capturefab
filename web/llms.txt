@@ -83,7 +83,7 @@ Plain `doctor` checks the host and prints a fix for each warning.
 `--efficiency auto|smooth|efficient` or `CAPTUREFAB_EFFICIENCY` sets efficiency mode for a process and the camera workers it starts, over Settings > Performance, which only the desktop window reads; `doctor` reports the mode in force and why.
 Workers follow a change in their session's mode for decoders they start afterwards; efficient halves how often a session polls its workers for status.
 Auto is efficient with at most 2 CPU cores or 2 GiB of memory, in the OS low-power mode, or on a desktop hint such as software rendering or a preview falling behind.
-Efficient mode reduces preview, polling and CPU embedding work (desktop previews at most 15 frames a second, 1280 pixels a side; auto capture's CPU embedding a fifth of a core); captures and recordings keep every frame.
+Efficient mode reduces preview and polling work (desktop previews at most 15 frames a second, 1280 pixels a side); captures and recordings keep every frame.
 With no display (a Linux login without DISPLAY or WAYLAND_DISPLAY), running with no subcommand prints the CLI help and suggests `serve`; a source build without the `gui` feature exits 5.
 
 Exit codes are 1 `operation_failed`, 2 `usage`, 3 `unavailable`, 4 `timeout`, 5 `unsupported` and 6 `storage_full`.
@@ -284,47 +284,6 @@ An existing export folder fails with exit 1; a full storage budget fails with ex
 RPC operations are `dataset_open`, `dataset_close`, `dataset_status`, `dataset_note`, `dataset_query` and `dataset_export`.
 Signal RPC operations are `signals`, `signal_read`, `signal_browse`, `signal_start` and `signal_stop`.
 Workflow files can use these operations too.
-
-## Learn automatic captures
-
-```sh
-capturefab --session bench --camera sim:0 capture-session new line.duckdb --json
-capturefab --session bench --camera sim:0 capture-session teach --json
-capturefab --session bench --camera sim:0 capture-session auto --sensitivity 0.5 --json
-capturefab --session bench --camera sim:0 capture-session review --json
-capturefab --session bench --camera sim:0 capture-session keep 2 --json
-```
-
-A capture session is a camera-bound `NAME.duckdb` plus a `NAME.frames` folder of raw frames beside it; it needs a running GUI or `serve` session and a connected camera.
-Close it, then copy the database and its `.frames` folder together.
-`teach` captures positive examples; `keep` and `discard` label pending suggestions. Pending suggestions never train.
-`keep ID` only relabels; `discard ID` deletes the frame file if it is unchanged.
-Frames count against the storage budget; a full budget is exit 6.
-A refused suggestion is retried after a minute, or at once after `discard` or `auto`; free space or raise the budget.
-`status.capture_session.note` says why a suggestion was skipped.
-`new --encoder auto` (the default) uses the DINOv2 ViT-S/14 model bundled in the executable; nothing is downloaded.
-Embeddings run on the GPU in an isolated helper process when possible (up to 30 frames per second), otherwise on the CPU, paced to at most half of one core (a fifth in efficiency mode).
-`auto` picks DINOv2 even without a GPU; `--encoder native` samples 4 times a second on CPU-only small computers.
-`status --json` reports `capture_session.accelerator` and `samples_per_second`; `doctor --json` reports `auto_capture.dinov2.gpu`.
-`--encoder native` uses a color/edge descriptor; `CAPTUREFAB_DINOV2_GPU=0` keeps DINOv2 on the CPU.
-A session keeps its encoder and model fingerprint: `resume` refuses a session learned with a different bundled model (exit 1).
-RPC operations are `capture_session_open` (`path`, `create`, optional `encoder`), `capture_session_close`, `capture_example`, `auto_capture`, `capture_review` and `review_capture`.
-
-## Review a folder
-
-```sh
-capturefab folder-review new review.duckdb --folder photos --json
-capturefab folder-review scan review.duckdb --json
-capturefab folder-review next review.duckdb --json
-capturefab folder-review keep review.duckdb 12 --json
-capturefab folder-review export review.duckdb --to keepers --json
-```
-
-Folder review ranks a folder's images and sampled video frames (every `--video-interval-ms`, default 2000) for keep/discard review. It runs locally without a camera or session; `--session` is exit 2. The folder is only read.
-`--rank novelty` (default) offers the item least like everything reviewed; `similar` the item most like kept items, optionally taught by `--examples CAPTURE.duckdb` from auto capture.
-`scan` commits each file on its own, retries failed files and drops pending items of removed files; `next` returns `item: null` when nothing reaches the threshold (`--all` ignores it).
-Repeats are set aside as `duplicates`. `export --to DIR` or `--destination NAME` copies kept items without overwriting; a full storage budget is exit 6.
-A missing folder, or a session another process holds, is exit 3. Limits: 20,000 items, 600 samples per video. `schema --json` key `folder_review` has the full contract.
 
 ## Use the AI assistant
 

@@ -26,7 +26,6 @@ fn camera(id: &str, pid: u32, frames: u64, dropped: u64, bytes: u64) -> CameraSn
         forwarding: None,
         jobs: vec![],
         auto: None,
-        capture_session: None,
         transport: None,
         history: CameraHistoryStatus::default(),
         lost: 0,

@@ -326,12 +326,7 @@ impl NativeTaskHost {
                     "Private tasks require finite captures and an owned capture identity to stop them."
                 )
             }
-            SessionCommand::CaptureSessionOpen { .. }
-            | SessionCommand::CaptureSessionClose
-            | SessionCommand::AutoCapture { .. }
-            | SessionCommand::CaptureExample { .. }
-            | SessionCommand::ReviewCapture { .. }
-            | SessionCommand::Capture { .. }
+            SessionCommand::Capture { .. }
             | SessionCommand::Schedule { .. }
             | SessionCommand::Forward { .. } => {
                 bail!(
@@ -355,7 +350,6 @@ impl NativeTaskHost {
             | SessionCommand::ReplayCameraChange { .. }
             | SessionCommand::Auto { .. }
             | SessionCommand::Manual { .. }
-            | SessionCommand::CaptureReview { .. }
             | SessionCommand::Jobs
             | SessionCommand::CancelJob { .. }
             | SessionCommand::Frame { .. }

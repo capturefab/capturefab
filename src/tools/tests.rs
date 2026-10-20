@@ -240,7 +240,6 @@ pub(crate) fn camera(info: CameraInfo) -> CameraSnapshot {
         forwarding_until_ms: None,
         jobs: Vec::new(),
         auto: None,
-        capture_session: None,
         transport: None,
         history: CameraHistoryStatus::default(),
         lost: 0,

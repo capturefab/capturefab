@@ -146,7 +146,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Every default feature except the window, so the GUI-free code paths keep compiling.
-      - run: cargo build --locked --no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,s3,ftp,sftp,parquet,modbus,mqtt,opcua,mtconnect,dinov2,hubs
+      - run: cargo build --locked --no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,s3,ftp,sftp,parquet,modbus,mqtt,opcua,mtconnect,hubs
       - run: cargo check --locked --no-default-features
       - run: cargo check --locked --no-default-features --features ftp
       - run: cargo check --locked --no-default-features --features sftp

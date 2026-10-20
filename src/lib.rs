@@ -19,7 +19,6 @@ pub mod analytics;
 #[cfg(feature = "ai")]
 pub mod assistant;
 pub mod auto;
-pub mod autocapture;
 #[cfg(any(feature = "s3", feature = "ai"))]
 pub mod aws;
 pub mod camera;
@@ -32,7 +31,6 @@ pub mod destination;
 pub mod doctor;
 pub mod efficiency;
 mod engine;
-pub mod folder_review;
 pub mod frame;
 pub mod genicam;
 #[cfg(feature = "gui")]

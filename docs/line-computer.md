@@ -154,7 +154,7 @@ Only the service has these keys then, not your SSH shell, where `destination add
 
 ## 7. Efficiency mode
 
-Efficiency mode spends less CPU on camera workers: fewer FFmpeg decoding threads for webcams and network streams, a faster libx264 preset for video, at some cost in smoothness and video file size, and a fifth of one core instead of half for automatic capture's DINOv2 embeddings on the CPU. The session also asks its workers for their status half as often. Captures and recordings keep every frame in every mode. The default, `auto`, chooses efficient on computers with at most two CPU cores or 2 GiB of memory, or with the Linux `low-power` power profile, so a 4 GB Raspberry Pi 4 or 5 stays smooth. With several cameras on a small board, choose it in the unit:
+Efficiency mode spends less CPU on camera workers: fewer FFmpeg decoding threads for webcams and network streams, a faster libx264 preset for video, at some cost in smoothness and video file size. The session also asks its workers for their status half as often. Captures and recordings keep every frame in every mode. The default, `auto`, chooses efficient on computers with at most two CPU cores or 2 GiB of memory, or with the Linux `low-power` power profile, so a 4 GB Raspberry Pi 4 or 5 stays smooth. With several cameras on a small board, choose it in the unit:
 
 ```ini
 Environment=CAPTUREFAB_EFFICIENCY=efficient
@@ -162,4 +162,3 @@ Environment=CAPTUREFAB_EFFICIENCY=efficient
 
 `capturefab doctor` shows the mode in force and why. See [host checks and efficiency mode](../README.md#host-checks-and-efficiency-mode).
 
-Without a GPU, [automatic capture](../README.md#automatic-capture-and-review) with the default DINOv2 encoder rests after each embedding to stay within that share of a core, so a small board samples it slowly; `status --json` reports the rate in `capture_session.samples_per_second`. Where frequent sampling matters more than recognizing what is in the picture, create the session with `capturefab --session line1 --camera ID capture-session new PATH --encoder native`, which samples four frames a second with a small fraction of a core.

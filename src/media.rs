@@ -1560,32 +1560,6 @@ impl ReplayDecoder {
         }
         Self::spawn(path, timeout, &options, &output)
     }
-    /// The one frame of a local video shown `offset_ms` after it starts, as
-    /// `open` with the same box would have sampled it.
-    pub(crate) fn frame_at(
-        path: &std::path::Path,
-        width: u32,
-        height: u32,
-        offset_ms: u64,
-        timeout: Duration,
-    ) -> Result<Self> {
-        let options = [
-            "-protocol_whitelist".into(),
-            "file,pipe".into(),
-            "-xerror".into(),
-            "-hwaccel".into(),
-            "none".into(),
-            "-threads".into(),
-            "1".into(),
-            "-f".into(),
-            Self::video_format(path)?.into(),
-            "-ss".into(),
-            format!("{}.{:03}", offset_ms / 1000, offset_ms % 1000),
-        ];
-        let mut output = Self::output(width, height, None);
-        output.extend(["-frames:v".into(), "1".into()]);
-        Self::spawn(path, timeout, &options, &output)
-    }
     fn video_format(path: &std::path::Path) -> Result<&'static str> {
         let extension = path
             .extension()

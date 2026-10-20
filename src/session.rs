@@ -87,33 +87,6 @@ pub enum SessionCommand {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         revert: bool,
     },
-    /// Create or resume a single-file, camera-bound capture database.
-    CaptureSessionOpen {
-        path: String,
-        create: bool,
-        /// New sessions only: the image encoder (default auto).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        encoder: Option<crate::autocapture::EncoderChoice>,
-    },
-    CaptureSessionClose,
-    /// Capture preference learning is independent of automatic exposure.
-    AutoCapture {
-        enabled: bool,
-        sensitivity: f64,
-        cooldown_ms: u64,
-    },
-    /// Save one positive training capture directly into the active database.
-    CaptureExample {
-        timeout_ms: u64,
-    },
-    /// Fetch the next pending candidate, or a specific pending candidate.
-    CaptureReview {
-        id: Option<u64>,
-    },
-    ReviewCapture {
-        id: u64,
-        keep: bool,
-    },
     Capture {
         output: String,
         count: u32,
@@ -426,7 +399,6 @@ pub fn deserialize_command<'de, D: serde::Deserializer<'de>>(
                     | "features"
                     | "xml"
                     | "stop_forward"
-                    | "capture_session_close"
                     | "dataset_close"
                     | "dataset_status"
                     | "signals"
@@ -535,49 +507,6 @@ impl SessionCommand {
     /// their owners when the command executes.
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::CaptureSessionOpen {
-                path,
-                create,
-                encoder,
-            } => {
-                ensure!(
-                    !path.trim().is_empty()
-                        && !path.chars().any(char::is_control)
-                        && path != ":memory:",
-                    "capture session requires a database file path"
-                );
-                ensure!(
-                    *create || encoder.is_none(),
-                    "the encoder is chosen when a capture session is created; resume uses the session's own"
-                );
-                ensure!(
-                    std::path::Path::new(path)
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("duckdb")),
-                    "capture session file must have a .duckdb extension"
-                );
-            }
-            Self::AutoCapture {
-                sensitivity,
-                cooldown_ms,
-                ..
-            } => {
-                ensure!(
-                    sensitivity.is_finite() && (0.0..=1.0).contains(sensitivity),
-                    "sensitivity must be a finite number from 0 to 1"
-                );
-                ensure!(
-                    (250..=3_600_000).contains(cooldown_ms),
-                    "cooldown must be 250..3600000 milliseconds"
-                );
-            }
-            Self::CaptureExample { timeout_ms } => validate_timeout(*timeout_ms)?,
-            Self::CaptureReview { id: Some(id) } | Self::ReviewCapture { id, .. } => {
-                ensure!(
-                    *id > 0 && *id <= i64::MAX as u64,
-                    "capture ID must be 1..9223372036854775807"
-                );
-            }
             Self::Activity { timeout_ms, .. } => {
                 ensure!(
                     *timeout_ms <= 25_000,
@@ -791,7 +720,6 @@ pub fn default_request_timeout(command: &SessionCommand) -> Duration {
         } => timeout_ms
             .saturating_mul(u64::from(*count))
             .saturating_add(60_000),
-        SessionCommand::CaptureExample { timeout_ms } => timeout_ms.saturating_add(60_000),
         // Waiting for the camera's turn, or starting a stopped camera and
         // settling its auto exposure, can outlast the frame wait itself.
         SessionCommand::Frame { timeout_ms, .. } => timeout_ms.saturating_add(15_000),
@@ -1090,8 +1018,6 @@ pub struct CameraSnapshot {
     #[serde(default)]
     pub auto: Option<crate::auto::AutoStatus>,
     #[serde(default)]
-    pub capture_session: Option<crate::autocapture::SessionStatus>,
-    #[serde(default)]
     pub transport: Option<crate::types::TransportStats>,
     #[serde(default)]
     pub history: CameraHistoryStatus,
@@ -1161,8 +1087,6 @@ pub struct SessionSnapshot {
     #[serde(default)]
     pub auto: Option<crate::auto::AutoStatus>,
     #[serde(default)]
-    pub capture_session: Option<crate::autocapture::SessionStatus>,
-    #[serde(default)]
     pub transport: Option<crate::types::TransportStats>,
     #[serde(default)]
     pub history: CameraHistoryStatus,
@@ -1208,7 +1132,6 @@ fn project_selected(state: &mut SessionSnapshot) {
         state.forwarding_until_ms = camera.forwarding_until_ms;
         state.jobs = camera.jobs.clone();
         state.auto = camera.auto.clone();
-        state.capture_session = camera.capture_session.clone();
         state.transport = camera.transport.clone();
         state.history = camera.history.clone();
         state.last_error = camera.last_error.clone();
@@ -1228,7 +1151,6 @@ fn project_selected(state: &mut SessionSnapshot) {
         state.forwarding_until_ms = None;
         state.jobs.clear();
         state.auto = None;
-        state.capture_session = None;
         state.transport = None;
         state.history = CameraHistoryStatus::default();
     }
@@ -1516,7 +1438,6 @@ impl Report {
             forwarding_until_ms: s.forwarding_until_ms,
             jobs: s.jobs.clone(),
             auto: s.auto.clone(),
-            capture_session: s.capture_session.clone(),
             transport: s.transport.clone(),
             history: s.history.clone(),
             lost: frames_lost(s),
@@ -3642,9 +3563,6 @@ pub fn run_worker(ring: &std::ffi::OsStr) -> Result<()> {
                     command => handle.request(command).map(Some),
                 },
             };
-            // Auto capture's writer and embedder change its status off the
-            // camera thread, which may be waiting for frames or busy.
-            handle.refresh_capture();
             // One snapshot clone per reply, serialized straight to the pipe; the
             // clone keeps the state lock out of the blocking write.
             let mut snapshot = handle.snapshot();
@@ -3980,7 +3898,6 @@ mod tests {
             forwarding: Some(format!("{id}.mp4")),
             jobs: Vec::new(),
             auto: None,
-            capture_session: None,
             transport: None,
             history: CameraHistoryStatus::default(),
             lost: 0,
@@ -5017,10 +4934,10 @@ mod tests {
         assert_eq!(merged(&report), serde_json::to_value(&worker).unwrap());
     }
     #[test]
-    fn deltas_carry_skipped_shots_capture_notes_and_writability_read_on_stop() {
-        // A job's skipped and retried shots and an auto capture note change
-        // without anything else changing, and Stop re-reads writable flags
-        // without walking the features: each reaches the coordinator.
+    fn deltas_carry_skipped_shots_and_writability_read_on_stop() {
+        // A job's skipped and retried shots change without anything else
+        // changing, and Stop re-reads writable flags without walking the
+        // features: each reaches the coordinator.
         let (mut sent, mut report) = (Sent::default(), Report::new());
         let job = serde_json::from_value(json!({
             "id": 1, "status": "running", "output": "s-{seq}.png", "count": 10,
@@ -5028,16 +4945,9 @@ mod tests {
             "last_file": null, "error": null
         }))
         .unwrap();
-        let capture = serde_json::from_value(json!({
-            "path": "line.duckdb", "camera": "sim:0", "enabled": true, "sensitivity": 0.5,
-            "cooldown_ms": 250, "manual_count": 0, "kept_count": 0, "discarded_count": 0,
-            "pending_count": 0, "blocked_storage": false, "state": "watching", "model": "native"
-        }))
-        .unwrap();
         let mut worker = SessionSnapshot {
             features: vec![feature("Width", 640)],
             jobs: vec![job],
-            capture_session: Some(capture),
             ..Default::default()
         };
         worker.features[0].writable = false;
@@ -5045,15 +4955,10 @@ mod tests {
         worker.jobs[0].skipped = 2;
         worker.jobs[0].retries = 1;
         worker.jobs[0].next_at_ms = 6000;
-        worker.capture_session.as_mut().unwrap().note = Some("Skipped a suggestion".into());
         let reply = relay(&mut sent, &mut report, &worker, false);
         assert_eq!(reply["snapshot"]["features"], json!([]), "unchanged");
         assert_eq!(reply["snapshot"]["jobs"][0]["skipped"], 2);
         assert_eq!(reply["snapshot"]["jobs"][0]["retries"], 1);
-        assert_eq!(
-            reply["snapshot"]["capture_session"]["note"],
-            "Skipped a suggestion"
-        );
         assert_eq!(merged(&report), serde_json::to_value(&worker).unwrap());
         worker.features[0].writable = true;
         let reply = relay(&mut sent, &mut report, &worker, false);

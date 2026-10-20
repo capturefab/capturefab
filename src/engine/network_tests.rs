@@ -131,7 +131,6 @@ impl Harness {
         // owner or a background acquisition changing their state.
         let (sender, _) = mpsc::sync_channel(32);
         let handle = WorkerHandle {
-            capture_session: Arc::default(),
             sender,
             state: Arc::new(RwLock::new(SessionSnapshot::default())),
             counters: Arc::default(),

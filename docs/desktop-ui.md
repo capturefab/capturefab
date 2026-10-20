@@ -123,13 +123,9 @@ all groups without changing their expanded state. Edited groups retain their
 drafts and report an edited count; failed writes reveal their group. Camera
 classification guidance and detection evidence are in Camera details.
 
-Ordinary capture puts destination, count, format and Capture & save first. Timeout,
-inactive automatic-capture setup and shell access use named disclosures.
-Scheduled jobs appear when scheduling is enabled or jobs exist. Active automatic
-sessions lead with their state, capacity guidance, counts and Review; their
-position stays stable as suggestions arrive. Sensitivity,
-minimum gap and model details are in Suggestion settings. Pending suggestions
-make Review the primary action. The Video tab exposes both local recording and
+Ordinary capture puts destination, count, format and Capture & save first. Timeout
+and shell access use named disclosures. Scheduled jobs appear when scheduling is
+enabled or jobs exist. The Video tab exposes both local recording and
 stream forwarding; its persisted tab identifier and shortcut remain unchanged.
 Encoder selection and per-file limits follow the start action in a disclosure.
 Invalid timeout, encoder and file-limit drafts reveal their editor.
@@ -434,19 +430,6 @@ desktop preferences use the locale's format. Unavailable locales, cache misses
 or cached values with a different viewer UTC offset use numeric fallback,
 keeping dates and clocks coherent with the current local instant until refreshed.
 Native GNOME/KDE preference behavior has not been executed or inspected.
-
-Automatic-capture review exposes its actual preview as a passive Image belonging
-to the named modal Dialog, with the capture identity and decision instructions.
-One persistent body region provides polite loading/saving/ready/caught-up status
-or an assertive failure Alert, including the native text value used for
-announcements. Full errors wrap and scroll in that body; Keep, Discard and Close
-retain their identities and pinned layout. Pointer movement and counter updates
-do not change the live outcome. Decision entry points reject keyboard, button
-and swipe actions while a settings-save alert covers review or shutdown is in
-progress. Actual shared-sheet regressions cover seven outcome phases, preview
-ownership, retained Close focus and Retry routing, long errors at compact sizes,
-and the normal key-message path under the covering alert. These tests establish
-semantics and routing, rather than spoken screen-reader behavior.
 
 Each window is created hidden. The root `WindowOpened` branch attaches the native
 adapter through `window::run`, then shows and focuses the window. Adapters are
@@ -879,13 +862,7 @@ the preferences intact.
 
 A subsequent isolated 900×620/Larger run inspected the dated Activity headings
 and confirmed that raw worker and command clocks described the same local date
-and time. A newly created temporary DuckDB session supplied the native Review
-auto captures sheet: its named preview Image and persistent status belonged to
-the sheet, Close retained focus, and Right kept the displayed suggestion. The
-same status node then reported the saved decision and next capture while the
-Keep/Discard action identities remained stable. The temporary database was saved
-and closed, automatic capture and the simulator stream were stopped, and native
-Quit ended PID 879. VoiceOver and real camera devices were left unchanged.
+and time.
 
 The refreshed bidi/window-lifecycle build at 900×620/Larger displayed separate
 selection intervals for `é אב` in a mixed Latin/Hebrew/Arabic/emoji address draft.

@@ -3,7 +3,6 @@ mod accessibility;
 mod agents;
 mod analytics;
 mod assistant;
-mod autocapture;
 mod brand;
 mod button;
 mod camera_history;
@@ -14,7 +13,6 @@ mod dataset;
 mod destinations;
 #[cfg(test)]
 mod display_tests;
-mod folder_review;
 mod format;
 mod gpu;
 mod help;
@@ -405,12 +403,6 @@ impl Pending {
             Job::Stop => "Stopping stream",
             Job::Capture if self.batch => "Capturing all cameras",
             Job::Capture => "Saving capture",
-            Job::CaptureSessionOpen => "Opening capture session",
-            Job::CaptureSessionClose => "Closing capture session",
-            Job::AutoCapture => "Updating automatic capture",
-            Job::CaptureExample => "Learning from capture",
-            Job::CaptureReview => "Loading capture for review",
-            Job::ReviewCapture => "Saving review",
             Job::AutoOn => "Enabling auto mode",
             Job::AutoOff => "Switching to manual",
             Job::Balance => "Updating auto balance",
@@ -452,12 +444,6 @@ enum Job {
     /// Stop a camera's stream; with `Pending::batch`, part of Stop all.
     Stop,
     Capture,
-    CaptureSessionOpen,
-    CaptureSessionClose,
-    AutoCapture,
-    CaptureExample,
-    CaptureReview,
-    ReviewCapture,
     AutoOn,
     AutoOff,
     /// A new balance for auto mode.
@@ -738,8 +724,6 @@ enum Message {
     /// Switch the Video tab to streaming to a URL, or back to recording.
     ForwardMode(bool),
     CapturePicker(destinations::Message),
-    AutoCapture(autocapture::Input),
-    FolderReview(folder_review::Input),
     RecordPicker(destinations::Message),
     Screenshot(window::Screenshot),
     ToggleInspector,
@@ -980,8 +964,6 @@ struct Workbench {
     side: sidebar::SideState,
     stage_ui: stage::StageState,
     inspect: inspector::InspectorState,
-    auto_capture: autocapture::State,
-    folder_review: folder_review::State,
     assistant: assistant::State,
     sheets: help::SheetState,
 }
@@ -1169,8 +1151,6 @@ impl Workbench {
             side: Default::default(),
             stage_ui: Default::default(),
             inspect: Default::default(),
-            auto_capture: Default::default(),
-            folder_review: Default::default(),
             assistant: Default::default(),
             sheets: Default::default(),
         };
@@ -1424,7 +1404,6 @@ impl Workbench {
             || self.capture_to.busy()
             || self.record_to.busy()
             || self.assistant.settings.busy()
-            || self.folder_review.busy()
             || self.assistant_ui_busy();
         let interval = if busy {
             Duration::from_millis(60)
@@ -1729,7 +1708,6 @@ impl Workbench {
         self.result_side(pending, result);
         self.result_stage(pending, result);
         self.result_inspector(pending, result);
-        self.result_autocapture(pending, result);
         self.dataset_settled(pending, result);
         self.signals_settled(pending, result);
         let notice = if pending.batch {
@@ -1900,8 +1878,6 @@ impl Workbench {
         self.tick_inspector();
         self.tick_analytics();
         self.tick_video_analytics();
-        self.tick_autocapture();
-        self.tick_folder_review();
         self.tick_signals();
         self.save_prefs();
         Task::batch([
@@ -3016,11 +2992,6 @@ impl Workbench {
             Message::SystemTheme(mode) => self.system_dark = mode == theme::Mode::Dark,
             Message::Key { chord, captured } => {
                 self.desktop_menu.cancel_alt();
-                if self.review_shortcut(chord, captured)
-                    || self.folder_review_shortcut(chord, captured)
-                {
-                    return Task::none();
-                }
                 return self.shortcut(chord, !captured);
             }
             Message::FocusNext(back) => {
@@ -3359,8 +3330,6 @@ impl Workbench {
                 self.send(Job::StopForward { recording }, SessionCommand::StopForward);
             }
             Message::CapturePicker(message) => return self.picker(false, message),
-            Message::AutoCapture(input) => return self.update_autocapture(input),
-            Message::FolderReview(input) => return self.update_folder_review(input),
             Message::Assistant(input) => return self.update_assistant(input),
             Message::RecordPicker(message) => {
                 // Typing never switches between Record and Stream: once the
@@ -3576,8 +3545,6 @@ impl Workbench {
             }
             Action::Overview if self.network_open => self.network_open = false,
             Action::Overview if self.analytics.open => self.analytics.open = false,
-            Action::Overview if self.auto_capture.open => self.auto_capture.open = false,
-            Action::Overview if self.folder_review.open => self.folder_review.open = false,
             Action::Overview if self.settings_open && self.settings_window.is_none() => {
                 return self.handle_message(Message::Settings(false));
             }

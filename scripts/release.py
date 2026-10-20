@@ -283,23 +283,6 @@ def cargo_features(web):
         flags[-1] += ',embedded-web'
     return flags
 
-DINOV2_SCRIPT = ROOT / 'scripts' / 'fetch-dinov2.py'
-DINOV2_DIR = ROOT / 'target' / 'models' / 'dinov2-small'
-
-def dinov2_pins():
-    """REPOSITORY, REVISION and SHA-256 pins of the bundled DINOv2 weights."""
-    return dict(re.findall(r'^([A-Z0-9_]+) = "([^"]*)"$', DINOV2_SCRIPT.read_text(), re.M))
-
-def dinov2_weights():
-    """The DINOv2 weights every release embeds, fetched by scripts/fetch-dinov2.py
-    when absent and verified against its pinned output SHA-256."""
-    pins, model = dinov2_pins(), DINOV2_DIR / 'model.safetensors'
-    if not model.is_file() or digest(model) != pins['OUTPUT_SHA256']:
-        run([sys.executable, str(DINOV2_SCRIPT)], cwd=ROOT)
-    if not model.is_file() or digest(model) != pins['OUTPUT_SHA256']:
-        raise RuntimeError(f'{model} does not match the pinned DINOv2 weights')
-    return model
-
 def crate_components(metadata, lock):
     """CycloneDX components for the crates a package links, with Cargo.lock checksums."""
     checksums = dict(((m[1], m[2]), m[3]) for m in re.finditer(r'\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"\n(?:source = "[^"]*"\n)?(?:checksum = "([0-9a-f]{64})")?', lock))
@@ -337,16 +320,11 @@ def cyclonedx(metadata, lock, recipe, ver, repository, serial, web=None):
         if pinned.get(f'{prefix}_SHA256'):
             item['hashes'] = [dict(alg='SHA-256', content=pinned[f'{prefix}_SHA256'])]
         media.append(item)
-    pins = dinov2_pins()
-    models = [dict(type='machine-learning-model', **{'bom-ref': 'model:dinov2-small'}, name=pins['REPOSITORY'], version=pins['REVISION'], scope='required',
-                   licenses=[dict(license=dict(id='Apache-2.0'))], hashes=[dict(alg='SHA-256', content=pins['OUTPUT_SHA256'])],
-                   description='DINOv2 ViT-S/14 weights converted to float16 by scripts/fetch-dinov2.py and embedded in each executable for automatic capture.',
-                   externalReferences=[dict(type='distribution', url=f"https://huggingface.co/{pins['REPOSITORY']}")])]
     root = dict(type='application', **{'bom-ref': 'capturefab'}, name='capturefab', version=ver, licenses=[dict(license=dict(id='MIT'))], purl=f'pkg:github/{repository}@v{ver}')
     return {'bomFormat': 'CycloneDX', 'specVersion': '1.6', 'serialNumber': f'urn:uuid:{serial}', 'version': 1,
             'metadata': dict(timestamp=dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'), tools=dict(components=[dict(type='application', name='capturefab scripts/release.py')]), component=root),
-            'components': crates + media + models,
-            'dependencies': [dict(ref='capturefab', dependsOn=[c['bom-ref'] for c in crates] + ['media:ffmpeg', 'model:dinov2-small']), dict(ref='media:ffmpeg', dependsOn=[m['bom-ref'] for m in media if m['bom-ref'] != 'media:ffmpeg'])]}
+            'components': crates + media,
+            'dependencies': [dict(ref='capturefab', dependsOn=[c['bom-ref'] for c in crates] + ['media:ffmpeg']), dict(ref='media:ffmpeg', dependsOn=[m['bom-ref'] for m in media if m['bom-ref'] != 'media:ffmpeg'])]}
 
 def sbom(output, ver, repository, web=False):
     metadata = run(['cargo', 'metadata', '--format-version', '1', '--locked', '--all-features'], cwd=ROOT, capture_output=True, text=True).stdout
@@ -377,9 +355,6 @@ def notices(target, web=False):
     text = license_notices(json.loads(metadata))
     if web:
         text += '\n' + license_notices(web_metadata(), 'Rust crates compiled into the browser client (web-client) built into this executable for serve --listen, and their license texts.')
-    pins = dinov2_pins()
-    dinov2_weights()
-    text += f"\n===== DINOv2 ViT-S/14 model weights ({pins['REPOSITORY']}@{pins['REVISION']}, Apache-2.0), embedded for automatic capture =====\n\n{(DINOV2_DIR / 'LICENSE').read_text(encoding='utf-8').strip()}\n"
     text += f"\n===== Phosphor Icons 2.1.2 font (MIT), assets/fonts =====\n\n{(ROOT / 'assets/fonts/Phosphor-LICENSE.txt').read_text(encoding='utf-8').strip()}\n"
     return text
 
@@ -633,7 +608,7 @@ def build(args):
             else:
                 web = web_dist()
                 command = ['cargo', 'build', '--locked', '--release', '--target', args.target, *cargo_features(web)]
-                env = dict(os.environ, CAPTUREFAB_DINOV2_WEIGHTS=str(dinov2_weights()), CAPTUREFAB_FFMPEG_BINARY=str((Path(args.ffmpeg_bundle) / 'bin' / ('ffmpeg.exe' if args.os == 'windows' else 'ffmpeg')).resolve()), CAPTUREFAB_FFMPEG_LICENSE=str((Path(args.ffmpeg_bundle) / 'licenses/NOTICE.txt').resolve()))
+                env = dict(os.environ, CAPTUREFAB_FFMPEG_BINARY=str((Path(args.ffmpeg_bundle) / 'bin' / ('ffmpeg.exe' if args.os == 'windows' else 'ffmpeg')).resolve()), CAPTUREFAB_FFMPEG_LICENSE=str((Path(args.ffmpeg_bundle) / 'licenses/NOTICE.txt').resolve()))
                 if web:
                     env['CAPTUREFAB_WEB_DIST'] = str(web.resolve())
                 run(command, cwd=ROOT, env=env)

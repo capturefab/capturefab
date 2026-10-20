@@ -578,29 +578,6 @@ pub fn preview_rgba(frame: &Frame, max_width: u32, max_height: u32) -> Result<(u
     let (width, height, rgba) = sampled(small.as_ref().unwrap_or(frame), bounds)?;
     Ok((width, height, rgba))
 }
-/// A preview of at most `max_width` × `max_height` that keeps one pixel, or
-/// one Bayer quad, every few rather than averaging them. Auto capture
-/// descriptors are computed from this, so sessions learned earlier stay
-/// comparable; anything shown uses `preview_rgba`.
-pub fn sampled_rgba(frame: &Frame, max_width: u32, max_height: u32) -> Result<(u32, u32, Vec<u8>)> {
-    let (max_width, max_height) = (max_width.max(1), max_height.max(1));
-    // Sample complete Bayer quads so every retained pixel keeps its CFA phase.
-    // Count quads rather than pixels to keep odd requested bounds bounded too.
-    let factor = if is_bayer(frame.pixel_format) {
-        (frame.width / 2)
-            .div_ceil((max_width / 2).max(1))
-            .max((frame.height / 2).div_ceil((max_height / 2).max(1)))
-    } else {
-        frame
-            .width
-            .div_ceil(max_width)
-            .max(frame.height.div_ceil(max_height))
-    };
-    let small = (factor > 1)
-        .then(|| decimate(frame, factor as usize))
-        .flatten();
-    sampled(small.as_ref().unwrap_or(frame), (max_width, max_height))
-}
 /// `source` as RGBA, taking every few pixels of its conversion when it is
 /// still larger than `bounds`: one-pixel bounds, or a Bayer source without a
 /// whole quad, cannot be reduced before converting.
@@ -622,38 +599,6 @@ fn sampled(source: &Frame, (max_width, max_height): (u32, u32)) -> Result<(u32, 
         }
     }
     Ok((width, height, rgba))
-}
-
-fn decimate(frame: &Frame, factor: usize) -> Option<Frame> {
-    let (unit, bytes): (usize, usize) = match frame.pixel_format {
-        0x0108_0008..=0x0108_000b => (2, 1),
-        MONO8 | 0x0108_00b1 | 0x0108_00c6 => (1, 1),
-        0x0110_0003 | 0x0110_0005 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => (1, 2),
-        RGB8 | 0x0218_0015 => (1, 3),
-        _ => return None,
-    };
-    let (w, h) = (frame.width as usize, frame.height as usize);
-    let step = unit.checked_mul(factor)?;
-    if w < unit || h < unit || frame.data.len() < w.checked_mul(h)?.checked_mul(bytes)? {
-        return None;
-    }
-    let (columns, rows) = ((w - unit) / step + 1, (h - unit) / step + 1);
-    let mut data = Vec::with_capacity(columns * rows * unit * unit * bytes);
-    let stride = step.checked_mul(bytes)?;
-    for y in (0..rows).flat_map(|row| (0..unit).map(move |dy| row * step + dy)) {
-        let line = &frame.data[y * w * bytes..(y + 1) * w * bytes];
-        data.extend(
-            line.chunks(stride)
-                .take(columns)
-                .flat_map(|p| &p[..unit * bytes]),
-        );
-    }
-    Some(Frame {
-        width: (columns * unit) as u32,
-        height: (rows * unit) as u32,
-        data,
-        ..*frame
-    })
 }
 
 /// Bounds for `preview_rgba` that keep at least `shown` pixels each way, so

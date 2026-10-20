@@ -458,8 +458,6 @@ impl Workbench {
 
     pub(super) fn sheet_open(&self) -> bool {
         self.help_open
-            || self.auto_capture.open
-            || self.folder_review.open
             || self.assistant.quick.open
             || self.network_open
             || self.analytics.open
