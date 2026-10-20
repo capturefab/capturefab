@@ -216,31 +216,22 @@ fn main() {
             } else {
                 "ffmpeg"
             });
-    let release = env::var("PROFILE").is_ok_and(|p| p == "release");
-    // Release builds must notice a bundle created after the previous build.
-    // Development builds resolve this path at runtime and need no rebuild.
-    if release && env::var_os("CAPTUREFAB_FFMPEG_BINARY").is_none() {
+    if env::var_os("CAPTUREFAB_FFMPEG_BINARY").is_none() {
         println!("cargo:rerun-if-changed={}", default.display());
     }
-    let source = env::var_os("CAPTUREFAB_FFMPEG_BINARY")
+    let path = env::var_os("CAPTUREFAB_FFMPEG_BINARY")
         .map(PathBuf::from)
-        .or_else(|| (release && default.is_file()).then(|| default.clone()));
-    let bytes = if let Some(path) = source {
-        println!("cargo:rerun-if-changed={}", path.display());
-        fs::read(&path)
-            .unwrap_or_else(|e| panic!("cannot read bundled FFmpeg {}: {e}", path.display()))
-    } else {
-        println!(
-            "cargo:rustc-env=CAPTUREFAB_LOCAL_FFMPEG={}",
-            default.display()
-        );
-        Vec::new()
-    };
+        .unwrap_or_else(|| build_ffmpeg(default));
+    println!("cargo:rerun-if-changed={}", path.display());
+    let bytes = fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read bundled FFmpeg {}: {e}; run scripts/build-ffmpeg.sh and copy its bin/ffmpeg there, or set CAPTUREFAB_FFMPEG_BINARY",
+            path.display()
+        )
+    });
     fs::write(out.join("capturefab-ffmpeg.bin"), &bytes).expect("write bundled FFmpeg");
     // Names the extracted copy, so processes running one build share a file.
-    let digest = if bytes.is_empty() {
-        String::new()
-    } else {
+    let digest: String = {
         use sha2::Digest;
         sha2::Sha256::digest(&bytes)
             .iter()
@@ -257,6 +248,34 @@ fn main() {
     };
     fs::write(out.join("capturefab-ffmpeg-license.txt"), license)
         .expect("write bundled FFmpeg license");
+}
+
+fn build_ffmpeg(default: PathBuf) -> PathBuf {
+    if default.is_file() {
+        return default;
+    }
+    println!("cargo:rerun-if-changed=scripts/build-ffmpeg.sh");
+    let bundle = default
+        .ancestors()
+        .nth(4)
+        .expect("FFmpeg path under target")
+        .join("ffmpeg-bundle");
+    let status = std::process::Command::new("bash")
+        .arg("scripts/build-ffmpeg.sh")
+        .arg(&bundle)
+        .status()
+        .expect("run scripts/build-ffmpeg.sh");
+    assert!(status.success(), "scripts/build-ffmpeg.sh failed");
+    fs::create_dir_all(default.parent().expect("FFmpeg bin directory"))
+        .expect("create FFmpeg bin directory");
+    fs::copy(
+        bundle
+            .join("bin")
+            .join(default.file_name().expect("FFmpeg file name")),
+        &default,
+    )
+    .expect("copy built FFmpeg");
+    default
 }
 
 fn build_task_filesystem() {

@@ -61,7 +61,7 @@ CAPTUREFAB_FFMPEG_LICENSE="$PWD/target/ffmpeg-bundle/licenses/NOTICE.txt" \
     cargo build --release
 ```
 
-Without `CAPTUREFAB_FFMPEG_BINARY`, release-profile builds embed `target/ffmpeg/<target>/bin/ffmpeg[.exe]` when it exists. Dev and test builds never embed that file; they run it in place, so debug binaries stay small and relink quickly. Set `CAPTUREFAB_FFMPEG_BINARY` to embed FFmpeg in any profile.
+Without `CAPTUREFAB_FFMPEG_BINARY`, every build embeds `target/ffmpeg/<target>/bin/ffmpeg[.exe]` and builds it with `scripts/build-ffmpeg.sh` when it is missing. `CAPTUREFAB_FFMPEG` still overrides the embedded copy at run time.
 
 On Windows, run from an MSYS2 MinGW/UCRT shell with the matching target compiler and CMake available, using `CC=gcc CXX=g++`. The output is `bin/ffmpeg.exe`; use that filename for `CAPTUREFAB_FFMPEG_BINARY`. Do not use the MSYS compiler, which adds a dependency on `msys-2.0.dll`. Native Windows ARM64 needs an ARM64 MinGW toolchain: MSYS2 has no ARM64 GCC, so use its CLANGARM64 environment with `TARGET_ARCH=aarch64 CC=clang CXX=clang++ AR=llvm-ar RANLIB=llvm-ranlib STRIP=llvm-strip OBJDUMP=llvm-objdump`. Pass `TARGET_ARCH` explicitly there, because the MSYS2 shell itself runs as x86_64 under emulation and `uname -m` reports x86_64; the script also passes the host triple to x264's configure for the same reason, and uses OpenSSL's `mingwarm64` target. Under LLVM's libc++ it adds winpthreads to SRT's static link flags and omits screen-capture filters as part of the camera-focused component policy. Media Foundation builds also enable D3D11VA, which FFmpeg's `mfenc` needs. The recipe does not use MSVC.
 

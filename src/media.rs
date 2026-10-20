@@ -460,16 +460,6 @@ pub(crate) fn executable() -> Result<Arc<Executable>> {
         );
         return Ok(Arc::new(Executable::external(PathBuf::from(path))));
     }
-    if let Some(path) = option_env!("CAPTUREFAB_LOCAL_FFMPEG")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-    {
-        return Ok(Arc::new(Executable::external(path)));
-    }
-    ensure!(
-        !EMBEDDED.is_empty(),
-        "this development build has no embedded FFmpeg; rebuild with CAPTUREFAB_FFMPEG_BINARY pointing to a target-compatible static FFmpeg, or set CAPTUREFAB_FFMPEG to an executable path"
-    );
     let mut extracted = EXECUTABLE
         .get_or_init(Default::default)
         .lock()
