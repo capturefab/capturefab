@@ -507,6 +507,16 @@ fn a_parked_stream_is_adopted_or_closed() {
     );
     let mut idle = HubBackend::connect(vec![factory], Duration::from_secs(2), meta()).unwrap();
     std::thread::sleep(PARK + Duration::from_millis(100));
+    // A loaded host may not have run the pump thread yet; it drops the parked
+    // stream when it does.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while idle.shared.lock().current.is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "the parked stream was not closed"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
     let before = opens.load(Ordering::SeqCst);
     idle.start(0).unwrap();
     frames(&mut idle, 1);
