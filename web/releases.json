@@ -1,92 +1,92 @@
 {
   "schema_version": 1,
-  "latest": "0.2.2",
+  "latest": "0.2.3",
   "releases": [
     {
-      "version": "0.2.2",
+      "version": "0.2.3",
       "date": "2026-10-20",
-      "url": "https://github.com/capturefab/capturefab/releases/tag/v0.2.2",
-      "checksums_url": "https://github.com/capturefab/capturefab/releases/download/v0.2.2/SHA256SUMS",
-      "source_url": "https://github.com/capturefab/capturefab/releases/download/v0.2.2/capturefab-0.2.2-source.tar.gz",
-      "sbom_url": "https://github.com/capturefab/capturefab/releases/download/v0.2.2/capturefab-0.2.2-sbom.cdx.json",
+      "url": "https://github.com/capturefab/capturefab/releases/tag/v0.2.3",
+      "checksums_url": "https://github.com/capturefab/capturefab/releases/download/v0.2.3/SHA256SUMS",
+      "source_url": "https://github.com/capturefab/capturefab/releases/download/v0.2.3/capturefab-0.2.3-source.tar.gz",
+      "sbom_url": "https://github.com/capturefab/capturefab/releases/download/v0.2.3/capturefab-0.2.3-sbom.cdx.json",
       "assets": [
         {
-          "name": "capturefab-0.2.2-linux-x86_64-desktop.tar.gz",
+          "name": "capturefab-0.2.3-linux-x86_64.tar.gz",
           "os": "linux",
           "arch": "x86_64",
           "available": true,
-          "sha256": "2bca19c9a565b77534fd711daa928f959360f6abafbfffe1d0f0a610627213b7",
-          "size": 93591594,
+          "sha256": "3be5439a382c344ca40098ddaad911b79bff9b3ef83a2badd63f57f278265797",
+          "size": 93723450,
           "target": "x86_64-unknown-linux-gnu",
           "platform_signature": "unsigned",
           "validation": "native-smoke-passed",
           "browser_client": true,
-          "url": "https://github.com/capturefab/capturefab/releases/download/v0.2.2/capturefab-0.2.2-linux-x86_64-desktop.tar.gz"
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.2.3/capturefab-0.2.3-linux-x86_64.tar.gz"
         },
         {
-          "name": "capturefab-0.2.2-linux-aarch64-desktop.tar.gz",
+          "name": "capturefab-0.2.3-linux-aarch64.tar.gz",
           "os": "linux",
           "arch": "aarch64",
           "available": true,
-          "sha256": "794c83fbec0c42d45678c89c255ee033514c950a21d04ef075abac1994da9385",
-          "size": 90511893,
+          "sha256": "1da5d3f950e033f992eab21adf6bfc46b192c6de90f7bc8ce6b5f3eeb804d76f",
+          "size": 90636003,
           "target": "aarch64-unknown-linux-gnu",
           "platform_signature": "unsigned",
           "validation": "native-smoke-passed",
           "browser_client": true,
-          "url": "https://github.com/capturefab/capturefab/releases/download/v0.2.2/capturefab-0.2.2-linux-aarch64-desktop.tar.gz"
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.2.3/capturefab-0.2.3-linux-aarch64.tar.gz"
         },
         {
-          "name": "capturefab-0.2.2-macos-x86_64-desktop.zip",
+          "name": "capturefab-0.2.3-macos-x86_64.zip",
           "os": "macos",
           "arch": "x86_64",
           "available": true,
-          "sha256": "9e379052343dad523e3b9a9b6d5379479d6dd2f523ff28a96125919d7f3f7706",
-          "size": 87806612,
+          "sha256": "feb5a5ae0406fdd8fbf8b7499fa05dd2b95f98b45cb492f25d118fbf06dc89e6",
+          "size": 87940445,
           "target": "x86_64-apple-darwin",
           "platform_signature": "apple-notarized",
           "validation": "native-smoke-passed",
           "browser_client": true,
-          "url": "https://github.com/capturefab/capturefab/releases/download/v0.2.2/capturefab-0.2.2-macos-x86_64-desktop.zip"
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.2.3/capturefab-0.2.3-macos-x86_64.zip"
         },
         {
-          "name": "capturefab-0.2.2-macos-aarch64-desktop.zip",
+          "name": "capturefab-0.2.3-macos-aarch64.zip",
           "os": "macos",
           "arch": "aarch64",
           "available": true,
-          "sha256": "3f3649aab3918566e1061485e8d363956a5328b327690335aa4b8501674485d9",
-          "size": 83652384,
+          "sha256": "3c3c6ffe64fbebbafafb0310ac5b3e2942493592d6884f5ac46bc89a0d515ecd",
+          "size": 83765463,
           "target": "aarch64-apple-darwin",
           "platform_signature": "apple-notarized",
           "validation": "native-smoke-passed",
           "browser_client": true,
-          "url": "https://github.com/capturefab/capturefab/releases/download/v0.2.2/capturefab-0.2.2-macos-aarch64-desktop.zip"
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.2.3/capturefab-0.2.3-macos-aarch64.zip"
         },
         {
-          "name": "capturefab-0.2.2-windows-x86_64-desktop.zip",
+          "name": "capturefab-0.2.3-windows-x86_64.zip",
           "os": "windows",
           "arch": "x86_64",
           "available": true,
-          "sha256": "ff922ac400c6954cd6dc067de6f1f1eed0f14a333a12881f822af5b063656cd7",
-          "size": 87510441,
+          "sha256": "1624c871eecab591fc8a426b7c8fbca057d9bc186b4c57e480aa41c4d235f65f",
+          "size": 87659841,
           "target": "x86_64-pc-windows-msvc",
           "platform_signature": "unsigned",
           "validation": "native-smoke-passed",
           "browser_client": true,
-          "url": "https://github.com/capturefab/capturefab/releases/download/v0.2.2/capturefab-0.2.2-windows-x86_64-desktop.zip"
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.2.3/capturefab-0.2.3-windows-x86_64.zip"
         },
         {
-          "name": "capturefab-0.2.2-windows-aarch64-desktop.zip",
+          "name": "capturefab-0.2.3-windows-aarch64.zip",
           "os": "windows",
           "arch": "aarch64",
           "available": true,
-          "sha256": "c7225dfd28402f94db1889bb4de7933092980b767fd5e7dc706121b3ac971d6c",
-          "size": 83605120,
+          "sha256": "1914c9ff59c742545cf353e5c97a8df6419a8344717dce02a10264232fe65737",
+          "size": 83731492,
           "target": "aarch64-pc-windows-msvc",
           "platform_signature": "unsigned",
           "validation": "native-smoke-passed",
           "browser_client": true,
-          "url": "https://github.com/capturefab/capturefab/releases/download/v0.2.2/capturefab-0.2.2-windows-aarch64-desktop.zip"
+          "url": "https://github.com/capturefab/capturefab/releases/download/v0.2.3/capturefab-0.2.3-windows-aarch64.zip"
         }
       ]
     }
