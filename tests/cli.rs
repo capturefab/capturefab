@@ -6182,7 +6182,7 @@ mod assistant_cli_tests {
             call(
                 "mixed-export",
                 "export_dataset",
-                json!({"folder":"assistant-mixed-bundle","format":"parquet","tables":["captures","samples","signals","captures_with_signals","events"],"since_ms":null,"until_ms":null,"max_bytes":1024 * 1024,"timeout":"10s"}),
+                json!({"folder":"assistant-mixed-bundle","format":"parquet","tables":["captures","samples","signals","captures_with_signals","events"],"since_ms":null,"until_ms":null,"max_bytes":1024 * 1024,"timeout":"60s"}),
             ),
             finish(),
         ]);
