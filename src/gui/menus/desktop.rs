@@ -275,11 +275,10 @@ fn enabled_indices(menu: &Menu) -> Vec<usize> {
 fn item_role(command: Command) -> accessibility::Role {
     use accessibility::Role;
     match command {
-        Command::Action(Action::FeaturesTab | Action::CaptureTab | Action::ForwardTab) => {
-            Role::MenuItemRadio
-        }
+        Command::Action(Action::CaptureTab | Action::ForwardTab) => Role::MenuItemRadio,
         Command::Action(
             Action::ToggleInspector
+            | Action::ToggleSidebar
             | Action::ToggleActivity
             | Action::ToggleExposure
             | Action::ToggleFocusRegion

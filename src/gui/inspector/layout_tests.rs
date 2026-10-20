@@ -38,12 +38,22 @@ impl Operation for ScrollGeometry {
         translation: Vector,
         _: &mut dyn scrollable::Scrollable,
     ) {
-        if id == Some(&Id::new(SCROLL)) {
+        if id == Some(&Id::new(SCROLL)) || id == Some(&Id::new(SIDEBAR_SCROLL)) {
             self.bounds = Some(bounds);
             self.content = Some(content);
             self.translation = translation;
         }
     }
+}
+
+/// The inspector, or the floating sidebar on `tab`.
+fn pane(app: &mut Workbench, tab: Option<Tab>) -> Element<'_, Message> {
+    let Some(tab) = tab else {
+        return app.inspector(Palette::of(false));
+    };
+    app.tab = tab;
+    app.inspect.tab_thumb.set(tab as usize as f32);
+    app.sidebar(Palette::of(false), false)
 }
 
 fn bench() -> Workbench {
@@ -82,7 +92,7 @@ fn compact_video_keeps_its_start_action_visible_before_encoding_details() {
             app.forward_codec = "h265";
             app.inspect.tab_thumb.set(Tab::Forward as usize as f32);
             let size = Size::new(INSPECTOR, 620.0 / scale.factor() - BAR - TOOLBAR);
-            let mut view = app.inspector(Palette::of(false));
+            let mut view = app.sidebar(Palette::of(false), false);
             let mut tree = Tree::new(view.as_widget());
             let node = view.as_widget_mut().layout(
                 &mut tree,
@@ -163,7 +173,7 @@ fn compact_purpose_guidance_and_primary_actions_fit_before_external_drive_shortc
                 }
                 app.tab = tab;
                 app.inspect.tab_thumb.set(tab as usize as f32);
-                let mut view = app.inspector(Palette::of(false));
+                let mut view = app.sidebar(Palette::of(false), false);
                 let mut tree = Tree::new(view.as_widget());
                 let node = view.as_widget_mut().layout(
                     &mut tree,
@@ -265,10 +275,8 @@ fn compact_inspector_tab_and_shift_tab_reveal_the_actual_workflow_controls() {
     for scale in prefs::UiScale::ALL {
         let size = Size::new(INSPECTOR, 360.0 / scale.factor() - BAR - TOOLBAR);
         let mut app = bench();
-        for tab in [Tab::Features, Tab::Capture, Tab::Forward] {
-            app.tab = tab;
-            app.inspect.tab_thumb.set(tab as usize as f32);
-            let mut view = app.inspector(Palette::of(false));
+        for tab in [None, Some(Tab::Capture), Some(Tab::Forward)] {
+            let mut view = pane(&mut app, tab);
             let mut tree = Tree::new(view.as_widget());
             let node = view.as_widget_mut().layout(
                 &mut tree,
@@ -288,10 +296,8 @@ fn compact_inspector_tabs_keep_their_scroll_region_and_capture_action_reachable(
             let mut app = bench();
             app.ui_scale = scale;
             let size = Size::new(INSPECTOR, native_height / scale.factor() - BAR - TOOLBAR);
-            for tab in [Tab::Features, Tab::Capture, Tab::Forward] {
-                app.tab = tab;
-                app.inspect.tab_thumb.set(tab as usize as f32);
-                let mut view = app.inspector(Palette::of(false));
+            for tab in [None, Some(Tab::Capture), Some(Tab::Forward)] {
+                let mut view = pane(&mut app, tab);
                 let mut tree = Tree::new(view.as_widget());
                 let node = view.as_widget_mut().layout(
                     &mut tree,
@@ -327,7 +333,7 @@ fn compact_inspector_tabs_keep_their_scroll_region_and_capture_action_reachable(
                         control.label().unwrap_or("control")
                     );
                 }
-                if tab == Tab::Capture {
+                if tab == Some(Tab::Capture) {
                     let primary = snapshot
                         .nodes
                         .iter()
@@ -343,7 +349,7 @@ fn compact_inspector_tabs_keep_their_scroll_region_and_capture_action_reachable(
                     let offset = ((original.y - bounds.y - 8.0).max(0.0))
                         .min((scroll.content.unwrap().height - bounds.height).max(0.0));
                     let mut to = scrollable::scroll_to::<()>(
-                        Id::new(SCROLL),
+                        Id::new(SIDEBAR_SCROLL),
                         scrollable::AbsoluteOffset {
                             x: None,
                             y: Some(offset),

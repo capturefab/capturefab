@@ -364,9 +364,9 @@ impl Workbench {
                 self.signals.fixture = Some(signals::fixture());
                 if word == "signals-auth" {
                     self.tab = Tab::Capture;
-                    self.inspector_open = true;
-                    self.inspector_summoned = true;
-                    self.inspector_peek = true;
+                    self.sidebar_open = true;
+                    self.sidebar_peek = true;
+                    self.sidebar_summoned = true;
                     self.signals.source_setup.fixture();
                 }
                 self.tick_signals();

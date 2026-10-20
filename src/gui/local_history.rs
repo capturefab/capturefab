@@ -41,7 +41,7 @@ fields! {
     quota_action: &'static str, schedule_enabled: bool, schedule_delay_seconds: u64,
     schedule_interval_seconds: f64, storage_open: bool, auto_changes_open: bool,
     appearance: Appearance, ui_scale: UiScale, performance: crate::efficiency::Mode, logs_open: bool, fit: bool, zoom: f32, exposure_open: bool,
-    inspector_open: bool, inspector_peek: bool,
+    inspector_open: bool, inspector_peek: bool, sidebar_open: bool, sidebar_peek: bool,
     image_mode: bool, recent: Vec<Recent>, auto_start: bool, tags: CaptureTags,
 }
 
@@ -190,6 +190,7 @@ pub(super) fn gesture(message: &Message) -> Option<(String, Option<String>)> {
                 | Action::ToggleFocusRegion
                 | Action::ToggleActivity
                 | Action::ToggleInspector
+                | Action::ToggleSidebar
                 | Action::Overview
                 | Action::ZoomFit
                 | Action::ZoomActual
@@ -248,8 +249,11 @@ pub(super) fn gesture(message: &Message) -> Option<(String, Option<String>)> {
         Message::BalanceCommit(_) => ("Change auto exposure balance".into(), None),
         Message::Menu(menus::Command::Schedule) => ("Change scheduling".into(), None),
         Message::IncludeSimulator(_) | Message::TrySimulator => ("Show simulator".into(), None),
-        Message::Tab(_) | Message::ShowTab(_) => ("Change settings panel".into(), None),
+        Message::Tab(_) | Message::ShowTab(_) | Message::ShowInspector => {
+            ("Change settings panel".into(), None)
+        }
         Message::ToggleInspector
+        | Message::ToggleSidebar
         | Message::ToggleImage
         | Message::ToggleExposure
         | Message::ToggleFocusRegion

@@ -198,7 +198,11 @@ impl Workbench {
                 title: "View",
                 items: vec![
                     Some(
-                        Item::action("Show Inspector", Action::ToggleInspector, ready)
+                        Item::action("Show Sidebar", Action::ToggleSidebar, camera)
+                            .checked(self.sidebar_shown()),
+                    ),
+                    Some(
+                        Item::action("Show Inspector", Action::ToggleInspector, camera)
                             .checked(self.inspector_shown()),
                     ),
                     Some(
@@ -206,12 +210,9 @@ impl Workbench {
                             .checked(self.logs_open),
                     ),
                     None,
+                    action("Camera Features", Action::FeaturesTab, camera),
                     Some(
-                        Item::action("Features", Action::FeaturesTab, camera)
-                            .checked(self.tab == Tab::Features),
-                    ),
-                    Some(
-                        Item::action("Capture", Action::CaptureTab, ready)
+                        Item::action("Capture", Action::CaptureTab, camera)
                             .checked(self.tab == Tab::Capture),
                     ),
                     Some(

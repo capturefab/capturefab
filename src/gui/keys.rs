@@ -238,6 +238,7 @@ pub enum Action {
     ZoomActual,
     ToggleActivity,
     ToggleInspector,
+    ToggleSidebar,
     ImageMode,
     ToggleExposure,
     ToggleFocusRegion,
@@ -251,7 +252,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 31] = [
+    pub const ALL: [Action; 32] = [
         Action::Undo,
         Action::Redo,
         Action::Discover,
@@ -273,6 +274,7 @@ impl Action {
         Action::ZoomActual,
         Action::ToggleActivity,
         Action::ToggleInspector,
+        Action::ToggleSidebar,
         Action::ImageMode,
         Action::ToggleExposure,
         Action::ToggleFocusRegion,
@@ -328,6 +330,7 @@ impl Action {
                 Action::FeaturesTab,
                 Action::CaptureTab,
                 Action::ForwardTab,
+                Action::ToggleSidebar,
                 Action::ToggleInspector,
                 Action::ToggleActivity,
             ],
@@ -368,7 +371,8 @@ impl Action {
             Action::ZoomFit => "Zoom to fit",
             Action::ZoomActual => "Actual pixels (1:1)",
             Action::ToggleActivity => "Activity log",
-            Action::ToggleInspector => "Camera settings",
+            Action::ToggleInspector => "Camera features",
+            Action::ToggleSidebar => "Capture and video settings",
             Action::ImageMode => "Image only",
             Action::ToggleExposure => "Histogram",
             Action::ToggleFocusRegion => "Focus region and scores",
@@ -425,6 +429,7 @@ impl Action {
             Action::ZoomActual => vec![with(cmd_alt, Key::Char('0'))],
             Action::ToggleActivity => vec![cmd('j')],
             Action::ToggleInspector => vec![cmd('i')],
+            Action::ToggleSidebar => vec![with(cmd_alt, Key::Char('s'))],
             Action::ImageMode => vec![bare(Key::Char('f'))],
             Action::ToggleExposure => vec![bare(Key::Char('h'))],
             Action::ToggleFocusRegion => vec![bare(Key::Char('r'))],

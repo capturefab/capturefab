@@ -706,10 +706,35 @@ impl Workbench {
     /// Width of the main area between the panes, as laid out now.
     pub(super) fn main_width(&self) -> f32 {
         let mut main = self.width;
-        if self.inspector_docked() {
-            main -= self.inspector_slide.lerp(0.0, INSPECTOR, self.now) + 1.0;
+        if self.panels_docked() {
+            main -= self.inspector_slide.lerp(0.0, INSPECTOR, self.now)
+                + self.sidebar_slide.lerp(0.0, INSPECTOR, self.now)
+                + 2.0;
         }
         main
+    }
+
+    /// Whether the docked sidebar holds the traffic lights and its toggle,
+    /// which the title bar then leaves out.
+    fn sidebar_beside(&self) -> bool {
+        self.panels_docked() && self.sidebar_slide.target() > 0.5
+    }
+
+    /// The button showing or hiding the capture and video sidebar.
+    pub(super) fn sidebar_toggle<'a>(&self, p: &'static Palette) -> Element<'a, Message> {
+        tip(
+            icon_button(
+                Icon::Sidebar,
+                16.0,
+                if self.sidebar_shown() {
+                    p.text
+                } else {
+                    p.secondary
+                },
+                Message::ToggleSidebar,
+            ),
+            Action::ToggleSidebar.hint("Capture and video", Os::CURRENT),
+        )
     }
 
     /// What the single-camera bar keeps beside its `title`, from a rough
@@ -719,10 +744,14 @@ impl Workbench {
     /// stopping never reflow the bar.
     fn bar_fit(&self, title: &str, label: Option<&str>, tags: &[&str]) -> Fit {
         let snapshot = &self.snapshot;
-        let padding = 20.0 + self.lights();
-        // The inspector toggle and the gaps before it and the actions; widths
+        let mut padding = 20.0;
+        // The panel toggles and the gaps beside them and the actions; widths
         // are as rendered, give or take a pixel.
         let mut actions = 28.0 + 2.0 * 8.0;
+        if !self.sidebar_beside() {
+            padding += self.lights();
+            actions += 28.0 + 10.0;
+        }
         if label.is_some() {
             // A gap after Auto, and Start or Stop; Auto itself, by its
             // label, is budgeted below.
@@ -856,6 +885,10 @@ impl Workbench {
     ) -> Element<'a, Message> {
         let os = Os::CURRENT;
         let mut left = row![].spacing(10).align_y(Alignment::Center);
+        let beside = self.sidebar_beside();
+        if !beside && (self.snapshot.connected.is_some() || self.sidebar_summoned) {
+            left = left.push(self.sidebar_toggle(p));
+        }
         if let Some(heading) = heading {
             left = left.push(heading);
         }
@@ -872,19 +905,21 @@ impl Workbench {
                 Action::ImageMode.hint("Image only", os),
             ));
         }
-        let bar = bar.push(tip(
-            icon_button(
-                Icon::Sliders,
-                16.0,
-                if self.inspector_shown() {
-                    p.text
-                } else {
-                    p.secondary
-                },
-                Message::ToggleInspector,
-            ),
-            Action::ToggleInspector.hint("Camera settings", os),
-        ));
+        if self.snapshot.connected.is_some() {
+            bar = bar.push(tip(
+                icon_button(
+                    Icon::Sliders,
+                    16.0,
+                    if self.inspector_shown() {
+                        p.text
+                    } else {
+                        p.secondary
+                    },
+                    Message::ToggleInspector,
+                ),
+                Action::ToggleInspector.hint("Camera features", os),
+            ));
+        }
         let bar = container(bar)
             .height(BAR)
             .width(Fill)
@@ -893,7 +928,7 @@ impl Workbench {
                 top: 0.0,
                 right: 10.0,
                 bottom: 0.0,
-                left: 10.0 + self.lights(),
+                left: 10.0 + if beside { 0.0 } else { self.lights() },
             });
         let bar: Element<'a, Message> = if cfg!(target_os = "macos") {
             mouse_area(bar)

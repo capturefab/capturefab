@@ -26,16 +26,22 @@ fn app() -> Workbench {
     app
 }
 
+enum Pane {
+    Features,
+    Capture,
+    Forward,
+}
+
 fn snapshot(
     app: &Workbench,
-    tab: Tab,
+    tab: Pane,
     tree: &mut Tree,
     renderer: &iced::Renderer,
 ) -> accesskit::TreeUpdate {
     let mut view = match tab {
-        Tab::Features => app.features(Palette::of(false)),
-        Tab::Capture => app.capture_settings(Palette::of(false)),
-        Tab::Forward => app.forward_settings(Palette::of(false)),
+        Pane::Features => app.features(Palette::of(false)),
+        Pane::Capture => app.capture_settings(Palette::of(false)),
+        Pane::Forward => app.forward_settings(Palette::of(false)),
     };
     tree.diff(view.as_widget());
     let node = view.as_widget_mut().layout(
@@ -108,7 +114,7 @@ fn collapsed_features_are_searchable_and_disclosures_retain_drafts_and_editor_id
     let renderer = destinations::layout_tests::renderer();
     let mut app = app();
     let mut tree = Tree::empty();
-    let initial = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let initial = snapshot(&app, Pane::Features, &mut tree, &renderer);
     assert_eq!(named(&initial, "Device").1.is_expanded(), Some(false));
     assert_eq!(named(&initial, "Device").1.description(), Some("1 feature"));
     assert!(
@@ -119,11 +125,11 @@ fn collapsed_features_are_searchable_and_disclosures_retain_drafts_and_editor_id
     );
 
     app.toggle_inspector_section(Section::Features("Transport"));
-    let transport = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let transport = snapshot(&app, Pane::Features, &mut tree, &renderer);
     let (field_id, _) = named(&transport, "Gev Heartbeat Timeout");
     app.edits.insert("GevHeartbeatTimeout".into(), "27".into());
     app.toggle_inspector_section(Section::Features("Device"));
-    let expanded = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let expanded = snapshot(&app, Pane::Features, &mut tree, &renderer);
     let (current_id, field) = named(&expanded, "Gev Heartbeat Timeout");
     assert_eq!(
         current_id, field_id,
@@ -131,7 +137,7 @@ fn collapsed_features_are_searchable_and_disclosures_retain_drafts_and_editor_id
     );
     assert_eq!(field.value(), Some("27"));
     app.toggle_inspector_section(Section::Features("Transport"));
-    let collapsed = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let collapsed = snapshot(&app, Pane::Features, &mut tree, &renderer);
     assert_eq!(
         named(&collapsed, "Transport").1.description(),
         Some("1 feature · 1 edited")
@@ -142,24 +148,24 @@ fn collapsed_features_are_searchable_and_disclosures_retain_drafts_and_editor_id
     );
 
     app.search = "image size".into();
-    let searched = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let searched = snapshot(&app, Pane::Features, &mut tree, &renderer);
     named(&searched, "Width");
     app.search = "exposure duration".into();
-    let searched = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let searched = snapshot(&app, Pane::Features, &mut tree, &renderer);
     named(&searched, "Exposure");
     app.search = "exposuretime".into();
-    let searched = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let searched = snapshot(&app, Pane::Features, &mut tree, &renderer);
     named(&searched, "Exposure");
 
     app.search = "VendorSpecial".into();
-    let searched = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let searched = snapshot(&app, Pane::Features, &mut tree, &renderer);
     named(&searched, "Vendor Special");
     assert!(!app.inspect.feature_groups_open.contains("Other"));
     app.search.clear();
     app.inspect
         .write_errors
         .insert("VendorSpecial".into(), "Camera refused this value".into());
-    let failed = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let failed = snapshot(&app, Pane::Features, &mut tree, &renderer);
     assert_eq!(named(&failed, "Other").1.is_expanded(), Some(true));
     named(&failed, "Vendor Special");
 }
@@ -169,7 +175,7 @@ fn capture_and_video_prioritize_actions_and_reveal_invalid_advanced_fields() {
     let renderer = destinations::layout_tests::renderer();
     let mut app = app();
     let mut tree = Tree::empty();
-    let capture = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    let capture = snapshot(&app, Pane::Capture, &mut tree, &renderer);
     let action = capture
         .nodes
         .iter()
@@ -200,7 +206,7 @@ fn capture_and_video_prioritize_actions_and_reveal_invalid_advanced_fields() {
             .any(|(_, node)| node.invalid().is_some())
     );
     app.drafts.insert(Num::Timeout, "invalid".into());
-    let invalid = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    let invalid = snapshot(&app, Pane::Capture, &mut tree, &renderer);
     assert_eq!(
         named(&invalid, "Capture options").1.is_expanded(),
         Some(true)
@@ -213,7 +219,7 @@ fn capture_and_video_prioritize_actions_and_reveal_invalid_advanced_fields() {
     );
 
     let mut tree = Tree::empty();
-    let video = snapshot(&app, Tab::Forward, &mut tree, &renderer);
+    let video = snapshot(&app, Pane::Forward, &mut tree, &renderer);
     let start = named(&video, "Start recording").1.bounds().unwrap();
     assert!(start.y1 < named(&video, "Video settings").1.bounds().unwrap().y0);
     for folded in ["Recording encoder", "Video codec", "Recording bitrate"] {
@@ -231,7 +237,7 @@ fn capture_and_video_prioritize_actions_and_reveal_invalid_advanced_fields() {
         "the folded settings are summed up"
     );
     app.forward_encoder = "invalid/encoder".into();
-    let invalid = snapshot(&app, Tab::Forward, &mut tree, &renderer);
+    let invalid = snapshot(&app, Pane::Forward, &mut tree, &renderer);
     assert_eq!(
         named(&invalid, "Video settings").1.is_expanded(),
         Some(true)
@@ -247,7 +253,7 @@ fn active_automatic_sessions_prioritize_review_without_moving_editors_on_suggest
     let renderer = destinations::layout_tests::renderer();
     let mut app = app();
     let mut tree = Tree::empty();
-    let manual = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    let manual = snapshot(&app, Pane::Capture, &mut tree, &renderer);
     let output_id = output_control(&manual).0;
     app.snapshot.capture_session = Some(crate::autocapture::SessionStatus {
         path: "/isolated/review.duckdb".into(),
@@ -267,7 +273,7 @@ fn active_automatic_sessions_prioritize_review_without_moving_editors_on_suggest
         samples_per_second: None,
         note: None,
     });
-    let active = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    let active = snapshot(&app, Pane::Capture, &mut tree, &renderer);
     assert_eq!(output_control(&active).0, output_id);
     let (review_id, review) = named(&active, "Review suggestions (0)");
     let review_bounds = review.bounds().unwrap();
@@ -278,7 +284,7 @@ fn active_automatic_sessions_prioritize_review_without_moving_editors_on_suggest
         "review is among the first visible actions"
     );
     app.snapshot.capture_session.as_mut().unwrap().pending_count = 3;
-    let suggestions = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    let suggestions = snapshot(&app, Pane::Capture, &mut tree, &renderer);
     let (current_id, review) = named(&suggestions, "Review suggestions (3)");
     assert_eq!(current_id, review_id);
     assert_eq!(review.bounds(), Some(review_bounds));
@@ -287,7 +293,7 @@ fn active_automatic_sessions_prioritize_review_without_moving_editors_on_suggest
     app.snapshot.capture_session.as_mut().unwrap().note = Some(
         "Discarded capture 12 but left /isolated/review.frames/00000012.raw in place: it changed after saving or was saved on another computer".into(),
     );
-    let noted = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    let noted = snapshot(&app, Pane::Capture, &mut tree, &renderer);
     assert_eq!(
         named(&noted, "Review suggestions (3)").1.bounds(),
         Some(review_bounds)
@@ -295,7 +301,7 @@ fn active_automatic_sessions_prioritize_review_without_moving_editors_on_suggest
     assert_eq!(named(&noted, "Capture example").1.bounds(), teach_bounds);
     assert_eq!(output_control(&noted).0, output_id);
     app.snapshot.capture_session = None;
-    let closed = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    let closed = snapshot(&app, Pane::Capture, &mut tree, &renderer);
     assert_eq!(output_control(&closed).0, output_id);
 }
 
@@ -304,7 +310,7 @@ fn the_schedule_command_shows_its_form_in_folded_capture_options() {
     let renderer = destinations::layout_tests::renderer();
     let mut app = app();
     let mut tree = Tree::empty();
-    let folded = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    let folded = snapshot(&app, Pane::Capture, &mut tree, &renderer);
     assert!(
         !folded
             .nodes
@@ -312,7 +318,7 @@ fn the_schedule_command_shows_its_form_in_folded_capture_options() {
             .any(|(_, node)| node.label() == Some("Capture interval"))
     );
     let _ = app.menu_command(super::super::menus::Command::Schedule);
-    let shown = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    let shown = snapshot(&app, Pane::Capture, &mut tree, &renderer);
     assert_eq!(named(&shown, "Capture options").1.is_expanded(), Some(true));
     assert_eq!(
         named(&shown, "Capture on a schedule").1.toggled(),
@@ -323,7 +329,7 @@ fn the_schedule_command_shows_its_form_in_folded_capture_options() {
 
     // Folded again, the summary says a schedule is on; its form waits.
     let _ = app.update(Message::InspectorDisclosure(Section::CaptureOptions));
-    let folded = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    let folded = snapshot(&app, Pane::Capture, &mut tree, &renderer);
     let options = named(&folded, "Capture options").1;
     assert_eq!(options.is_expanded(), Some(false));
     assert_eq!(options.description(), Some("Scheduled"));
@@ -381,7 +387,7 @@ fn opened_feature_groups_are_remembered_for_the_next_launch() {
     let next = relaunched(&app);
     assert!(next.inspect.feature_groups_open.contains("Image"));
     let mut tree = Tree::empty();
-    let features = snapshot(&next, Tab::Features, &mut tree, &renderer);
+    let features = snapshot(&next, Pane::Features, &mut tree, &renderer);
     assert_eq!(named(&features, "Image").1.is_expanded(), Some(true));
     named(&features, "Width");
     // Closed again, it is forgotten.
@@ -424,7 +430,7 @@ fn capture_tags_and_storage_reopen_where_they_were_left_without_turning() {
     );
     assert_eq!(next.inspect.storage_turn.get(next.now), 1.0);
     let mut tree = Tree::empty();
-    let capture = snapshot(&next, Tab::Capture, &mut tree, &renderer);
+    let capture = snapshot(&next, Pane::Capture, &mut tree, &renderer);
     named(&capture, "Capture tag Line");
     named(&capture, "Capture tag Station");
     named(&capture, "When a storage limit is reached");
@@ -436,7 +442,7 @@ fn a_section_shown_for_an_invalid_value_is_not_remembered_open() {
     let mut app = app();
     app.forward_bitrate = "invalid".into();
     let mut tree = Tree::empty();
-    let video = snapshot(&app, Tab::Forward, &mut tree, &renderer);
+    let video = snapshot(&app, Pane::Forward, &mut tree, &renderer);
     assert_eq!(named(&video, "Video settings").1.is_expanded(), Some(true));
     assert!(!app.prefs().open_sections.contains(&"video-settings".into()));
     let _ = app.update(Message::InspectorDisclosure(Section::EncoderOptions));
@@ -448,7 +454,7 @@ fn expand_all_opens_every_group_and_collapse_all_closes_them() {
     let renderer = destinations::layout_tests::renderer();
     let mut app = app();
     let mut tree = Tree::empty();
-    let folded = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let folded = snapshot(&app, Pane::Features, &mut tree, &renderer);
     named(&folded, "Expand all");
     assert!(labels(&folded).contains(&"6 settings"));
     let _ = app.update(Message::ExpandFeatureGroups(true));
@@ -458,16 +464,16 @@ fn expand_all_opens_every_group_and_collapse_all_closes_them() {
             .iter()
             .all(|group| app.inspect.feature_groups_open.contains(group))
     );
-    let open = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let open = snapshot(&app, Pane::Features, &mut tree, &renderer);
     named(&open, "Collapse all");
     named(&open, "Vendor Special");
     let _ = app.update(Message::InspectorDisclosure(Section::Features(groups[0])));
-    let one_closed = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let one_closed = snapshot(&app, Pane::Features, &mut tree, &renderer);
     named(&one_closed, "Collapse all");
     let _ = app.update(Message::ExpandFeatureGroups(false));
     assert!(app.inspect.feature_groups_open.is_empty());
     app.search = "gain".into();
-    let searching = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let searching = snapshot(&app, Pane::Features, &mut tree, &renderer);
     assert!(
         !labels(&searching)
             .iter()
@@ -485,7 +491,7 @@ fn the_manual_exposure_card_explains_auto_and_toggles_the_histogram() {
     profile.capabilities = vec![crate::camera_profile::CameraCapability::Exposure];
     app.exposure_open = false;
     let mut tree = Tree::empty();
-    let manual = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let manual = snapshot(&app, Pane::Features, &mut tree, &renderer);
     assert!(
         labels(&manual)
             .iter()
@@ -502,7 +508,7 @@ fn the_manual_exposure_card_explains_auto_and_toggles_the_histogram() {
     assert!(labels(&manual).contains(&focus.as_str()));
     let _ = app.update(Message::ToggleExposure);
     assert!(app.exposure_open);
-    let shown = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let shown = snapshot(&app, Pane::Features, &mut tree, &renderer);
     let hide = hint("Hide the histogram", Action::ToggleExposure);
     assert!(labels(&shown).contains(&hide.as_str()));
 }
@@ -523,7 +529,7 @@ fn quick_sliders_draft_while_dragging_and_apply_once_on_release() {
     exposure.value = Some(serde_json::json!(10_000.0));
     exposure.unit = Some("us".into());
     let mut tree = Tree::empty();
-    let features = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let features = snapshot(&app, Pane::Features, &mut tree, &renderer);
     let slider = features
         .nodes
         .iter()
@@ -654,7 +660,7 @@ fn an_out_of_range_draft_reads_plainly_and_keeps_the_raw_description() {
     let raw = format!("{:#}", exposure.validate_input("5").unwrap_err());
     app.edits.insert("ExposureTime".into(), "5".into());
     let mut tree = Tree::empty();
-    let features = snapshot(&app, Tab::Features, &mut tree, &renderer);
+    let features = snapshot(&app, Pane::Features, &mut tree, &renderer);
     let field = features
         .nodes
         .iter()
@@ -691,7 +697,7 @@ fn the_next_capture_names_its_file_and_folder_apart() {
         ("clip.png".into(), "C:\\captures".into())
     );
     let mut tree = Tree::empty();
-    let capture = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    let capture = snapshot(&app, Pane::Capture, &mut tree, &renderer);
     assert!(
         labels(&capture)
             .iter()
@@ -711,7 +717,7 @@ fn storage_limits_read_in_plain_words() {
     let _ = app.update(Message::ToggleStorage);
     let _ = app.update(Message::RetentionEnabled(true));
     let mut tree = Tree::empty();
-    let capture = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    let capture = snapshot(&app, Pane::Capture, &mut tree, &renderer);
     for label in [
         "Use up to",
         "Keep at most",
@@ -817,7 +823,7 @@ fn a_stream_url_being_retyped_stays_in_stream_mode() {
                 value.into(),
             )));
             assert!(app.forward_streams(), "{value:?} switched to Record");
-            let video = snapshot(&app, Tab::Forward, &mut Tree::empty(), &renderer);
+            let video = snapshot(&app, Pane::Forward, &mut Tree::empty(), &renderer);
             assert_eq!(named(&video, "Stream URL").1.value(), Some(value));
         }
         // Only the switch leaves Stream mode, and Undo takes it back.
@@ -839,7 +845,7 @@ fn a_stream_shows_one_url_field_and_nothing_about_files() {
     app.forward_output = "rtsp://127.0.0.1:8554/line-1".into();
     let _ = app.update(Message::InspectorDisclosure(Section::EncoderOptions));
     let mut tree = Tree::empty();
-    let video = snapshot(&app, Tab::Forward, &mut tree, &renderer);
+    let video = snapshot(&app, Pane::Forward, &mut tree, &renderer);
     let field = named(&video, "Stream URL").1;
     assert_eq!(field.value(), Some("rtsp://127.0.0.1:8554/line-1"));
     named(&video, "Start forwarding");
@@ -867,7 +873,7 @@ fn an_empty_output_asks_once_without_a_red_field() {
             app.forward_output.clear();
         }
         let mut tree = Tree::empty();
-        let video = snapshot(&app, Tab::Forward, &mut tree, &renderer);
+        let video = snapshot(&app, Pane::Forward, &mut tree, &renderer);
         let field = named(&video, if stream { "Stream URL" } else { "File" }).1;
         assert_eq!(field.invalid(), None);
         let asks: Vec<_> = labels(&video)
@@ -899,7 +905,7 @@ fn an_empty_output_asks_once_without_a_red_field() {
     let mut app = app();
     app.forward_output = "recording.unsupported".into();
     let mut tree = Tree::empty();
-    let video = snapshot(&app, Tab::Forward, &mut tree, &renderer);
+    let video = snapshot(&app, Pane::Forward, &mut tree, &renderer);
     let error = crate::media::validate_forward_output("recording.unsupported")
         .unwrap_err()
         .to_string();
@@ -920,7 +926,7 @@ fn a_capture_output_error_is_said_once() {
     let mut app = app();
     app.output = "rtsp://host/live".into();
     let mut tree = Tree::empty();
-    let capture = snapshot(&app, Tab::Capture, &mut tree, &renderer);
+    let capture = snapshot(&app, Pane::Capture, &mut tree, &renderer);
     let error = crate::engine::validate_capture_output("rtsp://host/live")
         .unwrap_err()
         .to_string();
@@ -939,7 +945,7 @@ fn the_default_recording_shows_where_it_saves_and_folds_its_field() {
     let mut app = app();
     app.forward_output = prefs::default_record_output();
     let mut tree = Tree::empty();
-    let video = snapshot(&app, Tab::Forward, &mut tree, &renderer);
+    let video = snapshot(&app, Pane::Forward, &mut tree, &renderer);
     assert!(!labels(&video).contains(&"File"), "the field waits folded");
     let location = named(&video, "Location & name").1;
     assert_eq!(location.is_expanded(), Some(false));
@@ -963,7 +969,7 @@ fn the_default_recording_shows_where_it_saves_and_folds_its_field() {
     for output in ["clips/run.mkv", "recording.unsupported"] {
         let mut app = super::disclosure_tests::app();
         app.forward_output = output.into();
-        let video = snapshot(&app, Tab::Forward, &mut Tree::empty(), &renderer);
+        let video = snapshot(&app, Pane::Forward, &mut Tree::empty(), &renderer);
         assert_eq!(named(&video, "File").1.value(), Some(output));
         assert!(
             !app.prefs()
@@ -975,7 +981,7 @@ fn the_default_recording_shows_where_it_saves_and_folds_its_field() {
     let mut app = super::disclosure_tests::app();
     app.forward_output = prefs::default_record_output();
     app.record_to.selected = Some("named destination".into());
-    let video = snapshot(&app, Tab::Forward, &mut Tree::empty(), &renderer);
+    let video = snapshot(&app, Pane::Forward, &mut Tree::empty(), &renderer);
     assert_eq!(named(&video, "Location & name").1.is_expanded(), Some(true));
     assert!(!labels(&video).iter().any(|l| l.starts_with("Saves as")));
     assert!(

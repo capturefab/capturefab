@@ -225,10 +225,12 @@ or set CAPTUREFAB_FFMPEG to an absolute path";
 
 impl Workbench {
     /// Put the workbench in a named state for a screenshot. Words:
-    /// - layout: `help`, `capture`, `forward`, `features`, `destinations`,
-    ///   `logs`, `image`, `focus`, `exposure`, `noscopes`, `inspector`,
-    ///   `noinspector`, `peek` (floating inspector
-    ///   open; use a narrow size), `light`, `dark`
+    /// - layout: `help`, `capture` and `forward` or `video` (the sidebar on
+    ///   that tab, floating where it cannot dock), `features`,
+    ///   `destinations`, `logs`, `image`, `focus`, `exposure`, `noscopes`,
+    ///   `inspector`, `noinspector`, `nosidebar`, `peek` (the floating
+    ///   inspector, unless a tab word floats the sidebar; use a narrow
+    ///   size), `light`, `dark`
     /// - notices, which stay put: `notice` (done), `warning` (discovery
     ///   warnings), `error`, `notice-long` (an error too long for the bar)
     /// - activity: `searching` (with `welcome`: discovery never finishes),
@@ -272,9 +274,16 @@ impl Workbench {
                 "side-hub" => self.scene.hubs = true,
                 "help" => self.help_open = true,
                 "analytics" => self.analytics.open = true,
-                "capture" => self.tab = Tab::Capture,
-                "forward" => self.tab = Tab::Forward,
-                "features" => self.tab = Tab::Features,
+                "capture" | "forward" | "video" => {
+                    self.tab = if *word == "capture" {
+                        Tab::Capture
+                    } else {
+                        Tab::Forward
+                    };
+                    self.sidebar_open = true;
+                    self.sidebar_peek = true;
+                }
+                "features" => self.inspector_open = true,
                 "destinations" => self.capture_to.manager_open = true,
                 "logs" => self.logs_open = true,
                 "image" => self.image_mode = true,
@@ -285,12 +294,9 @@ impl Workbench {
                     self.focus.open = false;
                 }
                 "noinspector" => self.inspector_open = false,
-                "inspector" => {
-                    // Asked for by name: show it even on a quiet first run.
-                    self.inspector_open = true;
-                    self.inspector_summoned = true;
-                }
-                "peek" => self.inspector_peek = true,
+                "nosidebar" => self.sidebar_open = false,
+                "inspector" => self.inspector_open = true,
+                "peek" if !self.sidebar_peek => self.inspector_peek = true,
                 "light" => self.appearance = Appearance::Light,
                 "dark" => self.appearance = Appearance::Dark,
                 "sheet-bottom" => self.scene.scroll_end = Some(SHEET_BODY),
@@ -702,7 +708,11 @@ impl Workbench {
         } else if request.staged && self.scene.scroll_end.is_some() {
             // The first staged frame establishes the scrollable's real
             // extent. Give the operation another paint before the screenshot.
-            task = operation::snap_to_end(self.scene.scroll_end.take().unwrap());
+            let id = self.scene.scroll_end.take().unwrap();
+            task = operation::snap_to_end(id);
+            if id == inspector::SCROLL {
+                task = task.chain(operation::snap_to_end(inspector::SIDEBAR_SCROLL));
+            }
         } else if request.staged && self.scene.scroll_down {
             self.scene.scroll_down = false;
             task = operation::scroll_by(SHEET_BODY, operation::AbsoluteOffset { x: 0.0, y: 150.0 });
@@ -974,8 +984,8 @@ mod tests {
             assert!(bench.handle.snapshot().signal_bindings.is_empty());
             if scene == "signals-auth" {
                 assert_eq!(bench.tab, Tab::Capture);
-                assert!(bench.inspector_open && bench.inspector_summoned);
-                assert!(bench.inspector_shown());
+                assert!(bench.sidebar_open && bench.sidebar_summoned);
+                assert!(bench.sidebar_shown());
             }
         }
     }
@@ -995,7 +1005,7 @@ mod tests {
         );
         app.apply_scene(&["signals-empty"]);
         assert_eq!(app.tab, Tab::Capture);
-        assert!(app.inspector_shown());
+        assert!(app.sidebar_shown());
         assert!(app.snapshot.cameras.is_empty());
         assert!(app.snapshot.connected.is_none());
         assert!(app.signals.fixture.is_none());
@@ -1022,20 +1032,20 @@ mod tests {
                 for physical_height in [620.0, 900.0] {
                     let mut app = bench();
                     app.snapshot.connected = Some(app.snapshot.cameras[0].info.clone());
-                    app.inspector_open = false;
-                    app.tab = Tab::Features;
+                    app.sidebar_open = false;
+                    app.tab = Tab::Forward;
                     app.apply_scene(&["signals-auth"]);
                     // An already restored disclosure must stay open when the
                     // fixture is applied, rather than toggling closed.
                     app.apply_scene(&["signals-auth"]);
                     assert_eq!(app.tab, Tab::Capture);
-                    assert!(app.inspector_open && app.inspector_summoned);
-                    assert!(app.inspector_shown());
+                    assert!(app.sidebar_open);
+                    assert!(app.sidebar_shown());
                     app.sync_inspector();
                     app.now += Duration::from_millis(500);
                     let size =
                         Size::new(INSPECTOR, physical_height / scale.factor() - BAR - TOOLBAR);
-                    let mut view = app.inspector(Palette::of(dark));
+                    let mut view = app.sidebar(Palette::of(dark), false);
                     let mut tree = Tree::new(view.as_widget());
                     let node = view.as_widget_mut().layout(
                         &mut tree,

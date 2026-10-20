@@ -1580,12 +1580,12 @@ mod tests {
             2,
             "the same buttons without a warning"
         );
-        // Pressing one opens the exposure time in the Features tab.
-        bench.tab = Tab::Capture;
+        // Pressing one opens the exposure time in the inspector.
+        bench.inspector_open = false;
         bench.image_mode = true;
         bench.search = "gamma".into();
         let _ = bench.update(Message::AdjustExposure);
-        assert_eq!(bench.tab, Tab::Features);
+        assert!(bench.inspector_open);
         assert!(!bench.image_mode && bench.search.is_empty());
         // The camera's own auto exposure running holds the exposure time.
         bench.snapshot.features[0].value = Some(json!("Continuous"));

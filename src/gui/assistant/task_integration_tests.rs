@@ -253,7 +253,6 @@ fn hiding_a_running_sheet_preserves_controls_and_take_over_waits_for_a_safe_stop
     app.assistant.tasks.mode = tasks::Mode::Autonomous;
     app.assistant.tasks.cameras.insert("sim:0".into());
     app.inspector_open = false;
-    app.inspector_summoned = false;
     let _ = app.update_assistant(Input::Quick(quick::Input::Open(false)));
     assert!(!app.assistant.quick.open);
     assert!(app.assistant.tasks.active());
@@ -273,7 +272,6 @@ fn hiding_a_running_sheet_preserves_controls_and_take_over_waits_for_a_safe_stop
     assert!(!app.assistant.tasks.active());
     assert!(!app.assistant.quick.open);
     assert!(app.inspector_open);
-    assert!(app.inspector_summoned);
     assert!(app.notice.is_some());
 }
 
@@ -285,19 +283,19 @@ fn camera_free_data_takeover_waits_for_runtime_completion_then_opens_actual_manu
     assert!(app.snapshot.cameras.is_empty());
     assert!(app.snapshot.connected.is_none());
     app.assistant.tasks.cameras.clear();
-    app.inspector_open = false;
-    app.inspector_peek = false;
-    app.tab = super::super::Tab::Features;
+    app.sidebar_open = false;
+    app.sidebar_peek = false;
+    app.tab = super::super::Tab::Forward;
     let _ = app.update_assistant(Input::Task(tasks::Input::TakeOver(
         tasks::TakeoverTarget::Data,
     )));
     assert!(app.assistant.tasks.active());
     assert!(app.assistant.quick.open);
-    assert!(!app.inspector_open);
+    assert!(!app.sidebar_open);
     assert!(!run.records().iter().any(|record| record["kind"] == "end"));
     let _ = app.take_assistant_handoff();
     assert!(
-        !app.inspector_open,
+        !app.sidebar_open,
         "stopping alone cannot reveal manual controls before the run ends"
     );
     run.gate.released.store(true, Ordering::SeqCst);
@@ -307,13 +305,13 @@ fn camera_free_data_takeover_waits_for_runtime_completion_then_opens_actual_manu
     assert!(!app.assistant.tasks.active());
     assert!(!app.assistant.quick.open);
     assert_eq!(app.tab, super::super::Tab::Capture);
-    assert!(app.inspector_shown());
+    assert!(app.sidebar_shown());
     assert!(run.records().iter().any(|record| record["kind"] == "end"));
     assert!(app.signals.input.is_empty());
     assert!(app.handle.snapshot().signals.is_empty());
     assert!(app.handle.snapshot().signal_bindings.is_empty());
     let renderer = destinations::layout_tests::renderer();
-    let mut view = app.inspector(Palette::of(false));
+    let mut view = app.sidebar(Palette::of(false), false);
     let mut tree = Tree::new(view.as_widget());
     let node = view.as_widget_mut().layout(
         &mut tree,

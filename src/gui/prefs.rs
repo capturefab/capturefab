@@ -487,6 +487,7 @@ pub struct Prefs {
     pub focus_region: [f32; 4],
     pub focus_metric: Metric,
     pub inspector_open: bool,
+    pub sidebar_open: bool,
     pub output: String,
     pub format: String,
     pub count: u32,
@@ -551,12 +552,13 @@ impl Default for Prefs {
             ui_scale: UiScale::Standard,
             performance: crate::efficiency::Mode::Auto,
             include_simulator: false,
-            tab: Tab::Features,
+            tab: Tab::Capture,
             exposure_open: true,
             focus_open: false,
             focus_region: DEFAULT_REGION,
             focus_metric: Metric::default(),
             inspector_open: true,
+            sidebar_open: true,
             output: default_capture_output(),
             format: "png".into(),
             count: 1,
@@ -633,6 +635,7 @@ impl Prefs {
             focus_region: layout.focus_region,
             focus_metric: layout.focus_metric,
             inspector_open: layout.inspector_open,
+            sidebar_open: layout.sidebar_open,
             window: layout.window,
             logs_open: layout.logs_open,
             open_sections: layout.open_sections.clone(),
@@ -1271,7 +1274,7 @@ mod tests {
         prefs.remember(recent("rtsp://camera.local/stream"));
         save_to(&file, &prefs).unwrap();
         assert_eq!(load_from(&file), prefs);
-        fs::write(&file, br#"{"count":3,"unknown":true}"#).unwrap();
+        fs::write(&file, br#"{"count":3,"tab":"features","unknown":true}"#).unwrap();
         assert_eq!(
             load_from(&file),
             Prefs {

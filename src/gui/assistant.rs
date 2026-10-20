@@ -367,9 +367,7 @@ impl Workbench {
             .to_owned();
         let name = crate::tools::redact::for_output_text(&name);
         let _ = self.update_assistant(Input::Quick(quick::Input::Open(false)));
-        self.inspector_open = true;
-        self.inspector_summoned = true;
-        self.inspector_peek = !self.inspector_docked();
+        self.show_inspector();
         self.inspector_slide.go(1.0, self.now);
         self.set_notice(
             format!("You have control of {name}. The assistant stopped."),

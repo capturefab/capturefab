@@ -159,9 +159,9 @@ def verify(path, temp):
         run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", str(at), "-i", str(path),
              "-frames:v", "1", "-y", str(sample)], timeout=20)
         with Image.open(sample) as frame:
-            # Exclude the inspector, toolbar and text counters. Movement must
+            # Exclude the side panels, toolbar and text counters. Movement must
             # be in the actual camera preview, not just a changing frame rate.
-            preview = frame.crop((20, 80, 740, 600)).convert("L")
+            preview = frame.crop((300, 80, 800, 600)).convert("L")
             if previous is not None:
                 diff = ImageChops.difference(previous, preview)
                 mean = ImageStat.Stat(diff).mean[0]

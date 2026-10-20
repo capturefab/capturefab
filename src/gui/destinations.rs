@@ -1029,8 +1029,15 @@ impl Watch {
             let version = list_version();
             (known != Some(version)).then(|| (version, destination::list().unwrap_or_default()))
         });
-        self.volumes
-            .poll(Duration::from_secs(5), || Some(volumes::list()));
+        self.volumes.poll(Duration::from_secs(5), || {
+            Some(
+                if std::env::var_os("CAPTUREFAB_SCREENSHOT_SCENE").is_some() {
+                    Vec::new()
+                } else {
+                    volumes::list()
+                },
+            )
+        });
         #[cfg(feature = "uploads")]
         if !self.pinned && self.uploads_matter() {
             let cost = self
@@ -3337,7 +3344,7 @@ pub(super) fn side_row<'a, M: 'a>(
 }
 
 /// The width of that column: "File names" at body size, with room to spare.
-const SIDE_LABEL: f32 = 74.0;
+const SIDE_LABEL: f32 = 68.0;
 
 /// A field's label with an action at the end of its line.
 fn labeled<'a>(

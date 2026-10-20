@@ -49,8 +49,8 @@ pub(super) const COPIED: Duration = Duration::from_millis(1500);
 pub(super) const SAVED: Duration = Duration::from_millis(1600);
 /// How often the system's accessibility display settings are read again.
 const ACCESSIBILITY_POLL: Duration = Duration::from_secs(2);
-/// Below this window width the inspector floats over the stage instead of docking.
-pub(super) const NARROW: f32 = 1100.0;
+/// Below this window width the side panels float over the stage instead of docking.
+pub(super) const NARROW: f32 = 1080.0;
 
 /// Native accessibility preferences; macOS polls and other desktops stream changes.
 static REDUCE_MOTION: AtomicBool = AtomicBool::new(false);
@@ -447,6 +447,7 @@ impl Workbench {
             shutter,
             welcome,
             inspector_slide,
+            sidebar_slide,
             bars,
             controls,
             notice_shown,
@@ -467,17 +468,52 @@ impl Workbench {
             || self.record_to.manager_open
     }
 
-    pub(super) fn inspector_docked(&self) -> bool {
+    pub(super) fn panels_docked(&self) -> bool {
         self.width >= NARROW
     }
 
     pub(super) fn inspector_shown(&self) -> bool {
         !self.image_mode
-            && if self.inspector_docked() {
-                self.inspector_open && (!self.first_run_quiet() || self.inspector_summoned)
+            && self.snapshot.connected.is_some()
+            && if self.panels_docked() {
+                self.inspector_open
             } else {
                 self.inspector_peek
             }
+    }
+
+    pub(super) fn sidebar_shown(&self) -> bool {
+        !self.image_mode
+            && (self.snapshot.connected.is_some() || self.sidebar_summoned)
+            && if self.panels_docked() {
+                self.sidebar_open
+            } else {
+                self.sidebar_peek
+            }
+    }
+
+    /// Open the inspector; in a narrow window it floats, and only one
+    /// panel floats at a time.
+    pub(super) fn show_inspector(&mut self) {
+        self.image_mode = false;
+        if self.panels_docked() {
+            self.inspector_open = true;
+        } else {
+            self.inspector_peek = true;
+            self.sidebar_peek = false;
+        }
+    }
+
+    /// Open the sidebar, as `show_inspector` opens the inspector.
+    pub(super) fn show_sidebar(&mut self) {
+        self.image_mode = false;
+        self.sidebar_summoned = self.snapshot.connected.is_none();
+        if self.panels_docked() {
+            self.sidebar_open = true;
+        } else {
+            self.sidebar_peek = true;
+            self.inspector_peek = false;
+        }
     }
 
     /// Whether anything moves, which keeps redraws coming every display frame.
@@ -532,6 +568,7 @@ impl Workbench {
         let welcome = self.snapshot.connected.is_none();
         let controls = controls_wanted(self.pointer_moved, now, self.over_controls);
         let inspector = self.inspector_shown();
+        let sidebar = self.sidebar_shown();
         let targets = [
             (welcome, &mut self.welcome),
             (controls, &mut self.controls),
@@ -539,6 +576,7 @@ impl Workbench {
             (self.exposure_open, &mut self.exposure_slide),
             (self.focus.open, &mut self.focus_slide),
             (inspector, &mut self.inspector_slide),
+            (sidebar, &mut self.sidebar_slide),
             (!self.image_mode, &mut self.bars),
         ];
         for (shown, motion) in targets {

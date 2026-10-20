@@ -216,15 +216,12 @@ fn value_text(tag: &TagStatus) -> String {
 impl Workbench {
     /// Expose manual controls without binding credentials or starting a source.
     pub(super) fn open_data_sources(&mut self) -> Task<Message> {
-        self.image_mode = false;
         self.tab = Tab::Capture;
-        self.inspector_open = true;
-        self.inspector_summoned = true;
-        self.inspector_peek = !self.inspector_docked();
-        self.inspector_slide.go(1.0, self.now);
+        self.show_sidebar();
+        self.sidebar_slide.go(1.0, self.now);
         self.restore_open_sections(&["signals".into()]);
         self.sync_inspector();
-        operation::snap_to_end(inspector::SCROLL)
+        operation::snap_to_end(inspector::SIDEBAR_SCROLL)
             .chain(accessibility::focus_in_window(ENDPOINT, self.main_window))
     }
     pub(super) fn signals_update(&mut self, message: Msg) -> Task<Message> {
@@ -916,18 +913,13 @@ mod tests {
             // Reproduce the old stale flag: render the expanded Capture pane,
             // then change state without ever rendering Live signals again.
             drop(app.view());
-            for tab in [Tab::Features, Tab::Forward] {
-                let _ = app.handle_message(Message::Tab(tab));
-                assert!(!app.signals_history_visible(), "{width}/{tab:?}");
-            }
+            let _ = app.handle_message(Message::Tab(Tab::Forward));
+            assert!(!app.signals_history_visible(), "{width}");
             let _ = app.handle_message(Message::Tab(Tab::Capture));
             assert!(app.signals_history_visible());
-            let _ = app.handle_message(Message::ToggleInspector);
-            assert!(
-                !app.signals_history_visible(),
-                "hidden inspector at {width}"
-            );
-            let _ = app.handle_message(Message::ToggleInspector);
+            let _ = app.handle_message(Message::ToggleSidebar);
+            assert!(!app.signals_history_visible(), "hidden sidebar at {width}");
+            let _ = app.handle_message(Message::ToggleSidebar);
             assert!(app.signals_history_visible());
             let _ = app.handle_message(Message::ToggleImage);
             assert!(!app.signals_history_visible(), "image mode at {width}");
@@ -1055,7 +1047,7 @@ mod tests {
                 assert!(app.handle.snapshot().signals.is_empty());
                 assert!(summary(&app.signals).contains("Storage error"));
                 let size = Size::new(INSPECTOR, 500.0);
-                let mut view = app.inspector(Palette::of(dark));
+                let mut view = app.sidebar(Palette::of(dark), false);
                 let mut tree = Tree::new(view.as_widget());
                 let node = view.as_widget_mut().layout(
                     &mut tree,
@@ -1069,7 +1061,7 @@ mod tests {
                     &node,
                     &renderer,
                     iced::advanced::widget::operation::scrollable::snap_to::<Message>(
-                        iced::advanced::widget::Id::new(inspector::SCROLL),
+                        iced::advanced::widget::Id::new(inspector::SIDEBAR_SCROLL),
                         iced::widget::scrollable::RelativeOffset::END.into(),
                     ),
                 );
@@ -1169,9 +1161,9 @@ mod tests {
         assert!(app.snapshot.connected.is_none() && app.snapshot.cameras.is_empty());
         assert!(app.signals.live.is_empty());
         app.image_mode = true;
-        app.inspector_open = false;
-        app.inspector_peek = false;
-        app.tab = Tab::Features;
+        app.sidebar_open = false;
+        app.sidebar_peek = false;
+        app.tab = Tab::Forward;
         let mut footer = app.picker_footer(Palette::of(false), space().into());
         let mut tree = Tree::new(footer.as_widget());
         let node = footer.as_widget_mut().layout(
@@ -1209,7 +1201,7 @@ mod tests {
         drop(footer);
         let task = app.handle_message(entries.0.remove(0));
         assert_eq!(app.tab, Tab::Capture);
-        assert!(app.inspector_shown());
+        assert!(app.sidebar_shown());
         assert!(!app.image_mode);
         assert!(app.pending.is_empty());
         assert!(app.handle.snapshot().signals.is_empty());
@@ -1218,7 +1210,7 @@ mod tests {
             !app.signals.source_setup.pending,
             "opening source controls never resolves profile credentials"
         );
-        let mut inspector = app.inspector(Palette::of(false));
+        let mut inspector = app.sidebar(Palette::of(false), false);
         let mut tree = Tree::new(inspector.as_widget());
         let size = Size::new(INSPECTOR, 620.0);
         let node = inspector.as_widget_mut().layout(
@@ -1317,9 +1309,9 @@ mod tests {
                 app.height = size.height;
                 app.ui_scale = scale;
                 app.image_mode = true;
-                app.inspector_open = false;
-                app.inspector_peek = false;
-                app.tab = Tab::Features;
+                app.sidebar_open = false;
+                app.sidebar_peek = false;
+                app.tab = Tab::Forward;
                 if populated {
                     let base = fixture().remove(0);
                     app.signals.live = (0..8)
@@ -1335,7 +1327,7 @@ mod tests {
                 let task = app.handle_message(Message::Signals(Msg::Open));
                 app.now += Duration::from_millis(500);
                 assert!(app.snapshot.cameras.is_empty() && app.snapshot.connected.is_none());
-                assert!(app.inspector_shown());
+                assert!(app.sidebar_shown());
                 let mut view = app.view();
                 let mut tree = Tree::new(view.as_widget());
                 let node = view.as_widget_mut().layout(

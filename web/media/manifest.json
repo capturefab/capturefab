@@ -1,15 +1,15 @@
 {
   "method": "Actual iced desktop renderer frames; H.264 encoding only. No reconstructed interface or desktop recording.",
   "source_note": "Current development desktop build from workspace source. The visible save and settings results come from real session CLI commands.",
-  "binary_sha256": "ce38cceb00ff1a153ac9ce0274ea5a94243ef78b599439a0fa07dddf3d41b9e5",
+  "binary_sha256": "a825de30ab3d42a2b5c5e8e424918f3a5084c5c0295fc1971143f0dd364fa30f",
   "demo": "Built-in simulator cameras in isolated temporary sessions. No physical cameras or saved user data.",
   "clips": [
     {
       "file": "live-preview.mp4",
       "poster": "live-preview.png",
-      "sha256": "e0bfc09ed5ce6e442a69ccd239a665d9ee380a71dfabea0821af03ca786f7d3f",
-      "poster_sha256": "7af03c5a2bb08beaf1458049c4807fdf3c52f2e6577a284288a67388d6084600",
-      "size_bytes": 429734,
+      "sha256": "a99726ee6001a1d953f3ab42689197c89a7e654752f4d778a94d7bff3e4ba7ae",
+      "poster_sha256": "1419e28981f8f632d16dd1f50c662f3f192582235d34f0a261bfb1d66e8e5cc8",
+      "size_bytes": 210251,
       "width": 1100,
       "height": 700,
       "duration_seconds": 8.0,
@@ -19,32 +19,32 @@
       "audio": false,
       "preview_frame_differences": [
         {
-          "mean_pixel_difference": 51.188,
-          "changed_fraction": 0.985
+          "mean_pixel_difference": 91.317,
+          "changed_fraction": 0.776
         },
         {
-          "mean_pixel_difference": 52.231,
-          "changed_fraction": 0.981
+          "mean_pixel_difference": 91.468,
+          "changed_fraction": 0.7771
         }
       ],
       "source": {
         "method": "Built-in renderer screenshot sequence with real simulator acquisition and session CLI commands",
-        "scene": "dark,features,nosidebar,noscopes",
-        "cameras": 4,
+        "scene": "dark,features,noscopes",
+        "cameras": 1,
         "frames": 64,
-        "duration_seconds": 29.174,
+        "duration_seconds": 22.078,
         "maximum_fps": 12,
-        "observed_fps": 2.159,
+        "observed_fps": 2.854,
         "playback_excerpt": {
           "start_seconds": 0,
           "end_seconds": 8,
           "speed": 1
         },
-        "first_frame_sha256": "a6dbcede6c13dd7cd203331d0cfd25dea60ace2305c392d9e6d31acf7a9d3d7e",
-        "last_frame_sha256": "c186186975c15724b7fde82e26e3bc5dae3afebb6bf592a6ff2ef7fe29c9c074",
+        "first_frame_sha256": "65d55fc2ecf25992ab4f478d288e25b947beb50c25a5e7ccddabaff25edf34fe",
+        "last_frame_sha256": "bd6eba15ecd0657a0187bb6be388ff17536d8ecb329395ea1ce4bf1c123bbac8",
         "actions": [
           {
-            "after_seconds": 1.796,
+            "after_seconds": 1.802,
             "arguments": [
               "--camera",
               "sim:0",
@@ -53,7 +53,7 @@
             ]
           },
           {
-            "after_seconds": 5.263,
+            "after_seconds": 5.301,
             "arguments": [
               "--camera",
               "sim:0",
@@ -63,14 +63,14 @@
           }
         ]
       },
-      "description": "Four built-in simulator cameras stream together. Real CLI commands change one camera's exposure, then restore it."
+      "description": "A built-in simulator camera streams in its window. Real CLI commands change its exposure, then restore it."
     },
     {
       "file": "capture-workflow.mp4",
       "poster": "capture-workflow.png",
-      "sha256": "8caa11a3ba4be0399167f0c46fa039e83621f2d9f95c0f7b3149e332a0a29345",
-      "poster_sha256": "3227278d0a76ebd235fd7855d5ae46d6723e08da3c2d2382a66e1ef5a6408d64",
-      "size_bytes": 292578,
+      "sha256": "8647145638f4d078276fa3715169b1128260ea9d8c826d837fb32deb3ee35a76",
+      "poster_sha256": "a4188dbbab599ae19ae39c8702305919b7762c263f127a96ebfaf065dd5fcbdf",
+      "size_bytes": 251990,
       "width": 1100,
       "height": 700,
       "duration_seconds": 8.0,
@@ -80,32 +80,32 @@
       "audio": false,
       "preview_frame_differences": [
         {
-          "mean_pixel_difference": 37.771,
-          "changed_fraction": 0.9936
+          "mean_pixel_difference": 26.661,
+          "changed_fraction": 0.7711
         },
         {
-          "mean_pixel_difference": 38.156,
-          "changed_fraction": 0.994
+          "mean_pixel_difference": 27.13,
+          "changed_fraction": 0.7709
         }
       ],
       "source": {
         "method": "Built-in renderer screenshot sequence with real simulator acquisition and session CLI commands",
-        "scene": "dark,capture,nosidebar,noscopes",
+        "scene": "dark,capture,noscopes",
         "cameras": 1,
         "frames": 64,
-        "duration_seconds": 26.708,
+        "duration_seconds": 22.557,
         "maximum_fps": 12,
-        "observed_fps": 2.359,
+        "observed_fps": 2.793,
         "playback_excerpt": {
           "start_seconds": 0,
           "end_seconds": 8,
           "speed": 1
         },
-        "first_frame_sha256": "b8ad257ff63122edc1a9cf709f569e7db72ef07461b2d96e6286ae19faaa254b",
-        "last_frame_sha256": "733d02bb8cf2519c2a93ef6f965a5d793f100787518c65d2ee3dfb76ff0b0e0a",
+        "first_frame_sha256": "14142ac4fdb3fd254e5271fb7b7d73136b9b59e81bb4a10c73d6ac4cefbc0271",
+        "last_frame_sha256": "e9c85d3fdc77cf6b06098b9547979251484821362dd501402a43d1fbc166086f",
         "actions": [
           {
-            "after_seconds": 2.531,
+            "after_seconds": 2.59,
             "arguments": [
               "--camera",
               "sim:0",
@@ -118,7 +118,7 @@
             "verified_saved_frames": 3
           },
           {
-            "after_seconds": 5.434,
+            "after_seconds": 5.4,
             "arguments": [
               "--camera",
               "sim:0",

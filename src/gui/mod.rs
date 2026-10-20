@@ -121,7 +121,7 @@ const BAR: f32 = if cfg!(target_os = "macos") {
 const LIGHTS: f32 = if cfg!(target_os = "macos") { 78.0 } else { 0.0 };
 /// Height of the toolbar under the stage, for folding it away.
 const TOOLBAR: f32 = 45.0;
-const INSPECTOR: f32 = 316.0;
+const INSPECTOR: f32 = 284.0;
 const GUTTER: f32 = 18.0;
 /// Efficiency mode draws at most 15 frames a second.
 const EFFICIENT_INTERVAL: Duration = Duration::from_micros(66_667);
@@ -526,7 +526,7 @@ impl Measured {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Tab {
-    Features,
+    #[serde(alias = "features")]
     Capture,
     Forward,
 }
@@ -699,8 +699,10 @@ enum Message {
     CopySessionCommand,
     Copy(String),
     Tab(Tab),
-    /// Show the inspector on `Tab`, from anywhere.
+    /// Show the capture sidebar on `Tab`, from anywhere.
     ShowTab(Tab),
+    /// Show the features inspector, from anywhere.
+    ShowInspector,
     Search(String),
     InspectorDisclosure(inspector::Section),
     /// Open every feature group, or close them all.
@@ -741,6 +743,7 @@ enum Message {
     RecordPicker(destinations::Message),
     Screenshot(window::Screenshot),
     ToggleInspector,
+    ToggleSidebar,
     ToggleImage,
     ToggleCameraView,
     Resized(Size),
@@ -939,13 +942,17 @@ struct Workbench {
     focus_slide: Motion,
     shutter: Motion,
     welcome: Motion,
-    /// Whether the inspector is docked open in a wide window.
+    /// Whether the features inspector is docked open in a wide window.
     inspector_open: bool,
     /// Whether the inspector floats over the stage in a narrow window.
     inspector_peek: bool,
-    /// The inspector was asked for before the first camera, which otherwise
-    /// keeps it out of the way; for this run only.
-    inspector_summoned: bool,
+    /// Whether the capture and video sidebar is docked open in a wide window.
+    sidebar_open: bool,
+    /// Whether the sidebar floats over the stage in a narrower window.
+    sidebar_peek: bool,
+    /// The sidebar was asked for with no camera, as data sources are; the
+    /// picker otherwise shows no panels.
+    sidebar_summoned: bool,
     /// What the Video tab held on the side it last left, in memory only:
     /// the recording template and its destination, and the stream URL.
     stashed_record: Option<(String, Option<String>)>,
@@ -964,6 +971,7 @@ struct Workbench {
     pointer_moved: Option<Instant>,
     over_controls: bool,
     inspector_slide: Motion,
+    sidebar_slide: Motion,
     /// Title bar and toolbar, hidden in image mode.
     bars: Motion,
     controls: Motion,
@@ -982,9 +990,6 @@ impl Workbench {
     fn new(handle: SessionHandle, session: String, simulated: bool, saved: Option<Prefs>) -> Self {
         let prefs = saved.clone().unwrap_or_default();
         let open_sections = prefs.open_sections.clone();
-        // A first run keeps the inspector out of the way until a camera
-        // comes; it must not slide away on launch.
-        let quiet = prefs.recent.is_empty();
         let now = Instant::now();
         motion::refresh_accessibility();
         let shown = |open: bool| if open { 1.0 } else { 0.0 };
@@ -1143,7 +1148,9 @@ impl Workbench {
             welcome: Motion::new(0.0, motion::WELCOME, Duration::ZERO, Kind::Fade),
             inspector_open: prefs.inspector_open,
             inspector_peek: false,
-            inspector_summoned: false,
+            sidebar_open: prefs.sidebar_open,
+            sidebar_peek: false,
+            sidebar_summoned: false,
             stashed_record: None,
             stashed_stream: String::new(),
             stream_draft: false,
@@ -1154,12 +1161,8 @@ impl Workbench {
             fullscreen: false,
             pointer_moved: None,
             over_controls: false,
-            inspector_slide: Motion::new(
-                shown(prefs.inspector_open && !quiet),
-                motion::PANEL,
-                motion::PANEL_OUT,
-                Kind::Move,
-            ),
+            inspector_slide: Motion::new(0.0, motion::PANEL, motion::PANEL_OUT, Kind::Move),
+            sidebar_slide: Motion::new(0.0, motion::PANEL, motion::PANEL_OUT, Kind::Move),
             bars: Motion::new(1.0, motion::IMAGE, motion::IMAGE_OUT, Kind::Move),
             controls: Motion::new(0.0, motion::CONTROLS_IN, motion::CONTROLS_OUT, Kind::Fade),
             chrome: Default::default(),
@@ -1239,6 +1242,7 @@ impl Workbench {
             focus_region: self.focus.saved_region(),
             focus_metric: self.focus.metric,
             inspector_open: self.inspector_open,
+            sidebar_open: self.sidebar_open,
             output: self.output.clone(),
             format: self.format.into(),
             count: self.count,
@@ -1569,12 +1573,6 @@ impl Workbench {
             ..Pending::unanswered(job)
         });
         Ok(self.pending.last_mut().expect("just pushed"))
-    }
-
-    /// A first run before any camera: nothing connected, connecting or
-    /// remembered. The docked inspector stays out of the way until then.
-    fn first_run_quiet(&self) -> bool {
-        self.recent.is_empty() && self.snapshot.cameras.is_empty() && !self.pending(Job::Connect)
     }
 
     /// Whether a command doing `job` is on its way, to any camera.
@@ -2467,10 +2465,10 @@ impl Workbench {
             return Task::none();
         };
         self.search.clear();
-        let tab = self.handle_message(Message::ShowTab(Tab::Features));
+        let shown = self.handle_message(Message::ShowInspector);
         self.reveal_feature(name);
         self.flash_feature(name);
-        // A control the stream holds read-only leaves the keyboard on the tab.
+        // A control the stream holds read-only leaves the keyboard in the search.
         let reachable = self
             .snapshot
             .features
@@ -2480,7 +2478,7 @@ impl Workbench {
         if reachable {
             operation::focus(format!("feature:{name}"))
         } else {
-            tab
+            shown
         }
     }
 
@@ -2973,8 +2971,9 @@ impl Workbench {
             Message::ScaledViewport(size) => {
                 self.width = size.width;
                 self.height = size.height;
-                if !self.inspector_docked() {
+                if !self.panels_docked() {
                     self.inspector_peek = false;
+                    self.sidebar_peek = false;
                 }
             }
             Message::Undo => return self.replay_history(true),
@@ -3232,14 +3231,12 @@ impl Workbench {
             Message::Tab(tab) => self.tab = tab,
             Message::ShowTab(tab) => {
                 self.tab = tab;
-                self.image_mode = false;
-                if self.inspector_docked() {
-                    self.inspector_open = true;
-                    self.inspector_summoned = true;
-                } else {
-                    self.inspector_peek = true;
-                }
+                self.show_sidebar();
                 return operation::focus(format!("inspector-tab-{}", tab as usize));
+            }
+            Message::ShowInspector => {
+                self.show_inspector();
+                return operation::focus("feature-search");
             }
             Message::Search(value) => self.search = value,
             Message::InspectorDisclosure(section) => self.toggle_inspector_section(section),
@@ -3374,23 +3371,29 @@ impl Workbench {
                 return self.picker(true, message);
             }
             Message::ToggleInspector => {
-                self.image_mode = false;
-                if self.inspector_docked() && self.first_run_quiet() && !self.inspector_summoned {
-                    // Hidden only for the quiet first run: show it.
-                    self.inspector_summoned = true;
-                    self.inspector_open = true;
-                } else if self.inspector_docked() {
-                    self.inspector_open = !self.inspector_open;
+                if self.inspector_shown() {
+                    self.inspector_open &= !self.panels_docked();
+                    self.inspector_peek = false;
                 } else {
-                    self.inspector_peek = !self.inspector_peek;
+                    self.show_inspector();
+                }
+            }
+            Message::ToggleSidebar => {
+                if self.sidebar_shown() {
+                    self.sidebar_open &= !self.panels_docked() || self.snapshot.connected.is_none();
+                    self.sidebar_peek = false;
+                    self.sidebar_summoned = false;
+                } else {
+                    self.show_sidebar();
                 }
             }
             Message::ToggleImage => self.image_mode = !self.image_mode,
             Message::Resized(size) => {
                 self.width = size.width;
                 self.height = size.height;
-                if self.inspector_docked() {
+                if self.panels_docked() {
                     self.inspector_peek = false;
+                    self.sidebar_peek = false;
                 }
                 return Task::done(self.main_window).then(move |id| {
                     window::is_maximized(id).then(move |maximized| {
@@ -3605,8 +3608,12 @@ impl Workbench {
             // Sheets take the keyboard until they close.
             _ if modal => {}
             Action::ToggleInspector => return self.handle_message(Message::ToggleInspector),
+            Action::ToggleSidebar => return self.handle_message(Message::ToggleSidebar),
             Action::Overview if self.image_mode => self.image_mode = false,
-            Action::Overview if self.inspector_peek => self.inspector_peek = false,
+            Action::Overview if self.inspector_peek || self.sidebar_peek => {
+                self.inspector_peek = false;
+                self.sidebar_peek = false;
+            }
             Action::ImageMode => self.image_mode = !self.image_mode,
             Action::ToggleExposure => self.toggle_exposure(),
             Action::ToggleFocusRegion => self.toggle_focus_region(),
@@ -3620,16 +3627,12 @@ impl Workbench {
             Action::Record if connected => self.record(),
             Action::ToggleAuto if connected => self.toggle_auto(),
             Action::SearchFeatures => {
-                let open = self.handle_message(Message::ShowTab(Tab::Features));
-                return open
-                    .chain(operation::snap_to(
-                        inspector::SCROLL,
-                        operation::RelativeOffset::START,
-                    ))
+                self.show_inspector();
+                return operation::snap_to(inspector::SCROLL, operation::RelativeOffset::START)
                     .chain(operation::focus("feature-search"))
                     .chain(operation::select_all("feature-search"));
             }
-            Action::FeaturesTab => return self.handle_message(Message::ShowTab(Tab::Features)),
+            Action::FeaturesTab => return self.handle_message(Message::ShowInspector),
             Action::CaptureTab => return self.handle_message(Message::ShowTab(Tab::Capture)),
             Action::ForwardTab => return self.handle_message(Message::ShowTab(Tab::Forward)),
             Action::ZoomIn => self.zoom_by(1.25),
@@ -3693,48 +3696,59 @@ impl Workbench {
         let p = self.window_palette(self.main_window);
         // iced omits zero-width row children. Keep opening panes in the tree
         // immediately so focus commands reach them before animation advances.
-        let inspector = self.inspector_slide.lerp(0.0, INSPECTOR, self.now).max(
-            if self.inspector_slide.target() > 0.5 {
-                1.0
-            } else {
-                0.0
-            },
-        );
-        let inspector_visible = inspector > 0.5 || self.inspector_slide.target() > 0.5;
-        let docked = self.inspector_docked();
+        let width = |slide: &Motion| {
+            let open = slide.target() > 0.5;
+            let width = slide
+                .lerp(0.0, INSPECTOR, self.now)
+                .max(if open { 1.0 } else { 0.0 });
+            (width > 0.5 || open).then_some(width)
+        };
+        let sidebar = width(&self.sidebar_slide);
+        let inspector = width(&self.inspector_slide);
+        let pane = |content, width| container(content).width(width).height(Fill).clip(true);
+        // The sidebar's slot stays put, so opening it keeps the stage's state.
+        let left: Element<'_, Message> = match sidebar.filter(|_| self.panels_docked()) {
+            Some(width) => row![
+                pane(self.sidebar(p, true), width),
+                rule::vertical(1).style(style::line)
+            ]
+            .into(),
+            None => space().width(0).into(),
+        };
         let mut body = row![
+            left,
             container(self.main(p))
                 .width(Fill)
                 .height(Fill)
                 .style(style::base),
         ];
-        if docked && inspector_visible {
-            body = body.push(rule::vertical(1).style(style::line)).push(
-                container(self.inspector(p))
-                    .width(inspector)
-                    .height(Fill)
-                    .clip(true),
-            );
+        if let Some(width) = inspector.filter(|_| self.panels_docked()) {
+            body = body
+                .push(rule::vertical(1).style(style::line))
+                .push(pane(self.inspector(p), width));
         }
         let mut layers = stack![body];
-        if !docked && inspector_visible {
-            // Between the title bar and the toolbar, so the button that
-            // closes it and the notices stay in reach.
-            layers = layers.push(
-                container(opaque(
-                    container(self.inspector(p))
-                        .width(inspector)
-                        .height(Fill)
-                        .clip(true)
-                        .style(style::floating),
-                ))
-                .align_right(Fill)
+        // Between the title bar and the toolbar, so the button that closes
+        // it and the notices stay in reach.
+        let float = |content, width, right| {
+            let panel = container(opaque(pane(content, width).style(style::floating)))
+                .width(Fill)
                 .padding(iced::Padding {
                     top: BAR,
                     bottom: TOOLBAR * self.bars.get(self.now),
                     ..iced::Padding::ZERO
-                }),
-            );
+                });
+            if right {
+                panel.align_right(Fill)
+            } else {
+                panel
+            }
+        };
+        if let Some(width) = sidebar.filter(|_| !self.panels_docked()) {
+            layers = layers.push(float(self.sidebar(p, false), width, false));
+        }
+        if let Some(width) = inspector.filter(|_| !self.panels_docked()) {
+            layers = layers.push(float(self.inspector(p), width, true));
         }
         // Building this 1×1 view is what turns on GPU frame decoding.
         let body: Element<'_, Message> = layers
@@ -3858,6 +3872,7 @@ mod tests {
             );
             app.width = width;
             app.snapshot.connected = Some(crate::transport::simulator::info());
+            app.sync_animations();
             let before = editors(&Tree::new(app.view().as_widget()));
             let _ = app.dispatch_action(Action::SearchFeatures);
             app.sync_animations();
@@ -4088,59 +4103,38 @@ mod tests {
     }
 
     #[test]
-    fn a_first_run_keeps_the_inspector_quiet_until_a_camera_or_a_request() {
+    fn side_panels_show_beside_a_camera_and_float_one_at_a_time() {
         let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
-        bench.width = 1280.0;
-        assert!(bench.inspector_open && bench.first_run_quiet());
-        assert!(!bench.inspector_shown(), "nothing to inspect yet");
-        assert_eq!(
-            bench.inspector_slide.get(bench.now),
-            0.0,
-            "no slide on launch"
+        bench.width = motion::NARROW;
+        assert!(bench.inspector_open && bench.sidebar_open);
+        assert!(
+            !bench.inspector_shown() && !bench.sidebar_shown(),
+            "the picker has no panels"
         );
-        // ⌘I shows it on the first press, leaving the preference as it was.
-        let _ = bench.handle_message(Message::ToggleInspector);
-        assert!(bench.inspector_open && bench.inspector_shown());
-        let _ = bench.handle_message(Message::ToggleInspector);
-        assert!(!bench.inspector_open && !bench.inspector_shown());
-
-        // So does a shortcut or menu item that shows one of its tabs.
-        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
-        bench.width = 1280.0;
+        // Asked for with no camera, as data sources are, the sidebar shows.
         let _ = bench.handle_message(Message::ShowTab(Tab::Capture));
-        assert!(bench.inspector_shown() && bench.tab == Tab::Capture);
-        // And a screenshot scene that names it.
-        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
-        bench.width = 1280.0;
-        bench.apply_scene(&["inspector"]);
-        assert!(bench.inspector_shown(), "the inspector scene word shows it");
+        assert!(bench.sidebar_shown() && !bench.inspector_shown());
+        let _ = bench.handle_message(Message::ToggleSidebar);
+        assert!(!bench.sidebar_shown() && bench.sidebar_open);
 
-        // A camera on its way shows it.
-        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
-        bench.width = 1280.0;
-        bench.send(
-            Job::Connect,
-            SessionCommand::Connect {
-                camera: "sim:0".into(),
-                timeout_ms: 2000,
-            },
+        bench.snapshot.connected = Some(crate::transport::simulator::info());
+        assert!(
+            bench.inspector_shown() && bench.sidebar_shown(),
+            "both dock"
         );
-        assert!(bench.inspector_shown());
+        let _ = bench.handle_message(Message::ToggleSidebar);
+        assert!(!bench.sidebar_open && bench.inspector_shown());
+        let _ = bench.handle_message(Message::ToggleSidebar);
+        assert!(bench.sidebar_open && bench.sidebar_shown());
 
-        // A returning user sees it from the start.
-        let prefs = Prefs {
-            recent: vec![Recent {
-                target: "sim:0".into(),
-                label: "Pattern camera".into(),
-                detail: "Simulator".into(),
-                transport: crate::types::Transport::Simulator,
-            }],
-            ..Prefs::default()
-        };
-        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, Some(prefs));
-        bench.width = 1280.0;
-        assert!(bench.inspector_shown());
-        assert_eq!(bench.inspector_slide.get(bench.now), 1.0);
+        // Narrower, both float, one at a time.
+        bench.width = 900.0;
+        let _ = bench.handle_message(Message::ToggleInspector);
+        assert!(bench.inspector_shown() && !bench.sidebar_shown());
+        let _ = bench.handle_message(Message::ShowTab(Tab::Forward));
+        assert!(bench.sidebar_shown() && !bench.inspector_shown());
+        let _ = bench.handle_message(Message::ShowInspector);
+        assert!(bench.inspector_shown() && !bench.sidebar_shown());
     }
 
     #[test]
@@ -4156,13 +4150,13 @@ mod tests {
         assert!(bench.logs_open && !bench.image_mode);
         bench.image_mode = true;
         bench.width = 1280.0;
-        bench.inspector_open = false;
+        bench.sidebar_open = false;
         let _ = bench.handle_message(Message::ShowTab(Tab::Forward));
         assert_eq!(bench.tab, Tab::Forward);
-        assert!(bench.inspector_open && !bench.image_mode);
+        assert!(bench.sidebar_open && !bench.image_mode);
         bench.width = 960.0;
         let _ = bench.handle_message(Message::ShowTab(Tab::Capture));
-        assert!(bench.inspector_peek, "floats in a narrow window");
+        assert!(bench.sidebar_peek, "floats in a narrow window");
     }
 
     #[test]

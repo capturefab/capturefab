@@ -41,6 +41,8 @@ const THUMB: Duration = Duration::from_millis(180);
 const ACCEPTED: Duration = Duration::from_millis(450);
 /// The panel's scrollable, for jumping back to its top.
 pub(super) const SCROLL: &str = "inspector";
+/// The sidebar's scrollable.
+pub(super) const SIDEBAR_SCROLL: &str = "sidebar";
 /// Rows an open feature group lays out until asked for the rest. The panel
 /// is rebuilt with every camera frame, and hundreds of rows cost a small
 /// computer more than its preview.
@@ -1080,7 +1082,7 @@ impl Workbench {
 
     /// Read current UI state even when the hidden panel is no longer rendered.
     pub(super) fn signals_history_visible(&self) -> bool {
-        self.inspector_shown() && self.tab == Tab::Capture && self.inspect.signals_open
+        self.sidebar_shown() && self.tab == Tab::Capture && self.inspect.signals_open
     }
 
     /// Point the settings panel's motions at what they show; from
@@ -1638,33 +1640,36 @@ fn wide_button<'a>(
     .on_press_maybe(on.filter(|_| !busy))
 }
 
+fn panel_scroll<'a>(content: Element<'a, Message>, id: &'static str) -> Element<'a, Message> {
+    scrollable(container(content).padding(iced::Padding {
+        top: 4.0,
+        right: 20.0,
+        bottom: 24.0,
+        left: 18.0,
+    }))
+    .id(id)
+    .height(Fill)
+    .style(style::scroll)
+    .into()
+}
+
+fn panel_body<'a>(
+    panel: iced::widget::Column<'a, Message>,
+    body: Element<'a, Message>,
+) -> Element<'a, Message> {
+    container(panel.push(space().height(8)).push(body))
+        .width(INSPECTOR)
+        .height(Fill)
+        .style(style::base)
+        .into()
+}
+
 impl Workbench {
+    /// The right-hand panel: the camera's features.
     pub(super) fn inspector(&self, p: &'static Palette) -> Element<'_, Message> {
-        let os = Os::CURRENT;
-        let tabs = inspector_tabs(
-            vec![
-                (
-                    "Features",
-                    Some(Message::Tab(Tab::Features)),
-                    Action::FeaturesTab.hint("Features panel", os),
-                ),
-                (
-                    "Capture",
-                    Some(Message::Tab(Tab::Capture)),
-                    Action::CaptureTab.hint("Capture panel", os),
-                ),
-                (
-                    "Video",
-                    Some(Message::Tab(Tab::Forward)),
-                    Action::ForwardTab.hint("Video recording and forwarding", os),
-                ),
-            ],
-            self.tab as usize,
-            self.inspect.tab_thumb.get(self.now),
-        );
         let mut panel = column![
             self.titlebar(
-                container(tabs)
+                container(text("Features").size(style::HEADING).font(style::SEMIBOLD))
                     .padding(iced::Padding {
                         left: 18.0,
                         right: 20.0,
@@ -1684,84 +1689,55 @@ impl Workbench {
         {
             panel = panel.push(container(self.network_indicator(status, p)).padding([4, 14]));
         }
-        let body: Element<'_, Message> =
-            if self.tab == Tab::Features && self.snapshot.connected.is_none() {
-                self.no_camera(p)
-            } else {
-                let content = match self.tab {
-                    Tab::Features => self.features(p),
-                    Tab::Capture => self.capture_settings(p),
-                    Tab::Forward => self.forward_settings(p),
-                };
-                let mut scroll: Option<Element<'_, Message>> = Some(
-                    scrollable(container(content).padding(iced::Padding {
-                        top: 4.0,
-                        right: 20.0,
-                        bottom: 24.0,
-                        left: 18.0,
-                    }))
-                    .id(SCROLL)
-                    .height(Fill)
-                    .style(style::scroll)
-                    .into(),
-                );
-                // Each tab scrolls in a slot of its own, so changing tabs,
-                // however it happens, starts the new one at its top.
-                let mut slots = Row::new().height(Fill);
-                for tab in [Tab::Features, Tab::Capture, Tab::Forward] {
-                    slots = slots.push(match scroll.take_if(|_| tab == self.tab) {
-                        Some(scroll) => scroll,
-                        None => space().into(),
-                    });
-                }
-                slots.into()
-            };
-        container(panel.push(space().height(8)).push(body))
-            .width(INSPECTOR)
-            .height(Fill)
-            .style(style::base)
-            .into()
+        panel_body(panel, panel_scroll(self.features(p), SCROLL))
     }
 
-    /// The Features tab with no camera: what will show here, and what can
-    /// be set up meanwhile.
-    fn no_camera(&self, p: &'static Palette) -> Element<'_, Message> {
-        let connecting = self.pending(Job::Connect);
-        let content = if connecting {
-            column![
-                icon::spinner(22.0, p.secondary, self.spin()),
-                text("Reading camera features…")
-                    .size(style::BODY)
-                    .color(p.secondary),
-            ]
-        } else {
-            column![
-                icon(Icon::Sliders, 28.0, p.tertiary),
-                text("No camera connected")
-                    .size(style::HEADING)
-                    .font(style::SEMIBOLD),
-                text("Features appear here once a camera is connected.")
-                    .size(style::SMALL)
-                    .color(p.secondary)
-                    .align_x(Alignment::Center),
-                row![
-                    link("Set up capture", Some(Message::Tab(Tab::Capture))),
-                    link("Record or forward video", Some(Message::Tab(Tab::Forward))),
-                ]
-                .spacing(4),
-            ]
-        };
-        center(
-            content
-                .spacing(10)
-                .align_x(Alignment::Center)
-                .max_width(240),
-        )
-        .padding(iced::Padding {
-            bottom: 80.0,
+    /// The left-hand panel: capture and video settings, by tab. Docked, it
+    /// starts under the window's traffic lights with its toggle.
+    pub(super) fn sidebar(&self, p: &'static Palette, docked: bool) -> Element<'_, Message> {
+        let os = Os::CURRENT;
+        let tabs = inspector_tabs(
+            vec![
+                (
+                    "Capture",
+                    Some(Message::Tab(Tab::Capture)),
+                    Action::CaptureTab.hint("Capture panel", os),
+                ),
+                (
+                    "Video",
+                    Some(Message::Tab(Tab::Forward)),
+                    Action::ForwardTab.hint("Video recording and forwarding", os),
+                ),
+            ],
+            self.tab as usize,
+            self.inspect.tab_thumb.get(self.now),
+        );
+        let mut header = row![].spacing(8).align_y(Alignment::Center);
+        if docked {
+            header = header.push(self.sidebar_toggle(p));
+        }
+        let header = container(header.push(tabs)).padding(iced::Padding {
+            left: if docked { 10.0 + self.lights() } else { 18.0 },
+            right: 20.0,
             ..iced::Padding::ZERO
-        })
-        .into()
+        });
+        // Each tab scrolls in a slot of its own, so changing tabs, however
+        // it happens, starts the new one at its top.
+        let mut slots = Row::new().height(Fill);
+        for tab in [Tab::Capture, Tab::Forward] {
+            slots = slots.push(if tab == self.tab {
+                panel_scroll(
+                    match tab {
+                        Tab::Capture => self.capture_settings(p),
+                        Tab::Forward => self.forward_settings(p),
+                    },
+                    SIDEBAR_SCROLL,
+                )
+            } else {
+                space().into()
+            });
+        }
+        panel_body(column![self.titlebar(header.into())], slots.into())
     }
 
     pub(super) fn features(&self, p: &'static Palette) -> Element<'_, Message> {
@@ -3855,7 +3831,7 @@ mod tests {
         assert!(!bench.inspect.index.is_quick[0]);
         assert_eq!(bench.exposure_control(), Some("ExposureAuto"));
         let _ = bench.update(Message::AdjustExposure);
-        assert_eq!(bench.tab, Tab::Features);
+        assert!(bench.inspector_shown());
         let (labels, focused) = features_view(&bench, &mut [&mut focus("feature:ExposureAuto")]);
         assert!(
             labels
@@ -4797,12 +4773,12 @@ mod tests {
         bench.tab = Tab::Forward;
         bench.sync_animations();
         let start = bench.now;
-        assert_eq!(bench.inspect.tab_thumb.get(start), 2.0, "placed at once");
+        assert_eq!(bench.inspect.tab_thumb.get(start), 1.0, "placed at once");
         assert!(!moving(&bench));
-        bench.tab = Tab::Features;
+        bench.tab = Tab::Capture;
         bench.sync_animations();
         let mid = bench.inspect.tab_thumb.get(start + THUMB / 2);
-        assert!(mid > 0.0 && mid < 2.0, "slides: {mid}");
+        assert!(mid > 0.0 && mid < 1.0, "slides: {mid}");
         bench.now = start + THUMB;
         assert!(!moving(&bench), "settles");
         assert_eq!(bench.inspect.tab_thumb.get(bench.now), 0.0);

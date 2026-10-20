@@ -153,8 +153,7 @@ impl Workbench {
             return false;
         }
         self.tab = Tab::Capture;
-        self.inspector_open = true;
-        self.inspector_peek = !self.inspector_docked();
+        self.show_sidebar();
         if !late {
             return false;
         }

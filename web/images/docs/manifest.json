@@ -1,7 +1,7 @@
 {
   "method": "Actual iced desktop renderer screenshots; crop only, no generated or reconstructed interface.",
   "source_note": "Current development desktop build from the workspace source.",
-  "binary_sha256": "bd64f8318bab3a31b4fa986e74dc0155169ef10aec0417df64120e0e42bf5cf9",
+  "binary_sha256": "a825de30ab3d42a2b5c5e8e424918f3a5084c5c0295fc1971143f0dd364fa30f",
   "logical_window": [
     1100,
     700
@@ -11,7 +11,7 @@
     {
       "file": "workspace.png",
       "source": "source/workspace.png",
-      "source_sha256": "bf6a94d91f9eeef56dd88282ff193e0451271782092d9984f38eea02e3161a84",
+      "source_sha256": "6280853d6b51305337f547ea2e072099f12519e9d127855dfae42fd829d75b0e",
       "source_size": [
         2200,
         1400
@@ -26,14 +26,14 @@
         2200,
         1400
       ],
-      "sha256": "bf6a94d91f9eeef56dd88282ff193e0451271782092d9984f38eea02e3161a84",
+      "sha256": "6280853d6b51305337f547ea2e072099f12519e9d127855dfae42fd829d75b0e",
       "scene": "dark,features,focus,exposure",
       "description": "A simulator camera in its own workbench window, with scopes and its Features inspector."
     },
     {
       "file": "cameras.png",
       "source": "source/picker.png",
-      "source_sha256": "8ff533c334c852353c2d8bcab642aa68f4c3956ac424c9e714257af96bd10d7c",
+      "source_sha256": "52bc5c6623656920e5f94cbd96ba225f88f413902c868ad4f4739366fd792c2b",
       "source_size": [
         2200,
         1400
@@ -48,80 +48,80 @@
         1000,
         1240
       ],
-      "sha256": "e847f8e5bf0469b7d324ed008f4422cea015154352191bee8dd1835e070baaff",
+      "sha256": "59335434bed296cb89a1cd140b22533afba6425bbdd2f71ff54fb75df34fa611",
       "scene": "dark,welcome",
       "description": "The camera picker in a window without a camera: found simulator cameras, the address field beside Search again, and data sources, Settings, Help and session controls."
     },
     {
       "file": "features.png",
       "source": "source/features.png",
-      "source_sha256": "ddd491e161d6d16f1454b4dbf00b00777e35226549aa76a6a69e3a36339a663e",
+      "source_sha256": "ce00522705fcd56178589848c58ce546a9369abfe6137efb830b6ee47152c08f",
       "source_size": [
         2200,
         1400
       ],
       "crop_pixels": [
-        1568,
+        1632,
         0,
         2200,
         1304
       ],
       "size": [
-        632,
+        568,
         1304
       ],
-      "sha256": "43a3b8250a8accac7633038bb709b55cc1521c4ac722b5c35caecb8b239087c7",
+      "sha256": "584f4ed98e573785ea22071402756b8d4a952fc0d0292ca3121013a78fb3c5aa",
       "scene": "dark,features,noscopes",
       "description": "Quick controls for the selected camera, with search and collapsed feature groups for less common settings."
     },
     {
       "file": "capture.png",
       "source": "source/capture.png",
-      "source_sha256": "865050e369327b094283e11d104eed10353eebbd3ab717e99b12e48f58aeed4d",
+      "source_sha256": "b9b59da54b8a21346a11cda6bdb39eda0006762162835955fcb6b4b8effec6f8",
       "source_size": [
         2200,
         1400
       ],
       "crop_pixels": [
-        1568,
         0,
-        2200,
+        0,
+        568,
         1400
       ],
       "size": [
-        632,
+        568,
         1400
       ],
-      "sha256": "80670ed9774ab85689ead9f729fa0a1f4fbc92a5861f8f4f93d478eda47479dd",
+      "sha256": "7a85e3950f6491315fa329d5a1ab92d6204162404376a81e07e57c3341f9360f",
       "scene": "dark,capture,noscopes,inspector-storage-default",
       "description": "Ordinary capture controls first, followed by the Capture options (timeout and scheduling), Automatic capture, Storage and retention, and Shell and agents disclosures; no automatic capture session is open in this scene."
     },
     {
       "file": "schedule.png",
       "source": "source/schedule.png",
-      "source_sha256": "7dac0264d6e698aae9b73062fbc0dc01b39334ec00564dd45cdb7cf62d69271c",
+      "source_sha256": "f6a3e11befc2520da92dcea1661c70dbb4c8eba0d8eca33a16929362445101f6",
       "source_size": [
         2200,
         1400
       ],
       "crop_pixels": [
-        1600,
+        32,
         828,
-        2170,
+        544,
         1192
       ],
       "size": [
-        570,
+        512,
         364
       ],
-      "sha256": "cf661903a2601e9ed4a8f0af4e744e2b27ea34689392fb14ce1cb5df3e65683f",
+      "sha256": "142e22247623aec95555f9dfd405f882a86e8088d965b18efcac595d989f5a43",
       "scene": "dark,capture,noscopes,inspector-widest,inspector-storage-default,scheduled",
       "description": "The capture scheduling form in Capture options, with start delay and frame interval."
     },
     {
       "file": "destinations.png",
       "source": "source/destinations.png",
-      "source_sha256": "abad352fd05cefe52691429bb90b52be30da1165eede850c32e6f22116e6b236",
+      "source_sha256": "d923818bed62a7318fbcc1a13927aac88623fce2446bb8a8e99ac6359dabdee7",
       "source_size": [
         2200,
         1400
@@ -136,14 +136,14 @@
         1144,
         800
       ],
-      "sha256": "249a1c0c93b87aa475d0030f80494515ab827f9dc4c02aafa7d877c6f248db4a",
+      "sha256": "f97fe52fb48f28be29b74250a9273fd775bd0eeca927a088b242dfadbdefa180",
       "scene": "dark,destinations-list,noscopes",
       "description": "Destination manager showing example folder and S3-compatible bucket destinations."
     },
     {
       "file": "scopes.png",
       "source": "source/scopes.png",
-      "source_sha256": "e5191a3e04555e3f7b78dfb9f5bdca988f08d2064c012395bee3021f73152f45",
+      "source_sha256": "86612ce1d55b3e4d6c0032b53fa315521ab9dc5deb3a91de483c89a4cf11dc11",
       "source_size": [
         2200,
         1400
@@ -158,36 +158,36 @@
         1316,
         804
       ],
-      "sha256": "f10757909fc7a08b5aed3ddd42aeee414685fddfa41797955c589586aefba0a7",
+      "sha256": "284104964a94f8d880ef95a29544a65128537a71db03865c11de9aac90129ffc",
       "scene": "dark,noinspector,focus,exposure",
       "description": "Live focus score with its focus measure chooser and exposure histogram alongside the focus region on a simulator image."
     },
     {
       "file": "forwarding.png",
       "source": "source/forwarding.png",
-      "source_sha256": "768032b671b1d7fa8222ab862d9d346ab2291c05c7ea4ad0b35e32f35359e29b",
+      "source_sha256": "96b81e7b25eac9255481f8a100ecc487505a1dabb5b38e969f4ed6aa4c559d75",
       "source_size": [
         2200,
         1400
       ],
       "crop_pixels": [
-        1568,
         0,
-        2200,
+        0,
+        568,
         840
       ],
       "size": [
-        632,
+        568,
         840
       ],
-      "sha256": "aef45215019ccc7e36209f6e31e19cd18e3f7b0adc03d4d71b644c6841099971",
+      "sha256": "85ae6f5ad3cb0327f8cb73327cc0231d50b8419becc0fe020c124f7df3bb5282",
       "scene": "dark,forward,noscopes,inspector-storage-default",
       "description": "Video panel with the Record to file or Forward to URL choice, the folded Location and name section, a start action and the next file name, followed by the Video settings disclosure summing up codec, frame rate and bitrate."
     },
     {
       "file": "history.png",
       "source": "source/destinations.png",
-      "source_sha256": "abad352fd05cefe52691429bb90b52be30da1165eede850c32e6f22116e6b236",
+      "source_sha256": "d923818bed62a7318fbcc1a13927aac88623fce2446bb8a8e99ac6359dabdee7",
       "source_size": [
         2200,
         1400

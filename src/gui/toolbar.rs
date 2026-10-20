@@ -17,8 +17,10 @@ const CAPTURE_ROOM: f32 = 120.0;
 const CAPTURE_ALL_ROOM: f32 = 46.0;
 /// What Capture All's words add.
 const CAPTURE_ALL_LABEL: f32 = 84.0;
-/// Room the Record button and the gap before it take.
-const RECORD_ROOM: f32 = 96.0;
+/// Room the Record button takes as its glyph, and the gap before it.
+const RECORD_ROOM: f32 = 44.0;
+/// What Record's word adds.
+const RECORD_LABEL: f32 = 52.0;
 /// Room the elapsed-time pill beside a recording's Stop button takes.
 const PILL_ROOM: f32 = 60.0;
 /// Room that pill takes when it counts down a timed recording, "1:02:03 left".
@@ -36,8 +38,12 @@ struct ToolbarFit {
     activity_label: bool,
     analytics_label: bool,
     destination_label: bool,
+    /// The destination shows at all; the docked sidebar also shows it.
+    destination: bool,
     /// Capture All keeps its words.
     capture_all_label: bool,
+    /// Record keeps its word.
+    record_label: bool,
     status: f32,
 }
 /// Room a notice's glyph and the gap after it take.
@@ -203,26 +209,28 @@ impl Workbench {
             left = left
                 .push(self.capture_button(p))
                 .push(self.capture_all_button(fit.capture_all_label, p));
-            if let Some(record) = self.record_button(p) {
+            if let Some(record) = self.record_button(fit.record_label, p) {
                 left = left.push(record);
             }
-            left = left.push(tip_above(
-                button(destination)
-                    .name(format!(
-                        "Capture destination: {}",
-                        self.capture_to.label(&preview)
-                    ))
-                    .padding([4, 6])
-                    .style(style::plain)
-                    .on_press(Message::ShowTab(Tab::Capture)),
-                Action::CaptureTab.hint(
-                    &format!(
-                        "Next file: {} · change it in Capture",
-                        self.capture_to.label(&preview)
+            left = left.push(fit.destination.then(|| {
+                tip_above(
+                    button(destination)
+                        .name(format!(
+                            "Capture destination: {}",
+                            self.capture_to.label(&preview)
+                        ))
+                        .padding([4, 6])
+                        .style(style::plain)
+                        .on_press(Message::ShowTab(Tab::Capture)),
+                    Action::CaptureTab.hint(
+                        &format!(
+                            "Next file: {} · change it in Capture",
+                            self.capture_to.label(&preview)
+                        ),
+                        os,
                     ),
-                    os,
-                ),
-            ));
+                )
+            }));
         }
         let unseen = self.chrome.unseen.filter(|_| !self.logs_open);
         let history_button = |undo: bool| {
@@ -375,7 +383,9 @@ impl Workbench {
             activity_label: main >= 620.0,
             analytics_label: main >= 520.0,
             destination_label: main >= 700.0,
+            destination: true,
             capture_all_label: true,
+            record_label: true,
             status: 0.0,
         };
         let status = |fit: &ToolbarFit| {
@@ -387,12 +397,17 @@ impl Workbench {
                     } else {
                         0.0
                     }
-                    + 8.0
-                    + if fit.destination_label { 120.0 } else { 28.0 }
+                    + match (fit.destination, fit.destination_label) {
+                        (false, _) => 0.0,
+                        (true, false) => 36.0,
+                        (true, true) => 128.0,
+                    }
             } else {
                 0.0
             } + if record {
-                RECORD_ROOM + self.recording_pill_room()
+                RECORD_ROOM
+                    + if fit.record_label { RECORD_LABEL } else { 0.0 }
+                    + self.recording_pill_room()
             } else {
                 0.0
             };
@@ -419,7 +434,35 @@ impl Workbench {
                 step(&mut fit);
             }
         }
-        fit.status = status(&fit).clamp(MIN_STATUS, STATUS);
+        // With both panels docked, labels fold to their glyphs in the same
+        // order, Capture All's last, so nothing overlaps. Without a notice the
+        // status needs only room for a few words, unless the destination's
+        // label can yield it more.
+        let least = if self.notice.is_some() {
+            MIN_STATUS
+        } else {
+            NOTICE_TEXT_MIN
+        };
+        let steps: [fn(&mut ToolbarFit); 6] = [
+            |fit| fit.destination_label = false,
+            |fit| fit.activity_label = false,
+            |fit| fit.analytics_label = false,
+            |fit| fit.record_label = false,
+            |fit| fit.destination = false,
+            |fit| fit.capture_all_label = false,
+        ];
+        for step in steps {
+            if status(&fit) >= least {
+                break;
+            }
+            step(&mut fit);
+        }
+        let least = if fit.destination_label {
+            MIN_STATUS
+        } else {
+            least
+        };
+        fit.status = status(&fit).clamp(least, STATUS);
         fit
     }
 
@@ -573,7 +616,7 @@ impl Workbench {
 
     /// Record or Stop for the selected camera, with how long it has been
     /// recording beside it, or how long it has left when it has a duration.
-    fn record_button(&self, p: &'static Palette) -> Option<Element<'_, Message>> {
+    fn record_button(&self, labelled: bool, p: &'static Palette) -> Option<Element<'_, Message>> {
         if !self.record_shown() {
             return None;
         }
@@ -603,7 +646,8 @@ impl Workbench {
         };
         let mut content = row![tip_above(
             button(
-                row![glyph, text(label).size(style::BODY)]
+                row![glyph]
+                    .push(labelled.then(|| text(label).size(style::BODY)))
                     .spacing(7)
                     .align_y(Alignment::Center),
             )
