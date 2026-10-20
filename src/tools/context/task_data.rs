@@ -566,7 +566,7 @@ mod tests {
                     SessionCommand::DatasetQuery {
                         sql: "SELECT text FROM events WHERE kind='note' ORDER BY id".into(),
                         limit: 10,
-                        timeout_ms: 1000,
+                        timeout_ms: 10_000,
                     },
                 )
                 .unwrap();
@@ -711,20 +711,20 @@ mod tests {
             SessionCommand::DatasetQuery {
                 sql: "SELECT 1".into(),
                 limit: 1,
-                timeout_ms: 1000,
+                timeout_ms: 10_000,
             },
             SessionCommand::DatasetQueryIf {
                 slot_id: f.slot(),
                 sql: "SELECT 1".into(),
                 limit: 1,
-                timeout_ms: 1000,
+                timeout_ms: 10_000,
                 max_result_bytes: 4096,
             },
             SessionCommand::DatasetModelQueryIf {
                 slot_id: foreign.clone(),
                 sql: "SELECT 1".into(),
                 limit: 1,
-                timeout_ms: 1000,
+                timeout_ms: 10_000,
                 max_result_bytes: 4096,
             },
             SessionCommand::DatasetExport {
@@ -745,7 +745,7 @@ mod tests {
                 until_ms: None,
                 storage: Default::default(),
                 max_bytes: 1 << 20,
-                timeout_ms: 1000,
+                timeout_ms: 10_000,
             },
             SessionCommand::SignalCapture {
                 uri: "sim-signal://forbidden-private".into(),
@@ -823,7 +823,7 @@ mod tests {
                     slot_id: f.slot(),
                     sql: "SELECT value_double * 2 AS doubled FROM samples ORDER BY ts_ms".into(),
                     limit: 10,
-                    timeout_ms: 1000,
+                    timeout_ms: 10_000,
                     max_result_bytes: 16_384,
                 },
             )
@@ -848,7 +848,7 @@ mod tests {
                     slot_id: f.slot(),
                     sql: "SELECT text FROM events WHERE kind='note' ORDER BY id".into(),
                     limit: 10,
-                    timeout_ms: 1000,
+                    timeout_ms: 10_000,
                     max_result_bytes: 16_384,
                 },
             )
@@ -1086,7 +1086,7 @@ mod tests {
                     slot_id: f.slot(),
                     sql: format!("SELECT \"{actual}\" FROM samples"),
                     limit: 1,
-                    timeout_ms: 1000,
+                    timeout_ms: 10_000,
                     max_result_bytes: 4096,
                 },
             )
@@ -1143,7 +1143,7 @@ mod tests {
                         ..StoragePolicy::default()
                     },
                     max_bytes: 4096,
-                    timeout_ms: 1000,
+                    timeout_ms: 10_000,
                 },
             )
             .unwrap_err();

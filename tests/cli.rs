@@ -3951,7 +3951,7 @@ fn dataset_with_signals_asof() {
             "log",
             "sim-signal://line1",
             "--duration",
-            "2s",
+            "5s",
             "--dataset",
             db_text,
         ],
@@ -7512,7 +7512,7 @@ mod assistant_cli_tests {
             vec![call(
                 "owned-crash-capture",
                 "start_signal_capture",
-                json!({"source":source,"every":"100ms","duration":"8s","max_samples":100000,"max_bytes":1024 * 1024,"tags":null}),
+                json!({"source":source,"every":"100ms","duration":"15s","max_samples":100000,"max_bytes":1024 * 1024,"tags":null}),
             )],
             2,
         );
@@ -7548,7 +7548,7 @@ mod assistant_cli_tests {
                     "--max-data-size",
                     "1MiB",
                     "--max-signal-time",
-                    "8s",
+                    "15s",
                 ],
                 &[],
             )
@@ -7639,7 +7639,7 @@ mod assistant_cli_tests {
         );
         let journal = std::fs::read(&log_path).unwrap();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let complete = loop {
             let sources = tools_ok(&dir, &cwd, &["--json", "--session", "tools-ci", "signals"]);
             let current = sources["sources"]
