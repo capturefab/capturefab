@@ -143,7 +143,7 @@ pub(super) struct Scene {
     /// Welcome discovery is display-only and never enumerates real devices.
     welcome: bool,
     searching: bool,
-    /// Cameras on saved hubs are in the camera list, as discovery finds
+    /// Cameras on saved hubs are on the welcome screen, as discovery finds
     /// them (synthetic: no hub is contacted).
     hubs: bool,
 }
@@ -227,7 +227,7 @@ impl Workbench {
     /// Put the workbench in a named state for a screenshot. Words:
     /// - layout: `help`, `capture`, `forward`, `features`, `destinations`,
     ///   `logs`, `image`, `focus`, `exposure`, `noscopes`, `inspector`,
-    ///   `noinspector`, `sidebar`, `nosidebar`, `peek` (floating inspector
+    ///   `noinspector`, `peek` (floating inspector
     ///   open; use a narrow size), `light`, `dark`
     /// - notices, which stay put: `notice` (done), `warning` (discovery
     ///   warnings), `error`, `notice-long` (an error too long for the bar)
@@ -290,8 +290,6 @@ impl Workbench {
                     self.inspector_open = true;
                     self.inspector_summoned = true;
                 }
-                "nosidebar" => self.sidebar_open = false,
-                "sidebar" => self.sidebar_open = true,
                 "peek" => self.inspector_peek = true,
                 "light" => self.appearance = Appearance::Light,
                 "dark" => self.appearance = Appearance::Dark,
@@ -596,10 +594,9 @@ impl Workbench {
                 ),
             ];
             self.snapshot.streaming = false;
-            self.previews.remove(&id);
             // A scanner starts without a document image. Drop the simulator's
-            // single-view frame as well as its tile preview so this fixture
-            // exercises the actual Ready to scan guidance.
+            // frame so this fixture exercises the actual Ready to scan
+            // guidance.
             self.shown = None;
         }
         for camera in self
@@ -691,7 +688,7 @@ impl Workbench {
                 Err(TryRecvError::Empty) => {}
             }
         } else if request.staged && self.scene.reveal_control == Some(signals::ENDPOINT) {
-            // Exercise the same ordered scroll-then-focus route as the sidebar.
+            // Exercise the same ordered scroll-then-focus route as the welcome screen.
             self.scene.reveal_control = None;
             self.scene.focus_control = None;
             task = self.open_data_sources();

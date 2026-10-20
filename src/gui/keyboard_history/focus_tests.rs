@@ -19,8 +19,6 @@ fn wrap(content: Element<'static, &'static str, Theme, ()>, background: bool) ->
         on_editor_focus: None,
         on_popup: None,
         on_escape: None,
-        on_content_focus: None,
-        suspend_content_focus: false,
     }
 }
 

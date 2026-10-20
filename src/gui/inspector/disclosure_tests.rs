@@ -505,39 +505,6 @@ fn the_manual_exposure_card_explains_auto_and_toggles_the_histogram() {
     let shown = snapshot(&app, Tab::Features, &mut tree, &renderer);
     let hide = hint("Hide the histogram", Action::ToggleExposure);
     assert!(labels(&shown).contains(&hide.as_str()));
-    // The overview's tiles draw no histogram: the link says it is off, and
-    // opens the selected camera where it shows.
-    let mut other = liveness::streaming_camera(10, 0, 30.0);
-    other.info.id = "sim:1".into();
-    app.snapshot.cameras = vec![liveness::streaming_camera(10, 0, 30.0), other];
-    app.focus_camera = false;
-    assert!(app.overview() && app.exposure_open);
-    let overview = snapshot(&app, Tab::Features, &mut tree, &renderer);
-    let elsewhere = hint(
-        "Show the histogram on the selected camera",
-        Action::ToggleExposure,
-    );
-    assert!(
-        labels(&overview).contains(&elsewhere.as_str()),
-        "{:?}",
-        labels(&overview)
-    );
-    assert!(!labels(&overview).contains(&hide.as_str()));
-    // Off in the overview, one press turns it on and opens the camera.
-    app.exposure_open = false;
-    let off = snapshot(&app, Tab::Features, &mut tree, &renderer);
-    assert!(
-        labels(&off).contains(&elsewhere.as_str()),
-        "{:?}",
-        labels(&off)
-    );
-    let camera = app.snapshot.active_camera.clone().unwrap();
-    let _ = app.update(Message::ShowScopeOn(camera.clone(), Scope::Histogram));
-    assert!(app.exposure_open && app.focus_camera);
-    // Already on, the same press leaves it on.
-    app.focus_camera = false;
-    let _ = app.update(Message::ShowScopeOn(camera, Scope::Histogram));
-    assert!(app.exposure_open && app.focus_camera);
 }
 
 #[test]

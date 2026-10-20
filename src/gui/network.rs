@@ -229,7 +229,7 @@ impl Workbench {
         }
     }
 
-    /// Whether the camera list offers the network check: only once GigE is
+    /// Whether the welcome screen offers the network check: only once GigE is
     /// in play (a GigE camera found, connected, recent or failing to
     /// connect), or a scan was run or shown. Elsewhere it is reachable from
     /// the quick guide's connection notes.

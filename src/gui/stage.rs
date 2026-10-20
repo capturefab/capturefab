@@ -1,7 +1,6 @@
-//! The single-camera stage: the live image edge to edge with its controls,
-//! scopes and status floating over it. Also what the stage shares with the
-//! overview's tiles: the zoom, liveness and error badges, the capture flash
-//! and the fade-in of a camera's first frame.
+//! The camera stage: the live image edge to edge with its controls, scopes
+//! and status floating over it: the zoom, liveness and error badges, the
+//! capture flash and the fade-in of a camera's first frame.
 use super::*;
 use crate::session::CameraSnapshot;
 use iced::widget::canvas::{self, Path, Stroke};
@@ -51,21 +50,14 @@ const RECONNECTING: &str = "Stream lost; ";
 /// The reconnect a screenshot scene shows.
 const SCENE_RECONNECT: &str = "Stream lost; reconnecting to rtsp://<redacted>@192.168.1.20:8554/line-1 (attempt 3): timed out after the stream ended (Connection refused)";
 
-/// State for the single-camera stage, the overview grid and the scopes.
+/// State for the stage and the scopes.
 pub(super) struct StageState {
     zoom: Zoom,
     /// The focus region locking on, replayed from 1 to 0 each time.
     pub(super) lock: Motion,
     /// The focus meter's lock count when last looked at.
     locks_seen: u64,
-    /// The controls of the tile the pointer just left, fading out.
-    hover_out: Motion,
-    /// That tile.
-    hover_last: Option<String>,
-    /// The tile under the pointer when last looked at.
-    hover_seen: Option<String>,
-    /// Pictures fading in on their camera's first frame, by camera ID, or
-    /// `MAIN_VIEW` for the single view.
+    /// The picture fading in on its camera's first frame, as `MAIN_VIEW`.
     reveal: Flashes<String>,
     /// Connected cameras, and those that have not shown a frame yet.
     known: HashSet<String>,
@@ -206,9 +198,6 @@ impl Default for StageState {
             },
             lock: Motion::new(0.0, LOCK, LOCK, Kind::Fade),
             locks_seen: 0,
-            hover_out: Motion::new(0.0, motion::HOVER, motion::HOVER_OUT, Kind::Fade),
-            hover_last: None,
-            hover_seen: None,
             reveal: Flashes::new(REVEAL),
             known: HashSet::new(),
             fresh: HashSet::new(),
@@ -223,7 +212,7 @@ impl Default for StageState {
 
 impl StageState {
     super::motion::registry! {
-        motions: [zoom.motion, lock, hover_out],
+        motions: [zoom.motion, lock],
         flashes: [reveal],
     }
 }
@@ -257,32 +246,11 @@ impl Workbench {
                 self.stage_ui.lock.replay(1.0, 0.0, now);
             }
         }
-        // The tile the pointer left fades its controls out; coming back
-        // before they have gone picks them up where they are.
-        if self.hovered_tile != self.stage_ui.hover_seen {
-            if let Some(left) = self.stage_ui.hover_seen.take() {
-                let shown = if self.hovered_tile.is_none() {
-                    self.tile_hover.get(now)
-                } else {
-                    1.0
-                };
-                self.stage_ui.hover_out.set(shown);
-                self.stage_ui.hover_out.go(0.0, now);
-                self.stage_ui.hover_last = Some(left);
-            } else if self.hovered_tile.is_some() && self.hovered_tile == self.stage_ui.hover_last {
-                let shown = self.stage_ui.hover_out.get(now);
-                self.tile_hover.set(shown);
-                self.tile_hover.go(1.0, now);
-                self.stage_ui.hover_out.set(0.0);
-            }
-            self.stage_ui.hover_seen = self.hovered_tile.clone();
-        }
         self.reveal_first_frames(still);
     }
 
-    /// Fade in each camera's first frame, in the single view or its tile,
-    /// and introduce the stage controls with it. Later frames, and switching
-    /// between the overview and a camera, show at once.
+    /// Fade in each camera's first frame, and introduce the stage controls
+    /// with it. Later frames show at once.
     fn reveal_first_frames(&mut self, still: bool) {
         let now = self.now;
         let main = self.shown.as_ref().and(self.observed_camera.as_ref());
@@ -296,26 +264,6 @@ impl Workbench {
                 self.wake_controls();
             }
             self.stage_ui.main_seen = main;
-        }
-        if self.stage_ui.fresh.is_empty() || !self.overview() {
-            return;
-        }
-        let shown: Vec<String> = self
-            .stage_ui
-            .fresh
-            .iter()
-            .filter(|id| {
-                self.previews
-                    .get(*id)
-                    .is_some_and(|preview| preview.shown.is_some())
-            })
-            .cloned()
-            .collect();
-        for id in shown {
-            self.stage_ui.fresh.remove(&id);
-            if !still {
-                self.stage_ui.reveal.hit(id, now);
-            }
         }
     }
 
@@ -394,8 +342,7 @@ impl Workbench {
     /// other one lately), `stage-error` (the selected camera reports an
     /// error; pair it with `stalled` so no frame retires it),
     /// `stage-reconnecting` (likewise, its network stream being reopened),
-    /// `stage-flash` (the selected camera's capture flash, held part way) and
-    /// `stage-hover` (the pointer over the selected camera's tile).
+    /// and `stage-flash` (the selected camera's capture flash, held part way).
     pub(super) fn scene_stage(&mut self, word: &str, late: bool) -> bool {
         let camera = self.snapshot.active_camera.clone();
         match (word, late) {
@@ -444,11 +391,6 @@ impl Workbench {
                 self.last_saved = Saved::from_result(camera, &result, self.now);
                 self.shutter.set(0.7);
             }
-            ("stage-hover", true) => {
-                self.hovered_tile = camera.clone();
-                self.stage_ui.hover_seen = camera;
-                self.tile_hover.set(1.0);
-            }
             _ => return false,
         }
         true
@@ -487,7 +429,6 @@ impl Workbench {
     }
 }
 
-// What the stage and the tiles share.
 impl Workbench {
     /// The selected camera's report.
     pub(super) fn active_camera(&self) -> Option<&CameraSnapshot> {
@@ -539,15 +480,9 @@ impl Workbench {
 
     /// `camera_error`, and where it comes from.
     pub(super) fn badge_error(&self, id: &str) -> Option<BadgeError<'_>> {
-        let local = if self.overview() {
-            self.previews
-                .get(id)
-                .and_then(|preview| preview.error.as_deref())
-        } else if self.snapshot.active_camera.as_deref() == Some(id) {
-            self.display_error.as_deref()
-        } else {
-            None
-        };
+        let local = (self.snapshot.active_camera.as_deref() == Some(id))
+            .then_some(self.display_error.as_deref())
+            .flatten();
         let reported = self
             .stage_ui
             .errors
@@ -738,18 +673,6 @@ impl Workbench {
     /// How far camera `key`'s picture has faded in on its first frame.
     pub(super) fn revealed(&self, key: &str) -> f32 {
         1.0 - self.stage_ui.reveal.level(key, self.now)
-    }
-
-    /// How much the overview tile of camera `id` shows its controls: while
-    /// the pointer is over it, and fading out after it leaves.
-    pub(super) fn tile_controls(&self, id: &str) -> f32 {
-        if self.hovered_tile.as_deref() == Some(id) {
-            self.tile_hover.get(self.now)
-        } else if self.stage_ui.hover_last.as_deref() == Some(id) {
-            self.stage_ui.hover_out.get(self.now)
-        } else {
-            0.0
-        }
     }
 }
 
@@ -1298,8 +1221,7 @@ mod tests {
         bench.now = start + REVEAL;
         assert_eq!(bench.revealed(MAIN_VIEW), 1.0);
         assert!(!bench.animating());
-        // Another frame of the same camera, or the same camera again after
-        // the overview, shows at once.
+        // Another frame of the same camera shows at once.
         bench.shown = None;
         bench.sync_animations();
         bench.shown = Some(shown(640.0, 480.0));
@@ -1307,40 +1229,6 @@ mod tests {
         bench.sync_animations();
         assert_eq!(bench.revealed(MAIN_VIEW), 1.0);
         assert!(bench.pointer_moved.is_none());
-    }
-
-    #[test]
-    fn tile_controls_fade_out_after_the_pointer_leaves() {
-        let mut bench = bench();
-        let start = bench.now;
-        let _ = bench.handle_message(Message::HoverTile(Some("sim:0".into())));
-        bench.sync_animations();
-        bench.now = start + motion::HOVER;
-        assert_eq!(bench.tile_controls("sim:0"), 1.0);
-        let left = bench.now;
-        let _ = bench.handle_message(Message::HoverTile(None));
-        bench.sync_animations();
-        assert_eq!(
-            bench.tile_controls("sim:0"),
-            1.0,
-            "still there as it leaves"
-        );
-        bench.now = left + motion::HOVER_OUT / 2;
-        let fading = bench.tile_controls("sim:0");
-        assert!(fading > 0.0 && fading < 1.0);
-        // Back before they have gone: they come back from where they are.
-        let _ = bench.handle_message(Message::HoverTile(Some("sim:0".into())));
-        bench.sync_animations();
-        assert!((bench.tile_controls("sim:0") - fading).abs() < 1e-4);
-        let back = bench.now;
-        bench.now = back + motion::HOVER;
-        assert_eq!(bench.tile_controls("sim:0"), 1.0);
-        let left = bench.now;
-        let _ = bench.handle_message(Message::HoverTile(None));
-        bench.sync_animations();
-        bench.now = left + motion::HOVER_OUT;
-        assert_eq!(bench.tile_controls("sim:0"), 0.0);
-        assert!(!bench.animating());
     }
 
     #[test]
@@ -1478,11 +1366,11 @@ mod tests {
         bench.image_mode = true;
         let _ = bench.handle_message(Message::CameraActivity("sim:0".into()));
         assert!(bench.logs_open && !bench.image_mode);
-        assert!(!bench.pending(Job::Select), "already selected");
+        assert!(bench.pending.is_empty(), "selecting stays in this window");
         bench.logs_open = false;
         let _ = bench.handle_message(Message::CameraActivity("sim:1".into()));
         assert!(bench.logs_open);
-        assert!(bench.pending_for(Job::Select, "sim:1"));
+        assert_eq!(bench.snapshot.active_camera.as_deref(), Some("sim:1"));
     }
 
     #[test]

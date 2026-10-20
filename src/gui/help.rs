@@ -902,10 +902,10 @@ mod tests {
     fn the_guide_names_every_key_a_field_takes() {
         assert_eq!(
             plain_keys_note(Os::Mac),
-            "↩, Esc, Space, F, H and R act on the workbench when no field has keyboard focus. Press Esc or click elsewhere to leave a field."
+            "Esc, Space, F, H and R act on the workbench when no field has keyboard focus. Press Esc or click elsewhere to leave a field."
         );
         // F1 and F11 work from a field, so they are not named.
-        assert!(plain_keys_note(Os::Windows).starts_with("Enter, Esc, Space, F, H and R act"));
+        assert!(plain_keys_note(Os::Windows).starts_with("Esc, Space, F, H and R act"));
     }
 
     #[test]

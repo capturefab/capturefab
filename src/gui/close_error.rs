@@ -4,11 +4,12 @@ use super::*;
 use iced::widget::column;
 
 const TITLE: &str = "Could Not Save Settings";
+const RECORDING: &str = "Stop Recording?";
 
 pub(super) struct CloseError {
     pub(super) window: window::Id,
     pub(super) target: CloseTarget,
-    details: String,
+    details: Option<String>,
 }
 
 impl Workbench {
@@ -17,6 +18,20 @@ impl Workbench {
         target: CloseTarget,
         details: String,
     ) -> Task<Message> {
+        self.alert_close(target, Some(details))
+    }
+
+    pub(super) fn confirm_recording_close(&mut self) -> Task<Message> {
+        self.alert_close(CloseTarget::Window, None)
+    }
+
+    pub(super) fn recording_close_confirmed(&self) -> bool {
+        self.close_error
+            .as_ref()
+            .is_some_and(|error| error.details.is_none())
+    }
+
+    fn alert_close(&mut self, target: CloseTarget, details: Option<String>) -> Task<Message> {
         let id = if self.settings_window == Some(self.focused_window) {
             self.focused_window
         } else {
@@ -99,17 +114,23 @@ impl Workbench {
             && error.window == id
         {
             let p = self.window_palette(id);
-            let details = error
-                .details
-                .strip_prefix("Could not save settings: ")
-                .unwrap_or(&error.details);
+            let details = error.details.as_deref().map(|details| {
+                details
+                    .strip_prefix("Could not save settings: ")
+                    .unwrap_or(details)
+            });
             layers = layers.push(responsive(move |size| close_alert(details, p, size)));
         }
         layers.into()
     }
 }
 
-fn close_alert<'a>(details: &'a str, p: &'static Palette, viewport: Size) -> Element<'a, Message> {
+fn close_alert<'a>(
+    details: Option<&'a str>,
+    p: &'static Palette,
+    viewport: Size,
+) -> Element<'a, Message> {
+    let title = if details.is_some() { TITLE } else { RECORDING };
     let width = (viewport.width - 32.0).clamp(1.0, 440.0);
     let compact = width < 320.0;
     let keep = button(text("Cancel").size(style::BODY))
@@ -117,7 +138,7 @@ fn close_alert<'a>(details: &'a str, p: &'static Palette, viewport: Size) -> Ele
         .padding([7, 16])
         .style(style::secondary)
         .on_press(Message::KeepOpen);
-    let retry = button(text("Retry").size(style::BODY))
+    let retry = button(text(if details.is_some() { "Retry" } else { "Close" }).size(style::BODY))
         .id("close-retry")
         .padding([7, 18])
         .style(style::primary)
@@ -133,23 +154,29 @@ fn close_alert<'a>(details: &'a str, p: &'static Palette, viewport: Size) -> Ele
             .align_y(Alignment::Center)
             .into()
     };
-    let body = column![
-        text("Capturefab is still open. Resolve the error, then try again.").size(style::BODY),
-        accessibility::label(
-            text(details).size(style::SMALL).color(p.danger).into(),
-            format!("Could not save settings: {details}"),
-            accessibility::Role::Alert,
-        ),
-    ]
+    let body = match details {
+        Some(details) => column![
+            text("Capturefab is still open. Resolve the error, then try again.").size(style::BODY),
+            accessibility::label(
+                text(details).size(style::SMALL).color(p.danger).into(),
+                format!("Could not save settings: {details}"),
+                accessibility::Role::Alert,
+            ),
+        ],
+        None => column![
+            text("This camera is recording. Closing its window disconnects it and stops the recording.")
+                .size(style::BODY)
+        ],
+    }
     .spacing(12);
     let alert = container(
         column![
             accessibility::label(
-                text(TITLE)
+                text(title)
                     .size(style::HEADING)
                     .font(style::SEMIBOLD)
                     .into(),
-                TITLE.into(),
+                title.into(),
                 accessibility::Role::Heading,
             ),
             container(scrollable(body).style(style::scroll))
@@ -164,7 +191,7 @@ fn close_alert<'a>(details: &'a str, p: &'static Palette, viewport: Size) -> Ele
     .style(style::sheet);
     let alert = keyboard_history::escape_guard(accessibility::group(
         keyboard_history::default_action(alert.into(), Some(Message::RetryClose)),
-        TITLE.into(),
+        title.into(),
         accessibility::Role::AlertDialog,
     ));
     opaque(center(opaque(alert)).style(|theme| style::scrim(theme, 1.0)))

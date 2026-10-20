@@ -71,25 +71,6 @@ fn bench() -> Workbench {
 }
 
 #[test]
-fn compact_inspector_camera_context_retains_identity_beside_a_long_model_name() {
-    let renderer = renderer();
-    let app = bench();
-    let mut view = app.camera_context(Palette::of(false)).unwrap();
-    let mut tree = Tree::new(view.as_widget());
-    let node = view.as_widget_mut().layout(
-        &mut tree,
-        &renderer,
-        &layout::Limits::new(Size::ZERO, Size::new(INSPECTOR, 80.0)),
-    );
-    let row = &node.children()[0].children()[0];
-    assert_eq!(row.children().len(), 3);
-    assert!(
-        row.children()[2].size().width >= 60.0,
-        "the selected camera's identity remains readable beside its long model name"
-    );
-}
-
-#[test]
 fn compact_video_keeps_its_start_action_visible_before_encoding_details() {
     let mut renderer = renderer();
     for scale in prefs::UiScale::ALL {

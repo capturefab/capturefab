@@ -14,8 +14,6 @@ mod focus_return;
 pub(super) use focus_return::FocusReturn;
 mod default_action;
 pub(super) use default_action::default_action;
-mod content_focus;
-pub(super) use content_focus::{Area, scope as content_scope};
 #[cfg(test)]
 mod alert_tests;
 #[cfg(test)]
@@ -45,33 +43,6 @@ pub(super) fn guard(
     edit: Option<EditRequest>,
     desktop_active: bool,
 ) -> Element<'_, Message> {
-    make_guard(content, edit, desktop_active, false, None)
-}
-
-/// Only the workbench document reports selection emphasis. Native Settings and
-/// modal/escape guards retain their ordinary editor and popup reporting.
-pub(super) fn main_guard(
-    content: Element<'_, Message>,
-    edit: Option<EditRequest>,
-    desktop_active: bool,
-    suspend_content_focus: bool,
-) -> Element<'_, Message> {
-    make_guard(
-        content,
-        edit,
-        desktop_active,
-        suspend_content_focus,
-        Some(Message::ContentFocused),
-    )
-}
-
-fn make_guard(
-    content: Element<'_, Message>,
-    edit: Option<EditRequest>,
-    desktop_active: bool,
-    suspend_content_focus: bool,
-    on_content_focus: Option<fn(Area) -> Message>,
-) -> Element<'_, Message> {
     Element::new(Guard {
         content,
         os: Os::CURRENT,
@@ -81,8 +52,6 @@ fn make_guard(
         on_editor_focus: Some(Message::EditorFocused),
         on_popup: Some(Message::PopupOpen),
         on_escape: Some(escape_message),
-        on_content_focus,
-        suspend_content_focus,
     })
 }
 
@@ -98,8 +67,6 @@ pub(super) fn escape_guard(content: Element<'_, Message>) -> Element<'_, Message
         on_editor_focus: None,
         on_popup: None,
         on_escape: Some(escape_message),
-        on_content_focus: None,
-        suspend_content_focus: false,
     })
 }
 
@@ -125,8 +92,6 @@ pub(super) fn background(content: Element<'_, Message>, inactive: bool) -> Eleme
         on_editor_focus: None,
         on_popup: None,
         on_escape: None,
-        on_content_focus: None,
-        suspend_content_focus: false,
     })
 }
 
@@ -139,8 +104,6 @@ struct Guard<'a, Message, Theme, Renderer> {
     on_editor_focus: Option<fn(bool) -> Message>,
     on_popup: Option<fn(bool) -> Message>,
     on_escape: Option<fn(bool) -> Message>,
-    on_content_focus: Option<fn(Area) -> Message>,
-    suspend_content_focus: bool,
 }
 
 #[derive(Default)]
@@ -149,7 +112,6 @@ struct State {
     modifiers: keyboard::Modifiers,
     editor_focused: Option<bool>,
     popup_open: Option<bool>,
-    content_focus: content_focus::Tracker,
 }
 
 /// Text inputs expose their editor immediately before their focus state.
@@ -289,9 +251,6 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Guard<'_, M, T, R> {
             // window is frontmost. Re-publish availability when it returns.
             state.editor_focused = None;
             state.popup_open = None;
-            if !self.suspend_content_focus {
-                state.content_focus.reported = None;
-            }
         }
         if self.background {
             if matches!(event, Event::Window(window::Event::RedrawRequested(_))) {
@@ -465,32 +424,6 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Guard<'_, M, T, R> {
                     shell.publish(on_popup(focus.popup_open));
                 }
             }
-            if !self.suspend_content_focus
-                && let Some(on_focus) = self.on_content_focus
-            {
-                let area = content_focus::focused_area(
-                    &mut self.content,
-                    &mut tree.children[0],
-                    layout,
-                    renderer,
-                )
-                .unwrap_or(state.content_focus.pointer_hint);
-                if state.content_focus.reported != Some(area) {
-                    state.content_focus.reported = Some(area);
-                    shell.publish(on_focus(area));
-                }
-            }
-        }
-        let pointer = !self.suspend_content_focus
-            && self.on_content_focus.is_some()
-            && content_focus::pointer_position(event, cursor).is_some();
-        if pointer {
-            content_focus::clear_pointer(
-                &mut self.content,
-                &mut tree.children[0],
-                layout,
-                renderer,
-            );
         }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
@@ -502,21 +435,6 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Guard<'_, M, T, R> {
             shell,
             viewport,
         );
-        if pointer {
-            let area = content_focus::pointer_area(
-                &mut self.content,
-                &mut tree.children[0],
-                layout,
-                renderer,
-            )
-            .unwrap_or(Area::Other);
-            if state.content_focus.pointer_hint != area {
-                state.content_focus.pointer_hint = area;
-                // A blank document press may be ignored by every child, so
-                // explicitly schedule the redraw that reports its new area.
-                shell.request_redraw();
-            }
-        }
         if escape
             && !popup_was_open
             && let Some(on_escape) = self.on_escape
@@ -619,8 +537,6 @@ mod tests {
             on_editor_focus: None,
             on_popup: None,
             on_escape: Some(|captured| format!("escape:{captured}")),
-            on_content_focus: None,
-            suspend_content_focus: false,
         };
         let mut tree = Tree::new(&guard as &dyn Widget<String, Theme, ()>);
         tree.children[0]
@@ -700,8 +616,6 @@ mod tests {
             on_editor_focus: None,
             on_popup: None,
             on_escape: Some(|captured| format!("escape:{captured}")),
-            on_content_focus: None,
-            suspend_content_focus: false,
         };
         let mut tree = Tree::new(&guard as &dyn Widget<String, Theme, ()>);
         let node = guard.layout(
@@ -830,8 +744,6 @@ mod tests {
                 on_editor_focus: None,
                 on_popup: None,
                 on_escape: None,
-                on_content_focus: None,
-                suspend_content_focus: false,
             };
             let mut tree = Tree::new(&guard as &dyn Widget<String, Theme, ()>);
             tree.children[0]
@@ -926,8 +838,6 @@ mod tests {
                     on_editor_focus: None,
                     on_popup: None,
                     on_escape: None,
-                    on_content_focus: None,
-                    suspend_content_focus: false,
                 };
                 let mut tree = Tree::new(&guard as &dyn Widget<String, Theme, ()>);
                 tree.children[0]
@@ -992,8 +902,6 @@ mod tests {
             on_editor_focus: None,
             on_popup: None,
             on_escape: None,
-            on_content_focus: None,
-            suspend_content_focus: false,
         };
         let mut tree = Tree::new(&guard as &dyn Widget<String, Theme, ()>);
         tree.children[0]
@@ -1088,8 +996,6 @@ mod tests {
                 on_editor_focus: None,
                 on_popup: None,
                 on_escape: None,
-                on_content_focus: None,
-                suspend_content_focus: false,
             };
             let mut tree = Tree::new(&guard as &dyn Widget<String, Theme, ()>);
             tree.children[0]
@@ -1158,8 +1064,6 @@ mod tests {
             on_editor_focus: None,
             on_popup: None,
             on_escape: None,
-            on_content_focus: None,
-            suspend_content_focus: false,
         };
         let mut tree = Tree::new(&guard as &dyn Widget<String, Theme, ()>);
         tree.children[0]
@@ -1238,8 +1142,6 @@ mod tests {
                 on_editor_focus: None,
                 on_popup: None,
                 on_escape: None,
-                on_content_focus: None,
-                suspend_content_focus: false,
             })
         }
         let mut guard = Guard {
@@ -1254,8 +1156,6 @@ mod tests {
             on_editor_focus: Some(|focused| format!("editor:{focused}")),
             on_popup: None,
             on_escape: None,
-            on_content_focus: None,
-            suspend_content_focus: false,
         };
         let mut tree = Tree::new(&guard as &dyn Widget<String, Theme, ()>);
         tree.children[0].children[0]

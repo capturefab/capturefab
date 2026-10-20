@@ -486,7 +486,6 @@ pub struct Prefs {
     pub focus_open: bool,
     pub focus_region: [f32; 4],
     pub focus_metric: Metric,
-    pub sidebar_open: bool,
     pub inspector_open: bool,
     pub output: String,
     pub format: String,
@@ -557,7 +556,6 @@ impl Default for Prefs {
             focus_open: false,
             focus_region: DEFAULT_REGION,
             focus_metric: Metric::default(),
-            sidebar_open: true,
             inspector_open: true,
             output: default_capture_output(),
             format: "png".into(),
@@ -623,6 +621,23 @@ impl Prefs {
         self.recent.retain(|r| r.target != entry.target);
         self.recent.insert(0, entry);
         self.recent.truncate(RECENT_LIMIT);
+    }
+    pub fn shared(&self) -> Self {
+        self.clone().with_layout(&Self::default())
+    }
+    pub fn with_layout(self, layout: &Self) -> Self {
+        Self {
+            tab: layout.tab,
+            exposure_open: layout.exposure_open,
+            focus_open: layout.focus_open,
+            focus_region: layout.focus_region,
+            focus_metric: layout.focus_metric,
+            inspector_open: layout.inspector_open,
+            window: layout.window,
+            logs_open: layout.logs_open,
+            open_sections: layout.open_sections.clone(),
+            ..self
+        }
     }
     fn sanitized(&self) -> Self {
         let mut prefs = self.clone();

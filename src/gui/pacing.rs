@@ -480,39 +480,17 @@ impl Workbench {
 
     /// The (camera ID, frame ID) pairs the main view shows now.
     pub(super) fn frames_shown(&self) -> Vec<(String, u64)> {
-        if self.overview() {
-            self.previews
-                .iter()
-                .filter(|(_, preview)| preview.shown.is_some())
-                .filter_map(|(id, preview)| Some((id.clone(), preview.frame_id?)))
-                .collect()
-        } else {
-            self.shown
-                .as_ref()
-                .and(self.snapshot.active_camera.clone())
-                .zip(self.frame_id)
-                .into_iter()
-                .collect()
-        }
+        self.shown
+            .as_ref()
+            .and(self.snapshot.active_camera.clone())
+            .zip(self.frame_id)
+            .into_iter()
+            .collect()
     }
 
-    /// The cameras whose frames the main view shows: in the overview, the
-    /// tiles in view, as tiles scrolled out take no frames.
+    /// The cameras whose frames the main view shows.
     pub(super) fn cameras_shown(&self) -> Vec<&str> {
-        if self.overview() {
-            let (grid, count) = (self.grid.get(), self.snapshot.cameras.len());
-            self.snapshot
-                .cameras
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| {
-                    grid.is_none_or(|grid| grid.shows(*index, count, self.grid_scroll))
-                })
-                .map(|(_, camera)| camera.info.id.as_str())
-                .collect()
-        } else {
-            self.snapshot.active_camera.as_deref().into_iter().collect()
-        }
+        self.snapshot.active_camera.as_deref().into_iter().collect()
     }
 
     /// The time between frames of the fastest shown camera, once its
@@ -625,7 +603,7 @@ mod tests {
 
     #[test]
     fn late_wakeups_do_not_lengthen_the_gap_but_a_lull_restarts_it() {
-        // A 30 fps overview on a 60 Hz display: a quarter refresh early.
+        // A 30 fps camera on a 60 Hz display: a quarter refresh early.
         let us = Duration::from_micros;
         let timing = Timing {
             gap: us(29_167),
@@ -720,24 +698,20 @@ mod tests {
     }
 
     #[test]
-    fn efficiency_mode_floors_the_frame_interval_in_each_view() {
+    fn efficiency_mode_floors_the_frame_interval() {
         let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
         let camera = liveness::streaming_camera(100, 0, 30.0);
         let us = Duration::from_micros;
-        // Refresh period, efficient, overview, and the frame interval.
-        for (period, efficient, overview, interval) in [
-            (16_667, false, false, 16_667),
-            (16_667, false, true, 33_333),
-            (16_667, true, false, 66_667),
-            (16_667, true, true, 200_000),
-            (8_333, false, false, 8_333),
-            (8_333, false, true, 33_333),
-            (8_333, true, false, 66_667),
-            (8_333, true, true, 200_000),
+        // Refresh period, efficient, and the frame interval.
+        for (period, efficient, interval) in [
+            (16_667, false, 16_667),
+            (16_667, true, 66_667),
+            (8_333, false, 8_333),
+            (8_333, true, 66_667),
         ] {
             let _mode = performance::process::force(efficient);
             bench.refresh.report(Some(us(period)));
-            bench.snapshot.cameras = vec![camera.clone(); if overview { 2 } else { 1 }];
+            bench.snapshot.cameras = vec![camera.clone()];
             assert_eq!(bench.frame_interval(), us(interval));
             // A quarter refresh early, so a late poll still meets its vsync.
             assert_eq!(bench.frame_gap(), us(interval) - us(period) / 4);
@@ -927,35 +901,6 @@ mod tests {
         assert_eq!(*cadence.shown.lock().unwrap(), ["sim:1"]);
         let handle = SessionHandle::new();
         assert_eq!(cadence.sequence(&handle), 0, "no feed, no frames");
-    }
-
-    #[test]
-    fn tiles_scrolled_out_of_view_are_neither_watched_nor_counted_as_shown() {
-        // A tile out of view takes no frames, so the watcher need not look
-        // for them and the keeping-up meter must not read it as behind.
-        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
-        bench.snapshot.cameras = (0..6)
-            .map(|i| {
-                let mut camera = liveness::streaming_camera(0, 0, 30.0);
-                camera.info.id = format!("tile{i}");
-                camera
-            })
-            .collect();
-        assert_eq!(bench.cameras_shown().len(), 6, "every tile before a layout");
-        // Two columns, three rows, two of them in view.
-        bench.grid.set(Some(grid::Grid {
-            columns: 2,
-            tile: Size::new(400.0, 300.0),
-            viewport: 600.0,
-        }));
-        assert_eq!(bench.cameras_shown(), ["tile0", "tile1", "tile2", "tile3"]);
-        let _ = bench.update(Message::OverviewScrolled(1000.0));
-        assert_eq!(bench.cameras_shown(), ["tile2", "tile3", "tile4", "tile5"]);
-        assert_eq!(
-            *bench.cadence.shown.lock().unwrap(),
-            ["tile2", "tile3", "tile4", "tile5"]
-        );
-        bench.handle.shutdown();
     }
 
     #[test]

@@ -223,10 +223,6 @@ fn enabled_action_styles_read_in_every_interaction_state() {
                 card(&theme, status),
                 toggle(false)(&theme, status),
                 toggle(true)(&theme, status),
-                row(0.0, true)(&theme, status),
-                row(1.0, true)(&theme, status),
-                row(0.0, false)(&theme, status),
-                row(1.0, false)(&theme, status),
             ];
             for style in styles {
                 for surface in panel_surfaces(p, &theme) {
@@ -333,25 +329,6 @@ fn checkboxes_sliders_and_progress_have_visible_functional_marks() {
     }
 }
 
-fn gradient_at(background: Background, offset: f32) -> Color {
-    let Background::Gradient(iced::Gradient::Linear(gradient)) = background else {
-        panic!("caption must provide an image shade");
-    };
-    let stops: Vec<_> = gradient.stops.into_iter().flatten().collect();
-    assert!(!stops.is_empty());
-    for pair in stops.windows(2) {
-        if offset >= pair[0].offset && offset <= pair[1].offset {
-            let amount = (offset - pair[0].offset) / (pair[1].offset - pair[0].offset);
-            return mix(pair[0].color, pair[1].color, amount);
-        }
-    }
-    if offset < stops[0].offset {
-        stops[0].color
-    } else {
-        stops.last().unwrap().color
-    }
-}
-
 #[test]
 fn stage_layers_read_over_extreme_image_colors_in_both_appearances() {
     for (theme, _) in window_appearances() {
@@ -404,19 +381,6 @@ fn stage_layers_read_over_extreme_image_colors_in_both_appearances() {
                             );
                         }
                     }
-                }
-            }
-            // The lower 75% contains the caption row; the top fades into the image.
-            for step in 0..=15 {
-                let surface = composite(
-                    gradient_at(caption(&theme).background.unwrap(), step as f32 * 0.05),
-                    picture,
-                );
-                for text in [STAGE.text, STAGE.secondary, STAGE.accent_text] {
-                    reads(text, surface, 4.5, "caption text across its row");
-                }
-                for color in [STAGE.live, STAGE.warn, STAGE.danger, STAGE.accent] {
-                    reads(color, surface, 3.0, "caption state mark");
                 }
             }
         }

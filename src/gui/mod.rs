@@ -17,9 +17,9 @@ mod display_tests;
 mod folder_review;
 mod format;
 mod gpu;
-mod grid;
 mod help;
 mod history;
+mod host;
 mod icon;
 mod inspector;
 mod keyboard_history;
@@ -117,26 +117,20 @@ const BAR: f32 = if cfg!(target_os = "macos") {
 } else {
     44.0
 };
-/// Room the macOS traffic lights need when no sidebar sits under them.
+/// Room the macOS traffic lights need.
 const LIGHTS: f32 = if cfg!(target_os = "macos") { 78.0 } else { 0.0 };
-const SIDEBAR: f32 = 240.0;
 /// Height of the toolbar under the stage, for folding it away.
 const TOOLBAR: f32 = 45.0;
 const INSPECTOR: f32 = 316.0;
 const GUTTER: f32 = 18.0;
-/// Small overview tiles gain nothing from more than 30 redraws a second.
-const OVERVIEW_INTERVAL: Duration = Duration::from_micros(33_333);
-/// Efficiency mode draws at most 15 frames a second in a camera's view, and
-/// 5 in the overview.
+/// Efficiency mode draws at most 15 frames a second.
 const EFFICIENT_INTERVAL: Duration = Duration::from_micros(66_667);
-const EFFICIENT_OVERVIEW_INTERVAL: Duration = Duration::from_millis(200);
 /// Least time between histograms of a stream's frames, and between focus
 /// scores: a histogram reads as well at 5 Hz, and focusing by hand wants more.
 const EXPOSURE_EVERY: Duration = Duration::from_millis(200);
 const FOCUS_EVERY: Duration = Duration::from_millis(66);
-/// Most pixels a side of a shrunk overview tile keeps, and of any view short
-/// of 1:1 in efficiency mode, on the GPU too.
-const TILE_SIDE: u32 = 1920;
+/// Most pixels a side of any view short of 1:1 keeps in efficiency mode, on
+/// the GPU too.
 const EFFICIENT_SIDE: u32 = 1280;
 
 /// Quit on SIGINT, SIGTERM or SIGHUP as the Quit command does, so the
@@ -211,29 +205,13 @@ pub fn run_capture(
     };
     let boot = move || {
         let capturing = screenshot.is_some();
-        let (main_window, opened) = window::open(window::Settings {
-            icon: Some(brand::window_icon()),
-            size: Size::new(
+        let (main_window, opened) = window::open(camera_window_settings(
+            Size::new(
                 window_size.width / initial_scale.factor(),
                 window_size.height / initial_scale.factor(),
             ),
-            position: prefs::centered_window(initial_scale),
-            min_size: Some(Size::new(900.0, 620.0)),
-            exit_on_close_request: false,
-            visible: false,
-            #[cfg(target_os = "macos")]
-            platform_specific: window::settings::PlatformSpecific {
-                title_hidden: true,
-                titlebar_transparent: true,
-                fullsize_content_view: true,
-            },
-            #[cfg(target_os = "linux")]
-            platform_specific: window::settings::PlatformSpecific {
-                application_id: "capturefab".into(),
-                ..Default::default()
-            },
-            ..window::Settings::default()
-        });
+            prefs::centered_window(initial_scale),
+        ));
         let mut app = Workbench::new(
             handle.clone(),
             session_label.clone(),
@@ -276,7 +254,7 @@ pub fn run_capture(
             app.discover();
         }
         (
-            app,
+            host::Host::new(app),
             Task::batch([
                 system::theme().map(Message::SystemTheme),
                 window::allow_automatic_tabbing(false),
@@ -288,23 +266,18 @@ pub fn run_capture(
                         prefs::fit_window(window_size, initial_scale)
                     },
                 ])),
-            ]),
+            ])
+            .map(move |message| Message::From(main_window, Box::new(message))),
         )
     };
     #[cfg(target_os = "macos")]
     brand::set_dock_icon();
     style::initialize_fonts();
-    iced::daemon(boot, Workbench::update, Workbench::window_view)
-        .title(|app: &Workbench, id| {
-            if app.settings_window == Some(id) {
-                "Settings".into()
-            } else {
-                app.title()
-            }
-        })
-        .subscription(Workbench::subscription)
-        .theme(Workbench::window_theme)
-        .scale_factor(|app: &Workbench, _| app.ui_scale.factor())
+    iced::daemon(boot, host::Host::update, host::Host::view)
+        .title(host::Host::title)
+        .subscription(host::Host::subscription)
+        .theme(host::Host::theme)
+        .scale_factor(host::Host::scale_factor)
         .default_font(style::SANS)
         .font(icon::REGULAR_BYTES)
         .font(icon::FILL_BYTES)
@@ -319,6 +292,29 @@ pub fn run_capture(
         anyhow::bail!(error);
     }
     Ok(())
+}
+
+fn camera_window_settings(size: Size, position: window::Position) -> window::Settings {
+    window::Settings {
+        icon: Some(brand::window_icon()),
+        size,
+        position,
+        min_size: Some(Size::new(900.0, 620.0)),
+        exit_on_close_request: false,
+        visible: false,
+        #[cfg(target_os = "macos")]
+        platform_specific: window::settings::PlatformSpecific {
+            title_hidden: true,
+            titlebar_transparent: true,
+            fullsize_content_view: true,
+        },
+        #[cfg(target_os = "linux")]
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: "capturefab".into(),
+            ..Default::default()
+        },
+        ..window::Settings::default()
+    }
 }
 
 /// Session activity has its own condition variable, so even an idle window
@@ -403,7 +399,6 @@ impl Pending {
             Job::NetworkScan => "Scanning network and tuning cameras",
             Job::Connect => "Connecting camera",
             Job::Disconnect => "Disconnecting",
-            Job::Select => "Selecting camera",
             Job::Start if self.batch => "Starting streams",
             Job::Start => "Starting stream",
             Job::Stop if self.batch => "Stopping streams",
@@ -452,7 +447,6 @@ enum Job {
     NetworkScan,
     Connect,
     Disconnect,
-    Select,
     /// Start a camera's stream; with `Pending::batch`, part of Start all.
     Start,
     /// Stop a camera's stream; with `Pending::batch`, part of Stop all.
@@ -511,18 +505,8 @@ impl Job {
     }
 }
 
-/// GPU slot of the single-camera view; camera tiles use their camera IDs.
+/// GPU slot of the camera view.
 const MAIN_VIEW: &str = "\0main";
-
-#[derive(Default)]
-struct CameraPreview {
-    frame_id: Option<u64>,
-    /// What `shown` was converted for; the tile's size can change under it.
-    limits: Option<preview::Limits>,
-    shown: Option<Shown>,
-    meta: Option<(u64, u32, u32, u32)>,
-    error: Option<String>,
-}
 
 /// When a scope last measured a frame of the stream, and which.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -603,13 +587,6 @@ enum Num {
     RetentionDays,
 }
 
-/// A scope the overview cannot draw over its tiles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Scope {
-    Histogram,
-    Focus,
-}
-
 #[derive(Debug, Clone)]
 enum Message {
     Undo,
@@ -643,7 +620,6 @@ enum Message {
     Menu(menus::Command),
     DesktopMenu(menus::DesktopInput),
     EditorFocused(bool),
-    ContentFocused(keyboard_history::Area),
     PopupOpen(bool),
     Settings(bool),
     Assistant(assistant::Input),
@@ -656,6 +632,10 @@ enum Message {
     WindowFocused(window::Id),
     WindowUnfocused(window::Id),
     InWindow(window::Id, Box<Message>),
+    From(window::Id, Box<Message>),
+    NewWindow,
+    QuitAll,
+    Adopt(Box<Prefs>),
     AccessibilityRequest(accessibility::Request),
     NativeInput {
         message: Box<Message>,
@@ -692,9 +672,7 @@ enum Message {
     ConnectAddress,
     ToggleStream,
     Capture,
-    Focus(bool),
     Select(String),
-    StreamCamera(String, bool),
     AllStreams(bool),
     AllAuto(bool),
     Fit,
@@ -707,8 +685,6 @@ enum Message {
     FocusRegionStart,
     /// A drag of the focus region let go.
     FocusRegionEnd,
-    /// The overview scrolled this far down.
-    OverviewScrolled(f32),
     /// Show the control that changes the histogram's exposure.
     AdjustExposure,
     FocusMetric(scopes::Metric),
@@ -764,7 +740,6 @@ enum Message {
     FolderReview(folder_review::Input),
     RecordPicker(destinations::Message),
     Screenshot(window::Screenshot),
-    ToggleSidebar,
     ToggleInspector,
     ToggleImage,
     ToggleCameraView,
@@ -773,11 +748,6 @@ enum Message {
     ZoomWindow,
     Pointer,
     OverControls(bool),
-    HoverTile(Option<String>),
-    FocusTile(String),
-    /// Turn a scope on if it is off and open this camera, where it draws.
-    ShowScopeOn(String, Scope),
-    CaptureCamera(String),
     /// Capture from every connected camera at once.
     AllCapture,
     /// Start recording on every camera that can, or stop all recordings.
@@ -804,7 +774,7 @@ type FeatureDrafts = (HashMap<String, String>, HashMap<String, String>);
 
 #[derive(Clone, Copy, Debug)]
 enum CloseTarget {
-    Window(window::Id),
+    Window,
     Quit,
 }
 
@@ -816,7 +786,6 @@ struct Workbench {
     window_editor_focus: HashMap<window::Id, bool>,
     /// The window currently receiving keyboard input, if the app is active.
     key_window: Option<window::Id>,
-    content_focus: keyboard_history::Area,
     settings_window: Option<window::Id>,
     accessibility: accessibility::Bridge,
     window_scales: HashMap<window::Id, f32>,
@@ -897,11 +866,7 @@ struct Workbench {
     /// Size of the preview stage at the last layout, so zooming from Fit
     /// starts where the image already is.
     stage: Cell<Size>,
-    /// The overview's tiles at the last layout, and how far it is scrolled.
-    grid: Cell<Option<grid::Grid>>,
-    grid_scroll: f32,
     exposure_open: bool,
-    focus_camera: bool,
     exposure: Option<frame::Exposure>,
     /// What the histogram and the focus score last measured.
     measured: (Measured, Measured),
@@ -928,7 +893,6 @@ struct Workbench {
     /// What the main view's frame was converted for.
     frame_limits: Option<preview::Limits>,
     display_error: Option<String>,
-    previews: HashMap<String, CameraPreview>,
     camera_views: HashMap<String, camera_view::CameraView>,
     /// Each streaming camera's recent frame rate, by camera id.
     throughput: HashMap<String, sparkline::History>,
@@ -956,6 +920,9 @@ struct Workbench {
     saved: Option<Prefs>,
     prefs_saver: prefs::Saver,
     closing: Option<CloseTarget>,
+    sole: bool,
+    settings_elsewhere: Option<window::Id>,
+    retired: bool,
     /// SIGINT, SIGTERM or SIGHUP asked the window to quit; see
     /// `quit_on_signal`.
     quit_signal: Arc<AtomicBool>,
@@ -972,7 +939,6 @@ struct Workbench {
     focus_slide: Motion,
     shutter: Motion,
     welcome: Motion,
-    sidebar_open: bool,
     /// Whether the inspector is docked open in a wide window.
     inspector_open: bool,
     /// Whether the inspector floats over the stage in a narrow window.
@@ -997,18 +963,10 @@ struct Workbench {
     fullscreen: bool,
     pointer_moved: Option<Instant>,
     over_controls: bool,
-    hovered_tile: Option<String>,
-    sidebar_slide: Motion,
     inspector_slide: Motion,
     /// Title bar and toolbar, hidden in image mode.
     bars: Motion,
     controls: Motion,
-    tile_hover: Motion,
-    /// The selection drawing in after it changes: the ring around the
-    /// selected tile; see `selection_level`.
-    ring: Motion,
-    /// The camera selected before the current one, while `ring` draws in.
-    ring_from: Option<String>,
     // Each part of the window keeps its own state in its own file.
     chrome: titlebar::ChromeState,
     side: sidebar::SideState,
@@ -1027,15 +985,6 @@ impl Workbench {
         // A first run keeps the inspector out of the way until a camera
         // comes; it must not slide away on launch.
         let quiet = prefs.recent.is_empty();
-        // A saved stream URL opens the Video tab in Stream mode, and keeps it
-        // there while the URL is cleared and retyped.
-        let stream_draft = !Output::of(&prefs.forward_output).recording();
-        let defaults = Prefs::default();
-        let pick = |choices: &[Choice], value: &str, fallback: &str| {
-            find(choices, value)
-                .or_else(|| find(choices, fallback))
-                .map_or("", |choice| choice.value)
-        };
         let now = Instant::now();
         motion::refresh_accessibility();
         let shown = |open: bool| if open { 1.0 } else { 0.0 };
@@ -1051,7 +1000,6 @@ impl Workbench {
             focused_window: main_window,
             window_editor_focus: HashMap::new(),
             key_window: Some(main_window),
-            content_focus: keyboard_history::Area::Image,
             settings_window: None,
             accessibility: Default::default(),
             window_scales: HashMap::new(),
@@ -1069,7 +1017,7 @@ impl Workbench {
             local_camera: None,
             client_activity,
             observed_camera: None,
-            include_simulator: simulated || prefs.include_simulator,
+            include_simulator: false,
             address: String::new(),
             search: String::new(),
             tab: prefs.tab,
@@ -1077,25 +1025,25 @@ impl Workbench {
             edit_sources: HashMap::new(),
             record_to: Picker::new(false, true).sharing(&capture_to),
             capture_to,
-            count: prefs.count,
-            format: pick(&FORMATS, &prefs.format, &defaults.format),
-            timeout_ms: prefs.timeout_ms,
-            scan_timeout_ms: prefs.scan_timeout_ms,
-            forward_codec: pick(&CODECS, &prefs.forward_codec, &defaults.forward_codec),
-            forward_encoder: prefs.forward_encoder,
-            forward_fps: prefs.forward_fps,
-            forward_bitrate: prefs.forward_bitrate,
-            forward_file_mib: prefs.forward_file_mib,
-            quota_gib: prefs.quota_gib,
-            quota_files: prefs.quota_files,
-            retention_enabled: prefs.retention_enabled,
-            retention_days: prefs.retention_days,
-            quota_action: pick(&ON_FULL, &prefs.quota_action, &defaults.quota_action),
+            count: 0,
+            format: "",
+            timeout_ms: 0,
+            scan_timeout_ms: 0,
+            forward_codec: "",
+            forward_encoder: String::new(),
+            forward_fps: 0.0,
+            forward_bitrate: String::new(),
+            forward_file_mib: 0.0,
+            quota_gib: 0.0,
+            quota_files: 0,
+            retention_enabled: false,
+            retention_days: 0,
+            quota_action: "",
             schedule_enabled: false,
-            schedule_delay_seconds: prefs.schedule_delay_seconds,
-            schedule_interval_seconds: prefs.schedule_interval_seconds,
-            output: prefs.output,
-            forward_output: prefs.forward_output,
+            schedule_delay_seconds: 0,
+            schedule_interval_seconds: 0.0,
+            output: String::new(),
+            forward_output: String::new(),
             drafts: HashMap::new(),
             balance: crate::auto::DEFAULT_BALANCE,
             balance_dragging: false,
@@ -1103,18 +1051,9 @@ impl Workbench {
             storage_status: Default::default(),
             auto_changes_open: false,
             system_dark: false,
-            // CAPTUREFAB_APPEARANCE=light|dark overrides the system, e.g. for screenshots.
-            appearance: match std::env::var("CAPTUREFAB_APPEARANCE").as_deref() {
-                Ok("light") => Appearance::Light,
-                Ok("dark") => Appearance::Dark,
-                _ => prefs.appearance,
-            },
-            ui_scale: match std::env::var("CAPTUREFAB_UI_SCALE").as_deref() {
-                Ok("large") => UiScale::Large,
-                Ok("larger") => UiScale::Larger,
-                _ => prefs.ui_scale,
-            },
-            performance: prefs.performance,
+            appearance: Appearance::System,
+            ui_scale: UiScale::Standard,
+            performance: Default::default(),
             performance_state: Default::default(),
             screenshot: None,
             logs_open: prefs.logs_open,
@@ -1132,10 +1071,7 @@ impl Workbench {
             fit: true,
             zoom: 1.0,
             stage: Cell::new(Size::new(800.0, 600.0)),
-            grid: Cell::new(None),
-            grid_scroll: 0.0,
             exposure_open: prefs.exposure_open,
-            focus_camera: false,
             exposure: None,
             measured: (Measured::default(), Measured::default()),
             focus: scopes::FocusMeter::new(
@@ -1156,7 +1092,6 @@ impl Workbench {
             frame_id: None,
             frame_limits: None,
             display_error: None,
-            previews: HashMap::new(),
             camera_views: HashMap::new(),
             throughput: HashMap::new(),
             liveness: HashMap::new(),
@@ -1167,14 +1102,17 @@ impl Workbench {
             copied: None,
             last_saved: None,
             last_recording: None,
-            auto_start: prefs.auto_start,
-            tags: prefs.tags,
+            auto_start: false,
+            tags: Default::default(),
             dataset,
             signals,
-            recent: prefs.recent,
+            recent: Vec::new(),
             saved,
             prefs_saver: prefs::Saver::new(),
             closing: None,
+            sole: true,
+            settings_elsewhere: None,
+            retired: false,
             quit_signal: Arc::default(),
             close_error: None,
             prefs_changed: None,
@@ -1203,13 +1141,12 @@ impl Workbench {
             shutter: Motion::new(0.0, motion::SHUTTER, motion::SHUTTER, Kind::Fade),
             // Replaced at once when a camera connects; it enters afresh each time.
             welcome: Motion::new(0.0, motion::WELCOME, Duration::ZERO, Kind::Fade),
-            sidebar_open: prefs.sidebar_open,
             inspector_open: prefs.inspector_open,
             inspector_peek: false,
             inspector_summoned: false,
             stashed_record: None,
             stashed_stream: String::new(),
-            stream_draft,
+            stream_draft: false,
             image_mode: false,
             width: 1280.0,
             height: 840.0,
@@ -1217,13 +1154,6 @@ impl Workbench {
             fullscreen: false,
             pointer_moved: None,
             over_controls: false,
-            hovered_tile: None,
-            sidebar_slide: Motion::new(
-                shown(prefs.sidebar_open),
-                motion::PANEL,
-                motion::PANEL_OUT,
-                Kind::Move,
-            ),
             inspector_slide: Motion::new(
                 shown(prefs.inspector_open && !quiet),
                 motion::PANEL,
@@ -1232,9 +1162,6 @@ impl Workbench {
             ),
             bars: Motion::new(1.0, motion::IMAGE, motion::IMAGE_OUT, Kind::Move),
             controls: Motion::new(0.0, motion::CONTROLS_IN, motion::CONTROLS_OUT, Kind::Fade),
-            tile_hover: Motion::new(0.0, motion::HOVER, motion::HOVER_OUT, Kind::Fade),
-            ring: Motion::new(1.0, motion::RING, motion::RING_OUT, Kind::Fade),
-            ring_from: None,
             chrome: Default::default(),
             side: Default::default(),
             stage_ui: Default::default(),
@@ -1244,10 +1171,60 @@ impl Workbench {
             assistant: Default::default(),
             sheets: Default::default(),
         };
+        bench.adopt(&prefs);
+        bench.include_simulator |= simulated;
+        // CAPTUREFAB_APPEARANCE=light|dark overrides the system, e.g. for screenshots.
+        match std::env::var("CAPTUREFAB_APPEARANCE").as_deref() {
+            Ok("light") => bench.appearance = Appearance::Light,
+            Ok("dark") => bench.appearance = Appearance::Dark,
+            _ => {}
+        }
+        match std::env::var("CAPTUREFAB_UI_SCALE").as_deref() {
+            Ok("large") => bench.ui_scale = UiScale::Large,
+            Ok("larger") => bench.ui_scale = UiScale::Larger,
+            _ => {}
+        }
         bench.restore_open_sections(&open_sections);
         performance::start(bench.performance);
         bench.sync_performance();
         bench
+    }
+
+    fn adopt(&mut self, prefs: &Prefs) {
+        let defaults = Prefs::default();
+        let pick = |choices: &[Choice], value: &str, fallback: &str| {
+            find(choices, value)
+                .or_else(|| find(choices, fallback))
+                .map_or("", |choice| choice.value)
+        };
+        self.appearance = prefs.appearance;
+        self.ui_scale = prefs.ui_scale;
+        self.performance = prefs.performance;
+        self.include_simulator = prefs.include_simulator;
+        self.count = prefs.count;
+        self.format = pick(&FORMATS, &prefs.format, &defaults.format);
+        self.timeout_ms = prefs.timeout_ms;
+        self.scan_timeout_ms = prefs.scan_timeout_ms;
+        self.forward_codec = pick(&CODECS, &prefs.forward_codec, &defaults.forward_codec);
+        self.forward_encoder = prefs.forward_encoder.clone();
+        self.forward_fps = prefs.forward_fps;
+        self.forward_bitrate = prefs.forward_bitrate.clone();
+        self.forward_file_mib = prefs.forward_file_mib;
+        self.quota_gib = prefs.quota_gib;
+        self.quota_files = prefs.quota_files;
+        self.retention_enabled = prefs.retention_enabled;
+        self.retention_days = prefs.retention_days;
+        self.quota_action = pick(&ON_FULL, &prefs.quota_action, &defaults.quota_action);
+        self.schedule_delay_seconds = prefs.schedule_delay_seconds;
+        self.schedule_interval_seconds = prefs.schedule_interval_seconds;
+        self.output = prefs.output.clone();
+        self.forward_output = prefs.forward_output.clone();
+        // A saved stream URL opens the Video tab in Stream mode, and keeps it
+        // there while the URL is cleared and retyped.
+        self.stream_draft = !Output::of(&self.forward_output).recording();
+        self.auto_start = prefs.auto_start;
+        self.tags = prefs.tags.clone();
+        self.recent = prefs.recent.clone();
     }
 
     fn prefs(&self) -> Prefs {
@@ -1261,7 +1238,6 @@ impl Workbench {
             focus_open: self.focus.open,
             focus_region: self.focus.saved_region(),
             focus_metric: self.focus.metric,
-            sidebar_open: self.sidebar_open,
             inspector_open: self.inspector_open,
             output: self.output.clone(),
             format: self.format.into(),
@@ -1337,6 +1313,23 @@ impl Workbench {
         if self.assistant.tasks.active() {
             return self.guard_assistant_quit(target);
         }
+        if matches!(target, CloseTarget::Quit) && !self.sole {
+            return Task::done(Message::QuitAll);
+        }
+        if matches!(target, CloseTarget::Window)
+            && self
+                .snapshot
+                .forwarding
+                .as_deref()
+                .is_some_and(crate::media::is_recording)
+            && !self.recording_close_confirmed()
+        {
+            return self.confirm_recording_close();
+        }
+        self.flush(target)
+    }
+
+    fn flush(&mut self, target: CloseTarget) -> Task<Message> {
         self.dismiss_close_error();
         self.closing = Some(target);
         self.assistant.settings.clear_secret();
@@ -1412,14 +1405,6 @@ impl Workbench {
         style::window_theme(self.dark(), self.key_window == Some(id))
     }
 
-    fn selection_emphasized(&self, area: keyboard_history::Area) -> bool {
-        self.key_window == Some(self.main_window)
-            && !self.sheet_open()
-            && self.close_error.is_none()
-            && self.closing.is_none()
-            && self.content_focus == area
-    }
-
     fn subscription(&self) -> Subscription<Message> {
         let streaming = self.snapshot.cameras.iter().any(|camera| camera.streaming);
         // Pending commands (connecting, discovering) tick fast enough to
@@ -1450,7 +1435,12 @@ impl Workbench {
         };
         // Redraws also measure the display until its refresh rate is known.
         let frames = if self.animating() || !self.refresh.calibrated() {
-            window::frames().map(Message::Frame)
+            event::listen_raw(|event, _, window| match event {
+                iced::Event::Window(window::Event::RedrawRequested(at)) => Some((window, at)),
+                _ => None,
+            })
+            .with(self.main_window)
+            .filter_map(|(main, (window, at))| (window == main).then_some(Message::Frame(at)))
         } else {
             Subscription::none()
         };
@@ -1470,62 +1460,9 @@ impl Workbench {
             frames,
             arrivals,
             time::every(interval).map(|_| Message::Tick),
-            event::listen_with(|event, status, window| {
-                let message = match event {
-                iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocused(window)),
-                iced::Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(window)),
-                iced::Event::Window(window::Event::CloseRequested) => {
-                    Some(Message::CloseRequested(window))
-                }
-                iced::Event::Window(
-                    window::Event::Opened { .. }
-                    | window::Event::Moved(_)
-                    | window::Event::Rescaled(_),
-                ) => Some(Message::Displaced),
-                // The widget guard routes Escape after inspecting the active
-                // popup. A captured popup Escape closes only that popup.
-                iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
-                    modifiers,
-                    ..
-                }) if modifiers.is_empty() => None,
-                iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(keyboard::key::Named::Tab),
-                    modifiers,
-                    ..
-                }) if status == event::Status::Ignored
-                    && !modifiers.control()
-                    && !modifiers.logo()
-                    && !modifiers.alt() =>
-                {
-                    Some(Message::FocusNext(modifiers.shift()))
-                }
-                iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                    key,
-                    physical_key,
-                    modifiers,
-                    ..
-                }) => keys::chord(&key, physical_key, modifiers, Os::CURRENT).map(|chord| {
-                    Message::Key {
-                        chord,
-                        captured: status == event::Status::Captured,
-                    }
-                }),
-                _ => None,
-                };
-                message.map(|message| Message::InWindow(window, Box::new(message)))
-            }).with(self.desktop_menu.active()).filter_map(|(active, message)| {
-                if active && matches!(&message, Message::InWindow(_, inner) if matches!(**inner, Message::Key { .. } | Message::FocusNext(_))) {
-                    None
-                } else {
-                    Some(message)
-                }
-            }),
-            system::theme_changes().map(Message::SystemTheme),
-            window::resize_events().map(|(id, size)| Message::InWindow(id, Box::new(Message::Resized(size)))),
-            motion::accessibility_subscription(),
-            menus::subscription(),
-            self.accessibility.subscription().map(Message::AccessibilityRequest),
+            self.accessibility
+                .subscription()
+                .map(Message::AccessibilityRequest),
         ])
     }
 
@@ -1614,10 +1551,6 @@ impl Workbench {
             | SessionCommand::Status => None,
             _ => acts_on.as_deref(),
         };
-        let selected = match &command {
-            SessionCommand::Select { camera } => Some(camera.clone()),
-            _ => None,
-        };
         let receiver = match target {
             Some(camera) => {
                 self.handle
@@ -1627,9 +1560,6 @@ impl Workbench {
                 .handle
                 .submit_as(command, ActivityOrigin::Gui, self.actor.clone()),
         }?;
-        if let Some(camera) = selected {
-            self.local_camera = Some(camera);
-        }
         self.give_way();
         self.pending.push(Pending {
             receiver,
@@ -1717,14 +1647,6 @@ impl Workbench {
         code_block(command, copied, p)
     }
 
-    /// Whether auto mode is being switched or tuned on any camera; for the
-    /// overview's Auto all.
-    fn auto_busy(&self) -> bool {
-        self.pending.iter().any(|p| p.job.is_auto())
-            || self.client_pending(&Job::AutoOn, None)
-            || self.client_pending(&Job::AutoOff, None)
-    }
-
     /// Whether auto mode is being switched or tuned on the selected camera,
     /// which its Auto controls go by. Each camera has its own worker, so
     /// another camera's command never holds them up.
@@ -1740,11 +1662,12 @@ impl Workbench {
     }
 
     fn title(&self) -> String {
-        let shown = if self.overview() {
-            Some("All cameras".to_owned())
-        } else {
-            self.snapshot.connected.as_ref().map(|c| c.model.clone())
-        };
+        let shown = self.snapshot.connected.as_ref().map(|camera| {
+            match twin_identity(&self.snapshot.cameras, camera) {
+                Some(identity) => format!("{} · {identity}", camera.model),
+                None => camera.model.clone(),
+            }
+        });
         match shown {
             None => "Capturefab".into(),
             Some(shown) if cfg!(target_os = "macos") => shown,
@@ -1756,14 +1679,13 @@ impl Workbench {
         if self.fullscreen { 0.0 } else { LIGHTS }
     }
 
-    /// How often new frames are shown at most: once a refresh, or the
-    /// overview's slower interval; efficiency mode slows both.
+    /// How often new frames are shown at most: once a refresh, slower in
+    /// efficiency mode.
     fn frame_interval(&self) -> Duration {
-        let floor = match (self.overview(), performance::efficient()) {
-            (false, false) => Duration::ZERO,
-            (true, false) => OVERVIEW_INTERVAL,
-            (false, true) => EFFICIENT_INTERVAL,
-            (true, true) => EFFICIENT_OVERVIEW_INTERVAL,
+        let floor = if performance::efficient() {
+            EFFICIENT_INTERVAL
+        } else {
+            Duration::ZERO
         };
         self.refresh.period().max(floor)
     }
@@ -1774,10 +1696,6 @@ impl Workbench {
     /// a whole extra refresh.
     fn frame_gap(&self) -> Duration {
         self.frame_interval() - self.refresh.period() / 4
-    }
-
-    fn overview(&self) -> bool {
-        self.snapshot.cameras.len() > 1 && !self.focus_camera
     }
 
     fn poll(&mut self) {
@@ -1942,7 +1860,6 @@ impl Workbench {
         self.age_copied();
         self.prune_flashes();
         self.poll_accessibility();
-        let selected = self.snapshot.active_camera.clone();
         // Out of sight, with no command of its own on the way, nobody is
         // looking: stopped cameras' workers are then polled at the idle rate.
         self.snapshot = if self.frames_paused() && self.pending.is_empty() {
@@ -1953,10 +1870,6 @@ impl Workbench {
         self.project_local_camera();
         self.scene.patch(&mut self.snapshot);
         self.sync_camera_history();
-        if self.snapshot.active_camera != selected {
-            self.ring_from = selected;
-            self.ring.replay(0.0, 1.0, self.now);
-        }
         self.sync_shared_editors();
         if let Some(status) = &self.snapshot.auto
             && !self.balance_dragging
@@ -2059,87 +1972,7 @@ impl Workbench {
                 .iter()
                 .any(|camera| &camera.info.id == id)
         });
-        if self.overview() {
-            self.update_previews();
-            if self.frame_id.take().is_some() {
-                self.gpu.retire(MAIN_VIEW);
-            }
-        } else {
-            self.update_frame(true);
-            for key in self.previews.drain().map(|(key, _)| key) {
-                self.gpu.retire(&key);
-            }
-        }
-    }
-
-    fn update_previews(&mut self) {
-        let snapshot = &self.snapshot;
-        let gpu = &self.gpu;
-        self.previews.retain(|id, _| {
-            let kept = snapshot.cameras.iter().any(|camera| &camera.info.id == id);
-            if !kept {
-                gpu.retire(id);
-            }
-            kept
-        });
-        let grid = self.grid.get();
-        let (count, scale) = (snapshot.cameras.len(), self.main_scale());
-        let (most, shrink_for_gpu) = if performance::efficient() {
-            (EFFICIENT_SIDE, preview::Shrink::Larger)
-        } else {
-            (TILE_SIDE, preview::Shrink::UnderHalf)
-        };
-        for (index, camera) in snapshot.cameras.iter().enumerate() {
-            let id = &camera.info.id;
-            if grid.is_some_and(|grid| !grid.shows(index, count, self.grid_scroll)) {
-                // Scrolled out: nothing pulled from the ring or converted, and
-                // no frame held for a GPU view that is not drawn. Shown again
-                // when it scrolls back in, without counting as a new frame.
-                if let Some(preview) = self.previews.get_mut(id)
-                    && matches!(preview.shown, Some(Shown::Gpu { .. }))
-                    && preview.limits.take().is_some()
-                {
-                    gpu.retire(id);
-                }
-                continue;
-            }
-            let Some(frame) = self.handle.latest_frame_for(id) else {
-                continue;
-            };
-            let tile = grid.map_or(Size::new(640.0, 480.0), |grid| grid.tile);
-            let native = Size::new(frame.width as f32, frame.height as f32);
-            let limits = preview::Limits {
-                shrink_for_gpu,
-                ..preview::Limits::shown(&frame, preview::fit_scale(tile, native) * scale, most)
-            };
-            let preview = self.previews.entry(id.clone()).or_default();
-            let fresh = preview.frame_id != Some(frame.id);
-            if !fresh && preview.limits == Some(limits) {
-                continue;
-            }
-            (preview.frame_id, preview.limits) = (Some(frame.id), Some(limits));
-            if fresh {
-                liveness::seen(&mut self.liveness, self.scene.frozen.as_ref(), id, self.now);
-            }
-            let meta = (frame.id, frame.width, frame.height, frame.pixel_format);
-            let state = self.camera_views.entry(id.clone()).or_default();
-            let shown = camera_view::present(
-                gpu,
-                &mut preview.shown,
-                state,
-                (camera.info.profile.kind, &camera.features),
-                id,
-                frame,
-                limits,
-            );
-            match shown {
-                Ok(()) => {
-                    preview.meta = Some(meta);
-                    preview.error = None;
-                }
-                Err(error) => preview.error = Some(error.to_string()),
-            }
-        }
+        self.update_frame(true);
     }
 
     /// Show the selected camera's newest frame, and its current frame again
@@ -2330,6 +2163,20 @@ impl Workbench {
             self.edits.clear();
             self.edit_sources.clear();
         }
+    }
+
+    /// The first simulated camera not connected yet.
+    fn free_simulator(&self) -> String {
+        (0..)
+            .map(|index| format!("sim:{index}"))
+            .find(|id| {
+                !self
+                    .snapshot
+                    .cameras
+                    .iter()
+                    .any(|camera| &camera.info.id == id)
+            })
+            .expect("a free simulated camera")
     }
 
     fn connecting(&self, id: &str) -> bool {
@@ -2585,30 +2432,6 @@ impl Workbench {
         }
     }
 
-    fn select_relative_camera(&mut self, step: isize) {
-        let count = self.snapshot.cameras.len();
-        if count < 2 {
-            return;
-        }
-        let current = self
-            .snapshot
-            .cameras
-            .iter()
-            .position(|camera| self.snapshot.active_camera.as_ref() == Some(&camera.info.id))
-            .unwrap_or(0);
-        let next = (current as isize + step).rem_euclid(count as isize) as usize;
-        let camera = self.snapshot.cameras[next].info.id.clone();
-        self.send(Job::Select, SessionCommand::Select { camera });
-    }
-
-    /// Open one camera from the overview, selecting it first if needed.
-    fn focus_tile(&mut self, camera: String) {
-        self.focus_camera = true;
-        if self.snapshot.active_camera.as_ref() != Some(&camera) {
-            self.send(Job::Select, SessionCommand::Select { camera });
-        }
-    }
-
     fn toggle_exposure(&mut self) {
         if !self.intensity_image() || self.camera_kind() == CameraKind::LineScan {
             return;
@@ -2683,9 +2506,7 @@ impl Workbench {
         if let Some(zoom) = zoom {
             self.zoom = zoom;
         }
-        if !self.overview() {
-            self.update_frame(false);
-        }
+        self.update_frame(false);
     }
 
     fn storage_policy(&self) -> StoragePolicy {
@@ -2708,10 +2529,10 @@ impl Workbench {
     fn copy_session_command(&mut self, announce: bool) -> Task<Message> {
         let command = self.session_command();
         if announce {
-            // With the camera list closed, its session control cannot
-            // confirm in place, so the toolbar must, even over an error.
-            // Image mode hides the toolbar too, so the error stays.
-            if !self.sidebar_open && !self.image_mode {
+            // The welcome screen's session control confirms in place; else
+            // the toolbar must, even over an error. Image mode hides the
+            // toolbar too, so the error stays.
+            if self.snapshot.connected.is_some() && !self.image_mode {
                 self.give_way();
             }
             self.set_notice("Session command copied", None, Level::Done);
@@ -2837,9 +2658,6 @@ impl Workbench {
                     {
                         return Task::none();
                     }
-                    Message::ContentFocused(_) if id != self.main_window => {
-                        return Task::none();
-                    }
                     Message::Resized(_) if id != self.main_window => {
                         return Task::none();
                     }
@@ -2864,7 +2682,6 @@ impl Workbench {
                 | Message::Redrawn
                 | Message::Pointer
                 | Message::OverControls(_)
-                | Message::HoverTile(_)
         );
         // An assistive technology hears of new state on the next draw. New
         // frames alone wait for its throttle; pointer input tells it itself.
@@ -2906,7 +2723,7 @@ impl Workbench {
         self.sync_performance();
         self.sync_animations();
         self.follow_frames();
-        if !frame_only {
+        if !frame_only && self.key_window.is_some() {
             menus::sync(self);
         }
         task
@@ -2914,7 +2731,7 @@ impl Workbench {
 
     fn handle_message(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::InWindow(_, _) | Message::NativeInput { .. } => {
+            Message::InWindow(_, _) | Message::NativeInput { .. } | Message::From(_, _) => {
                 unreachable!("window and native edit messages are unwrapped before update")
             }
             Message::WindowOpened(id)
@@ -3017,31 +2834,38 @@ impl Workbench {
             Message::CloseRequested(id)
                 if id == self.main_window && self.assistant.tasks.active() =>
             {
-                return self.guard_assistant_quit(CloseTarget::Window(id));
+                return self.guard_assistant_quit(CloseTarget::Window);
             }
             Message::CloseRequested(id) if id == self.main_window && self.sheet_open() => {
                 return self.dispatch_action(Action::Overview);
             }
-            Message::CloseRequested(id) => return self.close(CloseTarget::Window(id)),
+            Message::CloseRequested(_) => return self.close(CloseTarget::Window),
             Message::Quit => return self.close(CloseTarget::Quit),
             Message::PrefsFlushed(result) => {
                 let target = self.closing.take();
                 match result {
                     Ok(()) => {
-                        return match target {
-                            Some(target) => {
-                                if let CloseTarget::Window(id) = target {
-                                    debug_assert_eq!(id, self.main_window);
-                                }
-                                let mut detach =
-                                    vec![self.accessibility.detach(self.main_window).discard()];
-                                if let Some(id) = self.settings_window {
-                                    detach.push(self.accessibility.detach(id).discard());
-                                }
-                                Task::batch(detach).chain(iced::exit())
-                            }
-                            None => Task::none(),
+                        let Some(target) = target else {
+                            return Task::none();
                         };
+                        let windows: Vec<_> = std::iter::once(self.main_window)
+                            .chain(self.settings_window)
+                            .collect();
+                        let detach = Task::batch(
+                            windows
+                                .iter()
+                                .map(|id| self.accessibility.detach(*id).discard()),
+                        );
+                        if self.sole {
+                            return detach.chain(iced::exit());
+                        }
+                        if matches!(target, CloseTarget::Window)
+                            && let Some(camera) = self.local_camera.clone()
+                        {
+                            self.send_to(&camera, Job::Disconnect, SessionCommand::Disconnect);
+                        }
+                        self.retired = true;
+                        return detach.chain(Task::batch(windows.into_iter().map(window::close)));
                     }
                     Err(error) => {
                         self.set_notice(
@@ -3068,8 +2892,12 @@ impl Workbench {
                 self.window_editor_focus.insert(self.focused_window, value);
                 self.menu_editor = value;
             }
-            Message::ContentFocused(area) => self.content_focus = area,
             Message::PopupOpen(value) => self.popup_open = value,
+            Message::Settings(true) if self.settings_elsewhere.is_some() => {
+                return self
+                    .settings_elsewhere
+                    .map_or_else(Task::none, window::gain_focus);
+            }
             Message::Settings(open) => {
                 if open && !self.settings_open && self.sheet_open() {
                     return Task::none();
@@ -3128,6 +2956,16 @@ impl Workbench {
                         return operation::focus("sheet-close");
                     }
                 }
+            }
+            Message::NewWindow => return self.enter_address(),
+            Message::QuitAll => return self.flush(CloseTarget::Quit),
+            Message::Adopt(prefs) => {
+                self.adopt(&prefs);
+                self.dataset.path = prefs.dataset_path.clone();
+                self.dataset.auto = prefs.dataset_auto;
+                self.signals.recent = prefs.recent_signals.clone();
+                self.video_analytics.preferences = prefs.video_analytics.clone();
+                self.saved = self.saved.take().map(|saved| (*prefs).with_layout(&saved));
             }
             Message::Appearance(value) => self.appearance = value,
             Message::UiScale(value) => self.ui_scale = value,
@@ -3265,15 +3103,15 @@ impl Workbench {
             }
             Message::TrySimulator => {
                 self.include_simulator = true;
-                self.connect("sim:0".into());
+                self.connect(self.free_simulator());
             }
             Message::EnterAddress => return self.enter_address(),
             Message::Forget(target) => self.recent.retain(|recent| recent.target != target),
             Message::CameraRow(id) => {
-                if !self.snapshot.cameras.iter().any(|c| c.info.id == id) {
+                if self.snapshot.cameras.iter().any(|c| c.info.id == id) {
+                    self.show_camera(Some(id));
+                } else {
                     self.connect(id);
-                } else if self.snapshot.active_camera.as_ref() != Some(&id) {
-                    self.send(Job::Select, SessionCommand::Select { camera: id });
                 }
             }
             Message::Disconnect(id) => {
@@ -3296,15 +3134,7 @@ impl Workbench {
             }
             Message::ToggleStream => self.toggle_stream(),
             Message::Capture => self.capture(),
-            Message::Focus(focus) => self.focus_camera = focus,
-            Message::Select(camera) => self.send(Job::Select, SessionCommand::Select { camera }),
-            Message::StreamCamera(id, start) => {
-                if start {
-                    self.send_to(&id, Job::Start, SessionCommand::Start);
-                } else {
-                    self.send_to(&id, Job::Stop, SessionCommand::Stop);
-                }
-            }
+            Message::Select(camera) => self.show_camera(Some(camera)),
             Message::AllStreams(start) => {
                 let cameras = self
                     .snapshot
@@ -3374,13 +3204,6 @@ impl Workbench {
             }
             Message::FocusRegionEnd => self.remeasure_focus(Duration::ZERO),
             Message::AdjustExposure => return self.adjust_exposure(),
-            Message::OverviewScrolled(offset) => {
-                self.grid_scroll = offset;
-                // Tiles scrolled into view show their newest frame at once.
-                if self.overview() {
-                    self.update_previews();
-                }
-            }
             Message::FocusMetric(metric) => self.focus.set_metric(metric),
             Message::ResetFocusPeak => {
                 self.focus.reset();
@@ -3395,9 +3218,7 @@ impl Workbench {
             Message::CameraActivity(camera) => {
                 self.logs_open = true;
                 self.image_mode = false;
-                if self.snapshot.active_camera.as_ref() != Some(&camera) {
-                    self.send(Job::Select, SessionCommand::Select { camera });
-                }
+                self.show_camera(Some(camera));
             }
             Message::CopyLog => {
                 self.note_copied(notice::COPIED_LOG);
@@ -3552,10 +3373,6 @@ impl Workbench {
                 }
                 return self.picker(true, message);
             }
-            Message::ToggleSidebar => {
-                self.image_mode = false;
-                self.sidebar_open = !self.sidebar_open;
-            }
             Message::ToggleInspector => {
                 self.image_mode = false;
                 if self.inspector_docked() && self.first_run_quiet() && !self.inspector_summoned {
@@ -3596,27 +3413,6 @@ impl Workbench {
             }
             Message::Pointer => self.wake_controls(),
             Message::OverControls(over) => self.over_controls = over,
-            Message::HoverTile(id) => {
-                if id.is_some() && id != self.hovered_tile {
-                    self.tile_hover.replay(0.0, 1.0, self.now);
-                }
-                self.hovered_tile = id;
-            }
-            Message::FocusTile(camera) => self.focus_tile(camera),
-            Message::ShowScopeOn(camera, scope) => {
-                match scope {
-                    Scope::Histogram if !self.exposure_open => self.toggle_exposure(),
-                    Scope::Focus if !self.focus.open => self.toggle_focus_region(),
-                    _ => {}
-                }
-                self.focus_tile(camera);
-            }
-            Message::CaptureCamera(id) => {
-                if !self.pending_for(Job::Capture, &id) {
-                    let command = self.capture_command_for(false, Some(&id));
-                    self.send_to(&id, Job::Capture, command);
-                }
-            }
             Message::AllCapture => {
                 let cameras = self
                     .snapshot
@@ -3808,7 +3604,6 @@ impl Workbench {
             Action::CloseWindow => return Task::done(Message::CloseRequested(self.focused_window)),
             // Sheets take the keyboard until they close.
             _ if modal => {}
-            Action::ToggleSidebar => return self.handle_message(Message::ToggleSidebar),
             Action::ToggleInspector => return self.handle_message(Message::ToggleInspector),
             Action::Overview if self.image_mode => self.image_mode = false,
             Action::Overview if self.inspector_peek => self.inspector_peek = false,
@@ -3817,12 +3612,11 @@ impl Workbench {
             Action::ToggleFocusRegion => self.toggle_focus_region(),
             Action::Discover => self.discover(),
             Action::ConnectAddress => return self.enter_address(),
-            Action::NextCamera => self.select_relative_camera(1),
-            Action::PreviousCamera => self.select_relative_camera(-1),
-            Action::FocusCamera if self.overview() => self.focus_camera = true,
-            Action::Overview if self.snapshot.cameras.len() > 1 => self.focus_camera = false,
+            Action::NewWindow if self.local_camera.is_none() => return self.enter_address(),
+            Action::NewWindow => return Task::done(Message::NewWindow),
             Action::ToggleStream if connected => self.toggle_stream(),
             Action::Capture if connected => self.capture(),
+            Action::CaptureAll if connected => return self.handle_message(Message::AllCapture),
             Action::Record if connected => self.record(),
             Action::ToggleAuto if connected => self.toggle_auto(),
             Action::SearchFeatures => {
@@ -3899,13 +3693,6 @@ impl Workbench {
         let p = self.window_palette(self.main_window);
         // iced omits zero-width row children. Keep opening panes in the tree
         // immediately so focus commands reach them before animation advances.
-        let sidebar = self.sidebar_slide.lerp(0.0, SIDEBAR, self.now).max(
-            if self.sidebar_slide.target() > 0.5 {
-                1.0
-            } else {
-                0.0
-            },
-        );
         let inspector = self.inspector_slide.lerp(0.0, INSPECTOR, self.now).max(
             if self.inspector_slide.target() > 0.5 {
                 1.0
@@ -3915,24 +3702,12 @@ impl Workbench {
         );
         let inspector_visible = inspector > 0.5 || self.inspector_slide.target() > 0.5;
         let docked = self.inspector_docked();
-        let mut body = row![];
-        // Also while it heads open, so focusing its address field finds it.
-        if sidebar > 0.5 || self.sidebar_slide.target() > 0.5 {
-            // Anchored right, so the list slides out under the window's left edge.
-            body = body.push(
-                container(self.sidebar(p))
-                    .width(sidebar)
-                    .height(Fill)
-                    .align_right(sidebar)
-                    .clip(true),
-            );
-        }
-        body = body.push(
+        let mut body = row![
             container(self.main(p))
                 .width(Fill)
                 .height(Fill)
                 .style(style::base),
-        );
+        ];
         if docked && inspector_visible {
             body = body.push(rule::vertical(1).style(style::line)).push(
                 container(self.inspector(p))
@@ -3966,7 +3741,7 @@ impl Workbench {
             .push(shader(self.gpu.probe()).width(1).height(1))
             .into();
         let body = self.desktop_menus(body, p);
-        keyboard_history::main_guard(
+        keyboard_history::guard(
             self.sheets(body, p),
             if self.focused_window == self.main_window {
                 self.menu_edit
@@ -3974,10 +3749,6 @@ impl Workbench {
                 None
             },
             self.desktop_menu.active(),
-            self.sheet_open()
-                || self.close_error.is_some()
-                || self.assistant.quit.is_some()
-                || self.closing.is_some(),
         )
     }
 
@@ -3999,16 +3770,8 @@ impl Workbench {
     }
 
     fn main(&self, p: &'static Palette) -> Element<'_, Message> {
-        let content = if self.overview() {
-            self.overview_view(p)
-        } else {
-            self.single_view(p)
-        };
         // Always a stack, so the hint coming and going keeps the views' state.
-        let content = keyboard_history::content_scope(
-            stack![content, self.image_hint()].into(),
-            keyboard_history::Area::Image,
-        );
+        let content = stack![self.single_view(p), self.image_hint()];
         let bars = self.bars.get(self.now);
         let mut main = column![content];
         let activity = self.activity_slide.lerp(0.0, 171.0, self.now) * bars;
@@ -4084,29 +3847,22 @@ mod tests {
         }
 
         for width in [1280.0, 900.0] {
-            for action in [Action::SearchFeatures, Action::ConnectAddress] {
-                let mut app = Workbench::new(
-                    SessionHandle::new(),
-                    "test".into(),
-                    false,
-                    Some(Prefs {
-                        inspector_open: false,
-                        sidebar_open: false,
-                        ..Prefs::default()
-                    }),
-                );
-                app.width = width;
-                app.snapshot.connected = Some(crate::transport::simulator::info());
-                let before = editors(&Tree::new(app.view().as_widget()));
-                let _ = app.dispatch_action(action);
-                app.sync_animations();
-                let after = editors(&Tree::new(app.view().as_widget()));
-                assert_eq!(
-                    after,
-                    before + 1,
-                    "{action:?} is reachable at width {width}"
-                );
-            }
+            let mut app = Workbench::new(
+                SessionHandle::new(),
+                "test".into(),
+                false,
+                Some(Prefs {
+                    inspector_open: false,
+                    ..Prefs::default()
+                }),
+            );
+            app.width = width;
+            app.snapshot.connected = Some(crate::transport::simulator::info());
+            let before = editors(&Tree::new(app.view().as_widget()));
+            let _ = app.dispatch_action(Action::SearchFeatures);
+            app.sync_animations();
+            let after = editors(&Tree::new(app.view().as_widget()));
+            assert_eq!(after, before + 1, "search is reachable at width {width}");
         }
     }
 
@@ -4143,7 +3899,7 @@ mod tests {
             assert!(app.closing.is_none());
             assert_eq!(app.address, "unfinished camera draft");
             let _ = app.update(Message::CloseRequested(app.main_window));
-            assert!(matches!(app.closing, Some(CloseTarget::Window(id)) if id == app.main_window));
+            assert!(matches!(app.closing, Some(CloseTarget::Window)));
         }
     }
 
@@ -4190,9 +3946,9 @@ mod tests {
         let settings = window::Id::unique();
         app.settings_window = Some(settings);
         app.focused_window = settings;
-        let original = app.sidebar_open;
-        let _ = app.dispatch_action(Action::ToggleSidebar);
-        assert_eq!(app.sidebar_open, original);
+        let original = app.logs_open;
+        let _ = app.dispatch_action(Action::ToggleActivity);
+        assert_eq!(app.logs_open, original);
         assert!(app.closing.is_none());
     }
 
@@ -4212,7 +3968,7 @@ mod tests {
     #[test]
     fn close_freezes_changes_and_recovers_after_a_failed_preference_flush() {
         let mut app = Workbench::new(SessionHandle::new(), "test".into(), false, None);
-        let _ = app.close(CloseTarget::Window(app.main_window));
+        let _ = app.close(CloseTarget::Window);
         let original = app.include_simulator;
         let _ = app.update(Message::IncludeSimulator(!original));
         assert_eq!(app.include_simulator, original);
@@ -4221,10 +3977,10 @@ mod tests {
         assert!(app.notice.is_some());
         let error = app.close_error.as_ref().unwrap();
         assert_eq!(error.window, app.main_window);
-        assert!(matches!(error.target, CloseTarget::Window(id) if id == app.main_window));
+        assert!(matches!(error.target, CloseTarget::Window));
         let _ = app.update(Message::RetryClose);
         assert!(app.close_error.is_none());
-        assert!(matches!(app.closing, Some(CloseTarget::Window(id)) if id == app.main_window));
+        assert!(matches!(app.closing, Some(CloseTarget::Window)));
     }
 
     #[test]
@@ -4468,13 +4224,14 @@ mod tests {
     }
 
     #[test]
-    fn invalid_visible_drafts_block_buttons_shortcuts_and_tile_captures() {
+    fn invalid_visible_drafts_block_buttons_shortcuts_and_batch_captures() {
         let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        bench.snapshot.cameras = vec![liveness::streaming_camera(0, 0, 0.0)];
         bench.drafts.insert(Num::Count, "invalid".into());
         assert_eq!(bench.count, 1, "an old valid value is still stored");
         assert!(bench.validate_input(&bench.capture_command(false)).is_err());
         bench.capture();
-        let _ = bench.handle_message(Message::CaptureCamera("sim:0".into()));
+        let _ = bench.handle_message(Message::AllCapture);
         let _ = bench.handle_message(Message::Schedule);
         assert!(
             bench.pending.is_empty(),
@@ -4624,7 +4381,7 @@ mod tests {
         let mut other = liveness::streaming_camera(0, 0, 0.0);
         other.info.id = "sim:1".into();
         bench.snapshot.cameras = vec![liveness::streaming_camera(0, 0, 0.0), other];
-        let _ = bench.handle_message(Message::AllCapture);
+        let _ = bench.dispatch_action(Action::CaptureAll);
         let _ = bench.handle_message(Message::AllRecord(true));
         for job in [Job::Capture, Job::Forward { recording: true }] {
             let cameras: Vec<_> = bench
@@ -4643,6 +4400,27 @@ mod tests {
                 .unwrap()
                 .label(),
             "Capturing all cameras"
+        );
+    }
+
+    #[test]
+    fn picking_a_camera_stays_in_this_window_and_the_simulator_takes_a_free_one() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
+        let mut other = liveness::streaming_camera(0, 0, 0.0);
+        other.info.id = "sim:1".into();
+        bench.snapshot.cameras = vec![liveness::streaming_camera(0, 0, 0.0), other];
+        let _ = bench.handle_message(Message::Select("sim:1".into()));
+        assert!(bench.pending.is_empty(), "no session selection");
+        assert_eq!(bench.snapshot.connected.as_ref().unwrap().id, "sim:1");
+        let twin = format!(
+            "Pattern camera · {}",
+            identity(&bench.snapshot.cameras[1].info)
+        );
+        assert!(bench.title().starts_with(&twin), "{}", bench.title());
+        let _ = bench.handle_message(Message::TrySimulator);
+        assert_eq!(
+            bench.pending.last().unwrap().target.as_deref(),
+            Some("sim:2")
         );
     }
 

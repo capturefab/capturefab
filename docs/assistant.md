@@ -179,8 +179,8 @@ shown.
 
 **Stop**, **Pause/Resume**, and **Take over** remain available while working.
 Take over stops the task and waits for its current command and owned-data flush to finish. It
-selects the task's camera, or opens manual Data sources for a data-only task. The sidebar's
-Data sources action is always available, including when no camera or source is connected.
+selects the task's camera, or opens manual Data sources for a data-only task. The camera
+picker's Data sources action is available whenever no camera is shown in the window.
 Human camera controls stay enabled. Messages reach the assistant at the next round. Closing
 the sheet keeps the task running; the toolbar shows progress, Stop and pending
 approval. Quitting asks whether to keep running or stop and quit. After a task,

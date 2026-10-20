@@ -11,10 +11,12 @@ mod responsive_layout_tests;
 
 /// The widest the status at the right of the toolbar grows.
 const STATUS: f32 = 420.0;
-/// Keep the widest Capture label readable, including in the overview.
-const CAPTURE_ROOM: f32 = 160.0;
-/// What the overview's Capture button may add to name its camera.
-const CAPTURE_NAME_ROOM: f32 = 100.0;
+/// Keep the widest Capture label readable.
+const CAPTURE_ROOM: f32 = 120.0;
+/// Room the Capture All button takes as its glyph, and the gap before it.
+const CAPTURE_ALL_ROOM: f32 = 46.0;
+/// What Capture All's words add.
+const CAPTURE_ALL_LABEL: f32 = 84.0;
 /// Room the Record button and the gap before it take.
 const RECORD_ROOM: f32 = 96.0;
 /// Room the elapsed-time pill beside a recording's Stop button takes.
@@ -34,8 +36,8 @@ struct ToolbarFit {
     activity_label: bool,
     analytics_label: bool,
     destination_label: bool,
-    /// The overview's Capture button names the selected camera.
-    capture_name: bool,
+    /// Capture All keeps its words.
+    capture_all_label: bool,
     status: f32,
 }
 /// Room a notice's glyph and the gap after it take.
@@ -154,43 +156,6 @@ fn transport_inline(stats: &TransportStats) -> bool {
     !stats.notes.is_empty() || stats.resend_requested > 0 || format::transport_loss(stats) > 0
 }
 
-/// The overview Capture button's label: what it captures from, by the
-/// selected camera's model, or by its plain serial when a twin shares the
-/// model. "S/N" stays in the accessible name and tooltip.
-fn overview_capture_label(
-    cameras: &[crate::session::CameraSnapshot],
-    connected: Option<&CameraInfo>,
-    scanner: bool,
-) -> String {
-    let Some(camera) = connected else {
-        return "Capture selected".into();
-    };
-    let short = match twin_identity(cameras, camera) {
-        Some(_) if !camera.serial.trim().is_empty() => camera.serial.trim().to_owned(),
-        Some(identity) => identity,
-        None => camera.model.clone(),
-    };
-    format!("{} {short}", if scanner { "Scan" } else { "Capture" })
-}
-
-/// The overview Capture label's fixed slot: as wide as the widest label any
-/// connected camera, or saving, would give it, so selecting another tile
-/// never resizes the button or moves the folder beside it.
-fn overview_capture_slot(cameras: &[crate::session::CameraSnapshot]) -> f32 {
-    let size = style::BODY;
-    let mut widest = ["Capture selected", "Saving…", "Scanning…", "Saved"]
-        .iter()
-        .map(|label| titlebar::rough(label, size))
-        .fold(0.0, f32::max);
-    for camera in cameras {
-        for scanner in [false, true] {
-            let label = overview_capture_label(cameras, Some(&camera.info), scanner);
-            widest = widest.max(titlebar::rough(&label, size));
-        }
-    }
-    widest.min(CAPTURE_ROOM + CAPTURE_NAME_ROOM)
-}
-
 /// `style` with its text and fill faded by `alpha`, for controls that come
 /// and go with a notice.
 fn faded(
@@ -212,7 +177,7 @@ impl Workbench {
         let snapshot = &self.snapshot;
         let os = Os::CURRENT;
         // Nothing to capture from until a camera connects.
-        let capture = snapshot.connected.is_some() || self.overview();
+        let capture = snapshot.connected.is_some();
         let fit = self.toolbar_fit(capture);
         let width = fit.status;
         let mut left = row![].spacing(8).align_y(Alignment::Center);
@@ -235,7 +200,9 @@ impl Workbench {
             } else {
                 icon(Icon::Folder, 16.0, p.secondary)
             };
-            left = left.push(self.capture_button(fit.capture_name, p));
+            left = left
+                .push(self.capture_button(p))
+                .push(self.capture_all_button(fit.capture_all_label, p));
             if let Some(record) = self.record_button(p) {
                 left = left.push(record);
             }
@@ -408,14 +375,15 @@ impl Workbench {
             activity_label: main >= 620.0,
             analytics_label: main >= 520.0,
             destination_label: main >= 700.0,
-            capture_name: self.overview() && self.snapshot.connected.is_some(),
+            capture_all_label: true,
             status: 0.0,
         };
         let status = |fit: &ToolbarFit| {
             let capture_room = if capture {
                 CAPTURE_ROOM
-                    + if fit.capture_name {
-                        CAPTURE_NAME_ROOM
+                    + CAPTURE_ALL_ROOM
+                    + if fit.capture_all_label {
+                        CAPTURE_ALL_LABEL
                     } else {
                         0.0
                     }
@@ -440,7 +408,7 @@ impl Workbench {
         if self.problem_notice_shown() {
             let steps: [fn(&mut ToolbarFit); 4] = [
                 |fit| fit.destination_label = false,
-                |fit| fit.capture_name = false,
+                |fit| fit.capture_all_label = false,
                 |fit| fit.activity_label = false,
                 |fit| fit.analytics_label = false,
             ];
@@ -464,7 +432,7 @@ impl Workbench {
 
     /// Capture for the selected camera. While saving, the spinner takes the
     /// glyph's place; just after, it reads as saved.
-    fn capture_button(&self, named: bool, p: &'static Palette) -> Element<'_, Message> {
+    fn capture_button(&self, p: &'static Palette) -> Element<'_, Message> {
         let os = Os::CURRENT;
         let connected = self.snapshot.connected.is_some();
         let problem = self.validate_input(&self.capture_command(false)).err();
@@ -473,19 +441,13 @@ impl Workbench {
         // This user's pending capture is per camera. Other participants can
         // keep capturing while this button queues the user's own request.
         let saved = !capturing && self.just_saved(self.snapshot.active_camera.as_deref());
-        // In the overview, an idle button names the selected camera.
-        let outlined = self
-            .snapshot
-            .connected
-            .as_ref()
-            .filter(|_| self.overview() && !capturing && !saved);
-        let (glyph, label): (Element<'_, Message>, String) = if capturing {
+        let (glyph, label): (Element<'_, Message>, &str) = if capturing {
             (
                 icon::spinner(14.0, p.secondary, self.spin()),
-                if scanner { "Scanning…" } else { "Saving…" }.into(),
+                if scanner { "Scanning…" } else { "Saving…" },
             )
         } else if saved {
-            (icon(Icon::Check, 14.0, p.ink(p.live)), "Saved".into())
+            (icon(Icon::Check, 14.0, p.ink(p.live)), "Saved")
         } else {
             (
                 icon(
@@ -493,22 +455,8 @@ impl Workbench {
                     14.0,
                     if connected { p.text } else { p.tertiary },
                 ),
-                if self.overview() && named {
-                    overview_capture_label(
-                        &self.snapshot.cameras,
-                        self.snapshot.connected.as_ref(),
-                        scanner,
-                    )
-                } else if scanner {
-                    "Scan".into()
-                } else {
-                    "Capture".into()
-                },
+                if scanner { "Scan" } else { "Capture" },
             )
-        };
-        let name = match outlined {
-            Some(camera) => format!("Capture from {} {}", camera.model, identity(camera)),
-            None => label.clone(),
         };
         tip_above(
             button(
@@ -528,17 +476,12 @@ impl Workbench {
                             },
                         )
                     )
-                    .width(if self.overview() && named {
-                        Length::Fixed(overview_capture_slot(&self.snapshot.cameras))
-                    } else {
-                        Length::Shrink
-                    })
-                    .max_width(CAPTURE_ROOM + CAPTURE_NAME_ROOM)
+                    .max_width(CAPTURE_ROOM)
                 ]
                 .spacing(7)
                 .align_y(Alignment::Center),
             )
-            .name(name)
+            .name(label)
             .padding([6, 12])
             // Ignoring presses while saving would otherwise read as disabled.
             .style(move |theme, status| {
@@ -558,13 +501,61 @@ impl Workbench {
                 "Select a camera to capture from".to_owned()
             } else if let Some(problem) = problem {
                 problem.to_string()
-            } else if outlined.is_some() {
-                Action::Capture.hint(
-                    "Save from the selected camera using the settings in Capture",
-                    os,
-                )
             } else {
-                Action::Capture.hint("Save using the settings in Capture", os)
+                Action::Capture.hint("Capture from this camera", os)
+            },
+        )
+    }
+
+    /// Capture All, beside Capture: one frame from every camera in the
+    /// session at once. While that batch saves, the spinner takes its glyph.
+    fn capture_all_button(&self, labelled: bool, p: &'static Palette) -> Element<'_, Message> {
+        let problem = self.validate_input(&self.capture_command(false)).err();
+        let capturing = self
+            .pending
+            .iter()
+            .any(|pending| pending.batch && pending.job == Job::Capture);
+        let ready = !capturing && problem.is_none();
+        let glyph: Element<'_, Message> = if capturing {
+            icon::spinner(14.0, p.secondary, self.spin())
+        } else {
+            icon(Icon::Grid, 14.0, if ready { p.text } else { p.tertiary })
+        };
+        let mut content = row![glyph].spacing(7).align_y(Alignment::Center);
+        if labelled {
+            content = content.push(one_line(
+                "Capture All",
+                style::BODY,
+                style::SANS,
+                if capturing || ready {
+                    p.text
+                } else {
+                    p.secondary
+                },
+            ));
+        }
+        tip_above(
+            button(content)
+                .name("Capture All")
+                .padding([6, 12])
+                .style(move |theme, status| {
+                    let status = if capturing {
+                        button::Status::Active
+                    } else {
+                        status
+                    };
+                    style::secondary(theme, status)
+                })
+                .on_press_maybe(ready.then_some(Message::AllCapture)),
+            if capturing {
+                "Capturing from every camera…".to_owned()
+            } else if let Some(problem) = problem {
+                problem.to_string()
+            } else {
+                Action::CaptureAll.hint(
+                    "Capture one frame from every connected camera at once",
+                    Os::CURRENT,
+                )
             },
         )
     }
@@ -575,10 +566,9 @@ impl Workbench {
         (self.recording_here() && *camera == self.snapshot.active_camera).then_some(path.as_str())
     }
 
-    /// Whether the selected camera can record: a camera, not a scanner, and
-    /// not shown with several others.
+    /// Whether the selected camera can record: a camera, not a scanner.
     fn record_shown(&self) -> bool {
-        self.snapshot.connected.is_some() && !self.scanner_selected() && !self.overview()
+        self.snapshot.connected.is_some() && !self.scanner_selected()
     }
 
     /// Record or Stop for the selected camera, with how long it has been
@@ -690,16 +680,13 @@ impl Workbench {
         match pending.job {
             // The Capture button beside the status reads "Saving…".
             Job::Capture => true,
-            // The overview's pill reads "Starting…" or "Stopping…".
-            Job::Start | Job::Stop if pending.batch => self.overview(),
-            // The single camera's pill does, for the camera shown; a tile's
-            // own button shows nothing.
+            // The camera's pill does, for the camera shown.
             Job::Start | Job::Stop => {
-                !self.overview() && pending.camera == self.snapshot.active_camera
+                !pending.batch && pending.camera == self.snapshot.active_camera
             }
-            // The camera list's spinners.
-            Job::Discover | Job::Connect => self.sidebar_shown(),
-            Job::NetworkScan => self.sidebar_shown() || self.network_open,
+            // The welcome screen's spinners.
+            Job::Discover | Job::Connect => self.snapshot.connected.is_none(),
+            Job::NetworkScan => self.snapshot.connected.is_none() || self.network_open,
             _ => false,
         }
     }
@@ -867,7 +854,6 @@ impl Workbench {
         let issues = &self.side.discovery_issues;
         self.shown.is_none()
             && self.snapshot.connected.is_none()
-            && !self.overview()
             && !issues.is_empty()
             && notice.detail.as_deref() == Some(issues.join("\n").as_str())
     }
@@ -1244,25 +1230,18 @@ mod tests {
             batch,
             ..Pending::unanswered(Job::Start)
         };
-        bench.focus_camera = true;
         assert!(
             bench.shown_in_place(&start("sim:0", false)),
             "the pill says it"
         );
         assert!(!bench.shown_in_place(&start("sim:1", false)));
-        bench.focus_camera = false;
         assert!(
-            !bench.shown_in_place(&start("sim:1", false)),
-            "a tile's button shows nothing"
-        );
-        assert!(
-            bench.shown_in_place(&start("sim:1", true)),
-            "the overview pill"
+            !bench.shown_in_place(&start("sim:0", true)),
+            "Start all shows nowhere else"
         );
         let discovery = Pending::unanswered(Job::Discover);
-        bench.sidebar_open = true;
-        assert!(bench.shown_in_place(&discovery), "the camera list spins");
-        bench.sidebar_open = false;
+        assert!(bench.shown_in_place(&discovery), "the welcome screen spins");
+        bench.snapshot.connected = Some(crate::transport::simulator::info());
         assert!(!bench.shown_in_place(&discovery));
         assert!(!bench.shown_in_place(&Pending::unanswered(Job::Set("Gain".into()))));
     }
@@ -1360,41 +1339,6 @@ mod tests {
             ..clean
         };
         assert!(transport_inline(&incomplete));
-    }
-
-    #[test]
-    fn the_overview_capture_button_names_its_camera() {
-        let first = liveness::streaming_camera(0, 0, 0.0);
-        let mut twin = first.clone();
-        twin.info.id = "sim:1".into();
-        twin.info.serial = "SIM1".into();
-        let cameras = vec![first.clone(), twin.clone()];
-        assert_eq!(
-            overview_capture_label(&cameras, Some(&twin.info), false),
-            "Capture SIM1"
-        );
-        assert_eq!(
-            overview_capture_label(&cameras, Some(&twin.info), true),
-            "Scan SIM1"
-        );
-        // One slot for whichever camera is selected, wide enough for each.
-        let slot = overview_capture_slot(&cameras);
-        for camera in &cameras {
-            let label = overview_capture_label(&cameras, Some(&camera.info), false);
-            assert!(titlebar::rough(&label, style::BODY) <= slot, "{label}");
-        }
-        // Distinct models carry the model.
-        let mut other = twin.clone();
-        other.info.model = "Line camera".into();
-        let cameras = vec![first, other.clone()];
-        assert_eq!(
-            overview_capture_label(&cameras, Some(&other.info), false),
-            "Capture Line camera"
-        );
-        assert_eq!(
-            overview_capture_label(&cameras, None, false),
-            "Capture selected"
-        );
     }
 
     #[test]

@@ -62,13 +62,13 @@ impl Transport for Gate {
     }
 }
 
-struct LiveRun {
+pub(in crate::gui) struct LiveRun {
     handle: RunHandle,
     gate: Arc<Gate>,
     directory: PathBuf,
 }
 impl LiveRun {
-    fn new() -> Self {
+    pub(in crate::gui) fn new() -> Self {
         Self::with_scope(RunScope {
             cameras: vec!["sim:0".into()],
             ..Default::default()
@@ -153,7 +153,7 @@ fn wait_until(mut condition: impl FnMut() -> bool) {
     }
 }
 
-fn app_with_run(run: &LiveRun, sheet_open: bool) -> Workbench {
+pub(in crate::gui) fn app_with_run(run: &LiveRun, sheet_open: bool) -> Workbench {
     let mut app = Workbench::new(SessionHandle::new(), "task-quit-tests".into(), true, None);
     app.assistant.quick.synthetic = true;
     app.assistant.quick.open = sheet_open;

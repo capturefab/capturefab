@@ -29,8 +29,6 @@ pub(super) const CONTROLS_IDLE: Duration = Duration::from_secs(2);
 /// unheard. A rebuild, a tick at the latest, hears them again well inside
 /// `CONTROLS_IDLE`, so the controls never hide under a moving pointer.
 const POINTER_DEAF: Duration = Duration::from_millis(500);
-pub(super) const HOVER: Duration = Duration::from_millis(120);
-pub(super) const HOVER_OUT: Duration = Duration::from_millis(80);
 pub(super) const RING: Duration = Duration::from_millis(160);
 pub(super) const RING_OUT: Duration = Duration::from_millis(120);
 pub(super) const SCOPE: Duration = Duration::from_millis(140);
@@ -448,12 +446,9 @@ impl Workbench {
             focus_slide,
             shutter,
             welcome,
-            sidebar_slide,
             inspector_slide,
             bars,
             controls,
-            tile_hover,
-            ring,
             notice_shown,
         ],
         flashes: [],
@@ -470,10 +465,6 @@ impl Workbench {
             || (self.settings_open && self.settings_window.is_none())
             || self.capture_to.manager_open
             || self.record_to.manager_open
-    }
-
-    pub(super) fn sidebar_shown(&self) -> bool {
-        self.sidebar_open && !self.image_mode
     }
 
     pub(super) fn inspector_docked(&self) -> bool {
@@ -525,21 +516,6 @@ impl Workbench {
             .is_none_or(|moved| self.now.saturating_duration_since(moved) >= POINTER_DEAF)
     }
 
-    /// How selected camera `id` reads, from 0 to 1: the selection draws in
-    /// on the newly selected camera as it fades from the one before, in step
-    /// with the overview's ring. For the tile ring, sidebar rows and the
-    /// inspector, so all three move together.
-    pub(super) fn selection_level(&self, id: &str) -> f32 {
-        let t = self.ring.get(self.now);
-        if self.snapshot.active_camera.as_deref() == Some(id) {
-            t
-        } else if self.ring_from.as_deref() == Some(id) {
-            1.0 - t
-        } else {
-            0.0
-        }
-    }
-
     /// The step a spinner shows: one of 8, advancing every 120 ms. The slow
     /// tick runs at its busy rate while anything is pending, so spinners
     /// step without per-frame redraws. Screenshots hold it at 0.
@@ -553,9 +529,8 @@ impl Workbench {
     /// Point each motion at the state it shows, then let each area point its own.
     pub(super) fn sync_animations(&mut self) {
         let now = self.now;
-        let welcome = self.snapshot.connected.is_none() && !self.overview();
+        let welcome = self.snapshot.connected.is_none();
         let controls = controls_wanted(self.pointer_moved, now, self.over_controls);
-        let sidebar = self.sidebar_shown();
         let inspector = self.inspector_shown();
         let targets = [
             (welcome, &mut self.welcome),
@@ -563,7 +538,6 @@ impl Workbench {
             (self.logs_open, &mut self.activity_slide),
             (self.exposure_open, &mut self.exposure_slide),
             (self.focus.open, &mut self.focus_slide),
-            (sidebar, &mut self.sidebar_slide),
             (inspector, &mut self.inspector_slide),
             (!self.image_mode, &mut self.bars),
         ];
@@ -747,25 +721,6 @@ mod tests {
         assert_eq!(flashes.level("Gain", start + ms(500)), 1.0);
         flashes.prune(start + ms(1400));
         assert!(flashes.is_empty());
-    }
-
-    #[test]
-    fn selection_moves_from_the_previous_camera() {
-        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
-        let start = bench.now;
-        bench.snapshot.active_camera = Some("b".into());
-        bench.ring_from = Some("a".into());
-        bench.ring.replay(0.0, 1.0, start);
-        assert_eq!(bench.selection_level("b"), 0.0);
-        assert_eq!(bench.selection_level("a"), 1.0);
-        bench.now = start + RING / 2;
-        let (to, from) = (bench.selection_level("b"), bench.selection_level("a"));
-        assert!(to > 0.0 && to < 1.0);
-        assert!((to + from - 1.0).abs() < 1e-6, "a cross-fade");
-        bench.now = start + RING;
-        assert_eq!(bench.selection_level("b"), 1.0);
-        assert_eq!(bench.selection_level("a"), 0.0);
-        assert_eq!(bench.selection_level("c"), 0.0);
     }
 
     #[test]

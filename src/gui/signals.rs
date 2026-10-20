@@ -972,7 +972,7 @@ mod tests {
         let node = view.as_widget_mut().layout(
             &mut tree,
             renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(SIDEBAR, 620.0)),
+            &layout::Limits::new(Size::ZERO, Size::new(460.0, 620.0)),
         );
         let mut stops = Stops::default();
         view.as_widget_mut()
@@ -1134,7 +1134,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_source_sidebar_opens_and_focuses_manual_controls_without_a_camera_or_connection() {
+    fn zero_source_footer_opens_and_focuses_manual_controls_without_a_camera_or_connection() {
         use iced::advanced::{
             Layout, layout,
             widget::{Id, Operation, Tree, operation::Outcome},
@@ -1172,15 +1172,15 @@ mod tests {
         app.inspector_open = false;
         app.inspector_peek = false;
         app.tab = Tab::Features;
-        let mut sidebar = app.sidebar(Palette::of(false));
-        let mut tree = Tree::new(sidebar.as_widget());
-        let node = sidebar.as_widget_mut().layout(
+        let mut footer = app.picker_footer(Palette::of(false), space().into());
+        let mut tree = Tree::new(footer.as_widget());
+        let node = footer.as_widget_mut().layout(
             &mut tree,
             &renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(SIDEBAR, 620.0)),
+            &layout::Limits::new(Size::ZERO, Size::new(460.0, 620.0)),
         );
         let (snapshot, _, _) = accessibility::snapshot_widget(
-            sidebar.as_widget_mut(),
+            footer.as_widget_mut(),
             &mut tree,
             Layout::new(&node),
             &renderer,
@@ -1196,7 +1196,7 @@ mod tests {
             );
         }
         let mut entries = Entries::default();
-        sidebar
+        footer
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut entries);
         assert_eq!(entries.0.len(), 2);
@@ -1206,7 +1206,7 @@ mod tests {
                 .iter()
                 .all(|message| matches!(message, Message::Signals(Msg::Open)))
         );
-        drop(sidebar);
+        drop(footer);
         let task = app.handle_message(entries.0.remove(0));
         assert_eq!(app.tab, Tab::Capture);
         assert!(app.inspector_shown());

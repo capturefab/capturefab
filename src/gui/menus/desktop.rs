@@ -279,8 +279,7 @@ fn item_role(command: Command) -> accessibility::Role {
             Role::MenuItemRadio
         }
         Command::Action(
-            Action::ToggleSidebar
-            | Action::ToggleInspector
+            Action::ToggleInspector
             | Action::ToggleActivity
             | Action::ToggleExposure
             | Action::ToggleFocusRegion

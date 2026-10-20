@@ -42,8 +42,6 @@ fn bench() -> Workbench {
     app.snapshot.connected = Some(camera.info.clone());
     app.snapshot.cameras = vec![camera, other];
     app.output = "/tmp/long-laboratory-capture-destination/a-descriptive-camera-name.png".into();
-    app.sidebar_open = true;
-    app.sidebar_slide.set(1.0);
     app.inspector_open = true;
     app.inspector_slide.set(1.0);
     app.put_notice(
@@ -69,120 +67,100 @@ fn responsive_toolbar_keeps_capture_and_session_actions_visible_and_clickable() 
     let mut renderer = renderer();
     for native_width in [900.0, 1100.0, 1280.0, 1600.0] {
         for scale in prefs::UiScale::ALL {
-            for overview in [false, true] {
-                let mut app = bench();
-                app.width = native_width / scale.factor();
-                app.ui_scale = scale;
-                app.focus_camera = !overview;
-                let size = Size::new(app.main_width(), TOOLBAR);
-                let viewport = Rectangle::with_size(size);
-                let mut view = app.toolbar(Palette::of(false));
-                let mut tree = Tree::new(view.as_widget());
-                let node = view.as_widget_mut().layout(
-                    &mut tree,
-                    &renderer,
-                    &layout::Limits::new(Size::ZERO, size),
-                );
-                let mut geometry = Geometry::default();
-                view.as_widget_mut().operate(
-                    &mut tree,
-                    Layout::new(&node),
-                    &renderer,
-                    &mut geometry,
-                );
-                for (label, bounds) in &geometry.controls {
-                    assert!(
-                        inside(*bounds, viewport),
-                        "{label} clips at native width {native_width}, {scale}, overview={overview}: {bounds:?}, viewport={viewport:?}",
-                    );
-                }
-                // The overview names the selected camera: a twin here, so
-                // by its plain serial.
-                let connected = app.snapshot.connected.clone().unwrap();
-                let named = app.toolbar_fit(true).capture_name;
-                let (capture, capture_text) = if overview {
-                    (
-                        format!("Capture from {} {}", connected.model, identity(&connected)),
-                        if named {
-                            format!("Capture {}", connected.serial)
-                        } else {
-                            "Capture".to_owned()
-                        },
-                    )
-                } else {
-                    ("Capture".to_owned(), "Capture".to_owned())
-                };
-                let capture = capture.as_str();
-                let destination =
-                    format!("Capture destination: {}", app.capture_to.label(&app.output));
-                for action in [
-                    capture,
-                    destination.as_str(),
-                    "Session analytics for all cameras",
-                    "Session activity",
-                    "Show activity details",
-                    "Dismiss notification",
-                ] {
-                    let (_, bounds) = geometry.controls.iter().find(|(label, _)| label == action)
-                        .unwrap_or_else(|| panic!("{action} is available at {native_width}, {scale}, overview={overview}"));
-                    let cursor = iced::mouse::Cursor::Available(bounds.center());
-                    let mut messages = Vec::new();
-                    for event in [
-                        iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
-                        iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
-                    ] {
-                        view.as_widget_mut().update(
-                            &mut tree,
-                            &iced::Event::Mouse(event),
-                            Layout::new(&node),
-                            cursor,
-                            &renderer,
-                            &mut iced::advanced::clipboard::Null,
-                            &mut iced::advanced::Shell::new(&mut messages),
-                            &viewport,
-                        );
-                    }
-                    assert!(
-                        messages.iter().any(|message| match action {
-                            _ if action == capture => matches!(message, Message::Capture),
-                            "Session analytics for all cameras" =>
-                                matches!(message, Message::Analytics(true)),
-                            "Session activity" => matches!(message, Message::ToggleActivity),
-                            "Show activity details" => matches!(message, Message::ShowActivity),
-                            "Dismiss notification" => matches!(message, Message::DismissNotice),
-                            _ if action == destination => {
-                                matches!(message, Message::ShowTab(Tab::Capture))
-                            }
-                            _ => false,
-                        }),
-                        "{action} responds at {native_width}, {scale}, overview={overview}"
-                    );
-                }
-                let (_, capture_bounds) = geometry
-                    .controls
-                    .iter()
-                    .find(|(label, _)| label == capture)
-                    .unwrap();
-                let (_, capture_text) = geometry
-                    .labels
-                    .iter()
-                    .find(|(label, _)| *label == capture_text)
-                    .unwrap_or_else(|| panic!("{capture_text} is whole at {native_width}, {scale}, overview={overview}"));
+            let mut app = bench();
+            app.width = native_width / scale.factor();
+            app.ui_scale = scale;
+            let size = Size::new(app.main_width(), TOOLBAR);
+            let viewport = Rectangle::with_size(size);
+            let mut view = app.toolbar(Palette::of(false));
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, size),
+            );
+            let mut geometry = Geometry::default();
+            view.as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut geometry);
+            for (label, bounds) in &geometry.controls {
                 assert!(
-                    inside(*capture_text, *capture_bounds),
-                    "the complete Capture label remains readable"
-                );
-                prepare_artifact_frame(&mut view, &mut tree, &node, &renderer, size);
-                render_artifact_scaled(
-                    &format!("toolbar-{native_width}-{scale}-overview-{overview}"),
-                    &view,
-                    &tree,
-                    &node,
-                    &mut renderer,
-                    size,
-                    scale.factor(),
+                    inside(*bounds, viewport),
+                    "{label} clips at native width {native_width}, {scale}: {bounds:?}, viewport={viewport:?}",
                 );
             }
+            let destination = format!("Capture destination: {}", app.capture_to.label(&app.output));
+            for action in [
+                "Capture",
+                "Capture All",
+                destination.as_str(),
+                "Session analytics for all cameras",
+                "Session activity",
+                "Show activity details",
+                "Dismiss notification",
+            ] {
+                let (_, bounds) = geometry
+                    .controls
+                    .iter()
+                    .find(|(label, _)| label == action)
+                    .unwrap_or_else(|| panic!("{action} is available at {native_width}, {scale}"));
+                let cursor = iced::mouse::Cursor::Available(bounds.center());
+                let mut messages = Vec::new();
+                for event in [
+                    iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+                    iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+                ] {
+                    view.as_widget_mut().update(
+                        &mut tree,
+                        &iced::Event::Mouse(event),
+                        Layout::new(&node),
+                        cursor,
+                        &renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut iced::advanced::Shell::new(&mut messages),
+                        &viewport,
+                    );
+                }
+                assert!(
+                    messages.iter().any(|message| match action {
+                        "Capture" => matches!(message, Message::Capture),
+                        "Capture All" => matches!(message, Message::AllCapture),
+                        "Session analytics for all cameras" =>
+                            matches!(message, Message::Analytics(true)),
+                        "Session activity" => matches!(message, Message::ToggleActivity),
+                        "Show activity details" => matches!(message, Message::ShowActivity),
+                        "Dismiss notification" => matches!(message, Message::DismissNotice),
+                        _ if action == destination => {
+                            matches!(message, Message::ShowTab(Tab::Capture))
+                        }
+                        _ => false,
+                    }),
+                    "{action} responds at {native_width}, {scale}"
+                );
+            }
+            let (_, capture_bounds) = geometry
+                .controls
+                .iter()
+                .find(|(label, _)| label == "Capture")
+                .unwrap();
+            let (_, capture_text) = geometry
+                .labels
+                .iter()
+                .find(|(label, _)| *label == "Capture")
+                .unwrap_or_else(|| panic!("Capture is whole at {native_width}, {scale}"));
+            assert!(
+                inside(*capture_text, *capture_bounds),
+                "the complete Capture label remains readable"
+            );
+            prepare_artifact_frame(&mut view, &mut tree, &node, &renderer, size);
+            render_artifact_scaled(
+                &format!("toolbar-{native_width}-{scale}"),
+                &view,
+                &tree,
+                &node,
+                &mut renderer,
+                size,
+                scale.factor(),
+            );
         }
     }
 }
@@ -195,7 +173,6 @@ fn a_timed_recording_counts_down_beside_its_stop_button() {
             let mut app = bench();
             app.width = native_width / scale.factor();
             app.ui_scale = scale;
-            app.focus_camera = true;
             // Two hours from 1:23 ago: the widest time left, "1:58:37 left".
             let since = epoch_ms().saturating_sub(83_000);
             app.snapshot.forwarding = Some("/tmp/capturefab-clip.mp4".into());
@@ -259,12 +236,11 @@ fn responsive_toolbar_reveals_labels_before_duplicate_edit_actions() {
     let renderer = renderer();
     for (width, labels, history) in [
         (544.0, false, false),
-        (720.0, true, false),
+        (760.0, true, false),
         (960.0, true, true),
     ] {
         let mut app = bench();
         app.width = width;
-        app.sidebar_slide.set(0.0);
         app.inspector_slide.set(0.0);
         let mut view = app.toolbar(Palette::of(false));
         let mut tree = Tree::new(view.as_widget());
@@ -308,10 +284,7 @@ fn a_problem_notice_keeps_room_to_say_what_went_wrong() {
     let renderer = renderer();
     for main in [650.0, 760.0, 1100.0] {
         let mut app = bench();
-        app.focus_camera = false;
-        app.sidebar_slide.set(0.0);
         app.inspector_slide.set(0.0);
-        app.sidebar_open = false;
         app.inspector_open = false;
         app.width = main;
         app.put_notice(
@@ -319,7 +292,6 @@ fn a_problem_notice_keeps_room_to_say_what_went_wrong() {
             None,
             Level::Error,
         );
-        assert!(app.overview());
         let size = Size::new(app.main_width(), TOOLBAR);
         let mut view = app.toolbar(Palette::of(false));
         let mut tree = Tree::new(view.as_widget());
@@ -345,9 +317,7 @@ fn the_welcome_toolbar_offers_no_dead_undo_or_redo() {
     let renderer = renderer();
     let mut app = Workbench::new(SessionHandle::new(), "toolbar-welcome".into(), true, None);
     app.width = 1200.0;
-    app.sidebar_slide.set(0.0);
     app.inspector_slide.set(0.0);
-    app.sidebar_open = false;
     app.inspector_open = false;
     assert!(app.snapshot.connected.is_none() && app.history_label(true).is_none());
     let mut view = app.toolbar(Palette::of(false));
@@ -374,8 +344,6 @@ fn the_welcome_toolbar_offers_no_dead_undo_or_redo() {
 fn resizing_preserves_capture_and_session_action_identity() {
     let renderer = renderer();
     let mut app = bench();
-    app.focus_camera = true;
-    app.sidebar_slide.set(0.0);
     app.inspector_slide.set(0.0);
     let mut tree = Tree::empty();
     let mut previous = None;
@@ -396,6 +364,7 @@ fn resizing_preserves_capture_and_session_action_identity() {
         );
         let identities = [
             "Capture",
+            "Capture All",
             "Session analytics for all cameras",
             "Session activity",
         ]

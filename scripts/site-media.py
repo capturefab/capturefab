@@ -25,9 +25,9 @@ from PIL import Image, ImageChops, ImageStat
 ROOT = Path(__file__).resolve().parents[1]
 CLIPS = {
     "live-preview": {
-        "cameras": 4,
-        "scene": "dark,features,nosidebar,noscopes",
-        "description": "Four built-in simulator cameras stream together. Real CLI commands change one camera's exposure, then restore it.",
+        "cameras": 1,
+        "scene": "dark,features,noscopes",
+        "description": "A built-in simulator camera streams in its window. Real CLI commands change its exposure, then restore it.",
         "actions": [
             (1.5, ["--camera", "sim:0", "set", "ExposureTime=30000"]),
             (5.0, ["--camera", "sim:0", "set", "ExposureTime=10000"]),
@@ -36,7 +36,7 @@ CLIPS = {
     },
     "capture-workflow": {
         "cameras": 1,
-        "scene": "dark,capture,nosidebar,noscopes",
+        "scene": "dark,capture,noscopes",
         "description": "The Capture panel stays visible while real session CLI commands save three simulator frames, then one PNG. The app shows the saved result.",
         "actions": [
             (2.0, ["--camera", "sim:0", "capture", "-n", "3", "-o", "{temp}/frames"]),

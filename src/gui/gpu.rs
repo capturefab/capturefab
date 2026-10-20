@@ -16,7 +16,7 @@ use iced::{Rectangle, mouse, wgpu};
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, Mutex, PoisonError, Weak,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
@@ -521,7 +521,8 @@ pub struct Pipeline {
     decode: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     srgb: bool,
-    slots: HashMap<String, Slot>,
+    slots: HashMap<(usize, String), Slot>,
+    owners: HashMap<usize, Weak<Mutex<Shared>>>,
     /// Lets tests check direct drawing of frames `decode_once` would cache.
     #[cfg(test)]
     direct_only: bool,
@@ -605,6 +606,7 @@ impl shader::Pipeline for Pipeline {
             bind_group_layout,
             srgb: format.is_srgb(),
             slots: HashMap::new(),
+            owners: HashMap::new(),
             #[cfg(test)]
             direct_only: false,
         }
@@ -622,23 +624,36 @@ impl shader::Primitive for Primitive {
         bounds: &Rectangle,
         viewport: &Viewport,
     ) {
+        let owner = Arc::as_ptr(&self.gpu.shared) as usize;
+        pipeline
+            .owners
+            .entry(owner)
+            .or_insert_with(|| Arc::downgrade(&self.gpu.shared));
+        pipeline
+            .owners
+            .retain(|_, shared| shared.strong_count() > 0);
+        let owners = &pipeline.owners;
+        pipeline
+            .slots
+            .retain(|(owner, _), _| owners.contains_key(owner));
+        let key = (owner, self.key.clone());
         let frame = {
             let mut shared = self.gpu.shared();
-            for key in shared.retired.drain().collect::<Vec<_>>() {
-                pipeline.slots.remove(&key);
+            for retired in shared.retired.drain().collect::<Vec<_>>() {
+                pipeline.slots.remove(&(owner, retired));
             }
             shared.pending.remove(&self.key)
         };
-        let uploaded = match frame.map(|frame| pipeline.upload(device, queue, &self.key, &frame)) {
+        let uploaded = match frame.map(|frame| pipeline.upload(device, queue, &key, &frame)) {
             Some(Ok(())) => true,
             Some(Err(error)) => {
                 eprintln!("capturefab: GPU preview upload failed: {error}");
-                pipeline.slots.remove(&self.key);
+                pipeline.slots.remove(&key);
                 false
             }
             None => false,
         };
-        let Some(slot) = pipeline.slots.get_mut(&self.key) else {
+        let Some(slot) = pipeline.slots.get_mut(&key) else {
             return;
         };
         slot.stale |= uploaded;
@@ -726,7 +741,8 @@ impl shader::Primitive for Primitive {
     }
 
     fn draw(&self, pipeline: &Pipeline, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
-        if let Some(slot) = pipeline.slots.get(&self.key) {
+        let key = (Arc::as_ptr(&self.gpu.shared) as usize, self.key.clone());
+        if let Some(slot) = pipeline.slots.get(&key) {
             let (draw, bind_group) = match &slot.decoded {
                 Some(decoded) if slot.once => (&pipeline.pipeline, &decoded.bind_group),
                 _ => (&pipeline.direct, &slot.bind_group),
@@ -746,7 +762,7 @@ impl Pipeline {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        key: &str,
+        key: &(usize, String),
         frame: &Frame,
     ) -> Result<(), String> {
         let layout = Layout::of(frame.pixel_format).ok_or("unsupported pixel format")?;
@@ -780,7 +796,7 @@ impl Pipeline {
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             let bind_group = bind(device, &self.bind_group_layout, &view, &uniforms);
             self.slots.insert(
-                key.to_owned(),
+                key.clone(),
                 Slot {
                     texture,
                     storage,
@@ -900,17 +916,10 @@ mod tests {
     /// rows and frames shrunk for the GPU. Skipped without a GPU.
     #[test]
     fn gpu_decode_matches_cpu_conversion() {
-        use futures::executor::block_on;
         use shader::Pipeline as _;
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let Ok(adapter) =
-            block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-        else {
-            eprintln!("no GPU adapter; skipping");
+        let Some((device, queue)) = device() else {
             return;
         };
-        let (device, queue) =
-            block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut pipeline = Pipeline::new(&device, &queue, format);
         let mut seed = 0x2545_f491_u32;
@@ -960,7 +969,7 @@ mod tests {
                     let frame = frame(pixel_format, size, bytes, mask);
                     let bayer = Layout::of(pixel_format).unwrap().kind == BAYER;
                     let worst = render(&mut pipeline, (&device, &queue), &frame, direct_only);
-                    assert_eq!(pipeline.slots["test"].once, bayer && !direct_only);
+                    assert_eq!(pipeline.slot("test").once, bayer && !direct_only);
                     assert!(
                         worst <= 1,
                         "{pixel_format:#010x} {size:?} (direct only: {direct_only}): off by {worst}"
@@ -976,7 +985,7 @@ mod tests {
             assert!(GpuFrames::default().accepts(&wide));
             let worst = render(&mut pipeline, (&device, &queue), &wide, true);
             assert!(worst <= 1, "{pixel_format:#010x} folded: off by {worst}");
-            assert_eq!(pipeline.slots["test"].storage.1, 3);
+            assert_eq!(pipeline.slot("test").storage.1, 3);
         }
         // Overview tiles shrink color and mono frames to RGB8 and Mono8.
         for (pixel_format, bytes, mask, factor) in [
@@ -989,6 +998,70 @@ mod tests {
             assert!(matches!(small.pixel_format, RGB8 | MONO8));
             let worst = render(&mut pipeline, (&device, &queue), &small, false);
             assert!(worst <= 1, "{pixel_format:#010x} shrunk: off by {worst}");
+        }
+    }
+
+    #[test]
+    fn windows_drawing_the_same_view_keep_their_own_textures() {
+        use shader::{Pipeline as _, Primitive as _};
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let mut pipeline = Pipeline::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(8.0, 2.0));
+        let viewport = Viewport::with_physical_size(iced::Size::new(8, 2), 1.0);
+        let draw = |pipeline: &mut Pipeline, gpu: &GpuFrames| {
+            let primitive = Primitive {
+                gpu: gpu.clone(),
+                key: "main".into(),
+                image: bounds,
+            };
+            primitive.prepare(pipeline, &device, &queue, &bounds, &viewport);
+        };
+        let windows = [GpuFrames::default(), GpuFrames::default()];
+        for (gpu, width) in windows.iter().zip([4, 8]) {
+            gpu.submit(
+                "main",
+                Arc::new(Frame {
+                    width,
+                    height: 2,
+                    pixel_format: MONO8,
+                    data: vec![0; width as usize * 2],
+                    ..Frame::default()
+                }),
+            );
+            draw(&mut pipeline, gpu);
+        }
+        let sizes = |pipeline: &Pipeline| {
+            let mut sizes: Vec<_> = pipeline.slots.values().map(|slot| slot.size).collect();
+            sizes.sort();
+            sizes
+        };
+        assert_eq!(sizes(&pipeline), [(4, 2), (8, 2)]);
+        let [closed, open] = windows;
+        drop(closed);
+        draw(&mut pipeline, &open);
+        assert_eq!(sizes(&pipeline), [(8, 2)]);
+    }
+
+    fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        use futures::executor::block_on;
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let Ok(adapter) =
+            block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        else {
+            eprintln!("no GPU adapter; skipping");
+            return None;
+        };
+        Some(block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device"))
+    }
+
+    impl Pipeline {
+        fn slot(&self, key: &str) -> &Slot {
+            self.slots
+                .iter()
+                .find_map(|((_, slot_key), slot)| (slot_key == key).then_some(slot))
+                .expect("a slot for the key")
         }
     }
 

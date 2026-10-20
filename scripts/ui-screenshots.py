@@ -38,8 +38,8 @@ class Scene:
 # a long screen from stitched or generated UI pixels.
 BASELINE = (
     Scene("welcome", "welcome,side-recent", "Welcome, discovered sources, recent cameras and address entry"),
-    Scene("workspace", "features,focus,exposure", "Four-camera workspace with scopes and selected-camera inspector", 4),
-    Scene("camera", "open-camera,stage-controls,noscopes", "Focused camera with stage controls", 4),
+    Scene("workspace", "features,focus,exposure", "Camera window with scopes and Features inspector"),
+    Scene("camera", "stage-controls,noscopes", "Camera window with stage controls"),
     Scene("image", "image-hint,focus,exposure", "Image mode with focus and exposure scopes"),
     Scene("features", "features,noscopes", "Features inspector, Quick controls and collapsed feature groups"),
     Scene("capture", "capture,noscopes,inspector-storage-default", "Capture inspector with default storage policy"),
@@ -137,7 +137,7 @@ VARIANTS = (
     Scene("quick-command-data-auth", "quick-command-data-auth,noscopes", "Plan-first explicit local username and protected password setup", 1),
     Scene("quick-command-task-data-auth", "quick-command-task-data-auth,noscopes", "Task source profile creation without provider or preference credential disclosure", 1),
     Scene("signals-auth", "signals-auth,noscopes", "Manual Sources uses the same protected local source profile editor", 1),
-    Scene("signals-empty", "signals-empty,noscopes", "Manual source setup and sidebar entry before connecting any camera or source", 0),
+    Scene("signals-empty", "signals-empty,noscopes", "Manual source setup and camera picker entry before connecting any camera or source", 0),
     Scene("signals-persistence-error", "signals-persistence-error,noscopes,inspector-bottom", "Manual source persistence failure while the connection remains running", 0),
 )
 

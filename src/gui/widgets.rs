@@ -618,25 +618,6 @@ pub(super) fn dot<'a, M: 'a>(color: Color, size: f32) -> Element<'a, M> {
         .into()
 }
 
-/// A camera's status dot in `p`: filled while it is connected, a ring
-/// while it is not; see `CameraState`.
-pub(super) fn status_dot<'a, M: 'a>(state: CameraState, size: f32, p: &Palette) -> Element<'a, M> {
-    let color = state.color(p);
-    if !state.hollow() {
-        return dot(color, size);
-    }
-    container(space().width(size).height(size))
-        .style(move |_| container::Style {
-            border: iced::Border {
-                color,
-                width: 1.5,
-                radius: (size / 2.0).into(),
-            },
-            ..container::Style::default()
-        })
-        .into()
-}
-
 /// A section title: a small label above its group.
 pub(super) fn heading<'a, M: 'static>(title: &'a str, p: &'static Palette) -> Element<'a, M> {
     let content = container(

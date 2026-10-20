@@ -23,7 +23,7 @@ mod settings_layout_tests;
 mod settings_scenes;
 mod sheet;
 #[cfg(test)]
-mod task_integration_tests;
+pub(in crate::gui) mod task_integration_tests;
 #[cfg(test)]
 mod task_layout_tests;
 mod task_quit;

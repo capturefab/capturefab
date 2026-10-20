@@ -18,12 +18,13 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 SCENES = {
-    "workspace": (4, "dark,features,focus,exposure"),
+    "workspace": (1, "dark,features,focus,exposure"),
+    "picker": (1, "dark,welcome"),
     "features": (1, "dark,features,noscopes"),
     "capture": (1, "dark,capture,noscopes,inspector-storage-default"),
     "schedule": (1, "dark,capture,noscopes,inspector-widest,inspector-storage-default,scheduled"),
     "destinations": (1, "dark,destinations-list,noscopes"),
-    "scopes": (1, "dark,noinspector,nosidebar,focus,exposure"),
+    "scopes": (1, "dark,noinspector,focus,exposure"),
     "forwarding": (1, "dark,forward,noscopes,inspector-storage-default"),
     "quick-command": (2, "dark,quick-command-plan,noscopes"),
 }
@@ -32,15 +33,15 @@ SCENES = {
 # Originals remain beside the crops so every illustration can be audited.
 CROPS = {
     "quick-command": ("quick-command", (0, 0, 1100, 700), "Quick command plan with checked, editable camera tools and an explicit Run plan action. Provider and camera observations are synthetic display fixtures."),
-    "workspace": ("workspace", (0, 0, 1100, 700), "Four simulator cameras in the live workbench, with camera list and the selected camera's inspector."),
-    "cameras": ("workspace", (0, 0, 240, 700), "Connected simulator camera list and controls for finding or adding a source."),
+    "workspace": ("workspace", (0, 0, 1100, 700), "A simulator camera in its own workbench window, with scopes and its Features inspector."),
+    "cameras": ("picker", (300, 40, 800, 660), "The camera picker in a window without a camera: found simulator cameras, the address field beside Search again, and data sources, Settings, Help and session controls."),
     "features": ("features", (784, 0, 1100, 652), "Quick controls for the selected camera, with search and collapsed feature groups for less common settings."),
     "capture": ("capture", (784, 0, 1100, 700), "Ordinary capture controls first, followed by the Capture options (timeout and scheduling), Automatic capture, Storage and retention, and Shell and agents disclosures; no automatic capture session is open in this scene."),
     "schedule": ("schedule", (800, 414, 1085, 596), "The capture scheduling form in Capture options, with start delay and frame interval."),
-    "destinations": ("destinations", (264, 174, 836, 526), "Destination manager showing example folder and S3-compatible bucket destinations."),
+    "destinations": ("destinations", (264, 150, 836, 550), "Destination manager showing example folder and S3-compatible bucket destinations."),
     "scopes": ("scopes", (438, 40, 1096, 442), "Live focus score with its focus measure chooser and exposure histogram alongside the focus region on a simulator image."),
     "forwarding": ("forwarding", (784, 0, 1100, 420), "Video panel with the Record to file or Forward to URL choice, the folded Location and name section, a start action and the next file name, followed by the Video settings disclosure summing up codec, frame rate and bitrate."),
-    "history": ("destinations", (288, 238, 464, 277), "Undo and Redo controls in the destination manager; macOS keyboard shortcuts are shown."),
+    "history": ("destinations", (288, 218, 456, 255), "Undo and Redo controls in the destination manager; macOS keyboard shortcuts are shown."),
 }
 
 

@@ -151,31 +151,25 @@ impl Workbench {
     /// Project this window's focus from the shared cameras. Focus is local;
     /// settings, jobs, and activity continue to be shared with every client.
     pub(super) fn project_local_camera(&mut self) {
-        let available = |id: &str| {
-            self.snapshot
+        // A camera on its way keeps the window until it was shown and left.
+        if let Some(id) = &self.local_camera
+            && self.observed_camera.as_ref() == Some(id)
+            && !self
+                .snapshot
                 .cameras
                 .iter()
-                .any(|camera| camera.info.id == id)
-        };
-        let camera = self
-            .local_camera
-            .as_deref()
-            .filter(|id| available(id))
-            .or_else(|| {
-                self.snapshot
-                    .active_camera
-                    .as_deref()
-                    .filter(|id| available(id))
-            })
-            .or_else(|| {
-                self.snapshot
-                    .cameras
-                    .first()
-                    .map(|camera| camera.info.id.as_str())
-            })
-            .map(str::to_owned);
-        self.local_camera = camera.clone();
-        self.snapshot.select_view(camera.as_deref());
+                .any(|camera| &camera.info.id == id)
+        {
+            self.local_camera = None;
+        }
+        self.snapshot.select_view(self.local_camera.as_deref());
+    }
+
+    /// Show `camera` in this window, or the welcome screen for `None`.
+    pub(super) fn show_camera(&mut self, camera: Option<String>) {
+        self.local_camera = camera;
+        self.project_local_camera();
+        self.sync_shared_editors();
     }
 
     pub(super) fn selected_frame(&self) -> Option<Arc<crate::types::Frame>> {
@@ -631,7 +625,6 @@ fn matches_job(entry: &SessionActivity, job: &Job) -> bool {
         Job::NetworkScan => entry.operation == "network_scan",
         Job::Connect => entry.operation == "connect",
         Job::Disconnect => entry.operation == "disconnect",
-        Job::Select => entry.operation == "select",
         Job::Start => {
             entry.operation == "start"
                 || entry.operation == "execute"
@@ -1323,17 +1316,31 @@ mod tests {
     }
 
     #[test]
-    fn local_focus_falls_back_after_disconnect_and_keeps_shared_activity() {
+    fn a_window_keeps_its_camera_until_it_was_shown_and_left() {
         let mut bench = Workbench::new(SessionHandle::new(), "test".into(), false, None);
         let mut camera = super::super::liveness::streaming_camera(1, 0, 10.0);
         camera.info.id = "sim:1".into();
-        bench.snapshot.cameras = vec![camera];
+        bench.snapshot.cameras = vec![camera.clone()];
+        bench.snapshot.active_camera = Some("sim:1".into());
         bench.snapshot.activity = vec![entry(1, ActivityState::Running)];
+        // Another camera in the session never takes an empty window.
+        bench.project_local_camera();
+        assert!(bench.local_camera.is_none() && bench.snapshot.connected.is_none());
+        // A connect answered before the snapshot lists the camera keeps it.
         bench.local_camera = Some("sim:0".into());
         bench.project_local_camera();
-        assert_eq!(bench.local_camera.as_deref(), Some("sim:1"));
+        bench.sync_shared_editors();
+        assert_eq!(bench.local_camera.as_deref(), Some("sim:0"));
+        assert!(bench.snapshot.connected.is_none());
         assert_eq!(bench.snapshot.activity.len(), 1);
-        bench.snapshot.cameras.clear();
+        let mut own = camera.clone();
+        own.info.id = "sim:0".into();
+        bench.snapshot.cameras = vec![own, camera];
+        bench.project_local_camera();
+        bench.sync_shared_editors();
+        assert_eq!(bench.snapshot.connected.as_ref().unwrap().id, "sim:0");
+        // Once shown, its camera going away leaves the window empty.
+        bench.snapshot.cameras.remove(0);
         bench.project_local_camera();
         assert!(bench.local_camera.is_none() && bench.snapshot.connected.is_none());
     }

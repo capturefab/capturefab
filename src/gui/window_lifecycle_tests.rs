@@ -5,7 +5,7 @@ use iced::futures::StreamExt;
 use iced_runtime::{Action as RuntimeAction, window::Action as WindowAction};
 
 #[derive(Debug, PartialEq)]
-enum Effect {
+pub(super) enum Effect {
     Run(window::Id),
     Close(window::Id),
     Show(window::Id),
@@ -17,7 +17,7 @@ enum Effect {
     Other,
 }
 
-fn effects(task: Task<Message>) -> Vec<Effect> {
+pub(super) fn effects(task: Task<Message>) -> Vec<Effect> {
     effects_with_mode(task, None)
 }
 

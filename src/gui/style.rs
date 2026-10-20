@@ -136,7 +136,7 @@ pub const DARK_CONTRAST: Palette = Palette {
     ..DARK
 };
 
-/// Everything drawn on the stage and its glass: tiles, captions, overlays and
+/// Everything drawn on the stage and its glass: overlays, badges and
 /// the controls floating over the image. The stage is dark in both
 /// appearances. Its `text` and `secondary` are `ON_STAGE` and
 /// `ON_STAGE_SECONDARY`, which read over glass on a bright picture; its
@@ -499,7 +499,7 @@ pub const fn line_height(size: f32) -> f32 {
 pub const RADIUS_SMALL: f32 = 6.0;
 /// Buttons, list rows, menus and segment tracks.
 pub const RADIUS: f32 = 8.0;
-/// Tiles, the selection ring, wells and cards.
+/// Wells and cards.
 pub const RADIUS_MEDIUM: f32 = 10.0;
 /// Glass overlays floating over the stage.
 pub const RADIUS_LARGE: f32 = 12.0;
@@ -545,13 +545,6 @@ pub fn mix(a: Color, b: Color, t: f32) -> Color {
 
 // Containers
 
-pub fn sidebar(theme: &Theme) -> container::Style {
-    let p = Palette::from(theme);
-    container::Style::default()
-        .background(p.sidebar)
-        .color(p.text)
-}
-
 pub fn base(theme: &Theme) -> container::Style {
     let p = Palette::from(theme);
     container::Style::default().background(p.base).color(p.text)
@@ -562,37 +555,6 @@ pub fn stage(theme: &Theme) -> container::Style {
     container::Style::default()
         .background(p.stage)
         .color(ON_STAGE)
-}
-
-/// A camera tile's picture.
-pub fn tile(theme: &Theme) -> container::Style {
-    let p = Palette::from(theme);
-    container::Style {
-        background: Some(p.stage.into()),
-        border: border(RADIUS_MEDIUM),
-        text_color: Some(ON_STAGE),
-        ..container::Style::default()
-    }
-}
-
-/// The accent ring drawn around the selected tile, with corners of
-/// `radius`; `shown` fades it.
-pub fn ring(shown: f32, emphasized: bool, radius: f32) -> impl Fn(&Theme) -> container::Style {
-    move |theme| container::Style {
-        border: Border {
-            color: alpha(
-                if emphasized && Palette::from(theme).window_active {
-                    STAGE.accent
-                } else {
-                    STAGE_INACTIVE.accent
-                },
-                shown,
-            ),
-            width: 2.5,
-            radius: radius.into(),
-        },
-        ..container::Style::default()
-    }
 }
 
 /// The capture flash over a captured picture at full level: a white wash
@@ -606,21 +568,6 @@ pub const FLASH_WIDTH: f32 = 2.0;
 /// reduced, so only its edge flashes.
 pub fn flash_wash() -> bool {
     !super::motion::reduce_motion()
-}
-
-/// The capture flash over a tile at `level`; the single view draws the same
-/// over its picture.
-pub fn capture_flash(level: f32) -> impl Fn(&Theme) -> container::Style {
-    let wash = flash_wash();
-    move |_theme| container::Style {
-        background: wash.then(|| alpha(Color::WHITE, FLASH_WASH * level).into()),
-        border: Border {
-            color: alpha(Color::WHITE, FLASH_EDGE * level),
-            width: FLASH_WIDTH,
-            radius: RADIUS_MEDIUM.into(),
-        },
-        ..container::Style::default()
-    }
 }
 
 /// Dark glass behind controls that float over the image; `shown` fades it.
@@ -655,30 +602,6 @@ pub fn glass(shown: f32, solid: bool) -> impl Fn(&Theme) -> container::Style {
             blur_radius: 20.0,
         },
         text_color: Some(alpha(ON_STAGE, shown)),
-        ..container::Style::default()
-    }
-}
-
-/// How dark the shade under a tile's caption is, from its bottom edge (0)
-/// to its top (1): held deep across the text row, then fading out.
-const CAPTION_SHADE: [(f32, f32); 3] = [(0.0, 0.88), (0.75, 0.82), (1.0, 0.0)];
-
-/// The darkening under a tile's caption, so its text reads on any image:
-/// Primary and secondary labels read throughout the caption's text rows,
-/// even over a white image; only the top quarter fades out.
-pub fn caption(_theme: &Theme) -> container::Style {
-    let fade = CAPTION_SHADE
-        .iter()
-        .fold(iced::gradient::Linear::new(0.0), |fade, &(at, dark)| {
-            fade.add_stop(at, alpha(Color::BLACK, dark))
-        });
-    container::Style {
-        background: Some(Background::Gradient(fade.into())),
-        border: Border {
-            radius: border::Radius::default().bottom(RADIUS_MEDIUM),
-            ..Border::default()
-        },
-        text_color: Some(ON_STAGE),
         ..container::Style::default()
     }
 }
@@ -924,26 +847,6 @@ pub fn danger(theme: &Theme, status: button::Status) -> button::Style {
         button::Status::Hovered => button_base(Some(alpha(p.danger, 0.18)), ink, RADIUS),
         button::Status::Pressed => button_base(Some(alpha(p.danger, 0.26)), ink, RADIUS),
         button::Status::Disabled => button_base(Some(p.field), p.secondary, RADIUS),
-    }
-}
-
-/// A sidebar list row, with the selected fill drawn in by `selected`, from
-/// 0 to 1, so the highlight can cross-fade from one row to the next.
-pub fn row(selected: f32, emphasized: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |theme, status| {
-        let p = Palette::from(theme);
-        let selection = if emphasized {
-            p.selected
-        } else {
-            Palette::window_appearance(p.dark, p.increased(), false).selected
-        };
-        let rest = match status {
-            button::Status::Hovered => p.hover,
-            button::Status::Pressed => selection,
-            _ => alpha(selection, 0.0),
-        };
-        let fill = mix(rest, selection, selected.clamp(0.0, 1.0));
-        button_base((fill.a > 0.0).then_some(fill), p.text, RADIUS)
     }
 }
 
@@ -1444,14 +1347,6 @@ mod tests {
                 );
                 assert_eq!(input_invalid(&theme, focused).border.color, p.danger);
                 assert_eq!(input_dirty(&theme, focused).border.color, p.accent);
-                assert_eq!(
-                    ring(1.0, true, RADIUS_MEDIUM)(&theme).border.color,
-                    STAGE_INACTIVE.accent
-                );
-                assert_ne!(
-                    ring(1.0, true, RADIUS_MEDIUM)(&theme).border.color,
-                    STAGE.accent
-                );
             }
         }
     }
@@ -1461,19 +1356,10 @@ mod tests {
         let main = window_theme_appearance(false, false, false);
         let settings = window_theme_appearance(false, false, true);
         assert_ne!(main.name(), settings.name());
-        assert_eq!(
-            row(1.0, true)(&main, button::Status::Active).background,
-            Some(INACTIVE[0].selected.into())
-        );
-        assert_eq!(
-            row(1.0, true)(&settings, button::Status::Active).background,
-            Some(LIGHT.selected.into())
-        );
+        assert_eq!(Palette::from(&main).selected, INACTIVE[0].selected);
+        assert_eq!(Palette::from(&settings).selected, LIGHT.selected);
         let restored = window_theme_appearance(false, false, true);
-        assert_eq!(
-            row(1.0, true)(&restored, button::Status::Active).background,
-            Some(LIGHT.selected.into())
-        );
+        assert_eq!(Palette::from(&restored).selected, LIGHT.selected);
         // Looking up a restored foreground window must not recolor the
         // already constructed background window or allocate a new theme.
         assert!(!Palette::from(&main).window_active);
@@ -1588,15 +1474,5 @@ mod tests {
             let r = ratio(STAGE.accent_text, glass);
             assert!(r >= 3.0, "active glyph over {picture:?}: {r:.2}");
         }
-    }
-
-    #[test]
-    fn caption_text_reads_over_white_pictures() {
-        // The text row sits around the middle of the caption's shade.
-        let [(_, bottom), (stop, held), _] = CAPTION_SHADE;
-        let dark = bottom + (held - bottom) * (0.5 / stop);
-        let shade = over(alpha(Color::BLACK, dark), Color::WHITE);
-        let r = ratio(STAGE.text, shade);
-        assert!(r >= 4.5, "{r:.2}");
     }
 }

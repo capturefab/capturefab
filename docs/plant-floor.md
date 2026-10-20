@@ -31,8 +31,10 @@ default, and records to the same pattern with `.mp4`. Each capture gets a new
 name, so you can push **Capture & save** (Cmd/Ctrl-S) or **Record**
 (Cmd/Ctrl-Shift-R) again and again. The Capture panel shows the next name as
 **Next:**. **Show in Finder** (Explorer on Windows, folder on Linux) opens the
-last saved file. In the overview, **Capture all** and **Record all** act on
-every connected camera; each camera gets its own file.
+last saved file. Each window shows one camera; **File › Connect to Camera…**
+(Cmd/Ctrl-N) opens another. **Capture All** (Cmd/Ctrl-Shift-S) and the Camera
+menu's **Record All Cameras** act on every connected camera; each camera gets its
+own file.
 
 From a terminal, use the same placeholders:
 
@@ -133,7 +135,7 @@ capturefab --session line1 signals
 
 The desktop app does the same thing. **Live signals** in the Capture panel has
 an **Add data source** field and shows each tag with a short trend line. The
-sidebar lists running **Data sources** with a stop button. The **Dataset**
+camera picker lists running **Data sources** with a stop button. The **Dataset**
 section shows the open file. With **Catalog captures automatically** (on by
 default), the app creates `~/Capturefab/capturefab.duckdb` on the first saved
 file or signal sample.

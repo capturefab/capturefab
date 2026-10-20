@@ -1,18 +1,18 @@
 //! What the stage shows before pictures: the welcome screen with no camera
 //! connected, and a connected camera before its first frame.
 use super::*;
-use iced::widget::column;
-use sidebar::{ADDRESSES, DISCOVERING, DISCOVERS, ISSUES, place, recent_place};
+use iced::widget::{column, hover};
+use sidebar::{DISCOVERING, DISCOVERS, ISSUES, place, recent_place};
 
 /// Height of a welcome card: its padding and its title and detail lines.
 const CARD: f32 =
     10.0 + style::line_height(style::BODY) + 2.0 + style::line_height(style::CAPTION) + 10.0;
 /// Height of the discovery callout: its padding and one line.
 const CALLOUT: f32 = 4.0 + style::line_height(style::SMALL) + 4.0;
-/// Height of the welcome screen's content with one card and nothing else,
+/// Height of the welcome screen's content with one card and its footer,
 /// which sits centered; more grows downward from there, so nothing above
 /// the cards ever moves as discovery changes them.
-const ANCHORED: f32 = 330.0;
+const ANCHORED: f32 = 440.0;
 /// How far the welcome screen rises as it fades in.
 const RISE: f32 = 24.0;
 
@@ -132,28 +132,23 @@ impl Workbench {
         self.welcome_content_for(p, false)
     }
 
-    /// What the welcome screen offers: the cameras found and recent ones
-    /// it lists as cards, and whether it says it is searching.
-    fn welcome_choices(&self, compact: bool) -> (Vec<&CameraInfo>, Vec<&Recent>, bool) {
-        let found: Vec<&CameraInfo> = self
-            .snapshot
-            .devices
-            .iter()
-            .filter(|device| {
-                !self
-                    .snapshot
-                    .cameras
+    /// What the welcome screen offers: the cameras connected, found and
+    /// recent ones it lists as cards, and whether it says it is searching.
+    fn welcome_choices(&self) -> (Vec<&CameraInfo>, Vec<&Recent>, bool) {
+        let connected = self.snapshot.cameras.iter().map(|camera| &camera.info);
+        let found: Vec<&CameraInfo> = connected
+            .clone()
+            .chain(
+                self.snapshot
+                    .devices
                     .iter()
-                    .any(|camera| camera.info.id == device.id)
-            })
-            // The sidebar retains every discovered and recent source. Avoid
-            // duplicating a long source list above compact onboarding actions.
-            .take(if compact && self.sidebar_open { 1 } else { 4 })
+                    .filter(|device| !connected.clone().any(|camera| camera.id == device.id)),
+            )
+            .take(4)
             .collect();
         let recent: Vec<&Recent> = self
             .recent
             .iter()
-            .filter(|_| !compact || !self.sidebar_open)
             .filter(|recent| {
                 !self.snapshot.devices.iter().any(|device| {
                     device.id == recent.target
@@ -172,8 +167,8 @@ impl Workbench {
     /// How the welcome screen offers a simulated camera; see
     /// `simulator_offer`.
     #[cfg(test)]
-    fn welcome_simulator(&self, compact: bool) -> Option<bool> {
-        let (found, recent, searching_shown) = self.welcome_choices(compact);
+    fn welcome_simulator(&self) -> Option<bool> {
+        let (found, recent, searching_shown) = self.welcome_choices();
         welcome_simulator_for(&found, &recent, searching_shown)
     }
 
@@ -185,9 +180,9 @@ impl Workbench {
         let now = self.now;
         let discovering = self.pending(Job::Discover);
         let spin = self.spin();
-        let (found, recent, searching_shown) = self.welcome_choices(compact);
+        let (found, recent, searching_shown) = self.welcome_choices();
         let subtitle = if !found.is_empty() {
-            "Choose a camera to connect.".to_owned()
+            "Choose a camera.".to_owned()
         } else if searching_shown {
             DISCOVERING.into()
         } else {
@@ -297,10 +292,15 @@ impl Workbench {
             .iter()
             .all(|device| self.side.arrival(&device.id, now) < 1.0);
         for (index, device) in found.iter().enumerate() {
+            let connected = self.snapshot.cameras.iter().any(|c| c.info.id == device.id);
             let card = self.welcome_card(
                 Icon::transport(device.transport),
                 &device.model,
-                place(device),
+                if connected {
+                    format!("Connected · {}", place(device))
+                } else {
+                    place(device)
+                },
                 &device.id,
                 self.connecting_to(device),
                 p,
@@ -330,13 +330,30 @@ impl Workbench {
             extra += 30.0;
         }
         for entry in &recent {
-            cards = cards.push(self.welcome_card(
-                Icon::transport(entry.transport),
-                &entry.label,
-                recent_place(entry),
-                &entry.target,
-                self.connecting(&entry.target),
-                p,
+            let forget = tip(
+                button(icon(Icon::Close, 11.0, p.secondary))
+                    .name(format!("Forget {}", entry.label))
+                    .padding(5)
+                    .style(style::plain)
+                    .on_press(Message::Forget(entry.target.clone())),
+                "Forget",
+            );
+            cards = cards.push(hover(
+                self.welcome_card(
+                    Icon::transport(entry.transport),
+                    &entry.label,
+                    recent_place(entry),
+                    &entry.target,
+                    self.connecting(&entry.target),
+                    p,
+                ),
+                container(forget)
+                    .align_right(Fill)
+                    .center_y(Fill)
+                    .padding(iced::Padding {
+                        right: 36.0,
+                        ..iced::Padding::ZERO
+                    }),
             ));
         }
         // `ANCHORED` holds the first slot: a found camera's card, or the
@@ -369,67 +386,43 @@ impl Workbench {
             .on_press_maybe((!busy).then_some(on))
         };
         let simulator = welcome_simulator_for(&found, &recent, searching_shown);
-        // One family of buttons in every state. The simulator comes last,
-        // so it can come and go (once a simulated camera is listed) without
-        // moving the others; it is the primary action only on an empty
-        // screen, where it is the quickest way in.
-        let mut actions = row![
-            tip(
-                action(
-                    Icon::Refresh,
-                    if discovering {
-                        "Searching…"
-                    } else {
-                        "Search again"
-                    },
-                    Message::Discover,
-                    discovering,
-                    false,
-                ),
-                Action::Discover.hint(DISCOVERS, os),
+        // Search sits beside the address field. The simulator keeps its own
+        // slot, so it can come and go (once a simulated camera is listed)
+        // without resetting the field; it is the primary action only on an
+        // empty screen, where it is the quickest way in.
+        let search = tip(
+            action(
+                Icon::Refresh,
+                if discovering {
+                    "Searching…"
+                } else {
+                    "Search again"
+                },
+                Message::Discover,
+                discovering,
+                false,
             ),
-            tip(
-                action(
-                    Icon::Plus,
-                    "Enter an address",
-                    Message::EnterAddress,
-                    false,
-                    false,
-                ),
-                Action::ConnectAddress.hint(ADDRESSES, os),
-            ),
-        ];
-        if let Some(primary) = simulator {
-            actions = actions.push(action(
+            Action::Discover.hint(DISCOVERS, os),
+        );
+        let gap = if compact { 8.0 } else { 14.0 };
+        let simulator = simulator.map(|primary| {
+            container(action(
                 Icon::Cube,
                 "Try a simulated camera",
                 Message::TrySimulator,
-                self.connecting("sim:0"),
+                self.connecting(&self.free_simulator()),
                 primary,
-            ));
-        }
-        let actions = actions
-            .spacing(8)
-            .align_y(Alignment::Center)
-            .wrap()
-            .vertical_spacing(8);
-        let guide = row![
-            button(text("Quick guide").size(style::SMALL))
-                .style(style::link)
-                .padding([2, 6])
-                .on_press(Message::Help(true)),
-            text(Action::Help.key_label(os))
-                .size(style::CAPTION)
-                .color(p.secondary),
-        ]
-        .spacing(2)
-        .align_y(Alignment::Center);
+            ))
+            .padding(iced::Padding {
+                bottom: gap,
+                ..iced::Padding::ZERO
+            })
+        });
         let content = content
             .push(cards)
-            .push(space().height(if compact { 8 } else { 14 }))
-            .push(actions)
-            .push(space().height(if compact { 8 } else { 14 }))
-            .push(guide);
+            .push(space().height(gap))
+            .push(simulator)
+            .push(self.picker_footer(p, search));
         (content.into(), extra)
     }
 
@@ -616,7 +609,7 @@ mod tests {
             app.now += Duration::from_secs(3);
             app.welcome.set(1.0);
             let size = Size::new(
-                900.0 / scale.factor() - SIDEBAR,
+                900.0 / scale.factor(),
                 620.0 / scale.factor() - BAR - TOOLBAR,
             );
             let mut view = app.welcome(Palette::of(false));
@@ -642,8 +635,6 @@ mod tests {
             );
             for label in [
                 Action::Discover.hint(DISCOVERS, Os::CURRENT),
-                Action::ConnectAddress.hint(ADDRESSES, Os::CURRENT),
-                "Quick guide".into(),
                 "Ask the assistant".into(),
                 "Connect an agent".into(),
             ] {
@@ -655,6 +646,10 @@ mod tests {
                             && control.label() == Some(label.as_str())
                     })
                     .unwrap_or_else(|| panic!("{label} is visible in compact welcome at {scale}"));
+                // Larger interface sizes scroll to them; see below.
+                if scale != prefs::UiScale::Standard {
+                    continue;
+                }
                 let bounds = action.1.bounds().unwrap();
                 assert!(
                     bounds.height() >= 18.0
@@ -676,9 +671,8 @@ mod tests {
             );
             drop(view);
 
-            // With the sidebar closed, every source remains in the welcome
-            // body. A genuinely short viewport can still reveal its actions.
-            app.sidebar_open = false;
+            // Every source remains in the welcome body. A genuinely short
+            // viewport can still reveal its footer.
             let short = Size::new(400.0, 220.0);
             let mut view = app.welcome(Palette::of(false));
             let mut tree = Tree::new(view.as_widget());
@@ -707,17 +701,61 @@ mod tests {
                 Layout::new(&node),
                 &renderer,
             );
-            let guide = after
+            let settings = after
                 .nodes
                 .iter()
-                .find(|(_, control)| control.label() == Some("Quick guide"))
-                .expect("real scrolling reaches the last onboarding action");
-            assert!(guide.1.bounds().unwrap().y1 <= f64::from(short.height) + 0.5);
+                .find(|(_, control)| control.label() == Some("Settings"))
+                .expect("real scrolling reaches the footer");
+            let bounds = settings.1.bounds().unwrap();
+            assert!(bounds.y0 >= 0.0 && bounds.y1 <= f64::from(short.height) + 0.5);
         }
     }
 
     fn bench() -> Workbench {
         Workbench::new(SessionHandle::new(), "test".into(), true, None)
+    }
+
+    #[test]
+    fn a_new_window_shows_the_picker_with_its_address_field() {
+        use crate::gui::destinations::layout_tests::{prepare_artifact_frame, renderer};
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let renderer = renderer();
+        let mut app = bench();
+        let camera = liveness::streaming_camera(0, 0, 0.0);
+        app.snapshot.cameras = vec![camera.clone()];
+        app.project_local_camera();
+        assert!(app.local_camera.is_none() && app.snapshot.connected.is_none());
+        // The camera it showed is still connected, and offered as a card.
+        let (found, _, _) = app.welcome_choices();
+        assert_eq!(found[0].id, camera.info.id);
+        app.welcome.set(1.0);
+        let size = Size::new(900.0, 620.0 - BAR - TOOLBAR);
+        let mut view = app.welcome(Palette::of(false));
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        prepare_artifact_frame(&mut view, &mut tree, &node, &renderer, size);
+        let (snapshot, _, _) = accessibility::snapshot_widget(
+            view.as_widget_mut(),
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+        );
+        for label in ["Camera address", "Settings", "Open data sources"] {
+            let bounds = snapshot
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .and_then(|(_, node)| node.bounds())
+                .unwrap_or_else(|| panic!("{label}"));
+            assert!(
+                bounds.y1 <= f64::from(size.height) + 0.5,
+                "{label} fits without scrolling: {bounds:?}"
+            );
+        }
     }
 
     #[test]
@@ -746,7 +784,7 @@ mod tests {
         app.welcome.set(1.0);
         assert!(app.snapshot.devices.is_empty() && app.recent.is_empty());
         assert!(!app.pending(Job::Discover), "not searching");
-        let size = Size::new(900.0 - SIDEBAR, 620.0 - BAR - TOOLBAR);
+        let size = Size::new(900.0, 620.0 - BAR - TOOLBAR);
         let mut view = app.welcome(Palette::of(false));
         let mut tree = Tree::new(view.as_widget());
         let node = view.as_widget_mut().layout(
@@ -779,25 +817,11 @@ mod tests {
             );
             *id
         };
-        // Primary from the very choices the view lists, and last in the
-        // row, so it comes and goes without moving the others.
-        assert_eq!(app.welcome_simulator(false), Some(true), "primary");
-        let x = |label: &str| {
-            let id = visible(label);
-            snapshot
-                .nodes
-                .iter()
-                .find(|(node, _)| *node == id)
-                .unwrap()
-                .1
-                .bounds()
-                .unwrap()
-                .x0
-        };
-        let search = Action::Discover.hint(DISCOVERS, Os::CURRENT);
-        let address = Action::ConnectAddress.hint(ADDRESSES, Os::CURRENT);
-        assert!(x(&search) < x(&address));
-        assert!(x(&address) < x("Try a simulated camera"));
+        // Primary from the very choices the view lists.
+        assert_eq!(app.welcome_simulator(), Some(true), "primary");
+        visible(&Action::Discover.hint(DISCOVERS, Os::CURRENT));
+        visible("Try a simulated camera");
+        visible("Settings");
         let tips = visible("Connection tips");
         let task = bridge.dispatch(accessibility::Request {
             window,

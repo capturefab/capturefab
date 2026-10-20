@@ -39,8 +39,6 @@ pub(super) const ROW_GAP: f32 = 12.0;
 const THUMB: Duration = Duration::from_millis(180);
 /// How long a field glows once the camera has taken its value.
 const ACCEPTED: Duration = Duration::from_millis(450);
-/// How long the camera context row glows as the selection moves to it.
-const CONTEXT: Duration = Duration::from_millis(280);
 /// The panel's scrollable, for jumping back to its top.
 pub(super) const SCROLL: &str = "inspector";
 /// Rows an open feature group lays out until asked for the rest. The panel
@@ -670,8 +668,6 @@ pub(super) struct InspectorState {
     placed: bool,
     /// The camera the panel last showed.
     shown_camera: Option<String>,
-    /// The camera context row lighting up as the selection moves to it.
-    context: Motion,
     /// How open the storage and auto changes disclosures are.
     storage_turn: Motion,
     changes_turn: Motion,
@@ -709,7 +705,6 @@ impl Default for InspectorState {
             output_thumb: Motion::new(0.0, THUMB, THUMB, Kind::Move),
             placed: false,
             shown_camera: None,
-            context: Motion::new(0.0, CONTEXT, CONTEXT, Kind::Fade),
             storage_turn: Motion::new(0.0, motion::RING, motion::RING_OUT, Kind::Move),
             changes_turn: Motion::new(0.0, motion::RING, motion::RING_OUT, Kind::Move),
             index: FeatureIndex::default(),
@@ -722,7 +717,7 @@ impl Default for InspectorState {
 
 impl InspectorState {
     super::motion::registry! {
-        motions: [tab_thumb, mode_thumb, output_thumb, context, storage_turn, changes_turn],
+        motions: [tab_thumb, mode_thumb, output_thumb, storage_turn, changes_turn],
         flashes: [accepted],
     }
 }
@@ -1104,11 +1099,6 @@ impl Workbench {
         let moved = self.inspect.shown_camera.as_deref() != self.snapshot.active_camera.as_deref();
         let inspect = &mut self.inspect;
         if moved {
-            // Light up the context row as another camera takes the panel,
-            // but not for the first one.
-            if inspect.shown_camera.is_some() && self.snapshot.cameras.len() > 1 {
-                inspect.context.replay(1.0, 0.0, now);
-            }
             inspect.shown_camera = self.snapshot.active_camera.clone();
         }
         // Another camera's mode is no change of mode, so the thumb jumps.
@@ -1311,8 +1301,7 @@ impl Workbench {
     /// `inspector-search` and `inspector-nomatch` (a search with and without
     /// matches), `inspector-storage` (storage settings open),
     /// `inspector-noforward` (no forward output yet), `inspector-widest` (the
-    /// longest choices in every form, all of it open), `inspector-context`
-    /// (the camera context row lighting up), `inspector-dirty` (an
+    /// longest choices in every form, all of it open), `inspector-dirty` (an
     /// exposure time typed, not applied), `inspector-applying` (and being
     /// applied), `inspector-accepted` (just taken by the camera),
     /// `inspector-switching` (auto mode on its way), `inspector-connecting`
@@ -1365,7 +1354,6 @@ impl Workbench {
                 | "inspector-accepted"
                 | "inspector-switching"
                 | "inspector-connecting"
-                | "inspector-context"
                 | "inspector-capture-failed"
                 | "inspector-capturing",
                 false,
@@ -1390,7 +1378,6 @@ impl Workbench {
                 // The welcome card it came from shows it connecting too.
                 self.scene_hold(Job::Connect).target = Some("sim:0".into());
             }
-            ("inspector-context", true) => self.inspect.context.replay(1.0, 0.0, self.now),
             ("inspector-capture-failed", true) => self.settle(
                 &Pending {
                     camera,
@@ -1689,9 +1676,6 @@ impl Workbench {
         if let Some(status) = self.assistant_inspector_status(p) {
             panel = panel.push(status);
         }
-        if let Some(context) = self.camera_context(p) {
-            panel = panel.push(context);
-        }
         if let Some(status) = self
             .snapshot
             .connected
@@ -1737,56 +1721,6 @@ impl Workbench {
             .height(Fill)
             .style(style::base)
             .into()
-    }
-
-    /// With several cameras, which one the panel edits: pinned under the
-    /// tabs, lighting up as the selection moves.
-    fn camera_context(&self, p: &'static Palette) -> Option<Element<'_, Message>> {
-        if self.snapshot.cameras.len() < 2 {
-            return None;
-        }
-        let camera = self.snapshot.connected.as_ref()?;
-        let glow = self.inspect.context.get(self.now);
-        // The same state dot as the camera's row in the camera list, and
-        // like it, ahead of the name.
-        let state = self
-            .snapshot
-            .cameras
-            .iter()
-            .find(|state| state.info.id == camera.id)
-            .map_or(CameraState::Idle, |state| self.camera_state(state));
-        let line = row![
-            container(status_dot(state, 6.0, p)).center_x(13),
-            tip(
-                one_line(camera.model.as_str(), style::SMALL, style::MEDIUM, p.text).yield_room(),
-                camera.model.as_str(),
-            ),
-            tip(
-                one_line(identity(camera), style::SMALL, style::SANS, p.secondary).width(Fill),
-                identity(camera),
-            ),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center);
-        Some(
-            container(
-                container(line)
-                    .padding([6, 10])
-                    .width(Fill)
-                    .style(move |_| container::Style {
-                        background: Some(fade(p.accent_soft, glow).into()),
-                        border: iced::border::rounded(style::RADIUS),
-                        ..container::Style::default()
-                    }),
-            )
-            .padding(iced::Padding {
-                top: 6.0,
-                right: 10.0,
-                bottom: 0.0,
-                left: 8.0,
-            })
-            .into(),
-        )
     }
 
     /// The Features tab with no camera: what will show here, and what can
@@ -2253,34 +2187,20 @@ impl Workbench {
         };
         let mut links = row![].align_y(Alignment::Center);
         if scoped {
-            // The scopes draw over a single camera, not the overview's
-            // tiles: there a scope reads as off, and pressing it turns it on
-            // and opens the selected camera, where it shows.
-            let overview = self.overview();
-            let camera = self.snapshot.active_camera.clone();
             let link = |shown_label: &'static str,
                         hidden_label: &'static str,
                         what: &str,
                         open: bool,
                         toggle: Message,
-                        scope: Scope,
                         action: Action| {
-                let shown = open && !overview;
-                let elsewhere = overview && camera.is_some();
-                let on = match &camera {
-                    Some(camera) if overview => Message::ShowScopeOn(camera.clone(), scope),
-                    _ => toggle,
-                };
-                let hint = if shown {
+                let hint = if open {
                     format!("Hide the {what}")
-                } else if elsewhere {
-                    format!("Show the {what} on the selected camera")
                 } else {
                     format!("Show the {what}")
                 };
                 small(
-                    if shown { shown_label } else { hidden_label },
-                    on,
+                    if open { shown_label } else { hidden_label },
+                    toggle,
                     action.hint(&hint, os),
                 )
             };
@@ -2290,7 +2210,6 @@ impl Workbench {
                 "histogram",
                 self.exposure_open,
                 Message::ToggleExposure,
-                Scope::Histogram,
                 Action::ToggleExposure,
             );
             let focus = link(
@@ -2299,7 +2218,6 @@ impl Workbench {
                 "focus region",
                 self.focus.open,
                 Message::ToggleFocusRegion,
-                Scope::Focus,
                 Action::ToggleFocusRegion,
             );
             links = links.push(histogram).push(focus);
@@ -2496,7 +2414,14 @@ impl Workbench {
                                 .is_none()
                                 .then(|| Message::Commit(feature.name.clone())),
                         ),
-                    Action::FocusCamera.hint("Apply", Os::CURRENT),
+                    format!(
+                        "Apply · {}",
+                        keys::Chord {
+                            mods: keys::Mods::NONE,
+                            key: keys::Key::Enter,
+                        }
+                        .label(Os::CURRENT)
+                    ),
                 )
             } else {
                 // One caption line, as tall as Apply, so a field with no
@@ -4908,23 +4833,6 @@ mod tests {
         bench.sync_animations();
         assert_eq!(bench.inspect.mode_thumb.get(bench.now), 1.0);
         assert!(!bench.inspect.mode_thumb.animating(bench.now));
-    }
-
-    #[test]
-    fn the_context_row_lights_up_when_another_camera_is_selected() {
-        let mut bench = bench();
-        bench.snapshot.cameras = vec![
-            liveness::streaming_camera(10, 0, 30.0),
-            liveness::streaming_camera(10, 0, 30.0),
-        ];
-        bench.sync_animations();
-        let start = bench.now;
-        assert_eq!(bench.inspect.context.get(start), 0.0);
-        bench.snapshot.active_camera = Some("sim:1".into());
-        bench.sync_animations();
-        assert_eq!(bench.inspect.context.get(start), 1.0);
-        bench.now = start + CONTEXT;
-        assert!(!moving(&bench), "fades out and settles");
     }
 
     #[test]

@@ -41,7 +41,7 @@ fields! {
     quota_action: &'static str, schedule_enabled: bool, schedule_delay_seconds: u64,
     schedule_interval_seconds: f64, storage_open: bool, auto_changes_open: bool,
     appearance: Appearance, ui_scale: UiScale, performance: crate::efficiency::Mode, logs_open: bool, fit: bool, zoom: f32, exposure_open: bool,
-    focus_camera: bool, sidebar_open: bool, inspector_open: bool, inspector_peek: bool,
+    inspector_open: bool, inspector_peek: bool,
     image_mode: bool, recent: Vec<Recent>, auto_start: bool, tags: CaptureTags,
 }
 
@@ -143,12 +143,7 @@ impl LocalChange {
                     .iter()
                     .any(|item| &item.info.id == camera)
                 {
-                    app.send(
-                        Job::Select,
-                        SessionCommand::Select {
-                            camera: camera.clone(),
-                        },
-                    );
+                    app.show_camera(Some(camera.clone()));
                 }
             }
         }
@@ -194,9 +189,7 @@ pub(super) fn gesture(message: &Message) -> Option<(String, Option<String>)> {
                 | Action::ToggleExposure
                 | Action::ToggleFocusRegion
                 | Action::ToggleActivity
-                | Action::ToggleSidebar
                 | Action::ToggleInspector
-                | Action::FocusCamera
                 | Action::Overview
                 | Action::ZoomFit
                 | Action::ZoomActual
@@ -256,16 +249,13 @@ pub(super) fn gesture(message: &Message) -> Option<(String, Option<String>)> {
         Message::Menu(menus::Command::Schedule) => ("Change scheduling".into(), None),
         Message::IncludeSimulator(_) | Message::TrySimulator => ("Show simulator".into(), None),
         Message::Tab(_) | Message::ShowTab(_) => ("Change settings panel".into(), None),
-        Message::ToggleSidebar
-        | Message::ToggleInspector
+        Message::ToggleInspector
         | Message::ToggleImage
         | Message::ToggleExposure
         | Message::ToggleFocusRegion
         | Message::ToggleActivity
         | Message::ShowActivity
         | Message::CameraActivity(_)
-        | Message::Focus(_)
-        | Message::FocusTile(_)
         | Message::ToggleStorage
         | Message::ToggleAutoChanges => ("Change workbench view".into(), None),
         _ => return None,
@@ -290,13 +280,11 @@ pub(super) fn group_barrier(message: &Message) -> bool {
         | Message::Select(_)
         | Message::Disconnect(_)
         | Message::ToggleStream
-        | Message::StreamCamera(_, _)
         | Message::AllStreams(_)
         | Message::Auto(_)
         | Message::AllAuto(_)
         | Message::BalanceReleased
         | Message::Capture
-        | Message::CaptureCamera(_)
         | Message::Schedule
         | Message::CancelJob(_)
         | Message::StartForward
@@ -872,10 +860,11 @@ mod tests {
         let mut app = bench();
         update(&mut app, Message::Format(FORMATS[1]));
         assert_eq!(app.output, "capture.jpeg");
-        key(&mut app, Action::ToggleSidebar);
-        assert!(!app.sidebar_open);
+        let open = app.logs_open;
+        key(&mut app, Action::ToggleActivity);
+        assert_eq!(app.logs_open, !open);
         key(&mut app, Action::Undo);
-        assert!(app.sidebar_open);
+        assert_eq!(app.logs_open, open);
         assert_eq!(app.format, "jpeg");
         key(&mut app, Action::Undo);
         assert_eq!(app.format, "png");

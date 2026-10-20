@@ -1,12 +1,13 @@
-//! The camera list: discovered, connected and recent cameras, and the window footer.
+//! The camera picker's state and the welcome screen's footer: discovery,
+//! connect failures and the address field.
 use super::*;
-use iced::widget::{column, hover};
+use iced::widget::column;
 use motion::Flashes;
 use std::collections::HashSet;
 
-/// How many failed connect targets the camera list remembers.
+/// How many failed connect targets the picker remembers.
 const FAILURES_KEPT: usize = 8;
-/// How long a newly found camera takes to grow into the list and fade in.
+/// How long a newly found camera takes to grow onto the welcome screen.
 pub(super) const ARRIVE: Duration = Duration::from_millis(220);
 /// Between cameras found together, so they arrive one after another.
 const STAGGER: Duration = Duration::from_millis(40);
@@ -28,17 +29,11 @@ const SEARCH_SHOWN: Duration = Duration::from_millis(200);
 /// Key of the welcome screen's discovery callout in `SideState::arrived`.
 pub(super) const ISSUES: &str = "\0issues";
 
-/// Room between the sidebar's edges and its rows.
+/// Room between the footer's edges and its rows.
 const EDGE: f32 = 12.0;
 /// Inset of text and glyphs within a row, which headers and hints share, so
-/// the sidebar has one left edge.
+/// the footer has one left edge.
 pub(super) const INSET: f32 = 10.0;
-/// The slot leading glyphs sit in, so device and recent titles align.
-const LEAD: f32 = 16.0;
-/// The slot trailing status glyphs and the eject button share.
-const TRAIL: f32 = 21.0;
-/// A camera row's height while it grows in; a little over its real height.
-const ROW_HEIGHT: f32 = 48.0;
 
 /// What discovery looks for, in its tooltips.
 pub(super) const DISCOVERS: &str =
@@ -51,7 +46,7 @@ pub(super) const ADDRESSES: &str = "IP address, stream URL (RTSP, SRT, RTMP, HTT
 /// What the address field takes, in the room under it.
 const ADDRESS_HINT: &str = "e.g. 192.168.1.20 or rtsp://host/stream";
 
-/// State for the camera list and the welcome screen.
+/// State for the welcome screen.
 pub(super) struct SideState {
     /// The last discovery's problems, each in full: its warnings, or the
     /// error it failed with. Replaced whenever a discovery finishes.
@@ -210,9 +205,9 @@ fn probe_file(path: String) -> Receiver<bool> {
     receiver
 }
 
-/// The camera list's and welcome screen's hooks into the shared update cycle.
+/// The welcome screen's hooks into the shared update cycle.
 impl Workbench {
-    /// Point the camera list's and welcome screen's motions at what they show; from
+    /// Point the welcome screen's motions at what they show; from
     /// `sync_animations`. Also reads a changed address, here rather than in
     /// the view; whether it is a file is asked on the tick (`poll_file`).
     pub(super) fn sync_side(&mut self) {
@@ -224,9 +219,8 @@ impl Workbench {
         }
     }
 
-    /// Reveal the sidebar's address field and focus it, from the welcome
-    /// screen's "Enter an address" and its shortcut. The sidebar joins the
-    /// view as it heads open, so the focus finds the field at once.
+    /// Focus the welcome screen's address field, from its "Enter an
+    /// address" and its shortcut.
     pub(super) fn enter_address(&mut self) -> Task<Message> {
         // From the quick guide's first step: the field it leads to is
         // under the guide.
@@ -234,11 +228,10 @@ impl Workbench {
             self.show_help(false);
         }
         self.image_mode = false;
-        self.sidebar_open = true;
         focus_address()
     }
 
-    /// The camera list's and welcome screen's bookkeeping on the slow tick,
+    /// The welcome screen's bookkeeping on the slow tick,
     /// after the snapshot refresh; from `tick()`.
     pub(super) fn tick_side(&mut self) {
         let now = self.now;
@@ -309,7 +302,7 @@ impl Workbench {
         }
     }
 
-    /// Take a screenshot scene word for the camera list or welcome screen: `late` is
+    /// Take a screenshot scene word for the welcome screen: `late` is
     /// false while the scene is set up and true once its cameras stream.
     /// Returns whether the word was taken; see `apply_scene`. Words, for
     /// `welcome` scenes:
@@ -502,50 +495,6 @@ pub(super) fn reads_as_gige(target: &str, devices: &[CameraInfo]) -> bool {
         })
 }
 
-/// `glyph` centered in the leading slot.
-fn lead<'a>(glyph: Element<'a, Message>) -> Element<'a, Message> {
-    container(glyph).center_x(LEAD).into()
-}
-
-/// A small button that reveals itself over a row's trailing end on hover,
-/// on the row's hovered fill so it covers what sits there.
-fn reveal<'a>(button: Element<'a, Message>, p: &'static Palette) -> Element<'a, Message> {
-    container(container(button).style(move |_| container::Style {
-        background: Some(p.hover.into()),
-        border: iced::border::rounded(style::RADIUS_SMALL),
-        ..container::Style::default()
-    }))
-    .align_right(Fill)
-    .center_y(Fill)
-    .padding(iced::Padding {
-        right: INSET,
-        ..iced::Padding::ZERO
-    })
-    .into()
-}
-
-/// What a connected camera's trailing slot shows, if anything: a glyph, its
-/// color and what it means. `error` is the one its stage badge would show
-/// (`camera_error`), so one already told, retired or dismissed is not. A
-/// stall is its dot's to show, so the slot keeps a recording's mark.
-fn camera_status(
-    camera: &crate::session::CameraSnapshot,
-    error: Option<&str>,
-    p: &'static Palette,
-) -> Option<(Element<'static, Message>, String)> {
-    // While frames flow, the stage has the say.
-    if let Some(error) = error.filter(|_| !camera.streaming) {
-        return Some((Level::Error.mark(12.0, p), format!("Last error: {error}")));
-    }
-    let output = Output::of(camera.forwarding.as_ref()?);
-    let mark = if output.recording() {
-        dot(p.ink(p.danger), 7.0)
-    } else {
-        icon(Icon::Broadcast, 13.0, p.secondary)
-    };
-    Some((mark, output.about()))
-}
-
 impl Workbench {
     /// Whether the welcome screen should say discovery is searching: from
     /// the start until the first one finishes, then once one has run for
@@ -583,441 +532,14 @@ impl Workbench {
                 .is_some_and(|address| self.connecting(address))
     }
 
-    pub(super) fn sidebar(&self, p: &'static Palette) -> Element<'_, Message> {
-        let mut devices: Vec<&CameraInfo> = self.snapshot.devices.iter().collect();
-        for camera in &self.snapshot.cameras {
-            if !devices.iter().any(|device| device.id == camera.info.id) {
-                devices.push(&camera.info);
-            }
-        }
-        let discovering = self.pending(Job::Discover);
-        let spin = self.spin();
-        let mut header = row![
-            text("Cameras")
-                .size(style::CAPTION)
-                .font(style::SEMIBOLD)
-                .color(p.secondary),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center);
-        if !devices.is_empty() {
-            header = header.push(
-                text(devices.len().to_string())
-                    .size(style::CAPTION)
-                    .color(p.secondary),
-            );
-        }
-        if !self.side.discovery_issues.is_empty() {
-            header = header.push(tip(
-                Level::Warning.mark(12.0, p),
-                self.side.discovery_issues.join("\n"),
-            ));
-        }
-        let refresh: Element<'_, Message> = if discovering {
-            icon::spinner(14.0, p.secondary, spin)
-        } else {
-            icon(Icon::Refresh, 14.0, p.secondary)
-        };
-        let header = header.push(space::horizontal()).push(tip(
-            button(refresh)
-                .name(DISCOVERS)
-                .padding(5)
-                .style(style::plain)
-                .on_press_maybe((!discovering).then_some(Message::Discover)),
-            Action::Discover.hint(DISCOVERS, Os::CURRENT),
-        ));
-        let mut list = column![].spacing(2);
-        if devices.is_empty() {
-            list = list.push(
-                container(
-                    text(if discovering {
-                        "Looking for cameras…"
-                    } else {
-                        "No cameras found"
-                    })
-                    .size(style::SMALL)
-                    .color(p.secondary),
-                )
-                .padding([8.0, INSET]),
-            );
-        }
-        let recent: Vec<&Recent> = self
-            .recent
-            .iter()
-            .filter(|recent| {
-                !devices.iter().any(|device| {
-                    device.id == recent.target
-                        || device.address.as_deref() == Some(recent.target.as_str())
-                })
-            })
-            .collect();
-        for camera in &devices {
-            list = list.push(self.camera_row(camera, spin, p));
-        }
-        // A connect to something not listed yet shows where it will land.
-        let mut provisional: Vec<&str> = Vec::new();
-        for target in self.pending.iter().filter_map(|p| p.target.as_deref()) {
-            let listed = devices
-                .iter()
-                .any(|device| device.id == target || device.address.as_deref() == Some(target))
-                || recent.iter().any(|recent| recent.target == target)
-                || provisional.contains(&target);
-            if !listed {
-                provisional.push(target);
-                list = list.push(self.provisional_row(target, spin, p));
-            }
-        }
-        if !recent.is_empty() {
-            list = list.push(
-                container(
-                    text("Recent")
-                        .size(style::CAPTION)
-                        .font(style::SEMIBOLD)
-                        .color(p.secondary),
-                )
-                .padding(iced::Padding {
-                    top: 14.0,
-                    right: INSET,
-                    bottom: 4.0,
-                    left: INSET,
-                }),
-            );
-        }
-        for entry in recent {
-            list = list.push(self.recent_row(entry, spin, p));
-        }
-        list = list.push(self.sidebar_signals(p));
-        // The network check only once GigE is in play, under the list; the
-        // quick guide's connection notes keep it reachable otherwise. Its
-        // report only once there is one, so it is never shown disabled. The
-        // slot stays one container either way, so the widgets after it keep
-        // their state (the address field its focus) as it comes and goes.
-        let mut network = row![].align_y(Alignment::Center);
-        let relevant = self.network_check_relevant();
-        if relevant {
-            network = network
-                .push(self.network_scan_button(p))
-                .push(space::horizontal());
-            if self.snapshot.network_scan.is_some() {
-                network = network.push(
-                    button(text("Report").size(style::SMALL))
-                        .name("Open network scan results")
-                        .padding([4, 5])
-                        .style(style::plain)
-                        .on_press(Message::NetworkReport(true)),
-                );
-            }
-        }
-        let network = container(network).padding(if relevant {
-            iced::Padding::from([6.0, EDGE + INSET])
-        } else {
-            iced::Padding::ZERO
-        });
-        container(
-            column![
-                // Camera controls share the title row beside macOS traffic
-                // lights, leaving the sidebar's height for the device list.
-                self.titlebar(
-                    container(header)
-                        .padding(iced::Padding {
-                            left: self.lights().max(EDGE + INSET),
-                            right: EDGE + 1.0,
-                            ..iced::Padding::ZERO
-                        })
-                        .into()
-                ),
-                space().height(4),
-                container(keyboard_history::content_scope(
-                    scrollable(list).height(Fill).style(style::scroll).into(),
-                    keyboard_history::Area::CameraList,
-                ))
-                .height(Fill)
-                .padding([0.0, EDGE]),
-                // Under the list, so coming and going only trims its bottom
-                // and never moves a camera row.
-                network,
-                self.sidebar_footer(p),
-            ]
-            .padding(iced::Padding {
-                bottom: EDGE,
-                ..iced::Padding::ZERO
-            }),
-        )
-        .width(SIDEBAR)
-        .height(Fill)
-        .style(style::sidebar)
-        .into()
-    }
-
-    /// A discovered or connected camera: a status dot, its model, where it
-    /// is, and at the end what needs attention or the eject button.
-    fn camera_row<'a>(
-        &'a self,
-        camera: &'a CameraInfo,
-        spin: usize,
-        p: &'static Palette,
-    ) -> Element<'a, Message> {
-        let id = camera.id.as_str();
-        let active = self.snapshot.active_camera.as_deref() == Some(id);
-        let state = self.snapshot.cameras.iter().find(|c| c.info.id == id);
-        let connecting = state.is_none() && self.connecting_to(camera);
-        let failure = (state.is_none() && !connecting)
-            .then(|| self.side.connect_failures.get(id))
-            .flatten();
-        let network = self.network_status(camera);
-        let stalled = state
-            .filter(|state| state.streaming)
-            .and_then(|_| self.stalled(id));
-        let dot_state = match state {
-            Some(state) => self.camera_state(state),
-            None if network
-                .as_ref()
-                .is_some_and(|status| status.level == Level::Error) =>
-            {
-                CameraState::Failed
-            }
-            None if failure.is_some() => CameraState::Failed,
-            None => CameraState::Offline,
-        };
-        let glyph: Element<'a, Message> = if connecting {
-            icon::spinner(12.0, p.secondary, spin)
-        } else {
-            status_dot(dot_state, 8.0, p)
-        };
-        let (detail, ink) = if connecting {
-            ("Connecting…".to_owned(), p.secondary)
-        } else if let Some((error, _)) = failure {
-            (capitalize(first_line(error)), p.ink(p.danger))
-        } else if let Some(status) = &network {
-            (status.label.to_owned(), status.color(p))
-        } else {
-            (place(camera), p.secondary)
-        };
-        let status = state.and_then(|state| camera_status(state, self.camera_error(id), p));
-        let identity = format!("{} {} · {}", camera.vendor, camera.model, identity(camera));
-        let name = if state.is_some() {
-            identity
-        } else {
-            format!("Connect to {identity}")
-        };
-        let mut about = match state {
-            Some(_) => format!(
-                "{}{}",
-                if active { "Current camera. " } else { "" },
-                dot_state.about()
-            ),
-            None if connecting => "Connecting…".into(),
-            None => "Not connected.".into(),
-        };
-        let profile = state.map_or(&camera.profile, |state| &state.info.profile);
-        if let Some(status) = &network {
-            about.push_str(&format!("\n{}\n{}", place(camera), status.detail));
-        }
-        about.push_str(&format!(
-            "\n{}\nDetected from {}",
-            profile.kind.summary(),
-            profile.source
-        ));
-        // The dot says it stalled; for how long is here.
-        if let Some(silent) = stalled {
-            about = format!("{about}\n{}", silence(silent));
-        }
-        if let Some((_, status)) = &status {
-            about = format!("{about}\n{status}");
-        } else if let Some((error, _)) = failure {
-            about = format!("{about}\nCould not connect: {error}");
-        }
-        let hint = format!("{name}\n{about}");
-        let mut line = row![
-            lead(glyph),
-            column![
-                one_line(
-                    camera.model.as_str(),
-                    style::BODY,
-                    if active {
-                        style::SEMIBOLD
-                    } else {
-                        style::MEDIUM
-                    },
-                    p.text,
-                )
-                .width(Fill),
-                one_line(detail, style::CAPTION, style::SANS, ink).width(Fill),
-            ]
-            .spacing(1)
-            .width(Fill),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
-        let eject = || -> Element<'a, Message> {
-            tip(
-                button(icon(Icon::Eject, 13.0, p.secondary))
-                    .name(format!("Disconnect {} {}", camera.vendor, camera.model))
-                    .padding(4)
-                    .style(style::plain)
-                    .on_press(Message::Disconnect(camera.id.clone())),
-                "Disconnect",
-            )
-        };
-        if state.is_some() {
-            // Connected rows keep the trailing slot, so their text never
-            // shifts; eject takes it on hover, or for good on the selected row.
-            match status {
-                Some((glyph, about)) => {
-                    line = line.push(tip(container(glyph).center_x(TRAIL), about));
-                }
-                None if !active => line = line.push(space().width(TRAIL)),
-                None => {}
-            }
-            if active {
-                line = line.push(eject());
-            }
-        }
-        let base = tip(
-            button(line)
-                .name(name)
-                .description(about)
-                .width(Fill)
-                .padding([7.0, INSET])
-                .style(style::row(
-                    self.selection_level(id),
-                    self.selection_emphasized(keyboard_history::Area::CameraList),
-                ))
-                .on_press_maybe((!connecting).then(|| Message::CameraRow(camera.id.clone()))),
-            hint,
-        );
-        let row = if state.is_some() && !active {
-            hover(base, reveal(eject(), p))
-        } else {
-            base
-        };
-        self.arriving(id, row, p)
-    }
-
-    /// A connect to a target no row stands for yet, such as a typed address,
-    /// shown where the camera will appear.
-    fn provisional_row<'a>(
-        &self,
-        target: &str,
-        spin: usize,
-        p: &'static Palette,
-    ) -> Element<'a, Message> {
-        let line = row![
-            lead(icon::spinner(12.0, p.secondary, spin)),
-            column![
-                one_line(short_address(target), style::BODY, style::MEDIUM, p.text).width(Fill),
-                one_line("Connecting…", style::CAPTION, style::SANS, p.secondary).width(Fill),
-            ]
-            .spacing(1)
-            .width(Fill),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
-        button(line)
-            .name(format!("Connecting to {}", short_address(target)))
-            .width(Fill)
-            .padding([7.0, INSET])
-            .style(style::row(
-                0.0,
-                self.selection_emphasized(keyboard_history::Area::CameraList),
-            ))
-            .into()
-    }
-
-    /// A camera connected before and not found now, to reconnect or forget.
-    fn recent_row<'a>(
-        &self,
-        entry: &'a Recent,
-        spin: usize,
-        p: &'static Palette,
-    ) -> Element<'a, Message> {
-        let connecting = self.connecting(&entry.target);
-        let failure = (!connecting)
-            .then(|| self.side.connect_failures.get(&entry.target))
-            .flatten();
-        let (glyph, detail, ink): (Element<'a, Message>, String, Color) = if connecting {
-            (
-                icon::spinner(12.0, p.secondary, spin),
-                "Connecting…".into(),
-                p.secondary,
-            )
-        } else if let Some((error, _)) = failure {
-            (
-                status_dot(CameraState::Failed, 8.0, p),
-                capitalize(first_line(error)),
-                p.ink(p.danger),
-            )
-        } else {
-            (
-                icon(Icon::Recent, 13.0, p.tertiary),
-                recent_place(entry),
-                p.secondary,
-            )
-        };
-        let line = row![
-            lead(glyph),
-            column![
-                one_line(entry.label.as_str(), style::BODY, style::MEDIUM, p.text).width(Fill),
-                one_line(detail, style::CAPTION, style::SANS, ink).width(Fill),
-            ]
-            .spacing(1)
-            .width(Fill),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
-        let mut hint = format!("Reconnect {}", entry.label);
-        if let Some((error, _)) = failure {
-            hint = format!("{hint}\nCould not connect: {error}");
-        }
-        let forget = tip(
-            button(icon(Icon::Close, 11.0, p.secondary))
-                .name(format!("Forget {}", entry.label))
-                .padding(5)
-                .style(style::plain)
-                .on_press(Message::Forget(entry.target.clone())),
-            "Forget",
-        );
-        hover(
-            tip(
-                button(line)
-                    .name(format!("Reconnect {}", entry.label))
-                    .width(Fill)
-                    .padding([7.0, INSET])
-                    .style(style::row(
-                        0.0,
-                        self.selection_emphasized(keyboard_history::Area::CameraList),
-                    ))
-                    .on_press_maybe(
-                        (!connecting).then(|| Message::CameraRow(entry.target.clone())),
-                    ),
-                hint,
-            ),
-            reveal(forget, p),
-        )
-    }
-
-    /// `row` growing in and fading up while camera `id` arrives; as it is
-    /// otherwise. Under Reduce Motion it only fades.
-    fn arriving<'a>(
-        &self,
-        id: &str,
-        row: Element<'a, Message>,
-        p: &'static Palette,
-    ) -> Element<'a, Message> {
-        let t = self.side.arrival(id, self.now);
-        if t >= 1.0 {
-            return row;
-        }
-        let row = veil(row, p.sidebar, style::RADIUS, t);
-        if motion::reduce_motion() {
-            return row;
-        }
-        container(row).max_height(ROW_HEIGHT * t).clip(true).into()
-    }
-
-    /// The address field and what it will try, the simulator option, and
+    /// Under the welcome screen's cards: the network check once GigE is in
+    /// play, the data sources, the address field and what it will try, and
     /// the window's settings.
-    fn sidebar_footer(&self, p: &'static Palette) -> Element<'_, Message> {
+    pub(super) fn picker_footer<'a>(
+        &'a self,
+        p: &'static Palette,
+        search: Element<'a, Message>,
+    ) -> Element<'a, Message> {
         let typed = self.address.trim();
         let failure = self.side.connect_failures.get(typed);
         let shake = self.side.shake(typed, self.now);
@@ -1122,15 +644,43 @@ impl Workbench {
         ]
         .spacing(2)
         .align_y(Alignment::Center);
+        // Its report only once there is one, so it is never shown disabled.
+        // The slot stays one container either way, so the widgets after it
+        // keep their state as it comes and goes.
+        let mut network = row![].align_y(Alignment::Center);
+        if self.network_check_relevant() {
+            network = network
+                .push(self.network_scan_button(p))
+                .push(space::horizontal());
+            if self.snapshot.network_scan.is_some() {
+                network = network.push(
+                    button(text("Report").size(style::SMALL))
+                        .name("Open network scan results")
+                        .padding([4, 5])
+                        .style(style::plain)
+                        .on_press(Message::NetworkReport(true)),
+                );
+            }
+        }
         column![
             // Shifted both ways at once, so it moves without resizing.
-            container(field).padding(iced::Padding {
+            container(
+                row![
+                    tip(field, Action::ConnectAddress.hint(ADDRESSES, Os::CURRENT)),
+                    search
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+            )
+            .padding(iced::Padding {
                 left: EDGE + shake,
                 right: EDGE - shake,
                 ..iced::Padding::ZERO
             }),
             // Simulated cameras are a setting; the empty state offers one.
             container(hint).padding([0.0, EDGE + INSET]),
+            container(network).padding([0.0, EDGE]),
+            container(self.sidebar_signals(p)).padding([0.0, EDGE]),
             container(rule::horizontal(1).style(style::line)).padding([0.0, EDGE]),
             container(settings).padding(iced::Padding {
                 left: EDGE + 4.0,
@@ -1438,35 +988,6 @@ mod tests {
     }
 
     #[test]
-    fn the_selection_cross_fades_between_rows() {
-        use iced::widget::button::Status;
-        for dark in [false, true] {
-            let theme = style::theme(dark);
-            let p = Palette::of(dark);
-            let fill = |amount: f32, status: Status| {
-                style::row(amount, true)(&theme, status)
-                    .background
-                    .map(|background| match background {
-                        iced::Background::Color(color) => color,
-                        _ => unreachable!(),
-                    })
-            };
-            for status in [Status::Active, Status::Hovered, Status::Pressed] {
-                assert_eq!(fill(1.0, status), Some(p.selected), "selected");
-            }
-            assert_eq!(fill(0.0, Status::Active), None, "no fill at rest");
-            assert_eq!(fill(0.0, Status::Hovered), Some(p.hover));
-            assert_eq!(fill(0.0, Status::Pressed), Some(p.selected));
-            let half = fill(0.5, Status::Active).expect("a fill");
-            assert_eq!(
-                (half.r, half.g, half.b),
-                (p.selected.r, p.selected.g, p.selected.b)
-            );
-            assert!((half.a - 0.5).abs() < 1e-6, "fades in place");
-        }
-    }
-
-    #[test]
     fn quick_searches_do_not_flash_the_placeholder() {
         let mut bench = bench();
         let start = bench.now;
@@ -1504,7 +1025,6 @@ mod tests {
         bench.tick_side();
         bench.sync_side();
         for p in [&style::LIGHT, &style::DARK] {
-            let _ = bench.sidebar(p);
             let _ = bench.ready(p);
             let (_, extra) = bench.welcome_content(p);
             assert!(extra > 0.0, "the callout and recents add height");
@@ -1543,55 +1063,6 @@ mod tests {
     }
 
     #[test]
-    fn a_row_marks_only_the_errors_its_badge_would_show() {
-        let mut bench = bench();
-        let start = bench.now;
-        let mut camera = super::super::liveness::streaming_camera(10, 0, 30.0);
-        camera.streaming = false;
-        bench.snapshot.cameras = vec![camera];
-        let status = |bench: &Workbench| {
-            let camera = &bench.snapshot.cameras[0];
-            camera_status(camera, bench.camera_error("sim:0"), &style::LIGHT)
-                .map(|(_, about)| about)
-        };
-        // Past the stage's settle delay.
-        let settled = ms(500);
-        // A refused write its notice told: the worker keeps it, the row does not.
-        let refused = "ExposureTime violates Min=10";
-        let write = Pending {
-            camera: Some("sim:0".into()),
-            at: start,
-            ..Pending::unanswered(Job::Set("ExposureTime".into()))
-        };
-        bench.settle(&write, &Err(anyhow::anyhow!(refused)));
-        bench.snapshot.cameras[0].last_error = Some(refused.into());
-        bench.tick_stage();
-        bench.now = start + settled;
-        bench.tick_stage();
-        assert_eq!(status(&bench), None);
-        // One no notice told, such as another client's: marked once it settles.
-        bench.snapshot.cameras[0].last_error = Some("Link down".into());
-        bench.tick_stage();
-        assert_eq!(status(&bench), None, "not before it settles");
-        bench.now += settled;
-        bench.tick_stage();
-        assert_eq!(status(&bench).as_deref(), Some("Last error: Link down"));
-        // Dismissed on the stage, it leaves the row too.
-        bench.dismiss_stage_error("sim:0");
-        assert_eq!(status(&bench), None);
-    }
-
-    #[test]
-    fn a_stalled_row_keeps_its_recording_mark() {
-        let mut camera = super::super::liveness::streaming_camera(10, 0, 30.0);
-        camera.forwarding = Some("recordings/line-1.mkv".into());
-        let about = camera_status(&camera, Some("Frame timeout"), &style::DARK)
-            .map(|(_, about)| about)
-            .unwrap_or_default();
-        assert!(about.starts_with("Recording to "), "{about}");
-    }
-
-    #[test]
     fn failures_retire_once_their_camera_connects_any_way() {
         let mut bench = bench();
         let now = bench.now;
@@ -1612,30 +1083,25 @@ mod tests {
     }
 
     #[test]
-    fn entering_an_address_opens_the_sidebar() {
+    fn entering_an_address_leaves_image_mode() {
         let mut bench = bench();
-        bench.sidebar_open = false;
         bench.image_mode = true;
-        bench.sync_animations();
-        assert_eq!(bench.sidebar_slide.target(), 0.0);
         let _ = bench.handle_message(Message::EnterAddress);
-        bench.sync_animations();
-        assert!(bench.sidebar_shown());
-        assert_eq!(bench.sidebar_slide.target(), 1.0);
+        assert!(!bench.image_mode);
     }
 
-    /// The sidebar's accessible controls by name, and what pressing each
+    /// The footer's accessible controls by name, and what pressing each
     /// one sends.
-    fn sidebar_buttons(bench: &Workbench) -> Vec<(String, Option<Message>)> {
+    fn footer_buttons(bench: &Workbench) -> Vec<(String, Option<Message>)> {
         use iced::advanced::{Layout, layout, widget::Tree};
         use iced::futures::StreamExt;
         let renderer = super::super::destinations::layout_tests::renderer();
-        let mut view = bench.sidebar(Palette::of(false));
+        let mut view = bench.picker_footer(Palette::of(false), space().into());
         let mut tree = Tree::new(view.as_widget());
         let node = view.as_widget_mut().layout(
             &mut tree,
             &renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(SIDEBAR, 700.0)),
+            &layout::Limits::new(Size::ZERO, Size::new(460.0, 700.0)),
         );
         let (snapshot, bridge, window) = accessibility::snapshot_widget(
             view.as_widget_mut(),
@@ -1678,7 +1144,7 @@ mod tests {
         // Simulated cameras only: no network to check.
         bench.snapshot.devices = vec![device("sim:0", "SIM0"), device("sim:1", "SIM1")];
         assert!(!bench.network_check_relevant());
-        let buttons = sidebar_buttons(&bench);
+        let buttons = footer_buttons(&bench);
         assert!(!has(&buttons, "Scan network"));
         assert!(!has(&buttons, "Open network scan results"));
         // A GigE camera found: the check, but no report to open yet.
@@ -1686,7 +1152,7 @@ mod tests {
         gige.transport = Transport::GigE;
         gige.address = Some("10.0.0.2".into());
         bench.snapshot.devices.push(gige);
-        let buttons = sidebar_buttons(&bench);
+        let buttons = footer_buttons(&bench);
         assert!(has(&buttons, "Scan network"));
         assert!(
             !has(&buttons, "Open network scan results"),
@@ -1699,7 +1165,7 @@ mod tests {
             warnings: Vec::new(),
             scanned_at_ms: 0,
         });
-        let buttons = sidebar_buttons(&bench);
+        let buttons = footer_buttons(&bench);
         let report = buttons
             .iter()
             .find(|(label, _)| label == "Open network scan results")
@@ -1717,7 +1183,7 @@ mod tests {
             detail: "GigE · 192.168.1.40".into(),
             transport: Transport::GigE,
         }];
-        assert!(has(&sidebar_buttons(&bench), "Scan network"));
+        assert!(has(&footer_buttons(&bench), "Scan network"));
         bench.recent.clear();
         bench
             .side
@@ -1738,12 +1204,12 @@ mod tests {
     fn the_address_hint_shows_examples_until_something_reads() {
         assert!(
             ADDRESS_HINT.chars().count() <= 40,
-            "one line at the sidebar's width in caption size"
+            "one line at the footer's width in caption size"
         );
         let mut bench = bench();
         bench.sync_side();
         assert_eq!(bench.side.hint, (String::new(), None));
-        // Empty: the examples (see `sidebar_footer`); then what it will try.
+        // Empty: the examples (see `picker_footer`); then what it will try.
         bench.address = "192.168.1.20".into();
         bench.sync_side();
         assert!(
@@ -1758,83 +1224,12 @@ mod tests {
 
     #[test]
     fn the_footer_opens_settings_from_its_gear() {
-        let buttons = sidebar_buttons(&bench());
+        let buttons = footer_buttons(&bench());
         let settings = buttons
             .iter()
             .find(|(label, _)| label == "Settings")
             .expect("a Settings button");
         assert!(matches!(settings.1, Some(Message::Settings(true))));
         assert!(has(&buttons, "Keyboard shortcuts and quick guide"));
-    }
-
-    #[test]
-    fn native_camera_identity_stays_stable_while_status_changes() {
-        use iced::advanced::{Layout, layout, widget::Tree};
-        use iced::futures::StreamExt;
-        let renderer = super::super::destinations::layout_tests::renderer();
-        let mut bench = bench();
-        let camera = super::super::liveness::streaming_camera(10, 0, 30.0);
-        let name = format!(
-            "{} {} · {}",
-            camera.info.vendor,
-            camera.info.model,
-            identity(&camera.info)
-        );
-        bench.snapshot.active_camera = Some(camera.info.id.clone());
-        bench.snapshot.cameras = vec![camera];
-        let mut tree = Tree::empty();
-        let mut previous = None;
-        for (streaming, recording) in [(false, false), (true, false), (true, true)] {
-            bench.snapshot.cameras[0].streaming = streaming;
-            bench.snapshot.cameras[0].forwarding =
-                recording.then(|| "recordings/line-1.mkv".into());
-            let camera = &bench.snapshot.cameras[0];
-            let mut view = bench.camera_row(&camera.info, 0, Palette::of(false));
-            tree.diff(view.as_widget());
-            let layout = view.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, Size::new(320.0, 100.0)),
-            );
-            let (snapshot, bridge, window) = accessibility::snapshot_widget(
-                view.as_widget_mut(),
-                &mut tree,
-                Layout::new(&layout),
-                &renderer,
-            );
-            let (id, control) = snapshot
-                .nodes
-                .iter()
-                .find(|(_, node)| node.label() == Some(name.as_str()))
-                .expect("camera has a concise native identity");
-            let description = control.description().unwrap();
-            assert!(description.starts_with("Current camera. "));
-            assert!(description.contains(if streaming { "streaming" } else { "connected" }));
-            assert_eq!(description.contains("Recording to "), recording);
-            assert!(description.contains("Detected from "));
-            assert!(
-                control.live().is_none(),
-                "frame updates are not announcements"
-            );
-            if let Some(previous) = previous {
-                assert_eq!(*id, previous, "status retains the native target");
-            }
-            previous = Some(*id);
-            let task = bridge.dispatch(accessibility::Request {
-                window,
-                replay: None,
-                action: accesskit::ActionRequest {
-                    action: accesskit::Action::Click,
-                    target: *id,
-                    data: None,
-                },
-            });
-            let mut actions = iced_runtime::task::into_stream(task).unwrap();
-            assert!(matches!(
-                iced::futures::executor::block_on(actions.next()),
-                Some(iced_runtime::Action::Output(Message::CameraRow(id))) if id == camera.info.id
-            ));
-            assert!(iced::futures::executor::block_on(actions.next()).is_none());
-        }
     }
 }

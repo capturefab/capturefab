@@ -217,7 +217,7 @@ fn activity_scrolling_does_not_take_keys_from_other_controls_or_inactive_content
             column![
                 button(text("Another pane"))
                     .id("other-action")
-                    .on_press(Message::ToggleSidebar),
+                    .on_press(Message::ToggleInspector),
                 text_input("", "untouched draft")
                     .id("other-editor")
                     .on_input(Message::Search),

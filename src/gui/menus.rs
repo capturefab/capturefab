@@ -11,7 +11,6 @@ pub(super) enum Command {
     Disconnect,
     AllStreams(bool),
     AllAuto(bool),
-    AllCapture,
     /// Starts or stops recording on every camera; which one is decided
     /// when it runs, because AppKit keeps each slot's command fixed.
     AllRecord,
@@ -117,7 +116,12 @@ impl Workbench {
             Menu {
                 title: "File",
                 items: vec![
-                    action("Connect to Camera…", Action::ConnectAddress, ready),
+                    action("Connect to Camera…", Action::NewWindow, ready),
+                    action(
+                        "Enter Camera Address",
+                        Action::ConnectAddress,
+                        ready && !camera,
+                    ),
                     action(
                         "Quick Command…",
                         Action::QuickCommand,
@@ -194,10 +198,6 @@ impl Workbench {
                 title: "View",
                 items: vec![
                     Some(
-                        Item::action("Show Camera List", Action::ToggleSidebar, ready)
-                            .checked(self.sidebar_open && !self.image_mode),
-                    ),
-                    Some(
                         Item::action("Show Inspector", Action::ToggleInspector, ready)
                             .checked(self.inspector_shown()),
                     ),
@@ -263,19 +263,6 @@ impl Workbench {
             Menu {
                 title: "Camera",
                 items: vec![
-                    action("Next Camera", Action::NextCamera, multiple),
-                    action("Previous Camera", Action::PreviousCamera, multiple),
-                    action(
-                        "Open Selected Camera",
-                        Action::FocusCamera,
-                        multiple && self.overview(),
-                    ),
-                    action(
-                        "Show All Cameras",
-                        Action::Overview,
-                        multiple && !self.overview(),
-                    ),
-                    None,
                     action(
                         if streaming {
                             "Stop Stream"
@@ -322,11 +309,11 @@ impl Workbench {
                         Command::AllStreams(false),
                         multiple && self.snapshot.cameras.iter().any(|camera| camera.streaming),
                     )),
-                    Some(Item::command(
-                        "Capture From All Cameras",
-                        Command::AllCapture,
-                        multiple && !batch(Job::Capture),
-                    )),
+                    action(
+                        "Capture All",
+                        Action::CaptureAll,
+                        camera && !batch(Job::Capture),
+                    ),
                     Some(Item::command(
                         if recordings > 0 {
                             "Stop All Recordings"
@@ -432,7 +419,6 @@ impl Workbench {
             }
             Command::AllStreams(value) => self.handle_message(Message::AllStreams(value)),
             Command::AllAuto(value) => self.handle_message(Message::AllAuto(value)),
-            Command::AllCapture => self.handle_message(Message::AllCapture),
             Command::AllRecord => {
                 let (recordings, _) = titlebar::record_counts(&self.snapshot.cameras);
                 self.handle_message(Message::AllRecord(recordings == 0))
@@ -493,7 +479,8 @@ mod tests {
             .collect();
         for action in Action::ALL {
             assert!(
-                listed.contains(&action) || matches!(action, Action::Settings | Action::Quit),
+                listed.contains(&action)
+                    || matches!(action, Action::Settings | Action::Quit | Action::Overview),
                 "{action:?} is missing from menus"
             );
         }
@@ -529,7 +516,7 @@ mod tests {
     #[test]
     fn menu_availability_matches_focused_settings_and_help_history() {
         let mut app = bench();
-        let _ = app.update(Message::ToggleSidebar);
+        let _ = app.update(Message::ToggleActivity);
         let enabled = |app: &Workbench, wanted| {
             app.command_menus()
                 .into_iter()
@@ -563,22 +550,22 @@ mod tests {
     }
 
     #[test]
-    fn every_overview_batch_action_is_in_the_camera_menu() {
+    fn every_batch_action_is_in_the_camera_menu() {
         let mut app = bench();
         let camera = liveness::streaming_camera(0, 0, 0.0);
         app.snapshot.connected = Some(camera.info.clone());
         app.snapshot.active_camera = Some(camera.info.id.clone());
         app.snapshot.cameras = vec![camera.clone()];
-        let capture = |app: &Workbench| item(app, |c| *c == Command::AllCapture);
+        let capture = |app: &Workbench| item(app, |c| *c == Command::Action(Action::CaptureAll));
         let record = |app: &Workbench| item(app, |c| *c == Command::AllRecord);
-        // One camera: its own commands do it.
-        assert!(!capture(&app).enabled);
+        // One camera: its own Record does it; Capture All is always there.
+        assert!(capture(&app).enabled);
         assert!(!record(&app).enabled);
         let mut other = camera.clone();
         other.info.id = "sim:1".into();
         app.snapshot.cameras.push(other);
         let all = capture(&app);
-        assert_eq!(all.title, "Capture From All Cameras");
+        assert_eq!(all.title, "Capture All");
         assert!(all.enabled);
         let all = record(&app);
         assert_eq!(

@@ -347,9 +347,8 @@ fn outcome(job: &Job, value: &Value) -> Option<(String, Option<String>, Level)> 
             None => "Connected".into(),
         }),
         Job::Disconnect => done("Disconnected".into()),
-        // The selection, the job list and the status pill already show the
-        // result.
-        Job::Select | Job::RefreshJobs | Job::Start | Job::Stop => None,
+        // The job list and the status pill already show the result.
+        Job::RefreshJobs | Job::Start | Job::Stop => None,
         Job::AutoOn => done("Auto mode on".into()),
         Job::AutoOff => done("Auto mode off".into()),
         Job::Balance => done("Auto balance updated".into()),
@@ -420,7 +419,6 @@ fn failure(job: &Job) -> String {
         Job::NetworkScan => "Network scan failed",
         Job::Connect => "Could not connect",
         Job::Disconnect => "Could not disconnect",
-        Job::Select => "Could not select the camera",
         Job::Start => "Could not start the stream",
         Job::Stop => "Could not stop the stream",
         Job::AutoOn => "Could not turn on auto mode",
@@ -691,7 +689,6 @@ mod tests {
         }
         let (_, detail, _) = notice(Job::Capture, json!({"files": ["shots/capture-0001.png"]}));
         assert_eq!(detail.as_deref(), Some("shots/capture-0001.png"));
-        assert!(command_notice(&Job::Select, &Ok(json!({}))).is_none());
         // The status pill shows these.
         for (job, streaming) in [
             (Job::Start, true),
@@ -821,7 +818,7 @@ mod tests {
             "from the keyboard"
         );
 
-        // The camera list's session control confirms in place: an error
+        // The welcome screen's session control confirms in place: an error
         // keeps the toolbar.
         bench.set_notice("Capture failed: busy", None, Level::Error);
         let _ = bench.copy_session_command(true);
@@ -831,10 +828,10 @@ mod tests {
         bench.image_mode = true;
         let _ = bench.copy_session_command(true);
         assert_eq!(text(&bench), Some("Capture failed: busy"));
-        bench.sidebar_open = false;
+        bench.snapshot.connected = Some(crate::transport::simulator::info());
         let _ = bench.copy_session_command(true);
         assert_eq!(text(&bench), Some("Capture failed: busy"), "still hidden");
-        // With the list closed, only the toolbar can confirm.
+        // With a camera shown, only the toolbar can confirm.
         bench.image_mode = false;
         let _ = bench.copy_session_command(true);
         assert_eq!(text(&bench), Some("Session command copied"));

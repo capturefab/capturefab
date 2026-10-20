@@ -1,6 +1,6 @@
 //! How the workbench sizes the frames it shows, and paces its scopes.
 use super::*;
-use crate::{session::CameraSnapshot, shared_memory::SharedRing, types::Frame};
+use crate::{shared_memory::SharedRing, types::Frame};
 
 /// A workbench showing the selected camera of a ring this test writes to,
 /// converting on the CPU, out of efficiency mode whatever the host. Steps
@@ -34,16 +34,6 @@ fn frame(id: u64) -> Frame {
 /// Sizes of the frames waiting for the GPU under `key`.
 fn uploaded(gpu: &GpuFrames, key: &str) -> Option<(u32, u32)> {
     gpu.pending(key).map(|frame| (frame.width, frame.height))
-}
-
-/// Streaming cameras by `ids`, for the overview.
-fn cameras<const N: usize>(ids: [&str; N]) -> Vec<CameraSnapshot> {
-    ids.map(|id| {
-        let mut camera = liveness::streaming_camera(0, 0, 0.0);
-        camera.info.id = id.into();
-        camera
-    })
-    .into()
 }
 
 #[test]
@@ -127,20 +117,6 @@ fn efficiency_mode_keeps_1280_pixels_a_side_on_the_gpu_too_short_of_one_to_one()
         Some((2448, 2048)),
         "1:1 stays exact"
     );
-    // An overview tile at more than half size, likewise.
-    bench.snapshot.cameras = cameras(["cam"]);
-    bench.grid.set(Some(grid::Grid {
-        columns: 1,
-        tile: Size::new(800.0, 600.0),
-        viewport: 600.0,
-    }));
-    bench.undrawn = None;
-    bench.update_previews();
-    assert_eq!(uploaded(&gpu, "cam"), Some((1224, 1024)));
-    crate::efficiency::pin(false);
-    bench.undrawn = None;
-    bench.update_previews();
-    assert_eq!(uploaded(&gpu, "cam"), Some((2448, 2048)));
     // Without a GPU it converts as much.
     crate::efficiency::pin(true);
     bench.gpu = GpuFrames::cpu_only();
@@ -311,93 +287,5 @@ fn dragging_the_focus_region_scores_only_focus_and_once_more_on_release() {
     bench.undrawn = None;
     let _ = bench.update(Message::FocusRegion(region(0.7)));
     assert!(scored(&bench));
-    bench.handle.shutdown();
-}
-
-#[test]
-fn tiles_scrolled_out_of_view_let_go_of_their_frames() {
-    let mut bench = Workbench::new(SessionHandle::new(), "test".into(), true, None);
-    bench.snapshot.cameras = (0..6)
-        .map(|i| {
-            let mut camera = liveness::streaming_camera(0, 0, 0.0);
-            camera.info.id = format!("tile{i}");
-            camera
-        })
-        .collect();
-    let gpu = GpuFrames::limited(8192);
-    bench.gpu = gpu.clone();
-    for camera in &bench.snapshot.cameras {
-        let id = camera.info.id.clone();
-        gpu.submit(&id, std::sync::Arc::new(Frame::default()));
-        bench.previews.insert(
-            id.clone(),
-            CameraPreview {
-                frame_id: Some(1),
-                limits: Some(preview::Limits::shown(&Frame::default(), 1.0, TILE_SIDE)),
-                shown: Some(Shown::Gpu {
-                    key: id,
-                    size: Size::new(640.0, 480.0),
-                }),
-                ..CameraPreview::default()
-            },
-        );
-    }
-    // Two columns, three rows, two of them in view.
-    bench.grid.set(Some(grid::Grid {
-        columns: 2,
-        tile: Size::new(400.0, 300.0),
-        viewport: 600.0,
-    }));
-    bench.undrawn = None;
-    bench.update_previews();
-    for (i, camera) in bench.snapshot.cameras.iter().enumerate() {
-        let id = &camera.info.id;
-        let scrolled_out = i >= 4;
-        assert_eq!(gpu.is_retired(id), scrolled_out, "{id}");
-        assert_eq!(gpu.pending(id).is_none(), scrolled_out, "{id}");
-        assert_eq!(bench.previews[id].limits.is_none(), scrolled_out, "{id}");
-        assert_eq!(bench.previews[id].frame_id, Some(1), "{id}");
-    }
-    // Scrolling back shows them again with their newest frames.
-    bench.undrawn = None;
-    let _ = bench.update(Message::OverviewScrolled(300.0));
-    assert_eq!(bench.grid_scroll, 300.0);
-}
-
-#[test]
-fn a_tile_scrolled_back_shows_its_frame_again_without_counting_it_as_new() {
-    let (mut bench, mut writer) = bench();
-    let gpu = GpuFrames::limited(8192);
-    bench.gpu = gpu.clone();
-    // Three tiles in a column, one in view; the fed camera last.
-    bench.snapshot.cameras = cameras(["a", "b", "cam"]);
-    bench.grid.set(Some(grid::Grid {
-        columns: 1,
-        tile: Size::new(400.0, 300.0),
-        viewport: 300.0,
-    }));
-    bench.observe_liveness();
-    let started = bench.now;
-    writer.write(&frame(1), false).unwrap();
-    bench.grid_scroll = 1000.0;
-    bench.undrawn = None;
-    bench.update_previews();
-    assert!(gpu.pending("cam").is_some());
-    bench.grid_scroll = 0.0;
-    bench.undrawn = None;
-    bench.update_previews();
-    assert!(gpu.is_retired("cam"));
-    // The camera stalls meanwhile: its frame shows again but is no news.
-    bench.now += Duration::from_secs(10);
-    bench.grid_scroll = 1000.0;
-    bench.undrawn = None;
-    bench.update_previews();
-    assert!(!gpu.is_retired("cam") && gpu.pending("cam").is_some());
-    assert_eq!(bench.liveness["cam"].frame_at, started);
-    // A new frame is.
-    writer.write(&frame(2), false).unwrap();
-    bench.undrawn = None;
-    bench.update_previews();
-    assert_eq!(bench.liveness["cam"].frame_at, bench.now);
     bench.handle.shutdown();
 }

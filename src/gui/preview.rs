@@ -104,10 +104,6 @@ pub enum Shrink {
     /// None: the main view keeps whole frames on the GPU, so zooming in
     /// needs no new upload.
     Never,
-    /// Those shown at under half their size, as overview tiles of large
-    /// sensors are: a small texture filters cleanly where the shader would
-    /// point-sample a large one, and uploads a fraction of the bytes.
-    UnderHalf,
     /// Any larger, in efficiency mode, so no view uploads or decodes more
     /// pixels than it would convert without a GPU.
     Larger,
@@ -161,12 +157,6 @@ pub fn present(
     let shrink = !whole
         || match limits.shrink_for_gpu {
             Shrink::Never => false,
-            // The GPU filters a whole frame cleanly down to half its size;
-            // below that it would point-sample it.
-            Shrink::UnderHalf => {
-                limits.size.0.saturating_mul(2) < frame.width
-                    && limits.size.1.saturating_mul(2) < frame.height
-            }
             Shrink::Larger => true,
         };
     let small = shrink
@@ -260,22 +250,6 @@ mod tests {
         assert!(Arc::ptr_eq(&gpu.pending("main").unwrap(), &bayer));
         assert!(matches!(shown, Some(Shown::Gpu { .. })));
         assert_eq!(placed(&shown), Some(native));
-        // So does a tile at half size, which the GPU filters well...
-        let tile = |size| Limits {
-            size,
-            exact: false,
-            shrink_for_gpu: Shrink::UnderHalf,
-        };
-        present(&gpu, &mut shown, "tile", bayer.clone(), tile((1224, 1024))).unwrap();
-        assert!(Arc::ptr_eq(&gpu.pending("tile").unwrap(), &bayer));
-        // ...but a smaller tile shrinks it first, to colors it filters cleanly.
-        present(&gpu, &mut shown, "tile", bayer.clone(), tile((612, 512))).unwrap();
-        let small = gpu.pending("tile").unwrap();
-        assert_eq!(
-            (small.width, small.height, small.pixel_format),
-            (612, 512, RGB8)
-        );
-        assert_eq!(placed(&shown), Some(native));
         // Too large for a texture: shrunk for the GPU, to what the view shows
         // or what a texture holds, but whole on the CPU at 1:1.
         let downlevel = GpuFrames::limited(2048);
@@ -334,7 +308,7 @@ mod tests {
             shrink_for_gpu: Shrink::Larger,
             ..Limits::shown(&bayer, scale, 1280)
         };
-        // Fitted, and as a tile at more than half size.
+        // Fitted, and zoomed to more than half size.
         for scale in [0.29, 0.6] {
             present(&gpu, &mut shown, "main", bayer.clone(), capped(scale)).unwrap();
             let small = gpu.pending("main").unwrap();

@@ -83,7 +83,7 @@ Plain `doctor` checks the host and prints a fix for each warning.
 `--efficiency auto|smooth|efficient` or `CAPTUREFAB_EFFICIENCY` sets efficiency mode for a process and the camera workers it starts, over Settings > Performance, which only the desktop window reads; `doctor` reports the mode in force and why.
 Workers follow a change in their session's mode for decoders they start afterwards; efficient halves how often a session polls its workers for status.
 Auto is efficient with at most 2 CPU cores or 2 GiB of memory, in the OS low-power mode, or on a desktop hint such as software rendering or a preview falling behind.
-Efficient mode reduces preview, polling and CPU embedding work (desktop previews at most 15 frames a second, 5 per overview tile, 1280 pixels a side; auto capture's CPU embedding a fifth of a core); captures and recordings keep every frame.
+Efficient mode reduces preview, polling and CPU embedding work (desktop previews at most 15 frames a second, 1280 pixels a side; auto capture's CPU embedding a fifth of a core); captures and recordings keep every frame.
 With no display (a Linux login without DISPLAY or WAYLAND_DISPLAY), running with no subcommand prints the CLI help and suggests `serve`; a source build without the `gui` feature exits 5.
 
 Exit codes are 1 `operation_failed`, 2 `usage`, 3 `unavailable`, 4 `timeout`, 5 `unsupported` and 6 `storage_full`.
@@ -349,7 +349,7 @@ Select the image-permission checkbox before the assistant can send camera previe
 For a camera task select Ask before each change or Run on its own.
 Choose cameras, data sources, the dataset, allowed destinations, separate image/data permission and capture allowances before Start task. Data-only tasks do not require a camera.
 Review checked approval cards. Stop, Pause, Resume and Take over control the task.
-Data-only Take over waits for completion and owned-data flush, then opens manual Data sources; camera tasks select their camera. The sidebar Data sources action works with no camera or source connected.
+Data-only Take over waits for completion and owned-data flush, then opens manual Data sources; camera tasks select their camera. The camera picker's Data sources action works with no camera or source connected.
 The closed sheet leaves a toolbar status and Stop action. Quit asks before stopping.
 Review remaining effects or eligible settings restores after the task. New conversations use Plan first.
 
