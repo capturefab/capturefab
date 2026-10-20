@@ -2555,17 +2555,19 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     );
                 }
                 let h = client.local.as_ref().unwrap();
+                let mut seen = false;
                 loop {
                     if h.is_shutting_down() {
                         return Ok(());
                     }
                     // The status poller keeps the stored jobs current.
                     let state = h.stored();
-                    let job = state
-                        .jobs
-                        .iter()
-                        .find(|job| job.id == id)
-                        .context("capture job disappeared")?;
+                    let Some(job) = state.jobs.iter().find(|job| job.id == id) else {
+                        anyhow::ensure!(!seen, "capture job disappeared");
+                        std::thread::sleep(check_in(Some(Duration::ZERO)));
+                        continue;
+                    };
+                    seen = true;
                     match job.status.as_str() {
                         "complete" => {
                             let mut result = json!({"job":job});
