@@ -356,3 +356,17 @@ main>.page-head+.section{padding-top:44px}
 /* One-click download: the page buttons name the matched build. */
 [data-oneclick-state=ready]{display:inline-flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;line-height:1.25}
 [data-oneclick-state=ready] small{font-size:11px;font-weight:400;opacity:.85}
+
+/* Landing page: hero screenshot, source strip, inline download calls and download section. */
+.hero-shot{margin:0;min-width:0;padding:10px;border:1px solid var(--line);border-radius:12px;background:var(--panel);box-shadow:var(--shadow)}
+.hero-shot>a{display:block;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.hero-shot img{display:block;width:100%;height:auto}
+.hero-shot figcaption{font-size:12px;margin:10px 4px 2px;color:var(--muted)}
+.works-with{padding:20px 0 4px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.works-with .source-strip{margin:0}
+.inline-cta{margin-top:28px;font-size:14px}
+.download-section .section-heading{margin-inline:auto;text-align:center}
+.download-section .eyebrow{justify-content:center}
+.download-section .platform-form label:last-child{grid-column:auto}
+.download-section .download-card{max-width:720px;margin:0 auto}
+.start-section{margin-top:64px}
