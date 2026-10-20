@@ -102,8 +102,16 @@ impl Bench {
                 if path.is_dir() {
                     scan(&path);
                 } else {
+                    let bytes = match std::fs::read(&path) {
+                        Ok(bytes) => bytes,
+                        // A lock file its owner holds open: Windows refuses
+                        // other readers (ERROR_LOCK_VIOLATION), and it holds
+                        // no data.
+                        Err(error) if error.raw_os_error() == Some(33) => continue,
+                        Err(error) => panic!("{}: {error}", path.display()),
+                    };
                     assert!(
-                        !String::from_utf8_lossy(&std::fs::read(&path).unwrap()).contains("CANARY"),
+                        !String::from_utf8_lossy(&bytes).contains("CANARY"),
                         "a secret was stored in {}",
                         path.display()
                     );
