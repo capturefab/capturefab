@@ -76,7 +76,8 @@ jobs:
           choco install nasm --no-progress -y
           Add-Content $env:GITHUB_PATH 'C:\Program Files\NASM'
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test --locked
+      # Every test binary runs, so one failure does not hide the rest.
+      - run: cargo test --locked --no-fail-fast
       # Which accelerators this runner exposes; informational, never fails.
       - name: Report hardware acceleration
         if: ${{ !cancelled() }}

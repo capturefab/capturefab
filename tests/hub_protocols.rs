@@ -80,6 +80,10 @@ impl Bench {
             "capture",
             "-n",
             "1",
+            // Windows tries ::1 for localhost first and reports a refusal
+            // there only after about two seconds.
+            "--timeout-ms",
+            "10000",
             "-o",
             output.to_str().unwrap(),
         ]);
