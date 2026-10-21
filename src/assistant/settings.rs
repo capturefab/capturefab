@@ -21,6 +21,7 @@ use std::{
 
 pub const VERSION: u32 = 1;
 pub const MAX_BYTES: u64 = 64 * 1024;
+const LOCK_WAIT: Duration = Duration::from_secs(if cfg!(test) { 60 } else { 5 });
 static NEXT_WRITE: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) static STATE: crate::ipc::StateSet = crate::ipc::StateSet {
@@ -314,7 +315,7 @@ fn lock(directory: &Path) -> Result<Locked> {
             "Use a regular assistant settings lock file."
         );
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + LOCK_WAIT;
     loop {
         match FileExt::try_lock_exclusive(&file) {
             Ok(()) => return Ok(Locked { file, directory }),

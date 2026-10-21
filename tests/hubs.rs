@@ -181,7 +181,7 @@ fn jpeg(width: u32, height: u32, value: u8) -> Vec<u8> {
 }
 
 fn frames() -> Vec<Vec<u8>> {
-    (0..4).map(|value| jpeg(64, 36, value * 60)).collect()
+    (0..50).map(|value| jpeg(64, 36, value * 5)).collect()
 }
 
 fn png_size(path: &Path) -> (u32, u32) {

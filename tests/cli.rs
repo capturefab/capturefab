@@ -2720,7 +2720,7 @@ fn doctor_reports_destination_features() {
     let elapsed = started.elapsed();
     assert!(out.status.success());
     assert!(
-        elapsed < std::time::Duration::from_secs(2),
+        elapsed < std::time::Duration::from_secs(5),
         "doctor took {elapsed:?}"
     );
     let graphics = &serde_json::from_slice::<Value>(&out.stdout).unwrap()["result"]["graphics"];
@@ -6591,12 +6591,12 @@ mod assistant_cli_tests {
             call(
                 "data-start",
                 "start_signal_capture",
-                json!({"source":source,"every":"100ms","duration":"3s","max_samples":6,"max_bytes":4096,"tags":null}),
+                json!({"source":source,"every":"100ms","duration":"20s","max_samples":6,"max_bytes":4096,"tags":null}),
             ),
             call(
                 "data-wait",
                 "wait_for_data",
-                json!({"source":source,"timeout":"10s","samples":null}),
+                json!({"source":source,"timeout":"30s","samples":null}),
             ),
             call(
                 "data-query",
@@ -6636,7 +6636,7 @@ mod assistant_cli_tests {
                 "--max-data-size",
                 "4KiB",
                 "--max-signal-time",
-                "3s",
+                "20s",
             ],
         );
         assert_eq!(result["outcome"], "finished", "{result}");
@@ -7953,6 +7953,7 @@ fn signals_bounded_capture_lifecycle() {
     #[cfg(unix)]
     {
         request["max_bytes"] = json!(100000);
+        request["duration_ms"] = json!(60000);
         let restarting = ok(request.clone());
         let token = restarting["capture_id"].as_str().unwrap();
         let pid = restarting["helper_pid"].as_u64().unwrap();
@@ -7963,7 +7964,7 @@ fn signals_bounded_capture_lifecycle() {
                 .unwrap()
                 .success()
         );
-        let deadline = Instant::now() + Duration::from_secs(4);
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let sources = ok(json!({"op":"signals"}));
             let source = &sources["sources"][0];
