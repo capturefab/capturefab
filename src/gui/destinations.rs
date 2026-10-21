@@ -3344,7 +3344,7 @@ pub(super) fn side_row<'a, M: 'a>(
 }
 
 /// The width of that column: "File names" at body size, with room to spare.
-const SIDE_LABEL: f32 = 68.0;
+const SIDE_LABEL: f32 = 74.0;
 
 /// A field's label with an action at the end of its line.
 fn labeled<'a>(
