@@ -1,0 +1,49 @@
+name: Set up bundled FFmpeg
+description: Restore or build the pinned FFmpeg bundle shared by native CI checks.
+
+inputs:
+  runner-image:
+    description: Hosted runner image, including its architecture (for example ubuntu-24.04-arm).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - id: ffmpeg
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/ffmpeg-bundle
+        key: ffmpeg-ci-${{ inputs.runner-image }}-${{ hashFiles('scripts/build-ffmpeg.sh', 'third_party/**') }}
+    # Rust dependencies use MSVC and the host NASM. MSYS2 is needed only when
+    # compiling the separate static FFmpeg executable, so a cache hit skips it.
+    - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+      if: steps.ffmpeg.outputs.cache-hit != 'true' && runner.os == 'Windows'
+      with:
+        msystem: ${{ runner.arch == 'ARM64' && 'CLANGARM64' || 'UCRT64' }}
+        install: curl diffutils make perl tar xz
+        pacboy: cmake:p ninja:p pkgconf:p ${{ runner.arch == 'ARM64' && 'clang:p' || 'gcc:p nasm:p' }}
+    - name: Build FFmpeg
+      if: steps.ffmpeg.outputs.cache-hit != 'true' && runner.os != 'Windows'
+      shell: bash
+      run: BUILD_DIR="$RUNNER_TEMP/ffmpeg-build" scripts/build-ffmpeg.sh "$RUNNER_TEMP/ffmpeg-bundle"
+    - name: Build FFmpeg with MinGW
+      if: steps.ffmpeg.outputs.cache-hit != 'true' && runner.os == 'Windows'
+      shell: msys2 {0}
+      env:
+        TARGET_OS: mingw32
+        TARGET_ARCH: ${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
+        CC: ${{ runner.arch == 'ARM64' && 'clang' || 'gcc' }}
+        CXX: ${{ runner.arch == 'ARM64' && 'clang++' || 'g++' }}
+        AR: ${{ runner.arch == 'ARM64' && 'llvm-ar' || '' }}
+        RANLIB: ${{ runner.arch == 'ARM64' && 'llvm-ranlib' || '' }}
+        STRIP: ${{ runner.arch == 'ARM64' && 'llvm-strip' || '' }}
+        OBJDUMP: ${{ runner.arch == 'ARM64' && 'llvm-objdump' || '' }}
+      run: BUILD_DIR="$(cygpath -u "$RUNNER_TEMP")/ffmpeg-build" scripts/build-ffmpeg.sh "$(cygpath -u "$RUNNER_TEMP")/ffmpeg-bundle"
+    - if: steps.ffmpeg.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/ffmpeg-bundle
+        key: ${{ steps.ffmpeg.outputs.cache-primary-key }}
+    - name: Use the FFmpeg bundle
+      shell: bash
+      run: echo "CAPTUREFAB_FFMPEG_BINARY=$RUNNER_TEMP/ffmpeg-bundle/bin/ffmpeg$([ "$RUNNER_OS" = Windows ] && echo .exe)" >> "$GITHUB_ENV"

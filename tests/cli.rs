@@ -1813,8 +1813,19 @@ fn viewerless_streams_report_no_losses_and_keep_frames_off_disk() {
     };
     json(&dir, &["--json", "connect", "sim:0"]);
     json(&dir, &["--json", "start"]);
-    std::thread::sleep(std::time::Duration::from_secs(5));
-    let status = json(&dir, &["--json", "status"]);
+    // Wait for the frames this test checks instead of a fixed recording time.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        let status = json(&dir, &["--json", "status"]);
+        if status["cameras"][0]["frames"].as_u64().unwrap() > 30 {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "viewerless stream never produced enough frames: {status}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
     let camera = &status["cameras"][0];
     let frames = camera["frames"].as_u64().unwrap();
     let dropped = camera["dropped"].as_u64().unwrap();
