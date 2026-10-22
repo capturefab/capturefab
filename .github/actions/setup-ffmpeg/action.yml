@@ -14,6 +14,16 @@ runs:
       with:
         path: ${{ runner.temp }}/ffmpeg-bundle
         key: ffmpeg-ci-${{ inputs.runner-image }}-${{ hashFiles('scripts/build-ffmpeg.sh', 'third_party/**') }}
+    - name: Install NASM for FFmpeg SIMD
+      if: runner.os == 'Linux' && runner.arch == 'X64'
+      shell: bash
+      env:
+        FFMPEG_CACHE_HIT: ${{ steps.ffmpeg.outputs.cache-hit }}
+      run: |
+        if [ "$FFMPEG_CACHE_HIT" != true ] && ! command -v nasm >/dev/null 2>&1; then
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nasm
+        fi
     # Rust dependencies use MSVC and the host NASM. MSYS2 is needed only when
     # compiling the separate static FFmpeg executable, so a cache hit skips it.
     - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0

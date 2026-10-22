@@ -140,8 +140,6 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal -c clippy -c rustfmt -t wasm32-unknown-unknown --no-self-update && rustup default stable
-      - name: Install NASM for FFmpeg SIMD
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm
       - uses: ./.github/actions/setup-ffmpeg
         with:
           runner-image: ubuntu-24.04
