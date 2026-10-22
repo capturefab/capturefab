@@ -99,6 +99,10 @@ An existing Windows Modbus CLI test exposed a refusal/timeout race during
 validation. It now checks refusal with a longer deadline and independently
 checks timeout against a held-open silent listener, without platform-specific
 expected exit codes.
+Intel macOS also exceeded a three-second test fixture budget while setting up a
+private snapshot for a semantic privacy check. That helper now uses the existing
+production default budget. The explicit one-millisecond deadline, cancellation
+timing and resource-limit fixtures retain their original bounds and assertions.
 
 A subsequent [warm run of `0c2db78`](https://github.com/shntu/capturefab/actions/runs/39775422837)
 restored the exact current cache keys. The [WASM job](https://github.com/shntu/capturefab/actions/runs/39775422837/job/119813021289)

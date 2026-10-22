@@ -67,7 +67,11 @@ fn limits() -> ModelQueryLimits {
     }
 }
 fn run(fixture: &Fixture, sql: &str) -> Result<Value> {
-    query(fixture.source(), sql, limits(), &AtomicBool::new(false))
+    // Semantic checks use the production budget on slower debug runners.
+    // Deadline/cancellation tests below keep their explicit short bounds.
+    let mut bounds = limits();
+    bounds.snapshot.timeout_ms = super::super::query::DEFAULT_TIMEOUT_MS;
+    query(fixture.source(), sql, bounds, &AtomicBool::new(false))
 }
 
 #[test]
