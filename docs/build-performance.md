@@ -100,6 +100,29 @@ validation. It now checks refusal with a longer deadline and independently
 checks timeout against a held-open silent listener, without platform-specific
 expected exit codes.
 
+A subsequent [warm run of `0c2db78`](https://github.com/shntu/capturefab/actions/runs/39775422837)
+restored the exact current cache keys. The [WASM job](https://github.com/shntu/capturefab/actions/runs/39775422837/job/119813021289)
+completed in 1 minute 10 seconds, compared with 10 minutes 28 seconds in the
+preceding run. Its native remote integration-test compilation took 32.86 seconds
+instead of 7 minutes 30 seconds. All 12 browser tests and 13 native integration
+tests passed; both client builds and strict WASM Clippy still ran. Earlier jobs
+cached only the browser target directory, so their native test dependencies were
+rebuilt each time.
+In this warm run, the root target cache reused those native dependencies.
+These are observed cold-versus-warm timings; the WASM runner image also changed
+between the runs.
+
+The [warm no-GUI job](https://github.com/shntu/capturefab/actions/runs/39775422837/job/119813021915)
+completed in 3 minutes 11 seconds with no native engine compilations. The no-GUI
+build took 40.86 seconds; base, FTP, SFTP and hubs checks each took
+15.55–16.05 seconds. Both engine configurations were restored from the dependency
+cache, while each application configuration was still built or checked.
+
+These runs used a temporary public fork. Once the host dependency change created
+new Rust cache keys, six obsolete keys from the initial run were removed to keep the
+comparison within the repository cache quota. Current Rust keys, FFmpeg bundles
+and MSYS2 caches were retained. No upstream repository caches were changed.
+
 ## Baseline evidence
 
 Before this change, the [WASM job in run 39621917184](https://github.com/capturefab/capturefab/actions/runs/39621917184/job/119297340378)
