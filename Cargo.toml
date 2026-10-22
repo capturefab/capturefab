@@ -157,6 +157,11 @@ sha2 = { version = "0.10", features = ["asm"] }
 cc = "1"
 # Digest of the embedded FFmpeg, which names its extracted copy.
 sha2 = "0.10"
+# Keep DuckDB's host dependencies stable across isolated feature checks.
+# Proc-macro and SSH dependencies already use this union; requesting it here
+# avoids rebuilding the same native engine when switching base, FTP and SFTP.
+once_cell = "1"
+syn = { version = "3", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 
 [dev-dependencies]
 # Exercises the same semantic value/transition consumer as native adapters.

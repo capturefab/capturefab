@@ -982,6 +982,44 @@ mod tests {
         assert!(reader.fresh());
     }
     #[test]
+    fn unwatched_keep_alives_replace_full_slots_without_losses() {
+        let mut writer = SharedRing::create(&std::env::temp_dir(), 4096).unwrap();
+        let offered = (SLOTS * 2 + 1) as u32;
+        for id in 1..=u64::from(offered) {
+            // Make each keep-alive due without sleeping or polling the ring.
+            writer.published_at = Some(Instant::now() - KEEP_ALIVE);
+            assert_eq!(writer.write(&frame(id), false).unwrap(), Published::Frame);
+            if id >= SLOTS as u64 {
+                // With no reader freeing slots, every later publication must
+                // replace a READY slot while keeping the ring full.
+                assert!(
+                    (0..SLOTS).all(
+                        |slot| writer.atomic(writer.base(slot)).load(Ordering::Acquire) == READY
+                    )
+                );
+                assert!((0..SLOTS).any(|slot| writer.quad(writer.base(slot) + 8) == id));
+            }
+            assert_eq!(writer.preview_skipped(), 0);
+        }
+        assert_eq!(writer.sequence(), offered);
+        assert_eq!(writer.counters().acquired_sequence(), offered);
+        assert_eq!(writer.atomic(POLLS).load(Ordering::Relaxed), 0);
+
+        let mut reader = writer.reader().unwrap();
+        let mut taken = Frame::default();
+        let meta = reader.take_into(&mut taken, false).unwrap().unwrap();
+        let newest = frame(u64::from(offered));
+        assert_eq!(meta.seq, offered);
+        assert_eq!(taken.id, newest.id);
+        assert_eq!((taken.width, taken.height), (newest.width, newest.height));
+        assert_eq!(taken.pixel_format, newest.pixel_format);
+        assert_eq!(taken.timestamp_ns, newest.timestamp_ns);
+        assert_eq!(taken.data, newest.data);
+        assert!(reader.fresh());
+        assert_eq!(writer.atomic(POLLS).load(Ordering::Relaxed), 0);
+        assert_eq!(writer.preview_skipped(), 0);
+    }
+    #[test]
     fn idle_readers_get_one_keep_alive_a_second() {
         let mut writer = SharedRing::create(&std::env::temp_dir(), 4096).unwrap();
         let mut reader = writer.reader().unwrap();

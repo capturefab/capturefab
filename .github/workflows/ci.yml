@@ -30,7 +30,12 @@ jobs:
       - name: Install NASM for libjpeg-turbo SIMD
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm
+      - uses: ./.github/actions/setup-ffmpeg
+        with:
+          runner-image: ubuntu-24.04
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-features --all-targets -- -D warnings
 
@@ -78,43 +83,12 @@ jobs:
         run: |
           choco install nasm --no-progress -y
           Add-Content $env:GITHUB_PATH 'C:\Program Files\NASM'
-      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
-        if: runner.os == 'Windows'
+      - uses: ./.github/actions/setup-ffmpeg
         with:
-          msystem: ${{ runner.arch == 'ARM64' && 'CLANGARM64' || 'UCRT64' }}
-          install: curl diffutils make perl tar xz
-          pacboy: cmake:p ninja:p pkgconf:p ${{ runner.arch == 'ARM64' && 'clang:p' || 'gcc:p nasm:p' }}
-      - id: ffmpeg
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/ffmpeg-bundle
-          key: ffmpeg-ci-${{ matrix.os }}-${{ hashFiles('scripts/build-ffmpeg.sh', 'third_party/**') }}
-      - name: Build FFmpeg
-        if: steps.ffmpeg.outputs.cache-hit != 'true' && runner.os != 'Windows'
-        shell: bash
-        run: BUILD_DIR="$RUNNER_TEMP/ffmpeg-build" scripts/build-ffmpeg.sh "$RUNNER_TEMP/ffmpeg-bundle"
-      - name: Build FFmpeg with MinGW
-        if: steps.ffmpeg.outputs.cache-hit != 'true' && runner.os == 'Windows'
-        shell: msys2 {0}
-        env:
-          TARGET_OS: mingw32
-          TARGET_ARCH: ${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
-          CC: ${{ runner.arch == 'ARM64' && 'clang' || 'gcc' }}
-          CXX: ${{ runner.arch == 'ARM64' && 'clang++' || 'g++' }}
-          AR: ${{ runner.arch == 'ARM64' && 'llvm-ar' || '' }}
-          RANLIB: ${{ runner.arch == 'ARM64' && 'llvm-ranlib' || '' }}
-          STRIP: ${{ runner.arch == 'ARM64' && 'llvm-strip' || '' }}
-          OBJDUMP: ${{ runner.arch == 'ARM64' && 'llvm-objdump' || '' }}
-        run: BUILD_DIR="$(cygpath -u "$RUNNER_TEMP")/ffmpeg-build" scripts/build-ffmpeg.sh "$(cygpath -u "$RUNNER_TEMP")/ffmpeg-bundle"
-      - if: steps.ffmpeg.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/ffmpeg-bundle
-          key: ${{ steps.ffmpeg.outputs.cache-primary-key }}
-      - name: Use the FFmpeg bundle
-        shell: bash
-        run: echo "CAPTUREFAB_FFMPEG_BINARY=$RUNNER_TEMP/ffmpeg-bundle/bin/ffmpeg$([ "$RUNNER_OS" = Windows ] && echo .exe)" >> "$GITHUB_ENV"
+          runner-image: ${{ matrix.os }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
       # Every test binary runs, so one failure does not hide the rest.
       - run: cargo test --locked --no-fail-fast
       # Which accelerators this runner exposes; informational, never fails.
@@ -144,7 +118,12 @@ jobs:
       - name: Install NASM for libjpeg-turbo SIMD
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm
+      - uses: ./.github/actions/setup-ffmpeg
+        with:
+          runner-image: ubuntu-24.04
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
       # Every default feature except the window, so the GUI-free code paths keep compiling.
       - run: cargo build --locked --no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,s3,ftp,sftp,parquet,modbus,mqtt,opcua,mtconnect,hubs
       - run: cargo check --locked --no-default-features
@@ -161,9 +140,16 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal -c clippy -c rustfmt -t wasm32-unknown-unknown --no-self-update && rustup default stable
+      - uses: ./.github/actions/setup-ffmpeg
+        with:
+          runner-image: ubuntu-24.04
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: web-client
+          cache-on-failure: true
+          # The embedded-client integration test builds the native crate, too.
+          workspaces: |
+            . -> target
+            web-client -> target
       - run: cargo fmt --manifest-path web-client/Cargo.toml --check
       - run: cargo test --manifest-path web-client/Cargo.toml --locked
       - run: cargo clippy --manifest-path web-client/Cargo.toml --locked --target wasm32-unknown-unknown -- -D warnings
