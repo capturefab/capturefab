@@ -16,6 +16,9 @@ checksum-verified source build and saves the result. It exports
 `runner.temp`, outside Cargo's target directory: the Rust cache removes files it
 does not recognize as Cargo artifacts. Windows installs MSYS2 only on a bundle
 cache miss; Rust dependencies still use their original MSVC and NASM setup.
+Every bundle must successfully execute a version query before Cargo uses it,
+including cache hits. This catches loader or DLL failures that optional media
+tests can skip.
 Release builds retain their separate platform compatibility and signing checks.
 
 The WASM job caches both `web-client/target` and the root native `target`.
@@ -70,6 +73,32 @@ The initial minimal check took 49.73 seconds. The following FTP, SFTP and hubs
 checks took 8.34, 9.38 and 8.32 seconds, and each reported `Fresh libduckdb-sys`.
 These figures verify reuse on that host; they are not a comparison of total CI
 wall time across different runners.
+
+## Hosted measurements
+
+The first fork run populated empty dependency caches. The following run restored
+those dependencies on the same hosted Ubuntu image and retained all original
+commands and tests. Completed job outputs show:
+
+| Measurement | Empty dependencies | Restored dependencies |
+| --- | --- | --- |
+| Strict Clippy compilation | [9m04s](https://github.com/shntu/capturefab/actions/runs/39767775922/job/119787410085) | [54.59s](https://github.com/shntu/capturefab/actions/runs/39770864443/job/119797751097) |
+| Linux x64 test compilation | [10m37s](https://github.com/shntu/capturefab/actions/runs/39767775922/job/119787409945) | [1m36s](https://github.com/shntu/capturefab/actions/runs/39770864443/job/119797751233) |
+| Complete Linux x64 test job | [19m38s](https://github.com/shntu/capturefab/actions/runs/39767775922/job/119787409945) | [5m27s](https://github.com/shntu/capturefab/actions/runs/39770864443/job/119797751233) |
+
+The comparison runs are `84c1aee` and `cdc9f16`. The latter adds host dependency
+stabilization and the deterministic ring regression; runtime features and
+compiler profiles remain identical. These measurements cover the named jobs and
+steps. Cache availability and runner load affect elapsed time, and individual
+test runtimes varied between the runs.
+
+The no-GUI job also completed with exactly two DuckDB engine compilations:
+one with JSON/Parquet, and one without them. Its subsequent FTP, SFTP and hubs
+checks took 33.00, 37.09 and 22.17 seconds, with no further native engine builds.
+An existing Windows Modbus CLI test exposed a refusal/timeout race during
+validation. It now checks refusal with a longer deadline and independently
+checks timeout against a held-open silent listener, without platform-specific
+expected exit codes.
 
 ## Baseline evidence
 

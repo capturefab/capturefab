@@ -56,4 +56,9 @@ runs:
         key: ${{ steps.ffmpeg.outputs.cache-primary-key }}
     - name: Use the FFmpeg bundle
       shell: bash
-      run: echo "CAPTUREFAB_FFMPEG_BINARY=$RUNNER_TEMP/ffmpeg-bundle/bin/ffmpeg$([ "$RUNNER_OS" = Windows ] && echo .exe)" >> "$GITHUB_ENV"
+      run: |
+        ffmpeg="$RUNNER_TEMP/ffmpeg-bundle/bin/ffmpeg"
+        if [ "$RUNNER_OS" = Windows ]; then ffmpeg="$ffmpeg.exe"; fi
+        # Run restored bundles, too: optional media tests may skip an unusable executable.
+        "$ffmpeg" -hide_banner -version
+        echo "CAPTUREFAB_FFMPEG_BINARY=$ffmpeg" >> "$GITHUB_ENV"

@@ -40,6 +40,7 @@ class FfmpegSetupTests(unittest.TestCase):
 
     def tool(self, name, script):
         path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('#!/usr/bin/env bash\nset -e\n' + script)
         path.chmod(0o755)
 
@@ -91,10 +92,22 @@ class FfmpegSetupTests(unittest.TestCase):
         for system, suffix in (('Linux', ''), ('macOS', ''), ('Windows', '.exe')):
             with self.subTest(system=system):
                 self.env['RUNNER_OS'] = system
+                self.tool(f'ffmpeg-bundle/bin/ffmpeg{suffix}',
+                          'printf "%s\\n" "$*" > "$RUNNER_TEMP/runtime call"\n')
                 result = self.run_step('Use the FFmpeg bundle')
                 self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((self.root / 'runtime call').read_text().strip(),
+                                 '-hide_banner -version')
                 self.assertEqual((self.root / 'github env').read_text().splitlines()[-1],
                                  f'CAPTUREFAB_FFMPEG_BINARY={self.root}/ffmpeg-bundle/bin/ffmpeg{suffix}')
+
+    def test_unusable_bundle_fails_before_exporting_it_to_cargo(self):
+        for system, suffix in (('Linux', ''), ('macOS', ''), ('Windows', '.exe')):
+            with self.subTest(system=system):
+                self.env['RUNNER_OS'] = system
+                self.tool(f'ffmpeg-bundle/bin/ffmpeg{suffix}', 'exit 42\n')
+                self.assertEqual(self.run_step('Use the FFmpeg bundle').returncode, 42)
+                self.assertFalse((self.root / 'github env').exists())
 
 
 if __name__ == '__main__':

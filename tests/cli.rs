@@ -3783,18 +3783,42 @@ fn signals_read_modbus_from_loopback_fake() {
     let out = cmd(
         &dir,
         &[
+            "--timeout-ms",
+            "10000",
             "signals",
             "read",
             &format!("modbus-tcp://127.0.0.1:{closed}/1/holding/0"),
         ],
     );
-    // Windows reports a refusal only after its own two-second retry, which
-    // is also the connect timeout.
-    assert_eq!(
-        out.status.code(),
-        Some(if cfg!(windows) { 4 } else { 3 }),
+    // Windows may spend two seconds retrying before reporting refusal.
+    // Keep that outcome distinct from the application's shorter read timeout.
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .to_ascii_lowercase()
+            .contains("refused"),
         "{out:?}"
     );
+    // The socket accepts TCP handshakes but never answers a Modbus request.
+    // Holding it open makes timeout coverage independent of refusal timing.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = silent.local_addr().unwrap().port();
+    let out = cmd(
+        &dir,
+        &[
+            "--timeout-ms",
+            "300",
+            "signals",
+            "read",
+            &format!("modbus-tcp://127.0.0.1:{port}/1/holding/0"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(4), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("did not answer in time"),
+        "{out:?}"
+    );
+    drop(silent);
     let _ = std::fs::remove_dir_all(root);
 }
 
