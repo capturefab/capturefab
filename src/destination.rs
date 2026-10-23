@@ -723,13 +723,14 @@ mod tests {
         if std::env::var("CAPTUREFAB_FOLDER_TEST").as_deref() == Ok(name) {
             return false;
         }
+        // Parallel fixtures must not share a directory when the host clock
+        // returns the same timestamp to more than one test thread.
+        let mut nonce = [0u8; 8];
+        getrandom::fill(&mut nonce).unwrap();
         let root = std::env::temp_dir().join(format!(
-            "capturefab-folders-{}-{}",
+            "capturefab-folders-{}-{:016x}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            u64::from_ne_bytes(nonce)
         ));
         crate::ipc::ensure_private_dir(&root).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -789,7 +790,18 @@ mod tests {
 
     #[test]
     fn folder_paths_and_named_outputs_are_validated() {
-        let saved = folder("camera-1");
+        if isolated("destination::tests::folder_paths_and_named_outputs_are_validated") {
+            return;
+        }
+        let saved = Destination {
+            name: "camera-1".into(),
+            target: Target::Folder {
+                path: crate::ipc::state_dir().join("camera-1"),
+            },
+        };
+        // Mounted-volume validation needs an actual folder on Windows.
+        // Keep the fixture in the isolated test directory on every platform.
+        fs::create_dir_all(saved.local_root()).unwrap();
         assert_eq!(
             serde_json::from_value::<Destination>(serde_json::to_value(&saved).unwrap()).unwrap(),
             saved

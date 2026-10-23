@@ -63,9 +63,15 @@ struct Lease {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        // Shared locks held by another process keep the allocation counted.
-        // Close this copy before checking whether the last owner is gone.
-        drop(self.file.take());
+        // End this owner's lock explicitly: an unrelated fork can temporarily
+        // retain a copy of the open-file description until exec. Closing only
+        // our descriptor would leave its flock behind. A real worker opens an
+        // independent description, so its own shared lock still keeps the
+        // allocation counted after this last Arc owner releases it.
+        if let Some(file) = self.file.take() {
+            let _ = FileExt::unlock(&file);
+            drop(file);
+        }
         let Some(root) = self.path.parent() else {
             return;
         };
@@ -112,6 +118,10 @@ fn open_existing(path: &Path) -> Result<File> {
     );
     Ok(options().open(path)?)
 }
+fn contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
 fn gate(root: &Path) -> Result<File> {
     let file = options()
         .create(true)
@@ -121,9 +131,7 @@ fn gate(root: &Path) -> Result<File> {
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(file),
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
-            {
+            Err(error) if contended(&error) && Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(5));
             }
             Err(error) => {
@@ -183,7 +191,7 @@ fn collect(root: &Path) -> Result<BufferUsage> {
             Ok(()) => {
                 fs::remove_file(&path)?;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if contended(&error) => {
                 let record = read_record(&mut file)?;
                 usage.used_bytes = usage
                     .used_bytes
@@ -266,12 +274,15 @@ fn reserve_at(
     let path = root.join(format!("lease-{name}.json"));
     let mut file = options().create_new(true).open(&path)?;
     let result = (|| -> Result<()> {
-        file.lock_shared()?;
+        // admission.lock prevents collectors from seeing this record until it
+        // is fully written and its live-owner lock is held. Windows shared
+        // byte-range locks prohibit writes, even through the owning handle.
         file.write_all(&serde_json::to_vec(&Record {
             version: 1,
             capacity_bytes,
         })?)?;
         file.flush()?;
+        file.lock_shared()?;
         Ok(())
     })();
     if let Err(error) = result {
@@ -333,6 +344,17 @@ mod tests {
         }
     }
     #[test]
+    fn native_lock_contention_is_retryable() {
+        let root = root("contention");
+        crate::ipc::ensure_private_dir(&root).unwrap();
+        let held = gate(&root).unwrap();
+        let competing = options().open(root.join("admission.lock")).unwrap();
+        assert!(contended(&competing.try_lock_exclusive().unwrap_err()));
+        drop(competing);
+        drop(held);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn aggregate_admission_and_last_owner_release_are_exact() {
         let root = root("accounting");
         let lease = reserve_at(&root, 600, 1000, plenty()).unwrap();
@@ -352,6 +374,21 @@ mod tests {
         assert_eq!(usage_at(&root).unwrap().used_bytes, 600);
         drop(child);
         assert_eq!(usage_at(&root).unwrap(), BufferUsage::default());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn an_unrelated_descriptor_copy_does_not_retain_a_released_allocation() {
+        let root = root("inherited-description");
+        let lease = reserve_at(&root, 600, 1000, plenty()).unwrap();
+        // dup shares the same open-file description as fork inheritance, so
+        // keeping this handle open deterministically models a child that has
+        // not reached exec yet. It is not an independently joined owner.
+        let inherited = lease.0.file.as_ref().unwrap().try_clone().unwrap();
+        drop(lease);
+        assert_eq!(usage_at(&root).unwrap(), BufferUsage::default());
+        assert!(inherited.metadata().unwrap().is_file());
+        drop(inherited);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -530,8 +567,22 @@ mod tests {
     #[test]
     fn unreadable_live_reservation_fails_closed() {
         let root = root("corrupt");
-        let lease = reserve_at(&root, 600, 1000, plenty()).unwrap();
-        fs::write(&lease.0.path, b"bad").unwrap();
+        crate::ipc::ensure_private_dir(&root).unwrap();
+        let lease = {
+            // A synthetic corrupted record is locked after writing: Windows
+            // correctly prohibits modifying a live shared-locked record.
+            let _gate = gate(&root).unwrap();
+            let path = root.join("lease-00000000000000000000000000000000.json");
+            let mut file = options().create_new(true).open(&path).unwrap();
+            file.write_all(b"bad").unwrap();
+            file.flush().unwrap();
+            file.lock_shared().unwrap();
+            BufferLease(Arc::new(Lease {
+                file: Some(file),
+                path,
+                capacity_bytes: 600,
+            }))
+        };
         assert!(usage_at(&root).is_err());
         assert!(reserve_at(&root, 1, 1000, plenty()).is_err());
         drop(lease);

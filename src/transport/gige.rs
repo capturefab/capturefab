@@ -1925,7 +1925,12 @@ mod tests {
                 self.register(STREAM_PORT) as u16,
             )
         }
-        fn write(&mut self, address: u32, value: u32, stream: &UdpSocket) -> u16 {
+        fn write(
+            &mut self,
+            address: u32,
+            value: u32,
+            outgoing: &mut Vec<(Vec<u8>, SocketAddrV4, Duration)>,
+        ) -> u16 {
             self.register_writes.push((address, value));
             if address != STREAM_PACKET_SIZE {
                 self.registers.insert(address, value);
@@ -1955,18 +1960,7 @@ mod tests {
                     (&stale, self.stale),
                 ] {
                     if send {
-                        if self.test_packet_delay.is_zero() {
-                            let _ = stream.send_to(packet, self.destination());
-                        } else {
-                            let stream = stream.try_clone().unwrap();
-                            let destination = self.destination();
-                            let packet = packet.clone();
-                            let delay = self.test_packet_delay;
-                            thread::spawn(move || {
-                                thread::sleep(delay);
-                                let _ = stream.send_to(&packet, destination);
-                            });
-                        }
+                        outgoing.push((packet.clone(), self.destination(), self.test_packet_delay));
                     }
                 }
             }
@@ -1979,7 +1973,12 @@ mod tests {
             self.registers.insert(address, flags | size);
             0
         }
-        fn resend(&mut self, packet: &[u8], port: u16, stream: &UdpSocket) {
+        fn resend(
+            &mut self,
+            packet: &[u8],
+            port: u16,
+            outgoing: &mut Vec<(Vec<u8>, SocketAddrV4, Duration)>,
+        ) {
             self.requests.push((packet.to_vec(), port));
             let extended = packet[1] & 0x10 != 0;
             let block = if extended {
@@ -1996,7 +1995,7 @@ mod tests {
                     resent.truncate(if extended { 20 } else { 8 });
                 }
                 resent[..2].copy_from_slice(&self.resend_status.to_be_bytes());
-                let _ = stream.send_to(&resent, self.destination());
+                outgoing.push((resent, self.destination(), Duration::ZERO));
             }
         }
     }
@@ -2035,6 +2034,7 @@ mod tests {
                     };
                     let packet = &buffer[..length];
                     let (command, id) = (be16(packet, 2), be16(packet, 6));
+                    let mut outgoing = Vec::new();
                     let mut camera = state.lock().unwrap();
                     let reply = match command {
                         READ_REGISTER => {
@@ -2042,29 +2042,44 @@ mod tests {
                                 packet[8..].chunks(4).map(|a| be32(a, 0)).collect();
                             camera.register_reads.extend(&addresses);
                             if addresses.iter().any(|a| camera.unreadable.contains(a)) {
-                                ack(command + 1, id, 0x8003, &[])
+                                Some(ack(command + 1, id, 0x8003, &[]))
                             } else {
                                 let values: Vec<u8> = addresses
                                     .iter()
                                     .flat_map(|a| camera.register(*a).to_be_bytes())
                                     .collect();
-                                ack(command + 1, id, 0, &values)
+                                Some(ack(command + 1, id, 0, &values))
                             }
                         }
-                        WRITE_REGISTER => {
-                            match camera.write(be32(packet, 8), be32(packet, 12), &source) {
+                        WRITE_REGISTER => Some(
+                            match camera.write(be32(packet, 8), be32(packet, 12), &mut outgoing) {
                                 0 => ack(command + 1, id, 0, &1u32.to_be_bytes()),
                                 status => ack(command + 1, id, status, &[]),
-                            }
-                        }
+                            },
+                        ),
                         PACKET_RESEND => {
-                            camera.resend(packet, peer.port(), &source);
-                            continue;
+                            camera.resend(packet, peer.port(), &mut outgoing);
+                            None
                         }
-                        _ => ack(command + 1, id, 0x8001, &[]),
+                        _ => Some(ack(command + 1, id, 0x8001, &[])),
                     };
                     drop(camera);
-                    let _ = server.send_to(&reply, peer);
+                    // Stream I/O must not hold the camera-state lock needed
+                    // by independent control and heartbeat requests.
+                    for (packet, destination, delay) in outgoing {
+                        if delay.is_zero() {
+                            let _ = source.send_to(&packet, destination);
+                        } else {
+                            let source = source.try_clone().unwrap();
+                            thread::spawn(move || {
+                                thread::sleep(delay);
+                                let _ = source.send_to(&packet, destination);
+                            });
+                        }
+                    }
+                    if let Some(reply) = reply {
+                        let _ = server.send_to(&reply, peer);
+                    }
                 }
             });
             Self {
@@ -2080,16 +2095,30 @@ mod tests {
             self.camera.lock().unwrap().register(address)
         }
         fn send(&self, block: u64, extended: bool, drops: &[u32]) {
-            let mut camera = self.camera.lock().unwrap();
-            let size = (camera.register(STREAM_PACKET_SIZE) & 0xffff) as usize;
-            let overhead = if extended { 48 } else { 36 };
-            let packets = frame_packets(block, extended, WIDTH, HEIGHT, size - overhead);
+            self.send_with(block, extended, drops, |packet, destination| {
+                self.stream.send_to(packet, destination).unwrap();
+            });
+        }
+        fn send_with(
+            &self,
+            block: u64,
+            extended: bool,
+            drops: &[u32],
+            mut send: impl FnMut(&[u8], SocketAddrV4),
+        ) {
+            let (packets, destination) = {
+                let mut camera = self.camera.lock().unwrap();
+                let size = (camera.register(STREAM_PACKET_SIZE) & 0xffff) as usize;
+                let overhead = if extended { 48 } else { 36 };
+                let packets = frame_packets(block, extended, WIDTH, HEIGHT, size - overhead);
+                camera.frames.insert(block, packets.clone());
+                (packets, camera.destination())
+            };
             for (id, packet) in packets.iter().enumerate() {
                 if !drops.contains(&(id as u32)) {
-                    self.stream.send_to(packet, camera.destination()).unwrap();
+                    send(packet, destination);
                 }
             }
-            camera.frames.insert(block, packets);
         }
     }
     impl Drop for Fake {
@@ -2970,6 +2999,21 @@ mod tests {
         }
     }
     #[test]
+    fn fake_stream_sends_leave_camera_control_available() {
+        let (fake, mut gige) = streaming(|_| {});
+        let mut control = Control::connect(fake.address, Duration::from_secs(1)).unwrap();
+        let mut sent = 0;
+        fake.send_with(1, false, &[], |packet, destination| {
+            // This read must finish while stream delivery is paused here.
+            // Keeping the fake state locked across send would starve GVCP.
+            assert_ne!(control.read_register(CONTROL_PRIVILEGE).unwrap() & 3, 0);
+            fake.stream.send_to(packet, destination).unwrap();
+            sent += 1;
+        });
+        assert!(sent > 0);
+        assert_eq!(gige.next_frame(Duration::from_secs(1)).unwrap().id, 1);
+    }
+    #[test]
     fn frames_survive_a_worker_stall_while_packets_wait_in_the_socket() {
         let (fake, mut gige) = streaming(|camera| {
             camera.registers.insert(GVCP_CAPABILITY, 0x4);
@@ -2978,11 +3022,13 @@ mod tests {
         assert!(gige.next_frame(Duration::from_millis(5)).is_err());
         let before = gige.stats().unwrap().resend_requested;
         thread::sleep(FRAME_IDLE + Duration::from_millis(50));
-        let camera = fake.camera.lock().unwrap();
-        for packet in &camera.frames[&1][4..] {
-            fake.stream.send_to(packet, camera.destination()).unwrap();
+        let (packets, destination) = {
+            let camera = fake.camera.lock().unwrap();
+            (camera.frames[&1][4..].to_vec(), camera.destination())
+        };
+        for packet in packets {
+            fake.stream.send_to(&packet, destination).unwrap();
         }
-        drop(camera);
         assert_eq!(gige.next_frame(Duration::from_secs(1)).unwrap().id, 1);
         let stats = gige.stats().unwrap();
         assert_eq!(
@@ -3009,11 +3055,13 @@ mod tests {
         fake.send(1, false, &[4, 5, 6, 7]);
         assert!(gige.next_frame(Duration::from_millis(5)).is_err());
         assert!(timeout(&gige) <= POLL, "{:?}", timeout(&gige));
-        let camera = fake.camera.lock().unwrap();
-        for packet in &camera.frames[&1][4..] {
-            fake.stream.send_to(packet, camera.destination()).unwrap();
+        let (packets, destination) = {
+            let camera = fake.camera.lock().unwrap();
+            (camera.frames[&1][4..].to_vec(), camera.destination())
+        };
+        for packet in packets {
+            fake.stream.send_to(&packet, destination).unwrap();
         }
-        drop(camera);
         assert_eq!(gige.next_frame(Duration::from_secs(1)).unwrap().id, 1);
         assert!(gige.next_frame(Duration::from_millis(100)).is_err());
         assert!(timeout(&gige) > POLL * 8, "{:?}", timeout(&gige));
